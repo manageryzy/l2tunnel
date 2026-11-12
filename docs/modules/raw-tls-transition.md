@@ -6,6 +6,8 @@ The [tracked owner and switchable driver](raw-owner-handoff.md) prove local
 ownership using maintained TCP and mock packet I/O. This document specifies the
 TLS, peer and ingress boundaries now implemented for the bounded experimental
 [raw packet phase](raw-packet-phase.md). Retained TCP/TLS remains the default.
+The [explicit raw runtime](raw-runtime.md) adds finite native/MUX/recovery
+composition over caller-owned PacketIo; it does not qualify a native opener.
 The packet phase is custom TCP-shaped datagrams; it does not retain RFC TCP or
 HTTPS semantics and does not guarantee passage through middleboxes.
 

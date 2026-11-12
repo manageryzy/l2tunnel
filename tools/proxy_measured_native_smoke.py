@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -548,6 +549,31 @@ def audit_windows(paths: dict[str, Path], flows: list[dict], pressure: bool,
     return result
 
 
+def cleanup_owned_sockets(owners: dict[Path, tuple[int, int]], processes: list) -> list[str]:
+    """Remove only sockets inside unchanged private directories after all children exit."""
+    if any(process.poll() is None for process in processes):
+        raise RuntimeError('cannot remove private sockets while an owned child remains live')
+    removed = []
+    for path, identity in owners.items():
+        # Open the exact retained parent without following a substituted symlink.
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            parent = os.fstat(descriptor)
+            if (parent.st_dev, parent.st_ino) != identity or stat.S_IMODE(parent.st_mode) != 0o700:
+                raise RuntimeError('private socket directory identity changed')
+            try:
+                value = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISSOCK(value.st_mode):
+                raise RuntimeError('owned socket path was replaced with a non-socket')
+            os.unlink(path.name, dir_fd=descriptor)
+            removed.append(str(path))
+        finally:
+            os.close(descriptor)
+    return removed
+
+
 def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Path, state_dir: Path) -> dict:
     start = time.monotonic()
     end = start + BOUNDS['case']
@@ -557,6 +583,7 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
     case_dir.mkdir()
     receipt = Receipt(case_dir / 'receipt.json', {'status': 'running', 'plan': plan, 'stage': 'setup', 'cleanup': 'pending'})
     processes, captures, capture_paths, sockets, samples, events = [], {}, {}, {}, [], []
+    socket_owners = {}
     created = False
     def nsrun(side, *argv): return ['ip', 'netns', 'exec', ns[f'endpoint_{side}'], *argv]
     def stage(name, **fields):
@@ -596,6 +623,8 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
             private = secrets / f'{plan["duplex"]}-{side}'
             private.mkdir(mode=0o700)
             sockets[side] = private / 'proxy.sock'
+            owner = private.stat()
+            socket_owners[sockets[side]] = (owner.st_dev, owner.st_ino)
         for interface in ('a0', 'b0'):
             features[f'router-{interface}'] = offloads(ns['router'], interface, end)
         stage('capture_start', offloads=features, original_owned_ecn=ecn, underlay_ipv6=underlay_ipv6,
@@ -752,10 +781,10 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
                 raise RuntimeError(f'owned child cleanup failed: {child_errors}')
             if any((netns_lab.NETNS_DIRECTORY / name).exists() for name in ns.values()):
                 raise RuntimeError('owned namespaces remain after cleanup')
-            for path in sockets.values():
-                if path.exists():
-                    raise RuntimeError('private socket remains after daemon cleanup')
-            receipt.update(cleanup='passed', status='passed' if failure is None else receipt.value['status'], elapsed_seconds=time.monotonic() - start)
+            removed_sockets = cleanup_owned_sockets(socket_owners, processes)
+            receipt.update(cleanup='passed', removed_owned_sockets=removed_sockets,
+                           status='passed' if failure is None else receipt.value['status'],
+                           elapsed_seconds=time.monotonic() - start)
         except Exception as error:
             failure = error
             receipt.update(cleanup='failed', status='failed', cleanup_error=str(error)[:4096])

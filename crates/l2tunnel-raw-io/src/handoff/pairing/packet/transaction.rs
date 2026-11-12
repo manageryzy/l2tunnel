@@ -50,11 +50,7 @@ impl<I: PacketIo> Detached<I> {
             .allocated
             .checked_add(payload_len as u64)
             .ok_or(Error::Exhausted)?;
-        let reserve = if kind.control() {
-            0
-        } else {
-            8 * (u64::from(policy.mtu) - 40)
-        };
+        let reserve = kind.reserved_cells() * (u64::from(policy.mtu) - 40);
         if end >= u64::from(u32::MAX - f.local) {
             return Err(Error::Exhausted);
         }
@@ -1218,6 +1214,18 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         self.lanes = [None, None];
         self.records.clear();
         e
+    }
+    /// Check the actual fixed active/transition lifetime without performing I/O.
+    /// A terminal failure drops all original owners before returning the first cause.
+    pub fn check_live(&mut self) -> Result<(), Error> {
+        match self.check() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.fail(e)),
+        }
+    }
+    /// Maximum complete upper recovery record under the authenticated packet policy.
+    pub fn max_record_bytes(&self) -> usize {
+        self.policy.body_limit()
     }
     /// Actual accepted pair metadata; it contains no keys or handoff capability.
     pub fn info(&self) -> &PairInfo {

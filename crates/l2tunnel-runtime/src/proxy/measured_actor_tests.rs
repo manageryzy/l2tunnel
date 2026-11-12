@@ -663,3 +663,86 @@ async fn measured_actual_writer_partial_body_and_pending_flush_retain_token_in_b
     }
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn measured_native_credit_stall_is_visible_without_device_backpressure() -> Result {
+    let mut lab = Lab::active().await?;
+    lab.a.actor.measured_service()?;
+    assert!(
+        !lab.a
+            .actor
+            .measured
+            .as_ref()
+            .ok_or("Controller")?
+            .snapshot(&lab.a.actor.table, lab.a.actor.micros()?)?
+            .pressure
+            .receiver_pressure
+    );
+    // Both actual maintained hosts and all successful packet writes remain live.
+    // The downstream host deliberately does not consume its receive ring.
+    let bytes = vec![0x9d; 8192];
+    let mut written = 0;
+    for _ in 0..600 {
+        if written < 393216 {
+            written += lab.hosts[0].0.write(&bytes)?;
+        }
+        lab.step().await?;
+    }
+    let relay = lab.a.actor.table.relay_status(1).ok_or("relay")?;
+    assert_eq!(
+        relay.native.receive_bytes,
+        lab.a.actor.config.native.receive_bytes
+    );
+    assert!(
+        relay.produced.bytes == relay.peer_granted.bytes
+            || relay.produced.records == relay.peer_granted.records
+    );
+    assert!(lab.hosts[1].0.status().receive_bytes > 0);
+    for side in [&lab.a, &lab.b] {
+        let state = side.actor.measured.as_ref().ok_or("Controller")?;
+        assert!(!state.receiver_pressure);
+        assert!(!state.wire_pressure);
+    }
+    lab.a.actor.measured_service()?;
+    assert!(
+        lab.a
+            .actor
+            .measured
+            .as_ref()
+            .ok_or("Controller")?
+            .snapshot(&lab.a.actor.table, lab.a.actor.micros()?)?
+            .pressure
+            .receiver_pressure
+    );
+    let mut received = Vec::new();
+    for _ in 0..600 {
+        let mut buffer = [0; 4096];
+        while let l2tunnel_raw_tcp::ReadOutcome::Data(count) = lab.hosts[1].0.read(&mut buffer)? {
+            received.extend_from_slice(&buffer[..count]);
+        }
+        lab.step().await?;
+    }
+    assert_eq!(received, vec![0x9d; written]);
+    assert_eq!(
+        lab.a
+            .actor
+            .table
+            .relay_status(1)
+            .ok_or("relay")?
+            .native
+            .receive_bytes,
+        0
+    );
+    lab.a.actor.measured_service()?;
+    assert!(
+        !lab.a
+            .actor
+            .measured
+            .as_ref()
+            .ok_or("Controller")?
+            .snapshot(&lab.a.actor.table, lab.a.actor.micros()?)?
+            .pressure
+            .receiver_pressure
+    );
+    Ok(())
+}

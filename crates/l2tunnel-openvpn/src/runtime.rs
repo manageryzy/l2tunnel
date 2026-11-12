@@ -311,6 +311,10 @@ impl Control {
                 .and_then(|start| start.checked_add(self.close_timeout))
                 .ok_or(Error::Configuration("close deadline overflow"))
         })?;
+        if Instant::now() >= deadline {
+            self.shared.finish(Terminal::IncompleteClose);
+            return Err(Error::IncompleteClose);
+        }
         let shared = self.shared.clone();
         let mut terminal = shared.terminal.subscribe();
         let completed = timeout_at(deadline, async {
@@ -343,6 +347,11 @@ impl Control {
                 #[cfg(not(test))]
                 let _ = index;
                 task.await.map_err(|_| Error::Closed)??;
+                // timeout_at may poll a ready join before an expired timer. A
+                // completed child cannot authorize a later owner completion.
+                if Instant::now() >= deadline {
+                    return Err(Error::IncompleteClose);
+                }
             }
             Ok(())
         })
@@ -368,6 +377,10 @@ impl Control {
                 self.shared.finish(Terminal::IncompleteClose);
                 return Err(Error::IncompleteClose);
             }
+        }
+        if Instant::now() >= deadline {
+            self.shared.finish(Terminal::IncompleteClose);
+            return Err(Error::IncompleteClose);
         }
         self.tasks.clear(); // All handles are completed; only now may ownership end.
         Ok(CloseReceipt {
@@ -929,6 +942,36 @@ mod supervision_tests {
         })
         .await
         .map_err(|_| Error::Timeout)
+    }
+    #[tokio::test]
+    async fn expired_original_deadline_rejects_already_clean_ready_owners() -> Result<(), Error> {
+        let value = control();
+        value.shared.modify(|state| {
+            state.close_started = Some(Instant::now() - Duration::from_secs(2));
+            state.status.closing = true;
+            Ok(())
+        })?;
+        value.shared.finish(Terminal::Clean);
+        // timeout_at polls an already-ready inner future before its timer. Ready
+        // terminal state and empty joins therefore need an explicit time check.
+        assert!(matches!(value.close().await, Err(Error::IncompleteClose)));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn ready_join_after_executor_stall_cannot_finish_past_original_deadline()
+    -> Result<(), Error> {
+        let mut value = control();
+        value.close_timeout = Duration::from_millis(20);
+        value.shared.finish(Terminal::Clean);
+        // This current-thread runtime first polls close into its pending join.
+        // The owned task then deliberately stalls that executor past the bound;
+        // timeout_at may next see its ready join before polling the elapsed timer.
+        value.tasks.push(tokio::spawn(async {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(())
+        }));
+        assert!(matches!(value.close().await, Err(Error::IncompleteClose)));
+        Ok(())
     }
     #[tokio::test]
     async fn earlier_peer_close_bounds_terminal_wait_and_pair_supervisor_join() -> Result<(), Error>

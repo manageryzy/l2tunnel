@@ -278,6 +278,7 @@ async fn malformed_control_timeout_and_cancellation_close_preauth_connections() 
         }
     }
     let (client, server, _key, members) = fixture(profile(), EndpointLimits::default())?;
+    server.owner.force_endpoint_first();
     let address = server.local_addr()?;
     let task = tokio::spawn(async move { server.accept(&members, base(PacketLayer::Ip)).await });
     let connection = client.endpoint.connect(address, "quic.test")?.await?;
@@ -286,7 +287,11 @@ async fn malformed_control_timeout_and_cancellation_close_preauth_connections() 
     tokio::task::yield_now().await;
     task.abort();
     assert!(task.await.is_err());
-    timeout(Duration::from_secs(1), connection.closed()).await?;
+    let reason = timeout(Duration::from_secs(1), connection.closed()).await?;
+    assert!(matches!(
+        reason,
+        quinn::ConnectionError::ApplicationClosed(_)
+    ));
     Ok(())
 }
 
@@ -523,5 +528,134 @@ async fn observed_control_eof_closes_data_and_unreachable_udp_has_total_deadline
         Err(Error::TimedOut)
     ));
     assert_eq!(client.permits.available_permits(), limits.max_connections);
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandoned_endpoint_releases_exact_udp_tuple_without_waiting_for_transport_pto()
+-> TestResult {
+    let (mut client, _server, key, _members) = fixture(profile(), EndpointLimits::default())?;
+    // Test-only delayed recovery makes the ownership failure deterministic. The
+    // production transport configuration and five-second cleanup allowance stay
+    // unchanged; endpoint abandonment must not depend on any peer RTT/PTO.
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_rtt(Duration::from_secs(2));
+    client.config.inner.transport_config(Arc::new(transport));
+    client
+        .endpoint
+        .set_default_client_config(client.config.inner.clone());
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let address = client.local_addr()?;
+    let mut attempt = Box::pin(client.connect(
+        blackhole.local_addr()?,
+        "quic.test",
+        &key,
+        base(PacketLayer::Ip),
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(attempt.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(tokio::net::UdpSocket::bind(address).await.is_err());
+    drop(attempt);
+    drop(client);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(socket) = tokio::net::UdpSocket::bind(address).await {
+                drop(socket);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_sessions_retain_driver_owners_after_endpoint_factory_drop() -> TestResult {
+    let (client, server, key, members) = fixture(profile(), EndpointLimits::default())?;
+    let client_address = client.local_addr()?;
+    let server_address = server.local_addr()?;
+    let (a, b) = tokio::try_join!(
+        client.connect(server_address, "quic.test", &key, base(PacketLayer::Ip)),
+        server.accept(&members, base(PacketLayer::Ip)),
+    )?;
+    drop(client);
+    drop(server);
+    assert!(tokio::net::UdpSocket::bind(client_address).await.is_err());
+    assert!(tokio::net::UdpSocket::bind(server_address).await.is_err());
+    let (ac, mut at, ar) = a.into_parts();
+    let (bc, bt, mut br) = b.into_parts();
+    at.send(b"retained driver ownership").await?;
+    let mut output = vec![0; profile().max_datagram_bytes];
+    let received = br.receive(&mut output).await?;
+    let Received::Packet { len, .. } = received else {
+        return Err("retained authenticated datagram was discarded".into());
+    };
+    assert_eq!(&output[..len], b"retained driver ownership");
+    drop((ac, at, ar, bc, bt, br));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let a = tokio::net::UdpSocket::bind(client_address).await;
+            let b = tokio::net::UdpSocket::bind(server_address).await;
+            if a.is_ok() && b.is_ok() {
+                return;
+            }
+            drop((a, b));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_borrowed_accept_preserves_listener_reuse_and_endpoint_isolation() -> TestResult {
+    let (client, server, key, members) = fixture(profile(), EndpointLimits::default())?;
+    let mut accept = Box::pin(server.accept(&members, base(PacketLayer::Ip)));
+    let (connection, mut stream) = tokio::select! {
+        result = &mut accept => return Err(format!("preauth accept completed: {}", result.is_ok()).into()),
+        result = raw_connect(&client, &server) => result?,
+    };
+    stream.write_all(PRELUDE).await?;
+    std::future::poll_fn(|cx| {
+        assert!(accept.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(accept);
+    // Before handshake confirmation Quinn may encode an application close as
+    // transport CONNECTION_CLOSE. Both are actual peer close frames; idle,
+    // timeout and local cancellation are not accepted evidence.
+    assert!(matches!(
+        timeout(Duration::from_secs(1), connection.closed()).await?,
+        quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::ConnectionClosed(_)
+    ));
+    assert!(
+        tokio::net::UdpSocket::bind(server.local_addr()?)
+            .await
+            .is_err()
+    );
+    let (a, b) = tokio::try_join!(
+        client.connect(
+            server.local_addr()?,
+            "quic.test",
+            &key,
+            base(PacketLayer::Ip)
+        ),
+        server.accept(&members, base(PacketLayer::Ip)),
+    )?;
+    let (other_client, other_server, _, _) = fixture(profile(), EndpointLimits::default())?;
+    drop((other_client, other_server));
+    let (_ac, mut at, _ar) = a.into_parts();
+    let (_bc, _bt, mut br) = b.into_parts();
+    at.send(b"isolated").await?;
+    let mut bytes = vec![0; profile().max_datagram_bytes];
+    let Received::Packet { len, .. } = br.receive(&mut bytes).await? else {
+        return Err("unrelated endpoint teardown affected authenticated session".into());
+    };
+    assert_eq!(&bytes[..len], b"isolated");
     Ok(())
 }

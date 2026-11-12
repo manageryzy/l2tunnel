@@ -109,6 +109,15 @@ claims changed. Dropping an unused reusable listener released its tuples in
 about 3 ms in the same diagnostic. These are local cancellation observations,
 not general network close bounds.
 
+The later frozen wave15b cleanup failures showed that this historical PTO-based
+observation was not an ownership guarantee. The [QUIC endpoint owner correction](quic-owner-cleanup.md)
+now releases only the abandoned endpoint's driver resources independently of PTO,
+retains actual sessions/reusable listeners, and preserves the same five-second
+observation. The packed original-deadline postcheck now also classifies a late
+inner error as TimedOut. Before/after regressions and scoped source provenance are
+recorded in the [owner cleanup receipt](../../work/quic-owner-cleanup/validation.json).
+This does not revise the historical wave11 observations above.
+
 Native harness selection is a later independently reviewed checkpoint. Preserve
 existing frame/aligned defaults and historical receipts; use a new immutable build
 and first clean finite case before expansion to TAP/TUN/VXLAN full/half and impaired

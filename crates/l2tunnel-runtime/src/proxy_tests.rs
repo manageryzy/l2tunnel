@@ -516,7 +516,7 @@ async fn measured_links(
     }
 }
 
-async fn measured_stream_case(duplex: Duplex, ipv6: bool) -> TestResult {
+async fn measured_stream_case(duplex: Duplex, ipv6: bool, slow_status: bool) -> TestResult {
     let mut cfg = measured::config_tests::config()?;
     cfg.fixed.duplex = duplex;
     let prefix = if ipv6 {
@@ -538,6 +538,9 @@ async fn measured_stream_case(duplex: Duplex, ipv6: bool) -> TestResult {
     cfg.measured.ownership.handoff_timeout_micros = 500_000;
     cfg.measured.ownership.probe_timeout_micros = 300_000;
     cfg.measured.observation.sample_ttl_micros = 400_000;
+    if slow_status {
+        cfg.service.status_interval_micros = 500_000;
+    }
     let (a, b) = measured_links(&cfg).await?;
     assert_eq!(a.role(), session::Role::Originator);
     assert_eq!(b.role(), session::Role::Acceptor);
@@ -569,7 +572,15 @@ async fn measured_stream_case(duplex: Duplex, ipv6: bool) -> TestResult {
                             Err(e) => return Err(io::Error::other(e)),
                         }
                     }
-                    if sent[i] == input.len() && !closed[i] {
+                    // Native EOF does not order the separate measurement records
+                    // or their coalesced public snapshots. Keep this measurement
+                    // workload active until both real observations arrive, within
+                    // the same original transfer deadline; then exercise FIN/drain.
+                    if sent[i] == input.len()
+                        && !closed[i]
+                        && saw_rate == [true; 2]
+                        && saw_echo == [true; 2]
+                    {
                         s.engine.close();
                         closed[i] = true;
                     }
@@ -611,7 +622,13 @@ async fn measured_stream_case(duplex: Duplex, ipv6: bool) -> TestResult {
     assert_eq!(got[0], input_b);
     assert_eq!(got[1], input_a);
     assert_eq!(saw_rate, [true; 2]);
-    assert_eq!(saw_echo, [true; 2]);
+    assert_eq!(
+        saw_echo,
+        [true; 2],
+        "coalesced echo snapshot {duplex:?}/{ipv6}: {:?}/{:?}",
+        ha.status(),
+        hb.status()
+    );
     for handle in [&ha, &hb] {
         let s = handle.status().ok_or("measured snapshot")?;
         assert_eq!(s.runtime.flows, 1);
@@ -647,12 +664,17 @@ async fn measured_stream_case(duplex: Duplex, ipv6: bool) -> TestResult {
 #[tokio::test]
 async fn measured_actual_tcp_both_roles_full_half_ipv4_ipv6_and_full_flush_drain() -> TestResult {
     tokio::try_join!(
-        measured_stream_case(Duplex::Full, false),
-        measured_stream_case(Duplex::Full, true),
-        measured_stream_case(Duplex::Half, false),
-        measured_stream_case(Duplex::Half, true)
+        measured_stream_case(Duplex::Full, false, false),
+        measured_stream_case(Duplex::Full, true, false),
+        measured_stream_case(Duplex::Half, false, false),
+        measured_stream_case(Duplex::Half, true, false)
     )?;
     Ok(())
+}
+
+#[tokio::test]
+async fn measured_short_stream_observes_coalesced_status_before_fin() -> TestResult {
+    measured_stream_case(Duplex::Full, false, true).await
 }
 
 #[tokio::test]

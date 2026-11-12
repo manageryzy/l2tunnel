@@ -327,7 +327,9 @@ impl GateState {
                             > f.retired
                                 .checked_add(f.local_horizon)
                                 .ok_or(Error::Exhausted)?
-                                .saturating_sub(8 * (u64::from(policy.mtu) - 40))
+                                .saturating_sub(
+                                    h.kind.reserved_cells() * (u64::from(policy.mtu) - 40),
+                                )
                         {
                             return Err(Error::Capacity);
                         }

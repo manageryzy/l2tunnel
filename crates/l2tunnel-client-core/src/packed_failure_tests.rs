@@ -225,14 +225,26 @@ async fn expired_setup_never_polls_and_ready_after_expiry_drops_the_returned_own
     .await;
     assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::TimedOut));
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let end = Instant::now() + Duration::from_millis(1);
+    let result = finish_before(end, async {
+        let until = std::time::Instant::now() + Duration::from_millis(3);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        Err::<(), _>(io::Error::other(
+            "inner failure returned after original setup deadline",
+        ))
+    })
+    .await;
+    assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::TimedOut));
     Ok(())
 }
 
 async fn tuples_available(settings: udp::Settings, stage: &str) -> io::Result<()> {
-    // This is a cleanup observation bound, never an extension of setup. Quinn
-    // retains the endpoint while a canceled Connecting closes for 3 PTOs. With
-    // its pinned initial RTT (333 ms) and variance (166.5 ms), that is 2997 ms.
-    // The previous two-second test bound was shorter than this protocol period.
+    // This existing cleanup observation bound never extends setup. Last-owner
+    // abandonment now owns driver teardown rather than waiting for Quinn's
+    // variable 3-PTO drain. Keep the same five-second allowance as the failed
+    // aggregate; a rerun or wider observer is not an ownership fix.
     let started = Instant::now();
     timeout(Duration::from_secs(5), async {
         loop {

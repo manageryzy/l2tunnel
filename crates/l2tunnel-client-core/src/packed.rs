@@ -255,13 +255,15 @@ async fn finish_before<T>(
     }
     let value = tokio::time::timeout_at(end, operation)
         .await
-        .map_err(|_| expired())??;
+        .map_err(|_| expired())?;
     // timeout_at may poll a ready inner future first. A returned capability must
-    // still belong to the same original, live setup allowance.
+    // still belong to the same original, live setup allowance. A late inner
+    // failure also loses to that deadline rather than escaping as a different
+    // error merely because timeout_at polled the ready operation first.
     if Instant::now() >= end {
         return Err(expired());
     }
-    Ok(value)
+    value
 }
 fn expired() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "packed original setup deadline")

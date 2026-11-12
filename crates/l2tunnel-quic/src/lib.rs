@@ -4,6 +4,7 @@
 //! recovery engine are provided. QUIC always encrypts; configured ALPN is visible.
 
 mod config;
+mod owned_endpoint;
 pub use config::{ClientConfig, EndpointLimits, Profile, ServerConfig, Traffic, session_config};
 
 use std::fmt;
@@ -89,23 +90,26 @@ pub struct ClientEndpoint {
     endpoint: quinn::Endpoint,
     config: ClientConfig,
     permits: Arc<Semaphore>,
+    owner: owned_endpoint::Owner,
 }
 /// Server UDP endpoint with Retry and bounded pending/admitted handshakes.
 pub struct ServerEndpoint {
     endpoint: quinn::Endpoint,
     config: ServerConfig,
     permits: Arc<Semaphore>,
+    owner: owned_endpoint::Owner,
 }
 
 impl ClientEndpoint {
     /// Bind a UDP socket; wildcard/ephemeral local addresses are permitted.
     pub fn bind(local: SocketAddr, config: &ClientConfig) -> Result<Self, Error> {
-        let mut endpoint = quinn::Endpoint::client(local)?;
+        let (mut endpoint, owner) = owned_endpoint::bind(local, None, config.limits)?;
         endpoint.set_default_client_config(config.inner.clone());
         Ok(Self {
             endpoint,
             config: config.clone(),
             permits: Arc::new(Semaphore::new(config.limits.max_connections)),
+            owner,
         })
     }
     /// Actual local UDP endpoint, including an assigned ephemeral port.
@@ -162,7 +166,7 @@ impl ClientEndpoint {
             let tokens = client_gate(&mut stream, info.session_id).await?;
             let result = finish_connection(
                 connection,
-                (self.endpoint.clone(), permit),
+                (self.endpoint.clone(), self.owner.clone(), permit),
                 stream,
                 profile,
                 info,
@@ -179,11 +183,13 @@ impl ClientEndpoint {
 impl ServerEndpoint {
     /// Bind the UDP listener, without opening a TCP socket.
     pub fn bind(local: SocketAddr, config: &ServerConfig) -> Result<Self, Error> {
-        let endpoint = quinn::Endpoint::server(config.inner.clone(), local)?;
+        let (endpoint, owner) =
+            owned_endpoint::bind(local, Some(config.inner.clone()), config.limits)?;
         Ok(Self {
             endpoint,
             config: config.clone(),
             permits: Arc::new(Semaphore::new(config.limits.max_connections)),
+            owner,
         })
     }
     /// Actual local UDP listener address.
@@ -235,7 +241,7 @@ impl ServerEndpoint {
                 let tokens = server_gate(&mut stream, info.session_id).await?;
                 let result = finish_connection(
                     connection,
-                    (self.endpoint.clone(), permit),
+                    (self.endpoint.clone(), self.owner.clone(), permit),
                     stream,
                     profile,
                     info,
@@ -395,6 +401,7 @@ async fn server_gate(stream: &mut Stream, session: [u8; 16]) -> Result<Tokens, E
 struct Session {
     connection: quinn::Connection,
     _endpoint: quinn::Endpoint,
+    _owner: owned_endpoint::Owner,
     _permit: OwnedSemaphorePermit,
     open: AtomicBool,
     info: SessionInfo,
@@ -441,7 +448,7 @@ impl AuthenticatedConnection {
 }
 fn finish_connection(
     connection: quinn::Connection,
-    resources: (quinn::Endpoint, OwnedSemaphorePermit),
+    resources: (quinn::Endpoint, owned_endpoint::Owner, OwnedSemaphorePermit),
     stream: Stream,
     profile: Profile,
     info: SessionInfo,
@@ -457,7 +464,8 @@ fn finish_connection(
     let session = Arc::new(Session {
         connection,
         _endpoint: resources.0,
-        _permit: resources.1,
+        _owner: resources.1,
+        _permit: resources.2,
         open: AtomicBool::new(true),
         info,
         profile,

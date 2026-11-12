@@ -110,12 +110,24 @@ impl State {
     pub fn service(
         &mut self,
         table: &mut session::Table,
-        pressure: measurement::LocalPressure,
+        mut pressure: measurement::LocalPressure,
         now: Micros,
     ) -> io::Result<()> {
         self.controller
             .observe_table(table, now)
             .map_err(io::Error::other)?;
+        // Successful packet-device writes do not prove that the maintained
+        // receive ring can be consumed. The ordered relay can be waiting for
+        // cumulative peer credit while actual native stream bytes remain unread.
+        // Derive that current capacity stall from the real active owner; neither
+        // a target nor an idle zero-credit stream is pressure or a TCP rwnd value.
+        pressure.receiver_pressure |= (1..=table.status().flows as u64).any(|id| {
+            table.relay_status(id).is_some_and(|relay| {
+                relay.native.receive_bytes != 0
+                    && (relay.produced.bytes == relay.peer_granted.bytes
+                        || relay.produced.records == relay.peer_granted.records)
+            })
+        });
         self.pressure = pressure;
         if self
             .controller

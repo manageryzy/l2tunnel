@@ -214,6 +214,53 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
             self.assertEqual(receipt['cleanup'], 'passed')
             self.assertIn('setup failed', receipt['error'])
 
+    def test_failed_case_socket_cleanup_requires_dead_children_and_exact_private_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory) / 'private'; private.mkdir(mode=0o700)
+            path = private / 'proxy.sock'
+            identity = private.stat()
+            owners = {path: (identity.st_dev, identity.st_ino)}
+            process = unittest.mock.Mock()
+            with socket.socket(socket.AF_UNIX) as endpoint:
+                endpoint.bind(str(path))
+                process.poll.return_value = None
+                with self.assertRaisesRegex(RuntimeError, 'remains live'):
+                    h.cleanup_owned_sockets(owners, [process])
+                self.assertTrue(path.exists())
+                process.poll.return_value = -15
+            self.assertEqual(h.cleanup_owned_sockets(owners, [process]), [str(path)])
+            self.assertFalse(path.exists())
+            self.assertEqual(h.cleanup_owned_sockets(owners, [process]), [])
+            # A path replacement is not a socket we are authorized to unlink.
+            path.write_text('preserve')
+            with self.assertRaisesRegex(RuntimeError, 'non-socket'):
+                h.cleanup_owned_sockets(owners, [process])
+            self.assertEqual(path.read_text(), 'preserve')
+            path.unlink()
+            path.symlink_to(private / 'unrelated')
+            with self.assertRaisesRegex(RuntimeError, 'non-socket'):
+                h.cleanup_owned_sockets(owners, [process])
+            self.assertTrue(path.is_symlink())
+
+    def test_socket_cleanup_rejects_substituted_private_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / 'private'; private.mkdir(mode=0o700)
+            path = private / 'proxy.sock'
+            identity = private.stat()
+            owners = {path: (identity.st_dev, identity.st_ino)}
+            private.rename(root / 'old')
+            private.mkdir(mode=0o700)
+            with socket.socket(socket.AF_UNIX) as endpoint:
+                endpoint.bind(str(path))
+                with self.assertRaisesRegex(RuntimeError, 'identity'):
+                    h.cleanup_owned_sockets(owners, [])
+                self.assertTrue(path.exists())
+            path.unlink()
+            private.rmdir()
+            private.symlink_to(root / 'old', target_is_directory=True)
+            with self.assertRaises(OSError): h.cleanup_owned_sockets(owners, [])
+
     def test_status_strictness_capabilities_and_actual_observation_are_required(self):
         value = snapshot()
         h.validate_proxy_snapshot(value)

@@ -249,3 +249,28 @@ fn budget_has_one_shared_turn_and_finite_held_allowance() {
     assert!(!b.reserve(40, now));
     assert!(b.reserve(40, now + Duration::from_secs(1)));
 }
+
+#[test]
+fn upper_feedback_has_bounded_headroom_without_spending_internal_control_reserve() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    let data_end = 32768 - 8 * 536;
+    let offset = data_end - 10;
+    let data = seal(&mut sealer, wire::Kind::Data, offset, b"bulk")?;
+    state.ingest_phase(&outer(&data, 2000 + offset as u32, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 0);
+    let feedback = seal(&mut sealer, wire::Kind::Feedback, offset, b"feedback")?;
+    state.ingest_phase(&outer(&feedback, 2000 + offset as u32, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    // Four maximum cells remain exclusively available to internal controls.
+    let offset = 32768 - 4 * 536;
+    let too_far = seal(&mut sealer, wire::Kind::Feedback, offset, b"feedback")?;
+    // retirement advances on accepted feedback, so freeze its prior value here
+    // to exercise the exact initial-edge admission kernel rather than a new edge.
+    state.fence.as_mut().ok_or("fence")?.retired = 0;
+    state.ingest_phase(&outer(&too_far, 2000 + offset as u32, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    let ping = seal(&mut sealer, wire::Kind::Ping, offset, &[1; 8])?;
+    state.ingest_phase(&outer(&ping, 2000 + offset as u32, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    Ok(())
+}

@@ -754,7 +754,7 @@ pub async fn server_pair(
     pair(first, second, runtime, config, false).await
 }
 
-enum Engine {
+pub(super) enum Engine {
     Arq {
         context: RecoveryContext,
         endpoint: Box<SelectiveRepeat>,
@@ -766,7 +766,10 @@ impl Engine {
     fn new(config: Config, context: RecoveryContext) -> io::Result<Self> {
         Self::from_policy(config.policy()?, context)
     }
-    fn from_policy(config: DatagramPolicy, context: RecoveryContext) -> io::Result<Self> {
+    pub(super) fn from_policy(
+        config: DatagramPolicy,
+        context: RecoveryContext,
+    ) -> io::Result<Self> {
         if let Some(reliable) = config.reliable {
             Ok(Self::Cauchy(Box::new(
                 Reliable::new(reliable, context).map_err(io::Error::other)?,
@@ -780,7 +783,7 @@ impl Engine {
             })
         }
     }
-    fn inspect(&self, packet: &[u8], maximum: usize) -> io::Result<RecordKind> {
+    pub(super) fn inspect(&self, packet: &[u8], maximum: usize) -> io::Result<RecordKind> {
         match self {
             Self::Arq { context, .. } => Ok(
                 match inspect_packet(packet, *context, maximum).map_err(io::Error::other)? {
@@ -791,25 +794,25 @@ impl Engine {
             Self::Cauchy(endpoint) => endpoint.inspect_peer(packet).map_err(io::Error::other),
         }
     }
-    fn submit(&mut self, bytes: &[u8], now: Duration) -> io::Result<u64> {
+    pub(super) fn submit(&mut self, bytes: &[u8], now: Duration) -> io::Result<u64> {
         match self {
             Self::Arq { endpoint, .. } => endpoint.submit(bytes, now).map_err(io::Error::other),
             Self::Cauchy(endpoint) => endpoint.submit(bytes, now).map_err(io::Error::other),
         }
     }
-    fn receive(&mut self, bytes: &[u8], now: Duration) -> io::Result<()> {
+    pub(super) fn receive(&mut self, bytes: &[u8], now: Duration) -> io::Result<()> {
         match self {
             Self::Arq { endpoint, .. } => endpoint.receive(bytes, now).map_err(io::Error::other),
             Self::Cauchy(endpoint) => endpoint.receive(bytes, now).map_err(io::Error::other),
         }
     }
-    fn delivered(&mut self, output: &mut [u8]) -> io::Result<Option<(u64, usize)>> {
+    pub(super) fn delivered(&mut self, output: &mut [u8]) -> io::Result<Option<(u64, usize)>> {
         match self {
             Self::Arq { endpoint, .. } => endpoint.poll_delivered(output).map_err(io::Error::other),
             Self::Cauchy(endpoint) => endpoint.poll_delivered(output).map_err(io::Error::other),
         }
     }
-    fn poll(
+    pub(super) fn poll(
         &mut self,
         feedback: bool,
         now: Duration,
@@ -847,7 +850,7 @@ impl Engine {
         }
     }
 }
-fn pressure(error: &io::Error, side: BufferSide) -> bool {
+pub(super) fn pressure(error: &io::Error, side: BufferSide) -> bool {
     let Some(inner) = error.get_ref() else {
         return false;
     };

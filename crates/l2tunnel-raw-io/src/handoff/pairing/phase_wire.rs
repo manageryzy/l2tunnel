@@ -32,6 +32,13 @@ impl Kind {
             _ => Err(Error::Format),
         }
     }
+    pub(super) fn reserved_cells(self) -> u64 {
+        match self {
+            Self::Data => 8,
+            Self::Feedback => 4,
+            _ => 0,
+        }
+    }
     pub(super) fn control(self) -> bool {
         !matches!(self, Self::Data | Self::Feedback)
     }

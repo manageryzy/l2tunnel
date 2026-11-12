@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+l2tunnel-raw-io = { path = "../l2tunnel-raw-io" }
 l2tunnel-openvpn = { path = "../l2tunnel-openvpn" }
 l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
 l2tunnel-qos = { path = "../l2tunnel-qos" }

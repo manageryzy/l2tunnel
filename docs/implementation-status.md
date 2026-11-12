@@ -13,8 +13,8 @@ runtime and packed Ethernet audit checkpoints; subsequent concurrent module edit
 are not covered by that receipt.
 
 The [active workflow](development-workflow.md#current-composition-wave) now runs
-raw TLS-to-packet transition, measured proxy client/API integration and rolling
-local/global RLNC in three independent source/build lanes. Aggregate/build/native
+native raw packet ownership, its shared client/API integration and causal rolling
+repair scheduling in three independent source/build lanes. Aggregate/build/native
 qualification uses a copied source checkpoint, releasing developers immediately
 after copy verification. Clean native profiles use disjoint owned namespaces;
 concurrent runs qualify finite connectivity/integrity, not performance.
@@ -42,8 +42,43 @@ columns, bounds incremental work, and handles output pressure/deadlines. It has
 no integrated repair scheduler or transport yet. The measured proxy
 [shared client checkpoint](../work/proxy-measured-client/validation.json) passes
 95 library and 19 example cases and invokes the actual measured runtime through
-an explicit CLI profile. Both await the next whole-workspace snapshot; measured
-native window/fairness qualification remains pending.
+an explicit CLI profile. The subsequent wire codec adds nine focused cases.
+These finite modules do not close the complete Python-family gates.
+
+The source-stable wave15 aggregate failed in a paired OpenVPN-like UDP close;
+its unchanged isolated rerun passed, leaving the original cause unattributed.
+Wave15b with four test threads failed two QUIC cancellation/expiry socket-release
+checks. Both original receipts remain preserved in the
+[Git import provenance](checkpoints/2026-11-12.md). A successful observation build
+does not erase these aggregate failures.
+
+The completed derived-wave16 bundles include [raw packet runtime](modules/raw-runtime.md)
+(158 focused raw/runtime cases, one privileged case ignored),
+[QUIC ownership/deadline corrections](modules/quic-owner-cleanup.md)
+(128 client/example/QUIC cases), and explicit original-deadline checks in
+[OpenVPN-like close](modules/standalone-openvpn-runtime.md) (49 cases). The latter
+fixes a deterministic late-ready completion bug; it does not attribute the older
+paired close timeout. Root-owned source-stable aggregate validation is separate.
+
+The default-concurrency [wave16 aggregate](../work/implementation-wave16/validation.json)
+passed the previously failing QUIC/OpenVPN checks but stopped at the measured
+stream fixture's `saw_echo` assertion, after exact payload transfer and before
+drain. This was not a drain failure. A 500 ms public-status interval reproduces
+the fixture's ordering mistake: native EOF can arrive in 210 ms before a coalesced
+measurement snapshot. The corrected fixture keeps its measurement workload
+active until both real samples are observed, within the unchanged five-second
+transfer bound, then checks exact FIN/drain within its unchanged fifteen-second
+bound. All 158 runtime cases pass; a derived aggregate remains separate.
+
+Both [measured native clean cases](modules/proxy-measured-native.md) and their
+independent audits passed on the exact observation build. Both pressure cases
+completed exact-byte transfers but failed measurement acceptance. Saved captures
+show actual zero windows on all eight native legs; three reopen before the reader
+release and fail the unchanged first-reopen condition. A real maintained-stack
+regression now fixes the missing observation of unread native bytes stalled by
+exhausted peer credit; 157 runtime and 36 harness tests pass, including pressure
+clearing and ownership-safe failed-case socket cleanup. Native pressure, adaptive
+window growth and QoS/fairness qualification remain open.
 
 ## First native vertical slice
 

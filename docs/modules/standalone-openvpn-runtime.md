@@ -148,7 +148,10 @@ negotiated control maximum RTO plus ACK delay plus two driver poll intervals.
 Fresh accepted control input and newly emitted output restart quiet, never the
 original absolute close deadline. `Control::close` applies that same retained
 start/deadline to terminal waiting and every supervised task join; awaiting a join
-never moves its handle out of the owner. Cancellation or an earlier failed join
+never moves its handle out of the owner. Explicit checks before waiting, after
+each ready join and before the final receipt also reject completion at/after the
+original deadline: Tokio timeout wrappers may poll a ready child before an
+already-expired timer. Cancellation or an earlier failed join
 therefore aborts both the current and all not-yet-joined tasks. A peer-triggered
 earlier close does not acquire a fresh timeout when the caller later closes.
 This services final source retries after an
@@ -209,6 +212,7 @@ join is a project protocol over actual TLS, not an OpenVPN interoperability clai
 - [x] [MOD-OVPNRT-07] Qualify fixed IPv4/IPv6 tuples, admission/certificate/member failures, timeout/cancellation, wrong-profile demux, stale outer traffic, lease/key exhaustion and strict aggregate checks. Evidence: [configuration/profile rejection](../../crates/l2tunnel-openvpn/src/config.rs), [runtime failures and deadlines](../../crates/l2tunnel-openvpn/src/tests.rs), [IPv4/IPv6 paired tests](../../crates/l2tunnel-openvpn/src/pair/tests.rs), [wave 6 aggregate](../../work/implementation-wave6/validation.json).
 - [ ] [MOD-OVPNRT-08] Integrate reviewed runtime/device/client selection and owned native TAP/TUN capture/MTU tests; keep FEC and mode-parity claims separate.
 - [x] [MOD-OVPNRT-09] Bound terminal waiting and all task joins by the original close deadline while preserving abort ownership during cancellation. Evidence: [close implementation and deadline/cancellation regressions](../../crates/l2tunnel-openvpn/src/runtime.rs).
+- [x] [MOD-OVPNRT-09A] Reject already-ready clean state and ready task joins at/after the original close deadline, without widening the bound or changing retry/fault policy. Evidence: [close deadline investigation](../../work/openvpn-close15-review/REPORT.md), deterministic old-code failures and focused current checks. The earlier paired impairment timeout is preserved separately and is not attributed to this fix.
 
 
 ## Focused verification and remaining limits
@@ -254,3 +258,23 @@ now supplies reviewed frame fragmentation and bounded native ownership; the
 [shared client](openvpn-client.md) supplies explicit CLI selection, private key
 provisioning and the pinned TLS resource review. Platform checks, native
 captures/MTU and FEC/mode-parity gates remain open.
+
+## Snapshot15 close investigation
+
+The [close investigation](../../work/openvpn-close15-review/REPORT.md) preserves
+the snapshot15 paired impairment failure: data and TLS were drained, but the
+socket driver had not published clean before the original owner deadline. Four
+instrumented baseline reproductions passed under unchanged deadline/impairment
+settings; the original receipt lacks the final control/quiet timestamps needed
+for conclusive attribution. A 3.009-second quiet interval inside a five-second
+close bound cannot promise clean completion if final activity occurs after
+1.991 seconds. A pure regression pins that finite exhaustion rather than
+resetting or enlarging the close deadline.
+
+The investigation separately proved and fixed a ready-future deadline bypass:
+an already-Clean state or completed child could return success at/after the
+original deadline because the timeout wrapper polled the ready child first.
+Two deterministic regressions reject both an already-expired owner and a child
+made ready after an executor stall. This correction does not claim to fix the
+preserved snapshot15 `IncompleteClose` observation. The complete current crate
+passes 49 tests; strict validation details are recorded in the focused receipt.

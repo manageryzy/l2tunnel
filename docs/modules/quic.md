@@ -87,6 +87,11 @@ anti-amplification, congestion control and loss recovery. These finite caps are 
 an Internet denial-of-service qualification. Cancellation/failure closes partially
 authenticated connections and releases permits.
 
+Endpoint abandonment additionally uses [bounded endpoint-scoped driver ownership](quic-owner-cleanup.md).
+Actual sessions and reusable listeners retain the application token; only its
+last drop requests the finite final driver polls and resource release. This is
+abnormal cancellation, with no successful drain or peer-delivery claim.
+
 ## Acceptance ledger
 
 - [x] [MOD-QUIC-01] Freeze public profile, auth binding and primary-source design before implementation. Evidence: [carrier](../../crates/l2tunnel-quic/src/lib.rs), [profile](../../crates/l2tunnel-quic/src/config.rs), [UDP loopback tests](../../crates/l2tunnel-quic/src/tests.rs), [auth tests](../../crates/l2tunnel-auth/src/tests.rs).

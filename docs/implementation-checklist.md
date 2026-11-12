@@ -41,7 +41,10 @@ Current composition work is tracked in the narrower module ledgers:
 do not automatically complete the broader parent or P-* gates below. New active composition ledgers are
 [rolling local/global recovery](modules/local-global-rlnc.md),
 [measured proxy client](modules/proxy-measured-client.md) and
-[raw TLS transition](modules/raw-tls-transition.md).
+[raw TLS transition](modules/raw-tls-transition.md). Completed follow-on bundles
+are tracked in [raw packet runtime](modules/raw-runtime.md),
+[QUIC owner cleanup](modules/quic-owner-cleanup.md), and
+[measured proxy native checks](modules/proxy-measured-native.md).
 
 ## Tested native vertical slice
 
@@ -57,6 +60,7 @@ do not automatically complete the broader parent or P-* gates below. New active 
 - [x] [SLICE-11] Qualify genuine standalone QUIC authentication and packet forwarding on TAP/TUN/VXLAN with outer TCP blocked, full/paired-half and impaired links. Evidence: [36-case QUIC audit](../work/native-quic-matrix-audit.json), None/LZ4, ARQ/Cauchy, maintained QUIC AEAD, exact probes/TCP payloads, UDP path failure/restoration, actual MTU 1228 with offloads disabled and owned cleanup.
 - [x] [SLICE-12] Qualify explicit fixed-credit native TUN TCP proxy in clean full and paired-half modes, with independent IPv4/IPv6 TCP legs, transparent bypass, exact bytes/FIN/native fences and original TLS lane closure. Evidence: [two-case independent audit](../work/native-proxy-clean-audit.json), [stable binary build](../work/native-proxy-full-build/receipt.json); adaptive window growth, impairment and broad platform support remain separate.
 - [x] [SLICE-13] Qualify packed records over authenticated custom UDP in six clean Linux TAP/TUN/VXLAN full/half cases with exact payloads, bidirectional complete-packet aggregation, MTU/capture checks and owned cleanup. Evidence: [parallel six-case result](../work/packed-clean-matrix14b/receipt.json), [independent audits](modules/packed-native.md#clean-parallel-native-qualification); other carriers, impairment and complete Python packed parity remain separate.
+- [x] [SLICE-14] Qualify explicitly selected measured-proxy TUN connectivity in clean full/half modes with exact IPv4/IPv6 bytes, transparent bypass, actual measurement traffic, native fences and owned cleanup. Evidence: [full audit](../work/native-proxy-measured-full15-audit3.json), [half audit](../work/native-proxy-measured-half15-audit3.json), [scope and failed pressure gates](modules/proxy-measured-native.md). The exact observation build has separately recorded aggregate failures; these clean cases do not qualify adaptive windows or fairness.
 - [ ] [SLICE-04] Integrate active credit/QoS, distributed reload, recovery and VXLAN with authenticated native forwarding.
 
 ## Existing foundation versus outstanding M0 work

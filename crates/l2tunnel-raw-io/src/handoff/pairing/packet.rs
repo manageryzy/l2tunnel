@@ -121,8 +121,8 @@ impl PacketPolicy {
         ] {
             b.extend_from_slice(&n.to_be_bytes());
         }
-        for _ in 0..5 {
-            b.extend_from_slice(&1u16.to_be_bytes());
+        for version in [1u16, 1, 2, 1, 1] {
+            b.extend_from_slice(&version.to_be_bytes());
         }
         for n in [48u16, 128, 104, 280, 104, 8] {
             b.extend_from_slice(&n.to_be_bytes());
@@ -141,6 +141,12 @@ impl PacketPolicy {
             } else {
                 0
             }
+    }
+    /// Maximum complete upper recovery/control record in this fixed packet policy.
+    /// Includes no native-delivery or MUX admission authority.
+    pub fn max_record_bytes(self) -> Result<usize, Error> {
+        self.validate()?;
+        Ok(self.body_limit())
     }
     fn body_limit(self) -> usize {
         usize::from(self.mtu) - self.overhead() - wire::HEADER

@@ -1,7 +1,13 @@
 # Measured native TUN acceptance harness
 
 Status: the dry-run-first harness and its unprivileged validators/endpoints are
-implemented. No privileged measured TUN case has been run by this change. A
+implemented. Actual clean full and paired-half cases passed on the immutable
+[snapshot15 observation build](../../work/native-build15-observation/receipt.json),
+with independent [full](../../work/native-proxy-measured-full15-audit3.json) and
+[paired-half](../../work/native-proxy-measured-half15-audit3.json) receipt/hash and
+capture-evidence recomputation. These clean outcomes do not qualify pressure or
+performance. Snapshot15 aggregate validation still has separately recorded test
+failures; the observation build is not an aggregate-passing release. A
 passing harness test, target change or compile is not native advertised-window
 qualification. The [focused receipt](../../work/proxy-measured-native-harness/validation.json)
 and [client checkpoint](../../work/proxy-measured-client/validation.json) have
@@ -45,7 +51,12 @@ corrected, with a regression for `src/target/tests.rs`.
 All TUN, address, qdisc, ECN, offload and IPv6-underlay adjustments occur inside
 new journal-owned namespaces. No host route, qdisc, bridge, sysctl or existing
 namespace is adopted. Cleanup stops only retained child objects and uses the
-same ownership journal. Failed evidence and cleanup failures remain visible.
+same ownership journal. After all retained children exit, remove a remaining
+Unix socket only through its unchanged private mode-0700 directory's retained
+device/inode identity and a non-following directory descriptor. A live child,
+substituted parent, regular file or symlink is rejected. Forced daemon termination
+can leave this owned socket even after namespace cleanup; removing it preserves
+the original case failure. Failed evidence and cleanup failures remain visible.
 Private key material stays in a temporary mode-0700 directory; copied artifacts
 and receipts contain hashes and public paths, never private keys.
 
@@ -133,6 +144,29 @@ DSCP weights and no weight editor. This is a finite two-flow demand/completion
 gate. Weighted fairness, 4/16/64-flow tests, impairments, performance comparisons
 and native RTT/cwnd measurements remain separate tasks.
 
+## Snapshot15 pressure diagnosis
+
+Both original pressure cases remain failed and preserved: [full receipt](../../work/native-proxy-measured-full-pressure15/receipt.json)
+and [paired-half receipt](../../work/native-proxy-measured-half-pressure15/receipt.json).
+Exact application payload stages completed. All eight maintained native legs
+reached a zero window during their corresponding downstream reader pauses; the
+first zeros preceded reader release by approximately 1.916–1.940 seconds.
+The exact frozen first-reopen audit passes five legs and rejects full A/IPv6,
+full B/IPv6 and paired-half A/IPv6. Those three advertised a small positive
+residual window before release and therefore do not prove the required causal
+first reopening. Preserve this stricter acceptance gate and original workload;
+these observations are not a pressure qualification.
+
+Both peers had qualified ACK/service observations, two-flow demand and candidate
+growth, but no receiver/carrier pressure status samples. Source readback and a
+failing-before/passing-after real-stack regression identify missing observation
+of native unread bytes blocked at exhausted authenticated relay credit. The
+runtime now reports this current local receive-consumption stall even when all
+packet-device writes succeed, and clears it after actual reader progress. This
+is a ring/credit fact, separate from captured TCP window fields. See the
+[diagnosis and focused validation](../../work/measured-pressure16/REPORT.md).
+No pressure rerun or passing native pressure result is implied by this fix.
+
 ## Bounds and evidence
 
 Retain the fixed harness's original 300-second case, 30-second transfer,
@@ -155,6 +189,6 @@ pressure endpoints.
 - [x] [MOD-PROXY-MEASURED-NATIVE-01] Implement concrete dry-run-first clean/pressure plans, strict measured CLI/policy, immutable copied execution and same journal-owned setup/cleanup. Evidence: [harness](../../tools/proxy_measured_native_smoke.py) and the focused receipt; no privileged outcome is implied.
 - [x] [MOD-PROXY-MEASURED-NATIVE-02] Implement strict aggregate/measurement, exact pressure probe, first-reopen causality, timestamp/scaling and safe ownership validators; pass finite unprivileged tests and independent review. Evidence: [focused tests](../../tools/test_proxy_measured_native_smoke.py) and [receipt](../../work/proxy-measured-native-harness/validation.json). Real TUN captures remain a separate gate.
 - [ ] [MOD-PROXY-MEASURED-NATIVE-03] Freeze a source-stable qualified binary/helpers and pass one actual clean full-duplex case with exact IPv4/IPv6 split/bypass/FIN/native fences/TLS closure and cleanup.
-- [ ] [MOD-PROXY-MEASURED-NATIVE-04] Pass the same actual clean paired-half case, preserving both original authenticated lanes and reverse service.
+- [x] [MOD-PROXY-MEASURED-NATIVE-04] Pass the same actual clean paired-half case, preserving both original authenticated lanes and reverse service. Evidence: [original paired-half receipt](../../work/native-proxy-measured-half15/receipt.json) and [independent audit3](../../work/native-proxy-measured-half15-audit3.json), on the same immutable binary/helpers.
 - [ ] [MOD-PROXY-MEASURED-NATIVE-05] After clean cases pass, independently audit full/half pressure captures, mapped first reopen/new ACK, measured few-flow growth, two-flow demand/completion and all final fences.
 - [ ] [MOD-PROXY-MEASURED-NATIVE-06] Design and qualify separate weighted/many-flow fairness and impaired comparisons against unchanged fixed-credit baselines. Do not infer a speedup or broad native capability from this finite harness.

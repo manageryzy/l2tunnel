@@ -432,6 +432,18 @@ mod close_tests {
     use super::*;
     use std::time::Duration;
     #[test]
+    fn late_final_activity_cannot_fit_default_quiet_inside_original_five_seconds() {
+        let interval = Duration::from_secs(3) + Duration::from_millis(5 + 2 * 2);
+        let mut quiet = CloseQuiet::new(interval);
+        assert!(!quiet.poll(Duration::ZERO, true));
+        // A genuine late retry is serviceable but cannot renew the close owner.
+        // Its required quiet endpoint is 5.209s, beyond the original 5s bound.
+        quiet.activity();
+        assert!(!quiet.poll(Duration::from_millis(2_200), true));
+        assert!(!quiet.poll(Duration::from_secs(5), true));
+        assert!(quiet.poll(Duration::from_millis(5_209), true));
+    }
+    #[test]
     fn repeated_final_retries_reset_quiet_but_never_the_absolute_close_bound() {
         let mut quiet = CloseQuiet::new(Duration::from_millis(50));
         let absolute = Duration::from_millis(120);

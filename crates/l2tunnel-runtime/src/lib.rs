@@ -15,6 +15,8 @@ pub mod packed;
 pub mod proxy;
 /// Native packet forwarding over genuine standalone QUIC.
 pub mod quic;
+/// Explicit original-owner raw packet phase with common MUX and maintained recovery.
+pub mod raw_packet;
 /// Fixed-mode authenticated UDP with selective repeat and native packet framing.
 pub mod udp;
 #[cfg(test)]

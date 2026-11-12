@@ -594,6 +594,7 @@ dependencies = [
  "l2tunnel-pipeline",
  "l2tunnel-qos",
  "l2tunnel-quic",
+ "l2tunnel-raw-io",
  "l2tunnel-raw-tcp",
  "l2tunnel-recovery",
  "l2tunnel-reliable",

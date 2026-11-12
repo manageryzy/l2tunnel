@@ -6,9 +6,11 @@ TLS/member pairing, all-lane Prepare/Prepared/Armed/Seal, original-driver consum
 protected Hello/Commit and full/half record delivery are implemented in
 `l2tunnel_raw_io::handoff::pairing::packet`. See the
 [checkpoint 15 evidence](../../work/raw-transition-checkpoint15/REPORT.md).
-No runtime/CLI/native packet-phase capability, upper recovery integration, clean
-protected close, general-network congestion safety or middlebox qualification is
-claimed. Retained TCP/TLS remains the default. Earlier saved native results are
+The [explicit caller-PacketIo runtime](raw-runtime.md) now composes the existing
+MUX, codecs and maintained selective-repeat/Cauchy recovery with this carrier;
+its finite evidence is separate from checkpoint 15. No CLI/native packet-phase
+capability, clean protected close, general-network congestion safety or middlebox
+qualification is claimed. Retained TCP/TLS remains the default. Earlier saved native results are
 unchanged. The remaining sections preserve the design contract; the concrete
 startup-only failure/window decisions below supersede the earlier fallback target.
 
@@ -395,7 +397,8 @@ window inflation, probe bypass or timeout increase is authorized by this design.
 
 The stable tasks below remain open because their full deliverables extend beyond
 the finite checkpoint. Partial implementation/evidence for MOD-RAWPHASE-03 through
-06, 08, 09 and 14 is recorded in the checkpoint 15 report; the remaining edge,
+06, 08, 09 and 14 is recorded in the checkpoint 15 report; MOD-RAWPHASE-07 also
+has finite caller-PacketIo composition evidence in [checkpoint 16](../../work/raw-runtime16/REPORT.md); the remaining edge,
 close, recovery, runtime, native and path gates are not implied by those tests.
 
 - [ ] [MOD-RAWPHASE-01] Review the custom gap-retirement semantics, retained default, exact configuration/profile digest and middlebox/HTTPS limitations.
