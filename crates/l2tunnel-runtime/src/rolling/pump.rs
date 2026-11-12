@@ -58,7 +58,7 @@ where
     let mut tasks = JoinSet::new();
     for (index, (part, changes, output)) in setup.into_iter().enumerate() {
         let (reader, writer) = tokio::io::split(part.control);
-        tasks.spawn(udp::read_control_bound_timed(
+        tasks.spawn(crate::control::read_control_bound_timed(
             reader,
             index,
             control_tx.clone(),
