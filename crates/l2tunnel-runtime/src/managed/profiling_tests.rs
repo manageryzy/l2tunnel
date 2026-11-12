@@ -129,6 +129,7 @@ struct Device {
     outgoing: Arc<Mutex<VecDeque<Vec<u8>>>>,
     received: Arc<Mutex<Vec<Vec<u8>>>>,
     blocked: Arc<AtomicBool>,
+    blocked_write_observed: Arc<AtomicBool>,
 }
 impl PacketDevice for Device {
     type Error = io::Error;
@@ -150,6 +151,7 @@ impl PacketDevice for Device {
     }
     fn transmit(&mut self, packet: &[u8]) -> io::Result<()> {
         if self.blocked.load(Ordering::Relaxed) {
+            self.blocked_write_observed.store(true, Ordering::Release);
             return Err(io::ErrorKind::WouldBlock.into());
         }
         self.received
@@ -257,10 +259,24 @@ async fn actual_case(duplex: Duplex, enabled: bool) -> TestResult {
         rb,
         enabled.then_some(pb),
     ));
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(db.received.lock().map_err(|_| invalid("lock"))?.is_empty());
-    db.blocked.store(false, Ordering::Relaxed);
+    // Witness actual native backpressure and sender credit exhaustion instead of
+    // assuming the scheduler reaches either condition during a fixed sleep.
+    // One original bound covers both the blocked phase and exact-byte delivery.
     let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let credit_blocked = !enabled
+                || ha
+                    .status()
+                    .is_some_and(|snapshot| snapshot.counters["data_admission_credit_blocked"] > 0);
+            if db.blocked_write_observed.load(Ordering::Acquire) && credit_blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !db.received.lock().map_err(|_| invalid("lock"))?.is_empty() {
+            return Err(invalid("blocked native device accepted a packet"));
+        }
+        db.blocked.store(false, Ordering::Relaxed);
         loop {
             if da.received.lock().map_err(|_| invalid("lock"))?.len() == 3
                 && db.received.lock().map_err(|_| invalid("lock"))?.len() == 5

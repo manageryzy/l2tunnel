@@ -802,7 +802,7 @@ async fn actual_byte_flight_exceeds64_with_local2_and_real_native_pressure() -> 
                 timeout(Duration::from_secs(3), async {
                     loop {
                         let ready = [&a_status, &b_status].iter().all(|status| {
-                            status.borrow().flight.iter().flatten().any(|s| s.outstanding.records == 128 && s.flushed_total.records == 128)
+                            status.borrow().flight.iter().flatten().any(|s| s.outstanding.records > 64 && s.flushed_total.records > 64 && s.delivered.records == 0)
                         });
                         if ready && a.change(|n| n.writes > 0)? && b.change(|n| n.writes > 0)? { return Ok::<_, io::Error>(()); }
                         tokio::select! {
@@ -817,10 +817,16 @@ async fn actual_byte_flight_exceeds64_with_local2_and_real_native_pressure() -> 
                         .flight
                         .iter()
                         .flatten()
-                        .find(|s| s.outstanding.records == 128)
-                        .ok_or("missing actual debt")?;
-                    assert_eq!(flight.outstanding.bytes, actual_bytes);
-                    assert_eq!(flight.flushed_total.bytes, actual_bytes);
+                        .find(|s| s.outstanding.records > 64 && s.flushed_total.records > 64)
+                        .ok_or("missing actual debt and completed first sends")?;
+                    // Prove a larger link flight under actual native pressure,
+                    // without making all 128 first sends a throughput deadline.
+                    assert_eq!(flight.outstanding, flight.admitted);
+                    assert!(flight.admitted.records <= input.len() as u64);
+                    assert!(flight.admitted.bytes <= actual_bytes);
+                    assert!(flight.flushed_total.records <= flight.admitted.records);
+                    assert!(flight.flushed_total.bytes <= flight.admitted.bytes);
+                    assert_eq!(flight.delivered.records, 0);
                     assert_eq!(flight.delivered.bytes, 0);
                     assert!(flight.retained_records <= native_delivery.forward.max_records);
                 }
@@ -838,12 +844,38 @@ async fn actual_byte_flight_exceeds64_with_local2_and_real_native_pressure() -> 
                         }
                     }
                 }).await.map_err(|error| format!("{duplex:?}/{layer:?}/quic={use_quic} native receipt: {error}; a={:?}; b={:?}", *a_status.borrow(), *b_status.borrow()))??;
+                for status in [&a_status, &b_status] {
+                    let snapshot = *status.borrow();
+                    let flights: Vec<_> = snapshot.flight.iter().flatten().collect();
+                    assert!(!flights.is_empty(), "missing final sending-lane accounting");
+                    for flight in flights {
+                        for credit in [
+                            flight.admitted,
+                            flight.delivered,
+                            flight.delivered_prefix,
+                            flight.flushed,
+                            flight.flushed_total,
+                        ] {
+                            assert_eq!(credit.records, input.len() as u64);
+                            assert_eq!(credit.bytes, actual_bytes);
+                        }
+                        assert_eq!(flight.outstanding.records, 0);
+                        assert_eq!(flight.outstanding.bytes, 0);
+                        assert_eq!(flight.retained_records, 0);
+                        assert!(flight.next_flush_deadline.is_none());
+                    }
+                }
                 let transport =
                     udp_transport(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?;
                 let config = Config::for_udp(rt, transport, 4, native_delivery)?;
                 let classifier = l2tunnel_pipeline::Pipeline::new(config.pipeline)?;
                 for device in [&a, &b] {
                     let delivered = device.change(|n| n.delivered.clone())?;
+                    assert_eq!(delivered.len(), input.len());
+                    assert_eq!(
+                        delivered.iter().map(|p| p.len() as u64).sum::<u64>(),
+                        actual_bytes
+                    );
                     for frame in &input {
                         let key = classifier.classify(frame)?.key;
                         let expected: Vec<_> = input

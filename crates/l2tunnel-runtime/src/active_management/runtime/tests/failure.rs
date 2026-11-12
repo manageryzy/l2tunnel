@@ -692,7 +692,7 @@ async fn actual_tls_lost_commit_or_retire_reply_reconciles_only_after_exact_retr
             let requester = handle.clone();
             let mode = config.supported[1];
             let request = tokio::spawn(async move { requester.switch_policy(mode).await });
-            let uncertain = until(&handle, |s| s.phase == Phase::Uncertain).await?;
+            let uncertain = until(&handle, |s| s.phase == Phase::Uncertain).await.map_err(|error| format!("uncertainty observation: {error}; status={:?}; request_finished={}; local_finished={}; peer_finished={}; suppressed={}", handle.status(), request.is_finished(), local.is_finished(), peer.is_finished(), *observed.borrow()))?;
             assert!(!uncertain.admitting);
             assert!(!request.is_finished());
             assert_eq!(
@@ -705,7 +705,7 @@ async fn actual_tls_lost_commit_or_retire_reply_reconciles_only_after_exact_retr
             );
             assert!(*observed.borrow() > 0);
             dropping.store(false, Ordering::SeqCst);
-            let completed = timeout(Duration::from_secs(2), request).await???;
+            let completed = timeout(Duration::from_secs(2), request).await.map_err(|error| format!("reconciliation request: {error}; status={:?}; local_finished={}; peer_finished={}", handle.status(), local.is_finished(), peer.is_finished()))???;
             assert_eq!(completed.epoch, Epoch(2));
             assert_eq!(completed.mode, mode);
             until(&handle, |s| s.epoch == Epoch(2) && s.admitting).await?;
@@ -729,7 +729,7 @@ async fn actual_tls_exhausted_uncertainty_closes_without_local_success() -> Test
     };
     let (ll, rl) = links(runtime, &config).await?;
     let (handle, control) = channel();
-    let (counter, _) = watch::channel(0);
+    let (counter, observed) = watch::channel(0);
     let peer = tokio::spawn(faulty_peer(
         rl,
         config.clone(),
@@ -742,8 +742,16 @@ async fn actual_tls_exhausted_uncertainty_closes_without_local_success() -> Test
     let requester = handle.clone();
     let mode = config.supported[1];
     let request = tokio::spawn(async move { requester.switch_policy(mode).await });
-    until(&handle, |s| s.phase == Phase::Uncertain).await?;
-    assert!(timeout(Duration::from_secs(2), local).await??.is_err());
+    until(&handle, |s| s.phase == Phase::Uncertain).await.map_err(|error| format!("exhaustion uncertainty observation: {error}; status={:?}; request_finished={}; local_finished={}; peer_finished={}; suppressed={}", handle.status(), request.is_finished(), local.is_finished(), peer.is_finished(), *observed.borrow()))?;
+    assert!(
+        timeout(Duration::from_secs(2), local)
+            .await
+            .map_err(|error| format!(
+                "uncertainty runtime termination: {error}; status={:?}",
+                handle.status()
+            ))??
+            .is_err()
+    );
     assert_eq!(request.await?, Err(ControlError::Closed));
     assert_eq!(handle.status().ok_or("closed")?.epoch, Epoch(1));
     assert!(!handle.status().ok_or("closed")?.admitting);

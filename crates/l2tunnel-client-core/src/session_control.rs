@@ -159,7 +159,7 @@ async fn active_local_action(
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn version_rejection_cannot_submit_a_switch() {
+    async fn version_rejection_cannot_submit_a_switch() -> std::io::Result<()> {
         let (handle, _owner) = l2tunnel_runtime::managed::channel();
         let control = Control::managed(handle);
         let mut invalid = Box::pin(control.clone().request(Request {
@@ -170,10 +170,12 @@ mod tests {
         }));
         let response =
             std::future::poll_fn(|cx| match std::future::Future::poll(invalid.as_mut(), cx) {
-                std::task::Poll::Ready(response) => std::task::Poll::Ready(response),
-                std::task::Poll::Pending => panic!("invalid version submitted a runtime switch"),
+                std::task::Poll::Ready(response) => std::task::Poll::Ready(Ok(response)),
+                std::task::Poll::Pending => std::task::Poll::Ready(Err(std::io::Error::other(
+                    "invalid version submitted a runtime switch",
+                ))),
             })
-            .await;
+            .await?;
         assert!(!response.ok);
         assert_eq!(response.code, "unsupported_version");
         let status = control
@@ -183,6 +185,7 @@ mod tests {
             })
             .await;
         assert!(status.ok);
+        Ok(())
     }
     #[cfg(unix)]
     #[tokio::test]

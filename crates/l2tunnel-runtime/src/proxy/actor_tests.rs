@@ -161,7 +161,9 @@ fn expired_unannounced_id_is_terminal_without_consuming_queued_open() -> io::Res
     a.send_user()?;
     assert_eq!(a.sent_records, 0);
     assert!(!a.announced.contains(&1));
-    a.start = Instant::now() - Duration::from_millis(20);
+    // Advance the existing age; resetting to now-20ms can move observed time
+    // backwards when initial setup was delayed by another test or the scheduler.
+    a.start -= Duration::from_millis(20);
     let failure = a
         .poll_table()
         .err()
@@ -185,7 +187,7 @@ fn expired_staged_ready_is_discarded_before_terminal_replacement_handoff() -> io
     assert!(remote.scheduled.contains(&1));
     assert_eq!(remote.sent_records, 0);
     assert!(remote.table.pending_native(1).is_none());
-    remote.start = Instant::now() - Duration::from_millis(20);
+    remote.start -= Duration::from_millis(20);
     remote.poll_table()?;
     assert_eq!(
         remote.table.pending_record(1).and_then(|p| p.get(..4)),

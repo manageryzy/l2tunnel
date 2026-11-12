@@ -58,6 +58,7 @@ struct Native {
     delivered: Vec<Vec<u8>>,
     admitted: usize,
     blocked: bool,
+    blocked_writes: usize,
 }
 #[derive(Clone)]
 struct Device {
@@ -96,6 +97,7 @@ impl PacketDevice for Device {
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.change(|state| {
             if state.blocked {
+                state.blocked_writes += 1;
                 Err(io::ErrorKind::WouldBlock.into())
             } else {
                 state.delivered.push(bytes.to_vec());
@@ -351,7 +353,20 @@ async fn exercise(
         state.blocked = true;
         state.outgoing.extend(input.iter().cloned());
     })?;
-    sleep(Duration::from_millis(70)).await;
+    // Observe actual receiver pressure before releasing it. A fixed sleep also
+    // succeeds when neither actor has run and therefore tests no backpressure.
+    timeout(Duration::from_secs(8), async {
+        while b.change(|state| state.blocked_writes)? == 0 {
+            tokio::select! {
+                Some(result) = tasks.join_next() => {
+                    return Err(io::Error::other(format!("rolling runtime ended before pressure: {result:?}")));
+                },
+                _ = sleep(Duration::from_millis(2)) => {}
+            }
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await??;
     assert!(b.change(|state| state.delivered.is_empty())?);
     assert!(
         a.change(|state| state.admitted)? <= 6,

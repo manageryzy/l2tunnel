@@ -237,9 +237,16 @@ control parser and writer ownership cases), and the packed selection passes11.
 The shared pure codec/aligned packages pass75 and19 tests respectively. The
 actual authenticated larger-flight test covers UDP and genuine QUIC, full/paired
 half modes, TAP/TUN, both directions and real `PacketDevice::transmit` WouldBlock.
-With local queues of two, aligned holds128 records/98560 original native bytes,
-then verifies exact device delivery, per-flow FIFO and all delivery/send metadata
-released. These are actual loopback carriers with injected packet devices, not
+With local queues of two and the unchanged 128-record/98560-byte workload, the
+pressure phase requires more than 64 actually completed native first sends and
+more than 64 outstanding records in both directions, with no native delivery.
+After release it requires all 128 records/98560 bytes admitted, delivered and
+fully sent, exact device bytes/per-flow FIFO, and zero debt/send metadata. The
+original phase and protocol deadlines remain unchanged. The earlier
+[wave27b failure](../../work/implementation-wave27b/local-check.log) reached
+healthy larger flight but failed an unrelated all 128 first sends within 3 seconds condition;
+[the correction evidence](../../work/aligned-pressure27c/) retains that distinction.
+These are actual loopback carriers with injected packet devices, not
 kernel TAP/TUN throughput or advertised-window qualification.
 
 The old scalar mapping's exact1500/40-byte counterexample and original first-send
