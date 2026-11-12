@@ -87,6 +87,8 @@ async fn local_action(
         openvpn_drain: None,
         raw_packet: None,
         rolling: None,
+        #[cfg(unix)]
+        swift: None,
     });
     Response {
         version: VERSION,
@@ -146,6 +148,8 @@ async fn active_local_action(
         openvpn_drain: None,
         raw_packet: None,
         rolling: None,
+        #[cfg(unix)]
+        swift: None,
     });
     Response {
         version: VERSION,

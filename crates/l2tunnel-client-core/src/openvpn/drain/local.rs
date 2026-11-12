@@ -40,6 +40,8 @@ pub(super) fn action(
                 },
                 raw_packet: None,
                 rolling: None,
+                #[cfg(unix)]
+                swift: None,
                 active: None,
                 proxy: None,
                 openvpn_drain: Some(state),

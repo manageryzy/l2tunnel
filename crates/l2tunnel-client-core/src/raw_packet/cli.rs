@@ -147,6 +147,8 @@ pub(crate) fn response(
             openvpn_drain: None,
             raw_packet: Some(raw),
             rolling: None,
+            #[cfg(unix)]
+            swift: None,
         }),
     }
 }

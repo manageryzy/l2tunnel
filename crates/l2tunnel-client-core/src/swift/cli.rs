@@ -9,7 +9,7 @@ pub(super) const OPTIONS: &[&str] = &[
     "--swift-repair-permille",
     "--swift-report-ms",
 ];
-pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. No compression, VXLAN, lanes, control socket or hot switching.";
+pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. Optional --control-socket supports status only. No compression, VXLAN, lanes or hot switching.";
 pub(super) fn selection(
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
@@ -39,6 +39,7 @@ pub(super) fn selection(
         "--duplex",
         "--max-packet",
         "--compression",
+        "--control-socket",
     ];
     if options.get("--carrier").map(String::as_str) != Some("udp")
         || options
@@ -116,6 +117,11 @@ pub(super) async fn execute(
     settings: client::Settings,
 ) -> io::Result<()> {
     let name = required(options, "--device")?;
+    // Bound before authentication so an unusable path fails early.
+    let api = options
+        .get("--control-socket")
+        .map(crate::local::Server::bind)
+        .transpose()?;
     let session = match command {
         "connect" => {
             let address = required(options, "--remote")?
@@ -160,11 +166,76 @@ pub(super) async fn execute(
             "receive_buffer_bytes": session.receive_buffer()?,
         })
     );
-    session
-        .run(device, |snapshot| {
-            println!("{}", line("swift_report", snapshot))
-        })
-        .await
+    let session = if api.is_some() {
+        session.observe_every(Duration::from_secs(1))
+    } else {
+        session
+    };
+    let status = std::sync::Arc::new(std::sync::Mutex::new(client::Status::new(
+        effective,
+        &client::Snapshot::default(),
+    )));
+    let observed = status.clone();
+    let mut printed: Option<Duration> = None;
+    let run = session.run(device, |snapshot| {
+        // Counters are observed at the shorter of the print and status
+        // intervals; lines are printed only as often as the user asked.
+        let now = Duration::from_micros(snapshot.elapsed_micros);
+        if let Some(interval) = settings.report
+            && printed
+                .is_none_or(|at| now.saturating_sub(at) + Duration::from_millis(50) >= interval)
+        {
+            printed = Some(now);
+            println!("{}", line("swift_report", snapshot));
+        }
+        if let Ok(mut slot) = observed.lock() {
+            *slot = client::Status::new(effective, snapshot);
+        }
+    });
+    let result = match api {
+        Some(api) => {
+            let service = api.serve(move |request| std::future::ready(response(&status, request)));
+            tokio::pin!(service);
+            tokio::select! {
+                result = run => result,
+                result = &mut service => Err(result
+                    .err()
+                    .unwrap_or_else(|| io::Error::other("swift status service stopped"))),
+            }
+        }
+        None => run.await,
+    };
+    println!(
+        "{}",
+        serde_json::json!({"event": "swift_terminal", "ok": result.is_ok()})
+    );
+    result
+}
+/// Answer one local request. Only `status` is supported; the profile has no
+/// negotiated runtime changes.
+pub(crate) fn response(
+    status: &std::sync::Mutex<client::Status>,
+    request: crate::local::Request,
+) -> crate::local::Response {
+    use crate::local::{self, Action, Response, Snapshot};
+    let ok = matches!(request.action, Action::Status {});
+    let state = status.lock().map(|value| value.clone()).ok();
+    Response {
+        version: local::VERSION,
+        ok: ok && state.is_some(),
+        code: if ok { "ok" } else { "unsupported" }.into(),
+        state: state.map(|swift| Snapshot {
+            epoch: 0,
+            phase: "forwarding".into(),
+            compression: local::Compression::Off,
+            active: None,
+            proxy: None,
+            openvpn_drain: None,
+            raw_packet: None,
+            rolling: None,
+            swift: Some(swift),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +273,6 @@ mod tests {
             ("--compression", "lz4"),
             ("--fec", "cauchy"),
             ("--traffic", "active"),
-            ("--control-socket", "/unused/private.sock"),
             ("--vni", "7"),
             ("--udp-cover", "quic-like"),
             ("--swift-forward-kbit", "1"),
@@ -238,6 +308,52 @@ mod tests {
             other.remove(*key);
         }
         assert_eq!(selection(&other, config)?, None);
+        Ok(())
+    }
+    #[test]
+    fn status_reports_counters_and_other_commands_are_unsupported() -> io::Result<()> {
+        use crate::local::{Action, Request, VERSION};
+        let mut valid = options();
+        valid.insert("--control-socket".into(), "/unused/private.sock".into());
+        let config = configuration(&valid)?;
+        let settings = selection(&valid, config)?.ok_or_else(|| input("not selected"))?;
+        let runtime = settings.runtime(config, true)?;
+        let mut snapshot = client::Snapshot {
+            native_written: 7,
+            ..client::Snapshot::default()
+        };
+        snapshot.sender.sources = 9;
+        snapshot.sender.repairs = 1;
+        snapshot.sender.tail_repairs = 2;
+        let status = std::sync::Mutex::new(client::Status::new(runtime, &snapshot));
+        let ask = |action| {
+            response(
+                &status,
+                Request {
+                    version: VERSION,
+                    action,
+                },
+            )
+        };
+        let reply = ask(Action::Status {});
+        assert!(reply.ok);
+        let state = reply.state.ok_or_else(|| input("no state"))?;
+        assert_eq!(state.phase, "forwarding");
+        let swift = state.swift.ok_or_else(|| input("no swift state"))?;
+        assert_eq!(
+            (swift.native_written, swift.sources, swift.repairs),
+            (7, 9, 3)
+        );
+        assert_eq!(
+            (swift.channels, swift.send_bytes_per_second),
+            (16, 12_500_000)
+        );
+        let text = serde_json::to_string(&swift).map_err(io::Error::other)?;
+        let parsed: client::Status = serde_json::from_str(&text).map_err(io::Error::other)?;
+        assert_eq!(parsed, swift);
+        let refused = ask(Action::DrainProxy {});
+        assert!(!refused.ok);
+        assert_eq!(refused.code, "unsupported");
         Ok(())
     }
     #[test]

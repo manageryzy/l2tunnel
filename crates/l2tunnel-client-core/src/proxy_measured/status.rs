@@ -303,6 +303,8 @@ mod tests {
                 openvpn_drain: None,
                 raw_packet: None,
                 rolling: None,
+                #[cfg(unix)]
+                swift: None,
                 proxy: Some(crate::local::ProxySnapshot {
                     digest: "ff".repeat(32),
                     drain_accepted: true,

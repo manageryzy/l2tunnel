@@ -67,6 +67,10 @@ pub struct Snapshot {
     /// Present only for an explicitly authenticated rolling session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling: Option<crate::rolling::Snapshot>,
+    /// Present only for an explicitly authenticated swift session.
+    #[cfg(unix)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swift: Option<crate::swift::Status>,
 }
 /// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

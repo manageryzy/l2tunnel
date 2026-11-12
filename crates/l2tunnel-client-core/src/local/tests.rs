@@ -37,6 +37,8 @@ fn response() -> Response {
             openvpn_drain: None,
             raw_packet: None,
             rolling: None,
+            #[cfg(unix)]
+            swift: None,
         }),
     }
 }

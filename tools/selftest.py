@@ -43,14 +43,17 @@ PATHS = {
     'loss1': (35, 1),
     'impaired': (35, 15),
 }
-# Post-warm-up TCP goodput of `simulator/studies/compact_multiflow.py`'s task
-# (16 flows, compact selective-repeat ARQ, `tcp_delta` header profile, 100/10
-# Mbit/s, 70 ms RTT, 15% loss each way) with `authentication_bytes=21`, which
-# brings the simulator's 36-byte outer header to this tunnel's 57 bytes (IPv4,
-# UDP, packet number, AEAD tag, source header). Mean of three replications of
-# 30 s with 10 s warm-up, keyed by the inner TCP minimum RTO in milliseconds.
-# Receipt: work/swift-simulator-reference38/.
-SIMULATOR_REFERENCE = {1000: 80.72, 200: 79.04}
+# Post-warm-up TCP goodput in Mbit/s of `simulator/studies/compact_multiflow.py`'s
+# task (16 flows, compact selective-repeat ARQ, `tcp_delta` header profile,
+# 100/10 Mbit/s) with `authentication_bytes=21`, which brings the simulator's
+# 36-byte outer header to this tunnel's 57 bytes (IPv4, UDP, packet number,
+# AEAD tag, source header). Mean of three replications of 30 s with 10 s
+# warm-up, keyed by path and inner TCP minimum RTO in milliseconds. Receipts:
+# work/swift-simulator-reference38/ (impaired) and -reference40/ (the rest).
+SIMULATOR_REFERENCE = {
+    ('impaired', 1000): 80.72, ('impaired', 200): 79.04,
+    ('loss1', 1000): 94.55, ('delay', 1000): 94.61, ('clean', 1000): 94.58,
+}
 BLOCK = hashlib.shake_256(b'l2tunnel selftest payload').digest(1 << 16)
 
 
@@ -176,7 +179,8 @@ def endpoint_command(args: argparse.Namespace, side: str, work: Path) -> list[st
             '--swift-channels', str(args.swift_channels),
             '--swift-window', str(args.swift_window),
             '--swift-repair-permille', str(args.swift_repair_permille),
-            '--swift-report-ms', '1000'] + args.extra
+            '--swift-report-ms', '1000',
+            '--control-socket', str(work / f'control-{side}.sock')] + args.extra
     command += ['--carrier', 'udp', '--path-mtu', '1500', '--udp-cover', 'quic-like',
                 '--udp-protection', args.protection,
                 '--udp-bind', f'{local}:24440', '--udp-peer', f'{peer}:24440']
@@ -277,22 +281,83 @@ def send(address: str, port: int, flows: int, seconds: float) -> None:
         thread.join(seconds + 60)
 
 
-def reference(goodput_mbit: float, inner_rto_min_ms: int, tolerance: float,
+def reference(goodput_mbit: float, path: str, inner_rto_min_ms: int, tolerance: float,
               override: float | None = None) -> dict:
     """Compare measured forward goodput with the simulator at equal overhead.
 
     The kernel's own minimum RTO (selected with 0) is 200 ms.
     """
     key = inner_rto_min_ms or 200
-    expected = override if override is not None else SIMULATOR_REFERENCE.get(key)
+    expected = override if override is not None else SIMULATOR_REFERENCE.get((path, key))
     if expected is None:
-        return {'available': False, 'reason': f'no simulator run for a {key} ms minimum RTO'}
+        return {'available': False,
+                'reason': f'no simulator run for path {path} with a {key} ms minimum RTO'}
     floor = expected * (1 - tolerance)
     return {'available': True, 'simulator_goodput_mbit': expected,
             'simulator_inner_rto_min_ms': key, 'tolerance': tolerance,
             'required_goodput_mbit': round(floor, 3), 'observed_goodput_mbit': goodput_mbit,
             'observed_over_simulator': round(goodput_mbit / expected, 4),
             'meets_reference': goodput_mbit >= floor}
+
+
+def udp_echo(port: int, seconds: float) -> None:
+    """Answer every datagram with its SHA-256 until the deadline."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', port))
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.05, deadline - time.monotonic()))
+        try:
+            data, peer = sock.recvfrom(65535)
+        except socket.timeout:
+            break
+        sock.sendto(hashlib.sha256(data).digest(), peer)
+
+
+def udp_probe(address: str, port: int) -> None:
+    """Send datagrams from tiny to the largest unfragmented size; print how
+    many came back with the right digest."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.0)
+    good, sizes = 0, (1, 18, 64, 512, 1200, 1472)
+    for size in sizes:
+        data = BLOCK[:size]
+        for _ in range(8):   # the application retries; the tunnel itself is reliable
+            sock.sendto(data, (address, port))
+            try:
+                if sock.recvfrom(64)[0] == hashlib.sha256(data).digest():
+                    good += 1
+                    break
+            except socket.timeout:
+                continue
+    print(json.dumps({'sizes': len(sizes), 'answered': good}))
+
+
+def functional(script: str) -> dict:
+    """Layer-2 behaviour visible to the hosts, in both directions."""
+    checks = {}
+    for name, source, target in (('a_to_b', 'ha', HOST_B), ('b_to_a', 'hb', HOST_A)):
+        # 1472 bytes of ICMP payload with DF set is exactly one 1514-byte frame.
+        out = ns(source, 'ping', '-c', '5', '-i', '0.2', '-W', '3', '-M', 'do', '-s', '1472',
+                 target, check=False)
+        received = [line for line in out.splitlines() if 'packets transmitted' in line]
+        checks[f'full_mtu_ping_{name}'] = ' 0% packet loss' in (received[0] if received else '')
+        neighbours = json.loads(ns(source, 'ip', '-j', 'neigh', 'show', target) or '[]')
+        checks[f'arp_resolved_{name}'] = any(entry.get('lladdr') for entry in neighbours)
+    for name, source, sink, address in (('a_to_b', 'ha', 'hb', HOST_B), ('b_to_a', 'hb', 'ha', HOST_A)):
+        echo = subprocess.Popen(['ip', 'netns', 'exec', sink, sys.executable, script,
+                                 '--worker', 'udp-echo', '24600', '20'])
+        time.sleep(0.3)
+        out = ns(source, sys.executable, script, '--worker', 'udp-probe', address, '24600',
+                 check=False)
+        echo.terminate()
+        echo.wait(5)
+        try:
+            state = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            state = {'sizes': 6, 'answered': 0}
+        checks[f'udp_all_sizes_{name}'] = state['answered'] == state['sizes']
+    return checks
 
 
 def rate_mbit(samples: list, start: float, end: float) -> float:
@@ -325,10 +390,12 @@ def run(args: argparse.Namespace) -> int:
         ping = ns('ha', 'ping', '-c', '10', '-i', '0.2', '-W', '3', HOST_B, check=False)
         ping_summary = [line for line in ping.splitlines() if 'packet loss' in line or 'rtt' in line]
 
+        script = str(Path(__file__).resolve())
+        checks = functional(script)
         result = {'profile': args.profile, 'path': args.path, 'duplex': args.duplex,
                   'flows': args.flows, 'host_mtu': args.host_mtu,
-                  'inner_rto_min_ms': args.inner_rto_min_ms, 'ping': ping_summary}
-        script = str(Path(__file__).resolve())
+                  'inner_rto_min_ms': args.inner_rto_min_ms, 'ping': ping_summary,
+                  'functional': checks}
         directions = [('forward', 'ha', 'hb', HOST_B, 'ea')]
         if args.reverse:
             directions.append(('reverse', 'hb', 'ha', HOST_A, 'eb'))
@@ -355,7 +422,23 @@ def run(args: argparse.Namespace) -> int:
             if process.poll() is not None:
                 raise RuntimeError(f'endpoint {side} exited:\n' + logs[side].read_text()[-2000:])
 
-        passed = True
+        passed = all(checks.values())
+        if args.profile == 'swift':
+            # The same status command a user would run against a live endpoint.
+            result['status'] = {}
+            for side, space in (('a', 'ea'), ('b', 'eb')):
+                out = ns(space, args.binary, 'status', '--control-socket',
+                         str(work / f'control-{side}.sock'), check=False)
+                try:
+                    reply = json.loads(out.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    reply = {'ok': False, 'raw': out[-200:]}
+                swift = (reply.get('state') or {}).get('swift') or {}
+                result['status'][side] = {'ok': bool(reply.get('ok')),
+                                          'phase': (reply.get('state') or {}).get('phase'),
+                                          'native_written': swift.get('native_written')}
+                if not reply.get('ok') or not swift.get('native_written'):
+                    passed = False
         for name, _, _, _, endpoint in directions:
             state = json.loads((work / f'{name}.json').read_text())
             goodput = rate_mbit(state['samples'], args.warmup, total)
@@ -382,10 +465,10 @@ def run(args: argparse.Namespace) -> int:
                     result['swift'][side] = reports[-1]
         result['tc'] = {space: ns(space, 'tc', '-s', 'qdisc', 'show', 'dev', 'wan0').strip()
                         for space in ('ea', 'eb')}
-        comparable = (args.profile == 'swift' and args.path == 'impaired' and args.flows == 16
+        comparable = (args.profile == 'swift' and args.flows == 16
                       and (args.forward_mbit, args.reverse_mbit) == (100, 10) and not args.reverse)
         if comparable or args.reference_mbit is not None:
-            result['reference'] = reference(result['forward']['goodput_mbit'],
+            result['reference'] = reference(result['forward']['goodput_mbit'], args.path,
                                             args.inner_rto_min_ms, args.tolerance,
                                             args.reference_mbit)
         else:
@@ -415,7 +498,11 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == '--worker':
-        if sys.argv[2] == 'receive':
+        if sys.argv[2] == 'udp-echo':
+            udp_echo(int(sys.argv[3]), float(sys.argv[4]))
+        elif sys.argv[2] == 'udp-probe':
+            udp_probe(sys.argv[3], int(sys.argv[4]))
+        elif sys.argv[2] == 'receive':
             receive(int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]), sys.argv[6])
         else:
             send(sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]))

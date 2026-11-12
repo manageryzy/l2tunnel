@@ -43,6 +43,8 @@ fn legacy_request_and_optional_free_response_bytes_remain_literal() -> Result<()
             openvpn_drain: None,
             raw_packet: None,
             rolling: None,
+            #[cfg(unix)]
+            swift: None,
         }),
     };
     let expected = r#"{"version":1,"ok":true,"code":"ok","state":{"epoch":2,"phase":"idle","compression":"lz4"}}"#;

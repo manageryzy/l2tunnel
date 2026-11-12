@@ -11,11 +11,13 @@ percentage. All 47 complete Python mode gates remain open.
 The explicit [swift profile](modules/swift.md) is the first client path that
 reaches the reference workload. In `tools/selftest.py` (Linux TAP, unprivileged
 namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
-RTT, 15% loss each way) it measured 79.21, 79.92 and 79.57 Mbit/s forward
+RTT, 15% loss each way) it measured 79.74, 80.50 and 79.91 Mbit/s forward
 goodput against 80.72 Mbit/s from the Python simulator rerun at the tunnel's
-real per-datagram overhead, and 80.56 against 79.04 with the kernel's default
-minimum RTO. [Receipts](../work/swift-selftest39/impaired-1.json) and the
-[simulator runs](../work/swift-simulator-reference38/output.log) are saved.
+real per-datagram overhead, and 79.23 against 79.04 with the kernel's default
+minimum RTO. The 1% loss, delay-only and clean paths measured 93.41, 93.69 and
+92.80 against 94.55, 94.61 and 94.58. [Receipts](../work/swift-selftest41/impaired-1.json)
+and the simulator runs ([reference path](../work/swift-simulator-reference38/output.log),
+[control paths](../work/swift-simulator-reference40/output.log)) are saved.
 This is integration-tested in one local environment only: real devices,
 privileged host namespaces, soak, the shared service API and the other profiles'
 blocking corrections remain open, and no Python mode gate is closed by it.

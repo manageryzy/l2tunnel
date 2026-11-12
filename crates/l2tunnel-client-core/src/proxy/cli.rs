@@ -197,6 +197,8 @@ mod service {
                 openvpn_drain: None,
                 raw_packet: None,
                 rolling: None,
+                #[cfg(unix)]
+                swift: None,
                 proxy: Some(ProxySnapshot {
                     digest: self.digest.clone(),
                     drain_accepted: self.accepted,

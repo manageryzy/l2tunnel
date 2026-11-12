@@ -137,6 +137,71 @@ impl Settings {
     }
 }
 
+/// Non-secret state of a running swift session for the local status API.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// Ordering channels in use.
+    pub channels: u64,
+    /// Outbound budget in IP bytes per second.
+    pub send_bytes_per_second: u64,
+    /// Microseconds since forwarding started, at the latest observation.
+    pub elapsed_micros: u64,
+    /// Source symbols sent.
+    pub sources: u64,
+    /// Requested retransmissions sent.
+    pub retransmits: u64,
+    /// Proportional and idle repairs sent.
+    pub repairs: u64,
+    /// Protected datagrams sent.
+    pub datagrams_sent: u64,
+    /// IP bytes charged for them.
+    pub ip_bytes_sent: u64,
+    /// Authenticated datagrams received.
+    pub datagrams_received: u64,
+    /// Datagrams rejected by authentication, replay or length checks.
+    pub datagrams_rejected: u64,
+    /// Datagrams the socket or local firewall refused.
+    pub socket_drops: u64,
+    /// Native packets accepted from the device.
+    pub native_read: u64,
+    /// Native packets refused for size or a full queue.
+    pub native_dropped: u64,
+    /// Native packets written to the device.
+    pub native_written: u64,
+    /// Recovered packets the device refused.
+    pub native_write_drops: u64,
+    /// Native bytes removed by header compression.
+    pub header_bytes_saved: u64,
+    /// Largest per-channel round-trip estimate in microseconds.
+    pub round_trip_micros: u64,
+}
+
+impl Status {
+    /// Combine the fixed policy with the latest counters.
+    pub fn new(config: runtime::Config, snapshot: &Snapshot) -> Self {
+        Self {
+            channels: config.channels as u64,
+            send_bytes_per_second: config.send_bytes_per_second,
+            elapsed_micros: snapshot.elapsed_micros,
+            sources: snapshot.sender.sources,
+            retransmits: snapshot.sender.retransmits,
+            repairs: snapshot.sender.repairs + snapshot.sender.tail_repairs,
+            datagrams_sent: snapshot.datagrams_sent,
+            ip_bytes_sent: snapshot.ip_bytes_sent,
+            datagrams_received: snapshot.datagrams_received,
+            datagrams_rejected: snapshot.datagrams_rejected,
+            socket_drops: snapshot.socket_drops,
+            native_read: snapshot.native_read,
+            native_dropped: snapshot.native_dropped,
+            native_written: snapshot.native_written,
+            native_write_drops: snapshot.native_write_drops,
+            header_bytes_saved: snapshot.header_bytes_saved,
+            round_trip_micros: snapshot.sender.smoothed_rtt_micros,
+        }
+    }
+}
+
 /// One authenticated endpoint ready to forward.
 pub struct Session {
     control: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
@@ -183,6 +248,13 @@ impl Session {
     /// Effective kernel receive buffer of the data socket in bytes.
     pub fn receive_buffer(&self) -> io::Result<usize> {
         rustix::net::sockopt::socket_recv_buffer_size(&self.socket).map_err(io::Error::from)
+    }
+    /// Observe counters at least this often, for a frontend that serves
+    /// status; does not change the authenticated policy.
+    pub fn observe_every(mut self, interval: Duration) -> Self {
+        let current = self.config.report_interval;
+        self.config.report_interval = Some(current.map_or(interval, |value| value.min(interval)));
+        self
     }
     /// Effective runtime policy of this endpoint.
     pub fn config(&self) -> runtime::Config {
