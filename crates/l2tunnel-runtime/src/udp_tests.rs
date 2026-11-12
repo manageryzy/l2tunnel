@@ -1406,3 +1406,11 @@ async fn delivery_links(
     Ok((transport, a, b, relays))
 }
 crate::packet_delivery::actual_native_flight!();
+/// The same generated contract, with every control and datagram reader and
+/// writer owned inline by the runtime future instead of a spawned task. This is
+/// the runtime a lifecycle owner uses to release sockets synchronously on drop.
+mod inline_children {
+    use super::run_observed_inline as run_observed;
+    use super::*;
+    crate::packet_delivery::actual_native_flight!();
+}

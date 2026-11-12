@@ -1,4 +1,5 @@
-//! Presentation adapter for the managed-TCP profile of the shared lifecycle owner.
+//! Presentation adapter for the managed-TCP and base UDP profiles of the shared
+//! lifecycle owner. It parses credentials and prints; it owns no connection state.
 use super::*;
 use crate::service::{self, Completed, Terminal};
 use std::sync::Arc;
@@ -12,6 +13,10 @@ pub(super) async fn execute(
     device: DeviceSpec,
     delivery: Option<l2tunnel_runtime::managed::DeliveryConfig>,
     profile_interval: Option<Duration>,
+    udp: Option<(
+        crate::udp::Settings,
+        l2tunnel_runtime::managed::DeliveryConfig,
+    )>,
 ) -> io::Result<()> {
     let attachment = service::Attachment::new(config.layer, move || device.clone().open(config));
     let settings = service::Options {
@@ -29,17 +34,22 @@ pub(super) async fn execute(
             let member =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;
-            service::Prepared::client(
-                config,
-                service::Client {
-                    remote,
-                    tls,
-                    server_name: required(options, "--server-name")?.into(),
-                    member: Arc::new(member),
-                },
-                attachment,
-                settings,
-            )?
+            let credentials = service::Client {
+                remote,
+                tls,
+                server_name: required(options, "--server-name")?.into(),
+                member: Arc::new(member),
+            };
+            match udp {
+                Some((transport, delivery)) => service::Prepared::udp_client(
+                    config,
+                    credentials,
+                    transport,
+                    delivery,
+                    attachment,
+                )?,
+                None => service::Prepared::client(config, credentials, attachment, settings)?,
+            }
         }
         "serve" => {
             let listen = required(options, "--listen")?
@@ -54,16 +64,21 @@ pub(super) async fn execute(
                 .try_into()
                 .map_err(|_| input("allow-key must contain exactly 32 raw Ed25519 public bytes"))?;
             let members = MemberAllowlist::new(&[MemberPublicKey(key)]).map_err(auth_error)?;
-            service::Prepared::server(
-                config,
-                service::Server {
-                    listen,
-                    tls,
-                    members,
-                },
-                attachment,
-                settings,
-            )?
+            let credentials = service::Server {
+                listen,
+                tls,
+                members,
+            };
+            match udp {
+                Some((transport, delivery)) => service::Prepared::udp_server(
+                    config,
+                    credentials,
+                    transport,
+                    delivery,
+                    attachment,
+                )?,
+                None => service::Prepared::server(config, credentials, attachment, settings)?,
+            }
         }
         _ => return Err(input("unsupported managed service command")),
     };
@@ -97,9 +112,37 @@ pub(super) async fn execute(
             "Authenticated {:?} {:?}; forwarding packet device",
             config.layer, config.duplex
         );
-        println!("Carrier: tcp-tls; coordinated compression enabled");
-        if let Some(delivery) = delivery {
-            delivery_frontend::report(delivery);
+        // The effective profile comes from the authenticated factory through
+        // the service, never from re-deriving the requested options here.
+        let datagram = match life_handle.snapshot().runtime {
+            Some(service::Observation::UdpFrame(frame)) => Some(*frame),
+            _ => None,
+        };
+        if udp.is_some() != datagram.is_some() {
+            return Err(io::Error::other(
+                "service backend differs from the selected carrier",
+            ));
+        }
+        if let Some(frame) = datagram {
+            let profile = frame.effective;
+            delivery_frontend::report(frame.delivery);
+            println!(
+                "Carrier: UDP with retained TCP/TLS bootstrap/control; cover {:?}; protection {:?}; recovery {:?}; compression fixed",
+                profile.cover, profile.protection, profile.recovery
+            );
+            println!(
+                "Recovery banks: send {} records/{} bytes; receive {} records/{} bytes; local queue {} packets",
+                profile.arq.send_records,
+                profile.arq.send_bytes,
+                profile.arq.receive_records,
+                profile.arq.receive_bytes,
+                config.runtime().queue_packets
+            );
+        } else {
+            println!("Carrier: tcp-tls; coordinated compression enabled");
+            if let Some(delivery) = delivery {
+                delivery_frontend::report(delivery);
+            }
         }
         let terminal = async {
             match life_handle
@@ -116,6 +159,18 @@ pub(super) async fn execute(
                 }
             }
         };
+        if datagram.is_some() {
+            let latest = life_handle
+                .datagram_observer(generation)
+                .map_err(service_error)?
+                .ok_or_else(|| io::Error::other("base UDP observation absent"))?;
+            return datagram_profiling::observe(
+                terminal,
+                datagram_profiling::attach(latest, profile_interval),
+                datagram_profiling::Runtime::UdpFrame,
+            )
+            .await;
+        }
         profiling::observe(
             terminal,
             life_handle.profile(generation).map_err(service_error)?,

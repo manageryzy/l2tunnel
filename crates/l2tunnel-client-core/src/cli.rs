@@ -500,11 +500,6 @@ fn aligned_settings(
 enum Connected {
     Active(Link, super::active::Settings),
     ActiveManaged(Link, super::active_managed::Config),
-    Udp(
-        l2tunnel_runtime::udp::Link,
-        l2tunnel_runtime::udp::Config,
-        l2tunnel_runtime::managed::DeliveryConfig,
-    ),
     Quic(
         l2tunnel_runtime::quic::Link,
         l2tunnel_runtime::quic::Config,
@@ -651,12 +646,14 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
         })
         .transpose()?;
     let device_spec = DeviceSpec::parse(options, config)?;
-    if transport.is_none()
-        && quic.is_none()
-        && aligned.is_none()
-        && packed.is_none()
-        && active.is_none()
-    {
+    // Managed TCP and base UDP share one lifecycle owner with every other
+    // frontend. Derived record profiles, QUIC and active TUN are not migrated.
+    if quic.is_none() && aligned.is_none() && packed.is_none() && active.is_none() {
+        let udp = match (transport, base_delivery) {
+            (Some(settings), Some(selected)) => Some((settings, selected)),
+            (None, _) => None,
+            (Some(_), None) => return Err(input("base UDP delivery policy absent")),
+        };
         return service_frontend::execute(
             command,
             options,
@@ -664,6 +661,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             device_spec,
             delivery,
             profile_interval,
+            udp,
         )
         .await;
     }
@@ -742,22 +740,6 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     link,
                     profile,
                     base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
-                )
-            } else if let Some(settings) = transport {
-                let (link, profile) = super::udp::connect(
-                    remote,
-                    &tls,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
-                )
-                .await?;
-                Connected::Udp(
-                    link,
-                    profile,
-                    base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
                 )
             } else if let Some(settings) = managed_active {
                 Connected::ActiveManaged(
@@ -847,21 +829,6 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     )
                     .await?;
                     Connected::AlignedUdp(link, profile, records)
-                } else if let Some(settings) = transport {
-                    let (link, profile) = super::udp::accept(
-                        &listener,
-                        &tls,
-                        &allowlist,
-                        config,
-                        settings,
-                        base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
-                    )
-                    .await?;
-                    Connected::Udp(
-                        link,
-                        profile,
-                        base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
-                    )
                 } else if let Some(settings) = managed_active {
                     Connected::ActiveManaged(
                         super::active_managed::accept(
@@ -971,35 +938,6 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             );
             l2tunnel_runtime::aligned::run_quic(device, link, config.runtime(), profile, records)
                 .await
-        }
-        Connected::Udp(link, profile, delivery) => {
-            delivery_frontend::report(delivery);
-            println!(
-                "Carrier: UDP with retained TCP/TLS bootstrap/control; cover {:?}; protection {:?}; recovery {:?}; compression fixed",
-                profile.cover, profile.protection, profile.recovery
-            );
-            println!(
-                "Recovery banks: send {} records/{} bytes; receive {} records/{} bytes; local queue {} packets",
-                profile.arq.send_records,
-                profile.arq.send_bytes,
-                profile.arq.receive_records,
-                profile.arq.receive_bytes,
-                config.runtime().queue_packets
-            );
-            let (observations, reporter) = datagram_profiling::channel(profile_interval);
-            datagram_profiling::observe(
-                l2tunnel_runtime::udp::run_observed(
-                    device,
-                    link,
-                    config.runtime(),
-                    profile,
-                    reporter,
-                    delivery,
-                ),
-                observations,
-                datagram_profiling::Runtime::UdpFrame,
-            )
-            .await
         }
         Connected::Quic(link, profile, delivery) => {
             delivery_frontend::report(delivery);

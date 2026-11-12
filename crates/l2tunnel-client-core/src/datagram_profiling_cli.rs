@@ -31,6 +31,11 @@ pub(super) fn channel(interval: Option<Duration>) -> (Option<Observation>, Optio
         }
     }
 }
+/// Attach the existing printer to a latest-snapshot owner created elsewhere,
+/// such as the shared service's live base UDP generation.
+pub(super) fn attach(latest: Observer, interval: Option<Duration>) -> Option<Observation> {
+    interval.map(|interval| Observation { latest, interval })
+}
 #[derive(Serialize)]
 struct Counts {
     records: u64,
