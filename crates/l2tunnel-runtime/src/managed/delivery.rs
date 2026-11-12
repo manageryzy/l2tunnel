@@ -12,7 +12,7 @@ pub struct DeliveryConfig {
     pub reverse: delivery_window::Config,
 }
 impl DeliveryConfig {
-    pub(super) fn validate(self, runtime: RuntimeConfig) -> io::Result<()> {
+    pub(crate) fn validate(self, runtime: RuntimeConfig) -> io::Result<()> {
         for config in [self.forward, self.reverse] {
             config.validate().map_err(io::Error::other)?;
             if config.max_packet_bytes != runtime.max_packet as u64 {
@@ -21,21 +21,21 @@ impl DeliveryConfig {
         }
         Ok(())
     }
-    pub(super) fn outgoing(self, role: Role) -> delivery_window::Config {
+    pub(crate) fn outgoing(self, role: Role) -> delivery_window::Config {
         if role == Role::Client {
             self.forward
         } else {
             self.reverse
         }
     }
-    pub(super) fn incoming(self, role: Role) -> delivery_window::Config {
+    pub(crate) fn incoming(self, role: Role) -> delivery_window::Config {
         if role == Role::Client {
             self.reverse
         } else {
             self.forward
         }
     }
-    fn canonical(self) -> io::Result<Vec<u8>> {
+    pub(crate) fn canonical(self) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(192);
         for config in [self.forward, self.reverse] {
             for value in [
@@ -175,6 +175,42 @@ impl Window {
             profile.value(V::Target, status.target_bytes);
             profile.value(V::OutstandingBytes, status.outstanding.bytes);
             profile.value(V::OutstandingRecords, status.outstanding.records);
+            // A=admitted, F=local TLS-full-flushed, D=remote native-device delivered.
+            // F and D may cross: remote delivery can precede local callback observation.
+            // These partitions are ownership observations, not physical wire counters.
+            profile.value(V::ReservedBytes, status.outstanding.bytes);
+            profile.value(V::ReservedRecords, status.outstanding.records);
+            profile.value(
+                V::UnflushedBytes,
+                status.admitted.bytes - status.flushed.bytes,
+            );
+            profile.value(
+                V::UnflushedRecords,
+                status.admitted.records - status.flushed.records,
+            );
+            profile.value(
+                V::FlushedUnacknowledgedBytes,
+                status.flushed.bytes.saturating_sub(status.delivered.bytes),
+            );
+            profile.value(
+                V::FlushedUnacknowledgedRecords,
+                status
+                    .flushed
+                    .records
+                    .saturating_sub(status.delivered.records),
+            );
+            profile.value(
+                V::DeliveredAwaitingCallbackBytes,
+                status.delivered.bytes.saturating_sub(status.flushed.bytes),
+            );
+            profile.value(
+                V::DeliveredAwaitingCallbackRecords,
+                status
+                    .delivered
+                    .records
+                    .saturating_sub(status.flushed.records),
+            );
+
             profile.value(V::RetainedRecords, status.retained_records as u64);
             profile.value(V::Rtt, status.sample.map_or(0, |s| s.smoothed_micros));
             profile.value(V::RttFresh, u64::from(status.sample_fresh));

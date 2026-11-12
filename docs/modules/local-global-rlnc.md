@@ -121,7 +121,8 @@ never invoke it. No additional payload queue or packet allocation is introduced.
 Python references are CompactTransport `_source`, `_tail`, `_advance`,
 `_feedback`, `_receive_feedback`, SharedRecordTransport `_repair`, and fixed
 CompactWireTransport support/retention. Engineering differences are deliberate:
-exact integer ratio instead of parsed float, explicit caller handoff instead of
+an explicitly bounded numerator/denominator interface (Python also accumulates
+integer credit using `Fraction(str(repair_ratio))`), explicit caller handoff instead of
 simulated serialization finish, bounded resumable work/output storage, identified
 feedback with strict stale/conflict handling, original hard deadlines, full-byte
 GF recovery and structural enclosing wire. No inferred known link RTT, source

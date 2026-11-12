@@ -47,7 +47,7 @@ fn rolling_default_flow_1025_retains_ingress_after_idle() -> io::Result<()> {
         576,
         false,
     )?;
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, crate::rolling::config::test_delivery(rt))?;
     assert_eq!(config.pipeline.flows.capacity, 1024);
     let mut pipeline = Pipeline::new(config.pipeline).map_err(io::Error::other)?;
     for port in 10000..11024 {
@@ -111,7 +111,7 @@ fn rolling_retirement_preserves_selected_and_1100_successive_originals() -> io::
         576,
         false,
     )?;
-    let mut config = Config::for_udp(rt, transport, 4)?;
+    let mut config = Config::for_udp(rt, transport, 4, crate::rolling::config::test_delivery(rt))?;
     config.pipeline.flows.idle_timeout = Duration::from_millis(1);
     let mut pipeline = Pipeline::new(config.pipeline).map_err(io::Error::other)?;
     let metadata = pipeline

@@ -9,7 +9,8 @@ family, W8192 deployment, native activation and performance gates stay open.
 
 ## API and authenticated selection
 
-`runtime::rolling` exposes `Config { scheduler: rolling::scheduler::Policy,
+`runtime::rolling` exposes `Config { delivery: managed::DeliveryConfig,
+scheduler: rolling::scheduler::Policy,
 pipeline: PipelineConfig, stream: u32, epoch: u64, work: WorkBudget,
 passes_per_turn: usize }`, derived `Config::for_udp/for_quic`, UDP/QUIC
 `base_session_config` and lane `session_config` functions, `udp_carrier_config`,
@@ -17,7 +18,9 @@ passes_per_turn: usize }`, derived `Config::for_udp/for_quic`, UDP/QUIC
 RuntimeConfig retains TAP/TUN, compression, native ceiling/queue and poll period.
 Complete scheduler scalar policy, epoch/stream, tick unit (milliseconds), shared
 Pipeline/MUX policy, runtime and physical carrier/duplex policy are canonically
-bound **before authentication** under a new rolling-frame digest domain. Each
+bound **before authentication** under the rolling-frame v2 digest domain, including
+both canonical directional delivery configurations. Factories require the delivery
+argument; there is no implicit queue-sized fallback. Each
 full Scope uses the actual authenticated 16-byte session, negotiated epoch,
 checked stream+physical-lane and global direction. Existing retained full/pair
 factories verify actual link binding, roles and independent lane identities.
@@ -54,10 +57,11 @@ Budgeted Receiver service publishes ordered original fragments to the existing
 Reassembler and FrameCodec. Only complete validated original frames enter the
 bounded native output queue. WouldBlock retains exact bytes; only successful
 full PacketDevice acceptance advances cumulative native-delivery credit. Decode
-receipt/handoff is separate from that credit. Sender admission is bounded by
-admitted native frames minus peer native-delivery credit, in addition to rolling
-W debt, Pipeline queues, one pending ingress/selected packet and one bounded
-fragment batch. Peer credit regression/beyond-admission, wrong channel/sequence,
+receipt/handoff is separate from that credit. Sender admission uses actual native
+bytes and record counts with bandwidth/causal-RTT credit, independently of local
+queue capacity. Rolling W debt, Pipeline queues, one pending ingress/selected
+packet and one bounded fragment batch retain their own bounds. The receiver
+enforces the authenticated native byte/record limits. Peer credit regression/beyond-admission, wrong channel/sequence,
 wrong direction/kind, malformed source/feedback and expired ownership fail.
 
 One finite shared wire ledger covers lanes, source/repair emission, feedback and
@@ -67,7 +71,13 @@ feedback watch slot is a bounded replaceable ownership handoff: coalescing can
 lose an older receipt, and later stale-tail events elicit fresh cumulative
 feedback. This is not a claim of physical wire or native delivery. Existing
 reliable writer operation deadlines cover held control. There are no unbounded
-input, output or retry queues.
+input, output or retry queues. The final original fragment identifies each native
+record's first-flight completion; the datagram writer records its actual successful
+handoff before notifying the owner through a bounded non-coalescing channel.
+Repairs and retry handoffs never renew it. Authenticated credit records capture
+receipt time before awaiting the owner queue. The delivery controller receives
+event time and observation time separately, preserving original flush/sample
+deadlines through actor stalls. Neither timestamp claims physical-wire departure.
 
 The scheduler uses elapsed monotonic milliseconds, original debt/job/handoff
 bounds and finite per-call/per-turn work. Reassembly keeps its first-fragment
@@ -121,3 +131,4 @@ or complete local/global Python-family parity.
 - [x] [MOD-ROLLINGRT-04] Pass focused strict lint/docs/tests, record exact source hashes and independent scope review; then join a root-owned stable aggregate. Evidence: [focused receipt](../../work/rolling-runtime16/validation.json), root independent readback and [wave18 stable aggregate](../../work/implementation-wave18/validation.json), 987 Rust/142 Python cases with strict workspace lint/docs and all 620 source inputs unchanged.
 - [x] [MOD-ROLLINGRT-04A] Pass the scoped rolling/helper tests, strict runtime no-deps all-target lint, warning-denied docs, formatting and root independent readback; freeze exact input hashes. Evidence: [focused receipt](../../work/rolling-runtime16/validation.json). Whole-workspace aggregate remains the parent task above.
 - [ ] [MOD-ROLLINGRT-05] Add separate client selection, native owned-lab capture qualification, large-window service/memory measurements and complete Python family parity before closing parent rolling06/07 gates.
+- [ ] [MOD-ROLLINGRT-06] Replace queue-sized native flight admission with authenticated actual-byte bandwidth/RTT credit and independent metadata bounds. Prove admission beyond64 with the local queue unchanged, fragment-complete first-flight timestamps, pressure, send failure and original deadlines; pass current carrier tests and the combined aggregate.

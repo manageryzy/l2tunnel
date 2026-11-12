@@ -14,6 +14,23 @@ add child IDs. Update this ledger and the detailed checklists with every change.
 Follow the [parallel development workflow](development-workflow.md) for module
 design, interface agreement, concurrent implementation and integration.
 
+## Blocking behavior corrections — execute before new feature work
+
+These are the highest-priority implementation TODOs from the source26 audit.
+An audit note, an added capability flag or a passing component test cannot close
+them. Each fix requires a regression that rejects the previous behavior and
+validation through its actual selected client/runtime path. Existing leaf checks
+remain evidence for their stated scope, not a percentage of product completion.
+
+- [ ] [FIX-01] Separate local storage from authenticated byte/record flight budgets in rolling, aligned/packed and raw runtimes; size delivery credit from bandwidth and causal feedback RTT. Existing coupling includes `rolling/owner.rs::admit` and `aligned.rs::admit`. Validate small local queues with larger real outstanding debt, exact mixed-size bytes, receiver pressure, original deadlines and full/half operation.
+- [ ] [FIX-02] Make the Python high-performance composition reachable as one authenticated client profile: common connection-RR MUX16, actual local/global RLNC, correct retained-source bounds, compact records and the selected short-frame/ACK policy. Trace every selected option to the running data plane; do not substitute TCP/TLS frame forwarding or isolated library tests.
+- [ ] [FIX-03] Qualify the reference local support128/global support8192/every16 geometry, retained unconfirmed sources and bounded row/history storage as distinct limits. Current `window` is global support, so adding8192 retained debt behind support128 would strand old loss. Measure and remove the decoder's full-bank copy bottleneck, then prove old-source recovery, memory/work bounds and delayed feedback before replacing the runtime global-support128 ceiling. Design evidence: [ownership audit](../work/rolling-bdp27/fix03-retention-design.md).
+- [ ] [FIX-04] Run a matched native performance workload on that composition: record the exact reference profile, sixteen forward bulk flows and its ACK-return policy, 100/10 Mbit/s,70ms RTT and15% loss; compare clean/delay controls, exact payload/confirmation, same-window wire cost and latency. Keep simultaneous reverse-bulk stress as a distinct workload. Actual forward80Mbit/s remains required.
+- [ ] [FIX-05] Reproduce and correct any valid management retry/buffered-arrival sequence that trips the base runtime's256-record local-arrival limit. Keep original transaction deadlines and bounded authenticated control service; use actual delayed control delivery, not a success-only local state fixture.
+- [ ] [FIX-06] Make the complete simulator check reject unavailable/broken required adapters and unexpected skipped tests. Preserve optional dependency behavior for ordinary simulator users; reproduce the old false pass and replace it with a failing full-gate result.
+- [ ] [FIX-07] Finish the requirement-to-runtime/test audit, repair each confirmed behavior discrepancy, and remove superseded designs, duplicated progress prose and tests that do not distinguish correct behavior. Retain meaningful parser/security/deadline regressions and all historical experiment receipts.
+- [ ] [FIX-08] Reject packed MUX channel256 at composition setup, before any flow is created; preserve packed255/unpacked256 delivery and correct the documented Python integer repair-credit behavior. Evidence must include the formerly accepted invalid composition and valid boundary transfers.
+
 ## Reading order and detailed task lists
 
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
@@ -79,7 +96,7 @@ integration or performance acceptance.
 ## Tested native vertical slice
 
 - [x] [SLICE-01] Retain verified TLS 1.3 through member authentication and application data, with replay/configuration rejection tests. Evidence: [auth tests](../crates/l2tunnel-auth/src/tests.rs).
-- [x] [SLICE-02] Forward native Linux TAP/TUN in half and full duplex, including corrected IPv4/IPv6/TCP tests under 70 ms RTT / 15% loss with owned cleanup. Evidence: [corrected native receipt](../work/native-wave4/receipt.json).
+- [ ] [SLICE-02] Complete native Linux TAP/TUN half/full duplex at 70 ms RTT / 15% loss, including exact-byte IPv4 and IPv6 TCP and owned cleanup. The [historical six-case receipt](../work/native-wave4/receipt.json) covers clean full/half and impaired half only; IPv6 coverage is ICMP, not TCP. Add the missing full-duplex impaired and IPv6 TCP cases before checking this deliverable.
 - [x] [SLICE-03] Compose bounded scheduling, MUX, wire and VXLAN without granting management authority to user Ethernet bytes. Evidence: [facade integration](../crates/l2tunnel/tests/pipeline.rs).
 - [x] [SLICE-05] Qualify point-to-point Linux kernel VXLAN with explicit offload completion, VNI admission and native IPv4/IPv6/TCP traffic. Evidence: [VXLAN receipt](../work/vxlan-qualified/receipt.json).
 - [x] [SLICE-06] Qualify coordinated Off/LZ4/Off compression epochs through the private local API during native TAP/TUN/VXLAN TCP transfer, including impaired half-duplex links. Evidence: [nine-case native receipt](../work/native-managed-logical/receipt.json).

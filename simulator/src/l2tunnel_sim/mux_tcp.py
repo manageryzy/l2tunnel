@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from .compact import CompactHeaderCodec, tcp_profile_frame
 from .compact_ack import CoalescedACKTCP
 from .compact_wire import CompactWireTransport
-from .packed_wire import PackedWireTransport
+from .packed_wire import PACKED_CHANNEL, PackedWireTransport
 from .multiflow import MultiFlow
 from .mux import DuplexMux, frame_tuple
 from .tcp_syn_probe import EVENT_HEADER, SYNProbeConfig, TCPHandshakeProbe, handshake_frame
@@ -85,6 +85,11 @@ class UnifiedMuxMultiFlow(MultiFlow):
     """Share a fixed channel pool and coded transports across both directions."""
 
     def __init__(self, *args, compact_config, channel_count, simulation_factory, mapping="crc32", **kwargs):
+        packed = compact_config.pack_sources_max_delay_ms > 0
+        channel_limit = PACKED_CHANNEL if packed else 256
+        if (isinstance(channel_count, bool) or not isinstance(channel_count, int)
+                or not 1 <= channel_count <= channel_limit):
+            raise ValueError(f"unified mux channel_count must be an integer from one to {channel_limit}")
         super().__init__(*args, simulation_factory=simulation_factory, **kwargs)
         if len(self.flows) > 256:
             raise ValueError("unified mux TCP fixture supports up to 256 bulk connections")
@@ -92,7 +97,7 @@ class UnifiedMuxMultiFlow(MultiFlow):
             raise ValueError("unified mux requires compatible TCP endpoints in every flow")
         if compact_config.header_profile != "tcp_delta":
             raise ValueError("unified mux requires serialized TCP frame headers")
-        transport_type = PackedWireTransport if compact_config.pack_sources_max_delay_ms > 0 else CompactWireTransport
+        transport_type = PackedWireTransport if packed else CompactWireTransport
         self.shared_forward = transport_type(self.flows[0], False, compact_config)
         self.shared_reverse = transport_type(self.flows[0], True, compact_config)
         self.mux = DuplexMux(self.flows[0], (self.shared_forward, self.shared_reverse),

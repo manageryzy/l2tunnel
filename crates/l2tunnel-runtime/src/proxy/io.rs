@@ -141,7 +141,7 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
 }
 /// One noncatching-up physical control slot. Credit admission uses four slots
 /// between cumulative updates, retaining headroom for liveness and barriers.
-pub(super) fn control_interval(rate: usize) -> io::Result<Duration> {
+pub(crate) fn control_interval(rate: usize) -> io::Result<Duration> {
     if !(16..=1024).contains(&rate) {
         return Err(invalid("proxy control pacing rate"));
     }

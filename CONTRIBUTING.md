@@ -39,7 +39,7 @@ and restart the rust-analyzer server if the editor was already running. Check
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e './simulator[dev,quic]'
+.venv/bin/python -m pip install -e './simulator[dev,quic,plots]'
 .venv/bin/python tools/check.py
 # With that environment already activated:
 python3 tools/check.py

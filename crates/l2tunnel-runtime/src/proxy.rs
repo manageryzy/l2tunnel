@@ -18,6 +18,7 @@ mod config;
 pub mod measured;
 #[path = "proxy/io.rs"]
 mod transport;
+pub(crate) use transport::control_interval;
 mod wire;
 pub use config::{
     Config, DeliveryPolicy, IpPrefix, MemoryBound, MuxPolicy, NativePolicy, PortRange, RelayPolicy,

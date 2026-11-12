@@ -53,6 +53,13 @@ labels!(Value, VALUES,
     RetainedRecords => "delivery_retained_records", Rtt => "delivery_service_rtt_micros",
     RttFresh => "delivery_service_rtt_fresh", PendingBytes => "delivery_native_pending_bytes",
     StagedBytes => "delivery_staged_native_bytes",
+    ReservedBytes => "delivery_reserved_bytes", ReservedRecords => "delivery_reserved_records",
+    UnflushedBytes => "delivery_unflushed_bytes", UnflushedRecords => "delivery_unflushed_records",
+    FlushedUnacknowledgedBytes => "delivery_flushed_unacknowledged_bytes",
+    FlushedUnacknowledgedRecords => "delivery_flushed_unacknowledged_records",
+    DeliveredAwaitingCallbackBytes => "delivery_delivered_awaiting_flush_callback_bytes",
+    DeliveredAwaitingCallbackRecords => "delivery_delivered_awaiting_flush_callback_records",
+
 );
 labels!(Stage, STAGES,
     DriverWait => "driver_select_wait", WriterWait => "writer_select_wait",
@@ -60,7 +67,7 @@ labels!(Stage, STAGES,
     CodecEncode => "codec_encode", CodecDecode => "codec_decode",
     OuterEncode => "outer_encode", OuterDecode => "outer_decode",
     RecordRead => "transport_record_read", IncomingQueue => "incoming_queue_send_wait",
-    PrefixWrite => "transport_prefix_write", BodyWrite => "transport_body_write",
+    FramedWrite => "transport_framed_write",
     Flush => "transport_flush", CreditBlocked => "credit_blocked_elapsed",
 );
 
@@ -87,6 +94,7 @@ pub struct ProfileSnapshot {
     /// Maximum observed bounded queue/record values plus explicit configured limits.
     pub high_water: BTreeMap<&'static str, u64>,
     /// Current fixed-label delivery observations; delivery_enabled=0 means legacy policy.
+    /// Unflushed/flushed describe local TLS full-flush callbacks, never physical wire delivery.
     pub values: BTreeMap<&'static str, u64>,
     /// Fixed label set of stage attempt timings.
     pub timings: BTreeMap<&'static str, ProfileTiming>,
@@ -244,6 +252,12 @@ impl ProfileSink {
                         },
                     )
                 })
+                // Preserve old metric keys as unused zeros; never relabel old
+                // prefix/body observations as the new combined framed write.
+                .chain([
+                    ("transport_prefix_write", ProfileTiming::default()),
+                    ("transport_body_write", ProfileTiming::default()),
+                ])
                 .collect(),
         };
         self.0.output.send_replace(Some(snapshot));

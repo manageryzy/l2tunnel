@@ -1,4 +1,10 @@
 use super::*;
+use l2tunnel_flow_control::{delivery_window, target::Micros};
+
+pub(super) struct Outbound {
+    pub bytes: Vec<u8>,
+    pub native_complete: Option<u64>,
+}
 
 struct Native {
     bytes: Vec<u8>,
@@ -22,13 +28,17 @@ pub(super) struct State {
     native: VecDeque<Native>,
     record: Vec<u8>,
     codec: l2tunnel_codec::FrameCodec,
-    pub outbound: Option<mpsc::Sender<Vec<u8>>>,
+    pub outbound: Option<mpsc::Sender<Outbound>>,
     pub feedback: watch::Sender<udp::Feedback>,
     pub admitted: u64,
     received: u64,
     delivered: u64,
     peer_delivered: u64,
     pub dropped_busy: u64,
+    flight: Option<delivery_window::Controller>,
+    incoming_delivery: delivery_window::Config,
+    native_pending_bytes: u64,
+    frame_ends: VecDeque<(protocol::SourceId, u64)>,
 }
 impl State {
     pub fn new(
@@ -37,7 +47,7 @@ impl State {
         policy: DatagramPolicy,
         config: Config,
         feedback: watch::Sender<udp::Feedback>,
-        outbound: Option<mpsc::Sender<Vec<u8>>>,
+        outbound: Option<mpsc::Sender<Outbound>>,
     ) -> io::Result<Self> {
         let LaneContext {
             session,
@@ -73,6 +83,18 @@ impl State {
         let chunk = fragment_bytes - FRAGMENT_HEADER_BYTES;
         let count = u16::try_from(maximum.div_ceil(chunk))
             .map_err(|_| invalid("rolling fragment count"))?;
+        let role = if initiator {
+            super::super::managed::Role::Client
+        } else {
+            super::super::managed::Role::Server
+        };
+        let outgoing_delivery = config.delivery.outgoing(role);
+        let mut frame_ends = VecDeque::new();
+        if sends {
+            frame_ends
+                .try_reserve_exact(outgoing_delivery.max_records)
+                .map_err(io::Error::other)?;
+        }
         Ok(Self {
             sender: sends
                 .then(|| scheduler::Sender::new(config.scheduler, scope, protocol::Tick(0)))
@@ -122,9 +144,22 @@ impl State {
             delivered: 0,
             peer_delivered: 0,
             dropped_busy: 0,
+            flight: sends
+                .then(|| delivery_window::Controller::new(outgoing_delivery, Micros(0)))
+                .transpose()
+                .map_err(io::Error::other)?,
+            incoming_delivery: config.delivery.incoming(role),
+            native_pending_bytes: 0,
+            frame_ends,
         })
     }
-    pub fn control(&mut self, event: udp::ControlEvent, now: protocol::Tick) -> io::Result<()> {
+    pub fn control(
+        &mut self,
+        event: udp::ControlEvent,
+        now: protocol::Tick,
+        actual: Micros,
+        observed: Micros,
+    ) -> io::Result<()> {
         match event {
             udp::ControlEvent::Ack(bytes) => {
                 self.sender
@@ -139,6 +174,14 @@ impl State {
                         "rolling native credit regressed or exceeds admission",
                     ));
                 }
+                let flight = self
+                    .flight
+                    .as_mut()
+                    .ok_or_else(|| invalid("rolling native credit on receive-only lane"))?;
+                let end = flight.credit_at_record(value).map_err(io::Error::other)?;
+                flight
+                    .delivered_at(end, actual, observed)
+                    .map_err(io::Error::other)?;
                 self.peer_delivered = value;
             }
         }
@@ -166,7 +209,27 @@ impl State {
             Err(error) => Err(io::Error::other(error)),
         }
     }
+    #[cfg(test)]
     pub fn service(&mut self, now: protocol::Tick, config: Config) -> io::Result<()> {
+        self.service_at(
+            now,
+            config,
+            Micros(
+                now.0
+                    .checked_mul(1000)
+                    .ok_or_else(|| invalid("rolling test time overflow"))?,
+            ),
+        )
+    }
+    pub fn service_at(
+        &mut self,
+        now: protocol::Tick,
+        config: Config,
+        observed: Micros,
+    ) -> io::Result<()> {
+        if let Some(flight) = &mut self.flight {
+            flight.tick(observed).map_err(io::Error::other)?;
+        }
         if !self
             .reassembly
             .expire(now.0)
@@ -198,12 +261,18 @@ impl State {
         }
         Ok(())
     }
-    pub fn admit(&mut self, item: &pipeline::Packet, runtime: RuntimeConfig) -> io::Result<bool> {
-        if self.sender.is_none()
-            || !self.fragments.is_empty()
-            || self.admitted - self.peer_delivered >= runtime.queue_packets as u64
-        {
+    pub fn admit(&mut self, item: &pipeline::Packet, observed: Micros) -> io::Result<bool> {
+        if self.sender.is_none() || !self.fragments.is_empty() {
             return Ok(false);
+        }
+        let flight = self
+            .flight
+            .as_mut()
+            .ok_or_else(|| invalid("rolling missing native delivery owner"))?;
+        match flight.preview_admit(item.payload.len() as u64, observed) {
+            Ok(()) => (),
+            Err(delivery_window::Error::Blocked) => return Ok(false),
+            Err(error) => return Err(io::Error::other(error)),
         }
         let encoded = self
             .codec
@@ -212,6 +281,9 @@ impl State {
         let batch = self
             .fragmenter
             .fragment(&encoded)
+            .map_err(io::Error::other)?;
+        flight
+            .admit(item.payload.len() as u64, observed)
             .map_err(io::Error::other)?;
         for bytes in batch.fragments {
             let mut source = Vec::with_capacity(bytes.len() + 2);
@@ -227,13 +299,45 @@ impl State {
             && let Some(bytes) = self.fragments.front()
         {
             match sender.admit_source(bytes, now) {
-                Ok(_) => {
+                Ok(id) => {
+                    if self.fragments.len() == 1 {
+                        self.frame_ends.push_back((id, self.admitted));
+                    }
                     self.fragments.pop_front();
                 }
                 Err(protocol::Error::Busy | protocol::Error::Capacity) => (),
                 Err(error) => return Err(io::Error::other(error)),
             }
         }
+        Ok(())
+    }
+    pub fn completion(&self, id: scheduler::OutputId) -> Option<u64> {
+        if let scheduler::OutputId::Source(id) = id
+            && self
+                .frame_ends
+                .front()
+                .is_some_and(|(source, _)| *source == id)
+        {
+            return self.frame_ends.front().map(|(_, ordinal)| *ordinal);
+        }
+        None
+    }
+    pub fn queued(&mut self, id: scheduler::OutputId) {
+        if self.completion(id).is_some() {
+            self.frame_ends.pop_front();
+        }
+    }
+    pub fn first_flight(
+        &mut self,
+        ordinal: u64,
+        actual: Micros,
+        observed: Micros,
+    ) -> io::Result<()> {
+        self.flight
+            .as_mut()
+            .ok_or_else(|| invalid("rolling completion on receive-only lane"))?
+            .confirm_flushed_at(ordinal, actual, observed)
+            .map_err(io::Error::other)?;
         Ok(())
     }
     pub fn reassemble(
@@ -276,7 +380,7 @@ impl State {
             }
             ReassemblyStatus::Complete { message, length } => {
                 if message.0 != self.received
-                    || self.received - self.delivered >= runtime.queue_packets as u64
+                    || self.received - self.delivered >= self.incoming_delivery.max_records as u64
                     || (runtime.compression == super::super::Compression::None
                         && self.record.get(4) != Some(&0))
                 {
@@ -289,11 +393,19 @@ impl State {
                 if !packet_valid(runtime.layer, &bytes) {
                     return Err(invalid("rolling invalid native packet"));
                 }
+                let pending = self
+                    .native_pending_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| invalid("rolling pending native bytes overflow"))?;
+                if pending > self.incoming_delivery.max_inflight_bytes {
+                    return Err(invalid("rolling native receive byte budget exceeded"));
+                }
                 let deadline = protocol::Tick(
                     now.0
                         .checked_add(config.scheduler.recovery.handoff_ticks)
                         .ok_or_else(|| invalid("rolling native deadline overflow"))?,
                 );
+                self.native_pending_bytes = pending;
                 self.native.push_back(Native {
                     bytes,
                     channel,
@@ -355,6 +467,10 @@ impl State {
         }
         match result {
             Ok(()) => {
+                self.native_pending_bytes = self
+                    .native_pending_bytes
+                    .checked_sub(front.bytes.len() as u64)
+                    .ok_or_else(|| invalid("rolling native pending byte underflow"))?;
                 self.native.pop_front();
                 self.delivered = delivered;
                 self.feedback

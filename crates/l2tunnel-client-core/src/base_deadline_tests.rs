@@ -42,28 +42,51 @@ async fn original_one_second_budget_includes_both_authentications_and_pairing() 
     let binding = cfg.session()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let auth_started = Instant::now();
+    let original_budget = cfg.handshake_timeout;
     let peer = async {
         let (first, _) = timeout(Duration::from_secs(2), listener.accept()).await??;
+        // Match the production accept helper, including its TCP_NODELAY policy.
+        first.set_nodelay(true)?;
         sleep(Duration::from_millis(400)).await;
         let first =
             auth::server_accept(first, &c.server, &c.allow, binding, Duration::from_secs(3))
                 .await?;
+        let first_authenticated_at = auth_started.elapsed();
         let (second, _) = timeout(Duration::from_secs(2), listener.accept()).await??;
+        second.set_nodelay(true)?;
         sleep(Duration::from_millis(400)).await;
         let second =
             auth::server_accept(second, &c.server, &c.allow, binding, Duration::from_secs(3))
                 .await?;
+        let second_authenticated_at = auth_started.elapsed();
         sleep(Duration::from_millis(500)).await;
+        let pairing_started_at = auth_started.elapsed();
         let result = l2tunnel_runtime::server_pair(first, second).await;
-        Ok::<_, Failure>(result)
+        Ok::<_, Failure>((
+            result,
+            [first_authenticated_at, second_authenticated_at],
+            pairing_started_at,
+        ))
     };
     let client = async {
         let started = Instant::now();
         let result = connect(address, &c.client, "base-deadline.test", &c.member, cfg).await;
         (started.elapsed(), result)
     };
-    let ((elapsed, result), _peer) =
+    let ((elapsed, result), peer) =
         timeout(Duration::from_secs(4), async { tokio::join!(client, peer) }).await?;
+    let (pairing, authenticated_at, pairing_started_at) = peer?;
+    assert!(pairing_started_at >= original_budget);
+    assert!(authenticated_at[0] < authenticated_at[1]);
+    assert!(
+        authenticated_at.iter().all(|at| *at < original_budget),
+        "both peer authentications must complete inside the original budget: {authenticated_at:?}"
+    );
+    assert!(
+        pairing.is_err(),
+        "delayed peer pairing unexpectedly succeeded"
+    );
     assert!(
         result.is_err(),
         "late half admission succeeded after original1000ms: {elapsed:?}"
@@ -235,10 +258,13 @@ async fn client_pair_wait_cannot_restart_deadline_and_closes_both_authenticated_
     let address = listener.local_addr()?;
     let peer = async {
         let (stream, _) = timeout(Duration::from_secs(2), listener.accept()).await??;
+        // Match the production accept helper rather than adding Nagle delays.
+        stream.set_nodelay(true)?;
         let mut first =
             auth::server_accept(stream, &c.server, &c.allow, binding, Duration::from_secs(2))
                 .await?;
         let (second, _) = timeout(Duration::from_secs(2), listener.accept()).await??;
+        second.set_nodelay(true)?;
         sleep(Duration::from_millis(180)).await;
         let mut second =
             auth::server_accept(second, &c.server, &c.allow, binding, Duration::from_secs(2))

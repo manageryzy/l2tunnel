@@ -43,7 +43,7 @@ fn json(snapshot: &ProfileSnapshot) -> serde_json::Value {
             )
         })
         .collect();
-    serde_json::json!({"event": "runtime_profile", "schema": 2,
+    serde_json::json!({"event": "runtime_profile", "schema": 3,
         "runtime": "managed-tcp", "elapsed_nanos": snapshot.elapsed_nanos,
         "terminal": snapshot.terminal, "counters": snapshot.counters,
         "high_water": snapshot.high_water, "values": snapshot.values, "timings": timings})

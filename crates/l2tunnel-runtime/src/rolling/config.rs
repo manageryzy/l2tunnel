@@ -3,6 +3,8 @@ use super::*;
 /// Immutable explicit rolling source/frame, common MUX and service policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
+    /// Required canonical native delivery policies, independent of local queues.
+    pub delivery: super::super::managed::DeliveryConfig,
     /// Actual pure causal byte-recovery scheduling and total owner limits.
     pub scheduler: scheduler::Policy,
     /// The one common native admission/MUX policy, including all user probes.
@@ -22,20 +24,27 @@ impl Config {
         runtime: RuntimeConfig,
         transport: udp::Config,
         channels: u16,
+        delivery: super::super::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         udp::base_session_config(runtime, transport)?;
-        Self::derive(runtime, transport.policy()?, channels)
+        Self::derive(runtime, transport.policy()?, channels, delivery)
     }
     /// Derive an explicitly selected rolling policy from genuine QUIC datagram geometry.
     pub fn for_quic(
         runtime: RuntimeConfig,
         transport: quic::Config,
         channels: u16,
+        delivery: super::super::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         quic::base_session_config(runtime, transport)?;
-        Self::derive(runtime, transport.policy()?, channels)
+        Self::derive(runtime, transport.policy()?, channels, delivery)
     }
-    fn derive(runtime: RuntimeConfig, policy: DatagramPolicy, channels: u16) -> io::Result<Self> {
+    fn derive(
+        runtime: RuntimeConfig,
+        policy: DatagramPolicy,
+        channels: u16,
+        delivery: super::super::managed::DeliveryConfig,
+    ) -> io::Result<Self> {
         let max_payload = policy
             .payload_bytes
             .checked_sub(protocol::wire::HEADER_BYTES + 2)
@@ -50,6 +59,7 @@ impl Config {
             packets: runtime.queue_packets,
         };
         let value = Self {
+            delivery,
             scheduler: scheduler::Policy {
                 recovery: protocol::Config {
                     window: 32,
@@ -106,6 +116,24 @@ impl Config {
     }
     pub(super) fn validate(self, runtime: RuntimeConfig, policy: DatagramPolicy) -> io::Result<()> {
         runtime.validate()?;
+        self.delivery.validate(runtime)?;
+        for delivery in [self.delivery.forward, self.delivery.reverse] {
+            let markers = delivery
+                .max_records
+                .checked_mul(std::mem::size_of::<(protocol::SourceId, u64)>())
+                .ok_or_else(|| invalid("rolling native marker reservation overflow"))?;
+            let total = delivery
+                .metadata_bytes()
+                .map_err(io::Error::other)?
+                .checked_add(markers)
+                .ok_or_else(|| invalid("rolling native metadata reservation overflow"))?;
+            if total > delivery.metadata_limit_bytes {
+                return Err(invalid(
+                    "rolling delivery metadata budget excludes fragment markers",
+                ));
+            }
+        }
+
         self.scheduler.validate().map_err(io::Error::other)?;
         let c = self.scheduler.recovery;
         let profile = matches!(
@@ -168,8 +196,9 @@ impl Config {
     pub(super) fn bind(self, base: SessionConfig) -> io::Result<SessionConfig> {
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
         hash.update(
-            b"l2tunnel/rolling-frame-policy/v1/millisecond-ticks/l2rw1/l2rf1/lx1/channel-u16\0",
+            b"l2tunnel/rolling-frame-policy/v2/millisecond-ticks/l2rw1/l2rf1/lx1/channel-u16\0",
         );
+        hash.update(&self.delivery.canonical()?);
         let c = self.scheduler.recovery;
         for value in [
             c.window as u64,
@@ -208,7 +237,30 @@ impl Config {
             base,
             digest,
             self.pipeline,
-            b"l2tunnel/rolling-frame-runtime/v1\0",
+            b"l2tunnel/rolling-frame-runtime/v2\0",
         ))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_delivery(runtime: RuntimeConfig) -> super::super::managed::DeliveryConfig {
+    let config = l2tunnel_flow_control::delivery_window::Config {
+        target_bandwidth_bps: 80_000_000,
+        bootstrap_rtt_micros: 70_000,
+        min_rtt_micros: 2000,
+        max_rtt_micros: 1_000_000,
+        headroom_percent: 125,
+        minimum_bytes: runtime.max_packet as u64,
+        max_inflight_bytes: 4 * 1024 * 1024,
+        // Existing small fixtures explicitly reserve two native records.
+        max_records: 2,
+        max_packet_bytes: runtime.max_packet as u64,
+        metadata_limit_bytes: 1_000_000,
+        sample_ttl_micros: 4_000_000,
+        flush_timeout_micros: 120_000_000,
+    };
+    super::super::managed::DeliveryConfig {
+        forward: config,
+        reverse: config,
     }
 }

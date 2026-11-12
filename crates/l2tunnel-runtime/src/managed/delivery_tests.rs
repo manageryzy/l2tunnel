@@ -1,6 +1,7 @@
 //! Actual TLS byte accounting, bounded receiver debt and original-clock callbacks.
 use super::*;
 use l2tunnel_flow_control::delivery_window;
+use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -470,5 +471,84 @@ async fn held_original_flush_events_do_not_collapse_to_latest_watch_timestamp() 
     );
     task.abort();
     let _ = task.await;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn profile_splits_reservations_from_tls_full_flush_and_early_delivery_callbacks() -> TestResult
+{
+    fn read(
+        window: &mut delivery::Window,
+        sink: &ProfileSink,
+        handle: &ProfileHandle,
+    ) -> io::Result<BTreeMap<&'static str, u64>> {
+        window.publish(Some(sink))?;
+        sink.publish(true);
+        Ok(handle
+            .status()
+            .ok_or_else(|| invalid("missing gauge observation"))?
+            .values)
+    }
+    fn assert_split(values: &BTreeMap<&'static str, u64>, expected: [u64; 8]) {
+        let names = [
+            "delivery_reserved_bytes",
+            "delivery_reserved_records",
+            "delivery_unflushed_bytes",
+            "delivery_unflushed_records",
+            "delivery_flushed_unacknowledged_bytes",
+            "delivery_flushed_unacknowledged_records",
+            "delivery_delivered_awaiting_flush_callback_bytes",
+            "delivery_delivered_awaiting_flush_callback_records",
+        ];
+        for (name, expected) in names.into_iter().zip(expected) {
+            assert_eq!(values[name], expected, "{name}");
+        }
+        assert_eq!(
+            values["delivery_reserved_bytes"],
+            values["delivery_outstanding_bytes"]
+        );
+        assert_eq!(
+            values["delivery_reserved_records"],
+            values["delivery_outstanding_records"]
+        );
+    }
+    let origin = Instant::now();
+    let (handle, sink) = profiling_channel(Duration::from_millis(100))?;
+    sink.publish(true);
+    let disabled = handle.status().ok_or("missing legacy defaults")?.values;
+    assert_eq!(disabled["delivery_enabled"], 0);
+    assert_split(&disabled, [0; 8]);
+    let mut window = delivery::Window::new(policy(), Role::Client, origin)?;
+    assert!(window.admit(1500)?);
+    assert!(window.admit(40)?);
+    assert_split(
+        &read(&mut window, &sink, &handle)?,
+        [1540, 2, 1540, 2, 0, 0, 0, 0],
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    window.flush(delivery::FlushEvent {
+        ordinal: 1,
+        at: Instant::now(),
+    })?;
+    assert_split(
+        &read(&mut window, &sink, &handle)?,
+        [1540, 2, 40, 1, 1500, 1, 0, 0],
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    window.feedback(2, Instant::now())?;
+    assert_split(
+        &read(&mut window, &sink, &handle)?,
+        [0, 0, 40, 1, 0, 0, 40, 1],
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    window.flush(delivery::FlushEvent {
+        ordinal: 2,
+        at: origin + Duration::from_micros(1500),
+    })?;
+    let final_values = read(&mut window, &sink, &handle)?;
+    assert_eq!(final_values["delivery_enabled"], 1);
+    assert_split(&final_values, [0; 8]);
+    window.feedback(2, origin + Duration::from_millis(2))?;
+    assert_eq!(read(&mut window, &sink, &handle)?, final_values);
     Ok(())
 }

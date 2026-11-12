@@ -94,7 +94,12 @@ pub struct Status {
     pub admitted: Credit,
     /// Monotonic authenticated remote-device delivery prefix.
     pub delivered: Credit,
-    /// Admitted minus delivered original bytes and records.
+    /// Original-byte/count prefix whose full flush is confirmed. This can lag
+    /// delivered when authenticated feedback is observed before the callback.
+    /// Full TLS flush is a handoff boundary, not proof of physical wire flight.
+    pub flushed: Credit,
+    /// Admitted minus delivered original bytes and records. This reservation
+    /// includes local queued/writer bytes not yet confirmed fully flushed.
     pub outstanding: Credit,
     /// Future byte target, retaining all prior outstanding debt.
     pub target_bytes: u64,
@@ -119,6 +124,7 @@ pub struct Controller {
     admitted: Credit,
     delivered: Credit,
     flushed_records: u64,
+    flushed_bytes: u64,
     last_flush_at: Option<Micros>,
     last_feedback_at: Option<Micros>,
     sample: Option<Sample>,
@@ -186,6 +192,7 @@ impl Controller {
             admitted: Credit::default(),
             delivered: Credit::default(),
             flushed_records: 0,
+            flushed_bytes: 0,
             last_flush_at: None,
             last_feedback_at: None,
             sample: None,
@@ -255,6 +262,10 @@ impl Controller {
         Ok(Status {
             admitted: self.admitted,
             delivered: self.delivered,
+            flushed: Credit {
+                bytes: self.flushed_bytes,
+                records: self.flushed_records,
+            },
             outstanding: Credit {
                 bytes: self.admitted.bytes - self.delivered.bytes,
                 records: self.admitted.records - self.delivered.records,
@@ -354,6 +365,12 @@ impl Controller {
                 return Err(Error::Time);
             }
         }
+        let flushed_bytes = self
+            .index(records)
+            .and_then(|i| self.entries[i])
+            .ok_or(Error::Flush)?
+            .end
+            .bytes;
         for record in self.flushed_records + 1..=records {
             let i = self.index(record).ok_or(Error::Flush)?;
             if let Some(e) = &mut self.entries[i] {
@@ -361,6 +378,7 @@ impl Controller {
             }
         }
         self.flushed_records = records;
+        self.flushed_bytes = flushed_bytes;
         self.last_flush_at = Some(actual_flush_at);
         self.at = observed_at;
         self.prune();

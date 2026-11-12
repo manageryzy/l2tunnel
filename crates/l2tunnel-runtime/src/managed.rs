@@ -344,6 +344,8 @@ async fn read_records<R: AsyncRead + Unpin>(
     delivery: bool,
 ) -> io::Result<()> {
     let mut expected = 0;
+    let control_interval = super::proxy::control_interval(CONTROL_RATE)?;
+    let mut control_due = Instant::now();
     loop {
         let read_span = profile.as_ref().map(|p| p.span(PS::RecordRead));
         let mut prefix = [0_u8; 4];
@@ -384,6 +386,15 @@ async fn read_records<R: AsyncRead + Unpin>(
             return Err(invalid("unsupported managed record kind or length"));
         }
         expected = increment(expected)?;
+        if header.kind == Kind::Control {
+            // Reliable buffering preserves order, not arrival spacing. Service one
+            // already-bounded authenticated record per slot instead of closing a
+            // healthy session whose legal retries arrived together.
+            tokio::time::sleep_until(control_due).await;
+            control_due = Instant::now()
+                .checked_add(control_interval)
+                .ok_or_else(|| invalid("managed control receive deadline overflow"))?;
+        }
         let received_at = delivery.then(Instant::now);
         let send_span = profile.as_ref().map(|p| p.span(PS::IncomingQueue));
         sender
@@ -413,7 +424,7 @@ async fn write_record<W: AsyncWrite + Unpin>(
     profile: Option<&ProfileSink>,
 ) -> io::Result<()> {
     let outer_span = profile.map(|p| p.span(PS::OuterEncode));
-    let bytes = wire::encode(
+    let mut bytes = wire::encode(
         Header {
             kind,
             epoch,
@@ -424,16 +435,23 @@ async fn write_record<W: AsyncWrite + Unpin>(
         payload,
     )
     .map_err(wire_error)?;
+    let record_len = bytes.len();
+    let prefix = u32::try_from(record_len)
+        .map_err(io::Error::other)?
+        .to_be_bytes();
+    let framed_len = record_len
+        .checked_add(4)
+        .ok_or_else(|| invalid("managed framed length overflow"))?;
+    bytes.try_reserve_exact(4).map_err(io::Error::other)?;
+    bytes.resize(framed_len, 0);
+    bytes.copy_within(..record_len, 4);
+    bytes[..4].copy_from_slice(&prefix);
     drop(outer_span);
     *number = increment(*number)?;
     {
-        let _span = profile.map(|p| p.span(PS::PrefixWrite));
-        writer
-            .write_u32(u32::try_from(bytes.len()).map_err(io::Error::other)?)
-            .await?;
-    }
-    {
-        let _span = profile.map(|p| p.span(PS::BodyWrite));
+        // Keep prefix and body in one plaintext write. This preserves framing and
+        // the original per-record flush boundary without cross-record batching.
+        let _span = profile.map(|p| p.span(PS::FramedWrite));
         writer.write_all(&bytes).await?;
     }
     {
@@ -442,8 +460,8 @@ async fn write_record<W: AsyncWrite + Unpin>(
     }
     if let Some(p) = profile {
         p.count(PC::RecordsFlushed, 1);
-        p.count(PC::RecordBytesFlushed, (bytes.len() + 4) as u64);
-        p.high(PH::RecordBytes, (bytes.len() + 4) as u64);
+        p.count(PC::RecordBytesFlushed, bytes.len() as u64);
+        p.high(PH::RecordBytes, bytes.len() as u64);
         match kind {
             Kind::Data => p.count(PC::DataFlushed, 1),
             Kind::Feedback => p.count(PC::FeedbackFlushed, 1),
@@ -474,20 +492,41 @@ async fn write_records<W: AsyncWrite + Unpin>(
         Data(OutData),
     }
     let mut number = 0;
+    let control_interval = super::proxy::control_interval(CONTROL_RATE)?;
+    let mut control_due = Instant::now();
+    let mut delayed = None;
     loop {
         let wait = profile.as_ref().map(|p| p.span(PS::WriterWait));
-        let selected = tokio::select! {
-            biased;
-            message = control.recv() => Selected::Control(message.ok_or_else(|| invalid("managed control producer stopped"))?),
-            changed = credit.changed() => {
-                changed.map_err(|_| invalid("delivery credit producer stopped"))?;
-                Selected::Feedback(*credit.borrow_and_update())
-            },
-            packet = data.recv() => Selected::Data(packet.ok_or_else(|| invalid("managed data producer stopped"))?),
+        let selected = if delayed.is_some() {
+            // This frame owns its original bounded control slot. Keep data and
+            // native-delivery feedback progressing until its physical slot is due.
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(control_due) => Selected::Control(delayed.take().ok_or_else(|| invalid("missing paced control"))?),
+                changed = credit.changed() => {
+                    changed.map_err(|_| invalid("delivery credit producer stopped"))?;
+                    Selected::Feedback(*credit.borrow_and_update())
+                },
+                packet = data.recv() => Selected::Data(packet.ok_or_else(|| invalid("managed data producer stopped"))?),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                message = control.recv() => Selected::Control(message.ok_or_else(|| invalid("managed control producer stopped"))?),
+                changed = credit.changed() => {
+                    changed.map_err(|_| invalid("delivery credit producer stopped"))?;
+                    Selected::Feedback(*credit.borrow_and_update())
+                },
+                packet = data.recv() => Selected::Data(packet.ok_or_else(|| invalid("managed data producer stopped"))?),
+            }
         };
         drop(wait);
         match selected {
             Selected::Control(message) => {
+                if Instant::now() < control_due {
+                    delayed = Some(message);
+                    continue;
+                }
                 if let Some(p) = &profile {
                     p.count(PC::WriterWakeControl, 1);
                 }
@@ -501,6 +540,10 @@ async fn write_records<W: AsyncWrite + Unpin>(
                     profile.as_ref(),
                 )
                 .await?;
+                // Noncatching-up spacing starts at this frame's actual full flush.
+                control_due = Instant::now()
+                    .checked_add(control_interval)
+                    .ok_or_else(|| invalid("managed control send deadline overflow"))?;
                 progress.control.send_replace(message.sequence);
             }
             Selected::Feedback(delivered) => {
@@ -565,8 +608,6 @@ struct Driver {
     control_out: ControlSender,
     native_pending: VecDeque<Vec<u8>>,
     delivery: Option<delivery::Window>,
-    rate_start: Tick,
-    controls_received: usize,
 }
 impl Driver {
     fn codec(&self) -> io::Result<&FrameCodec> {
@@ -715,14 +756,6 @@ impl Driver {
                 self.peer_delivered = delivered;
             }
             Kind::Control => {
-                if now.0.saturating_sub(self.rate_start.0) >= 1_000 {
-                    self.rate_start = now;
-                    self.controls_received = 0;
-                }
-                self.controls_received += 1;
-                if self.controls_received > CONTROL_RATE {
-                    return Err(invalid("management input service budget exceeded"));
-                }
                 let effects = match self.peer.receive(self.origin, &record.payload, now) {
                     Ok(effects) => effects,
                     Err(transaction::Error::Admission(
@@ -1244,8 +1277,6 @@ async fn run_managed_inner<D: PacketDevice<Error = io::Error>>(
         },
         native_pending,
         delivery: window,
-        rate_start: Tick(0),
-        controls_received: 0,
     };
     let _reverse_writer = link.reverse_writer;
     let reverse = async move {
@@ -1430,3 +1461,11 @@ mod profiling_tests;
 #[cfg(test)]
 #[path = "managed/delivery_tests.rs"]
 mod delivery_tests;
+
+#[cfg(test)]
+#[path = "managed/framed_write_tests.rs"]
+mod framed_write_tests;
+
+#[cfg(test)]
+#[path = "managed/control_pacing_tests.rs"]
+mod control_pacing_tests;

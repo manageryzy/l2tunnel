@@ -295,3 +295,61 @@ fn delayed_actual_flush_never_resamples_old_feedback_or_revives_expiry() -> Test
     );
     Ok(())
 }
+
+fn assert_prefix_split(s: Status) {
+    for (a, f, d) in [
+        (s.admitted.bytes, s.flushed.bytes, s.delivered.bytes),
+        (s.admitted.records, s.flushed.records, s.delivered.records),
+    ] {
+        assert!(a >= f && a >= d);
+        let unflushed_undelivered = a - f.max(d);
+        let flushed_unacknowledged = f.saturating_sub(d);
+        let delivered_awaiting_flush = d.saturating_sub(f);
+        assert_eq!(a - d, unflushed_undelivered + flushed_unacknowledged);
+        assert_eq!(a - f, unflushed_undelivered + delivered_awaiting_flush);
+    }
+}
+#[test]
+fn flushed_actual_byte_prefix_exposes_local_reservation_and_early_feedback_split() -> TestResult {
+    let mut c = Controller::new(config(), Micros(0))?;
+    assert_eq!(c.status(Micros(0))?.flushed, Credit::default());
+    assert_prefix_split(c.status(Micros(0))?);
+    let first = c.admit(40, Micros(0))?;
+    let second = c.admit(60, Micros(0))?;
+    let third = c.admit(100, Micros(0))?;
+    c.confirm_flushed(first.records, Micros(10))?;
+    c.delivered(second, Micros(20))?;
+    let early = c.status(Micros(20))?;
+    assert_eq!(early.admitted, third);
+    assert_eq!(early.flushed, first);
+    assert_eq!(early.delivered, second);
+    assert_eq!(
+        early.outstanding,
+        Credit {
+            bytes: 100,
+            records: 1
+        }
+    );
+    assert_eq!(early.admitted.bytes - early.flushed.bytes, 160);
+    assert_eq!(early.delivered.bytes - early.flushed.bytes, 60);
+    assert_prefix_split(early);
+    c.confirm_flushed(second.records, Micros(30))?;
+    let caught_up = c.status(Micros(30))?;
+    assert_eq!(caught_up.flushed, second);
+    assert_eq!(caught_up.sample, early.sample);
+    assert_prefix_split(caught_up);
+    c.confirm_flushed(third.records, Micros(40))?;
+    let handed_off = c.status(Micros(40))?;
+    assert_eq!(handed_off.flushed, third);
+    assert_eq!(handed_off.flushed.bytes - handed_off.delivered.bytes, 100);
+    assert_prefix_split(handed_off);
+    c.delivered(third, Micros(50))?;
+    c.confirm_flushed(third.records, Micros(60))?;
+    c.delivered(third, Micros(60))?;
+    let done = c.status(Micros(60))?;
+    assert_eq!(done.flushed, third);
+    assert_eq!(done.outstanding, Credit::default());
+    assert_eq!(done.retained_records, 0);
+    assert_prefix_split(done);
+    Ok(())
+}

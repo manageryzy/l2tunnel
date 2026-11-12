@@ -93,6 +93,32 @@ def test_plan_requires_actual_unified_mux_within_channel_limit(monkeypatch):
         runner.validate_tasks(plan)
 
 
+@pytest.mark.parametrize("mapping", ["crc32", "connection_round_robin"])
+def test_packed_mux_rejects_reserved_channel_at_construction(study, mapping, monkeypatch):
+    task = mux_case(256)
+    task["profile"]["mux"]["mapping"] = mapping
+    task["profile"]["compact"]["pack_sources_max_delay_ms"] = .5
+
+    def unexpected_flow_creation(*args, **kwargs):
+        pytest.fail("invalid packed channel count reached flow construction")
+
+    monkeypatch.setattr(study.ObservedMuxTCP, "__init__", unexpected_flow_creation)
+    with pytest.raises(ValueError, match="unified mux channel_count.*255"):
+        study.execute(task)
+
+
+@pytest.mark.parametrize("packed,channels", [(True, 255), (False, 256)])
+def test_mux_channel_limit_preserves_valid_end_to_end_delivery(study, packed, channels):
+    task = mux_case(channels)
+    task["profile"]["compact"]["pack_sources_max_delay_ms"] = .5 if packed else 0
+    row = study.execute(task)
+    assert row["mux_channel_count"] == channels
+    assert row["fully_confirmed"] and row["mux_both_directions_confirmed"]
+    assert row["tcp_syn_probe_all_flushed"]
+    assert row["tcp_syn_ping_completed"] > 16
+    assert row["mux_endpoint_records_pending"] == 0
+
+
 def test_normal_entry_supports_generic_connection_rotation(study):
     task = mux_case(16, loss=.15)
     task['profile']['mux']['mapping'] = 'connection_round_robin'

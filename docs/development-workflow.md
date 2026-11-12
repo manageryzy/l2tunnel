@@ -27,7 +27,9 @@ API. No task is complete just because its enum/trait or crate compiles.
 
 ## Work cycle
 
-1. **Select a wave.** The integrator chooses ready, independent checklist tasks and
+1. **Select blocking behavior first.** Reproduce and fix the master checklist
+   FIX-* discrepancies before adding features or polishing a fallback. The
+   integrator chooses ready, independent repair tasks and
    gives each worker exclusive files plus the exact inputs, boundary and tests.
    Keep one authoritative owner for shared core types, the public facade, root
    manifests, mode catalog, global checklist and validation tooling.
@@ -76,75 +78,25 @@ API. No task is complete just because its enum/trait or crate compiles.
    number of unchecked boxes alone. Retain design/API/test receipts for the next
    agent so work can continue without reconstructing chat history.
 
-## Completed first coding wave
+## Current ownership and acceptance
 
-| Owner slot | Library | Design document | First complete behavior | Deliberately pending integration |
-| --- | --- | --- | --- | --- |
-| Worker A | `l2tunnel-flow-control` | [Flow-control module](modules/flow-control.md) | Checked cumulative-credit accounting and bounded receiver reservations | Adaptive probing, network feedback and TCP proxy |
-| Worker B | `l2tunnel-qos` | [QoS module](modules/qos.md) | Bounded byte-aware weighted deficit scheduling | Full class/path hierarchy, congestion control and OS QoS bindings |
-| Worker C | `l2tunnel-management` | [Management module](modules/management.md) | Draft control framing and trusted-origin boundary | Cryptographic authentication, reliable network control and distributed reload |
-| Integrator | `l2tunnel-vxlan` | [VXLAN module](modules/vxlan.md) | Checked VXLAN header/frame codec and VNI/domain admission | Live VTEP sockets, learning/FDB/BUM and bridge lifecycle |
+The integrator owns the current repair order, shared interfaces, client wiring,
+validation, ledger changes and Git index. Workers own disjoint runtime behavior,
+Python parity/recovery and test-acceptance repairs. Keep the live assignments in
+the task messages; obsolete wave tables are not executable priorities.
 
-These modules have no dependency on each other's unfinished APIs. The facade is
-integrated after their public surfaces settle. All ordinary data continues to use
-the common user policy; no management/probe shortcut is added by these primitives.
+For each behavioral discrepancy, record one stable blocking task with the
+observed call path, a regression that fails before the repair, and the required
+real-client acceptance. Remove superseded implementations and duplicate or
+self-confirming tests once their meaningful failure coverage has a replacement.
+Do not keep a known-wrong branch merely to preserve a passing fixture. Retain
+historical experiment receipts unchanged.
 
-## Current composition wave
-
-The first primitives now have focused behavior tests. The runnable Linux slice
-also includes authenticated persistent TCP/TLS, TAP/TUN/VXLAN adapters, bounded
-native queues, a private Unix client API and coordinated compression epochs.
-Native qualification is recorded separately from primitive acceptance.
-
-| Owner slot | Exclusive work | Frozen upstream interfaces | Acceptance before runtime integration |
-| --- | --- | --- | --- |
-| Worker A | Genuine HTTPS carrier contract and implementation | Existing maintained TLS/member/session APIs; raw packet results stay separate | Specify valid HTTP streaming and bounded ordinary unauthenticated handling, then preserve original TLS/socket ownership and explicit ALPN/SNI/authentication binding |
-| Worker B | Corrected measured native pressure qualification | Frozen directional pressure correction and explicitly bounded pressure-only WAN capture allocation | Preserve payload/growth/first-reopen acceptance and deadlines; execute only the exact root-verified build and audit complete captures |
-| Worker C | Rolling-frame native harness | Frozen tested UDP/QUIC rolling runtime and explicit shared client | Exercise actual TAP/TUN full/half device paths, exact payloads, bounded loss and owned cleanup; retain separate large-window and Python-family gates |
-| Integrator | Frozen aggregate/build, shared integration helpers and local Git checkpoints | Exact copied completed bundles, isolated build target, immutable native helpers and structural auditor | Review interfaces, run full checks, retain failed acceptance evidence, commit coherent validated snapshots and qualify native profiles while workers continue |
-
-All four slots carry implementation or executable validation work. Module design
-stays in the module ledger and is followed directly by code and focused tests;
-there is no separate approval round for each internal helper. Review focuses on
-material interface, ownership, security and test findings. A failing check blocks
-that checkpoint's acceptance, not independent development.
-
-Use a distinct Cargo target directory per worker and one exclusive target for
-snapshot validation. Avoid repeated full-suite runs after a successful unchanged
-checkpoint. The integrator may run independent clean native cases concurrently
-when they have disjoint lab IDs, namespace ownership and output directories;
-serialize only cases that share mutable resources or deliberately measure a
-common host load. Preserve failed receipts before making the next attempt.
-
-The wave16b aggregate passed on its frozen source; the derived wave17 aggregate
-failed a raw paired-lane review assertion and remains preserved. Wave18 composes
-the focused-tested causal fixture fix, raw native harness, rolling runtime and
-directional native-pressure correction while these next worker lanes continue.
-The previous measured native pressure rerun exposed a directional classification
-defect despite focused tests passing, so native acceptance remains a separate gate.
-Existing fixed-credit proxy,
-aligned UDP/QUIC, standalone OpenVPN-like clean drain and other native receipts
-retain their documented finite scope. All 47 complete Python family gates remain
-open until their own requirements pass. See [current evidence](implementation-status.md)
-and the module ledgers for evidence, failures and remaining tasks.
-
-## Subsequent waves and readiness gates
-
-- **Wire and session wave:** canonical config codec, bounded stream assembler,
-  maintained TLS/identity dependencies, replay/keys, lane join and runtime driver.
-  Freeze authentication proofs before protected packet/session state mutation.
-- **Data-plane wave:** real frame/header codecs, payload FEC/ARQ, adaptive-credit
-  controller and hierarchical QoS. Differential-test real bytes against Python
-  vectors; never use sender payload knowledge at the receiver.
-- **Integration wave:** persistent TCP/TLS, both UDP covers and standalone UDP,
-  qualified raw TCP, internal management transactions and full VXLAN adapter.
-  Reuse the fixed control codec during data-mode changes.
-- **Client wave:** shared client-core/local API and CLI proceed with fake backends
-  while Linux/Windows/Android adapters develop independently. GUI uses the same
-  API after its contract stabilizes; choose the toolkit at CL-17.
-- **Qualification wave:** isolated TUN/TAP/VXLAN/netem tests, actual TCP proxy, QoS
-  pressure/fairness, hot switches and native clients. Performance and release
-  claims require the specific native/carrier/configuration receipts.
+Full checks prove their recorded suite passed. They do not prove unavailable
+adapters ran, complete Python-mode fidelity, native throughput or platform
+support. Validate required prerequisites and unexpected skips. A checked leaf
+cannot close its parent integration/performance gate. Do not report the count
+of waves, tests or checked leaf tasks as product completion.
 
 ## Integration rules
 

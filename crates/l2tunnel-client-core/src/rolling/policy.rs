@@ -13,6 +13,49 @@ pub struct Settings {
     recovery: Recovery,
     scheduling: Scheduling,
     service: Service,
+    delivery: Delivery,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Delivery {
+    forward_bandwidth_bps: u64,
+    reverse_bandwidth_bps: u64,
+    bootstrap_rtt_micros: u64,
+    min_rtt_micros: u64,
+    max_rtt_micros: u64,
+    headroom_percent: u16,
+    minimum_bytes: u64,
+    max_inflight_bytes: u64,
+    max_records: usize,
+    metadata_limit_bytes: usize,
+    sample_ttl_micros: u64,
+    flush_timeout_micros: u64,
+}
+impl Delivery {
+    fn config(&self, max_packet: usize) -> io::Result<l2tunnel_runtime::managed::DeliveryConfig> {
+        let direction = |target_bandwidth_bps| l2tunnel_flow_control::delivery_window::Config {
+            target_bandwidth_bps,
+            bootstrap_rtt_micros: self.bootstrap_rtt_micros,
+            min_rtt_micros: self.min_rtt_micros,
+            max_rtt_micros: self.max_rtt_micros,
+            headroom_percent: self.headroom_percent,
+            minimum_bytes: self.minimum_bytes,
+            max_inflight_bytes: self.max_inflight_bytes,
+            max_records: self.max_records,
+            max_packet_bytes: max_packet as u64,
+            metadata_limit_bytes: self.metadata_limit_bytes,
+            sample_ttl_micros: self.sample_ttl_micros,
+            flush_timeout_micros: self.flush_timeout_micros,
+        };
+        let result = l2tunnel_runtime::managed::DeliveryConfig {
+            forward: direction(self.forward_bandwidth_bps),
+            reverse: direction(self.reverse_bandwidth_bps),
+        };
+        for config in [result.forward, result.reverse] {
+            config.validate().map_err(io::Error::other)?;
+        }
+        Ok(result)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,7 +130,8 @@ impl Settings {
         self.policy()
             .validate()
             .map_err(|_| invalid("invalid rolling recovery/scheduling policy"))?;
-        if self.version != 1
+        self.delivery.config(1)?;
+        if self.version != 2
             || self.profile != PROFILE
             || !(1..=256).contains(&self.channels)
             || self.epoch == 0
@@ -112,6 +156,7 @@ impl Settings {
     ) -> io::Result<()> {
         self.scalars()?;
         connection.session()?;
+        self.delivery(connection.max_packet)?;
         if recovery != l2tunnel_runtime::udp::RecoveryMode::SelectiveRepeat
             || (connection.duplex == l2tunnel_core::Duplex::Half && self.stream == u32::MAX)
         {
@@ -120,6 +165,12 @@ impl Settings {
             ));
         }
         Ok(())
+    }
+    pub(crate) fn delivery(
+        &self,
+        max_packet: usize,
+    ) -> io::Result<l2tunnel_runtime::managed::DeliveryConfig> {
+        self.delivery.config(max_packet)
     }
     pub(super) fn apply(&self, mut value: runtime::Config) -> runtime::Config {
         value.scheduler = self.policy();

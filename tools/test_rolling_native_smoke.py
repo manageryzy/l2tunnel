@@ -77,7 +77,7 @@ class RollingNativeTests(unittest.TestCase):
 
     def snapshot(self,plan):
         cover='quic_like' if plan['carrier']=='udp' else 'not_applicable'
-        return {'profile':'rolling-frame-v1','requested_carrier':plan['carrier'],'effective_carrier':plan['carrier'],'requested_cover':cover,'effective_cover':cover,'layer':plan['layer'],'duplex':plan['duplex'],'pipeline':'tap_system' if plan['layer']=='tap' else 'tun_drr','channels':4,'window':32,'max_payload':1000,'epoch':1,'digest':'ab'*32,'phase':'forwarding','hot_reload':False,'clean_drain':False,'tcp_window_ownership':False,'native_qualified':False,'large_window_qualified':False,'failure':None}
+        return {'profile':'rolling-frame-v2','requested_carrier':plan['carrier'],'effective_carrier':plan['carrier'],'requested_cover':cover,'effective_cover':cover,'layer':plan['layer'],'duplex':plan['duplex'],'pipeline':'tap_system' if plan['layer']=='tap' else 'tun_drr','channels':4,'window':32,'max_payload':1000,'epoch':1,'digest':'ab'*32,'phase':'forwarding','hot_reload':False,'clean_drain':False,'tcp_window_ownership':False,'native_qualified':False,'large_window_qualified':False,'failure':None}
 
     def test_status_is_actual_exact_and_no_unsupported_claim_can_pass(self):
         plan=self.plan();value=self.snapshot(plan);rolling.validate_snapshot(value,plan)

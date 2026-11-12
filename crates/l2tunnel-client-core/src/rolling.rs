@@ -11,7 +11,7 @@ pub use status::{Carrier, Cover, LaneMode, Layer, Observer, Phase, PipelineProfi
 /// Maximum entire untrusted rolling policy document before parser allocation.
 pub const MAX_POLICY_BYTES: usize = 65536;
 /// Explicit authenticated profile selected only by this client surface.
-pub const PROFILE: &str = "rolling-frame-v1";
+pub const PROFILE: &str = "rolling-frame-v2";
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -48,6 +48,7 @@ pub fn udp_config(
         config.runtime(),
         profile,
         settings.channels,
+        settings.delivery(config.max_packet)?,
     )?);
     runtime::udp_base_session_config(config.runtime(), profile, value)?;
     Ok((profile, value))
@@ -64,6 +65,7 @@ pub fn quic_config(
         config.runtime(),
         profile,
         settings.channels,
+        settings.delivery(config.max_packet)?,
     )?);
     runtime::quic_base_session_config(config.runtime(), profile, value)?;
     Ok((profile, value))

@@ -36,13 +36,14 @@ HELPERS = {'tools/rolling_native_smoke.py': Path(__file__),
 
 
 def policy() -> dict:
-    return {'version': 1, 'profile': 'rolling-frame-v1', 'channels': 4, 'stream': 1, 'epoch': 1,
+    return {'version': 2, 'profile': 'rolling-frame-v2', 'channels': 4, 'stream': 1, 'epoch': 1,
             'recovery': {'window': 32, 'local_window': 8, 'global_every': 16, 'max_payload': 1000,
                 'max_rows': 32, 'repair_history': 64, 'handoff_sources': 8, 'job_millis': 5000,
                 'debt_millis': 20000, 'handoff_millis': 5000, 'memory_bytes': 33554432},
             'scheduling': {'repair_numerator': 1, 'repair_denominator': 2, 'tail_millis': 20,
                 'feedback_millis': 5, 'feedback_packets': 4, 'memory_bytes': 33554432},
-            'service': {'field_work': 4096, 'copy_work': 4096, 'metadata_work': 4096, 'passes_per_turn': 8}}
+            'service': {'field_work': 4096, 'copy_work': 4096, 'metadata_work': 4096, 'passes_per_turn': 8},
+            'delivery': {'forward_bandwidth_bps': 100000000, 'reverse_bandwidth_bps': 10000000, 'bootstrap_rtt_micros': 70000, 'min_rtt_micros': 1000, 'max_rtt_micros': 2000000, 'headroom_percent': 125, 'minimum_bytes': 3200, 'max_inflight_bytes': 4194304, 'max_records': 8192, 'metadata_limit_bytes': 2097152, 'sample_ttl_micros': 4000000, 'flush_timeout_micros': 10000000}}
 
 
 def case_plan(lab_id: str, carrier: str, layer: str, duplex: str, profile: str) -> dict:
@@ -86,7 +87,7 @@ def daemon_command(plan: dict, side: str, binary: Path, secrets: Path, policy_pa
 def validate_snapshot(value: dict, plan: dict, digest: str | None = None, phase: str = 'forwarding') -> dict:
     fields = {'profile','requested_carrier','effective_carrier','requested_cover','effective_cover','layer','duplex','pipeline','channels','window','max_payload','epoch','digest','phase','hot_reload','clean_drain','tcp_window_ownership','native_qualified','large_window_qualified','failure'}
     cover = 'quic_like' if plan['carrier'] == 'udp' else 'not_applicable'
-    expected = {'profile':'rolling-frame-v1','requested_carrier':plan['carrier'],'effective_carrier':plan['carrier'],
+    expected = {'profile':'rolling-frame-v2','requested_carrier':plan['carrier'],'effective_carrier':plan['carrier'],
                 'requested_cover':cover,'effective_cover':cover,'layer':plan['layer'],'duplex':plan['duplex'],
                 'pipeline':'tap_system' if plan['layer']=='tap' else 'tun_drr','channels':4,'window':32,'max_payload':1000,'epoch':1,
                 'phase':phase,'failure':None,'hot_reload':False,'clean_drain':False,'tcp_window_ownership':False,

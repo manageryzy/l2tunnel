@@ -1,23 +1,26 @@
 # Explicit rolling-frame client, CLI and local status
 
-Status: implemented and integration-tested on unprivileged Linux loopback through
-the shared client API; the interface/ownership contract was recorded before code. This selects
-the separately tested rolling runtime; it does not alter any existing default
-carrier, record/recovery mode or client. Native activation, W8192 deployment and
-complete local/global Python-family qualification remain open.
+Status: the previous client profile has finite unprivileged Linux loopback
+evidence. Version2 now requires a separate authenticated delivery policy; its
+combined validation is tracked below. Native activation, W8192 deployment,
+compact-record composition and complete Python-family qualification remain open.
 
 ## Selection and strict policy
 
 New `client_core::rolling::Settings::from_json` accepts at most 65536 total
 untrusted bytes before parsing. Every object uses deny_unknown_fields; all fields
 are required, duplicate/missing fields and unsupported versions/profiles fail.
-The document is `{version:1, profile:"rolling-frame-v1", channels, stream, epoch,
+The document is `{version:2, profile:"rolling-frame-v2", channels, stream, epoch,
 recovery:{window,local_window,global_every,max_payload,max_rows,repair_history,
 handoff_sources,job_millis,debt_millis,handoff_millis,memory_bytes},
 scheduling:{repair_numerator,repair_denominator,tail_millis,feedback_millis,
 feedback_packets,memory_bytes},service:{field_work,copy_work,metadata_work,
-passes_per_turn}}`. Scalars use checked typed integers and existing pure/runtime
-limits. Milliseconds are the runtime's bound tick unit. Runtime-dependent MTU,
+passes_per_turn},delivery:{forward_bandwidth_bps,reverse_bandwidth_bps,
+bootstrap_rtt_micros,min_rtt_micros,max_rtt_micros,headroom_percent,minimum_bytes,
+max_inflight_bytes,max_records,metadata_limit_bytes,sample_ttl_micros,
+flush_timeout_micros}}`. Scalars use checked typed integers and existing pure/runtime
+limits. Scheduler times use milliseconds; delivery times use explicit microseconds.
+Runtime-dependent MTU,
 layer/duplex, memory and geometry validation finishes before credentials or I/O.
 
 CLI selection is `--record-profile rolling --rolling-policy JSON_FILE` with
@@ -35,6 +38,16 @@ profile. The resulting complete immutable policy, not only user-editable fields,
 is bound before authentication by runtime rolling factories. All native user
 traffic/probes retain that same common MUX. This profile does not own endpoint
 TCP windows, measured adaptation or weight editing.
+
+Delivery bandwidth is canonical initiator-to-responder and reverse, independent
+of which peer reads the file. Both peers must authenticate the same values.
+The native byte budget is bandwidth times causal delivery RTT with configured
+headroom and hard byte/record bounds. The bootstrap RTT applies before a valid
+sample. Local Pipeline/device queue limits remain separate. A writer completion
+means the final original fragment was accepted by the datagram carrier; it is
+not a physical-wire timestamp. Version1 is rejected instead of silently retaining
+the old local-queue-sized flight window. Recovery support is still capped at128;
+raising the native record cap does not qualify retained-source8192 service.
 
 ## Shared API and lifecycle
 
@@ -74,6 +87,7 @@ opens another socket just to furnish status.
 - [x] [MOD-ROLLINGCL-04] Join and pass root's next stable `tools/check.py` aggregate; scoped checks do not close this gate. Evidence: [immutable source19 aggregate](../../work/implementation-wave19/validation.json), 629 unchanged inputs, 999 Rust and 154 Python cases, formatting, strict Clippy/rustdoc and golden/CLI checks.
 - [x] [MOD-ROLLINGCL-04A] Pass scoped tests, strict lint/docs/formatting and exact-file review receipt. Evidence: [113 library and 19 example tests, strict checks and exact files](../../work/rolling-client19/validation.json).
 - [ ] [MOD-ROLLINGCL-05] Qualify separately selected native owned-lab/capture, large-window service and full Python-family behavior before closing parent gates.
+- [ ] [MOD-ROLLINGCL-06] Require and bind the version2 canonical bandwidth/RTT/byte/record delivery policy through the shared API, CLI and native harness. Reject old/missing/unknown policies and prove each field changes authentication; pass the actual carrier/layer/duplex matrix and root aggregate before accepting the replacement.
 
 ## Finite evidence and operating boundary
 
@@ -95,11 +109,5 @@ loopback; loss/feedback-loss/backpressure evidence belongs to the independently
 recorded [rolling runtime](rolling-runtime.md) and pure scheduler tests. No new
 privileged native test, platform qualification or Python-family claim follows.
 
-All client-core library and example tests, strict no-dependency Clippy and rustdoc
-are recorded with exact source hashes in the [scoped receipt](../../work/rolling-client19/validation.json).
-Root owns the separately frozen whole-workspace `tools/check.py` run; this live
-lane does not duplicate it or claim it passed. Historical failed test/compiler
-logs are preserved beside the final scoped logs. An initial new manual TLS peer
-fixture omitted production `TCP_NODELAY`; adding that same setting fixed the
-fixture without changing the original 200 ms deadline. It now deliberately
-spends 100 ms on first-lane setup before testing the missing second lane.
+Historical scoped results remain in the linked receipts. Version2 corrections
+require their own current aggregate and do not inherit throughput qualification.

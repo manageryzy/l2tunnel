@@ -1102,12 +1102,40 @@ pub(super) enum ControlEvent {
     Credit(u64),
 }
 pub(super) async fn read_control_bound(
-    mut reader: impl AsyncRead + Unpin,
+    reader: impl AsyncRead + Unpin,
     lane: usize,
     events: mpsc::Sender<(usize, ControlEvent)>,
     duration: Duration,
     feedback_bytes: usize,
     magic: [u8; 4],
+) -> io::Result<()> {
+    read_control_bound_inner(reader, events, duration, feedback_bytes, magic, |event| {
+        (lane, event)
+    })
+    .await
+}
+/// Retain the original authenticated parse receipt before bounded event queueing.
+/// The legacy wrapper performs no additional clock reads.
+pub(super) async fn read_control_bound_timed(
+    reader: impl AsyncRead + Unpin,
+    lane: usize,
+    events: mpsc::Sender<(usize, ControlEvent, Instant)>,
+    duration: Duration,
+    feedback_bytes: usize,
+    magic: [u8; 4],
+) -> io::Result<()> {
+    read_control_bound_inner(reader, events, duration, feedback_bytes, magic, |event| {
+        (lane, event, Instant::now())
+    })
+    .await
+}
+async fn read_control_bound_inner<E>(
+    mut reader: impl AsyncRead + Unpin,
+    events: mpsc::Sender<E>,
+    duration: Duration,
+    feedback_bytes: usize,
+    magic: [u8; 4],
+    mut map: impl FnMut(ControlEvent) -> E,
 ) -> io::Result<()> {
     loop {
         let event = timeout(duration, async {
@@ -1136,7 +1164,7 @@ pub(super) async fn read_control_bound(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP control read deadline"))??;
         if let Some(event) = event {
             events
-                .send((lane, event))
+                .send(map(event))
                 .await
                 .map_err(|_| invalid("UDP control consumer closed"))?;
         }
@@ -1577,3 +1605,7 @@ where
 #[cfg(test)]
 #[path = "udp_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "udp_timed_control_tests.rs"]
+mod timed_control_tests;

@@ -378,7 +378,12 @@ async fn actual_udp_rolling_tap_tun_full_half_covers_and_suites_with_loss_and_ba
                 for protection in [Protection::ChaCha20Poly1305, Protection::HmacSha256] {
                     let rt = runtime(layer);
                     let transport = udp_transport(duplex, cover, protection)?;
-                    let config = small(Config::for_udp(rt, transport, 4)?);
+                    let config = small(Config::for_udp(
+                        rt,
+                        transport,
+                        4,
+                        crate::rolling::config::test_delivery(rt),
+                    )?);
                     let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
                     let a = Device::new(layer);
                     let b = Device::new(layer);
@@ -406,7 +411,12 @@ async fn actual_quic_rolling_tap_tun_full_half_with_loss_and_backpressure() -> T
         for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
             let rt = runtime(layer);
             let transport = quic_transport(duplex)?;
-            let config = small(Config::for_quic(rt, transport, 4)?);
+            let config = small(Config::for_quic(
+                rt,
+                transport,
+                4,
+                crate::rolling::config::test_delivery(rt),
+            )?);
             let (a_link, b_link, relays) = quic_links(rt, transport, config).await?;
             let a = Device::new(layer);
             let b = Device::new(layer);
@@ -429,10 +439,15 @@ fn full_policy_is_bound_and_geometry_rejected_before_authentication() -> TestRes
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let config = small(Config::for_udp(rt, transport, 4)?);
+    let config = small(Config::for_udp(
+        rt,
+        transport,
+        4,
+        crate::rolling::config::test_delivery(rt),
+    )?);
     let base = udp_base_session_config(rt, transport, config)?;
     assert_ne!(base, udp::base_session_config(rt, transport)?);
-    for mutation in 0..11 {
+    for mutation in 0..13 {
         let mut changed = config;
         match mutation {
             0 => changed.epoch += 1,
@@ -445,11 +460,13 @@ fn full_policy_is_bound_and_geometry_rejected_before_authentication() -> TestRes
             7 => changed.scheduler.recovery.handoff_ticks += 1,
             8 => changed.work.field += 1,
             9 => changed.passes_per_turn += 1,
-            _ => changed.pipeline.flows.idle_timeout += Duration::from_secs(1),
+            10 => changed.pipeline.flows.idle_timeout += Duration::from_secs(1),
+            11 => changed.delivery.forward.target_bandwidth_bps += 1,
+            _ => changed.delivery.reverse.max_records += 1,
         }
         assert_ne!(base, udp_base_session_config(rt, transport, changed)?);
     }
-    for mutation in 0..6 {
+    for mutation in 0..7 {
         let mut changed = config;
         match mutation {
             0 => changed.epoch = 0,
@@ -457,7 +474,11 @@ fn full_policy_is_bound_and_geometry_rejected_before_authentication() -> TestRes
             2 => changed.passes_per_turn = 65,
             3 => changed.scheduler.recovery.max_payload += 1,
             4 => changed.pipeline.flows.mapping = pipeline::Mapping::ConnectionRoundRobin,
-            _ => changed.pipeline.profile = pipeline::Profile::TapSystem,
+            5 => changed.pipeline.profile = pipeline::Profile::TapSystem,
+            _ => {
+                changed.delivery.forward.metadata_limit_bytes =
+                    changed.delivery.forward.metadata_bytes()?
+            }
         }
         assert!(udp_base_session_config(rt, transport, changed).is_err());
     }
@@ -472,7 +493,12 @@ async fn changed_binding_rejects_before_device_read_and_original_control_eof_sto
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let config = small(Config::for_udp(rt, transport, 4)?);
+    let config = small(Config::for_udp(
+        rt,
+        transport,
+        4,
+        crate::rolling::config::test_delivery(rt),
+    )?);
     let (a, b, _relays) = udp_links(rt, transport, config, false).await?;
     let device = Device::new(rt.layer);
     device.change(|s| s.outgoing.push_back(packet(rt.layer, 1, 100)))?;
@@ -504,7 +530,12 @@ fn owner_feedback_loss_stale_tail_repeats_receipt_without_native_credit_or_sende
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let mut config = small(Config::for_udp(rt, transport, 4)?);
+    let mut config = small(Config::for_udp(
+        rt,
+        transport,
+        4,
+        crate::rolling::config::test_delivery(rt),
+    )?);
     config.scheduler.repair_numerator = 0;
     config.scheduler.feedback_packets = 1;
     let (a_feedback, _) = watch::channel(udp::Feedback::default());
@@ -538,7 +569,7 @@ fn owner_feedback_loss_stale_tail_repeats_receipt_without_native_credit_or_sende
     let input = packet(rt.layer, 1, 100);
     a_pipeline.enqueue(input.clone(), Duration::ZERO)?;
     let selected = a_pipeline.dequeue()?.ok_or("common selected packet")?;
-    assert!(a.admit(&selected, rt)?);
+    assert!(a.admit(&selected, l2tunnel_flow_control::target::Micros(0))?);
     a.submit(protocol::Tick(0))?;
     let sender = a.sender.as_mut().ok_or("sender")?;
     let mut wire = vec![0; transport.policy()?.payload_bytes];
@@ -584,7 +615,12 @@ fn owner_feedback_loss_stale_tail_repeats_receipt_without_native_credit_or_sende
         .ok_or("fresh wire")?
         .to_vec();
     receiver.confirm_feedback(fresh.id, protocol::Tick(10))?;
-    a.control(udp::ControlEvent::Ack(bytes), protocol::Tick(10))?;
+    a.control(
+        udp::ControlEvent::Ack(bytes),
+        protocol::Tick(10),
+        l2tunnel_flow_control::target::Micros(10_000),
+        l2tunnel_flow_control::target::Micros(10_000),
+    )?;
     assert_eq!(a.sender.as_ref().ok_or("sender")?.deadline(), None);
     assert_eq!(b.feedback.borrow().credit, 0);
     let mut device = Device::new(rt.layer);
@@ -595,10 +631,20 @@ fn owner_feedback_loss_stale_tail_repeats_receipt_without_native_credit_or_sende
     b.deliver(&mut device, &mut b_pipeline, || Ok(protocol::Tick(11)))?;
     assert_eq!(device.change(|s| s.delivered.clone())?, vec![input]);
     assert_eq!(b.feedback.borrow().credit, 1);
-    a.control(udp::ControlEvent::Credit(1), protocol::Tick(11))?;
+    a.control(
+        udp::ControlEvent::Credit(1),
+        protocol::Tick(11),
+        l2tunnel_flow_control::target::Micros(11_000),
+        l2tunnel_flow_control::target::Micros(11_000),
+    )?;
     assert!(
-        a.control(udp::ControlEvent::Credit(2), protocol::Tick(11))
-            .is_err()
+        a.control(
+            udp::ControlEvent::Credit(2),
+            protocol::Tick(11),
+            l2tunnel_flow_control::target::Micros(11_000),
+            l2tunnel_flow_control::target::Micros(11_000)
+        )
+        .is_err()
     );
     Ok(())
 }
@@ -613,7 +659,12 @@ async fn actual_authenticated_wrong_scope_and_credit_cannot_enter_native_path() 
             CoverProfile::OpenVpnLike,
             Protection::HmacSha256,
         )?;
-        let config = small(Config::for_udp(rt, transport, 4)?);
+        let config = small(Config::for_udp(
+            rt,
+            transport,
+            4,
+            crate::rolling::config::test_delivery(rt),
+        )?);
         let (a, b, _relays) = udp_links(rt, transport, config, false).await?;
         let (mut parts, _) =
             a.0.into_bound_parts(udp_base_session_config(rt, transport, config)?)?;
@@ -666,7 +717,12 @@ async fn actual_blocked_native_expires_at_original_handoff_without_delivery() ->
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let mut config = small(Config::for_udp(rt, transport, 4)?);
+    let mut config = small(Config::for_udp(
+        rt,
+        transport,
+        4,
+        crate::rolling::config::test_delivery(rt),
+    )?);
     config.scheduler.recovery.handoff_ticks = 50;
     let (a_link, b_link, _relays) = udp_links(rt, transport, config, false).await?;
     let a = Device::new(rt.layer);
@@ -695,7 +751,12 @@ async fn rolling_flow_churn_preserves_full_half_recovery_native_and_reverse_affi
     for duplex in [Duplex::Full, Duplex::Half] {
         let rt = runtime(PacketLayer::Ip);
         let transport = udp_transport(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?;
-        let mut config = small(Config::for_udp(rt, transport, 4)?);
+        let mut config = small(Config::for_udp(
+            rt,
+            transport,
+            4,
+            crate::rolling::config::test_delivery(rt),
+        )?);
         config.pipeline.flows.capacity = 4;
         config.pipeline.flows.idle_timeout = Duration::from_millis(10);
         let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;

@@ -269,7 +269,13 @@ mod tests {
             1500,
             false,
         )?;
-        let r = l2tunnel_runtime::rolling::Config::for_udp(c.runtime(), p, 4)?;
+        let settings = crate::rolling::Settings::from_json(include_bytes!("test-policy.json"))?;
+        let r = l2tunnel_runtime::rolling::Config::for_udp(
+            c.runtime(),
+            p,
+            4,
+            settings.delivery(c.max_packet)?,
+        )?;
         let observer = crate::rolling::Observer::new(
             c,
             r,

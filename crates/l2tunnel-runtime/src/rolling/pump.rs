@@ -1,4 +1,5 @@
 use super::*;
+use l2tunnel_flow_control::target::Micros;
 
 pub(super) async fn run_parts<D, C, S, R>(
     mut device: D,
@@ -27,6 +28,7 @@ where
         udp::SharedBudget::from_policy_feedback(policy, started, scheduler::FEEDBACK_BYTES)?;
     let (control_tx, mut control_rx) = mpsc::channel(8);
     let (data_tx, mut data_rx) = mpsc::channel(config.scheduler.recovery.window * parts.len());
+    let (sent_tx, mut sent_rx) = mpsc::channel(parts.len());
     let mut states = Vec::new();
     let mut setup = Vec::new();
     // Construct all fallible protocol owners before spawning any carrier task.
@@ -56,7 +58,7 @@ where
     let mut tasks = JoinSet::new();
     for (index, (part, changes, output)) in setup.into_iter().enumerate() {
         let (reader, writer) = tokio::io::split(part.control);
-        tasks.spawn(udp::read_control_bound(
+        tasks.spawn(udp::read_control_bound_timed(
             reader,
             index,
             control_tx.clone(),
@@ -79,9 +81,10 @@ where
             ));
         }
         if let Some(output) = output {
-            tasks.spawn(udp::write_datagrams(part.sender, output));
+            tasks.spawn(write_datagrams(part.sender, output, index, sent_tx.clone()));
         }
     }
+    drop(sent_tx);
     drop(control_tx);
     drop(data_tx);
     let mut ticker = interval(runtime.poll_interval);
@@ -98,7 +101,8 @@ where
                     Ok(Err(error)) => Err(error), Err(error) => Err(io::Error::other(error)),
                     Ok(Ok(())) => Err(invalid("rolling carrier task ended")),
                 },
-                Some((lane,event)) = control_rx.recv() => states[lane].control(event,ticks(started.elapsed())?)?,
+                Some((lane,event,received_at)) = control_rx.recv() => states[lane].control(event,ticks(started.elapsed())?,micros(started,received_at)?,micros(started,Instant::now())?)?,
+                Some((lane,ordinal,sent_at))=sent_rx.recv()=>states[lane].first_flight(ordinal,micros(started,sent_at)?,micros(started,Instant::now())?)?,
                 Some((lane,bytes)) = data_rx.recv() => states[lane].data(&bytes,ticks(started.elapsed())?,config)?,
                 _ = ticker.tick() => (),
             }
@@ -106,18 +110,20 @@ where
             ingress_step(&mut device, &mut pipeline, &mut ingress, &mut packet, runtime, config, started.elapsed())?;
             for _ in 0..config.passes_per_turn {
                 for state in &mut states {
-                    state.service(ticks(started.elapsed())?, config)?;
+                    state.service_at(ticks(started.elapsed())?, config,micros(started,Instant::now())?)?;
                     state.deliver(&mut device, &mut pipeline, || ticks(started.elapsed()))?;
                     state.reassemble(runtime, config, ticks(started.elapsed())?)?;
                     if state.sender.is_some() {
                         if selected.is_none() { selected = pipeline.dequeue().map_err(io::Error::other)?; }
-                        if let Some(item) = &selected && state.admit(item, runtime)? { selected = None; }
+                        if let Some(item) = &selected && state.admit(item,micros(started,Instant::now())?)? { selected = None; }
                         state.submit(ticks(started.elapsed())?)?;
                     }
+                    let mut queued=None;
                     if let Some(outbound) = &state.outbound {
                         match outbound.try_reserve() {
                             Ok(permit) => {
                                 let now = started.elapsed();
+                                let mut emitted=None;
                                 let sender = state.sender.as_mut().ok_or_else(|| invalid("rolling missing sender"))?;
                                 if let Some(length) = budget.poll_with(false, now, &mut encoded, |output, allowance| {
                                     let Some(value) = sender.pending_output() else { return Ok(None); };
@@ -128,14 +134,21 @@ where
                                         return Err(invalid("rolling encoded length differs from charged fixed width"));
                                     }
                                     sender.confirm_output(id, ticks(now)?).map_err(io::Error::other)?;
+                                    emitted=Some(id);
                                     allowance.packets -= 1; allowance.wire_bytes -= length;
                                     Ok(Some(length))
-                                })? { permit.send(encoded[..length].to_vec()); }
+                                })? {
+                                    let id=emitted.ok_or_else(||invalid("rolling output identity missing"))?;
+                                    let native_complete=state.completion(id);
+                                    permit.send(owner::Outbound{bytes:encoded[..length].to_vec(),native_complete});
+                                    queued=Some(id);
+                                }
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => (),
                             Err(mpsc::error::TrySendError::Closed(_)) => return Err(invalid("rolling data writer closed")),
                         }
                     }
+                    if let Some(id)=queued { state.queued(id); }
                     if let Some(receiver) = &mut state.receiver {
                         let now = started.elapsed();
                         if let Some(length) = budget.poll_with(true, now, &mut encoded, |output, allowance| {
@@ -156,6 +169,40 @@ where
     while tasks.join_next().await.is_some() {}
     result
 }
+fn micros(origin: Instant, event: Instant) -> io::Result<Micros> {
+    let elapsed = event
+        .checked_duration_since(origin)
+        .ok_or_else(|| invalid("rolling delivery clock regression"))?;
+    Ok(Micros(
+        u64::try_from(elapsed.as_micros()).map_err(io::Error::other)?,
+    ))
+}
+async fn write_datagrams(
+    mut sender: impl DatagramSend,
+    mut output: mpsc::Receiver<owner::Outbound>,
+    lane: usize,
+    sent: mpsc::Sender<(usize, u64, Instant)>,
+) -> io::Result<()> {
+    while let Some(packet) = output.recv().await {
+        // Reserve the non-coalescing completion slot before physical handoff.
+        let permit = if packet.native_complete.is_some() {
+            Some(
+                sent.reserve()
+                    .await
+                    .map_err(|_| invalid("rolling first-flight consumer closed"))?,
+            )
+        } else {
+            None
+        };
+        sender.send(&packet.bytes).await?;
+        let completed = Instant::now();
+        if let (Some(ordinal), Some(permit)) = (packet.native_complete, permit) {
+            permit.send((lane, ordinal, completed));
+        }
+    }
+    Err(invalid("rolling datagram producer closed"))
+}
+
 fn ingress_step<D: PacketDevice<Error = io::Error>>(
     device: &mut D,
     pipeline: &mut Pipeline,
@@ -230,3 +277,7 @@ pub(super) fn retire_registration(
 #[cfg(test)]
 #[path = "flow_tests.rs"]
 mod flow_retirement_tests;
+
+#[cfg(test)]
+#[path = "first_flight_tests.rs"]
+mod first_flight_tests;

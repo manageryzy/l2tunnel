@@ -261,6 +261,7 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
         "/recovery/window",
         "/scheduling/feedback_packets",
         "/service/field_work",
+        "/delivery/forward_bandwidth_bps",
     ] {
         let mut missing = value.clone();
         let (parent, key) = pointer.rsplit_once('/').ok_or("pointer")?;
@@ -274,7 +275,7 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
             "missing {pointer}"
         );
     }
-    for parent in ["", "/recovery", "/scheduling", "/service"] {
+    for parent in ["", "/recovery", "/scheduling", "/service", "/delivery"] {
         let mut unknown = value.clone();
         unknown
             .pointer_mut(parent)
@@ -285,10 +286,11 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
     }
     let text = std::str::from_utf8(bytes)?;
     for (key, number) in [
-        ("version", "1"),
+        ("version", "2"),
         ("window", "8"),
         ("feedback_packets", "2"),
         ("field_work", "4096"),
+        ("forward_bandwidth_bps", "100000000"),
     ] {
         let duplicated = text.replacen(
             &format!("\"{key}\":{number}"),
@@ -299,12 +301,15 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
         assert!(Settings::from_json(duplicated.as_bytes()).is_err());
     }
     for (pointer, number) in [
-        ("/version", 2),
+        ("/version", 1),
         ("/channels", 0),
         ("/recovery/window", 129),
         ("/service/field_work", 0),
         ("/service/passes_per_turn", 65),
         ("/scheduling/repair_denominator", 0),
+        ("/delivery/forward_bandwidth_bps", 0),
+        ("/delivery/max_records", 8193),
+        ("/delivery/headroom_percent", 99),
     ] {
         let mut bad = value.clone();
         *bad.pointer_mut(pointer).ok_or("pointer")? = number.into();
@@ -364,6 +369,18 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
         ("/service/copy_work", 4095),
         ("/service/metadata_work", 4095),
         ("/service/passes_per_turn", 7),
+        ("/delivery/forward_bandwidth_bps", 100000001),
+        ("/delivery/reverse_bandwidth_bps", 10000001),
+        ("/delivery/bootstrap_rtt_micros", 70001),
+        ("/delivery/min_rtt_micros", 1001),
+        ("/delivery/max_rtt_micros", 2000001),
+        ("/delivery/headroom_percent", 126),
+        ("/delivery/minimum_bytes", 3201),
+        ("/delivery/max_inflight_bytes", 4194305),
+        ("/delivery/max_records", 8191),
+        ("/delivery/metadata_limit_bytes", 2097153),
+        ("/delivery/sample_ttl_micros", 4000001),
+        ("/delivery/flush_timeout_micros", 10000001),
     ] {
         let mut other = value.clone();
         *other.pointer_mut(pointer).ok_or("pointer")? = number.into();
