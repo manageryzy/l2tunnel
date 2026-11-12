@@ -91,11 +91,24 @@ fn vacant_staging_expiry_does_not_publish_or_renew_deadline() -> Result<(), Erro
     let c = config();
     let mut d = Decoder::new(c, scope(), Tick(0))?;
     d.begin_source(scope(), SourceId(0), &[4, 5], Tick(0))?;
-    for _ in 0..900 {
-        if !matches!(d.step(Tick(0), budget(1))?, DecodeStep::Pending(_)) {
+    // Hold actual partially stored unpublished bytes instead of relying on
+    // a dense-algebra iteration count that a systematic fast path removes.
+    for _ in 0..100_000 {
+        if matches!(
+            d.job.as_ref().ok_or(Error::Identity)?.phase,
+            Phase::Store { index: 1.., .. }
+        ) {
             break;
         }
+        assert!(matches!(
+            d.step(Tick(0), budget(1))?,
+            DecodeStep::Pending(_)
+        ));
     }
+    assert!(matches!(
+        d.job.as_ref().ok_or(Error::Identity)?.phase,
+        Phase::Store { index: 1.., .. }
+    ));
     assert_eq!(d.status().decoded_prefix, 0);
     assert!(d.pending_source().is_none());
     assert!(d.step(Tick(100), budget(1)).is_err());

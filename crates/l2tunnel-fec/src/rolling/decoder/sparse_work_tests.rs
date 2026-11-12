@@ -72,7 +72,7 @@ fn sparse_large_clean_original_does_not_snapshot_all_window_metadata() -> Result
         Begin::Staged
     );
     let work = finish(&mut decoder)?;
-    let bound = 5 * c.window + 3 * c.max_rows + 8 * c.width()? + 256;
+    let bound = 2 * c.width()? + 32;
     eprintln!(
         "sparse_clean_work copies={} field={} metadata={} metadata_bound={bound} memory={}",
         work.copies,
@@ -83,11 +83,13 @@ fn sparse_large_clean_original_does_not_snapshot_all_window_metadata() -> Result
     assert_eq!(decoder.pending_source(), Some((SourceId(0), &[11, 12][..])));
     assert_eq!(decoder.status().known_sources, 1);
     assert_eq!(decoder.status().rank, 0);
-    // Candidate clear/normalize/count and actual algebra scans remain charged;
-    // cloning known/pivot/map arrays and an unrelated full eviction scan do not.
+    // A rank-zero original validates/stores its exact vector and publishes its
+    // identity. Empty candidate/row algebra must not scale with W or max_rows.
+    assert_eq!(work.field, 0);
+    assert!(work.copies <= 2 * c.width()?);
     assert!(
         work.metadata <= bound,
-        "clean original copied configured metadata banks"
+        "clean original visited configured empty algebra capacity"
     );
     Ok(())
 }

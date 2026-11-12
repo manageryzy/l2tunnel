@@ -25,8 +25,9 @@ cells and copies only equation rows first mutated by a job. One preallocated
 transaction decision publishes those versions atomically; abort leaves the prior
 committed versions selected. Known payloads occupy one shared preallocated ring;
 staging never overwrites an identity still referenced by committed history.
-Rank-zero systematic input skips row copies. Unchanged rows and metadata are
-neither copied nor swept at publication. Fixed version descriptors and decision
+Rank-zero systematic input validates and stores its owned original vector without
+empty coefficient/row algebra. Unchanged rows and metadata are neither copied nor
+swept at publication. Fixed version descriptors and decision
 references/free slots are included in `Decoder::memory_bound` before allocation.
 Every useful repair end is bounded by decoded-prefix+W before work. Repairs ending
 at/before the decoded prefix are stale. Recovered source handoff is separate from
@@ -140,6 +141,7 @@ is supplied. Gates 06/07 remain open after this finite subgate.
 - [x] [MOD-LGR-06B] Implement causal bounded repair-credit/tail/identified cumulative feedback scheduling over actual rolling owners and wire; verify independent two-owner exact bytes under data/repair/feedback loss, reorder, output pressure, tiny work and original expiry. Evidence: [scoped exact-file receipt](../../work/rolling-scheduler16/validation.json), 49 FEC unit and 16 independent integration cases (13 scheduler / 3 existing stream), strict FEC lint/docs and formatting. New maintained-Python repair/feedback literals pin actual deficit/rank and full structural bytes; W8 budget1/17/65536 exchanges cross eight windows. This finite pure slice does not complete either parent gate.
 - [x] [MOD-LGR-06C] Remove complete known-payload bank copies while preserving bounded work, retained history and atomic recovery publication. Evidence: [focused optimization receipt](../../work/fix03-shared26/RECEIPT.md),69 FEC tests, strict Clippy and formatting; partial rank-positive recovery preserves exact committed payload/rows/identities through original expiry. At G8192/width1450 the reservation drops23,756,800 bytes. This is a pure-module checkpoint; FIX-03 still requires measured large-window service cost and runtime qualification.
 - [x] [MOD-LGR-06D] Remove whole-capacity equation and metadata transaction snapshots with preallocated two-version cells, first-mutation row copies and constant-size publish/abort. Verify actual W8192/2048-row clean and rank-one work, repeated Capacity rollback/retry, partial-copy original expiry, delayed-handoff ring wrap and commit-token reuse/exhaustion. Evidence: [scoped before/after report](../../work/rolling-sparse29/REPORT.md), [exact receipt](../../work/rolling-sparse29/validation.json). This pure work reduction leaves the runtime global-support128 guard, remaining algebra/window scans and FIX-03/FIX-09 parent gates open.
+- [x] [MOD-LGR-06E] Bypass empty coefficient/row algebra only for a staged systematic original with committed rank zero, reusing exact length/padding validation, budgeted known storage and atomic publication. Verify width-only work across three window/row geometries; genuine equation-to-zero-rank transition followed by fast original, later repair and ring reuse; partial-store expiry and handoff pressure. Evidence: [before/after report](../../work/rolling-fast30/REPORT.md), [focused receipt](../../work/rolling-fast30/validation.json). Runtime global support128 and FIX-03/FIX-09 native/performance gates remain unchanged.
 - [ ] [MOD-LGR-07] Integrate explicit aligned/packed selection, runtime/client/native qualification and complete Python family parity.
 
 The implementation checks the configured reservation before allocating two row
@@ -154,8 +156,10 @@ Nonwrapping transaction serial exhaustion is checked before decision allocation.
 A cursor evicts only newly expired known identities, including prefix advancement
 that occurred during idle handoff service. Row copies and GF elimination advance
 under separate byte, field and metadata budgets; a budget of one still progresses.
-Candidate clearing, coefficient normalization/reduction/counting and row scans
-remain dense work. W8192 native service rates and matched Python throughput remain
+For repairs and rank-positive source jobs, candidate clearing, coefficient
+normalization/reduction/counting and row scans remain dense work. Rank-zero
+systematic input uses only the original vector and common publication phases;
+actual prefix advancement and expired-identity eviction remain budgeted work. W8192 native service rates and matched Python throughput remain
 unqualified; finite work counters are not CPU or real-kernel measurements.
 
 Independent received-byte fixtures use literal maintained Python GF equations,

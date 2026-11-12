@@ -132,6 +132,9 @@ enum Phase {
 struct Job {
     ticket: Ticket,
     resume: Option<Phase>,
+    // Only authenticated originals with no unresolved equation may bypass
+    // candidate algebra. The existing input vector retains exact length/padding.
+    systematic: bool,
     input: Input,
     phase: Phase,
     deadline: Tick,
@@ -338,11 +341,25 @@ impl Decoder {
         self.active = Some(ticket);
         self.shadow = self.live;
         self.shadow.observed = self.shadow.observed.max(input.end());
+        let systematic = matches!(input, Input::Source(_)) && self.live.rank == 0;
+        let phase = if let Input::Source(id) = input
+            && systematic
+        {
+            Phase::Validate {
+                row: None,
+                id,
+                index: 0,
+                length: 0,
+            }
+        } else {
+            Phase::Clear(0)
+        };
         self.job = Some(Job {
             ticket,
             resume: None,
+            systematic,
             input,
-            phase: Phase::Clear(0),
+            phase,
             deadline: job_end,
             debt,
             recovered: 0,
@@ -524,9 +541,15 @@ impl Decoder {
         }
         Ok(())
     }
-    fn payload_byte(&self, row: Option<usize>, index: usize) -> Result<u8, Error> {
+    fn payload_byte(
+        &self,
+        row: Option<usize>,
+        index: usize,
+        systematic: bool,
+    ) -> Result<u8, Error> {
         match row {
             Some(row) => self.row_byte(row, self.config.window + index),
+            None if systematic => Ok(self.input[index]),
             None => Ok(self.candidate[self.config.window + index]),
         }
     }
@@ -930,8 +953,8 @@ impl Decoder {
             } => {
                 if index == 0 {
                     let length = usize::from(u16::from_be_bytes([
-                        self.payload_byte(row, 0)?,
-                        self.payload_byte(row, 1)?,
+                        self.payload_byte(row, 0, job.systematic)?,
+                        self.payload_byte(row, 1, job.systematic)?,
                     ]));
                     if length == 0 || length > self.config.max_payload {
                         return Err(Error::Length);
@@ -964,7 +987,7 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    if index >= length + 2 && self.payload_byte(row, index)? != 0 {
+                    if index >= length + 2 && self.payload_byte(row, index, job.systematic)? != 0 {
                         return Err(Error::Length);
                     }
                     job.phase = Phase::Validate {
@@ -992,6 +1015,10 @@ impl Decoder {
                             index: 0,
                             count: 0,
                         };
+                    } else if job.systematic {
+                        // Rank was zero at admission and this path never adds a
+                        // row. Shared prefix/eviction/publication still run.
+                        job.phase = Phase::Advance;
                     } else {
                         job.phase = Phase::Scan {
                             row: 0,
@@ -1003,7 +1030,7 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    let value = self.payload_byte(row, index)?;
+                    let value = self.payload_byte(row, index, job.systematic)?;
                     // Both identity banks proved this slot unreferenced. Partial
                     // payload writes are invisible until the identity bank commits.
                     self.known_data[slot * width + index] = value;
@@ -1223,3 +1250,6 @@ mod tests;
 
 #[cfg(test)]
 mod sparse_work_tests;
+
+#[cfg(test)]
+mod systematic_work_tests;
