@@ -181,13 +181,16 @@ impl State {
         })
     }
     pub fn reclaim_outbound(&mut self) -> io::Result<()> {
-        while let Ok(bytes) = self.recycled_outbound.try_recv() {
+        while let Ok(mut bytes) = self.recycled_outbound.try_recv() {
             if self.free_outbound.len() >= 2
-                || bytes.len() != self.outbound_capacity
+                || bytes.len() > self.outbound_capacity
                 || bytes.capacity() < self.outbound_capacity
             {
                 return Err(invalid("rolling outbound buffer ownership bound"));
             }
+            // An exact source record is shorter than the slot. Restore the full
+            // reserved length inside the retained allocation before reuse.
+            bytes.resize(self.outbound_capacity, 0);
             self.free_outbound.push(bytes);
         }
         Ok(())
@@ -227,8 +230,12 @@ impl State {
         Ok(())
     }
     pub fn data(&mut self, bytes: &[u8], now: protocol::Tick, config: Config) -> io::Result<()> {
-        let scope = match protocol::wire::inspect(config.scheduler.recovery, bytes)
-            .map_err(io::Error::other)?
+        let scope = match protocol::wire::inspect_with(
+            config.scheduler.recovery,
+            config.scheduler.source_wire,
+            bytes,
+        )
+        .map_err(io::Error::other)?
         {
             protocol::wire::View::Source { scope, .. } => scope,
             protocol::wire::View::Repair(value) => value.scope,

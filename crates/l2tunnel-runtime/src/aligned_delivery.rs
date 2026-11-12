@@ -283,8 +283,8 @@ pub(super) async fn write_datagrams<S: DatagramSend>(
                     .map_err(|_| invalid("aligned send observer closed"))?,
             )
         };
-        sender.send(&packet.bytes).await?;
-        let at = Instant::now();
+        let receipt = sender.send(&packet.bytes).await?;
+        let at = receipt.validate(packet.bytes.len(), S::BOUNDARY, Instant::now())?;
         if let Some(permit) = permit {
             permit.send(Sent {
                 lane,

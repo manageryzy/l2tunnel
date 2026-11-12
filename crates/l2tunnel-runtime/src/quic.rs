@@ -1,8 +1,9 @@
 //! Fixed native packet runtime over genuine UDP-only QUIC, independent of custom covers.
 //! The bounded recovery/device pump is shared with UDP; QUIC owns outer congestion control.
-use super::udp::{self, DatagramParts, DatagramPolicy, DatagramReceive, DatagramSend};
+use super::udp::{self, DatagramPolicy};
 pub use super::udp::{Lane, RecoveryMode, WireBudget};
 use super::{Compression, Duplex, RuntimeConfig, invalid};
+use crate::datagram::{DatagramParts, DatagramReceive, DatagramSend, DatagramSent, SendBoundary};
 use l2tunnel_auth::{Direction, SessionConfig, SessionInfo};
 use l2tunnel_core::ConfigDigest;
 use l2tunnel_device::PacketDevice;
@@ -563,11 +564,17 @@ pub async fn server_pair(
     pair(first, second, runtime, config, false, delivery).await
 }
 impl DatagramSend for DatagramSender {
-    async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::QuicDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<DatagramSent> {
         DatagramSender::send(self, bytes)
             .await
-            .map(|_| ())
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        Ok(DatagramSent {
+            actual_at: tokio::time::Instant::now(),
+            payload_bytes: bytes.len(),
+            boundary: SendBoundary::QuicDatagramAccepted,
+        })
     }
 }
 impl DatagramReceive for DatagramReceiver {

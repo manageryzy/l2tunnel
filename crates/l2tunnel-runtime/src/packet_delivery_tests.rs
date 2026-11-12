@@ -161,13 +161,19 @@ struct Sender {
     attempts: Arc<AtomicUsize>,
     fail: bool,
 }
-impl crate::udp::DatagramSend for Sender {
-    async fn send(&mut self, _bytes: &[u8]) -> io::Result<()> {
+impl crate::datagram::DatagramSend for Sender {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             Err(io::Error::other("deliberate send failure"))
         } else {
-            Ok(())
+            Ok(crate::datagram::DatagramSent {
+                actual_at: tokio::time::Instant::now(),
+                payload_bytes: bytes.len(),
+                boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+            })
         }
     }
 }
@@ -252,12 +258,18 @@ async fn owned_writer_recycles_original_allocation_and_preserves_exact_lengths()
         next: u8,
         pointer: usize,
     }
-    impl crate::udp::DatagramSend for ExactSender {
-        async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+    impl crate::datagram::DatagramSend for ExactSender {
+        const BOUNDARY: crate::datagram::SendBoundary =
+            crate::datagram::SendBoundary::OsDatagramAccepted;
+        async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
             assert_eq!(bytes.as_ptr() as usize, self.pointer);
             assert_eq!(bytes, vec![self.next; usize::from(self.next) + 1]);
             self.next += 1;
-            Ok(())
+            Ok(crate::datagram::DatagramSent {
+                actual_at: tokio::time::Instant::now(),
+                payload_bytes: bytes.len(),
+                boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+            })
         }
     }
     let (tx, rx) = mpsc::channel(1);
@@ -307,5 +319,108 @@ fn configured8192_metadata_backing_accounting_is_explicit() -> Result<(), Box<dy
         "flight_backing_bytes: controller={controller} entries={entries} bitmaps={bitmaps} total={}",
         controller + entries + bitmaps
     );
+    Ok(())
+}
+
+/// Test-only actor-backed adapter: successful real OS handoff happens before its
+/// caller is permitted to observe completion. No timestamp is created at wakeup.
+struct DelayedUdpCompletion {
+    socket: tokio::net::UdpSocket,
+    peer: std::net::SocketAddr,
+    original: Option<tokio::sync::oneshot::Sender<crate::datagram::DatagramSent>>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl crate::datagram::DatagramSend for DelayedUdpCompletion {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
+        let length = self.socket.send_to(bytes, self.peer).await?;
+        if length != bytes.len() {
+            return Err(io::Error::other("partial actual UDP handoff"));
+        }
+        let receipt = crate::datagram::DatagramSent {
+            actual_at: Instant::now(),
+            payload_bytes: length,
+            boundary: Self::BOUNDARY,
+        };
+        self.original
+            .take()
+            .ok_or_else(|| invalid("one original completion owner"))?
+            .send(receipt)
+            .map_err(|_| invalid("original completion observer closed"))?;
+        self.release.notified().await;
+        Ok(receipt)
+    }
+}
+#[tokio::test]
+async fn actual_udp_send_timestamp_survives_delayed_adapter_completion_without_buffer_copy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let source = socket.local_addr()?;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (original, original_rx) = tokio::sync::oneshot::channel();
+    let (packets, input) = mpsc::channel(1);
+    let (events, mut observed) = mpsc::channel(1);
+    let (returned, mut buffers) = mpsc::channel(1);
+    let task = tokio::spawn(write(
+        DelayedUdpCompletion {
+            socket,
+            peer: peer.local_addr()?,
+            original: Some(original),
+            release: release.clone(),
+        },
+        input,
+        events,
+        0,
+        returned,
+    ));
+    let buffer = vec![7; 128];
+    let pointer = buffer.as_ptr() as usize;
+    let capacity = buffer.capacity();
+    packets
+        .send(Packet {
+            bytes: buffer,
+            length: 3,
+            witness: Some(Witness {
+                ordinal: 1,
+                index: 0,
+            }),
+        })
+        .await?;
+    let mut received = [0; 16];
+    let (length, from) = tokio::time::timeout_at(deadline, peer.recv_from(&mut received)).await??;
+    assert_eq!((length, from), (3, source));
+    assert_eq!(&received[..length], &[7; 3]);
+    let actual = tokio::time::timeout_at(deadline, original_rx).await??;
+    assert_eq!(
+        actual.boundary,
+        crate::datagram::SendBoundary::OsDatagramAccepted
+    );
+    assert_eq!(actual.payload_bytes, 3);
+    assert!(observed.try_recv().is_err());
+    assert!(buffers.try_recv().is_err());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let released_at = Instant::now();
+    release.notify_one();
+    let event = tokio::time::timeout_at(deadline, observed.recv())
+        .await?
+        .ok_or("send event")?;
+    assert_eq!(
+        event.at, actual.actual_at,
+        "waiter wake time must not replace OS handoff time"
+    );
+    assert!(event.at < released_at);
+    assert_eq!(event.lane, 0);
+    let (lane, buffer) = tokio::time::timeout_at(deadline, buffers.recv())
+        .await?
+        .ok_or("original buffer")?;
+    assert_eq!(lane, 0);
+    assert_eq!(buffer.as_ptr() as usize, pointer);
+    assert_eq!(buffer.capacity(), capacity);
+    assert_eq!(buffer.len(), 128);
+    task.abort();
+    let _ = task.await;
     Ok(())
 }

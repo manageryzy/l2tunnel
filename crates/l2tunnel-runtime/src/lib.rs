@@ -4,6 +4,7 @@ pub mod active;
 /// Canonical policy/catalog binding for planned coordinated active-TUN switching.
 pub mod active_management;
 mod control;
+mod datagram;
 /// Separate authenticated finite native/retained-TLS shutdown profile.
 pub mod drained;
 /// Authenticated runtime with bounded coordinated compression hot switching.

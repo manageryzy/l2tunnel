@@ -218,12 +218,18 @@ struct Sender {
     fail: bool,
 }
 impl DatagramSend for Sender {
-    async fn send(&mut self, _: &[u8]) -> io::Result<()> {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail {
             Err(io::ErrorKind::BrokenPipe.into())
         } else {
-            Ok(())
+            Ok(crate::datagram::DatagramSent {
+                actual_at: tokio::time::Instant::now(),
+                payload_bytes: bytes.len(),
+                boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+            })
         }
     }
 }

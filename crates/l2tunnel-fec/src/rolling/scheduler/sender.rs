@@ -211,8 +211,40 @@ impl Sender {
                 scope,
                 id,
                 original,
-            } => wire::encode_source(self.policy.recovery, scope, id, original, output),
-            Output::Repair(repair) => wire::encode_repair(self.policy.recovery, repair, output),
+            } => wire::encode_source_with(
+                self.policy.recovery,
+                self.policy.source_wire,
+                scope,
+                id,
+                original,
+                output,
+            ),
+            Output::Repair(repair) => wire::encode_repair_with(
+                self.policy.recovery,
+                self.policy.source_wire,
+                repair,
+                output,
+            ),
+        }
+    }
+    /// Exact length `encode_pending` would write for the current immutable output.
+    /// Polling changes nothing; charge this before reserving carrier allowance.
+    pub fn pending_wire_len(&self) -> Result<Option<usize>, Error> {
+        match self.pending_output() {
+            None => Ok(None),
+            Some(Output::Source { original, .. }) => wire::source_len(
+                self.policy.recovery,
+                self.policy.source_wire,
+                original.len(),
+            )
+            .map(Some),
+            Some(Output::Repair(_)) => self
+                .policy
+                .recovery
+                .width()?
+                .checked_add(wire::HEADER_BYTES)
+                .map(Some)
+                .ok_or(Error::Length),
         }
     }
     /// Confirm complete caller handoff of this identity, earning source credit or retiring repair.

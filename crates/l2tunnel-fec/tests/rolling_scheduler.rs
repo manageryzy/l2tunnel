@@ -37,6 +37,7 @@ fn policy() -> Policy {
         feedback_ticks: 3,
         feedback_packets: 4,
         memory_bytes: 1 << 20,
+        source_wire: rolling::wire::SourceWire::Padded,
     }
 }
 fn work(n: usize) -> WorkBudget {
@@ -61,7 +62,10 @@ fn original(id: u32) -> Vec<u8> {
 fn packet(sender: &Sender) -> Result<(OutputId, Vec<u8>)> {
     let id = sender.pending_output().ok_or("output absent")?.id();
     let mut bytes = vec![0; rolling::wire::HEADER_BYTES + policy().recovery.width()?];
-    sender.encode_pending(&mut bytes)?;
+    let length = sender.encode_pending(&mut bytes)?;
+    // The charged length is exactly what the selected source format emits.
+    assert_eq!(sender.pending_wire_len()?, Some(length));
+    bytes.truncate(length);
     Ok((id, bytes))
 }
 fn drive_sender(sender: &mut Sender, now: Tick, n: usize) -> Result {
@@ -98,8 +102,21 @@ fn source_wire(id: SourceId, original: &[u8]) -> Result<Vec<u8>> {
 
 #[test]
 fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss() -> Result {
-    for units in [1, 17, 65_536] {
-        let p = policy();
+    use rolling::wire::SourceWire;
+    for (units, source_wire) in [
+        (1, SourceWire::Padded),
+        (17, SourceWire::Padded),
+        (65_536, SourceWire::Padded),
+        (1, SourceWire::Exact),
+        (17, SourceWire::Exact),
+        (65_536, SourceWire::Exact),
+    ] {
+        let p = Policy {
+            source_wire,
+            ..policy()
+        };
+        let full = rolling::wire::HEADER_BYTES + p.recovery.width()?;
+        let mut short_sources = 0;
         let mut sender = Sender::new(p, scope(), Tick(0))?;
         let mut receiver = Receiver::new(p, scope(), Tick(0))?;
         let mut admitted = 0;
@@ -127,12 +144,24 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                 // WouldBlock: no confirmation and no new output identity/bytes.
                 if round % 13 != 2 {
                     let lose = match output {
-                        Output::Source { id, .. } => {
+                        Output::Source { id, original, .. } => {
+                            // Padded records are always full width. Exact ones
+                            // carry only the header, length and original bytes.
+                            assert_eq!(
+                                bytes.len(),
+                                match source_wire {
+                                    SourceWire::Padded => full,
+                                    SourceWire::Exact =>
+                                        rolling::wire::HEADER_BYTES + 2 + original.len(),
+                                }
+                            );
+                            short_sources += usize::from(bytes.len() < full);
                             let lose = id.0 % 5 == 0 || id.0 % 7 == 3;
                             dropped[0] += usize::from(lose);
                             lose
                         }
                         Output::Repair(r) => {
+                            assert_eq!(bytes.len(), full, "repairs are never trimmed");
                             tails += usize::from(r.support.tail);
                             let lose = r.id.0 % 4 == 1;
                             dropped[1] += usize::from(lose);
@@ -203,6 +232,7 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
             if delivered == 64 && sender.status().encoder.confirmed_prefix == 64 {
                 assert!(dropped.iter().all(|count| *count > 0));
                 assert!(tails > 0);
+                assert_eq!(short_sources > 0, source_wire == SourceWire::Exact);
                 assert_eq!(sender.deadline(), None);
                 break;
             }

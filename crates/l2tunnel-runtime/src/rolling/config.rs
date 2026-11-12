@@ -80,6 +80,7 @@ impl Config {
                 feedback_ticks: 5,
                 feedback_packets: 4,
                 memory_bytes: 32 << 20,
+                source_wire: protocol::wire::SourceWire::Padded,
             },
             pipeline: PipelineConfig {
                 profile: match runtime.layer {
@@ -195,9 +196,18 @@ impl Config {
     }
     pub(super) fn bind(self, base: SessionConfig) -> io::Result<SessionConfig> {
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        hash.update(
-            b"l2tunnel/rolling-frame-policy/v2/millisecond-ticks/l2rw1/l2rf1/lx1/channel-u16\0",
-        );
+        // The padded label is the unchanged original identity. Exact source
+        // records are a distinct authenticated policy, never a silent variant.
+        hash.update(match self.scheduler.source_wire {
+            protocol::wire::SourceWire::Padded => {
+                b"l2tunnel/rolling-frame-policy/v2/millisecond-ticks/l2rw1/l2rf1/lx1/channel-u16\0"
+                    .as_slice()
+            }
+            protocol::wire::SourceWire::Exact => {
+                b"l2tunnel/rolling-frame-policy/v2/millisecond-ticks/l2rw2-exact-source/l2rf1/lx1/channel-u16\0"
+                    .as_slice()
+            }
+        });
         hash.update(&self.delivery.canonical()?);
         let c = self.scheduler.recovery;
         for value in [

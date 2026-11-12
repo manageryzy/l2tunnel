@@ -162,6 +162,8 @@ struct Observations {
     dropped: AtomicUsize,
     reordered: AtomicUsize,
     largest: AtomicUsize,
+    packets: AtomicUsize,
+    bytes: AtomicUsize,
 }
 struct Relays {
     tasks: JoinSet<io::Result<()>>,
@@ -188,6 +190,7 @@ impl Relays {
             loop {tokio::select! {
                 result=socket.recv_from(&mut input)=>{
                     let (length,source)=result?;observations.largest.fetch_max(length,Ordering::Relaxed);
+                    observations.packets.fetch_add(1,Ordering::Relaxed);observations.bytes.fetch_add(length,Ordering::Relaxed);
                     let destination=if source==server { if let Some(client)=client {client}else{continue} } else {client=Some(source);server};
                     count+=1;
                     if impair&&count.is_multiple_of(7) {observations.dropped.fetch_add(1,Ordering::Relaxed);continue;}
@@ -412,10 +415,66 @@ async fn actual_udp_rolling_tap_tun_full_half_covers_and_suites_with_loss_and_ba
                         relays.observations.largest.load(Ordering::Relaxed) + 28
                             <= transport.path_mtu
                     );
+                    // The original padded format sends every source and repair
+                    // at the one full protected width, however short the data.
+                    assert_eq!(
+                        relays.observations.bytes.load(Ordering::Relaxed),
+                        relays.observations.packets.load(Ordering::Relaxed)
+                            * relays.observations.largest.load(Ordering::Relaxed)
+                    );
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn actual_udp_exact_source_wire_recovers_mixed_sizes_and_real_zero_tails_with_less_wire()
+-> TestResult {
+    for duplex in [Duplex::Full, Duplex::Half] {
+        for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
+            let rt = runtime(layer);
+            let transport = udp_transport(
+                duplex,
+                CoverProfile::OpenVpnLike,
+                Protection::ChaCha20Poly1305,
+            )?;
+            let mut config = small(Config::for_udp(
+                rt,
+                transport,
+                4,
+                crate::rolling::config::test_delivery(rt),
+            )?);
+            config.scheduler.source_wire = protocol::wire::SourceWire::Exact;
+            let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
+            let a = Device::new(layer);
+            let b = Device::new(layer);
+            let mut tasks = JoinSet::new();
+            tasks.spawn(run_udp(a.clone(), a_link, rt, transport, config));
+            tasks.spawn(run_udp(b.clone(), b_link, rt, transport, config));
+            // Add native packets whose final bytes are genuine zeros: an exact
+            // record must carry them, not confuse them with removed padding.
+            let mut input = frames(layer)?;
+            for (value, length) in [(9, 300), (10, 1500)] {
+                let mut zero_tail = packet(layer, value, length);
+                let start = zero_tail.len() - 40;
+                zero_tail[start..].fill(0);
+                input.push(zero_tail);
+            }
+            exercise(&a, &b, &mut tasks, &input).await?;
+            let seen = &relays.observations;
+            assert!(seen.dropped.load(Ordering::Relaxed) > 0);
+            assert!(seen.reordered.load(Ordering::Relaxed) > 0);
+            let largest = seen.largest.load(Ordering::Relaxed);
+            assert!(largest + 28 <= transport.path_mtu);
+            // Short final fragments are no longer inflated to the full width.
+            assert!(
+                seen.bytes.load(Ordering::Relaxed) < seen.packets.load(Ordering::Relaxed) * largest
+            );
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
         }
     }
     Ok(())
@@ -462,9 +521,10 @@ fn full_policy_is_bound_and_geometry_rejected_before_authentication() -> TestRes
     )?);
     let base = udp_base_session_config(rt, transport, config)?;
     assert_ne!(base, udp::transport_session_config(rt, transport)?);
-    for mutation in 0..13 {
+    for mutation in 0..14 {
         let mut changed = config;
         match mutation {
+            13 => changed.scheduler.source_wire = protocol::wire::SourceWire::Exact,
             0 => changed.epoch += 1,
             1 => changed.stream += 1,
             2 => changed.scheduler.repair_numerator = 2,

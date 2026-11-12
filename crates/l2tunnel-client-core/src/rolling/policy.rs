@@ -40,6 +40,25 @@ struct Scheduling {
     feedback_millis: u64,
     feedback_packets: u32,
     memory_bytes: usize,
+    /// Absent means the original padded records, so existing policy files keep
+    /// their exact authenticated identity. Both peers must select the same value.
+    #[serde(default, skip_serializing_if = "SourceWire::is_padded")]
+    source_wire: SourceWire,
+}
+/// Explicit systematic-source record format of the rolling wire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SourceWire {
+    /// Version-one records with the complete zero-padded source vector.
+    #[default]
+    Padded,
+    /// Version-two source records ending after the exact original bytes.
+    Exact,
+}
+impl SourceWire {
+    fn is_padded(&self) -> bool {
+        *self == Self::Padded
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,7 +102,15 @@ impl Settings {
             feedback_ticks: s.feedback_millis,
             feedback_packets: s.feedback_packets,
             memory_bytes: s.memory_bytes,
+            source_wire: match s.source_wire {
+                SourceWire::Padded => fec::wire::SourceWire::Padded,
+                SourceWire::Exact => fec::wire::SourceWire::Exact,
+            },
         }
+    }
+    #[cfg(test)]
+    pub(super) fn apply_scheduler_for_test(&self) -> scheduler::Policy {
+        self.policy()
     }
     fn scalars(&self) -> io::Result<()> {
         self.policy()

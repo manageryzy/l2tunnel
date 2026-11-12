@@ -3,6 +3,7 @@
 //! reload are unsupported. Existing frame/fragment runtime profiles are unchanged.
 
 use super::{Compression, Duplex, RuntimeConfig, invalid, packet_valid, quic, udp};
+use crate::datagram::{DatagramParts, DatagramReceive, DatagramSend};
 use l2tunnel_aligned::{self as protocol, NativePolicy};
 use l2tunnel_auth::SessionConfig;
 use l2tunnel_codec::{aligned_body, aligned_receiver};
@@ -17,7 +18,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, MissedTickBehavior, interval},
 };
-use udp::{DatagramParts, DatagramPolicy, DatagramReceive, DatagramSend, Lane};
+use udp::{DatagramPolicy, Lane};
 #[path = "aligned_delivery.rs"]
 mod delivery;
 #[path = "aligned_owner.rs"]

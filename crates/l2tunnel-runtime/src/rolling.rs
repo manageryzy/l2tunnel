@@ -1,6 +1,7 @@
 //! Explicit fixed rolling-frame recovery over retained authenticated UDP/QUIC owners.
 //! No existing carrier profile, runtime default or client mode is changed.
 use super::{Duplex, RuntimeConfig, invalid, packet_valid, quic, udp};
+use crate::datagram::{DatagramParts, DatagramReceive, DatagramSend};
 use l2tunnel_auth::SessionConfig;
 use l2tunnel_codec::{
     FRAGMENT_HEADER_BYTES, FragmentConfig, FragmentContext, Fragmenter, MessageId, Reassembler,
@@ -17,7 +18,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, MissedTickBehavior, interval},
 };
-use udp::{DatagramParts, DatagramPolicy, DatagramReceive, DatagramSend, Lane};
+use udp::{DatagramPolicy, Lane};
 mod config;
 pub use config::Config;
 mod owner;

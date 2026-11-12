@@ -10,13 +10,19 @@ struct Sender {
     fail: bool,
 }
 impl DatagramSend for Sender {
-    async fn send(&mut self, _: &[u8]) -> io::Result<()> {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
         self.entered.store(true, Ordering::SeqCst);
         self.release.notified().await;
         if self.fail {
             Err(io::Error::other("injected datagram send failure"))
         } else {
-            Ok(())
+            Ok(crate::datagram::DatagramSent {
+                actual_at: tokio::time::Instant::now(),
+                payload_bytes: bytes.len(),
+                boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+            })
         }
     }
 }
@@ -92,7 +98,9 @@ struct BlockedSender {
     release: Arc<Notify>,
 }
 impl DatagramSend for BlockedSender {
-    async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
         let original = bytes.to_vec();
         self.entered
             .send((bytes.as_ptr() as usize, original.clone()))
@@ -103,7 +111,11 @@ impl DatagramSend for BlockedSender {
             bytes, original,
             "writer-owned bytes changed while send was blocked"
         );
-        Ok(())
+        Ok(crate::datagram::DatagramSent {
+            actual_at: tokio::time::Instant::now(),
+            payload_bytes: bytes.len(),
+            boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+        })
     }
 }
 #[tokio::test]

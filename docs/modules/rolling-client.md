@@ -89,6 +89,7 @@ opens another socket just to furnish status.
 - [ ] [MOD-ROLLINGCL-05] Qualify separately selected native owned-lab/capture, large-window service and full Python-family behavior before closing parent gates.
 - [ ] [MOD-ROLLINGCL-06] Require and bind the version2 canonical bandwidth/RTT/byte/record delivery policy through the shared API, CLI and native harness. Reject old/missing/unknown policies and prove each field changes authentication; pass the actual carrier/layer/duplex matrix and root aggregate before accepting the replacement.
 - [x] [MOD-ROLLINGCL-07] Anchor the paired-QUIC deadline fixture to actual first-lane authentication and second-lane Initial, advancing the controlled clock across the original 200 ms deadline. Reject a renewed inner pairing budget and prove socket release. Evidence: [positive and negative fixture receipt](../../work/client-fixture-deadlines26b/validation.json). No production deadline was increased.
+- [x] [MOD-ROLLINGCL-08] Accept an optional `scheduling.source_wire` of `padded` or `exact` in the strict rolling policy. An absent field keeps the padded format and is not re-serialised, so existing policy files keep their authenticated identity; unknown values are rejected. Evidence: [policy test](../../crates/l2tunnel-client-core/src/rolling/tests.rs), [source34 aggregate](../../work/implementation-wave34/validation.json). The native rolling harness does not select the exact format yet.
 
 ## Finite evidence and operating boundary
 

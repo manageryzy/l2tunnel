@@ -1,6 +1,7 @@
 //! Fixed-mode native packets over authenticated UDP with bounded selective repeat.
 //! TLS remains the authenticated liveness, recovery-feedback and delivery-credit path.
 use super::{Compression, Duplex, RuntimeConfig, invalid, packet_valid};
+use crate::datagram::{DatagramParts, DatagramReceive, DatagramSend, DatagramSent, SendBoundary};
 use crate::managed::{DeliveryConfig, Role};
 use crate::packet_delivery as delivery;
 use l2tunnel_auth::SessionConfig;
@@ -579,21 +580,18 @@ impl Config {
         })
     }
 }
-pub(super) trait DatagramSend: Send + 'static {
-    fn send(&mut self, bytes: &[u8]) -> impl std::future::Future<Output = io::Result<()>> + Send;
-}
-pub(super) trait DatagramReceive: Send + 'static {
-    fn receive(
-        &mut self,
-        output: &mut [u8],
-    ) -> impl std::future::Future<Output = io::Result<Option<usize>>> + Send;
-}
 impl DatagramSend for UdpSender {
-    async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<DatagramSent> {
         UdpSender::send(self, bytes)
             .await
-            .map(|_| ())
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        Ok(DatagramSent {
+            actual_at: Instant::now(),
+            payload_bytes: bytes.len(),
+            boundary: SendBoundary::OsDatagramAccepted,
+        })
     }
 }
 impl DatagramReceive for UdpReceiver {
@@ -605,12 +603,7 @@ impl DatagramReceive for UdpReceiver {
         }
     }
 }
-pub(super) struct DatagramParts<C, S, R> {
-    pub session: [u8; 16],
-    pub control: C,
-    pub sender: S,
-    pub receiver: R,
-}
+
 struct Parts {
     control: Control,
     sender: UdpSender,
@@ -1374,6 +1367,51 @@ pub async fn run_observed<D: PacketDevice<Error = io::Error>>(
     observer: Option<delivery::Reporter>,
     delivery: DeliveryConfig,
 ) -> io::Result<()> {
+    run_base(
+        device,
+        link,
+        runtime,
+        config,
+        observer,
+        delivery,
+        Children::spawned(),
+    )
+    .await
+}
+/// Same protocol behavior as [`run_observed`], but every control/datagram reader
+/// and writer is owned inline by the returned future instead of a spawned task.
+/// Dropping that future therefore drops the original TLS control, UDP socket and
+/// device owners in the same call stack, which a lifecycle owner needs before it
+/// publishes release or rebinds the same addresses. All children then share one
+/// task's scheduling; this is not a throughput-equivalence claim.
+pub async fn run_observed_inline<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: Config,
+    observer: Option<delivery::Reporter>,
+    delivery: DeliveryConfig,
+) -> io::Result<()> {
+    run_base(
+        device,
+        link,
+        runtime,
+        config,
+        observer,
+        delivery,
+        Children::inline(),
+    )
+    .await
+}
+async fn run_base<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: Config,
+    observer: Option<delivery::Reporter>,
+    delivery: DeliveryConfig,
+    children: Children,
+) -> io::Result<()> {
     if link.binding != base_session_config(runtime, config, delivery)?
         || device.layer() != runtime.layer
     {
@@ -1393,7 +1431,7 @@ pub async fn run_observed<D: PacketDevice<Error = io::Error>>(
         .collect();
     let mut policy = config.policy()?;
     policy.control_magic = *b"L2U2";
-    run_datagrams(
+    run_datagrams_with(
         device,
         parts,
         link.initiator,
@@ -1401,10 +1439,113 @@ pub async fn run_observed<D: PacketDevice<Error = io::Error>>(
         policy,
         observer,
         delivery,
+        children,
     )
     .await
 }
+type Child = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>;
+/// Two lanes times control reader, control writer, datagram reader and writer.
+const MAX_CHILDREN: usize = 8;
+/// Owner of the per-lane I/O futures. `Spawned` keeps the original separate Tokio
+/// tasks, whose sockets are released asynchronously after the parent is dropped.
+/// `Inline` keeps the same futures inside the parent, so its drop releases them.
+enum Children {
+    Spawned(JoinSet<io::Result<()>>),
+    Inline { futures: Vec<Child>, next: usize },
+}
+impl Children {
+    fn spawned() -> Self {
+        Self::Spawned(JoinSet::new())
+    }
+    fn inline() -> Self {
+        Self::Inline {
+            futures: Vec::with_capacity(MAX_CHILDREN),
+            next: 0,
+        }
+    }
+    fn add(
+        &mut self,
+        future: impl std::future::Future<Output = io::Result<()>> + Send + 'static,
+    ) -> io::Result<()> {
+        match self {
+            Self::Spawned(set) => {
+                set.spawn(future);
+            }
+            Self::Inline { futures, .. } => {
+                if futures.len() >= MAX_CHILDREN {
+                    return Err(invalid("UDP inline child bound"));
+                }
+                futures.push(Box::pin(future));
+            }
+        }
+        Ok(())
+    }
+    /// First finished child, or `None` when no child remains. Inline children are
+    /// polled once each per parent wake, starting after the previous start so no
+    /// lane is always first. No clock is read and no timestamp is created here.
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<io::Result<()>>> {
+        use std::task::Poll;
+        match self {
+            Self::Spawned(set) => set.poll_join_next(cx).map(|joined| {
+                joined.map(|result| match result {
+                    Ok(result) => result,
+                    Err(error) => Err(io::Error::other(error)),
+                })
+            }),
+            Self::Inline { futures, next } => {
+                if futures.is_empty() {
+                    return Poll::Ready(None);
+                }
+                let count = futures.len();
+                let start = *next % count;
+                *next = (start + 1) % count;
+                for offset in 0..count {
+                    let index = (start + offset) % count;
+                    let Some(child) = futures.get_mut(index) else {
+                        continue;
+                    };
+                    if let Poll::Ready(result) = child.as_mut().poll(cx) {
+                        drop(futures.swap_remove(index));
+                        return Poll::Ready(Some(result));
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
 pub(super) async fn run_datagrams<D, C, S, R>(
+    device: D,
+    parts: Vec<DatagramParts<C, S, R>>,
+    initiator: bool,
+    runtime: RuntimeConfig,
+    config: DatagramPolicy,
+    observer: Option<delivery::Reporter>,
+    native_delivery: DeliveryConfig,
+) -> io::Result<()>
+where
+    D: PacketDevice<Error = io::Error>,
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: DatagramSend,
+    R: DatagramReceive,
+{
+    run_datagrams_with(
+        device,
+        parts,
+        initiator,
+        runtime,
+        config,
+        observer,
+        native_delivery,
+        Children::spawned(),
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn run_datagrams_with<D, C, S, R>(
     mut device: D,
     parts: Vec<DatagramParts<C, S, R>>,
     initiator: bool,
@@ -1412,6 +1553,7 @@ pub(super) async fn run_datagrams<D, C, S, R>(
     config: DatagramPolicy,
     observer: Option<delivery::Reporter>,
     native_delivery: DeliveryConfig,
+    mut tasks: Children,
 ) -> io::Result<()>
 where
     D: PacketDevice<Error = io::Error>,
@@ -1456,7 +1598,6 @@ where
     let (returned_tx, mut returned_rx) = mpsc::channel::<(usize, Vec<u8>)>(2 * parts.len());
     let started = Instant::now();
     let budget = SharedBudget::from_policy(config, started);
-    let mut tasks = JoinSet::new();
     let mut states = Vec::new();
     for (index, parts) in parts.into_iter().enumerate() {
         let session = parts.session;
@@ -1481,32 +1622,32 @@ where
         let receives = config.duplex == Duplex::Full || !sends;
         let (reader, writer) = tokio::io::split(parts.control);
         let (feedback, changes) = watch::channel(Feedback::default());
-        tasks.spawn(read_control_bound_timed(
+        tasks.add(read_control_bound_timed(
             reader,
             index,
             control_tx.clone(),
             config.control_timeout,
             config.feedback_bytes(),
             config.control_magic,
-        ));
-        tasks.spawn(write_control_bound(writer, changes, config, budget.clone()));
+        ))?;
+        tasks.add(write_control_bound(writer, changes, config, budget.clone()))?;
         if receives {
-            tasks.spawn(read_datagrams(
+            tasks.add(read_datagrams(
                 parts.receiver,
                 config.payload_bytes,
                 index,
                 data_tx.clone(),
-            ));
+            ))?;
         }
         let outbound = if sends {
             let (tx, rx) = mpsc::channel(1);
-            tasks.spawn(delivery::write(
+            tasks.add(delivery::write(
                 parts.sender,
                 rx,
                 sent_tx.clone(),
                 index,
                 returned_tx.clone(),
-            ));
+            ))?;
             Some(tx)
         } else {
             None
@@ -1577,9 +1718,9 @@ where
     let mut encoded = vec![0; config.payload_bytes];
     loop {
         tokio::select! {
-            Some(result) = tasks.join_next() => return match result {
-                Ok(Err(error)) => Err(error), Err(error) => Err(io::Error::other(error)),
-                Ok(Ok(())) => Err(invalid("UDP task ended unexpectedly")),
+            Some(result) = std::future::poll_fn(|cx| tasks.poll_next(cx)) => return match result {
+                Err(error) => Err(error),
+                Ok(()) => Err(invalid("UDP task ended unexpectedly")),
             },
             Some((lane,buffer)) = returned_rx.recv() => {
                 let buffers=&mut states[lane].writer_buffers;

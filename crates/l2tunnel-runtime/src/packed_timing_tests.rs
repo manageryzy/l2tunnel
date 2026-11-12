@@ -10,8 +10,10 @@ struct Sender {
     blocked: watch::Receiver<bool>,
     emitted: Arc<Mutex<Vec<Vec<u8>>>>,
 }
-impl udp::DatagramSend for Sender {
-    async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+impl crate::datagram::DatagramSend for Sender {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
         while *self.blocked.borrow_and_update() {
             self.blocked
                 .changed()
@@ -26,11 +28,15 @@ impl udp::DatagramSend for Sender {
             return Err(invalid("test capture bound"));
         }
         packets.push(bytes.to_vec());
-        Ok(())
+        Ok(crate::datagram::DatagramSent {
+            actual_at: tokio::time::Instant::now(),
+            payload_bytes: bytes.len(),
+            boundary: crate::datagram::SendBoundary::OsDatagramAccepted,
+        })
     }
 }
 struct Receiver(mpsc::Receiver<Vec<u8>>);
-impl udp::DatagramReceive for Receiver {
+impl crate::datagram::DatagramReceive for Receiver {
     async fn receive(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
         let bytes = self
             .0
@@ -70,7 +76,7 @@ impl Pump {
         let (gate, changes) = watch::channel(blocked);
         let (input, receive) = mpsc::channel(16);
         let emitted = Arc::new(Mutex::new(Vec::new()));
-        let parts = vec![udp::DatagramParts {
+        let parts = vec![crate::datagram::DatagramParts {
             session: [65; 16],
             control,
             sender: Sender {

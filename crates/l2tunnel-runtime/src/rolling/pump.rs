@@ -139,11 +139,13 @@ where
                                 let sender = state.sender.as_mut().ok_or_else(|| invalid("rolling missing sender"))?;
                                 if let Some(length) = budget.poll_with(false, now, &mut buffer, |output, allowance| {
                                     let Some(value) = sender.pending_output() else { return Ok(None); };
-                                    let length = config.scheduler.recovery.width().map_err(io::Error::other)? + protocol::wire::HEADER_BYTES;
+                                    // Charge the exact record this output will emit, not the slot width.
+                                    let Some(length) = sender.pending_wire_len().map_err(io::Error::other)? else { return Ok(None); };
+                                    if length > output.len() { return Err(invalid("rolling record exceeds reserved outbound slot")); }
                                     if allowance.packets == 0 || allowance.wire_bytes < length { return Ok(None); }
                                     let id = value.id();
                                     if sender.encode_pending(output).map_err(io::Error::other)? != length {
-                                        return Err(invalid("rolling encoded length differs from charged fixed width"));
+                                        return Err(invalid("rolling encoded length differs from charged record length"));
                                     }
                                     sender.confirm_output(id, ticks(now)?).map_err(io::Error::other)?;
                                     emitted=Some(id);
@@ -152,7 +154,9 @@ where
                                 })? {
                                     let id=emitted.ok_or_else(||invalid("rolling output identity missing"))?;
                                     let native_complete=state.completion(id);
-                                    if buffer.len() != length { return Err(invalid("rolling outbound slot length mismatch")); }
+                                    if length > buffer.len() { return Err(invalid("rolling outbound slot length mismatch")); }
+                                    // Send only the emitted record; capacity is retained for reuse.
+                                    buffer.truncate(length);
                                     permit.send(owner::Outbound{bytes:buffer,native_complete});
                                     queued=Some(id);
                                 } else {
@@ -193,8 +197,8 @@ fn micros(origin: Instant, event: Instant) -> io::Result<Micros> {
         u64::try_from(elapsed.as_micros()).map_err(io::Error::other)?,
     ))
 }
-async fn write_datagrams(
-    mut sender: impl DatagramSend,
+async fn write_datagrams<S: DatagramSend>(
+    mut sender: S,
     mut output: mpsc::Receiver<owner::Outbound>,
     lane: usize,
     sent: mpsc::Sender<(usize, u64, Instant)>,
@@ -211,8 +215,8 @@ async fn write_datagrams(
         } else {
             None
         };
-        sender.send(&packet.bytes).await?;
-        let completed = Instant::now();
+        let receipt = sender.send(&packet.bytes).await?;
+        let completed = receipt.validate(packet.bytes.len(), S::BOUNDARY, Instant::now())?;
         if let (Some(ordinal), Some(permit)) = (packet.native_complete, permit) {
             permit.send((lane, ordinal, completed));
         }

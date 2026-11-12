@@ -356,9 +356,10 @@ impl Flight {
     }
 }
 
-/// Capacity is reserved before I/O; only a successful physical send publishes.
-pub(crate) async fn write(
-    mut sender: impl crate::udp::DatagramSend,
+/// Capacity is reserved before I/O; only the original maintained carrier handoff
+/// publishes. OS admission and QUIC admission remain distinct receipt boundaries.
+pub(crate) async fn write<S: crate::datagram::DatagramSend>(
+    mut sender: S,
     mut packets: mpsc::Receiver<Packet>,
     events: mpsc::Sender<Sent>,
     lane: usize,
@@ -379,8 +380,8 @@ pub(crate) async fn write(
             .bytes
             .get(..packet.length)
             .ok_or_else(|| invalid("packet writer length exceeds owned buffer"))?;
-        sender.send(bytes).await?;
-        let at = Instant::now();
+        let receipt = sender.send(bytes).await?;
+        let at = receipt.validate(bytes.len(), S::BOUNDARY, Instant::now())?;
         if let Some(witness) = packet.witness {
             permit
                 .ok_or_else(|| invalid("packet send event not reserved"))?

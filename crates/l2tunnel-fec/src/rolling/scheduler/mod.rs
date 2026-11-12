@@ -28,6 +28,8 @@ pub struct Policy {
     pub feedback_packets: u32,
     /// Conservative total reservation for each constructed scheduler owner.
     pub memory_bytes: usize,
+    /// Explicit systematic-source record format; both peers must select the same.
+    pub source_wire: wire::SourceWire,
 }
 impl Policy {
     /// Validate scalar limits before constructing owners or allocating payloads.

@@ -429,3 +429,165 @@ fn structural_scope_is_complete_and_does_not_grant_owner_authority() -> TestResu
     }
     Ok(())
 }
+
+// Independent Python struct.pack literals for the exact-source format. The
+// source ends after its three original bytes, including the real trailing zero.
+const EXACT0: &str = "4c32525702010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000000000000000000000100000000000a00000003010200";
+const EXACT_REPAIR16: &str = "4c32525702020000000102030405060708090a0b0c0d0e0f0102030405060708102030400200000000000000000000100000000000000003e3779b10000a000000456fc1000000000000";
+
+#[test]
+fn exact_source_literal_omits_only_the_zero_tail_and_repairs_stay_full_width() -> TestResult {
+    let source = hex(EXACT0)?;
+    assert_eq!(source.len(), HEADER_BYTES + 2 + 3);
+    assert_eq!(source_len(config(), SourceWire::Exact, 3)?, 69);
+    assert_eq!(source_len(config(), SourceWire::Padded, 3)?, 74);
+    let View::Source {
+        scope: actual_scope,
+        id,
+        original,
+    } = inspect_with(config(), SourceWire::Exact, &source)?
+    else {
+        return Err("exact original became repair".into());
+    };
+    assert_eq!(
+        (actual_scope, id, original),
+        (scope(), SourceId(0), &[1, 2, 0][..])
+    );
+    let mut output = [0xa5; 80];
+    assert_eq!(
+        encode_source_with(
+            config(),
+            SourceWire::Exact,
+            scope(),
+            SourceId(0),
+            &[1, 2, 0],
+            &mut output
+        )?,
+        69
+    );
+    assert_eq!(&output[..69], source);
+    assert_eq!(&output[69..], &[0xa5; 11], "bytes after the record changed");
+
+    let repair = hex(EXACT_REPAIR16)?;
+    assert_eq!(repair.len(), 74);
+    let View::Repair(view) = inspect_with(config(), SourceWire::Exact, &repair)? else {
+        return Err("exact repair became original".into());
+    };
+    assert_eq!((view.id, view.bytes), (RepairId(16), &EQUATION[..]));
+    output.fill(0xa5);
+    assert_eq!(
+        encode_repair_with(
+            config(),
+            SourceWire::Exact,
+            equation(16, 3, false)?,
+            &mut output
+        )?,
+        74
+    );
+    assert_eq!(&output[..74], repair);
+    // The padded format's bytes are unchanged by the additive format.
+    output.fill(0xa5);
+    encode_source(config(), scope(), SourceId(0), &[1, 2, 0], &mut output)?;
+    assert_eq!(&output[..74], hex(SOURCE0)?);
+    Ok(())
+}
+
+#[test]
+fn exact_and_padded_formats_never_accept_each_other() -> TestResult {
+    let padded = [hex(SOURCE0)?, hex(REPAIR16)?];
+    let exact = [hex(EXACT0)?, hex(EXACT_REPAIR16)?];
+    for record in &padded {
+        assert!(inspect_with(config(), SourceWire::Exact, record).is_err());
+        assert!(inspect(config(), record).is_ok());
+    }
+    for record in &exact {
+        assert!(inspect(config(), record).is_err());
+        assert!(inspect_with(config(), SourceWire::Padded, record).is_err());
+    }
+    // A padded-length source relabelled as version two is not canonical either:
+    // the exact format rejects every byte after the declared original.
+    let mut relabelled = hex(SOURCE0)?;
+    relabelled[4] = EXACT_SOURCE_VERSION;
+    assert_eq!(
+        inspect_with(config(), SourceWire::Exact, &relabelled).err(),
+        Some(Error::Length)
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_source_rejects_truncation_trailing_bytes_and_length_limits() -> TestResult {
+    let source = hex(EXACT0)?;
+    for cut in 0..source.len() {
+        assert!(
+            inspect_with(config(), SourceWire::Exact, &source[..cut]).is_err(),
+            "truncated at {cut}"
+        );
+    }
+    let mut trailing = source.clone();
+    trailing.push(0);
+    assert_eq!(
+        inspect_with(config(), SourceWire::Exact, &trailing).err(),
+        Some(Error::Length)
+    );
+    let mut zero = source.clone();
+    zero[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&0_u16.to_be_bytes());
+    assert!(inspect_with(config(), SourceWire::Exact, &zero[..HEADER_BYTES + 2]).is_err());
+    assert!(inspect_with(config(), SourceWire::Exact, &zero).is_err());
+    let mut reserved = source.clone();
+    reserved[7] = 1;
+    assert_eq!(
+        inspect_with(config(), SourceWire::Exact, &reserved).err(),
+        Some(Error::Format)
+    );
+
+    // Largest original fills the vector exactly; one more byte is rejected
+    // without touching the caller output.
+    let full = [0_u8; 8];
+    let mut output = [0xa5; 80];
+    let length = encode_source_with(
+        config(),
+        SourceWire::Exact,
+        scope(),
+        SourceId(7),
+        &full,
+        &mut output,
+    )?;
+    assert_eq!(length, HEADER_BYTES + config().width()?);
+    let View::Source { original, .. } =
+        inspect_with(config(), SourceWire::Exact, &output[..length])?
+    else {
+        return Err("full exact original became repair".into());
+    };
+    assert_eq!(original, &full, "an all-zero original is real data");
+    output.fill(0xa5);
+    for (bad, expected) in [(&[][..], Error::Length), (&[0_u8; 9][..], Error::Length)] {
+        assert_eq!(
+            encode_source_with(
+                config(),
+                SourceWire::Exact,
+                scope(),
+                SourceId(7),
+                bad,
+                &mut output
+            )
+            .err(),
+            Some(expected)
+        );
+        assert_eq!(output, [0xa5; 80]);
+    }
+    assert_eq!(
+        encode_source_with(
+            config(),
+            SourceWire::Exact,
+            scope(),
+            SourceId(7),
+            &[9],
+            &mut output[..HEADER_BYTES + 2]
+        )
+        .err(),
+        Some(Error::OutputTooSmall)
+    );
+    assert_eq!(output, [0xa5; 80]);
+    Ok(())
+}

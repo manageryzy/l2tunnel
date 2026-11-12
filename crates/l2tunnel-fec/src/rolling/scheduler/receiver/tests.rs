@@ -22,6 +22,7 @@ fn feedback_identity_exhaustion_is_terminal_without_reusing_a_wire_identity() ->
         feedback_ticks: 2,
         feedback_packets: 1,
         memory_bytes: 1 << 20,
+        source_wire: wire::SourceWire::Padded,
     };
     let scope = Scope {
         session: [1; 16],

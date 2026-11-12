@@ -111,7 +111,8 @@ impl Receiver {
         if self.scan.is_some() {
             return Err(Error::Busy);
         }
-        let result = match wire::inspect(self.policy.recovery, bytes)? {
+        let result = match wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?
+        {
             wire::View::Source {
                 scope,
                 id,

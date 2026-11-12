@@ -9,8 +9,48 @@ use super::{Config, Error, MAX_PAYLOAD, Repair, RepairId, Scope, SourceId, Suppo
 pub const HEADER_BYTES: usize = 64;
 /// Maximum full record under the rolling payload limit; block limits are separate.
 pub const MAX_RECORD_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD + 2;
-/// Version of this enclosing length-vector format, distinct from compact wire.
+/// Version of the original fixed-width enclosing format, distinct from compact wire.
 pub const VERSION: u8 = 1;
+/// Version whose systematic source records omit the zero tail; repairs stay full width.
+pub const EXACT_SOURCE_VERSION: u8 = 2;
+
+/// Explicitly selected systematic-source encoding, bound by the authenticated policy.
+///
+/// Both formats share the header, identities and full-width repair vectors and
+/// present the identical original bytes to the decoder. Each accepts only its
+/// own version byte, so records of the two formats can never be mixed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SourceWire {
+    /// Version 1: every source record carries its complete zero-padded vector.
+    #[default]
+    Padded,
+    /// Version 2: a source record ends after its exact original bytes. The
+    /// receiver's decoder reconstructs the same bounded zero-padded vector.
+    Exact,
+}
+impl SourceWire {
+    /// Wire version byte required in every record of this format.
+    pub const fn version(self) -> u8 {
+        match self {
+            Self::Padded => VERSION,
+            Self::Exact => EXACT_SOURCE_VERSION,
+        }
+    }
+}
+
+/// Exact complete source-record length for a validated original length.
+///
+/// Rejects an empty or oversized original before any allocation or output.
+pub fn source_len(config: Config, format: SourceWire, original: usize) -> Result<usize, Error> {
+    let width = config.width()?;
+    if original == 0 || original > config.max_payload {
+        return Err(Error::Length);
+    }
+    match format {
+        SourceWire::Padded => add(HEADER_BYTES, width),
+        SourceWire::Exact => add(add(HEADER_BYTES, 2)?, original),
+    }
+}
 const MAGIC: &[u8; 4] = b"L2RW";
 const SOURCE: u8 = 1;
 const REPAIR: u8 = 2;
@@ -62,12 +102,29 @@ fn repair_shape(config: Config, repair: Repair<'_>, width: usize) -> Result<(), 
 /// by a received length. Arbitrary scope bytes are returned for the authenticated
 /// caller to compare. Invalid input cannot mutate an encoder or decoder.
 pub fn inspect(config: Config, bytes: &[u8]) -> Result<View<'_>, Error> {
+    inspect_with(config, SourceWire::Padded, bytes)
+}
+
+/// Inspect exactly one complete record of the explicitly selected format.
+///
+/// The repair width and the maximum source length come from the validated local
+/// configuration. An exact source record must end precisely after its declared
+/// original, so truncation and trailing bytes are both rejected. A record whose
+/// version byte belongs to the other format is a format error, never a fallback.
+pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<View<'_>, Error> {
     let width = config.width()?;
-    if bytes.len() != add(HEADER_BYTES, width)? {
+    let full = add(HEADER_BYTES, width)?;
+    let exact_source =
+        format == SourceWire::Exact && bytes.len() >= HEADER_BYTES && bytes[5] == SOURCE;
+    if exact_source {
+        if bytes.len() < add(HEADER_BYTES, 3)? || bytes.len() > full {
+            return Err(Error::Length);
+        }
+    } else if bytes.len() != full {
         return Err(Error::Length);
     }
     if &bytes[..4] != MAGIC
-        || bytes[4] != VERSION
+        || bytes[4] != format.version()
         || !matches!(bytes[5], SOURCE | REPAIR)
         || bytes[6] & !TAIL != 0
         || bytes[7] != 0
@@ -99,10 +156,15 @@ pub fn inspect(config: Config, bytes: &[u8]) -> Result<View<'_>, Error> {
             return Err(Error::Identity);
         }
         let length = usize::from(u16::from_be_bytes(array(&vector[..2])?));
-        if length == 0
-            || length > config.max_payload
-            || vector[2 + length..].iter().any(|b| *b != 0)
-        {
+        if length == 0 || length > config.max_payload {
+            return Err(Error::Length);
+        }
+        let tail = vector.get(2 + length..).ok_or(Error::Length)?;
+        let canonical = match format {
+            SourceWire::Padded => tail.iter().all(|b| *b == 0),
+            SourceWire::Exact => tail.is_empty(),
+        };
+        if !canonical {
             return Err(Error::Length);
         }
         Ok(View::Source {
@@ -122,10 +184,18 @@ pub fn inspect(config: Config, bytes: &[u8]) -> Result<View<'_>, Error> {
     }
 }
 
-fn header(output: &mut [u8], kind: u8, scope: Scope, id: u64, support: Support, width: u16) {
+fn header(
+    output: &mut [u8],
+    version: u8,
+    kind: u8,
+    scope: Scope,
+    id: u64,
+    support: Support,
+    width: u16,
+) {
     output[..HEADER_BYTES].fill(0);
     output[..4].copy_from_slice(MAGIC);
-    output[4] = VERSION;
+    output[4] = version;
     output[5] = kind;
     output[6] = u8::from(support.tail);
     output[8..24].copy_from_slice(&scope.session);
@@ -150,18 +220,39 @@ pub fn encode_source(
     original: &[u8],
     output: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_source_with(config, SourceWire::Padded, scope, id, original, output)
+}
+
+/// Encode one exact original in the explicitly selected source format.
+///
+/// The exact format writes only the header, length and original bytes; nothing
+/// beyond the returned length is modified. Every rejection leaves the entire
+/// caller output unchanged.
+pub fn encode_source_with(
+    config: Config,
+    format: SourceWire,
+    scope: Scope,
+    id: SourceId,
+    original: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
     let width = config.width()?;
     let support = source_support(id)?;
-    if original.is_empty() || original.len() > config.max_payload {
-        return Err(Error::Length);
-    }
-    let length = add(HEADER_BYTES, width)?;
+    let length = source_len(config, format, original.len())?;
     if output.len() < length {
         return Err(Error::OutputTooSmall);
     }
     let width = u16::try_from(width).map_err(|_| Error::Length)?;
     let original_len = u16::try_from(original.len()).map_err(|_| Error::Length)?;
-    header(output, SOURCE, scope, u64::from(id.0), support, width);
+    header(
+        output,
+        format.version(),
+        SOURCE,
+        scope,
+        u64::from(id.0),
+        support,
+        width,
+    );
     output[HEADER_BYTES..length].fill(0);
     output[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&original_len.to_be_bytes());
     output[HEADER_BYTES + 2..HEADER_BYTES + 2 + original.len()].copy_from_slice(original);
@@ -177,6 +268,18 @@ pub fn encode_repair(
     repair: Repair<'_>,
     output: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_repair_with(config, SourceWire::Padded, repair, output)
+}
+
+/// Encode a complete full-width equation under the selected format's version.
+///
+/// Repair vectors are never trimmed in either format; only the version differs.
+pub fn encode_repair_with(
+    config: Config,
+    format: SourceWire,
+    repair: Repair<'_>,
+    output: &mut [u8],
+) -> Result<usize, Error> {
     let width = config.width()?;
     repair_shape(config, repair, width)?;
     let length = add(HEADER_BYTES, width)?;
@@ -186,6 +289,7 @@ pub fn encode_repair(
     let width = u16::try_from(width).map_err(|_| Error::Length)?;
     header(
         output,
+        format.version(),
         REPAIR,
         repair.scope,
         repair.id.0,
