@@ -1,4 +1,4 @@
-//! Explicit bounded diagnostics for the ordinary managed TCP/TLS runtime.
+//! Explicit bounded diagnostics for managed TCP/TLS and base UDP/QUIC frames.
 use super::{BTreeMap, Duration, input, io};
 use l2tunnel_runtime::managed::{ProfileHandle, ProfileSnapshot};
 use std::future::Future;
@@ -16,7 +16,9 @@ pub(super) fn interval(options: &BTreeMap<String, String>) -> io::Result<Option<
     if !(100..=60_000).contains(&millis) {
         return Err(input("profile interval must be 0 or 100..60000 ms"));
     }
-    if options.get("--carrier").is_some_and(|value| value != "tcp")
+    if options
+        .get("--carrier")
+        .is_some_and(|value| !matches!(value.as_str(), "tcp" | "udp" | "quic"))
         || options
             .get("--traffic")
             .is_some_and(|value| value != "system")
@@ -25,7 +27,7 @@ pub(super) fn interval(options: &BTreeMap<String, String>) -> io::Result<Option<
             .is_some_and(|value| value != "frame")
     {
         return Err(input(
-            "profiling requires system traffic over TCP/TLS frame records",
+            "profiling requires system frame records over TCP/TLS or base UDP/QUIC",
         ));
     }
     Ok(Some(Duration::from_millis(millis)))
@@ -91,8 +93,13 @@ mod tests {
         }
         options.insert("--profile-ms".into(), "100".into());
         assert_eq!(interval(&options)?, Some(Duration::from_millis(100)));
+        for carrier in ["tcp", "udp", "quic"] {
+            options.insert("--carrier".into(), carrier.into());
+            assert_eq!(interval(&options)?, Some(Duration::from_millis(100)));
+        }
+        options.remove("--carrier");
         for (key, value) in [
-            ("--carrier", "udp"),
+            ("--carrier", "openvpn-like"),
             ("--traffic", "active"),
             ("--traffic", "proxy-measured"),
             ("--record-profile", "rolling"),

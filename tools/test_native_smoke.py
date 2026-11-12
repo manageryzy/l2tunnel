@@ -360,6 +360,21 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('error:', result.stderr)
 
+    def test_base_datagram_profiles_select_delivery_without_changing_tcp_or_openvpn(self):
+        from .native_smoke import DELIVERY_POLICY
+        tool = Path(__file__).with_name('native_smoke.py')
+        for carrier in ('udp', 'quic', 'tcp', 'openvpn-like'):
+            with self.subTest(carrier=carrier):
+                result = subprocess.run([sys.executable, str(tool), '--carrier', carrier,
+                                         '--layers', 'tap', '--only-case', 'tap-full-clean'],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                value = json.loads(result.stdout)
+                self.assertEqual(value['record_profile'], 'frame')
+                self.assertEqual(value['cases'], [['tap', 'full', False]])
+                self.assertEqual(value['delivery'],
+                                 DELIVERY_POLICY if carrier in ('udp', 'quic') else None)
+
     def test_aligned_dry_run_selects_exact_case_and_complete_matrix(self):
         tool = Path(__file__).with_name('native_smoke.py')
         base = [sys.executable, str(tool), '--record-profile', 'aligned', '--carrier', 'quic', '--fec', 'cauchy']

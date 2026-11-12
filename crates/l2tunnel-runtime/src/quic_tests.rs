@@ -12,6 +12,26 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
+fn native_delivery(runtime: RuntimeConfig) -> crate::managed::DeliveryConfig {
+    let policy = l2tunnel_flow_control::delivery_window::Config {
+        target_bandwidth_bps: 80_000_000,
+        bootstrap_rtt_micros: 70_000,
+        min_rtt_micros: 2_000,
+        max_rtt_micros: 2_000_000,
+        headroom_percent: 125,
+        minimum_bytes: runtime.max_packet as u64,
+        max_inflight_bytes: (runtime.max_packet * runtime.queue_packets) as u64,
+        max_records: runtime.queue_packets,
+        max_packet_bytes: runtime.max_packet as u64,
+        metadata_limit_bytes: 2 * 1024 * 1024,
+        sample_ttl_micros: 1_000_000,
+        flush_timeout_micros: 10_000_000,
+    };
+    crate::managed::DeliveryConfig {
+        forward: policy,
+        reverse: policy,
+    }
+}
 fn runtime(layer: PacketLayer) -> RuntimeConfig {
     RuntimeConfig {
         layer,
@@ -170,6 +190,14 @@ async fn authenticated(
     config: Config,
     relays: &mut Relays,
 ) -> Result<Vec<(AuthenticatedConnection, AuthenticatedConnection)>, TestError> {
+    authenticated_with_delivery(runtime, config, relays, native_delivery(runtime)).await
+}
+async fn authenticated_with_delivery(
+    runtime: RuntimeConfig,
+    config: Config,
+    relays: &mut Relays,
+    selected_delivery: crate::managed::DeliveryConfig,
+) -> Result<Vec<(AuthenticatedConnection, AuthenticatedConnection)>, TestError> {
     let cert = rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()])?;
     let chain = vec![cert.cert.der().to_vec()];
     let key_der = cert.signing_key.serialize_der();
@@ -192,7 +220,7 @@ async fn authenticated(
             &ServerConfig::from_der(&chain, &key_der, profile, limits)?,
         )?;
         let relay = relays.add(server.local_addr()?).await?;
-        let base = base_session_config(runtime, config)?;
+        let base = base_session_config(runtime, config, selected_delivery)?;
         let (a, b) = tokio::join!(
             client.connect(relay, "quic.test", &member, base),
             server.accept(&members, base)
@@ -202,21 +230,29 @@ async fn authenticated(
     Ok(result)
 }
 async fn links(runtime: RuntimeConfig, config: Config) -> Result<(Link, Link, Relays), TestError> {
+    links_with_delivery(runtime, config, native_delivery(runtime)).await
+}
+async fn links_with_delivery(
+    runtime: RuntimeConfig,
+    config: Config,
+    selected_delivery: crate::managed::DeliveryConfig,
+) -> Result<(Link, Link, Relays), TestError> {
     let mut relays = Relays::new();
-    let mut values = authenticated(runtime, config, &mut relays).await?;
+    let mut values =
+        authenticated_with_delivery(runtime, config, &mut relays, selected_delivery).await?;
     if config.duplex == Duplex::Full {
         let (a, b) = values.pop().ok_or("missing pair")?;
         Ok((
-            Link::full(a, runtime, config)?,
-            Link::full(b, runtime, config)?,
+            Link::full(a, runtime, config, selected_delivery)?,
+            Link::full(b, runtime, config, selected_delivery)?,
             relays,
         ))
     } else {
         let (a2, b2) = values.pop().ok_or("missing second")?;
         let (a1, b1) = values.pop().ok_or("missing first")?;
         let (a, b) = tokio::join!(
-            client_pair(a1, a2, runtime, config),
-            server_pair(b1, b2, runtime, config)
+            client_pair(a1, a2, runtime, config, selected_delivery),
+            server_pair(b1, b2, runtime, config, selected_delivery)
         );
         Ok((a?, b?, relays))
     }
@@ -274,8 +310,20 @@ async fn all_native_profiles_real_udp_loss_reorder_fragmentation_and_backpressur
                     })?;
                     relays.state.impaired.store(true, Ordering::Relaxed);
                     let mut tasks = JoinSet::new();
-                    tasks.spawn(run(a_device.clone(), a, runtime, config));
-                    tasks.spawn(run(b_device.clone(), b, runtime, config));
+                    tasks.spawn(run(
+                        a_device.clone(),
+                        a,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
+                    tasks.spawn(run(
+                        b_device.clone(),
+                        b,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     assert!(b_device.change(|n| n.delivered.is_empty())?);
                     assert!(a_device.change(|n| n.admitted)? <= runtime.queue_packets);
@@ -309,17 +357,29 @@ async fn link_binding_role_lane_and_device_config_fail_before_admission() -> Tes
         .ok_or("missing full")?;
     let mut mismatch = runtime;
     mismatch.max_packet -= 1;
-    assert!(Link::full(a, mismatch, full).is_err());
+    assert!(Link::full(a, mismatch, full, native_delivery(mismatch)).is_err());
     let half = config(Duplex::Half, RecoveryMode::SelectiveRepeat)?;
     let mut pair = authenticated(runtime, half, &mut relays).await?;
     let (a2, b2) = pair.pop().ok_or("second")?;
     let (a1, b1) = pair.pop().ok_or("first")?;
-    assert!(client_pair(a2, a1, runtime, half).await.is_err());
-    assert!(client_pair(b1, b2, runtime, half).await.is_err());
+    assert!(
+        client_pair(a2, a1, runtime, half, native_delivery(runtime))
+            .await
+            .is_err()
+    );
+    assert!(
+        client_pair(b1, b2, runtime, half, native_delivery(runtime))
+            .await
+            .is_err()
+    );
     let (a, _b, _relays) = links(runtime, full).await?;
     let device = Device::new(PacketLayer::Ethernet);
     device.change(|n| n.outgoing.push_back(packet(PacketLayer::Ethernet, 1, 100)))?;
-    assert!(run(device.clone(), a, runtime, full).await.is_err());
+    assert!(
+        run(device.clone(), a, runtime, full, native_delivery(runtime))
+            .await
+            .is_err()
+    );
     assert_eq!(device.change(|n| n.admitted)?, 0);
     Ok(())
 }
@@ -333,7 +393,7 @@ fn mtu_and_all_policy_fields_are_authentication_bound() -> TestResult {
     Config::new(Duplex::Half, [1; 16], 1248, true)?;
     let cfg = config(Duplex::Half, RecoveryMode::SelectiveRepeat)?;
     let rt = runtime(PacketLayer::Ip);
-    let base = base_session_config(rt, cfg)?;
+    let base = base_session_config(rt, cfg, native_delivery(rt))?;
     for field in 0..9 {
         let mut c = cfg;
         match field {
@@ -354,11 +414,11 @@ fn mtu_and_all_policy_fields_are_authentication_bound() -> TestResult {
             }
             _ => return Err("test field".into()),
         };
-        assert_ne!(base, base_session_config(rt, c)?);
+        assert_ne!(base, base_session_config(rt, c, native_delivery(rt))?);
     }
     assert_ne!(
-        session_config(rt, cfg, Lane::First)?,
-        session_config(rt, cfg, Lane::Second)?
+        session_config(rt, cfg, Lane::First, native_delivery(rt))?,
+        session_config(rt, cfg, Lane::Second, native_delivery(rt))?
     );
     Ok(())
 }
@@ -373,8 +433,8 @@ async fn malformed_control_data_native_size_and_control_closure_fail_explicitly(
             .await?
             .pop()
             .ok_or("pair")?;
-        let mut attacker = checked_parts(a, rt, cfg, Lane::First)?;
-        let victim = Link::full(b, rt, cfg)?;
+        let mut attacker = checked_parts(a, rt, cfg, Lane::First, native_delivery(rt))?;
+        let victim = Link::full(b, rt, cfg, native_delivery(rt))?;
         let device = Device::new(PacketLayer::Ip);
         if failure == 2 {
             device.change(|n| {
@@ -383,7 +443,7 @@ async fn malformed_control_data_native_size_and_control_closure_fail_explicitly(
             })?;
         }
         let mut tasks = JoinSet::new();
-        tasks.spawn(run(device, victim, rt, cfg));
+        tasks.spawn(run(device, victim, rt, cfg, native_delivery(rt)));
         match failure {
             0 => attacker.control.write_all(b"BAD!\x01\x01\0\0").await?,
             1 => {
@@ -428,8 +488,8 @@ async fn common_budget_keeps_control_live_under_native_block_and_blackhole_termi
         n.outgoing = (0..6).map(|i| packet(rt.layer, i + 100, 3000)).collect();
     })?;
     let mut tasks = JoinSet::new();
-    tasks.spawn(run(ad.clone(), a, rt, cfg));
-    tasks.spawn(run(bd.clone(), b, rt, cfg));
+    tasks.spawn(run(ad.clone(), a, rt, cfg, native_delivery(rt)));
+    tasks.spawn(run(bd.clone(), b, rt, cfg, native_delivery(rt)));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(tasks.try_join_next().is_none());
     assert!(ad.change(|n| n.admitted)? <= rt.queue_packets);
@@ -443,3 +503,15 @@ async fn common_budget_keeps_control_live_under_native_block_and_blackhole_termi
     assert!(result.is_err());
     Ok(())
 }
+
+async fn delivery_links(
+    rt: RuntimeConfig,
+    duplex: Duplex,
+    recovery: RecoveryMode,
+    policy: crate::managed::DeliveryConfig,
+) -> Result<(Config, Link, Link, Relays), TestError> {
+    let transport = config(duplex, recovery)?;
+    let (a, b, relays) = links_with_delivery(rt, transport, policy).await?;
+    Ok((transport, a, b, relays))
+}
+crate::packet_delivery::actual_native_flight!();

@@ -28,11 +28,14 @@ use std::{
 use tokio::time::{Instant, Sleep};
 
 mod status;
-pub use status::{Capabilities, Carrier, Cover, Observer, Selection, Snapshot, Traffic};
+pub use status::{
+    Capabilities, Carrier, Cover, NativeFlight, Observer, RecoveryWindow, Selection, Snapshot,
+    Traffic,
+};
 /// Entire untrusted policy bound, checked before JSON parsing.
 pub const MAX_POLICY_BYTES: usize = 65_536;
 /// Exact separately selected startup profile.
-pub const PROFILE: &str = "raw-packet-runtime-v1";
+pub const PROFILE: &str = "raw-packet-runtime-v2";
 /// Validated immutable operator policy; factories revalidate connection-dependent bounds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Settings(Document);
@@ -46,6 +49,7 @@ struct Document {
     channels: u16,
     packet: Packet,
     recovery: Recovery,
+    delivery: crate::delivery::Policy,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,9 +116,10 @@ impl Settings {
         }
         let value: Document =
             serde_json::from_slice(bytes).map_err(|_| invalid("invalid strict raw policy JSON"))?;
-        if value.version != 1 || value.profile != PROFILE {
+        if value.version != 2 || value.profile != PROFILE {
             return Err(invalid("raw policy version/profile"));
         }
+        value.delivery.config(40)?;
         value
             .packet
             .policy()
@@ -167,6 +172,7 @@ impl Settings {
             transport,
             connection.duplex,
             self.0.channels,
+            self.0.delivery.config(connection.max_packet)?,
         )?
         .with_recovery(match self.0.recovery {
             Recovery::SelectiveRepeat => runtime::RecoveryMode::SelectiveRepeat,

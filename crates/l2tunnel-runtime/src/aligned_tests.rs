@@ -517,7 +517,7 @@ fn configuration_rejects_unimplemented_or_inconsistent_policies_and_binds_every_
             141, 21, 208, 14, 39, 175, 96, 80, 17, 225, 66, 168, 100
         ]
     );
-    assert_ne!(base, udp::base_session_config(rt, transport)?);
+    assert_ne!(base, udp::transport_session_config(rt, transport)?);
     let mut changed = config;
     changed.protocol.receiver.body.predictive = false;
     changed.protocol.receiver.body.timestamp_pair_dictionary = false;

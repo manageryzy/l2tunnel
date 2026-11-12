@@ -1,9 +1,52 @@
 # Explicit UDP client selection
 
-Status: implemented, unit-tested and qualified on native Linux for both custom
-covers and both protection suites. This extends the shared headless client and CLI and consumes
-the authenticated UDP carrier and device runtime. It does not add a second
-protocol implementation to the CLI. Each cover/suite has its own native receipt.
+Status: the explicit base-frame delivery migration passed 144 local client tests, strict
+Clippy, rustdoc and formatting. Aggregate and new-profile native qualification are pending. Earlier Linux native receipts below qualify their
+recorded transport profiles, not the new delivery-bound base identity. Both custom
+covers and protection suites retain the shared carrier/client implementation.
+
+## Mandatory base-frame delivery policy
+
+Base UDP/QUIC frames require a complete final `managed::DeliveryConfig` on public
+UDP `connect`/`accept` and genuine QUIC `connect`/`Listener::bind`. The policy uses
+identical canonical forward/reverse directions on both peers and enters a new
+base authentication identity (UDP runtime v3; QUIC runtime v2). CLI selection requires `--delivery-window bdp`,
+`--forward-mbps`, `--reverse-mbps` and `--bootstrap-rtt-ms` before credential,
+socket or device work. TCP frame retains its supported legacy default. The shared
+strict `delivery::Policy` remains the versioned JSON representation.
+
+Reusable transport `Settings`/`runtime_config` describe carrier geometry.
+Aligned/packed/rolling retain their existing independent bindings and private
+lane helpers; they do not inherit this second base-frame policy. One absolute
+deadline from validated public connect/accept entry covers all base lane setup
+and pairing, including the first idle accept. Later phases cannot renew it.
+Cancellation retains the existing carrier/endpoint/task ownership.
+
+Local packet queues, native delivery flight and the independently bounded
+64-source recovery banks remain separate. Startup reports configured recovery
+send/receive records and bytes. Optional `--profile-ms 100..60000` emits typed
+`datagram_profile` schema1 latest snapshots at that interval and on termination;
+`0`/absence disables it. Each lane reports distinct local, recovery and native
+fields. `observer_elapsed_micros` has its own observation origin; native service
+sample times use the lane actor's original clock. The terminal flag means the
+operation ended, not clean close. TCP retains `runtime_profile` schema3. Other
+record/traffic profiles reject enabled profiling. No configured target is an
+endpoint TCP cwnd/rwnd or measured throughput result.
+
+- [ ] [MOD-UCLIENT-09] Qualify mandatory base-frame delivery policy and shared CLI selection before I/O, original UDP setup/idle-accept deadlines, real full/half authentication and mismatch rejection; preserve derived bindings and record exact scoped/aggregate evidence.
+- [ ] [MOD-UCLIENT-10] Qualify bounded opt-in base UDP/QUIC datagram observations with typed independent local/recovery/native fields and unchanged managed profiling; require formatter, flag-boundary and actor evidence without a native throughput claim.
+
+Scoped evidence: [client receipt](../../work/base-delivery28/client-validation.json),
+[144-case result](../../work/base-delivery28/client-all-final.log),
+[restored deadline witnesses](../../work/base-delivery28/client-positive-deadlines-restored.log),
+[actual occupied-QUIC-port regression](../../work/base-delivery28/client-positive-bind-restored.log),
+and [runtime actor receipt](../../work/base-delivery28/validation.json).
+The executed [negative proofs](../../work/base-delivery28/client-negative-executed/restore.json)
+reject an outer-deadline bypass and the old classifier that missed a wrapped
+`AddrInUse`. Startup fixture retries remain limited to bind collisions, within
+original bounds; the rolling clock fixture retries only before its first Pending.
+The earlier rolling early-return cause was not reproduced and is not asserted to
+be this collision. The full diagnostic run did capture the packed QUIC collision.
 
 ## User configuration and early validation
 
@@ -27,8 +70,8 @@ identity remain required for the UDP bootstrap. UDP endpoints are trusted local
 configuration and are never learned from unverified datagrams. Initial runtime,
 recovery, packetization, direction and protection settings are bound into member
 authentication before any device packet is accepted. There is no unauthenticated
-fallback or downgrade. Raw TCP remains an explicit unsupported selection until
-its implementation and path qualification exist.
+fallback or downgrade. The separate [original-owner raw-packet profile](raw-packet-client.md) has its own
+authenticated selection and qualification ledger; UDP never silently selects it.
 
 The first UDP runtime profile fixes compression for the session. A local hot
 switch API must report unsupported for this profile until its real epoch/barrier

@@ -12,6 +12,8 @@ struct Detached<I: PacketIo> {
     proof: wire::LaneProof,
     sealer: PacketSealer,
     pending: Option<Pending>,
+    tracked: Option<RecordToken>,
+    completed: Option<SentRecord>,
     last_transition: Option<Instant>,
     last_transition_kind: Option<wire::Kind>,
     copies: u16,
@@ -132,6 +134,20 @@ impl<I: PacketIo> Detached<I> {
             match self.io.send(&p.bytes) {
                 Ok(()) => {
                     let p = self.pending.take().ok_or(Error::Proof)?;
+                    if let Some(token) = self.tracked.take() {
+                        if self.completed.is_some() {
+                            return Err(Error::Proof);
+                        }
+                        self.completed = Some(SentRecord {
+                            lane: if self.proof.lane == 0 {
+                                PairLane::First
+                            } else {
+                                PairLane::Second
+                            },
+                            token,
+                            sent_at: self.io.last_send_at.take().ok_or(Error::Proof)?,
+                        });
+                    }
                     lock(&self.io.state)?
                         .fence
                         .as_mut()
@@ -686,6 +702,8 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             proof,
             sealer,
             pending: None,
+            tracked: None,
+            completed: None,
             last_transition: None,
             last_transition_kind: None,
             copies: 0,
@@ -1014,6 +1032,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                     return Ok(());
                 }
                 self.records.push_back(ReceivedRecord {
+                    received_at: cell.received_at,
                     lane: if i == 0 {
                         PairLane::First
                     } else {
@@ -1262,6 +1281,40 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             Err(e) => Err(self.fail(e)),
             Ok(()) => Ok(()),
         }
+    }
+    /// Reserve a bounded completion cell and stage one exact recovery record.
+    /// A successful return is admission only; consume its actual send receipt.
+    pub fn stage_record_tracked(
+        &mut self,
+        lane: PairLane,
+        kind: RecordKind,
+        bytes: &[u8],
+    ) -> Result<RecordToken, Error> {
+        let index = lane.index();
+        let owner = self
+            .lanes
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::Configuration)?;
+        if owner.completed.is_some() || owner.tracked.is_some() {
+            return Err(Error::Busy);
+        }
+        self.stage_record(lane, kind, bytes)?;
+        let owner = self.lanes[index].as_mut().ok_or(Error::Proof)?;
+        let token = RecordToken(owner.pending.as_ref().ok_or(Error::Proof)?.end);
+        owner.tracked = Some(token);
+        Ok(token)
+    }
+    /// Take one pre-reserved successful handoff receipt without renewing any age.
+    pub fn take_sent_record(&mut self, lane: PairLane) -> Result<Option<SentRecord>, Error> {
+        self.check_live()?;
+        Ok(self
+            .lanes
+            .get_mut(lane.index())
+            .and_then(Option::as_mut)
+            .ok_or(Error::Configuration)?
+            .completed
+            .take())
     }
     /// Bounded fair physical progress, transition replies and authenticated liveness.
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {

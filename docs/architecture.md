@@ -46,6 +46,16 @@ is an ordering/admission domain. An inner flow is a classified user connection.
 These counts are independent; the simulator's 16-channel comparison does not
 require 16 physical TCP connections. Keep separate fields and metrics for each.
 
+The current runtime still has four audited integration gaps, tracked as blocking
+[FIX-01 and FIX-10 through FIX-12](implementation-checklist.md): independent
+storage/native-flight/recovery budgets, interchangeable carrier and user recovery,
+a negotiated stable session control envelope, and a shared client lifecycle.
+Focused base UDP/QUIC/raw delivery integration addresses the first boundary;
+common legacy parser, protected-datagram owner and existing-session command
+extractions address only parts of the other three. These do not complete the
+conceptual stack or authorize unchecked combinations. Each composition must
+bind its selected policies before I/O and reject unsupported combinations.
+
 ## Connection bootstrap, authentication and multistream joining
 
 The portable first implementation uses maintained Rust TLS (rustls, exact version

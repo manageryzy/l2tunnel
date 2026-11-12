@@ -1,7 +1,10 @@
 # UDP packet runtime
 
-Status: implemented and real TCP/TLS/UDP loopback integration-tested with two
-independent memory packet devices. Native OS qualification has a separate receipt.
+Status: the new base profile requires authenticated native-byte delivery policy,
+with focused real TCP/TLS/UDP loopback tests using independent memory packet
+devices. Its stable combined aggregate and native qualification remain pending.
+The historical native receipts below cover the earlier fixed-count profile, not
+the newly authenticated delivery profile. See [current delivery contract](packet-delivery.md).
 The design was written before implementation. This adapter composes existing authenticated
 UDP, selectable selective-repeat/Cauchy recovery, frame compression and fragmentation.
 It is one ordered data channel with fixed None/Lz4 compression. It does not implement
@@ -18,18 +21,18 @@ Defaults are 120 seconds for the control lease, 1 second for heartbeats and 60
 seconds for incomplete reassembly. Pair setup must finish within the first lane
 lease; the constructor fails closed if a delayed second authentication exhausts it.
 No background heartbeat is claimed before `run`.
-`base_session_config(runtime, config)` binds all behavioral/resource settings;
-`session_config(runtime, config, Lane::{First,Second})` adds the exact UDP profile;
-`carrier_config(runtime, config, lane, peer)` constructs the matching carrier
+`base_session_config(runtime, config, delivery)` binds all behavioral/resource settings;
+`session_config(runtime, config, Lane::{First,Second}, delivery)` adds the exact UDP profile;
+`carrier_config(runtime, config, lane, peer, delivery)` constructs the matching carrier
 bootstrap input. Both peers authenticate that final digest before establishing UDP.
 
-`Link::full(carrier, runtime, config)` consumes one established full carrier.
-`client_pair(first, second, runtime, config)` and `server_pair(...)` consume two
+`Link::full(carrier, runtime, config, delivery)` consumes one established full carrier.
+`client_pair(first, second, runtime, config, delivery)` and `server_pair(...)` consume two
 independently authenticated half carriers. First is global client-to-server lane
 0; Second is global server-to-client lane 1. Constructors reject mismatched digest,
 identity, role, lane or duplicate session IDs before device reads. A random 32-byte
 TLS challenge on First is echoed on Second and acknowledged on both lanes. The
-same TLS connections remain live for control. `run(device, link, runtime, config)`
+same TLS connections remain live for control. `run(device, link, runtime, config, delivery)`
 checks the retained binding once more and owns all socket tasks until termination.
 
 ## Wire and bounded state
@@ -42,7 +45,10 @@ retaining its logical ARQ source identity. No OS IP fragmentation is requested.
 The fixed epoch is 1. Per-lane full session IDs/roles bind ARQ; fragments carry a
 shortened context only inside that fully authenticated and validated envelope.
 
-TLS control uses an 8-byte `L2UC`, version 1, kind, u16 big-endian length header.
+The current base profile wraps the unchanged carrier/recovery digest under
+`l2tunnel/udp-runtime/v3/delivery-window-v1` and binds all fields of both canonical
+delivery directions. Derived aligned/packed/rolling profiles retain the exact old
+transport helper bytes and their own delivery semantics. TLS control uses an 8-byte `L2U2`, version 1, kind, u16 big-endian length header.
 Kinds: heartbeat 1/length 0; ACK 2/length 48 for selective repeat or 56 for
 Cauchy, selected from authenticated configuration; cumulative actual
 native delivery credit 3/length 8. Unknown kinds, lengths, role/context mismatch,
@@ -50,11 +56,16 @@ regressing credit or credit beyond admitted frames terminate the link. Device
 EtherTypes never enter this control parser. UDP accepts only the selected engine's source/systematic/repair records; TLS accepts
 only its feedback. ACKs are cumulative/bitmap engine output, not arbitrary user ACKs.
 
-Each lane owns bounded ARQ windows, one pending outbound fragment batch, one
-incomplete ordered reassembly, bounded complete native packets and one UDP writer
-slot. The sender limits admitted native packets by actual peer device delivery,
-including packets stalled on WouldBlock. This is fixed runtime admission credit,
-not the planned adaptive TUN flow-control ledger. Native input uses the shared 65536-byte maximum-plus-one buffer contract while
+Each lane owns independently bounded 64-source recovery windows, one pending
+outbound fragment batch, one incomplete ordered reassembly and a separate
+authenticated native-byte/record delivery bank. The small local device queue
+retains its original configured packet limit. Native flight uses the shared BDP
+controller and real original sizes, with all-original-fragment send callbacks
+and authenticated device-delivery receipt timestamps. It is neither endpoint
+TCP cwnd/rwnd control nor per-flow TUN QoS. Two preallocated outgoing buffers move
+through queue/writer ownership and are returned only after successful sends.
+Receive datagrams, native codec/fragment buffers and feedback still involve
+bounded copies/allocations; this is not an allocation-free runtime. Native input uses the shared 65536-byte maximum-plus-one buffer contract while
 still enforcing the configured native packet limit before encoding.
 Reassembly timeout is terminal:
 ACKed partial records are never silently forgotten while claiming reliability.
@@ -79,8 +90,9 @@ EOF with pending work fails explicitly; reconnect/resume is not implemented.
 The loopback matrix has deterministic every-seventh-datagram loss and
 periodic reordering. It checks both directions byte-for-byte using a 576-byte
 outer path MTU and 2500/3200-byte native packets. A blocked receiving device retains
-exactly the configured two admitted packets while reverse traffic and TLS feedback
-continue. This finite local test does not establish congestion fairness, Internet
+the explicit test delivery policy's two admitted packets while reverse traffic
+and TLS feedback continue. New larger-flight tests configure 128 native records
+independently of the unchanged local queue of two and recovery source span 64. This finite local test does not establish congestion fairness, Internet
 reliability, Windows/Android device support or Python experiment parity.
 
 ## Local validation
@@ -195,3 +207,8 @@ After the Cauchy adapter and shared allowance changes, executed on local Linux:
 and `python3 tools/check.py` all passed. The aggregate local log is
 `/tmp/l2tunnel-udp-fec-check.log`; the integrator's stable workspace snapshot is
 separate evidence for the complete concurrent implementation wave.
+
+
+## Mandatory byte-delivery profile migration
+
+- [ ] [MOD-UDP-RUNTIME-07] Qualify the new mandatory delivery-policy profile in a stable aggregate and separately bound native runs. Focused [shared delivery tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) do not replace the historical native gates or establish80Mbit/s. See [packet-delivery contract](packet-delivery.md) and [FIX-01](../implementation-checklist.md).

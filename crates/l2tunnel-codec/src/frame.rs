@@ -150,6 +150,12 @@ impl FrameCodec {
         Ok(record)
     }
 
+    /// Validate record framing and return its exact original size before allocation.
+    /// Compressed body validity is checked by decoding, not by this size preflight.
+    pub fn decoded_len(&self, record: &[u8]) -> Result<usize, CodecError> {
+        Ok(self.parse(record)?.original_length)
+    }
+
     /// Decode only after validating lengths, returning exactly one original frame.
     pub fn decode_vec(&self, record: &[u8]) -> Result<Vec<u8>, CodecError> {
         let parsed = self.parse(record)?;

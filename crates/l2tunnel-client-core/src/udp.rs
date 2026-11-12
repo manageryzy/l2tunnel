@@ -3,9 +3,9 @@ use super::{ConnectionConfig, auth_error, socket};
 use l2tunnel_auth::{self as auth, ClientTls, MemberAllowlist, MemberKey, ServerTls};
 use l2tunnel_core::Duplex;
 pub use l2tunnel_datagram::{CoverProfile, Protection};
-use l2tunnel_runtime::udp as runtime;
 /// Negotiated selective-repeat or systematic Cauchy repair policy.
 pub use l2tunnel_runtime::udp::RecoveryMode;
+use l2tunnel_runtime::{managed::DeliveryConfig, udp as runtime};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, UdpSocket};
@@ -96,7 +96,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-/// Build the exact fixed UDP runtime profile after local frontend validation.
+/// Validate reusable UDP transport geometry; base-native factories also require delivery policy.
 pub fn runtime_config(config: ConnectionConfig, settings: Settings) -> io::Result<runtime::Config> {
     config.session()?;
     settings.validate(config.duplex)?;
@@ -119,10 +119,10 @@ async fn bind(settings: Settings) -> io::Result<(UdpSocket, Option<UdpSocket>)> 
     Ok((first, second))
 }
 
-/// Private explicit record binding; public legacy callers always use Frame.
+/// Private explicit record binding; base frames carry their mandatory native delivery policy.
 #[derive(Clone, Copy)]
 pub(crate) enum Records<'a> {
-    Frame,
+    Frame(DeliveryConfig),
     Rolling(&'a l2tunnel_runtime::rolling::Config),
     Aligned(&'a l2tunnel_runtime::aligned::Config),
     Packed(&'a l2tunnel_runtime::packed::Config),
@@ -136,9 +136,9 @@ impl Records<'_> {
         peer: SocketAddr,
     ) -> io::Result<(l2tunnel_udp::Config, auth::SessionConfig)> {
         match self {
-            Self::Frame => Ok((
-                runtime::carrier_config(runtime_config, profile, lane, peer)?,
-                runtime::session_config(runtime_config, profile, lane)?,
+            Self::Frame(delivery) => Ok((
+                runtime::carrier_config(runtime_config, profile, lane, peer, delivery)?,
+                runtime::session_config(runtime_config, profile, lane, delivery)?,
             )),
             Self::Aligned(config) => Ok((
                 l2tunnel_runtime::aligned::udp_carrier_config(
@@ -195,7 +195,7 @@ pub(crate) struct Lanes {
     pub(crate) profile: runtime::Config,
 }
 
-/// Authenticate the actual UDP profile and retain its full or paired TLS control lanes.
+/// Authenticate base frames with explicit delivery under one whole-attempt deadline.
 pub async fn connect(
     address: SocketAddr,
     tls: &ClientTls,
@@ -203,24 +203,46 @@ pub async fn connect(
     identity: &MemberKey,
     config: ConnectionConfig,
     settings: Settings,
+    delivery: DeliveryConfig,
 ) -> io::Result<(runtime::Link, runtime::Config)> {
-    let lanes = connect_lanes(
-        address,
-        tls,
-        server_name,
-        identity,
-        config,
-        settings,
-        Records::Frame,
-    )
-    .await?;
-    let link = match lanes.second {
-        None => runtime::Link::full(lanes.first, config.runtime(), lanes.profile)?,
-        Some(second) => {
-            runtime::client_pair(lanes.first, second, config.runtime(), lanes.profile).await?
-        }
-    };
-    Ok((link, lanes.profile))
+    let profile = runtime_config(config, settings)?;
+    Records::Frame(delivery).lane(
+        config.runtime(),
+        profile,
+        runtime::Lane::First,
+        settings.forward.peer,
+    )?;
+    let deadline = super::HandshakeDeadline::start(config.handshake_timeout)?;
+    deadline
+        .within(async {
+            let lanes = connect_lanes(
+                address,
+                tls,
+                server_name,
+                identity,
+                config,
+                settings,
+                Records::Frame(delivery),
+            )
+            .await?;
+            let link = match lanes.second {
+                None => {
+                    runtime::Link::full(lanes.first, config.runtime(), lanes.profile, delivery)?
+                }
+                Some(second) => {
+                    runtime::client_pair(
+                        lanes.first,
+                        second,
+                        config.runtime(),
+                        lanes.profile,
+                        delivery,
+                    )
+                    .await?
+                }
+            };
+            Ok((link, lanes.profile))
+        })
+        .await
 }
 
 pub(crate) async fn connect_lanes(
@@ -301,22 +323,53 @@ impl ClientLane<'_> {
     }
 }
 
-/// Accept exactly one authenticated UDP peer/pair. No UDP packet chooses its identity.
+/// Accept one base-frame peer/pair under one deadline, including the first idle accept.
+/// No UDP packet chooses its identity; cancellation releases attempt-owned lanes.
 pub async fn accept(
     listener: &TcpListener,
     tls: &ServerTls,
     allowlist: &MemberAllowlist,
     config: ConnectionConfig,
     settings: Settings,
+    delivery: DeliveryConfig,
 ) -> io::Result<(runtime::Link, runtime::Config)> {
-    let lanes = accept_lanes(listener, tls, allowlist, config, settings, Records::Frame).await?;
-    let link = match lanes.second {
-        None => runtime::Link::full(lanes.first, config.runtime(), lanes.profile)?,
-        Some(second) => {
-            runtime::server_pair(lanes.first, second, config.runtime(), lanes.profile).await?
-        }
-    };
-    Ok((link, lanes.profile))
+    let profile = runtime_config(config, settings)?;
+    Records::Frame(delivery).lane(
+        config.runtime(),
+        profile,
+        runtime::Lane::First,
+        settings.forward.peer,
+    )?;
+    let deadline = super::HandshakeDeadline::start(config.handshake_timeout)?;
+    deadline
+        .within(async {
+            let lanes = accept_lanes(
+                listener,
+                tls,
+                allowlist,
+                config,
+                settings,
+                Records::Frame(delivery),
+            )
+            .await?;
+            let link = match lanes.second {
+                None => {
+                    runtime::Link::full(lanes.first, config.runtime(), lanes.profile, delivery)?
+                }
+                Some(second) => {
+                    runtime::server_pair(
+                        lanes.first,
+                        second,
+                        config.runtime(),
+                        lanes.profile,
+                        delivery,
+                    )
+                    .await?
+                }
+            };
+            Ok((link, lanes.profile))
+        })
+        .await
 }
 pub(crate) async fn accept_lanes(
     listener: &TcpListener,

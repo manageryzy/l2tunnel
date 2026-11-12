@@ -342,7 +342,12 @@ fn rolling_strict_policy_limits_nested_duplicates_and_pre_auth_geometry() -> Tes
     let digest = runtime::udp_base_session_config(connection.runtime(), t, r)?.digest;
     assert_ne!(
         digest,
-        l2tunnel_runtime::udp::base_session_config(connection.runtime(), t)?.digest
+        l2tunnel_runtime::udp::base_session_config(
+            connection.runtime(),
+            t,
+            crate::delivery_tests::policy()
+        )?
+        .digest
     );
     for (pointer, number) in [
         ("/channels", 3),

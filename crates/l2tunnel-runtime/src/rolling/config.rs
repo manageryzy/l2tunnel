@@ -26,7 +26,7 @@ impl Config {
         channels: u16,
         delivery: super::super::managed::DeliveryConfig,
     ) -> io::Result<Self> {
-        udp::base_session_config(runtime, transport)?;
+        udp::transport_session_config(runtime, transport)?;
         Self::derive(runtime, transport.policy()?, channels, delivery)
     }
     /// Derive an explicitly selected rolling policy from genuine QUIC datagram geometry.
@@ -36,7 +36,7 @@ impl Config {
         channels: u16,
         delivery: super::super::managed::DeliveryConfig,
     ) -> io::Result<Self> {
-        quic::base_session_config(runtime, transport)?;
+        quic::transport_session_config(runtime, transport)?;
         Self::derive(runtime, transport.policy()?, channels, delivery)
     }
     fn derive(

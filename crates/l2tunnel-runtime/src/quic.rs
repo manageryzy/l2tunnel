@@ -227,7 +227,10 @@ pub fn carrier_profile(config: Config, lane: Lane) -> io::Result<Profile> {
     config.profile_unchecked(lane)
 }
 /// Canonical native/recovery binding passed to the genuine QUIC endpoint before authentication.
-pub fn base_session_config(runtime: RuntimeConfig, config: Config) -> io::Result<SessionConfig> {
+pub(crate) fn transport_session_config(
+    runtime: RuntimeConfig,
+    config: Config,
+) -> io::Result<SessionConfig> {
     runtime.validate()?;
     config.validate()?;
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
@@ -311,14 +314,37 @@ pub fn base_session_config(runtime: RuntimeConfig, config: Config) -> io::Result
         digest: ConfigDigest(digest),
     })
 }
+/// Bind mandatory native-byte delivery policy independently of recovery/local queues.
+pub fn base_session_config(
+    runtime: RuntimeConfig,
+    config: Config,
+    delivery: crate::managed::DeliveryConfig,
+) -> io::Result<SessionConfig> {
+    let transport = transport_session_config(runtime, config)?;
+    crate::packet_delivery::validate(runtime, delivery, config.arq.max_source_bytes)?;
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"l2tunnel/quic-runtime/v2/delivery-window-v1\0");
+    hash.update(&transport.digest.0);
+    hash.update(&delivery.canonical()?);
+    Ok(SessionConfig {
+        layer: transport.layer,
+        digest: ConfigDigest(
+            hash.finish()
+                .as_ref()
+                .try_into()
+                .map_err(|_| invalid("delivery digest length"))?,
+        ),
+    })
+}
 /// Final expected auth binding; the endpoint applies this profile to the supplied base once.
 pub fn session_config(
     runtime: RuntimeConfig,
     config: Config,
     lane: Lane,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<SessionConfig> {
     carrier::session_config(
-        base_session_config(runtime, config)?,
+        base_session_config(runtime, config, delivery)?,
         carrier_profile(config, lane)?,
     )
     .map_err(io::Error::other)
@@ -335,13 +361,14 @@ fn checked_parts(
     runtime: RuntimeConfig,
     config: Config,
     lane: Lane,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Parts> {
     checked_parts_bound(
         value,
         runtime,
         config,
         lane,
-        base_session_config(runtime, config)?,
+        base_session_config(runtime, config, delivery)?,
     )
 }
 fn checked_parts_bound(
@@ -386,12 +413,13 @@ impl Link {
         value: AuthenticatedConnection,
         runtime: RuntimeConfig,
         config: Config,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         Self::full_bound(
             value,
             runtime,
             config,
-            base_session_config(runtime, config)?,
+            base_session_config(runtime, config, delivery)?,
         )
     }
     pub(super) fn full_bound(
@@ -436,13 +464,14 @@ async fn pair(
     runtime: RuntimeConfig,
     config: Config,
     initiator: bool,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
     pair_bound(
         first,
         second,
         runtime,
         config,
-        base_session_config(runtime, config)?,
+        base_session_config(runtime, config, delivery)?,
         initiator,
     )
     .await
@@ -519,8 +548,9 @@ pub async fn client_pair(
     second: AuthenticatedConnection,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
-    pair(first, second, runtime, config, true).await
+    pair(first, second, runtime, config, true, delivery).await
 }
 /// Verify a server's two separately authenticated directional QUIC connections.
 pub async fn server_pair(
@@ -528,8 +558,9 @@ pub async fn server_pair(
     second: AuthenticatedConnection,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
-    pair(first, second, runtime, config, false).await
+    pair(first, second, runtime, config, false, delivery).await
 }
 impl DatagramSend for DatagramSender {
     async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -555,8 +586,22 @@ pub async fn run<D: PacketDevice<Error = io::Error>>(
     link: Link,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<()> {
-    if link.binding != base_session_config(runtime, config)? || device.layer() != runtime.layer {
+    run_observed(device, link, runtime, config, None, delivery).await
+}
+/// Run with bounded read-only observations of local, recovery and delivery domains.
+pub async fn run_observed<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: Config,
+    observer: Option<crate::udp::Reporter>,
+    delivery: crate::managed::DeliveryConfig,
+) -> io::Result<()> {
+    if link.binding != base_session_config(runtime, config, delivery)?
+        || device.layer() != runtime.layer
+    {
         return Err(invalid("QUIC runtime/device differs from authentication"));
     }
     let parts = link
@@ -569,7 +614,18 @@ pub async fn run<D: PacketDevice<Error = io::Error>>(
             receiver: p.receiver,
         })
         .collect();
-    udp::run_datagrams(device, parts, link.initiator, runtime, config.policy()?).await
+    let mut policy = config.policy()?;
+    policy.control_magic = *b"L2Q2";
+    udp::run_datagrams(
+        device,
+        parts,
+        link.initiator,
+        runtime,
+        policy,
+        observer,
+        delivery,
+    )
+    .await
 }
 #[cfg(test)]
 #[path = "quic_tests.rs"]

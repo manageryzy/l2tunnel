@@ -23,6 +23,7 @@ pub(crate) enum NativeControlEvent {
     Ack(Vec<u8>),
     Delivered { channel: u8, record: u64 },
 }
+#[cfg(test)]
 pub(crate) async fn read_control_bound(
     reader: impl AsyncRead + Unpin,
     lane: usize,

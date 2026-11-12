@@ -202,3 +202,31 @@ fn no_feature_build_rejects_lz4_explicitly() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn original_length_preflight_reuses_strict_framing_without_decoding_allocations() -> TestResult {
+    for layer in [FrameLayer::Ethernet, FrameLayer::Ip] {
+        for compression in [Compression::None, Compression::Lz4IfSmaller] {
+            if compression == Compression::Lz4IfSmaller && !cfg!(feature = "lz4") {
+                continue;
+            }
+            let codec = codec(layer, compression, 1500)?;
+            let record = codec.encode_vec(&vec![7; 1500])?;
+            assert_eq!(codec.decoded_len(&record)?, 1500);
+            assert_eq!(codec.decode_vec(&record)?.len(), 1500);
+            for end in 0..FRAME_HEADER_BYTES {
+                assert!(codec.decoded_len(&record[..end]).is_err());
+            }
+            let mut bad = record.clone();
+            bad.push(0);
+            assert!(codec.decoded_len(&bad).is_err());
+            let mut bad = record.clone();
+            bad[8..12].copy_from_slice(&1501u32.to_be_bytes());
+            assert!(codec.decoded_len(&bad).is_err());
+            let mut bad = record;
+            bad[5] = 1;
+            assert!(codec.decoded_len(&bad).is_err());
+        }
+    }
+    Ok(())
+}

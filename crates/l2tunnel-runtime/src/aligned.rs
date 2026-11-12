@@ -43,7 +43,7 @@ impl Config {
         channels: u16,
         delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
-        udp::base_session_config(runtime, transport)?;
+        udp::transport_session_config(runtime, transport)?;
         Self::from_policy(runtime, transport.policy()?, channels, delivery)
     }
     /// Derive exact budgets from an explicitly Cauchy genuine QUIC transport.
@@ -53,7 +53,7 @@ impl Config {
         channels: u16,
         delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
-        quic::base_session_config(runtime, transport)?;
+        quic::transport_session_config(runtime, transport)?;
         Self::from_policy(runtime, transport.policy()?, channels, delivery)
     }
     fn from_policy(
@@ -313,7 +313,7 @@ pub fn udp_base_session_config(
     config: Config,
 ) -> io::Result<SessionConfig> {
     config.validate(runtime, transport.policy()?)?;
-    bind(udp::base_session_config(runtime, transport)?, config)
+    bind(udp::transport_session_config(runtime, transport)?, config)
 }
 /// Exact retained TLS member-authentication binding for this aligned UDP lane.
 pub fn udp_session_config(
@@ -339,7 +339,7 @@ pub fn udp_carrier_config(
     lane: Lane,
     peer: SocketAddr,
 ) -> io::Result<l2tunnel_udp::Config> {
-    let mut carrier = udp::carrier_config(runtime, transport, lane, peer)?;
+    let mut carrier = udp::transport_carrier_config(runtime, transport, lane, peer)?;
     carrier.base = udp_base_session_config(runtime, transport, config)?;
     Ok(carrier)
 }
@@ -350,7 +350,7 @@ pub fn quic_base_session_config(
     config: Config,
 ) -> io::Result<SessionConfig> {
     config.validate(runtime, transport.policy()?)?;
-    bind(quic::base_session_config(runtime, transport)?, config)
+    bind(quic::transport_session_config(runtime, transport)?, config)
 }
 /// Exact expected member-authentication binding after QUIC profile application.
 pub fn quic_session_config(

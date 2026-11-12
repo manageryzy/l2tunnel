@@ -1,9 +1,11 @@
 # Original-owner raw packet runtime
 
 Status: implemented with finite local integration tests over real maintained TCP,
-TLS/member authentication and original mock PacketIo. No native descriptor opener,
-CLI/native packet capability, clean protected close, running-session switch,
-congestion safety or middlebox qualification is claimed. The ordinary retained
+TLS/member authentication and original mock PacketIo. The original checkpoint16
+did not include a native descriptor opener or CLI; those later capabilities have
+separate [client](raw-packet-client.md) and [native opener](raw-native-packet.md)
+evidence. No clean protected close, running-session switch, congestion safety or
+middlebox qualification is claimed. The ordinary retained
 raw TCP/TLS profile and defaults are unchanged. Evidence is recorded in
 [checkpoint 16](../../work/raw-runtime16/REPORT.md); the earlier
 [startup transition checkpoint](../../work/raw-transition-checkpoint15/REPORT.md)
@@ -71,8 +73,19 @@ reserved u16 zero, then the existing FrameCodec bytes. Existing Fragmenter and
 Reassembler own message identities and bounds; there is no native-fragment copy
 outside those maintained codecs.
 
+Runtime profile v2 requires canonical forward/reverse `managed::DeliveryConfig`.
+One shared `packet_delivery::Flight` per sending lane reserves actual original
+native bytes using bandwidth × bounded measured RTT, separately from local
+Pipeline queue capacity and the unchanged 64-source recovery window. A tracked
+PacketCarrier completion records the original successful `PacketIo::send` time;
+all original fragments must succeed before full native flush is confirmed.
+Authenticated feedback retains its original parse time across owner delay. Only
+causally ordered full flush and native-device delivery contribute an RTT sample.
+The receiver uses the explicit incoming native byte/record budget, plus one
+bounded encoded reassembly slot; a full budget retains that exact slot.
+
 Native admission minus confirmed peer-native delivery cannot exceed the declared
-per-lane native window. Source receipt/ARQ ACK is not native delivery. Only actual
+per-lane native byte/record budget. Source receipt/ARQ ACK is not native delivery. Only actual
 successful device transmit increments local native delivery; WouldBlock retains
 the same native bytes and gives no credit. A confirmation above actual admission
 is terminal. Because this carrier reorders, an older cumulative confirmation is
@@ -128,3 +141,12 @@ larger raw phase/native gates remain open.
 - [x] [MOD-RAWRUNTIME-07] Complete independent source review and a source-stable workspace aggregate including required tools/check.py. Evidence: root reviewed original ownership, admission/feedback/credit and bounds; [wave16b](../../work/implementation-wave16b/validation.json) passed 949 Rust/126 Python cases with stable 593-input identity and strict workspace checks. Subsequent native opener/client changes remain separate.
 - [ ] [MOD-RAWRUNTIME-08] Add separately reviewed original native PacketIo opening, explicit shared client/service selection/status and an approved immutable native/path qualification experiment.
 - [ ] [MOD-RAWRUNTIME-09] Qualify protected clean close, real congestion behavior, all-boundary resource/cancellation matrices and nonzero running-session hot-switch/native fences before broader capability claims.
+
+- [x] [MOD-RAWRUNTIME-10] Separate local queue, actual native-byte reservation/full-send/device debt, and the unchanged bounded recovery window; bind mandatory v2 delivery policy before I/O and preserve original send/receipt timestamps. Evidence: [scoped source28 receipt](../../work/raw-delivery28/RECEIPT.md), including old local2 failure and actual mixed-size65 flight, blocked physical-send deadline and existing loss/fragmentation cases. No native throughput qualification.
+
+Terminal status preserves the last fully published coherent accounting snapshot
+and changes its phase/fault to the terminal result. It does not claim to include
+partial work from a failed actor turn. The original I/O/protocol error is retained;
+no terminal accounting is fabricated to reconcile partially completed work. The
+same-turn admission/writer-failure regression has a retained old-source failure
+and corrected pass in the source28 receipt.

@@ -114,7 +114,7 @@ fn auth_error(error: auth::Error) -> io::Error {
 fn base_expired() -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        "original TCP handshake deadline elapsed",
+        "original connection setup deadline elapsed",
     )
 }
 #[derive(Clone, Copy)]
@@ -377,3 +377,6 @@ mod base_deadline_tests;
 
 #[cfg(test)]
 mod delivery_tests;
+
+#[cfg(test)]
+mod base_datagram_delivery_tests;

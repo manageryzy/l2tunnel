@@ -11,7 +11,11 @@ fn options_and_exact_geometry_fail_before_socket_work() -> TestResult {
     let binding = runtime::udp_base_session_config(config.runtime(), profile, records)?;
     assert_ne!(
         binding,
-        l2tunnel_runtime::udp::base_session_config(config.runtime(), profile)?
+        l2tunnel_runtime::udp::base_session_config(
+            config.runtime(),
+            profile,
+            crate::delivery_tests::policy()
+        )?
     );
     let (_, aligned) = crate::aligned::udp_config(
         config,
@@ -159,7 +163,7 @@ async fn actual_udp_and_quic_reject_every_packing_policy_mismatch_and_wrong_iden
 }
 
 #[test]
-fn frame_bindings_stay_fixed_and_aligned_v2_binds_explicit_delivery() -> TestResult {
+fn base_frame_delivery_is_versioned_and_aligned_v2_bindings_stay_fixed() -> TestResult {
     let config = connection(PacketLayer::Ethernet, Duplex::Full);
     let (a, _) = endpoints(Duplex::Full)?;
     let profile = udp::runtime_config(config, a)?;
@@ -180,35 +184,44 @@ fn frame_bindings_stay_fixed_and_aligned_v2_binds_explicit_delivery() -> TestRes
         },
     )?;
     let actual = [
-        l2tunnel_runtime::udp::base_session_config(config.runtime(), profile)?
-            .digest
-            .0,
+        l2tunnel_runtime::udp::base_session_config(
+            config.runtime(),
+            profile,
+            crate::delivery_tests::policy(),
+        )?
+        .digest
+        .0,
         l2tunnel_runtime::aligned::udp_base_session_config(config.runtime(), profile, aligned_udp)?
             .digest
             .0,
-        l2tunnel_runtime::quic::base_session_config(config.runtime(), quic)?
-            .digest
-            .0,
+        l2tunnel_runtime::quic::base_session_config(
+            config.runtime(),
+            quic,
+            crate::delivery_tests::policy(),
+        )?
+        .digest
+        .0,
         l2tunnel_runtime::aligned::quic_base_session_config(config.runtime(), quic, aligned_quic)?
             .digest
             .0,
     ];
-    // Entries0/2 preserve the original frame digests. Entries1/3 intentionally
-    // identify aligned v2 with canonical native delivery, never the old v1 profile.
+    // Entries0/2 independently wrap the frozen old transport digests with the
+    // explicit base delivery policy (Python hashlib recipe retained in work).
+    // Entries1/3 preserve the existing aligned v2 identities byte-for-byte.
     assert_eq!(
         actual,
         [
             [
-                5, 78, 111, 172, 0, 231, 206, 217, 157, 197, 80, 168, 208, 59, 196, 211, 248, 186,
-                134, 130, 15, 72, 63, 209, 35, 220, 30, 167, 43, 173, 94, 215
+                18, 166, 245, 219, 57, 242, 10, 253, 95, 137, 176, 73, 89, 106, 114, 213, 111, 165,
+                104, 43, 27, 76, 36, 109, 253, 147, 177, 221, 229, 57, 229, 29
             ],
             [
                 129, 73, 123, 2, 98, 145, 23, 184, 185, 239, 215, 132, 202, 116, 193, 228, 27, 98,
                 237, 27, 91, 228, 207, 255, 20, 211, 174, 149, 104, 194, 18, 132
             ],
             [
-                215, 222, 43, 32, 176, 189, 36, 11, 58, 36, 90, 12, 141, 155, 219, 230, 87, 94,
-                180, 79, 45, 77, 198, 52, 147, 180, 144, 250, 31, 57, 74, 63
+                103, 105, 69, 20, 55, 135, 205, 55, 114, 193, 70, 80, 198, 173, 221, 187, 108, 221,
+                85, 156, 218, 221, 97, 188, 99, 255, 221, 83, 219, 52, 155, 216
             ],
             [
                 105, 252, 241, 205, 161, 123, 76, 93, 218, 18, 176, 82, 233, 196, 183, 216, 47,

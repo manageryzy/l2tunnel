@@ -33,10 +33,29 @@ BOUNDS = {'case': 150, 'startup': 35, 'command': 10, 'transfer': 30,
           'confirmed': 10, 'carrier_loss': 18, 'cleanup': 30}
 MARK = 0x12aa0001
 MAX_SAMPLES = 512
+# Native byte admission is independent of the finite connectivity lab's raw
+# wire budget below; these settings do not qualify an 80 Mbit/s workload.
+DELIVERY_POLICY = {
+    'forward_bandwidth_bps': 100_000_000, 'reverse_bandwidth_bps': 10_000_000,
+    'bootstrap_rtt_micros': 70_000, 'min_rtt_micros': 1000, 'max_rtt_micros': 2_000_000,
+    'headroom_percent': 125, 'minimum_bytes': 3200, 'max_inflight_bytes': 4 * 1024 * 1024,
+    'max_records': 8192, 'metadata_limit_bytes': 2 * 1024 * 1024,
+    'sample_ttl_micros': 4_000_000, 'flush_timeout_micros': 10_000_000,
+}
 SELECTION = {'carrier': 'raw_packet_v1', 'udp_cover': 'none', 'traffic': 'system'}
 CAPABILITIES = {'runtime_implemented': True, 'native_qualified': False,
                 'congestion_control': False, 'clean_drain': False, 'hot_reload': False}
 COUNTERS = {'admitted', 'sources', 'received', 'delivered', 'peer_delivered', 'staged'}
+FLIGHT_COUNTERS = {f'{domain}_{unit}' for domain in
+                   ('admitted', 'delivered', 'flushed', 'flushed_total', 'outstanding')
+                   for unit in ('bytes', 'records')}
+SAMPLE_FIELDS = {'raw_rtt_micros', 'smoothed_rtt_micros', 'sample_at_micros'}
+RECOVERY_COUNTERS = {f'{direction}_{unit}' for direction in ('send', 'receive')
+                     for unit in ('bytes', 'records')}
+WINDOW_FIELDS = {'runtime_profile', 'delivery', 'recovery', 'native_pending_bytes',
+                 'native_pending_records', 'local_queue_packets_limit', 'local_queue_bytes_limit',
+                 'local_queue_packets', 'local_queue_bytes', 'wire_bytes_per_second',
+                 'wire_packets_per_second'}
 HELPERS = {'tools/raw_packet_native_smoke.py': Path(__file__),
            'tools/proxy_native_smoke.py': Path(bounded.__file__),
            'tools/raw_native_smoke.py': Path(retained.__file__),
@@ -49,7 +68,8 @@ def policy(duplex: str, side: str, suite: str = 'integrity') -> dict:
     def endpoints(ports):
         a, b = f'192.0.2.2:{ports[0]}', f'192.0.2.6:{ports[1]}'
         return {'local': a if side == 'a' else b, 'peer': b if side == 'a' else a}
-    return {'version': 1, 'profile': 'raw-packet-runtime-v1',
+    return {'version': 2, 'profile': 'raw-packet-runtime-v2',
+            'delivery': dict(DELIVERY_POLICY),
             'forward': endpoints(retained.PORTS[0]),
             'reverse': endpoints(retained.PORTS[1]) if duplex == 'half' else None,
             'channels': 4, 'packet': {'mtu': 1200, 'protection': suite,
@@ -86,9 +106,78 @@ def case_plan(lab_id: str, layer: str, duplex: str, suite: str = 'integrity') ->
                               'congestion', 'PMTU/NAT/middleboxes', 'hot switching', 'other platforms']}
 
 
+def unsigned(value, maximum=2**64 - 1) -> bool:
+    return type(value) is int and 0 <= value <= maximum
+
+
+def validate_windows(value: dict) -> None:
+    """Keep local storage, retained recovery and original native flight distinct."""
+    if value['runtime_profile'] != 'raw-packet-runtime-v2':
+        raise ValueError('wrong raw native delivery profile')
+    for name in ('delivery', 'recovery', 'native_pending_bytes', 'native_pending_records'):
+        if not isinstance(value[name], list) or len(value[name]) != 2:
+            raise ValueError('invalid raw lane window array')
+    for unit in ('packets', 'bytes'):
+        used, limit = value[f'local_queue_{unit}'], value[f'local_queue_{unit}_limit']
+        if not unsigned(used) or not unsigned(limit) or limit == 0 or used > limit:
+            raise ValueError('local raw queue exceeds its own bound')
+    for name in ('wire_bytes_per_second', 'wire_packets_per_second'):
+        if not unsigned(value[name]) or value[name] == 0:
+            raise ValueError('missing configured raw wire budget')
+    for index in (0, 1):
+        if (not unsigned(value['native_pending_bytes'][index], DELIVERY_POLICY['max_inflight_bytes'])
+                or not unsigned(value['native_pending_records'][index], DELIVERY_POLICY['max_records'])):
+            raise ValueError('native receive bank exceeds negotiated bound')
+        if value['native_pending_records'][index] != value['received'][index] - value['delivered'][index]:
+            raise ValueError('native receive bank differs from device delivery debt')
+        flight = value['delivery'][index]
+        if flight is not None:
+            if (not isinstance(flight, dict) or set(flight) !=
+                    FLIGHT_COUNTERS | SAMPLE_FIELDS | {'target_bytes', 'sample_fresh', 'retained_records'}
+                    or any(not unsigned(flight[name]) for name in FLIGHT_COUNTERS)
+                    or not unsigned(flight['target_bytes'], DELIVERY_POLICY['max_inflight_bytes'])
+                    or flight['target_bytes'] == 0
+                    or not unsigned(flight['retained_records'], DELIVERY_POLICY['max_records'])
+                    or type(flight['sample_fresh']) is not bool):
+                raise ValueError('invalid bounded native flight accounting')
+            for unit in ('bytes', 'records'):
+                admitted, delivered = flight[f'admitted_{unit}'], flight[f'delivered_{unit}']
+                if (delivered > admitted or flight[f'outstanding_{unit}'] != admitted - delivered
+                        or not 0 <= flight[f'flushed_{unit}'] <= flight[f'flushed_total_{unit}'] <= admitted):
+                    raise ValueError('inconsistent native byte/record flight')
+            if (flight['admitted_records'] != value['admitted'][index]
+                    or flight['delivered_records'] != value['peer_delivered'][index]
+                    or flight['outstanding_bytes'] > DELIVERY_POLICY['max_inflight_bytes']
+                    or not flight['outstanding_records'] <= flight['retained_records'] <= flight['admitted_records']):
+                raise ValueError('native flight does not match runtime ownership')
+            samples = [flight[name] for name in SAMPLE_FIELDS]
+            if (any(sample is None for sample in samples) and not all(sample is None for sample in samples)
+                    or any(sample is not None and not unsigned(sample) for sample in samples)
+                    or flight['sample_fresh'] and all(sample is None for sample in samples)):
+                raise ValueError('incomplete or fabricated native RTT sample')
+            if all(sample is not None for sample in samples) and (
+                    not 0 < flight['raw_rtt_micros'] <= flight['sample_at_micros']
+                    or not DELIVERY_POLICY['min_rtt_micros'] <= flight['smoothed_rtt_micros'] <= DELIVERY_POLICY['max_rtt_micros']):
+                raise ValueError('native RTT sample violates causal clock or policy bounds')
+        elif value['admitted'][index] or value['peer_delivered'][index]:
+            raise ValueError('native flight missing despite admitted ownership')
+        recovery = value['recovery'][index]
+        if recovery is not None:
+            if (not isinstance(recovery, dict) or set(recovery) !=
+                    RECOVERY_COUNTERS | {name + '_limit' for name in RECOVERY_COUNTERS}
+                    or any(not unsigned(n) for n in recovery.values())):
+                raise ValueError('invalid retained recovery accounting')
+            for name in RECOVERY_COUNTERS:
+                limit = recovery[name + '_limit']
+                if limit == 0 or recovery[name] > limit or name.endswith('records') and limit > 64:
+                    raise ValueError('recovery exceeds independent source bound')
+        elif flight is not None or value['native_pending_records'][index] or value['native_pending_bytes'][index]:
+            raise ValueError('recovery accounting missing for an initialized lane')
+
+
 def validate_snapshot(value: dict, digest: str | None = None, phase: str | None = None) -> dict:
     if (not isinstance(value, dict) or set(value) != {'requested', 'effective', 'capabilities', 'digest',
-            'phase', 'fault', *COUNTERS} or value['requested'] != SELECTION or value['effective'] != SELECTION
+            'phase', 'fault', *COUNTERS, *WINDOW_FIELDS} or value['requested'] != SELECTION or value['effective'] != SELECTION
             or value['capabilities'] != CAPABILITIES
             or any(type(value['capabilities'].get(k)) is not bool for k in CAPABILITIES)
             or not isinstance(value['digest'], str) or not re.fullmatch('[0-9a-f]{64}', value['digest'])
@@ -106,6 +195,7 @@ def validate_snapshot(value: dict, digest: str | None = None, phase: str | None 
             raise ValueError('impossible native delivery credit')
     if value['phase'] != 'Stopped' and value['fault'] is not None:
         raise ValueError('nonterminal snapshot has a fault')
+    validate_windows(value)
     return value
 
 
@@ -165,6 +255,15 @@ def confirmed(peers: dict, lanes: int) -> bool:
         active = range(lanes) if lanes == 1 else (0 if side == 'a' else 1,)
         if not all(a['admitted'][i] > 0 and a['sources'][i] > 0 and a['staged'][i] > 0 for i in active):
             return False
+        for i in active:
+            flight, recovery = a['delivery'][i], a['recovery'][i]
+            if (flight is None or recovery is None or flight['outstanding_bytes']
+                    or flight['outstanding_records'] or flight['retained_records']
+                    or recovery['send_records'] or recovery['send_bytes']
+                    or any(flight[f'{name}_{unit}'] != flight[f'admitted_{unit}']
+                           for name in ('delivered', 'flushed', 'flushed_total')
+                           for unit in ('bytes', 'records'))):
+                return False
     return True
 
 

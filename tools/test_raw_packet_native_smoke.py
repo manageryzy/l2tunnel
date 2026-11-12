@@ -27,6 +27,23 @@ def status(phase='Active', duplex='full', side='a'):
             value[name] = [1, 0] if side == 'a' else [0, 1]
         for name in ('received', 'delivered'):
             value[name] = [0, 1] if side == 'a' else [1, 0]
+    value.update(runtime_profile='raw-packet-runtime-v2', delivery=[None, None], recovery=[None, None],
+                 native_pending_bytes=[0, 0], native_pending_records=[0, 0],
+                 local_queue_packets_limit=64, local_queue_bytes_limit=102400,
+                 local_queue_packets=0, local_queue_bytes=0,
+                 wire_bytes_per_second=1048576, wire_packets_per_second=2048)
+    for lane in range(1 if duplex == 'full' else 2):
+        count = value['admitted'][lane]
+        value['delivery'][lane] = {f'{name}_{unit}': count * (100 if unit == 'bytes' else 1)
+                                   for name in ('admitted', 'delivered', 'flushed', 'flushed_total')
+                                   for unit in ('bytes', 'records')}
+        value['delivery'][lane].update(outstanding_bytes=0, outstanding_records=0,
+                                      retained_records=0, target_bytes=1093750,
+                                      raw_rtt_micros=None, smoothed_rtt_micros=None,
+                                      sample_at_micros=None, sample_fresh=False)
+        value['recovery'][lane] = {name: 0 for name in smoke.RECOVERY_COUNTERS}
+        value['recovery'][lane].update({name + '_limit': 64 if name.endswith('records') else 65536
+                                        for name in smoke.RECOVERY_COUNTERS})
     return value
 
 
@@ -197,6 +214,11 @@ class RawPacketEvidenceTests(unittest.TestCase):
             self.assertIn('--carrier', plan['profile'])
             self.assertEqual(plan['profile'][plan['profile'].index('--carrier') + 1], 'raw-packet')
             a, b = plan['policies']['a'], plan['policies']['b']
+            self.assertEqual((a['version'], a['profile']), (2, 'raw-packet-runtime-v2'))
+            self.assertEqual(a['delivery'], smoke.DELIVERY_POLICY)
+            self.assertEqual(a['delivery'], b['delivery'])
+            self.assertEqual(a['packet']['queue_packets'], 8)
+            self.assertEqual(a['packet']['bytes_per_second'], 1048576)
             self.assertEqual(a['forward'], dict(local=b['forward']['peer'], peer=b['forward']['local']))
             self.assertEqual(a['packet']['protection'], 'integrity')
             self.assertEqual(a['reverse'] is None, plan['duplex'] == 'full')
@@ -239,6 +261,59 @@ class RawPacketEvidenceTests(unittest.TestCase):
         for changed in [text + '\n' + text, text.replace('TimedOut', 'BrokenPipe'), text.replace('Stopped', 'Active')]:
             with self.assertRaises(ValueError): smoke.verify_terminal(changed, 1, 16, 18, 'ab' * 32)
         with self.assertRaises(ValueError): smoke.event('{"event":"x","event":"raw_packet_terminal"}', 'raw_packet_terminal')
+
+    def test_window_domains_allow_native_debt_above_local_and_recovery_limits(self):
+        value = status()
+        value.update(admitted=[128, 0], peer_delivered=[0, 0],
+                     local_queue_packets_limit=2, local_queue_packets=2)
+        flight = value['delivery'][0]
+        flight.update(admitted_bytes=12800, admitted_records=128, delivered_bytes=0, delivered_records=0,
+                      flushed_bytes=12800, flushed_records=128, flushed_total_bytes=12800,
+                      flushed_total_records=128, outstanding_bytes=12800, outstanding_records=128,
+                      retained_records=128, target_bytes=3200)
+        # A smaller future target must not erase existing native debt. Neither
+        # the local queue nor the independent64-source recovery cap is that debt.
+        value['recovery'][0].update(send_records=64, send_bytes=6400)
+        smoke.validate_snapshot(value)
+        for mutate in [lambda v: v.update(local_queue_packets=3),
+                       lambda v: v['recovery'][0].update(send_records=65),
+                       lambda v: v['delivery'][0].update(outstanding_bytes=12799),
+                       lambda v: v['delivery'][0].update(admitted_records=True),
+                       lambda v: v.update(native_pending_bytes=[smoke.DELIVERY_POLICY['max_inflight_bytes'] + 1, 0]),
+                       lambda v: v.update(native_pending_records=[1, 0]),
+                       lambda v: v.update(runtime_profile='raw-packet-runtime-v1')]:
+            changed = copy.deepcopy(value); mutate(changed)
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                smoke.validate_snapshot(changed)
+
+    def test_rtt_sample_absence_and_staleness_do_not_fabricate_measurements(self):
+        value = status()
+        value['delivery'][0]['sample_fresh'] = True
+        with self.assertRaises(ValueError): smoke.validate_snapshot(value)
+        value['delivery'][0].update(raw_rtt_micros=70000, smoothed_rtt_micros=70000,
+                                    sample_at_micros=90000, sample_fresh=False)
+        smoke.validate_snapshot(value)
+        for fields in [{'raw_rtt_micros': 0}, {'raw_rtt_micros': 90001},
+                       {'smoothed_rtt_micros': 999}, {'smoothed_rtt_micros': 2000001}]:
+            changed = copy.deepcopy(value)
+            changed['delivery'][0].update(fields)
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                smoke.validate_snapshot(changed)
+        value['delivery'][0]['raw_rtt_micros'] = None
+        with self.assertRaises(ValueError): smoke.validate_snapshot(value)
+
+    def test_native_confirmation_waits_for_actual_send_callback_and_recovery_release(self):
+        peers = {side: status() for side in ('a', 'b')}
+        flight = peers['a']['delivery'][0]
+        flight.update(flushed_bytes=0, flushed_records=0, flushed_total_bytes=0,
+                      flushed_total_records=0, retained_records=1)
+        smoke.validate_snapshot(peers['a'])  # Legitimate ACK-before-callback state.
+        self.assertFalse(smoke.confirmed(peers, 1))
+        peers['a'] = status()
+        peers['a']['recovery'][0].update(send_records=1, send_bytes=100)
+        self.assertFalse(smoke.confirmed(peers, 1))
+        peers['a']['recovery'][0].update(send_records=0, send_bytes=0)
+        self.assertTrue(smoke.confirmed(peers, 1))
 
     def test_original_full_half_bootstrap_phase_and_data_geometry(self):
         for lanes in (1, 2):

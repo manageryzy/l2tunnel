@@ -398,3 +398,5 @@ mod managed_tests;
 
 /// Fixed common-MUX aligned symbol runtime over protected UDP or genuine QUIC.
 pub mod aligned;
+
+mod packet_delivery;

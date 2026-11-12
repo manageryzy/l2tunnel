@@ -4,7 +4,7 @@ use super::udp::{Endpoints, RecoveryMode};
 use l2tunnel_auth::{MemberAllowlist, MemberKey, SessionConfig};
 use l2tunnel_core::Duplex;
 use l2tunnel_quic::{self as carrier, ClientEndpoint, EndpointLimits, ServerEndpoint};
-use l2tunnel_runtime::quic as runtime;
+use l2tunnel_runtime::{managed::DeliveryConfig, quic as runtime};
 use std::io;
 
 /// Explicit peer/lane policy; no custom UDP cover or optional transport encryption.
@@ -59,7 +59,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-/// Compute the exact canonical real-QUIC runtime profile before native I/O.
+/// Validate reusable QUIC transport geometry; base-native factories also require delivery policy.
 pub fn runtime_config(config: ConnectionConfig, settings: Settings) -> io::Result<runtime::Config> {
     config.session()?;
     settings.validate(config.duplex)?;
@@ -131,28 +131,41 @@ pub(crate) struct Lanes {
     pub(crate) profile: runtime::Config,
     pub(crate) pair_deadline: tokio::time::Instant,
 }
-/// Bind both lanes before authenticating; never open a TCP socket.
+/// Bind and authenticate base-native lanes under one original setup deadline.
+/// Both lanes are owned before authentication; no TCP socket is opened.
 pub async fn connect(
     roots: &[Vec<u8>],
     name: &str,
     member: &MemberKey,
     config: ConnectionConfig,
     settings: Settings,
+    delivery: DeliveryConfig,
 ) -> io::Result<(runtime::Link, runtime::Config)> {
     let profile = runtime_config(config, settings)?;
-    let base = runtime::base_session_config(config.runtime(), profile)?;
-    let lanes = connect_lanes(roots, name, member, config, settings, base).await?;
-    let link = match lanes.second {
-        None => runtime::Link::full(lanes.first, config.runtime(), profile)?,
-        Some(second) => {
-            finish_pair(
-                lanes.pair_deadline,
-                runtime::client_pair(lanes.first, second, config.runtime(), profile),
-            )
-            .await?
-        }
-    };
-    Ok((link, profile))
+    let base = runtime::base_session_config(config.runtime(), profile, delivery)?;
+    let deadline = super::HandshakeDeadline::start(config.handshake_timeout)?;
+    deadline
+        .within(async {
+            let lanes = connect_lanes(roots, name, member, config, settings, base).await?;
+            let link = match lanes.second {
+                None => runtime::Link::full(lanes.first, config.runtime(), profile, delivery)?,
+                Some(second) => {
+                    finish_pair(
+                        lanes.pair_deadline,
+                        runtime::client_pair(
+                            lanes.first,
+                            second,
+                            config.runtime(),
+                            profile,
+                            delivery,
+                        ),
+                    )
+                    .await?
+                }
+            };
+            Ok((link, profile))
+        })
+        .await
 }
 pub(crate) async fn connect_lanes(
     roots: &[Vec<u8>],
@@ -224,6 +237,9 @@ pub struct Listener {
     profile: runtime::Config,
     settings: Settings,
     base: SessionConfig,
+    // Derived listeners use their own authenticated record policy and cannot
+    // invoke the public base-native accept path.
+    delivery: Option<DeliveryConfig>,
 }
 impl Listener {
     /// Validate certificates/profile and bind all required UDP lanes atomically by ownership.
@@ -232,10 +248,13 @@ impl Listener {
         key: &[u8],
         config: ConnectionConfig,
         settings: Settings,
+        delivery: DeliveryConfig,
     ) -> io::Result<Self> {
         let profile = runtime_config(config, settings)?;
-        let base = runtime::base_session_config(config.runtime(), profile)?;
-        Self::bind_base(certs, key, config, settings, base)
+        let base = runtime::base_session_config(config.runtime(), profile, delivery)?;
+        let mut listener = Self::bind_base(certs, key, config, settings, base)?;
+        listener.delivery = Some(delivery);
+        Ok(listener)
     }
     pub(crate) fn bind_base(
         certs: &[Vec<u8>],
@@ -276,25 +295,46 @@ impl Listener {
             profile,
             settings,
             base,
+            delivery: None,
         })
     }
-    /// Authenticate the configured peer and pair directional lanes before device I/O.
+    /// Authenticate base frames under one entry deadline, including idle first accept.
+    /// Derived listeners reject this public path before endpoint I/O.
     pub async fn accept(
         &self,
         allowlist: &MemberAllowlist,
     ) -> io::Result<(runtime::Link, runtime::Config)> {
-        let lanes = self.accept_lanes(allowlist).await?;
-        let link = match lanes.second {
-            None => runtime::Link::full(lanes.first, self.config.runtime(), self.profile)?,
-            Some(second) => {
-                finish_pair(
-                    lanes.pair_deadline,
-                    runtime::server_pair(lanes.first, second, self.config.runtime(), self.profile),
-                )
-                .await?
-            }
-        };
-        Ok((link, self.profile))
+        let delivery = self
+            .delivery
+            .ok_or_else(|| invalid("derived QUIC listener cannot use base-native accept"))?;
+        let deadline = super::HandshakeDeadline::start(self.config.handshake_timeout)?;
+        deadline
+            .within(async {
+                let lanes = self.accept_lanes(allowlist).await?;
+                let link = match lanes.second {
+                    None => runtime::Link::full(
+                        lanes.first,
+                        self.config.runtime(),
+                        self.profile,
+                        delivery,
+                    )?,
+                    Some(second) => {
+                        finish_pair(
+                            lanes.pair_deadline,
+                            runtime::server_pair(
+                                lanes.first,
+                                second,
+                                self.config.runtime(),
+                                self.profile,
+                                delivery,
+                            ),
+                        )
+                        .await?
+                    }
+                };
+                Ok((link, self.profile))
+            })
+            .await
     }
     pub(crate) async fn accept_lanes(&self, allowlist: &MemberAllowlist) -> io::Result<Lanes> {
         let first = self

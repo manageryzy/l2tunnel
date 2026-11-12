@@ -1,6 +1,8 @@
 //! Fixed-mode native packets over authenticated UDP with bounded selective repeat.
 //! TLS remains the authenticated liveness, recovery-feedback and delivery-credit path.
 use super::{Compression, Duplex, RuntimeConfig, invalid, packet_valid};
+use crate::managed::{DeliveryConfig, Role};
+use crate::packet_delivery as delivery;
 use l2tunnel_auth::SessionConfig;
 use l2tunnel_codec::{
     FRAGMENT_HEADER_BYTES, FragmentConfig, FragmentContext, Fragmenter, MessageId, Reassembler,
@@ -29,6 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+
+/// Read-only bounded base-native runtime observations.
+pub use crate::packet_delivery::{LaneStatus, Observer, Reporter, Snapshot, observations};
 
 /// Negotiated ordered recovery; FEC repairs preserve original ARQ/native identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,7 +376,10 @@ fn profile(config: Config, lane: Lane) -> io::Result<Profile> {
     Ok(value)
 }
 /// Canonical initial packet/recovery/queue binding before adding the physical UDP lane.
-pub fn base_session_config(runtime: RuntimeConfig, config: Config) -> io::Result<SessionConfig> {
+pub(crate) fn transport_session_config(
+    runtime: RuntimeConfig,
+    config: Config,
+) -> io::Result<SessionConfig> {
     runtime.validate()?;
     config.validate()?;
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
@@ -459,14 +467,37 @@ pub fn base_session_config(runtime: RuntimeConfig, config: Config) -> io::Result
         ),
     })
 }
+/// Bind mandatory native-byte delivery policy independently of recovery/local queues.
+pub fn base_session_config(
+    runtime: RuntimeConfig,
+    config: Config,
+    delivery: crate::managed::DeliveryConfig,
+) -> io::Result<SessionConfig> {
+    let transport = transport_session_config(runtime, config)?;
+    crate::packet_delivery::validate(runtime, delivery, config.arq.max_source_bytes)?;
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"l2tunnel/udp-runtime/v3/delivery-window-v1\0");
+    hash.update(&transport.digest.0);
+    hash.update(&delivery.canonical()?);
+    Ok(SessionConfig {
+        layer: transport.layer,
+        digest: ConfigDigest(
+            hash.finish()
+                .as_ref()
+                .try_into()
+                .map_err(|_| invalid("delivery digest length"))?,
+        ),
+    })
+}
 /// Exact TLS member-authentication binding for the selected lane.
 pub fn session_config(
     runtime: RuntimeConfig,
     config: Config,
     lane: Lane,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<SessionConfig> {
     carrier::session_config(
-        base_session_config(runtime, config)?,
+        base_session_config(runtime, config, delivery)?,
         profile(config, lane)?,
     )
     .map_err(io::Error::other)
@@ -477,12 +508,23 @@ pub fn carrier_config(
     config: Config,
     lane: Lane,
     peer: SocketAddr,
+    delivery: crate::managed::DeliveryConfig,
+) -> io::Result<carrier::Config> {
+    let mut value = transport_carrier_config(runtime, config, lane, peer)?;
+    value.base = base_session_config(runtime, config, delivery)?;
+    Ok(value)
+}
+pub(crate) fn transport_carrier_config(
+    runtime: RuntimeConfig,
+    config: Config,
+    lane: Lane,
+    peer: SocketAddr,
 ) -> io::Result<carrier::Config> {
     if peer.is_ipv6() && config.outer_overhead_bytes < 48 {
         return Err(invalid("IPv6 UDP needs complete outer headers"));
     }
     Ok(carrier::Config {
-        base: base_session_config(runtime, config)?,
+        base: transport_session_config(runtime, config)?,
         profile: profile(config, lane)?,
         peer,
         timeout: config.control_timeout,
@@ -608,12 +650,17 @@ pub struct Link {
 }
 impl Link {
     /// Validate and retain one full-duplex authenticated UDP carrier.
-    pub fn full(value: Carrier, runtime: RuntimeConfig, config: Config) -> io::Result<Self> {
+    pub fn full(
+        value: Carrier,
+        runtime: RuntimeConfig,
+        config: Config,
+        delivery: crate::managed::DeliveryConfig,
+    ) -> io::Result<Self> {
         Self::full_bound(
             value,
             runtime,
             config,
-            base_session_config(runtime, config)?,
+            base_session_config(runtime, config, delivery)?,
         )
     }
     pub(super) fn full_bound(
@@ -658,13 +705,14 @@ async fn pair(
     runtime: RuntimeConfig,
     config: Config,
     initiator: bool,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
     pair_bound(
         first,
         second,
         runtime,
         config,
-        base_session_config(runtime, config)?,
+        base_session_config(runtime, config, delivery)?,
         initiator,
     )
     .await
@@ -741,8 +789,9 @@ pub async fn client_pair(
     second: Carrier,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
-    pair(first, second, runtime, config, true).await
+    pair(first, second, runtime, config, true, delivery).await
 }
 /// Verify a listener's two independently authenticated, directionally fixed UDP lanes.
 pub async fn server_pair(
@@ -750,8 +799,9 @@ pub async fn server_pair(
     second: Carrier,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<Link> {
-    pair(first, second, runtime, config, false).await
+    pair(first, second, runtime, config, false, delivery).await
 }
 
 pub(super) enum Engine {
@@ -792,6 +842,54 @@ impl Engine {
                 },
             ),
             Self::Cauchy(endpoint) => endpoint.inspect_peer(packet).map_err(io::Error::other),
+        }
+    }
+    pub(super) fn outgoing_source(
+        &self,
+        packet: &[u8],
+        context: RecoveryContext,
+        policy: DatagramPolicy,
+    ) -> io::Result<Option<u64>> {
+        match self {
+            Self::Arq { .. } => {
+                let peer = RecoveryContext {
+                    role: match context.role {
+                        EndpointRole::Initiator => EndpointRole::Responder,
+                        EndpointRole::Responder => EndpointRole::Initiator,
+                    },
+                    ..context
+                };
+                match inspect_packet(packet, peer, policy.arq.max_source_bytes)
+                    .map_err(io::Error::other)?
+                {
+                    PacketView::Data { source, .. } => Ok(Some(source.0)),
+                    PacketView::Ack { .. } => Err(invalid("feedback on base data writer")),
+                }
+            }
+            Self::Cauchy(endpoint) => {
+                endpoint.inspect_output(packet).map_err(io::Error::other)?;
+                let config = policy
+                    .reliable
+                    .ok_or_else(|| invalid("missing Cauchy geometry"))?;
+                let view = reliable::inspect_structural(
+                    packet,
+                    context.role,
+                    policy.payload_bytes,
+                    policy.arq.max_source_bytes,
+                    config.fec.block,
+                )
+                .map_err(io::Error::other)?;
+                if view.sender != context {
+                    return Err(invalid("outgoing source context differs from local owner"));
+                }
+                Ok(view.source.map(|(source, _)| source.0))
+            }
+        }
+    }
+    pub(super) fn retained(&self) -> l2tunnel_recovery::Retained {
+        match self {
+            Self::Arq { endpoint, .. } => endpoint.retained(),
+            Self::Cauchy(endpoint) => endpoint.storage().arq,
         }
     }
     pub(super) fn submit(&mut self, bytes: &[u8], now: Duration) -> io::Result<u64> {
@@ -1092,13 +1190,14 @@ impl SharedBudget {
         }
     }
 }
+#[cfg(test)]
+use crate::control::read_control_bound;
 // Transitional crate-private aliases keep existing fixed-profile owners source
 // compatible; framing and parsing are owned by the common control module.
-#[cfg(test)]
 use crate::control::read_control_bound_timed;
 pub(super) use crate::control::{
-    ControlEvent, Feedback, NativeControlEvent, read_control_bound,
-    read_native_control_bound_timed, write_control_frame_bound,
+    ControlEvent, Feedback, NativeControlEvent, read_native_control_bound_timed,
+    write_control_frame_bound,
 };
 pub(super) async fn write_control_bound(
     mut writer: impl AsyncWrite + Unpin,
@@ -1150,14 +1249,6 @@ async fn read_control(
     read_control_bound(reader, lane, events, duration, feedback_bytes, *b"L2UC").await
 }
 #[cfg(test)]
-async fn write_control_frame(
-    writer: &mut (impl AsyncWrite + Unpin),
-    kind: u8,
-    body: &[u8],
-) -> io::Result<()> {
-    write_control_frame_bound(writer, kind, body, *b"L2UC").await
-}
-#[cfg(test)]
 async fn write_control(
     writer: impl AsyncWrite + Unpin,
     changes: watch::Receiver<Feedback>,
@@ -1184,33 +1275,38 @@ pub(super) async fn read_datagrams(
         }
     }
 }
-pub(super) async fn write_datagrams(
-    mut sender: impl DatagramSend,
-    mut packets: mpsc::Receiver<Vec<u8>>,
-) -> io::Result<()> {
-    while let Some(bytes) = packets.recv().await {
-        sender.send(&bytes).await?;
-    }
-    Err(invalid("datagram producer closed"))
-}
+
 struct State {
     engine: Engine,
+    context: RecoveryContext,
     fragmenter: Fragmenter,
     reassembly: Reassembler,
     fragments: VecDeque<Vec<u8>>,
+    fragment_message: u64,
+    // The bank backs authenticated delivery credit; native is the small local queue.
+    bank: VecDeque<Vec<u8>>,
     native: VecDeque<Vec<u8>>,
-    outbound: Option<mpsc::Sender<Vec<u8>>>,
+    pending_bytes: u64,
+    staged: Option<Vec<u8>>,
+    flight: delivery::Flight,
+    incoming: l2tunnel_flow_control::delivery_window::Config,
+    outbound: Option<mpsc::Sender<delivery::Packet>>,
+    writer_buffers: Vec<Vec<u8>>,
     feedback: watch::Sender<Feedback>,
     receives: bool,
     admitted: u64,
     received: u64,
     delivered: u64,
     peer_delivered: u64,
+    recovery_blocked: bool,
+    delivery_blocked: bool,
+    device_blocked: bool,
 }
 impl State {
     fn control(
         &mut self,
         event: ControlEvent,
+        actual: Duration,
         now: Duration,
         config: DatagramPolicy,
     ) -> io::Result<()> {
@@ -1228,6 +1324,7 @@ impl State {
                         "UDP native delivery credit exceeds admitted frames or regresses",
                     ));
                 }
+                self.flight.feedback(value, actual, now)?;
                 self.peer_delivered = value;
             }
         }
@@ -1246,6 +1343,7 @@ impl State {
         }
     }
 }
+
 fn ticks(now: Duration) -> io::Result<u64> {
     u64::try_from(now.as_millis()).map_err(|_| invalid("runtime clock exhausted"))
 }
@@ -1263,8 +1361,22 @@ pub async fn run<D: PacketDevice<Error = io::Error>>(
     link: Link,
     runtime: RuntimeConfig,
     config: Config,
+    delivery: crate::managed::DeliveryConfig,
 ) -> io::Result<()> {
-    if link.binding != base_session_config(runtime, config)? || device.layer() != runtime.layer {
+    run_observed(device, link, runtime, config, None, delivery).await
+}
+/// Run with bounded read-only observations of local, recovery and delivery domains.
+pub async fn run_observed<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: Config,
+    observer: Option<delivery::Reporter>,
+    delivery: DeliveryConfig,
+) -> io::Result<()> {
+    if link.binding != base_session_config(runtime, config, delivery)?
+        || device.layer() != runtime.layer
+    {
         return Err(invalid(
             "UDP runtime/device differs from authenticated configuration",
         ));
@@ -1279,7 +1391,18 @@ pub async fn run<D: PacketDevice<Error = io::Error>>(
             receiver: p.receiver,
         })
         .collect();
-    run_datagrams(device, parts, link.initiator, runtime, config.policy()?).await
+    let mut policy = config.policy()?;
+    policy.control_magic = *b"L2U2";
+    run_datagrams(
+        device,
+        parts,
+        link.initiator,
+        runtime,
+        policy,
+        observer,
+        delivery,
+    )
+    .await
 }
 pub(super) async fn run_datagrams<D, C, S, R>(
     mut device: D,
@@ -1287,6 +1410,8 @@ pub(super) async fn run_datagrams<D, C, S, R>(
     initiator: bool,
     runtime: RuntimeConfig,
     config: DatagramPolicy,
+    observer: Option<delivery::Reporter>,
+    native_delivery: DeliveryConfig,
 ) -> io::Result<()>
 where
     D: PacketDevice<Error = io::Error>,
@@ -1294,13 +1419,41 @@ where
     S: DatagramSend,
     R: DatagramReceive,
 {
+    if parts.is_empty() || parts.len() > 2 {
+        return Err(invalid("invalid base physical lane count"));
+    }
     let codec = runtime.codec()?;
     let maximum = codec.max_encoded_len();
-    let chunk = config.arq.max_source_bytes - FRAGMENT_HEADER_BYTES;
-    let max_fragments =
-        u16::try_from(maximum.div_ceil(chunk)).map_err(|_| invalid("UDP fragment count"))?;
+    let chunk = config
+        .arq
+        .max_source_bytes
+        .checked_sub(FRAGMENT_HEADER_BYTES)
+        .filter(|n| *n != 0)
+        .ok_or_else(|| invalid("UDP fragment payload"))?;
+    let max_fragments = u16::try_from(delivery::validate(
+        runtime,
+        native_delivery,
+        config.arq.max_source_bytes,
+    )?)
+    .map_err(|_| invalid("UDP fragment count"))?;
+    let role = if initiator {
+        Role::Client
+    } else {
+        Role::Server
+    };
+    let outgoing = native_delivery.outgoing(role);
+    let incoming = native_delivery.incoming(role);
     let (control_tx, mut control_rx) = mpsc::channel(8);
     let (data_tx, mut data_rx) = mpsc::channel(config.arq.receive_records * parts.len());
+    // This owns callback slots, not additional recovery or native flight permission.
+    let callback_cap = config
+        .arq
+        .send_records
+        .checked_mul(parts.len())
+        .ok_or_else(|| invalid("UDP callback capacity overflow"))?;
+    let (sent_tx, mut sent_rx) = mpsc::channel::<delivery::Sent>(callback_cap);
+    // Two owned buffers per physical sending lane cover queue1 plus writer1.
+    let (returned_tx, mut returned_rx) = mpsc::channel::<(usize, Vec<u8>)>(2 * parts.len());
     let started = Instant::now();
     let budget = SharedBudget::from_policy(config, started);
     let mut tasks = JoinSet::new();
@@ -1328,7 +1481,7 @@ where
         let receives = config.duplex == Duplex::Full || !sends;
         let (reader, writer) = tokio::io::split(parts.control);
         let (feedback, changes) = watch::channel(Feedback::default());
-        tasks.spawn(read_control_bound(
+        tasks.spawn(read_control_bound_timed(
             reader,
             index,
             control_tx.clone(),
@@ -1347,13 +1500,20 @@ where
         }
         let outbound = if sends {
             let (tx, rx) = mpsc::channel(1);
-            tasks.spawn(write_datagrams(parts.sender, rx));
+            tasks.spawn(delivery::write(
+                parts.sender,
+                rx,
+                sent_tx.clone(),
+                index,
+                returned_tx.clone(),
+            ));
             Some(tx)
         } else {
             None
         };
         states.push(State {
             engine: Engine::from_policy(config, context)?,
+            context,
             fragmenter: Fragmenter::new(
                 fragment_context,
                 FragmentConfig {
@@ -1381,21 +1541,36 @@ where
             )
             .map_err(io::Error::other)?,
             fragments: VecDeque::new(),
+            fragment_message: 0,
+            bank: VecDeque::new(),
             native: VecDeque::new(),
+            pending_bytes: 0,
+            staged: None,
+            flight: delivery::Flight::new(outgoing, usize::from(max_fragments))?,
+            incoming,
             outbound,
+            writer_buffers: if sends {
+                vec![vec![0; config.payload_bytes], vec![0; config.payload_bytes]]
+            } else {
+                Vec::new()
+            },
             feedback,
             receives,
             admitted: 0,
             received: 0,
             delivered: 0,
             peer_delivered: 0,
+            recovery_blocked: false,
+            delivery_blocked: false,
+            device_blocked: false,
         });
     }
     drop(control_tx);
     drop(data_tx);
+    drop(sent_tx);
+    drop(returned_tx);
     let mut ticker = interval(runtime.poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Native adapters require a full maximum-plus-one sentinel to detect truncation.
     let mut packet = vec![0; l2tunnel_device::READ_BUFFER_BYTES];
     let mut source = vec![0; config.arq.max_source_bytes];
     let mut record = vec![0; maximum];
@@ -1403,16 +1578,48 @@ where
     loop {
         tokio::select! {
             Some(result) = tasks.join_next() => return match result {
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(io::Error::other(error)),
+                Ok(Err(error)) => Err(error), Err(error) => Err(io::Error::other(error)),
                 Ok(Ok(())) => Err(invalid("UDP task ended unexpectedly")),
             },
-            Some((lane, event)) = control_rx.recv() => states[lane].control(event, started.elapsed(), config)?,
-            Some((lane, bytes)) = data_rx.recv() => states[lane].data(&bytes, started.elapsed(), config)?,
+            Some((lane,buffer)) = returned_rx.recv() => {
+                let buffers=&mut states[lane].writer_buffers;
+                if buffers.len()>=2 || buffer.len()!=config.payload_bytes {
+                    return Err(invalid("UDP owned writer buffer accounting"));
+                }
+                buffers.push(buffer);
+            },
+            Some(event) = sent_rx.recv() => {
+                states[event.lane].flight.sent(event.witness,
+                    delivery::since(started,event.at)?, started.elapsed())?;
+            },
+            Some((lane,event,at)) = control_rx.recv() => {
+                // Apply only genuinely earlier successful sends; the original receipt
+                // remains authoritative if another send callback arrives later.
+                for _ in 0..callback_cap {
+                    let Ok(sent) = sent_rx.try_recv() else { break };
+                    states[sent.lane].flight.sent(sent.witness,
+                        delivery::since(started,sent.at)?, started.elapsed())?;
+                }
+                states[lane].control(event,delivery::since(started,at)?,started.elapsed(),config)?;
+            },
+            Some((lane,bytes)) = data_rx.recv() => states[lane].data(&bytes,started.elapsed(),config)?,
             _ = ticker.tick() => {},
         }
-        let now = started.elapsed();
+        // Bounded turn work even when the physical writer replenishes concurrently.
+        for _ in 0..callback_cap {
+            let Ok(event) = sent_rx.try_recv() else { break };
+            states[event.lane].flight.sent(
+                event.witness,
+                delivery::since(started, event.at)?,
+                started.elapsed(),
+            )?;
+        }
         for state in &mut states {
+            let now = started.elapsed();
+            state.flight.tick(now)?;
+            state.recovery_blocked = false;
+            state.delivery_blocked = false;
+            state.device_blocked = false;
             if !state
                 .reassembly
                 .expire(ticks(now)?)
@@ -1424,20 +1631,44 @@ where
                     "UDP native packet reassembly expired",
                 ));
             }
+            // Move only the configured local queue; the separately bounded bank
+            // carries additional authenticated native delivery storage.
+            while state.native.len() < runtime.queue_packets {
+                let Some(bytes) = state.bank.pop_front() else {
+                    break;
+                };
+                state.native.push_back(bytes);
+            }
             while let Some(bytes) = state.native.front() {
                 match device.transmit(bytes) {
                     Ok(()) => {
+                        state.pending_bytes =
+                            state
+                                .pending_bytes
+                                .checked_sub(bytes.len() as u64)
+                                .ok_or_else(|| invalid("UDP pending native byte underflow"))?;
                         state.native.pop_front();
                         increment(&mut state.delivered)?;
                         state
                             .feedback
                             .send_modify(|feedback| feedback.credit = state.delivered);
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        state.device_blocked = true;
+                        break;
+                    }
                     Err(error) => return Err(error),
                 }
             }
-            while state.native.len() < runtime.queue_packets {
+            for _ in 0..config.arq.receive_records {
+                let pending = state
+                    .native
+                    .len()
+                    .checked_add(state.bank.len())
+                    .ok_or_else(|| invalid("UDP pending native records overflow"))?;
+                if pending >= state.incoming.max_records {
+                    break;
+                }
                 let Some((_, length)) = state.engine.delivered(&mut source)? else {
                     break;
                 };
@@ -1447,12 +1678,19 @@ where
                     .map_err(io::Error::other)?
                 {
                     if message.0 != state.received
-                        || state.received - state.delivered >= runtime.queue_packets as u64
                         || (runtime.compression == Compression::None && record.get(4) != Some(&0))
                     {
-                        return Err(invalid(
-                            "UDP native sequence, delivery window or codec mismatch",
-                        ));
+                        return Err(invalid("UDP native sequence or codec mismatch"));
+                    }
+                    let native_len = codec
+                        .decoded_len(&record[..length])
+                        .map_err(io::Error::other)?;
+                    let total = state
+                        .pending_bytes
+                        .checked_add(native_len as u64)
+                        .ok_or_else(|| invalid("UDP native byte bank overflow"))?;
+                    if total > state.incoming.max_inflight_bytes {
+                        return Err(invalid("UDP peer exceeds authenticated native byte bank"));
                     }
                     let native = codec
                         .decode_vec(&record[..length])
@@ -1460,51 +1698,95 @@ where
                     if !packet_valid(runtime.layer, &native) {
                         return Err(invalid("invalid UDP native packet"));
                     }
-                    state.native.push_back(native);
+                    state.pending_bytes = total;
+                    state.bank.push_back(native);
                     increment(&mut state.received)?;
                 }
             }
             if let Some(outbound) = &state.outbound {
-                if state.fragments.is_empty()
-                    && state.admitted - state.peer_delivered < runtime.queue_packets as u64
-                    && let Some(length) = device.receive(&mut packet)?
-                {
-                    if length > runtime.max_packet
-                        || !packet_valid(runtime.layer, &packet[..length])
+                if state.fragments.is_empty() {
+                    let status = state.flight.status(now)?;
+                    let record_room = status.outstanding.records < outgoing.max_records as u64
+                        && status.retained_records < outgoing.max_records;
+                    if state.staged.is_none()
+                        && record_room
+                        && let Some(length) = device.receive(&mut packet)?
                     {
-                        return Err(invalid("device supplied invalid UDP native packet"));
+                        if length > runtime.max_packet
+                            || !packet_valid(runtime.layer, &packet[..length])
+                        {
+                            return Err(invalid("device supplied invalid UDP native packet"));
+                        }
+                        state.staged = Some(packet[..length].to_vec());
                     }
-                    let bytes = codec
-                        .encode_vec(&packet[..length])
-                        .map_err(io::Error::other)?;
-                    state.fragments = state
-                        .fragmenter
-                        .fragment(&bytes)
-                        .map_err(io::Error::other)?
-                        .fragments
-                        .into();
-                    increment(&mut state.admitted)?;
+                    if let Some(native) = state.staged.as_ref() {
+                        if state.flight.preview(native.len(), now)? {
+                            let bytes = codec.encode_vec(native).map_err(io::Error::other)?;
+                            let batch = state
+                                .fragmenter
+                                .fragment(&bytes)
+                                .map_err(io::Error::other)?;
+                            state.flight.admit(
+                                batch.message.0,
+                                native.len(),
+                                batch.fragments.len(),
+                                now,
+                            )?;
+                            state.fragment_message = batch.message.0;
+                            state.fragments = batch.fragments.into();
+                            state.staged = None;
+                            increment(&mut state.admitted)?;
+                        } else {
+                            state.delivery_blocked = true;
+                        }
+                    }
                 }
-                while let Some(bytes) = state.fragments.front() {
+                for _ in 0..config.arq.send_records {
+                    let Some(bytes) = state.fragments.front() else {
+                        break;
+                    };
                     match state.engine.submit(bytes, now) {
-                        Ok(_) => {
+                        Ok(source) => {
+                            state.flight.submitted(state.fragment_message, source)?;
                             state.fragments.pop_front();
                         }
-                        Err(error) if pressure(&error, BufferSide::Send) => break,
+                        Err(error) if pressure(&error, BufferSide::Send) => {
+                            state.recovery_blocked = true;
+                            break;
+                        }
                         Err(error) => return Err(error),
                     }
                 }
-                match outbound.try_reserve() {
-                    Ok(permit) => {
-                        if let Some(length) =
-                            budget.poll(false, now, &mut state.engine, &mut encoded)?
-                        {
-                            permit.send(encoded[..length].to_vec());
+                if let Some(mut buffer) = state.writer_buffers.pop() {
+                    match outbound.try_reserve() {
+                        Ok(permit) => {
+                            if let Some(length) =
+                                budget.poll(false, now, &mut state.engine, &mut buffer)?
+                            {
+                                let source = state.engine.outgoing_source(
+                                    &buffer[..length],
+                                    state.context,
+                                    config,
+                                )?;
+                                let witness = source
+                                    .map(|id| state.flight.witness(id))
+                                    .transpose()?
+                                    .flatten();
+                                permit.send(delivery::Packet {
+                                    bytes: buffer,
+                                    length,
+                                    witness,
+                                });
+                            } else {
+                                state.writer_buffers.push(buffer);
+                            }
                         }
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        return Err(invalid("UDP writer closed"));
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            state.writer_buffers.push(buffer)
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(invalid("UDP writer closed"));
+                        }
                     }
                 }
             }
@@ -1513,6 +1795,25 @@ where
                     .feedback
                     .send_modify(|feedback| feedback.ack = Some(encoded[..length].to_vec()));
             }
+        }
+        if let Some(observer) = &observer {
+            let mut snapshot = delivery::Snapshot::default();
+            for (lane, state) in states.iter().enumerate() {
+                snapshot.lanes[lane] = Some(delivery::LaneStatus {
+                    delivery: state.flight.status(started.elapsed())?,
+                    recovery: state.engine.retained(),
+                    recovery_limits: config.arq,
+                    local_queue_limit: runtime.queue_packets,
+                    local_queued: state.native.len(),
+                    bank_records: state.bank.len(),
+                    native_pending_bytes: state.pending_bytes,
+                    staged_bytes: state.staged.as_ref().map_or(0, Vec::len),
+                    recovery_blocked: state.recovery_blocked,
+                    delivery_blocked: state.delivery_blocked,
+                    device_blocked: state.device_blocked,
+                });
+            }
+            observer.publish(snapshot);
         }
     }
 }

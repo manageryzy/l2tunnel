@@ -290,8 +290,23 @@ pub enum RecordKind {
     /// Upper recovery feedback; finite carrier control service still applies.
     Feedback,
 }
+/// Opaque locally staged record identity, scoped to its physical lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordToken(u64);
+/// Genuine successful original packet-adapter handoff, not peer delivery.
+#[derive(Clone, Copy, Debug)]
+pub struct SentRecord {
+    /// Physical lane that owned the staged record.
+    pub lane: PairLane,
+    /// Exact locally issued record identity.
+    pub token: RecordToken,
+    /// Original successful PacketIo::send completion time.
+    pub sent_at: Instant,
+}
 /// One complete authenticated carrier record, not a native-delivery confirmation.
 pub struct ReceivedRecord {
+    /// Original successful authenticated parse receipt, before bounded retention.
+    pub received_at: Instant,
     /// Original physical lane.
     pub lane: PairLane,
     /// Recovery record category.

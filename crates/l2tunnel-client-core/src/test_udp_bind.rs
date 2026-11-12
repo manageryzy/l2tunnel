@@ -1,11 +1,25 @@
 fn udp_startup_addr_in_use(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut cause = Some(error);
-    while let Some(current) = cause {
-        if current.downcast_ref::<io::Error>()
-            .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse) {
-            return true;
+    // io::Error::source can skip its boxed error, and the maintained QUIC
+    // carrier intentionally exposes no source chain. Inspect these typed
+    // wrappers directly; authentication/protocol variants are never retried.
+    for _ in 0..16 {
+        let Some(current) = cause else { return false };
+        if let Some(error) = current.downcast_ref::<io::Error>() {
+            if error.kind() == io::ErrorKind::AddrInUse {
+                return true;
+            }
+            cause = error
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+        } else if let Some(error) = current.downcast_ref::<l2tunnel_quic::Error>() {
+            cause = match error {
+                l2tunnel_quic::Error::Io(inner) => Some(inner),
+                _ => return false,
+            };
+        } else {
+            cause = current.source();
         }
-        cause = current.source();
     }
     false
 }
@@ -31,6 +45,7 @@ macro_rules! retry_udp_startup {
                 }
             }
             unreachable!("bounded startup retry always returns")
-        }).await?
+        })
+        .await?
     }};
 }

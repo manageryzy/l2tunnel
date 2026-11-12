@@ -18,6 +18,8 @@ pub struct Config {
     pub credit_interval: Duration,
     /// Original first-fragment lifetime; feedback does not renew it.
     pub reassembly_timeout: Duration,
+    /// Canonical native-byte flight, independent of local queues and source recovery.
+    pub delivery: super::super::managed::DeliveryConfig,
 }
 impl Config {
     /// Derive finite direct selective-repeat and common-MUX defaults at the real MTU.
@@ -26,6 +28,7 @@ impl Config {
         transport: PacketPhaseConfig,
         duplex: Duplex,
         channels: u16,
+        delivery: super::super::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         runtime.validate()?;
         let maximum = transport
@@ -39,6 +42,7 @@ impl Config {
             .checked_mul(runtime.max_packet)
             .ok_or_else(|| invalid("raw pipeline byte bound"))?;
         let value = Self {
+            delivery,
             transport,
             runtime,
             duplex,
@@ -190,8 +194,9 @@ impl Config {
             .checked_add(4)
             .ok_or_else(|| invalid("raw native envelope overflow"))?;
         let chunk = self.arq.max_source_bytes - FRAGMENT_HEADER_BYTES;
-        u16::try_from(maximum.div_ceil(chunk))
-            .map_err(|_| invalid("raw fragment count exceeds wire field"))?;
+        let parts = maximum.div_ceil(chunk);
+        u16::try_from(parts).map_err(|_| invalid("raw fragment count exceeds wire field"))?;
+        super::super::packet_delivery::validate_parts(self.runtime, self.delivery, parts)?;
         Pipeline::new(self.pipeline).map_err(io::Error::other)?;
         udp::Engine::from_policy(
             self.policy()?,
@@ -218,8 +223,9 @@ impl Config {
     pub fn session_config(self) -> io::Result<SessionConfig> {
         self.validate()?;
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        hash.update(b"l2tunnel/raw-packet-runtime/v1/frame-v1/fragment-v1/arq-v1/reliable-v1/native-credit-v1\0");
+        hash.update(b"l2tunnel/raw-packet-runtime/v2/frame-v1/fragment-v1/arq-v1/reliable-v1/native-byte-delivery-v1\0");
         hash.update(&self.transport.pair.session.digest.0);
+        hash.update(&self.delivery.canonical()?);
         hash.update(&[
             match self.runtime.layer {
                 PacketLayer::Ethernet => 1,
@@ -272,7 +278,29 @@ impl Config {
             self.transport.pair.session,
             ConfigDigest(digest),
             self.pipeline,
-            b"l2tunnel/raw-packet-runtime/v1/common-mux-crc32\0",
+            b"l2tunnel/raw-packet-runtime/v2/common-mux-crc32\0",
         ))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_delivery(runtime: RuntimeConfig) -> super::super::managed::DeliveryConfig {
+    let policy = l2tunnel_flow_control::delivery_window::Config {
+        target_bandwidth_bps: 80_000_000,
+        bootstrap_rtt_micros: 70_000,
+        min_rtt_micros: 2_000,
+        max_rtt_micros: 1_000_000,
+        headroom_percent: 125,
+        minimum_bytes: runtime.max_packet as u64,
+        max_inflight_bytes: 4 * 1024 * 1024,
+        max_records: 2,
+        max_packet_bytes: runtime.max_packet as u64,
+        metadata_limit_bytes: 2 * 1024 * 1024,
+        sample_ttl_micros: 4_000_000,
+        flush_timeout_micros: 10_000_000,
+    };
+    super::super::managed::DeliveryConfig {
+        forward: policy,
+        reverse: policy,
     }
 }

@@ -200,6 +200,7 @@ fn config(
         transport,
         if half { Duplex::Half } else { Duplex::Full },
         4,
+        super::config::test_delivery(runtime),
     )?;
     config.arq.initial_rto = Duration::from_millis(25);
     config.arq.maximum_rto = Duration::from_millis(100);
@@ -253,6 +254,7 @@ struct Native {
     delivered: Vec<Vec<u8>>,
     reads: usize,
     blocked: bool,
+    blocked_transmits: usize,
 }
 #[derive(Clone)]
 struct Device {
@@ -292,6 +294,7 @@ impl PacketDevice for Device {
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.change(|s| {
             if s.blocked {
+                s.blocked_transmits += 1;
                 Err(io::ErrorKind::WouldBlock.into())
             } else {
                 s.delivered.push(bytes.to_vec());
@@ -504,6 +507,8 @@ fn canonical_runtime_binding_covers_native_mux_recovery_and_feedback_policy() ->
     let mut cases = Vec::new();
     let mut c = base;
     c.runtime.max_packet -= 1;
+    c.delivery.forward.max_packet_bytes = c.runtime.max_packet as u64;
+    c.delivery.reverse.max_packet_bytes = c.runtime.max_packet as u64;
     c.pipeline.parse.max_packet_bytes -= 1;
     c.pipeline.queue.bytes = c.runtime.max_packet * c.runtime.queue_packets;
     if let pipeline::Profile::TunDrr(mut qos) = c.pipeline.profile {
@@ -511,6 +516,12 @@ fn canonical_runtime_binding_covers_native_mux_recovery_and_feedback_policy() ->
         qos.base_quantum_bytes = c.runtime.max_packet as u32;
         c.pipeline.profile = pipeline::Profile::TunDrr(qos);
     }
+    cases.push(c);
+    let mut c = base;
+    c.delivery.forward.target_bandwidth_bps += 1;
+    cases.push(c);
+    let mut c = base;
+    c.delivery.reverse.bootstrap_rtt_micros += 1;
     cases.push(c);
     let mut c = base;
     c.runtime.compression = Compression::Lz4IfSmaller;
@@ -710,8 +721,18 @@ async fn authenticated_bad_native_channel_never_reaches_device() -> R {
     let mut frame = vec![0xff, 0xff, 0, 0];
     frame.extend_from_slice(&encoded);
     let fragments = sender.lanes[0].fragmenter.fragment(&frame)?.fragments;
+    sender.lanes[0]
+        .flight
+        .as_mut()
+        .ok_or("sender flight")?
+        .admit(0, native.len(), fragments.len(), Duration::ZERO)?;
     for fragment in fragments {
-        sender.lanes[0].engine.submit(&fragment, Duration::ZERO)?;
+        let source = sender.lanes[0].engine.submit(&fragment, Duration::ZERO)?;
+        sender.lanes[0]
+            .flight
+            .as_mut()
+            .ok_or("sender flight")?
+            .submitted(0, source)?;
     }
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -809,3 +830,127 @@ async fn lz4_large_native_frames_include_actual_small_mtu_fragmentation() -> R {
 
 #[path = "flow_tests.rs"]
 mod flow_retirement;
+
+#[tokio::test]
+async fn native_actual_byte_flight_exceeds_local_two_and_sixty_four_before_device_release() -> R {
+    let mut config = config(PacketLayer::Ip, true, false, Protection::ChaCha20Poly1305)?;
+    config.delivery.forward.max_records = 128;
+    config.delivery.reverse.max_records = 128;
+    let (a, b, _) = links(config).await?;
+    let state = a.subscribe();
+    let ad = Device::new(PacketLayer::Ip);
+    let bd = Device::new(PacketLayer::Ip);
+    let packets: Vec<_> = (0..65_u8)
+        .map(|i| packet(PacketLayer::Ip, i + 1, [40, 73, 128][usize::from(i) % 3]))
+        .collect();
+    let actual_bytes = packets.iter().map(|p| p.len() as u64).sum::<u64>();
+    ad.change(|s| s.outgoing = packets.clone().into())?;
+    bd.change(|s| s.blocked = true)?;
+    let ar = tokio::spawn(run(ad.clone(), a));
+    let br = tokio::spawn(run(bd.clone(), b));
+    let reached = tokio::time::timeout(Duration::from_secs(3), async {
+        while state.borrow().delivery[0].is_none_or(|s| s.flushed_total.records != 65)
+            || bd.change(|s| s.blocked_transmits == 0).unwrap_or(true)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "native byte budget must exceed local2: admitted={:?}",
+        state.borrow().admitted
+    );
+    assert_eq!(state.borrow().peer_delivered[0], 0);
+    let flight = state.borrow().delivery[0].ok_or("missing flight status")?;
+    assert_eq!(flight.admitted.bytes, actual_bytes);
+    assert_eq!(flight.flushed_total.bytes, actual_bytes);
+    assert_eq!(flight.outstanding.bytes, actual_bytes);
+    assert!(bd.change(|s| s.delivered.is_empty())?);
+    bd.change(|s| s.blocked = false)?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while bd.change(|s| s.delivered.len())? != 65
+            || state.borrow().delivery[0]
+                .is_none_or(|s| s.delivered.records != 65 || s.retained_records != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    assert_eq!(bd.change(|s| s.delivered.clone())?, packets);
+    let flight = state.borrow().delivery[0].ok_or("completed flight")?;
+    assert_eq!(flight.delivered.bytes, actual_bytes);
+    assert_eq!(flight.outstanding.bytes, 0);
+    assert!(flight.sample.is_some());
+    ar.abort();
+    br.abort();
+    let _ = ar.await;
+    let _ = br.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_physical_send_never_confirms_and_keeps_original_flush_deadline() -> R {
+    let mut config = config(PacketLayer::Ip, true, false, Protection::ChaCha20Poly1305)?;
+    config.delivery.forward.flush_timeout_micros = 20_000;
+    let (a, _b, probes) = links(config).await?;
+    let state = a.subscribe();
+    probes[0].blocked.store(true, Ordering::SeqCst);
+    let before = probes[0].sends.load(Ordering::SeqCst);
+    let device = Device::new(PacketLayer::Ip);
+    device.change(|s| s.outgoing.push_back(packet(PacketLayer::Ip, 1, 128)))?;
+    let error = match tokio::time::timeout(Duration::from_secs(1), run(device, a)).await? {
+        Err(error) => error,
+        Ok(()) => return Err("blocked first flight must expire".into()),
+    };
+    assert!(probes[0].sends.load(Ordering::SeqCst) > before);
+    assert_eq!(state.borrow().admitted[0], 1);
+    let flight = state.borrow().delivery[0].ok_or("flight status")?;
+    assert_eq!(flight.flushed_total.records, 0);
+    assert_eq!(flight.outstanding.bytes, 128);
+    assert!(flight.sample.is_none());
+    assert!(error.to_string().contains("Expired"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_mid_turn_error_keeps_last_coherent_snapshot_and_original_error() -> R {
+    let config = config(PacketLayer::Ip, true, false, Protection::ChaCha20Poly1305)?;
+    let (mut a, _b, _) = links(config).await?;
+    let device = Device::new(PacketLayer::Ip);
+    device.change(|s| s.outgoing.push_back(packet(PacketLayer::Ip, 1, 73)))?;
+    let state = a.subscribe();
+    let mut owner = Owner::new(
+        device,
+        a.carrier.take().ok_or("carrier")?,
+        config,
+        a.status.clone(),
+    )?;
+    let before = state.borrow().clone();
+    // Inject a bounded writer-envelope failure in the second lane. The first
+    // lane must genuinely admit its native packet earlier in the SAME turn.
+    owner.lanes[1].pending = Some((
+        carrier::RecordKind::Feedback,
+        vec![0; owner.carrier.max_record_bytes() + 1],
+    ));
+    let error = poll_fn(|cx| Poll::Ready(owner.turn(cx)))
+        .await
+        .err()
+        .ok_or("expected writer-envelope failure")?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        carrier_error(carrier::Error::Configuration).to_string()
+    );
+    assert_eq!(owner.status.admitted[0], 1);
+    assert_eq!(owner.status.delivery[0], None);
+    // Match run(): preserve the original error before the owner is destroyed.
+    owner.status.fault = Some(error.kind());
+    drop(owner);
+    let mut expected = before;
+    expected.phase = Phase::Stopped;
+    expected.fault = Some(error.kind());
+    assert_eq!(*state.borrow(), expected);
+    Ok(())
+}

@@ -11,6 +11,26 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
 
+fn native_delivery(runtime: RuntimeConfig) -> crate::managed::DeliveryConfig {
+    let policy = l2tunnel_flow_control::delivery_window::Config {
+        target_bandwidth_bps: 80_000_000,
+        bootstrap_rtt_micros: 70_000,
+        min_rtt_micros: 2_000,
+        max_rtt_micros: 2_000_000,
+        headroom_percent: 125,
+        minimum_bytes: runtime.max_packet as u64,
+        max_inflight_bytes: (runtime.max_packet * runtime.queue_packets) as u64,
+        max_records: runtime.queue_packets,
+        max_packet_bytes: runtime.max_packet as u64,
+        metadata_limit_bytes: 2 * 1024 * 1024,
+        sample_ttl_micros: 1_000_000,
+        flush_timeout_micros: 10_000_000,
+    };
+    crate::managed::DeliveryConfig {
+        forward: policy,
+        reverse: policy,
+    }
+}
 fn runtime(layer: PacketLayer) -> RuntimeConfig {
     RuntimeConfig {
         layer,
@@ -169,6 +189,7 @@ async fn carriers(
         &client_tls,
         &server_tls,
         &member,
+        native_delivery(runtime),
     )
     .await
 }
@@ -182,6 +203,7 @@ async fn carriers_with_identity(
     client_tls: &ClientTls,
     server_tls: &ServerTls,
     member: &MemberKey,
+    selected_delivery: crate::managed::DeliveryConfig,
 ) -> Result<(Carrier, Carrier), TestError> {
     let allowlist = MemberAllowlist::new(&[member.public_key()])?;
     let a = UdpSocket::bind("127.0.0.1:0").await?;
@@ -202,7 +224,7 @@ async fn carriers_with_identity(
     let (b_tcp, _) = listener.accept().await?;
     a_tcp.set_nodelay(true)?;
     b_tcp.set_nodelay(true)?;
-    let binding = session_config(runtime, config, lane)?;
+    let binding = session_config(runtime, config, lane, selected_delivery)?;
     let (a_tls, b_tls) = tokio::try_join!(
         client_connect(
             a_tcp,
@@ -221,14 +243,30 @@ async fn carriers_with_identity(
         ),
     )?;
     Ok(tokio::try_join!(
-        carrier::establish(a_tls, a, carrier_config(runtime, config, lane, peer)?),
-        carrier::establish(b_tls, b, carrier_config(runtime, config, lane, peer)?),
+        carrier::establish(
+            a_tls,
+            a,
+            carrier_config(runtime, config, lane, peer, selected_delivery)?
+        ),
+        carrier::establish(
+            b_tls,
+            b,
+            carrier_config(runtime, config, lane, peer, selected_delivery)?
+        ),
     )?)
 }
 async fn links(
     runtime: RuntimeConfig,
     config: Config,
     impair: bool,
+) -> Result<(Link, Link, Relays), TestError> {
+    links_with_delivery(runtime, config, impair, native_delivery(runtime)).await
+}
+async fn links_with_delivery(
+    runtime: RuntimeConfig,
+    config: Config,
+    impair: bool,
+    selected_delivery: crate::managed::DeliveryConfig,
 ) -> Result<(Link, Link, Relays), TestError> {
     let cert = rcgen::generate_simple_self_signed(vec!["udp-runtime.test".to_owned()])?;
     let chain = vec![cert.cert.der().to_vec()];
@@ -245,12 +283,13 @@ async fn links(
         &client_tls,
         &server_tls,
         &member,
+        selected_delivery,
     )
     .await?;
     let (a, b) = if config.duplex == Duplex::Full {
         (
-            Link::full(a, runtime, config)?,
-            Link::full(b, runtime, config)?,
+            Link::full(a, runtime, config, selected_delivery)?,
+            Link::full(b, runtime, config, selected_delivery)?,
         )
     } else {
         let (c, d) = carriers_with_identity(
@@ -262,11 +301,12 @@ async fn links(
             &client_tls,
             &server_tls,
             &member,
+            selected_delivery,
         )
         .await?;
         tokio::try_join!(
-            client_pair(a, c, runtime, config),
-            server_pair(b, d, runtime, config)
+            client_pair(a, c, runtime, config, selected_delivery),
+            server_pair(b, d, runtime, config, selected_delivery)
         )?
     };
     Ok((a, b, relays))
@@ -301,8 +341,20 @@ async fn real_devices_all_profiles_loss_reorder_fragmentation_and_blocked_delive
                         native.blocked = true;
                     })?;
                     let mut tasks = JoinSet::new();
-                    tasks.spawn(run(a_device.clone(), a, runtime, config));
-                    tasks.spawn(run(b_device.clone(), b, runtime, config));
+                    tasks.spawn(run(
+                        a_device.clone(),
+                        a,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
+                    tasks.spawn(run(
+                        b_device.clone(),
+                        b,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
                     tokio::select! {
                         result = delivered(&a_device, b_packets.len()) => result?,
                         result = tasks.join_next() => return Err(format!("runtime unexpectedly ended {result:?} duplex={duplex:?} layer={layer:?} cover={cover:?}").into()),
@@ -350,8 +402,14 @@ async fn compressed_packets_and_retained_control_eof() -> TestResult {
     let b_device = Device::new(runtime.layer);
     let bytes = packet(runtime.layer, 4, 3900);
     a_device.change(|native| native.outgoing.push_back(bytes.clone()))?;
-    let a_task = tokio::spawn(run(a_device, a, runtime, config));
-    let mut b_task = tokio::spawn(run(b_device.clone(), b, runtime, config));
+    let a_task = tokio::spawn(run(a_device, a, runtime, config, native_delivery(runtime)));
+    let mut b_task = tokio::spawn(run(
+        b_device.clone(),
+        b,
+        runtime,
+        config,
+        native_delivery(runtime),
+    ));
     tokio::select! {
         result = delivered(&b_device, 1) => result?,
         result = &mut b_task => return Err(format!("runtime unexpectedly ended {result:?}").into()),
@@ -374,29 +432,29 @@ fn canonical_binding_and_configuration_fail_closed() -> TestResult {
         Protection::HmacSha256,
     )?;
     assert_ne!(
-        session_config(runtime, config, Lane::First)?,
-        session_config(runtime, config, Lane::Second)?
+        session_config(runtime, config, Lane::First, native_delivery(runtime))?,
+        session_config(runtime, config, Lane::Second, native_delivery(runtime))?
     );
     let mut other = config;
     other.arq.max_retries += 1;
     assert_ne!(
-        base_session_config(runtime, config)?,
-        base_session_config(runtime, other)?
+        base_session_config(runtime, config, native_delivery(runtime))?,
+        base_session_config(runtime, other, native_delivery(runtime))?
     );
     let mut other_runtime = runtime;
     other_runtime.queue_packets += 1;
     assert_ne!(
-        base_session_config(runtime, config)?,
-        base_session_config(other_runtime, config)?
+        base_session_config(runtime, config, native_delivery(runtime))?,
+        base_session_config(other_runtime, config, native_delivery(other_runtime))?
     );
     other.heartbeat_interval = other.control_timeout;
-    assert!(base_session_config(runtime, other).is_err());
+    assert!(base_session_config(runtime, other, native_delivery(runtime)).is_err());
     other = config;
     other.arq.max_source_bytes = config.path_mtu;
-    assert!(base_session_config(runtime, other).is_err());
+    assert!(base_session_config(runtime, other, native_delivery(runtime)).is_err());
     other = config;
     other.duplex = Duplex::Full;
-    assert!(session_config(runtime, other, Lane::Second).is_err());
+    assert!(session_config(runtime, other, Lane::Second, native_delivery(runtime)).is_err());
     assert!(
         Config::new(
             Duplex::Full,
@@ -421,15 +479,29 @@ async fn wrong_constructor_profile_and_role_fail_before_device_use() -> TestResu
     let (a, _b) = carriers(runtime, config, Lane::First, &mut relays, false).await?;
     let mut different = runtime;
     different.queue_packets += 1;
-    assert!(Link::full(a, different, config).is_err());
+    assert!(Link::full(a, different, config, native_delivery(different)).is_err());
     let (a, _b, _relays) = links(runtime, config, false).await?;
     let device = Device::new(runtime.layer);
-    assert!(run(device.clone(), a, different, config).await.is_err());
+    assert!(
+        run(
+            device.clone(),
+            a,
+            different,
+            config,
+            native_delivery(different)
+        )
+        .await
+        .is_err()
+    );
     assert_eq!(device.change(|native| native.admitted)?, 0);
     let mut half = config;
     half.duplex = Duplex::Half;
     let (a, b) = carriers(runtime, half, Lane::First, &mut relays, false).await?;
-    assert!(client_pair(a, b, runtime, half).await.is_err());
+    assert!(
+        client_pair(a, b, runtime, half, native_delivery(runtime))
+            .await
+            .is_err()
+    );
     Ok(())
 }
 #[tokio::test]
@@ -467,8 +539,14 @@ async fn lost_udp_exhausts_retries_while_tls_control_stays_available() -> TestRe
     let b_device = Device::new(runtime.layer);
     a_device.change(|native| native.outgoing.push_back(packet(runtime.layer, 1, 2000)))?;
     let mut tasks = JoinSet::new();
-    tasks.spawn(run(a_device, a, runtime, config));
-    tasks.spawn(run(b_device.clone(), b, runtime, config));
+    tasks.spawn(run(a_device, a, runtime, config, native_delivery(runtime)));
+    tasks.spawn(run(
+        b_device.clone(),
+        b,
+        runtime,
+        config,
+        native_delivery(runtime),
+    ));
     let result = timeout(Duration::from_secs(2), tasks.join_next())
         .await?
         .ok_or_else(|| invalid("missing runtime result"))??;
@@ -531,21 +609,32 @@ async fn acknowledged_partial_native_packet_expiry_fails_the_link() -> TestResul
     let (tx, mut rx) = mpsc::channel(8);
     let (feedback, changes) = watch::channel(Feedback::default());
     let mut controls = JoinSet::new();
-    controls.spawn(read_control(
+    controls.spawn(read_control_bound(
         reader,
         0,
         tx,
         config.control_timeout,
         config.feedback_bytes(),
+        *b"L2U2",
     ));
-    controls.spawn(write_control(
+    controls.spawn(write_control_bound(
         writer,
         changes,
-        config,
+        {
+            let mut policy = config.policy()?;
+            policy.control_magic = *b"L2U2";
+            policy
+        },
         SharedBudget::new(config, Instant::now()),
     ));
     let device = Device::new(runtime.layer);
-    let task = tokio::spawn(run(device.clone(), b, runtime, config));
+    let task = tokio::spawn(run(
+        device.clone(),
+        b,
+        runtime,
+        config,
+        native_delivery(runtime),
+    ));
     parts.sender.send(&bytes[..length]).await?;
     let (_, ack) = timeout(Duration::from_secs(1), rx.recv())
         .await?
@@ -572,8 +661,14 @@ async fn authenticated_unearned_delivery_credit_is_rejected() -> TestResult {
     let (mut a, b, _relays) = links(runtime, config, false).await?;
     let mut parts = a.parts.pop().ok_or_else(|| invalid("missing peer parts"))?;
     let device = Device::new(runtime.layer);
-    let task = tokio::spawn(run(device.clone(), b, runtime, config));
-    write_control_frame(&mut parts.control, 3, &1_u64.to_be_bytes()).await?;
+    let task = tokio::spawn(run(
+        device.clone(),
+        b,
+        runtime,
+        config,
+        native_delivery(runtime),
+    ));
+    write_control_frame_bound(&mut parts.control, 3, &1_u64.to_be_bytes(), *b"L2U2").await?;
     let result = timeout(Duration::from_secs(1), task).await??;
     let error = result
         .err()
@@ -652,7 +747,7 @@ async fn native_sentinel_buffer_does_not_expand_configured_packet_limit() -> Tes
     })?;
     let result = timeout(
         Duration::from_secs(1),
-        run(device.clone(), a, runtime, config),
+        run(device.clone(), a, runtime, config, native_delivery(runtime)),
     )
     .await?;
     assert!(result.is_err());
@@ -706,11 +801,17 @@ async fn authenticated_udp_ack_and_tls_data_cannot_cross_dispatch_boundaries() -
         };
         assert_eq!(length, ACK_PACKET_BYTES);
         let device = Device::new(runtime.layer);
-        let task = tokio::spawn(run(device.clone(), b, runtime, config));
+        let task = tokio::spawn(run(
+            device.clone(),
+            b,
+            runtime,
+            config,
+            native_delivery(runtime),
+        ));
         if udp_ack {
             parts.sender.send(&bytes[..length]).await?;
         } else {
-            write_control_frame(&mut parts.control, 2, &bytes[..length]).await?;
+            write_control_frame_bound(&mut parts.control, 2, &bytes[..length], *b"L2U2").await?;
         }
         assert!(timeout(Duration::from_secs(1), task).await??.is_err());
         assert_eq!(device.change(|native| native.delivered.len())?, 0);
@@ -742,8 +843,20 @@ async fn cauchy_real_devices_all_profiles_loss_reorder_and_blocked_delivery() ->
                         native.blocked = true;
                     })?;
                     let mut tasks = JoinSet::new();
-                    tasks.spawn(run(a_device.clone(), a, runtime, config));
-                    tasks.spawn(run(b_device.clone(), b, runtime, config));
+                    tasks.spawn(run(
+                        a_device.clone(),
+                        a,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
+                    tasks.spawn(run(
+                        b_device.clone(),
+                        b,
+                        runtime,
+                        config,
+                        native_delivery(runtime),
+                    ));
                     tokio::select! {
                         result = delivered(&a_device, b_packets.len()) => result?,
                         result = tasks.join_next() => return Err(format!("runtime unexpectedly ended {result:?} duplex={duplex:?} layer={layer:?} cover={cover:?}").into()),
@@ -802,8 +915,14 @@ async fn real_cauchy_repair_precedes_rto_and_insufficient_rank_uses_arq() -> Tes
                 a_device.change(|native| native.outgoing.push_back(bytes.clone()))?;
                 let started = Instant::now();
                 let mut tasks = JoinSet::new();
-                tasks.spawn(run(a_device, a, runtime, config));
-                tasks.spawn(run(b_device.clone(), b, runtime, config));
+                tasks.spawn(run(a_device, a, runtime, config, native_delivery(runtime)));
+                tasks.spawn(run(
+                    b_device.clone(),
+                    b,
+                    runtime,
+                    config,
+                    native_delivery(runtime),
+                ));
                 tokio::select! {
                     result = delivered(&b_device, 1) => result?,
                     result = tasks.join_next() => return Err(format!("Cauchy runtime ended {result:?}").into()),
@@ -1055,26 +1174,26 @@ fn cauchy_dimensions_and_every_budget_are_authentication_bound() -> TestResult {
     })?;
     assert!(cauchy.arq.max_source_bytes < config.arq.max_source_bytes);
     assert_ne!(
-        base_session_config(runtime, cauchy)?,
-        base_session_config(runtime, config)?
+        base_session_config(runtime, cauchy, native_delivery(runtime))?,
+        base_session_config(runtime, config, native_delivery(runtime))?
     );
     let mut other = cauchy;
     other.wire_budget.packets += 1;
     assert_ne!(
-        base_session_config(runtime, cauchy)?,
-        base_session_config(runtime, other)?
+        base_session_config(runtime, cauchy, native_delivery(runtime))?,
+        base_session_config(runtime, other, native_delivery(runtime))?
     );
     other = cauchy;
     other.wire_budget.wire_bytes += 1;
     assert_ne!(
-        base_session_config(runtime, cauchy)?,
-        base_session_config(runtime, other)?
+        base_session_config(runtime, cauchy, native_delivery(runtime))?,
+        base_session_config(runtime, other, native_delivery(runtime))?
     );
     other = cauchy;
     other.wire_budget.interval += Duration::from_nanos(1);
     assert_ne!(
-        base_session_config(runtime, cauchy)?,
-        base_session_config(runtime, other)?
+        base_session_config(runtime, cauchy, native_delivery(runtime))?,
+        base_session_config(runtime, other, native_delivery(runtime))?
     );
     assert!(
         config
@@ -1105,7 +1224,7 @@ fn cauchy_dimensions_and_every_budget_are_authentication_bound() -> TestResult {
     );
     other = cauchy;
     other.arq.max_source_bytes = config.arq.max_source_bytes;
-    assert!(base_session_config(runtime, other).is_err());
+    assert!(base_session_config(runtime, other, native_delivery(runtime)).is_err());
     Ok(())
 }
 
@@ -1139,8 +1258,20 @@ async fn cauchy_small_shared_allowance_keeps_control_and_native_credit_live() ->
             native.blocked = true;
         })?;
         let mut tasks = JoinSet::new();
-        tasks.spawn(run(a_device.clone(), a, runtime, config));
-        tasks.spawn(run(b_device.clone(), b, runtime, config));
+        tasks.spawn(run(
+            a_device.clone(),
+            a,
+            runtime,
+            config,
+            native_delivery(runtime),
+        ));
+        tasks.spawn(run(
+            b_device.clone(),
+            b,
+            runtime,
+            config,
+            native_delivery(runtime),
+        ));
         tokio::select! {
             result = delivered(&a_device, b_bytes.len()) => result?,
             result = tasks.join_next() => return Err(format!("paced Cauchy runtime ended {result:?}").into()),
@@ -1177,11 +1308,18 @@ async fn cauchy_truncated_envelope_and_old_ack_shape_fail_closed() -> TestResult
         let (mut a, b, _relays) = links(runtime, config, false).await?;
         let mut parts = a.parts.pop().ok_or_else(|| invalid("missing peer parts"))?;
         let device = Device::new(runtime.layer);
-        let task = tokio::spawn(run(device.clone(), b, runtime, config));
+        let task = tokio::spawn(run(
+            device.clone(),
+            b,
+            runtime,
+            config,
+            native_delivery(runtime),
+        ));
         if udp {
             parts.sender.send(b"L2RF\x01\x03\0\0\0").await?;
         } else {
-            write_control_frame(&mut parts.control, 2, &[0; ACK_PACKET_BYTES]).await?;
+            write_control_frame_bound(&mut parts.control, 2, &[0; ACK_PACKET_BYTES], *b"L2U2")
+                .await?;
         }
         assert!(timeout(Duration::from_secs(1), task).await??.is_err());
         assert_eq!(device.change(|native| native.delivered.len())?, 0);
@@ -1255,3 +1393,16 @@ fn reliable_feedback_and_data_charge_their_distinct_enclosing_paths() -> TestRes
     );
     Ok(())
 }
+
+async fn delivery_links(
+    rt: RuntimeConfig,
+    duplex: Duplex,
+    recovery: RecoveryMode,
+    policy: crate::managed::DeliveryConfig,
+) -> Result<(Config, Link, Link, Relays), TestError> {
+    let transport = config(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?
+        .with_recovery(recovery)?;
+    let (a, b, relays) = links_with_delivery(rt, transport, false, policy).await?;
+    Ok((transport, a, b, relays))
+}
+crate::packet_delivery::actual_native_flight!();

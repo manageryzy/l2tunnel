@@ -55,7 +55,7 @@ measurement; two TLS writes alone have not been proved the throughput cause.
 | --- | --- | --- |
 | Verified handshake, member identity, full/paired-half ownership | Real retained TLS and authenticated UDP/QUIC/raw slices | Broader carrier/path security, cover and resource gates remain in CONN-* |
 | TAP/TUN and fixed-peer VXLAN | Finite native Linux connectivity/data-integrity matrices | Broad VTEP/MTU/offload/platform behavior and performance remain open |
-| Local queue versus link flight budget | TCP/TLS frame BDP; focused rolling/aligned/packed byte-credit integration | Base UDP/QUIC and raw retain queue/flight coupling; aggregate/native qualification and FIX-01 remain open |
+| Local queue versus link flight budget | TCP/TLS frame BDP; focused rolling/aligned/packed and base UDP/QUIC/raw byte-credit integration | New base/raw aggregate and native qualification remain open; recovery still has an independent 64-source ceiling, so FIX-01 remains open |
 | Python high-performance composition | Codec/recovery libraries and separate aligned/packed/rolling clients exist | No qualified matching native composition; FIX-02 through FIX-04 |
 | TUN flow control and QoS | Transparent active-credit path and fixed TCP-proxy slices | Adaptive native-window growth and complete fairness/pressure gates still fail or remain unrun |
 | Hot mode switching | Authenticated compression changes and finite active-TUN switches | Full codec/recovery/MUX switching matrix and control-under-load correctness remain open |
@@ -70,7 +70,8 @@ that a client selects it or that a native acceptance test exercised it.
 ## Architecture corrections in progress
 
 The blocking fixes remain in the master checklist. Tested changes include
-independent native byte delivery budgets for rolling/aligned/packed, shared
+independent native byte delivery budgets for rolling/aligned/packed and base
+UDP/QUIC/raw, shared
 immutable FEC history, bounded reusable rolling output buffers, one contiguous
 TLS framing write, and explicit pressure/deadline witnesses. These do not prove
 end-to-end zero copy or the native performance target.
@@ -80,8 +81,13 @@ datagrams have a separate internal owner, and existing-session command handling
 is public in client-core. These are real extractions with unchanged wire
 identities; the public interchangeable recovery composition, negotiated stable
 control envelope and complete client lifecycle API are still required by
-FIX-10 through FIX-12. Base UDP/QUIC and raw delivery budget integration remains
-part of FIX-01, including the independently bounded recovery source window.
+FIX-10 through FIX-12. The current [base UDP/QUIC](modules/packet-delivery.md)
+and [raw](modules/raw-runtime.md) changes replace local-queue admission limits
+with authenticated original-byte/record budgets. Their actual-carrier tests use
+a local queue of two and larger native flight; original send completion, receiver
+pressure and deadlines remain explicit. They are newer than source27e and await
+the coordinated aggregate. The independently bounded recovery source window and
+new native performance qualification remain part of FIX-01.
 
 The [audit inventory](../work/deep-audit26/checked-index.json) is navigation for
 unreviewed evidence, not a completion percentage. Confirmed discrepancies require

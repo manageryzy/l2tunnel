@@ -1,7 +1,9 @@
 # Native packets over genuine standalone QUIC
 
-Status: implemented and integration-tested with memory devices and 36 native
-Linux TAP/TUN/VXLAN scenarios over UDP-only QUIC. This runtime
+Status: the new mandatory native-byte delivery profile passes focused memory-device
+carrier tests; its combined aggregate and native qualification remain pending.
+The 36 native Linux TAP/TUN/VXLAN scenarios below are historical receipts for the
+earlier fixed-count profile. See [current delivery contract](packet-delivery.md). This runtime
 uses genuine UDP-only QUIC authentication, a retained reliable control stream and
 QUIC DATAGRAM data. It is separate from custom `QuicLike` UDP and never changes
 existing custom UDP selections. No TCP socket is required. Hot switching remains
@@ -17,12 +19,13 @@ The opaque ALPN identifier is explicitly configured and observable. QUIC is alwa
 AEAD. Complete IP MTU must accommodate QUIC's 1200-byte minimum UDP payload.
 
 `carrier_profile(config, udp::Lane)` produces the genuine carrier Profile;
-`base_session_config(runtime, config)` binds native layer, codec, device packet/queue
+`base_session_config(runtime, config, delivery)` binds native layer, codec, device packet/queue
 bounds and the exact recovery/runtime policy before carrier profile binding.
 The QUIC endpoint's `connect`/`accept` receives this base, applying the profile once.
-`session_config(runtime, config, lane)` computes the final expected authentication
-binding for link validation. `Link::full`, asynchronous `client_pair` / `server_pair`
-and `run(device, link, runtime, config)` mirror the existing UDP embedding pattern.
+`session_config(runtime, config, lane, delivery)` computes the final expected authentication
+binding for link validation. `Link::full` and asynchronous `client_pair` /
+`server_pair` also require the final `DeliveryConfig` argument.
+`run(device, link, runtime, config, delivery)` follows the UDP embedding pattern.
 Full uses one connection; Half uses two genuine independently authenticated QUIC
 connections, First C2S and Second S2C. Both retain bidirectional reliable control.
 
@@ -34,9 +37,10 @@ native device read. No hand-constructed binding authorizes a link.
 
 The implementation extracts a narrow private generic datagram adapter from the
 existing UDP runtime: `DatagramPolicy`, typed owned parts, bounded async sender and
-receiver adapters, and one `run_datagrams` pump. Existing UDP derives identical
-policy and keeps its public API, defaults, wire prefix and tests. Genuine QUIC uses
-a distinct `L2QF` runtime control prefix and its own profile/digest, while sharing the
+receiver adapters, and one `run_datagrams` pump. That historical extraction kept
+legacy UDP unchanged; the current base migration requires mandatory delivery
+policy in both runtimes. Genuine QUIC uses the new distinct `L2Q2` base control
+prefix and `l2tunnel/quic-runtime/v2/delivery-window-v1` digest domain, sharing the
 same FrameCodec, Fragmenter/Reassembler, SelectiveRepeat/Reliable, common budget,
 native delivery credit and failure handling. No second recovery algorithm or
 separate native admission bypass is introduced.
@@ -102,3 +106,14 @@ and parsers remain in their existing protocol crates. For custom UDP, canonical
 profile/digests, `L2UC` controls and charge values are unchanged. Genuine QUIC uses
 `L2QF`, a distinct pairing prefix and distinct runtime/carrier authentication
 domains; it cannot be selected by changing custom UDP header appearance.
+
+
+## Mandatory byte-delivery profile migration
+
+- [ ] [MOD-QUIC-RUNTIME-08] Qualify the new mandatory delivery-policy profile through a stable aggregate and separately scoped native runs. Focused [shared ownership tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [same actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) cover local integration only; the historical 36-case audit does not qualify the changed profile. The existing64-source recovery bank and QUIC congestion/queue limits remain independent and do not establish80Mbit/s or close [FIX-01](../implementation-checklist.md).
+
+Successful `DatagramSender::send` is the maintained QUIC
+`send_datagram_wait` handoff, not captured UDP kernel transmission. The native
+service observation spans that successful adapter boundary to authenticated
+remote device delivery and includes downstream QUIC scheduling. See
+[packet delivery and copy/memory accounting](packet-delivery.md).

@@ -56,6 +56,7 @@ impl Budget {
 }
 #[derive(Clone)]
 pub(super) struct Cell {
+    pub received_at: Instant,
     pub header: wire::Header,
     pub body: Vec<u8>,
 }
@@ -370,6 +371,7 @@ impl GateState {
                     self.records_outstanding += 1;
                 }
                 self.incoming.push_back(Cell {
+                    received_at: Instant::now(),
                     header: h,
                     body: output[wire::HEADER..opened.payload_len].to_vec(),
                 });
@@ -457,6 +459,7 @@ impl GateState {
                 let header = wire::Header::parse(&output[..opened.payload_len])?;
                 let candidate = Early {
                     cell: Cell {
+                        received_at: Instant::now(),
                         header,
                         body: output[wire::HEADER..opened.payload_len].to_vec(),
                     },
@@ -545,6 +548,7 @@ pub(super) struct GateIo<I: PacketIo> {
     pub state: Arc<Mutex<GateState>>,
     pub budget: SharedBudget,
     pending: Option<([u8; 32], usize)>,
+    pub last_send_at: Option<Instant>,
 }
 impl<I: PacketIo> GateIo<I> {
     pub fn new(
@@ -559,6 +563,7 @@ impl<I: PacketIo> GateIo<I> {
             state: Arc::new(Mutex::new(GateState::new(config, policy, deadline))),
             budget,
             pending: None,
+            last_send_at: None,
         }
     }
     pub fn original(self) -> I {
@@ -681,6 +686,7 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
         };
         match self.io.send(bytes) {
             Ok(()) => {
+                self.last_send_at = Some(Instant::now());
                 self.pending = None;
                 let mut state = lock(&self.state).map_err(io::Error::other)?;
                 state.sent_packets = sent.0;

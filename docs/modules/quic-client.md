@@ -1,8 +1,27 @@
 # Explicit genuine QUIC client composition
 
-Status: implemented and qualified by a 36-case finite Linux native matrix. The design preceded implementation. This shared client uses the independently
-authenticated genuine QUIC carrier/runtime, with no TCP bootstrap socket. Existing
-custom `--carrier udp --udp-cover quic-like` remains a distinct selection.
+Status: the explicit base-frame delivery migration passed 144 local client tests, strict
+Clippy, rustdoc and formatting. Aggregate and new-profile native qualification are pending. The historical 36-case finite Linux native matrix
+below qualifies its recorded earlier identity. Genuine QUIC remains UDP-only;
+custom `--carrier udp --udp-cover quic-like` is a separate selection.
+
+## Base-frame delivery boundary
+
+The [shared base-frame contract](udp-client.md#mandatory-base-frame-delivery-policy)
+defines mandatory policy, CLI validation, original deadlines and observations.
+Public `Listener::bind` validates and retains that delivery policy before parsing
+credentials or binding endpoints. Public `accept` uses only this immutable bound
+policy. A private derived `bind_base` listener rejects public base `accept` with
+InvalidInput before endpoint I/O; derived record owners continue using their own
+private authenticated lane path. No accept-time override or capability flag can
+replace a bound base policy.
+
+- [ ] [MOD-QCLIENT-06] Qualify mandatory QUIC base policy binding, private-derived/public-base rejection before I/O, original full/half setup deadline with actual first-auth/second-Initial witnesses, and exact existing derived identities. Record scoped and aggregate evidence separately from historical native receipts.
+
+Local evidence is recorded in the [client receipt](../../work/base-delivery28/client-validation.json)
+and the [shared scoped evidence](udp-client.md#mandatory-base-frame-delivery-policy).
+The actual first-lane-authentication/second-Initial test rejects a deliberately
+removed outer deadline while retaining the original 200 ms setup allowance.
 
 ## Interface and ownership
 
@@ -14,14 +33,15 @@ reverse settings. Both peers explicitly provision the same nonzero application I
 It is observable ALPN, not a promise of HTTP/3 or resistance to identification.
 QUIC always uses maintained transport AEAD; integrity-only is not available.
 
-`connect(roots, server_name, member, ConnectionConfig, Settings)` binds both required
+`connect(roots, server_name, member, ConnectionConfig, Settings, DeliveryConfig)` binds both required
 UDP lanes, authenticates their exact profiles, and performs the existing runtime
-pair proof. `Listener::bind(certs, key, ConnectionConfig, Settings)` binds both
+pair proof. `Listener::bind(certs, key, ConnectionConfig, Settings, DeliveryConfig)` binds both
 server endpoints before readiness; `accept(allowlist)` authenticates/pairs them.
 Only then may the shared CLI open a TAP/TUN/VXLAN adapter. The resulting runtime
 link retains endpoint handles; all intermediate handles are dropped on failure.
 One admitted connection per physical endpoint and finite pending/handshake limits
-apply. Half-lane follow-up has a total timeout; idle first-listener wait is cancellable.
+apply. Public accept includes the idle first-listener wait in its one original setup
+bound; persistent idle waiting and retries are caller policy.
 After cryptographic authentication, the configured exact peer address is also
 checked before link creation. Address matching never replaces member identity.
 

@@ -242,6 +242,7 @@ async fn raw_reverse_1100_native_flows_preserve_exact_bytes_and_local_ids() -> R
         let metadata = sender.enqueue(original.clone(), Duration::ZERO)?;
         // This fixture starts at the validated reassembly handoff. The separate
         // reverse-capacity regression traverses actual encoded recovery bytes.
+        owner.lanes[0].native_bytes += original.len() as u64;
         owner.lanes[0].native.push_back(NativeFrame {
             bytes: original.clone(),
             channel: metadata.binding.channel,
@@ -294,6 +295,7 @@ async fn raw_full_flow_table_does_not_hide_bad_inner_or_channel_before_native_wr
             bytes.truncate(28);
             bytes[2..4].copy_from_slice(&28u16.to_be_bytes());
         }
+        owner.lanes[0].native_bytes += bytes.len() as u64;
         owner.lanes[0].native.push_back(NativeFrame {
             bytes,
             channel: if malformed {

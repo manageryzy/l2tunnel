@@ -6,8 +6,8 @@ Existing retained raw/TCP defaults remain unchanged. Native packet qualification
 and root stable aggregate are separate gates; see the
 [scoped receipt](../../work/raw-packet-client/validation.json).
 
-The shared API accepts a strict JSON policy of at most 65,536 bytes. Version 1
-profile `raw-packet-runtime-v1` specifies explicit IPv4 forward/reverse tuples,
+The shared API accepts a strict JSON policy of at most 65,536 bytes. Version 2
+profile `raw-packet-runtime-v2` specifies explicit IPv4 forward/reverse tuples,
 packet MTU/protection/pacing/key lifetime policy, MUX channels and maintained
 selective-repeat or Cauchy recovery. Required missing, duplicate and unknown fields are rejected by parsing;
 connection-dependent shape, channels and recovery bounds are revalidated before
@@ -49,8 +49,16 @@ forward local/peer fields on the server:
 
 ```json
 {
-  "version": 1,
-  "profile": "raw-packet-runtime-v1",
+  "version": 2,
+  "profile": "raw-packet-runtime-v2",
+  "delivery": {
+    "forward_bandwidth_bps": 80000000, "reverse_bandwidth_bps": 10000000,
+    "bootstrap_rtt_micros": 70000, "min_rtt_micros": 2000,
+    "max_rtt_micros": 1000000, "headroom_percent": 125,
+    "minimum_bytes": 4000, "max_inflight_bytes": 4194304,
+    "max_records": 8192, "metadata_limit_bytes": 2097152,
+    "sample_ttl_micros": 4000000, "flush_timeout_micros": 10000000
+  },
   "forward": {"local": "192.0.2.11:45001", "peer": "192.0.2.12:45002"},
   "reverse": null,
   "channels": 4,
@@ -89,3 +97,14 @@ on this profile's local service; every mutation/drain action returns unsupported
 The fixed 8,192-byte local response cap and legacy omitted-field reply bytes stay
 unchanged. Setup observers expose no effective selection; callers obtain a new
 Observer from the returned authenticated Session for its effective profile/digest.
+
+Runtime profile v2 requires the shared twelve-field delivery policy; v1 documents
+are rejected rather than migrated silently. The lower `raw_packet_v1` carrier
+status still names the unchanged protected record wire. `runtime_profile` names
+the separately authenticated v2 native accounting contract. Native-flight,
+receiver-pending, local-Pipeline and source-recovery occupancy remain separate.
+RTT/sample fields are null until genuine causal observation and retain their
+original feedback timestamp when stale. The example raw wire allowance remains
+1 MiB/s (8.39 Mbit/s); its 80 Mbit/s target is not an achieved-throughput claim.
+
+- [x] [MOD-RAWCLI-04] Require typed canonical v2 native delivery policy and expose separate native, local queue and recovery accounting through the shared API. Evidence: [six actual client cases and scoped receipt](../../work/raw-delivery28/RECEIPT.md); historical v1 receipts retain their original meaning.

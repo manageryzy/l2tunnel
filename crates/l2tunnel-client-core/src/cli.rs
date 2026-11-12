@@ -23,6 +23,8 @@ mod raw_packet_frontend;
 mod rolling_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
+#[path = "datagram_profiling_cli.rs"]
+mod datagram_profiling;
 #[path = "delivery_cli.rs"]
 mod delivery_frontend;
 #[path = "profiling_cli.rs"]
@@ -496,8 +498,16 @@ enum Connected {
     Tcp(Link),
     Active(Link, super::active::Settings),
     ActiveManaged(Link, super::active_managed::Config),
-    Udp(l2tunnel_runtime::udp::Link, l2tunnel_runtime::udp::Config),
-    Quic(l2tunnel_runtime::quic::Link, l2tunnel_runtime::quic::Config),
+    Udp(
+        l2tunnel_runtime::udp::Link,
+        l2tunnel_runtime::udp::Config,
+        l2tunnel_runtime::managed::DeliveryConfig,
+    ),
+    Quic(
+        l2tunnel_runtime::quic::Link,
+        l2tunnel_runtime::quic::Config,
+        l2tunnel_runtime::managed::DeliveryConfig,
+    ),
     AlignedUdp(
         l2tunnel_runtime::aligned::UdpLink,
         l2tunnel_runtime::udp::Config,
@@ -603,6 +613,29 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
     let quic = quic_settings(options, config)?;
     let active = active_settings(options, config)?;
     let aligned = aligned_settings(options, config)?;
+    let base_delivery =
+        if (transport.is_some() || quic.is_some()) && aligned.is_none() && packed.is_none() {
+            let selected = delivery_frontend::required_settings(options, config)?;
+            // Validate exact tracking/geometry bounds before credential files, sockets
+            // or native devices. Derived records retain their own authenticated policy.
+            if let Some(settings) = transport {
+                l2tunnel_runtime::udp::base_session_config(
+                    config.runtime(),
+                    super::udp::runtime_config(config, settings)?,
+                    selected,
+                )?;
+            }
+            if let Some(settings) = quic {
+                l2tunnel_runtime::quic::base_session_config(
+                    config.runtime(),
+                    super::quic::runtime_config(config, settings)?,
+                    selected,
+                )?;
+            }
+            Some(selected)
+        } else {
+            None
+        };
     let managed_active = options
         .get("--active-policies")
         .map(|path| {
@@ -677,14 +710,36 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 .await?;
                 Connected::AlignedUdp(link, profile, records)
             } else if let Some(settings) = quic {
-                let (link, profile) =
-                    super::quic::connect(&roots, server_name, &identity, config, settings).await?;
-                Connected::Quic(link, profile)
+                let (link, profile) = super::quic::connect(
+                    &roots,
+                    server_name,
+                    &identity,
+                    config,
+                    settings,
+                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
+                )
+                .await?;
+                Connected::Quic(
+                    link,
+                    profile,
+                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
+                )
             } else if let Some(settings) = transport {
-                let (link, profile) =
-                    super::udp::connect(remote, &tls, server_name, &identity, config, settings)
-                        .await?;
-                Connected::Udp(link, profile)
+                let (link, profile) = super::udp::connect(
+                    remote,
+                    &tls,
+                    server_name,
+                    &identity,
+                    config,
+                    settings,
+                    base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
+                )
+                .await?;
+                Connected::Udp(
+                    link,
+                    profile,
+                    base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
+                )
             } else if let Some(settings) = managed_active {
                 Connected::ActiveManaged(
                     super::active_managed::connect(
@@ -756,10 +811,20 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 let (link, profile, records) = listener.accept(&allowlist).await?;
                 Connected::AlignedQuic(link, profile, records)
             } else if let Some(settings) = quic {
-                let listener = super::quic::Listener::bind(&certificates, &key, config, settings)?;
+                let listener = super::quic::Listener::bind(
+                    &certificates,
+                    &key,
+                    config,
+                    settings,
+                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
+                )?;
                 println!("Listening on QUIC UDP {}", settings.forward.local);
                 let (link, profile) = listener.accept(&allowlist).await?;
-                Connected::Quic(link, profile)
+                Connected::Quic(
+                    link,
+                    profile,
+                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
+                )
             } else {
                 let listener = TcpListener::bind(address).await?;
                 println!("Listening on {}", listener.local_addr()?);
@@ -776,9 +841,20 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     .await?;
                     Connected::AlignedUdp(link, profile, records)
                 } else if let Some(settings) = transport {
-                    let (link, profile) =
-                        super::udp::accept(&listener, &tls, &allowlist, config, settings).await?;
-                    Connected::Udp(link, profile)
+                    let (link, profile) = super::udp::accept(
+                        &listener,
+                        &tls,
+                        &allowlist,
+                        config,
+                        settings,
+                        base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
+                    )
+                    .await?;
+                    Connected::Udp(
+                        link,
+                        profile,
+                        base_delivery.ok_or_else(|| input("base UDP delivery policy absent"))?,
+                    )
                 } else if let Some(settings) = managed_active {
                     Connected::ActiveManaged(
                         super::active_managed::accept(
@@ -922,19 +998,63 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             println!("Carrier: tcp-tls; coordinated compression enabled");
             link
         }
-        Connected::Udp(link, profile) => {
+        Connected::Udp(link, profile, delivery) => {
+            delivery_frontend::report(delivery);
             println!(
                 "Carrier: UDP with retained TCP/TLS bootstrap/control; cover {:?}; protection {:?}; recovery {:?}; compression fixed",
                 profile.cover, profile.protection, profile.recovery
             );
-            return l2tunnel_runtime::udp::run(device, link, config.runtime(), profile).await;
+            println!(
+                "Recovery banks: send {} records/{} bytes; receive {} records/{} bytes; local queue {} packets",
+                profile.arq.send_records,
+                profile.arq.send_bytes,
+                profile.arq.receive_records,
+                profile.arq.receive_bytes,
+                config.runtime().queue_packets
+            );
+            let (observations, reporter) = datagram_profiling::channel(profile_interval);
+            return datagram_profiling::observe(
+                l2tunnel_runtime::udp::run_observed(
+                    device,
+                    link,
+                    config.runtime(),
+                    profile,
+                    reporter,
+                    delivery,
+                ),
+                observations,
+                datagram_profiling::Runtime::UdpFrame,
+            )
+            .await;
         }
-        Connected::Quic(link, profile) => {
+        Connected::Quic(link, profile, delivery) => {
+            delivery_frontend::report(delivery);
             println!(
                 "Carrier: genuine QUIC over UDP only; retained authenticated control; AEAD; recovery {:?}; compression fixed",
                 profile.recovery
             );
-            return l2tunnel_runtime::quic::run(device, link, config.runtime(), profile).await;
+            println!(
+                "Recovery banks: send {} records/{} bytes; receive {} records/{} bytes; local queue {} packets",
+                profile.arq.send_records,
+                profile.arq.send_bytes,
+                profile.arq.receive_records,
+                profile.arq.receive_bytes,
+                config.runtime().queue_packets
+            );
+            let (observations, reporter) = datagram_profiling::channel(profile_interval);
+            return datagram_profiling::observe(
+                l2tunnel_runtime::quic::run_observed(
+                    device,
+                    link,
+                    config.runtime(),
+                    profile,
+                    reporter,
+                    delivery,
+                ),
+                observations,
+                datagram_profiling::Runtime::QuicFrame,
+            )
+            .await;
         }
     };
     use l2tunnel_runtime::managed::{self, ManagedConfig, Role, TransactionSettings};
@@ -1213,7 +1333,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", raw_packet_frontend::HELP);
         println!("\n{}", delivery_frontend::HELP);
         println!(
-            "\nProfiling: --profile-ms 0|100..60000 (default off), currently system traffic over TCP/TLS frame records only. Emits bounded cumulative runtime_profile JSON snapshots; transport timing includes async waits."
+            "\nProfiling: --profile-ms 0|100..60000 (default off), system frame records over TCP/TLS or base UDP/QUIC. TCP emits runtime_profile schema3; base UDP/QUIC emits distinct datagram_profile schema1 latest snapshots on the selected interval and at termination. Transport timing includes async waits."
         );
         return ExitCode::SUCCESS;
     }
@@ -1393,6 +1513,39 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn base_datagram_delivery_is_required_before_credential_or_socket_io() -> io::Result<()> {
+        for carrier in ["udp", "quic"] {
+            let mut options = BTreeMap::from([
+                ("--layer".into(), "tun".into()),
+                ("--duplex".into(), "full".into()),
+                ("--carrier".into(), carrier.into()),
+                ("--udp-bind".into(), "127.0.0.1:24440".into()),
+                ("--udp-peer".into(), "127.0.0.1:24441".into()),
+                ("--remote".into(), "127.0.0.1:24441".into()),
+                ("--ca".into(), "/nonexistent/base-delivery28/ca".into()),
+            ]);
+            if carrier == "udp" {
+                options.insert("--udp-cover".into(), "quic-like".into());
+            } else {
+                options.insert("--quic-application-id".into(), "71".repeat(16));
+            }
+            for mode in [None, Some("legacy")] {
+                if let Some(mode) = mode {
+                    options.insert("--delivery-window".into(), mode.into());
+                }
+                let error = execute("connect", &options)
+                    .await
+                    .err()
+                    .ok_or_else(|| input("base datagram missing delivery policy accepted"))?;
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("delivery-window bdp"));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn fec_selection_binds_profile_and_rejects_unused_or_unbounded_knobs() -> io::Result<()> {
         let mut values = BTreeMap::from([
@@ -1412,8 +1565,16 @@ mod tests {
         let a = super::super::udp::runtime_config(config, plain)?;
         let b = super::super::udp::runtime_config(config, coded)?;
         assert_ne!(
-            l2tunnel_runtime::udp::base_session_config(config.runtime(), a)?,
-            l2tunnel_runtime::udp::base_session_config(config.runtime(), b)?
+            l2tunnel_runtime::udp::base_session_config(
+                config.runtime(),
+                a,
+                crate::delivery_tests::policy()
+            )?,
+            l2tunnel_runtime::udp::base_session_config(
+                config.runtime(),
+                b,
+                crate::delivery_tests::policy()
+            )?
         );
         assert!(b.arq.max_source_bytes < a.arq.max_source_bytes);
         for (key, value) in [
@@ -1455,10 +1616,15 @@ mod tests {
         let mut changed = settings;
         changed.application_id[0] ^= 1;
         assert_ne!(
-            l2tunnel_runtime::quic::base_session_config(config.runtime(), profile)?,
             l2tunnel_runtime::quic::base_session_config(
                 config.runtime(),
-                super::super::quic::runtime_config(config, changed)?
+                profile,
+                crate::delivery_tests::policy()
+            )?,
+            l2tunnel_runtime::quic::base_session_config(
+                config.runtime(),
+                super::super::quic::runtime_config(config, changed)?,
+                crate::delivery_tests::policy(),
             )?
         );
         for (key, value) in [

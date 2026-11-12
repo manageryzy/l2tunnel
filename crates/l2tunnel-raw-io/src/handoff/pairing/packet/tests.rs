@@ -187,3 +187,82 @@ async fn actual_hmac_full_and_half_original_owner_transition() -> R {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn tracked_record_requires_actual_send_and_preserves_original_receipt_time() -> R {
+    let (mut a, mut b, probes) = transitioned(false).await?;
+    probes[0].blocked.store(true, Ordering::SeqCst);
+    let token =
+        a.stage_record_tracked(PairLane::First, RecordKind::Data, b"exact tracked bytes")?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    tokio::time::timeout_at(
+        deadline,
+        poll_fn(|cx| {
+            if let Poll::Ready(Err(e)) = a.poll_progress(cx) {
+                return Poll::Ready(Err(e));
+            }
+            if probes[0]
+                .pending
+                .lock()
+                .map_err(|_| Error::Proof)?
+                .is_some()
+            {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }),
+    )
+    .await??;
+    assert!(a.take_sent_record(PairLane::First)?.is_none());
+    assert!(matches!(
+        a.stage_record_tracked(PairLane::First, RecordKind::Data, b"cannot replace pending"),
+        Err(Error::Busy)
+    ));
+    let released = Instant::now();
+    probes[0].blocked.store(false, Ordering::SeqCst);
+    tokio::time::timeout_at(
+        deadline,
+        poll_fn(|cx| {
+            if let Poll::Ready(Err(e)) = a.poll_progress(cx) {
+                return Poll::Ready(Err(e));
+            }
+            if let Poll::Ready(Err(e)) = b.poll_progress(cx) {
+                return Poll::Ready(Err(e));
+            }
+            if b.record().is_some() {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }),
+    )
+    .await??;
+    assert!(matches!(
+        a.stage_record_tracked(
+            PairLane::First,
+            RecordKind::Data,
+            b"completion slot remains owned"
+        ),
+        Err(Error::Busy)
+    ));
+    let sent = a
+        .take_sent_record(PairLane::First)?
+        .ok_or("missing send receipt")?;
+    assert_eq!(sent.token, token);
+    assert_eq!(sent.lane, PairLane::First);
+    assert!(sent.sent_at >= released);
+    assert!(a.take_sent_record(PairLane::First)?.is_none());
+    let received = b.record().ok_or("missing authenticated record")?;
+    assert_eq!(received.bytes, b"exact tracked bytes");
+    let receipt = received.received_at;
+    assert!(receipt >= sent.sent_at);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.record().ok_or("retained record")?.received_at, receipt);
+    b.consume_record()?;
+    a.abort();
+    b.abort();
+    Ok(())
+}

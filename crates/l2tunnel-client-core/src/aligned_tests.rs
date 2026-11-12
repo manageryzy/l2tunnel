@@ -323,7 +323,11 @@ fn aligned_limits_and_binding_are_explicit() -> TestResult {
     let binding = runtime::udp_base_session_config(config.runtime(), transport, records)?;
     assert_ne!(
         binding,
-        l2tunnel_runtime::udp::base_session_config(config.runtime(), transport)?
+        l2tunnel_runtime::udp::base_session_config(
+            config.runtime(),
+            transport,
+            crate::delivery_tests::policy()
+        )?
     );
     let (_, changed) = udp_config(
         config,
@@ -381,7 +385,11 @@ fn aligned_limits_and_binding_are_explicit() -> TestResult {
     let (quic, records) = quic_config(config, as_quic(a), settings)?;
     assert_ne!(
         runtime::quic_base_session_config(config.runtime(), quic, records)?,
-        l2tunnel_runtime::quic::base_session_config(config.runtime(), quic)?
+        l2tunnel_runtime::quic::base_session_config(
+            config.runtime(),
+            quic,
+            crate::delivery_tests::policy()
+        )?
     );
     Ok(())
 }
@@ -490,7 +498,7 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
     Ok(())
 }
 #[tokio::test]
-async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> TestResult {
+async fn base_frame_client_helpers_bind_delivery_for_full_and_half() -> TestResult {
     let credentials = credentials()?;
     let client = ClientTls::from_der_roots(&credentials.chain)?;
     let server = ServerTls::from_der(&credentials.chain, &credentials.key)?;
@@ -507,9 +515,17 @@ async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> Test
                         "aligned-client.test",
                         &credentials.member,
                         config,
-                        a
+                        a,
+                        crate::delivery_tests::policy(),
                     ),
-                    udp::accept(&listener, &server, &credentials.members, config, b)
+                    udp::accept(
+                        &listener,
+                        &server,
+                        &credentials.members,
+                        config,
+                        b,
+                        crate::delivery_tests::policy()
+                    )
                 )
             })
             .await??;
@@ -517,8 +533,13 @@ async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> Test
         })?;
         retry_udp_startup!(8, {
             let (a, b) = endpoints(duplex)?;
-            let listener =
-                quic::Listener::bind(&credentials.chain, &credentials.key, config, as_quic(b))?;
+            let listener = quic::Listener::bind(
+                &credentials.chain,
+                &credentials.key,
+                config,
+                as_quic(b),
+                crate::delivery_tests::policy(),
+            )?;
             timeout(Duration::from_secs(8), async {
                 tokio::try_join!(
                     quic::connect(
@@ -526,7 +547,8 @@ async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> Test
                         "aligned-client.test",
                         &credentials.member,
                         config,
-                        as_quic(a)
+                        as_quic(a),
+                        crate::delivery_tests::policy(),
                     ),
                     listener.accept(&credentials.members)
                 )
@@ -574,6 +596,48 @@ async fn udp_startup_retry_is_bounded_and_only_retries_bind_collisions() -> Test
 }
 
 #[tokio::test]
+async fn udp_startup_classifies_actual_wrapped_quic_bind_without_retrying_auth() -> TestResult {
+    let credentials = credentials()?;
+    let held = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let held_address = held.local_addr()?;
+    let (mut a, _) = endpoints(Duplex::Full)?;
+    a.forward.local = held_address;
+    let config = connection(PacketLayer::Ip, Duplex::Full);
+    let transport = as_quic(a);
+    let error = match quic::connect(
+        &credentials.chain,
+        "aligned-client.test",
+        &credentials.member,
+        config,
+        transport,
+        crate::delivery_tests::policy(),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => return Err(io::Error::other("occupied client endpoint accepted").into()),
+    };
+    // This is the real factory wrapper from the formerly unrecognized failure.
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(
+        udp_startup_addr_in_use(&error),
+        "actual bind error: {error:?}"
+    );
+    assert!(std::net::UdpSocket::bind(held_address).is_err());
+    drop(held);
+    let _released = std::net::UdpSocket::bind(held_address)?;
+    for error in [
+        l2tunnel_quic::Error::Authentication(l2tunnel_auth::Error::BindingMismatch),
+        l2tunnel_quic::Error::Protocol("rejected"),
+        l2tunnel_quic::Error::TimedOut,
+        l2tunnel_quic::Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+    ] {
+        assert!(!udp_startup_addr_in_use(&io::Error::other(error)));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn udp_startup_retries_cannot_renew_original_deadline() {
     let attempts = std::cell::Cell::new(0);
     let result: Result<(), TestError> = async {
@@ -591,4 +655,264 @@ async fn udp_startup_retries_cannot_renew_original_deadline() {
             .is_some()
     }));
     assert_eq!(attempts.get(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn base_half_quic_first_lane_auth_keeps_original_pair_deadline() -> TestResult {
+    use std::{future::Future, task::Poll};
+
+    // Real QUIC I/O must not race a100ms CPU/scheduler allowance. Both Quinn's
+    // TokioRuntime and the client use this injected clock. Keep it from idle
+    // auto-advance, and bound actual socket/crypto progress independently.
+    async fn wall_bound<F: Future>(
+        operation: F,
+        deadline: std::time::Instant,
+    ) -> io::Result<F::Output> {
+        tokio::pin!(operation);
+        std::future::poll_fn(|cx| {
+            if std::time::Instant::now() >= deadline {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "real QUIC fixture wall watchdog exhausted",
+                )));
+            }
+            match operation.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(Ok(value)),
+                Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    let c = credentials()?;
+    let config = ConnectionConfig {
+        handshake_timeout: Duration::from_millis(200),
+        ..connection(PacketLayer::Ip, Duplex::Half)
+    };
+    let (a, b) = endpoints(Duplex::Half)?;
+    let profile = quic::runtime_config(config, as_quic(b))?;
+    let base = l2tunnel_runtime::quic::base_session_config(
+        config.runtime(),
+        profile,
+        crate::delivery_tests::policy(),
+    )?;
+    let tls = l2tunnel_quic::ServerConfig::from_der(
+        &c.chain,
+        &c.key,
+        l2tunnel_runtime::quic::carrier_profile(profile, l2tunnel_runtime::quic::Lane::First)?,
+        l2tunnel_quic::EndpointLimits {
+            max_connections: 1,
+            pending_connections: 4,
+            handshake_timeout: config.handshake_timeout,
+        },
+    )?;
+    let listener = l2tunnel_quic::ServerEndpoint::bind(b.forward.local, &tls)?;
+    let reverse = b.reverse.ok_or("server reverse")?;
+    // Receive the second lane's genuine Initial without answering it. This
+    // witnesses completed client first-lane authentication and avoids an ICMP
+    // refusal substituting for the intended incomplete second handshake.
+    let blackhole = tokio::net::UdpSocket::bind(reverse.local).await?;
+    let client_reverse = a.reverse.ok_or("client reverse")?;
+    let mut clock = tokio::task::JoinSet::new();
+    clock.spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let wall_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let started = tokio::time::Instant::now();
+    let mut attempt = Box::pin(quic::connect(
+        &c.chain,
+        "aligned-client.test",
+        &c.member,
+        config,
+        as_quic(a),
+        crate::delivery_tests::policy(),
+    ));
+    // Start the original allowance before delaying the peer's first accept.
+    let initial = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+    assert!(
+        initial.is_pending(),
+        "setup ended before the first peer accept"
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let retained = wall_bound(
+        async {
+            tokio::select! {
+                result=&mut attempt=>Err(io::Error::other(format!("first QUIC lane failed before original pair wait: {:?}",result.err()))),
+                result=listener.accept(&c.members,base)=>result.map_err(io::Error::other),
+            }
+        },
+        wall_deadline,
+    )
+    .await??;
+    let mut packet = [0; 1500];
+    let (length, peer) = wall_bound(
+        async {
+            tokio::select! {
+                result=&mut attempt=>Err(io::Error::other(format!("setup ended before second Initial: {:?}",result.err()))),
+                result=blackhole.recv_from(&mut packet)=>result,
+            }
+        },
+        wall_deadline,
+    )
+    .await??;
+    assert_eq!(peer, client_reverse.local);
+    assert!(length >= 1200, "missing full QUIC Initial datagram");
+    assert_eq!(packet[0] & 0xf0, 0xc0); // QUIC v1 long-header Initial.
+    assert_eq!(&packet[1..5], &1u32.to_be_bytes());
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    for endpoint in [a.forward.local, client_reverse.local] {
+        assert_eq!(
+            tokio::net::UdpSocket::bind(endpoint)
+                .await
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse)
+        );
+    }
+    tokio::time::advance(Duration::from_millis(99)).await;
+    let early = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+    assert!(early.is_pending(), "original setup ended before200ms");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let expired = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+    let Poll::Ready(result) = expired else {
+        return Err("original200ms setup bound was renewed after first authentication".into());
+    };
+    assert_eq!(
+        result.err().ok_or("missing QUIC pair timeout")?.kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(started.elapsed(), config.handshake_timeout);
+    drop(attempt);
+    wall_bound(
+        async {
+            loop {
+                let one = tokio::net::UdpSocket::bind(a.forward.local).await;
+                let two = tokio::net::UdpSocket::bind(client_reverse.local).await;
+                if one.is_ok() && two.is_ok() {
+                    return;
+                }
+                drop((one, two));
+                tokio::task::yield_now().await;
+            }
+        },
+        wall_deadline,
+    )
+    .await?;
+    drop((retained, listener, blackhole, clock));
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_frame_policy_mismatch_reaches_authentication_and_rejects_both_peers() -> TestResult {
+    let credentials = credentials()?;
+    let config = connection(PacketLayer::Ethernet, Duplex::Full);
+    let client = ClientTls::from_der_roots(&credentials.chain)?;
+    let server = ServerTls::from_der(&credentials.chain, &credentials.key)?;
+    let client_delivery = crate::delivery_tests::policy();
+    let mut server_delivery = client_delivery;
+    server_delivery.reverse.target_bandwidth_bps += 1;
+    for genuine in [false, true] {
+        let (first, second) = retry_udp_startup!(5, {
+            let (a, b) = endpoints(Duplex::Full)?;
+            let (first, second) = if genuine {
+                let listener = quic::Listener::bind(
+                    &credentials.chain,
+                    &credentials.key,
+                    config,
+                    as_quic(b),
+                    server_delivery,
+                )?;
+                timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        async {
+                            quic::connect(
+                                &credentials.chain,
+                                "aligned-client.test",
+                                &credentials.member,
+                                config,
+                                as_quic(a),
+                                client_delivery,
+                            )
+                            .await
+                            .map(|_| ())
+                        },
+                        async { listener.accept(&credentials.members).await.map(|_| ()) },
+                    )
+                })
+                .await?
+            } else {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        async {
+                            udp::connect(
+                                listener.local_addr()?,
+                                &client,
+                                "aligned-client.test",
+                                &credentials.member,
+                                config,
+                                a,
+                                client_delivery,
+                            )
+                            .await
+                            .map(|_| ())
+                        },
+                        async {
+                            udp::accept(
+                                &listener,
+                                &server,
+                                &credentials.members,
+                                config,
+                                b,
+                                server_delivery,
+                            )
+                            .await
+                            .map(|_| ())
+                        },
+                    )
+                })
+                .await?
+            };
+            if [&first, &second].iter().any(|result| {
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| udp_startup_addr_in_use(error))
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "test startup bind collision",
+                )
+                .into());
+            }
+            Ok((first, second))
+        })?;
+        assert!(first.is_err() && second.is_err());
+        let errors = [first, second];
+        assert!(
+            errors
+                .iter()
+                .any(|result| result.as_ref().err().is_some_and(|error| {
+                    let cause = error.get_ref();
+                    cause.is_some_and(|cause| {
+                        matches!(
+                            cause.downcast_ref::<l2tunnel_auth::Error>(),
+                            Some(l2tunnel_auth::Error::BindingMismatch)
+                        ) || matches!(
+                            cause.downcast_ref::<l2tunnel_quic::Error>(),
+                            Some(l2tunnel_quic::Error::Authentication(
+                                l2tunnel_auth::Error::BindingMismatch
+                            ))
+                        )
+                    })
+                })),
+            "must witness actual authenticated policy mismatch, not only two failures; genuine={genuine} errors={errors:?}"
+        );
+    }
+    Ok(())
 }

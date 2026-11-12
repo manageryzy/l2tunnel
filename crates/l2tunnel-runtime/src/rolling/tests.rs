@@ -461,7 +461,7 @@ fn full_policy_is_bound_and_geometry_rejected_before_authentication() -> TestRes
         crate::rolling::config::test_delivery(rt),
     )?);
     let base = udp_base_session_config(rt, transport, config)?;
-    assert_ne!(base, udp::base_session_config(rt, transport)?);
+    assert_ne!(base, udp::transport_session_config(rt, transport)?);
     for mutation in 0..13 {
         let mut changed = config;
         match mutation {

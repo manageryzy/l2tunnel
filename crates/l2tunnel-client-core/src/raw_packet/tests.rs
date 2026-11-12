@@ -22,7 +22,7 @@ fn connection(half: bool, layer: PacketLayer) -> ConnectionConfig {
 fn document(half: bool, server: bool, cauchy: bool, integrity: bool) -> serde_json::Value {
     let endpoints =
         |a, b| serde_json::json!({"local":if server{b}else{a},"peer":if server{a}else{b}});
-    serde_json::json!({"version":1,"profile":PROFILE,"forward":endpoints("192.0.2.11:45001","192.0.2.12:45002"),"reverse":if half{endpoints("192.0.2.11:45003","192.0.2.12:45004")}else{serde_json::Value::Null},"channels":4,"packet":{"mtu":576,"protection":if integrity{"integrity"}else{"aead"},"queue_packets":8,"horizon_bytes":32768,"minimum_transfer_bytes":65536,"bytes_per_second":1048576,"packets_per_second":2048,"burst_bytes":16384,"burst_packets":32,"max_key_packets":1048576,"max_key_bytes":1073741824},"recovery":if cauchy{serde_json::json!({"mode":"cauchy","sources":4,"repairs":2,"flush_micros":2000})}else{serde_json::json!({"mode":"selective_repeat"})}})
+    serde_json::json!({"version":2,"profile":PROFILE,"forward":endpoints("192.0.2.11:45001","192.0.2.12:45002"),"reverse":if half{endpoints("192.0.2.11:45003","192.0.2.12:45004")}else{serde_json::Value::Null},"channels":4,"delivery":{"forward_bandwidth_bps":80000000,"reverse_bandwidth_bps":10000000,"bootstrap_rtt_micros":70000,"min_rtt_micros":2000,"max_rtt_micros":1000000,"headroom_percent":125,"minimum_bytes":4000,"max_inflight_bytes":4194304,"max_records":128,"metadata_limit_bytes":2097152,"sample_ttl_micros":4000000,"flush_timeout_micros":10000000},"packet":{"mtu":576,"protection":if integrity{"integrity"}else{"aead"},"queue_packets":8,"horizon_bytes":32768,"minimum_transfer_bytes":65536,"bytes_per_second":1048576,"packets_per_second":2048,"burst_bytes":16384,"burst_packets":32,"max_key_packets":1048576,"max_key_bytes":1073741824},"recovery":if cauchy{serde_json::json!({"mode":"cauchy","sources":4,"repairs":2,"flush_micros":2000})}else{serde_json::json!({"mode":"selective_repeat"})}})
 }
 fn settings(half: bool, server: bool, cauchy: bool, integrity: bool) -> R<Settings> {
     Ok(Settings::from_json(&serde_json::to_vec(&document(
@@ -116,6 +116,7 @@ fn strict_policy_limits_all_levels_and_runtime_binding() -> R {
         vec!["forward", "unknown"],
         vec!["packet", "unknown"],
         vec!["recovery", "unknown"],
+        vec!["delivery", "unknown"],
     ] {
         let mut value = base.clone();
         let mut at = &mut value;
@@ -126,7 +127,7 @@ fn strict_policy_limits_all_levels_and_runtime_binding() -> R {
         assert!(Settings::from_json(&serde_json::to_vec(&value)?).is_err());
     }
     for key in [
-        "version", "profile", "forward", "channels", "packet", "recovery",
+        "version", "profile", "forward", "channels", "packet", "recovery", "delivery",
     ] {
         let mut value = base.clone();
         value.as_object_mut().ok_or("object")?.remove(key);
@@ -153,7 +154,7 @@ fn strict_policy_limits_all_levels_and_runtime_binding() -> R {
     maximum.resize(MAX_POLICY_BYTES, b' ');
     assert!(Settings::from_json(&maximum).is_ok());
     for (path, value) in [
-        (vec!["version"], serde_json::json!(2)),
+        (vec!["version"], serde_json::json!(1)),
         (vec!["profile"], serde_json::json!("automatic")),
         (vec!["packet", "mtu"], serde_json::json!(575)),
         (vec!["packet", "queue_packets"], serde_json::json!(0)),
@@ -516,13 +517,22 @@ async fn actual_full_half_tls_transition_common_mux_recovery_and_native_status()
 #[tokio::test]
 async fn actual_authenticated_policy_mismatch_releases_original_inputs() -> R {
     let credentials = credentials()?;
-    for (half, packet_mismatch) in [(false, false), (true, false), (true, true)] {
+    for (half, mismatch) in [(false, 0), (true, 0), (true, 1), (false, 2), (true, 3)] {
         let sa = settings(half, false, false, false)?;
         let mut sb = settings(half, true, false, false)?;
-        if packet_mismatch {
-            sb.0.packet.bytes_per_second -= 1;
-        } else {
-            sb.0.channels = 3;
+        match mismatch {
+            0 => sb.0.channels = 3,
+            1 => sb.0.packet.bytes_per_second -= 1,
+            _ => {
+                let mut value = serde_json::to_value(&sb.0.delivery)?;
+                let field = if mismatch == 2 {
+                    "forward_bandwidth_bps"
+                } else {
+                    "reverse_bandwidth_bps"
+                };
+                value[field] = serde_json::json!(9999999);
+                sb.0.delivery = serde_json::from_value(value)?;
+            }
         }
         let (a, b, probes) = ios(half);
         let config = connection(half, PacketLayer::Ip);

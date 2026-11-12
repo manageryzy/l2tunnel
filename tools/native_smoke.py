@@ -777,7 +777,7 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
         common.extend(packed_options(packed))
     if record_profile == 'aligned':
         common.extend(['--record-profile', 'aligned', '--aligned-channels', str(aligned_channels)])
-    if record_profile in ('aligned', 'packed'):
+    if carrier in ('udp', 'quic'):
         common.extend(delivery_options())
     if traffic == 'active':
         common.extend(['--traffic', 'active', '--active-stats-ms', '250'])
@@ -1130,7 +1130,7 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
                     'tcp_probe_protocol': 'progress32k-v1' if active_progress else 'final-checksum-v1',
                     'follower_rejection': follower_rejection,
                     'carrier': carrier, 'traffic': traffic, 'record_profile': record_profile,
-                    'delivery': DELIVERY_POLICY if record_profile in ('aligned', 'packed') else None,
+                    'delivery': DELIVERY_POLICY if carrier in ('udp', 'quic') else None,
                     'aligned_channels': aligned_channels,
                     **({'packed': packed, 'packed_burst': burst_result} if record_profile == 'packed' else {}),
                     'flow_churn': churn_result,
@@ -1315,7 +1315,7 @@ def main() -> int:
                           'netem_duplex': args.netem_duplex, 'tcp_family': args.tcp_family,
                           'openvpn_path_probe': args.openvpn_path_probe if args.carrier == 'openvpn-like' else None,
                           'aligned_channels': args.aligned_channels,
-                          'delivery': DELIVERY_POLICY if args.record_profile in ('aligned', 'packed') else None,
+                          'delivery': DELIVERY_POLICY if args.carrier in ('udp', 'quic') else None,
                           **({'packed': packed, 'packed_preflight': 'reviewed immutable daemon/auditor/build/helpers plus validation-only geometry required before namespace work'} if packed is not None else {}),
                           'traffic': args.traffic, 'fec': fec, 'flow_churn': args.flow_churn, 'adaptive': args.adaptive,
                           'active_policy_switch': args.active_policy_switch,
@@ -1352,7 +1352,7 @@ def main() -> int:
     receipt = {'status': 'running', 'cases': [], 'netem_duplex': args.netem_duplex, 'tcp_family': args.tcp_family, 'planned_cases': [case_name(layer, duplex, impaired, args.openvpn_path_probe) for layer, duplex, impaired in cases],
                'openvpn_path_probe': args.openvpn_path_probe if args.carrier == 'openvpn-like' else None,
                'record_profile': args.record_profile, 'aligned_channels': args.aligned_channels,
-               'delivery': DELIVERY_POLICY if args.record_profile in ('aligned', 'packed') else None, 'scope': f'native Linux {args.carrier} device forwarding with retained authenticated ' + ('QUIC control and TCP explicitly blocked' if args.carrier == 'quic' else 'standalone TLS over UDP control and TCP explicitly blocked' if args.carrier == 'openvpn-like' else 'TCP/TLS control'),
+               'delivery': DELIVERY_POLICY if args.carrier in ('udp', 'quic') else None, 'scope': f'native Linux {args.carrier} device forwarding with retained authenticated ' + ('QUIC control and TCP explicitly blocked' if args.carrier == 'quic' else 'standalone TLS over UDP control and TCP explicitly blocked' if args.carrier == 'openvpn-like' else 'TCP/TLS control'),
                'active_transaction': transaction_timing(args.active_switch_timing) if args.active_policy_switch else None,
                'active_transfer_timeout_seconds': args.active_transfer_timeout if args.active_policy_switch else None,
                'tcp_io_inactivity_timeout_seconds': 45,

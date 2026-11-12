@@ -326,7 +326,7 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
         handshake_timeout: Duration::from_millis(200),
         ..connection(PacketLayer::Ip, Duplex::Half)
     };
-    let (a, b) = endpoints(Duplex::Half)?;
+    let (mut a, b) = endpoints(Duplex::Half)?;
     let (profile, records) = quic_config(config, as_quic(b), &settings)?;
     let base = runtime::quic_base_session_config(config.runtime(), profile, records)?;
     let tls = l2tunnel_quic::ServerConfig::from_der(
@@ -345,7 +345,6 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
     // witnesses completed client first-lane authentication and avoids an ICMP
     // refusal substituting for the intended incomplete second handshake.
     let blackhole = tokio::net::UdpSocket::bind(reverse.local).await?;
-    let client_reverse = a.reverse.ok_or("client reverse")?;
     let mut clock = tokio::task::JoinSet::new();
     clock.spawn(async {
         loop {
@@ -362,12 +361,40 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
         as_quic(a),
         &settings,
     ));
-    // Start the original allowance before delaying the peer's first accept.
-    let initial = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
-    assert!(
-        initial.is_pending(),
-        "setup ended before the first peer accept"
-    );
+    // Socket reservations cannot be passed through the public factory. Retry
+    // only an actual local bind collision returned by its first synchronous
+    // poll, before any Pending/authentication progress. Logical time and both
+    // original watchdogs are unchanged; no completed/partial session is retried.
+    for retry in 0..4 {
+        assert_eq!(Instant::now(), started);
+        let initial = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+        let early_error = match &initial {
+            Poll::Ready(Err(error)) => Some(error),
+            _ => None,
+        };
+        if retry < 3 && early_error.is_some_and(|error| udp_startup_addr_in_use(error)) {
+            drop(attempt);
+            let (fresh, _) = endpoints(Duplex::Half)?;
+            a.forward.local = fresh.forward.local;
+            a.reverse.as_mut().ok_or("client reverse")?.local =
+                fresh.reverse.ok_or("fresh reverse")?.local;
+            attempt = Box::pin(connect_quic(
+                &c.chain,
+                "rolling-client.test",
+                &c.member,
+                config,
+                as_quic(a),
+                &settings,
+            ));
+            continue;
+        }
+        assert!(
+            initial.is_pending(),
+            "setup ended before the first peer accept: {early_error:?}"
+        );
+        break;
+    }
+    let client_reverse = a.reverse.ok_or("client reverse")?;
     tokio::time::advance(Duration::from_millis(100)).await;
     let retained = wall_bound(
         async {
