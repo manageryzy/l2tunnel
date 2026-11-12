@@ -380,6 +380,7 @@ dependencies = [
  "l2tunnel-datagram",
  "l2tunnel-device",
  "l2tunnel-fec",
+ "l2tunnel-flow-control",
  "l2tunnel-openvpn",
  "l2tunnel-packet",
  "l2tunnel-platform-linux",

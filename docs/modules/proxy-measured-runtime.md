@@ -4,8 +4,10 @@ Status: the additive configuration, retained-link factories, version-2 framing,
 private handoff ledger and actual common-actor composition are implemented.
 Focused tests cover maintained native TCP endpoints over real authenticated TLS
 in full/paired-half mode, plus bounded writer, expiry and admission failures.
-Client selection, kernel advertised-window qualification and native activation
-remain planned; no measured profile is selected by the CLI.
+Explicit measured client selection and bounded aggregate local status are now
+implemented and focused-tested through the [shared client](proxy-measured-client.md).
+Kernel advertised-window qualification, native activation evidence and per-flow
+pagination remain separate gates.
 The pure C checkpoint is recorded in
 [its focused receipt](../../work/proxy-observation-c/validation.json). Its runtime
 authority and native advertised-window gates remain separate.
@@ -474,8 +476,9 @@ by a completed pure/runtime gate alone.
 - [ ] [MOD-PROXY-MEASURED-06] Preserve startup and original quiesce/drain barriers; test prequeued native input, pre-start drain, admitted measurement on a terminal flow, local/peer quiesce with blocked native/writer, no post-Barrier user work, asymmetric paired shutdown, and callback after original session deadline.
 - [x] [MOD-PROXY-MEASURED-06A] Implement actual measured original-deadline/drain composition and finite terminal/writer/native-pressure regressions; retain the full profile-specific startup/barrier matrix above as a separate acceptance task. Evidence: [38 focused tests](../../work/proxy-measured-runtime/validation.json) include all 17 fixed regressions, measured Ready-at/after-expiry, 10ms startup versus 100ms native poll, terminal admitted records, original-deadline callback/empty-join rejection, both writer branches and full/half blocked-native peer-only drain. No production deadline or maintained TIME-WAIT timer was widened.
 - [ ] [MOD-PROXY-MEASURED-07] Run actual authenticated TCP/TLS full/paired loopback with independent maintained native endpoints, exact bidirectional opaque bytes/FIN, transparent ICMP bypass and denied-route behavior; pressure/recovery must advance real native ACKs and preserve grant right edges. Keep this separate from kernel/device proof.
-- [ ] [MOD-PROXY-MEASURED-08] Pass focused runtime/old fixed regressions, strict lint/docs and independent review, followed by root-coordinated stable aggregate; no source-stability or native claim from a targeted compile alone.
+- [x] [MOD-PROXY-MEASURED-08] Pass focused runtime/old fixed regressions, strict lint/docs and independent review, followed by root-coordinated stable aggregate; no source-stability or native claim from a targeted compile alone. Evidence: [source-stable wave14b](../../work/implementation-wave14b/validation.json), 858 Rust/107 Python cases with strict workspace lint/docs; this runtime checkpoint precedes later client edits.
 - [ ] [MOD-PROXY-MEASURED-09] Add separately reviewed strict client JSON/explicit CLI selection and bounded aggregate/paged status; keep fixed defaults, unsupported-action errors, prompt drain acceptance, actual terminal result and five-second local-only grace unchanged.
+- [x] [MOD-PROXY-MEASURED-09A] Implement explicit strict measured client/CLI selection and bounded aggregate status through the shared service, keeping paged per-flow status separate. Evidence: [client checklist](proxy-measured-client.md), [95 library/19 example focused checks and independent review](../../work/proxy-measured-client/validation.json).
 - [ ] [MOD-PROXY-MEASURED-10] Freeze a dedicated owned-native acceptance plan and immutable build before one clean TUN case: prearm native/underlay capture, actual split proof, original SYN options/scaling, maintained TIME-WAIT, IPv4/IPv6 exact bytes/FIN, transparency/routes, final fences and complete cleanup.
 - [ ] [MOD-PROXY-MEASURED-11] Independently prove actual advertised-window pressure/reopening in each direction: retained application backpressure must exhaust real buffers, constrain native receive consumption and emit/deliver scaled window changes; unblocking must yield real ACK release, nonrevoked relay grants, reopened native window and renewed exact-byte progress. A target-only change is explicitly unobserved native effect.
 - [ ] [MOD-PROXY-MEASURED-12] Only after clean full/half gates, qualify bounded 1/2/4/16/64 demand, idle/joins/exits, weighted fairness and finite loss/delay against unchanged fixed-credit baselines with queue/RSS/native and outer byte accounting; preserve timeout/reset/unsupported outcomes and do not infer a performance claim from pure tests.

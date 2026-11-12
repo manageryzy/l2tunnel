@@ -251,10 +251,11 @@ class ProxyHarnessTests(unittest.TestCase):
                  'tools/netns_lab.py', 'crates/example/Cargo.toml', 'crates/example/src/lib.rs',
                  'crates/example/fixtures/body.bin', 'apps/example/Cargo.toml', 'third_party/source/src/lib.rs',
                  'third_party/source/LICENSE', 'third_party/source/Cargo.toml', 'third_party/source.patch',
-                 'third_party/provenance.json', '.cargo/config.toml']
+                 'third_party/provenance.json', '.cargo/config.toml',
+                 'crates/example/src/target/tests.rs', 'third_party/source/target/build-cache']
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in [*names, 'third_party/source/target/build-cache']:
+            for name in [*names, 'target/build-cache']:
                 path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
             before = h.source_hashes(root)
             self.assertEqual(set(before), set(names))

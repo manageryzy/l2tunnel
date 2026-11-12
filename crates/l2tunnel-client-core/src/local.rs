@@ -64,14 +64,14 @@ pub struct Snapshot {
     /// Present only for the distinct managed active profile; legacy bytes stay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<ActiveSnapshot>,
-    /// Present only for the fixed proxy profile; omitted from legacy replies.
+    /// Present only for an explicit proxy profile; omitted from legacy replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxySnapshot>,
     /// Present only for the explicit standalone native-drain profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openvpn_drain: Option<crate::openvpn::drain::Snapshot>,
 }
-/// Fixed authenticated proxy configuration and observed local lifecycle.
+/// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxySnapshot {
@@ -83,6 +83,9 @@ pub struct ProxySnapshot {
     pub runtime: Option<ProxyStatus>,
     /// Populated only after the actual run future returns.
     pub terminal: Option<ProxyTerminal>,
+    /// Actual measured profile capabilities/aggregate; absent for fixed proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<crate::proxy_measured::LocalSnapshot>,
 }
 /// Observed runtime counters without credentials or application payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

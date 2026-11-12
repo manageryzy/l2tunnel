@@ -2,15 +2,20 @@
 use super::*;
 use crate::proxy as client;
 
-pub(super) const HELP: &str = "Fixed-credit proxy: --traffic proxy --proxy-policy JSON_FILE; TUN, TCP/TLS, frame records and compression off only. Both peers require the same explicit route/channel/TIME-WAIT policy. Default TIME-WAIT remains maintained. Optional private --control-socket supports status and drain-proxy. Drain acknowledges submission promptly; query status for the actual terminal result. After termination only local status remains for five seconds. No adaptive window or reload is implied.";
+pub(super) const HELP: &str = "Fixed-credit proxy: --traffic proxy --proxy-policy JSON_FILE; TUN, TCP/TLS, frame records and compression off only. Both peers require the same explicit route/channel/TIME-WAIT policy. Default TIME-WAIT remains maintained. Optional private --control-socket supports status and drain-proxy. Drain acknowledges submission promptly; query status for the actual terminal result. After termination only local status remains for five seconds. No adaptive window or reload is implied. Measured relay targets require explicit --traffic proxy-measured --proxy-policy JSON_FILE; the same TUN/TCP/frame/compression restrictions apply. Native window qualification and hot reload remain unavailable.";
 
 pub(super) fn selection(
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
 ) -> io::Result<Option<&str>> {
-    if options.get("--traffic").map(String::as_str) != Some("proxy") {
+    if !matches!(
+        options.get("--traffic").map(String::as_str),
+        Some("proxy" | "proxy-measured")
+    ) {
         if options.contains_key("--proxy-policy") {
-            return Err(input("--proxy-policy requires explicit --traffic proxy"));
+            return Err(input(
+                "--proxy-policy requires explicit --traffic proxy or proxy-measured",
+            ));
         }
         return Ok(None);
     }
@@ -31,6 +36,7 @@ pub(super) fn selection(
         .chain(UDP_OPTIONS)
         .chain(&ACTIVE_OPTIONS[1..])
         .chain(standalone::OPTIONS)
+        .chain(packed_frontend::OPTIONS)
         .any(|key| options.contains_key(*key))
     {
         return Err(input(
@@ -52,6 +58,9 @@ pub(super) async fn execute(
     config: ConnectionConfig,
     path: &str,
 ) -> io::Result<()> {
+    if options.get("--traffic").map(String::as_str) == Some("proxy-measured") {
+        return measured_frontend::execute(command, options, config, path).await;
+    }
     let settings = client::Settings::from_json(&bounded_file(path, client::MAX_POLICY_BYTES)?)?;
     client::runtime_config(config, &settings)?;
     let device = DeviceSpec::parse(options, config)?;
@@ -127,15 +136,46 @@ mod service {
     };
     use std::sync::{Arc, Mutex};
 
+    pub(super) enum RuntimeHandle {
+        Fixed(client::Handle),
+        Measured(crate::proxy_measured::Handle, Duplex),
+    }
+    impl RuntimeHandle {
+        fn observed(
+            &self,
+        ) -> (
+            Option<l2tunnel_runtime::proxy::Status>,
+            Option<crate::proxy_measured::LocalSnapshot>,
+        ) {
+            match self {
+                Self::Fixed(handle) => (handle.status(), None),
+                Self::Measured(handle, lanes) => {
+                    let status = handle.status();
+                    let measured = crate::proxy_measured::LocalSnapshot::observed(
+                        *lanes,
+                        status.as_ref().map(|s| &s.measurement),
+                    );
+                    (status.map(|s| s.runtime), Some(measured))
+                }
+            }
+        }
+        fn request_drain(&self) -> io::Result<client::DrainWaiter> {
+            match self {
+                Self::Fixed(handle) => handle.request_drain(),
+                Self::Measured(handle, _) => handle.request_drain(),
+            }
+        }
+    }
     struct State {
-        handle: client::Handle,
+        handle: RuntimeHandle,
         digest: String,
         accepted: bool,
         terminal: Option<ProxyTerminal>,
     }
     impl State {
         fn snapshot(&self) -> Snapshot {
-            let status = self.handle.status().map(|s| ProxyStatus {
+            let (status, measured) = self.handle.observed();
+            let status = status.map(|s| ProxyStatus {
                 phase: format!("{:?}", s.phase),
                 flows: s.flows,
                 active: s.active,
@@ -160,6 +200,7 @@ mod service {
                     drain_accepted: self.accepted,
                     runtime: status,
                     terminal: self.terminal.clone(),
+                    measured,
                 }),
             }
         }
@@ -207,9 +248,9 @@ mod service {
             },
         }
     }
-    pub(crate) async fn serve<F>(
+    pub(super) async fn serve<F>(
         run: F,
-        handle: client::Handle,
+        handle: RuntimeHandle,
         digest: [u8; 32],
         api: Option<local::Server>,
         grace: Duration,
@@ -272,7 +313,7 @@ mod service {
         fn accepted_waiter_drop_is_not_terminal_and_retries_do_not_resubmit() -> io::Result<()> {
             let (handle, _control) = client::control_channel();
             let mut state = State {
-                handle,
+                handle: RuntimeHandle::Fixed(handle),
                 digest: "ab".repeat(32),
                 accepted: false,
                 terminal: None,
@@ -319,9 +360,51 @@ mod service {
     }
 }
 #[cfg(unix)]
-use service::serve;
+pub(crate) async fn serve<F>(
+    run: F,
+    handle: client::Handle,
+    digest: [u8; 32],
+    api: Option<crate::local::Server>,
+    grace: Duration,
+) -> io::Result<client::CloseReport>
+where
+    F: std::future::Future<Output = io::Result<client::CloseReport>>,
+{
+    service::serve(
+        run,
+        service::RuntimeHandle::Fixed(handle),
+        digest,
+        api,
+        grace,
+    )
+    .await
+}
+#[cfg(unix)]
+pub(crate) async fn serve_measured<F>(
+    run: F,
+    handle: crate::proxy_measured::Handle,
+    lanes: Duplex,
+    digest: [u8; 32],
+    api: Option<crate::local::Server>,
+    grace: Duration,
+) -> io::Result<client::CloseReport>
+where
+    F: std::future::Future<Output = io::Result<client::CloseReport>>,
+{
+    service::serve(
+        run,
+        service::RuntimeHandle::Measured(handle, lanes),
+        digest,
+        api,
+        grace,
+    )
+    .await
+}
+#[path = "../proxy_measured/cli.rs"]
+#[cfg(target_os = "linux")]
+mod measured_frontend;
 #[cfg(all(test, unix))]
-pub(crate) use service::serve as serve_for_test;
+pub(crate) use serve as serve_for_test;
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]

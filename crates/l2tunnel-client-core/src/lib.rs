@@ -29,6 +29,8 @@ pub mod openvpn;
 pub mod packed;
 /// Explicit fixed-credit TUN proxy with retained original TCP/TLS ownership.
 pub mod proxy;
+/// Explicit measured relay targets over retained native TUN proxy TCP/TLS lanes.
+pub mod proxy_measured;
 /// Explicit genuine QUIC endpoint/profile configuration, independent of TCP.
 pub mod quic;
 /// Explicit authenticated UDP endpoint/profile configuration.

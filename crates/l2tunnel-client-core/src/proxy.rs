@@ -59,6 +59,9 @@ impl Settings {
         }
         let document: Document = serde_json::from_slice(input)
             .map_err(|_| invalid("invalid strict proxy policy JSON"))?;
+        Self::from_document(document)
+    }
+    pub(super) fn from_document(document: Document) -> io::Result<Self> {
         if document.version != 1 || !(1..=256).contains(&document.channels) {
             return Err(invalid("proxy policy version or channels"));
         }
@@ -88,7 +91,7 @@ impl Settings {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Document {
+pub(super) struct Document {
     version: u16,
     channels: u16,
     time_wait_reset: Reset,
@@ -168,20 +171,23 @@ fn expired() -> io::Error {
         "proxy original setup deadline elapsed",
     )
 }
-fn deadline(timeout: Duration) -> io::Result<Instant> {
+pub(super) fn deadline(timeout: Duration) -> io::Result<Instant> {
     Instant::now().checked_add(timeout).ok_or_else(expired)
 }
-fn remaining(end: Instant) -> io::Result<Duration> {
+pub(super) fn remaining(end: Instant) -> io::Result<Duration> {
     end.checked_duration_since(Instant::now())
         .filter(|d| !d.is_zero())
         .ok_or_else(expired)
 }
-async fn within<T>(end: Instant, future: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+pub(super) async fn within<T>(
+    end: Instant,
+    future: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
     let value = timeout_at(end, future).await.map_err(|_| expired())??;
     remaining(end)?;
     Ok(value)
 }
-fn auth_error(value: auth::Error) -> io::Error {
+pub(super) fn auth_error(value: auth::Error) -> io::Error {
     match value {
         auth::Error::TimedOut => expired(),
         other => super::auth_error(other),
@@ -233,7 +239,7 @@ impl Session {
         runtime::run(device, self.link, self.config, control).await
     }
 }
-fn remote(address: SocketAddr) -> io::Result<()> {
+pub(super) fn remote(address: SocketAddr) -> io::Result<()> {
     if address.port() == 0
         || address.ip().is_unspecified()
         || address.ip().is_multicast()

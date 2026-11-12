@@ -49,7 +49,7 @@ def main() -> None:
     if result.returncode != 2 or 'Unknown command' not in result.stderr:
         raise RuntimeError('CLI must reject unspecified network execution')
     if sys.platform == 'linux':
-        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_raw_native_smoke', 'tools.test_proxy_native_smoke', 'tools.test_openvpn_drain_native_smoke', '-v')
+        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_raw_native_smoke', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', '-v')
     else:
         print('Linux namespace harness tests skipped on this host.', flush=True)
     print('Local workspace checks passed. This command runs no privileged tests or remote CI.', flush=True)

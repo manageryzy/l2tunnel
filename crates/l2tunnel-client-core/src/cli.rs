@@ -13,6 +13,8 @@ use std::process::ExitCode;
 mod proxy_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use proxy_frontend::serve_for_test as serve_proxy_for_test;
+#[cfg(all(test, unix))]
+pub(crate) use proxy_frontend::serve_measured as serve_measured_for_test;
 #[path = "packed_cli.rs"]
 mod packed_frontend;
 #[path = "openvpn/cli.rs"]

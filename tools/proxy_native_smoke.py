@@ -103,7 +103,7 @@ def source_hashes(root: Path = ROOT) -> dict[str, str]:
         if path.is_file(): sources.add(path)
     for name in ('crates', 'apps', 'third_party'):
         sources.update(path for path in (root / name).rglob('*') if path.is_file()
-                       and not {'target', '__pycache__', '.git'}.intersection(path.relative_to(root).parts))
+                       and not {'__pycache__', '.git'}.intersection(path.relative_to(root).parts))
     return {str(path.relative_to(root)): file_hash(path) for path in sorted(sources)}
 
 
