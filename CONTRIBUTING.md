@@ -32,13 +32,27 @@ and restart the rust-analyzer server if the editor was already running. Check
   maintained crypto implementations; no homegrown primitives or accept-all TLS.
 - Keep wire parsing, transport delivery and native device ownership separate.
   A new native FFI crate needs an isolated documented unsafe policy/review.
+- Transfer buffer ownership across packet stages instead of cloning payloads.
+  Use bounded reusable slots for asynchronous handoffs; never recycle before
+  the consumer completes. Account for allocations, copied bytes and required
+  coding/cryptographic writes separately. Transaction rollback must not copy
+  immutable packet history or every equation row on each input.
 - Avoid ABI/semver promises while the wire and embedding contracts remain draft.
   An unused enum or trait cannot satisfy a mode-completion requirement.
 
 Development and test builds use line-level debug information and disable
 incremental compilation to bound disk use. Workers and validation snapshots
 share the workspace `target` directory instead of retaining separate build
-trees. Wait for Cargo's lock; preserve receipts outside the disposable target.
+trees. Use one active source tree for compilation at a time, including snapshots;
+Cargo's lock does not prevent stale workspace artifacts when separate copies
+reuse the same output directory. Before switching source trees, stop builds and
+invalidate the affected workspace packages. Preserve receipts outside the
+disposable target.
+Clean only identified Cargo output directories or explicitly superseded copied
+executables. ELF format and an inactive process are not proof that a file is
+disposable: Python extension modules, shared libraries and installed dependency
+trees remain runtime inputs. Preserve those files and package RECORD manifests;
+verify the actual simulator adapter imports after any environment cleanup.
 Use `CARGO_PROFILE_DEV_DEBUG=2` explicitly when full variable debug information
 is needed for a debugging session.
 

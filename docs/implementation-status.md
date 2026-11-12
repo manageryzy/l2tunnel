@@ -6,15 +6,31 @@ performance requirement. Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-## Current verified checkpoint
+## Current verification
 
-Source25 is committed as `8f6bc63` and `7248d33`. Its
-[aggregate check](../work/implementation-wave25/validation.json) passed 1159 Rust
-test executions including feature variants, 202 Python tool tests and 1654
-simulator cases. All 799 recorded source inputs stayed unchanged. The
-[release receipt](../work/native-build25/receipt.json) binds the executable and
-copied native helpers to that source. Remote CI and Windows/Android device tests
-are not covered by this check.
+The current repair checkpoint is not aggregate-qualified. The
+[source27d check](../work/implementation-wave27d/validation.json) stopped at an
+OpenVPN-like paired impairment test returning `IncompleteClose` under its
+original five-second deadline. Its fixture continues counter-based packet loss
+through final control exchange, so clean close is not guaranteed within that
+bound. The [independent review](../work/openvpn-paired-close27d-review/REPORT.md)
+does not attribute the saved failure to a particular lost ACK. A causal fixture
+correction and subsequent stable aggregate check are required.
+
+The preceding [source27c check](../work/implementation-wave27c/validation.json)
+passed 1205 Rust test executions and 216 Python tool test executions, then failed
+simulator collection because disk cleanup had incorrectly removed an installed
+cryptography extension. The exact dependency was restored and its RECORD hash
+verified; the independent [full simulator rerun](../work/check-python-repair27/full-simulator.log)
+passes all 1658 cases without skips. Component results do not turn the failed
+aggregate into a pass. Remote CI and Windows/Android device tests remain separate.
+
+## Latest native measurements
+
+The [source25 aggregate](../work/implementation-wave25/validation.json) and
+[release receipt](../work/native-build25/receipt.json) bind the executable and
+copied helpers used for the latest native measurements. Later source repairs
+have not been qualified by those historical runs.
 
 Four serial native TAP/TUN half-duplex cases passed exact payload, EOF, helper
 provenance and owned cleanup. Every case failed forward 80 Mbit/s acceptance:
@@ -40,32 +56,38 @@ measurement; two TLS writes alone have not been proved the throughput cause.
 | --- | --- | --- |
 | Verified handshake, member identity, full/paired-half ownership | Real retained TLS and authenticated UDP/QUIC/raw slices | Broader carrier/path security, cover and resource gates remain in CONN-* |
 | TAP/TUN and fixed-peer VXLAN | Finite native Linux connectivity/data-integrity matrices | Broad VTEP/MTU/offload/platform behavior and performance remain open |
-| Local queue versus link flight budget | Source25 BDP is wired only into TCP/TLS frame mode | Rolling/aligned/packed/raw still require independent delivery credit; FIX-01 |
+| Local queue versus link flight budget | TCP/TLS frame BDP; focused rolling/aligned/packed byte-credit integration | Base UDP/QUIC and raw retain queue/flight coupling; aggregate/native qualification and FIX-01 remain open |
 | Python high-performance composition | Codec/recovery libraries and separate aligned/packed/rolling clients exist | No qualified matching native composition; FIX-02 through FIX-04 |
 | TUN flow control and QoS | Transparent active-credit path and fixed TCP-proxy slices | Adaptive native-window growth and complete fairness/pressure gates still fail or remain unrun |
 | Hot mode switching | Authenticated compression changes and finite active-TUN switches | Full codec/recovery/MUX switching matrix and control-under-load correctness remain open |
-| Shared clients | Runnable Linux shared CLI/local API profiles | Full deployable configuration, GUI, Windows and Android runtimes remain open |
+| Shared clients | Runnable Linux shared CLI/local API profiles and reusable existing-session commands | Full service lifecycle remains private CLI orchestration; FIX-12, GUI and native Windows/Android remain open |
+| Carrier/recovery and stable control boundaries | Independent pure protocol crates; multiple fixed runtime compositions | OpenVPN-like user recovery and data-mode-dependent control framing require FIX-10/FIX-11 |
 
 Use [the architecture](architecture.md), [project boundaries](implementation-plan.md),
 [Python parity contracts](mode-parity.md) and the stable task IDs in the master
 and module ledgers for exact scope. A supported library symbol is not evidence
 that a client selects it or that a native acceptance test exercised it.
 
-## Unaccepted working changes and active repairs
+## Architecture corrections in progress
 
-Source26 working changes include independent rolling delivery credit, exact
-full-flush byte accounting, separate local/unconfirmed gauges, one contiguous TLS
-framing write, paced management service, strict complete-simulator checks, meaningful
-authentication deadline witnesses and early packed-channel validation. Focused
-checks exist, but no source26 aggregate/native performance acceptance is claimed.
-The full behavior audit takes priority over further fallback micro-optimization.
-Confirmed discrepancies become blocking implementation TODOs, followed by
-regressions and real-path validation; changing descriptions alone cannot close them.
+The blocking fixes remain in the master checklist. Tested changes include
+independent native byte delivery budgets for rolling/aligned/packed, shared
+immutable FEC history, bounded reusable rolling output buffers, one contiguous
+TLS framing write, and explicit pressure/deadline witnesses. These do not prove
+end-to-end zero copy or the native performance target.
 
-The audit inventory currently contains 643 checked leaf tasks out of 1042 before
-its new repair tasks. Evidence links exist, but link existence is not deep review.
-[Audit navigation](../work/deep-audit26/checked-index.json) explicitly retains
-unreviewed entries. No audit-complete claim follows from that inventory.
+The legacy retained-control parser now lives outside UDP, protected OpenVPN-like
+datagrams have a separate internal owner, and existing-session command handling
+is public in client-core. These are real extractions with unchanged wire
+identities; the public interchangeable recovery composition, negotiated stable
+control envelope and complete client lifecycle API are still required by
+FIX-10 through FIX-12. Base UDP/QUIC and raw delivery budget integration remains
+part of FIX-01, including the independently bounded recovery source window.
+
+The [audit inventory](../work/deep-audit26/checked-index.json) is navigation for
+unreviewed evidence, not a completion percentage. Confirmed discrepancies require
+behavioral fixes and regressions; descriptions and evidence links alone do not
+close a gate.
 
 ## Evidence and reproduction
 
@@ -82,3 +104,10 @@ unreviewed entries. No audit-complete claim follows from that inventory.
   [the audit snapshot](../work/deep-audit26/status-before-cleanup.md) and Git history.
   Saved simulator and native experiment receipts are unchanged. Repeated wave
   narratives were removed from this current-status page.
+- The [disk cleanup record](../work/disk-cleanup-20261112/summary.json) lists
+  removed compiler caches and binary copies. It also mistakenly removed one
+  required Python native extension; the [append-only repair receipt](../work/disk-cleanup-20261112/dependency-repair.json)
+  records exact restoration and verification of all five installed native
+  dependency files. The unsafe one-off cleanup script is retired. Source, Git
+  history, saved experiment results and validation logs remain. Commit `34f6272`
+  disables incremental development caches and requires one shared Cargo target.

@@ -6,6 +6,7 @@ users retain the simulator's optional-dependency skip behavior.
 """
 from __future__ import annotations
 
+import argparse
 import importlib
 import importlib.metadata
 import os
@@ -15,6 +16,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPENDENCIES = ('numpy', 'scipy', 'plotly', 'pytest', 'aioquic', 'matplotlib')
+# aioquic's package root does not load its native crypto or connection adapters.
+# Import the actual modules used by the simulator before starting the full gate.
+DEPENDENCY_IMPORTS = {
+    'aioquic': ('aioquic', 'aioquic.quic.configuration', 'aioquic.quic.connection'),
+}
 _SKIP_COUNT = 0
 _SKIP_EXAMPLES: list[str] = []
 
@@ -22,12 +28,14 @@ _SKIP_EXAMPLES: list[str] = []
 def verify_dependencies() -> None:
     """Require both distribution metadata and usable imports for the full suite."""
     for name in DEPENDENCIES:
+        module = name
         try:
             version = importlib.metadata.version(name)
-            importlib.import_module(name)
+            for module in DEPENDENCY_IMPORTS.get(name, (name,)):
+                importlib.import_module(module)
         except (importlib.metadata.PackageNotFoundError, ImportError) as error:
             raise RuntimeError(
-                f'Full simulator checks require an importable {name}; install an '
+                f'Full simulator checks require an importable {name} ({module}); install an '
                 'environment with python3 -m pip install -e "./simulator[dev,quic,plots]"'
             ) from error
         print(f'Simulator check dependency: {name}=={version}', flush=True)
@@ -71,8 +79,14 @@ def pytest_sessionfinish(session, exitstatus) -> None:
         session.exitstatus = 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check-dependencies', action='store_true',
+                        help='validate full-suite imports without starting pytest')
+    arguments = parser.parse_args(argv)
     verify_dependencies()
+    if arguments.check_dependencies:
+        return 0
     environment = {
         **os.environ,
         'PYTHONDONTWRITEBYTECODE': '1',

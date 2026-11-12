@@ -7,6 +7,9 @@ import json
 import io
 import struct
 import tempfile
+import hashlib
+import select
+import socket
 from unittest.mock import patch
 from types import SimpleNamespace
 from pathlib import Path
@@ -14,6 +17,142 @@ from .native_smoke import verify_ping, verify_state, verify_blocked_ping, active
 from .tcp_probe import progress_record, save_progress, MAXIMUM, PROGRESS_BYTES
 
 class AcceptanceTests(unittest.TestCase):
+    def test_full_netem_is_explicit_and_default_matrix_unchanged(self):
+        tool = Path(__file__).with_name('native_smoke.py')
+        base = [sys.executable, str(tool), '--include-netem']
+        default = subprocess.run(base, capture_output=True, text=True, timeout=10)
+        self.assertEqual(default.returncode, 0, default.stderr)
+        value = json.loads(default.stdout)
+        self.assertEqual(value['cases'], [[layer, mode, loss] for layer in ('tap', 'tun')
+                         for mode, loss in (('half', False), ('full', False))]
+                         + [[layer, 'half', True] for layer in ('tap', 'tun')])
+        self.assertEqual((value['netem_duplex'], value['tcp_family']), ('half', 4))
+        both = subprocess.run([*base, '--netem-duplex', 'both'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(both.returncode, 0, both.stderr)
+        self.assertEqual(json.loads(both.stdout)['cases'], value['cases'][:4]
+                         + [[layer, mode, True] for layer in ('tap', 'tun') for mode in ('half', 'full')])
+        for layer in ('tap', 'tun'):
+            result = subprocess.run([*base, '--layers', layer, '--netem-duplex', 'full',
+                                     '--only-case', f'{layer}-full-netem', '--tcp-family', '6'],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            selected = json.loads(result.stdout)
+            self.assertEqual(selected['cases'], [[layer, 'full', True]])
+            self.assertEqual((selected['tcp_family'], selected['netem_duplex']), (6, 'full'))
+
+    def test_invalid_full_netem_or_tcp_family_cannot_reach_mutation(self):
+        from . import native_smoke as native
+        for options in (['--netem-duplex', 'full'], ['--only-case', 'tap-full-netem'],
+                        ['--include-netem', '--only-case', 'tap-full-netem'], ['--tcp-family', '5']):
+            with self.subTest(options=options), patch.object(sys, 'argv', ['native_smoke.py', '--apply', *options]), \
+                    patch.object(native.netns_lab, 'require_root') as root, \
+                    patch.object(native.netns_lab, 'apply') as apply, patch('sys.stderr', new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as error:
+                    native.main()
+                self.assertEqual(error.exception.code, 2)
+                root.assert_not_called()
+                apply.assert_not_called()
+
+    @staticmethod
+    def receive_exact(stream, count):
+        received = bytearray()
+        while len(received) < count:
+            data = stream.recv(count - len(received))
+            if not data:
+                raise EOFError('independent TCP fixture received incomplete bytes')
+            received.extend(data)
+        return bytes(received)
+
+    def test_real_ipv4_ipv6_probe_listener_checks_independent_bytes(self):
+        tool = Path(__file__).with_name('tcp_probe.py')
+        payload = bytes(range(256)) * 256
+        for version, family, host in ((4, socket.AF_INET, '127.0.0.1'), (6, socket.AF_INET6, '::1')):
+            with self.subTest(version=version), subprocess.Popen(
+                    [sys.executable, str(tool), 'listen', host, '--family', str(version), '--port', '0'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as server:
+                try:
+                    self.assertTrue(select.select([server.stdout], [], [], 5)[0], 'probe listener readiness timed out')
+                    line = server.stdout.readline(256)
+                    self.assertTrue(line.startswith('Listening '), line)
+                    ready = json.loads(line.partition(' ')[2])
+                    self.assertEqual(ready['ip_version'], version)
+                    with socket.socket(family, socket.SOCK_STREAM) as client:
+                        client.settimeout(5)
+                        client.connect((host, ready['port']))
+                        self.assertEqual(client.family, family)
+                        client.sendall(len(payload).to_bytes(4, 'big') + payload)
+                        self.assertEqual(self.receive_exact(client, 32), hashlib.sha256(payload).digest())
+                    stdout, stderr = server.communicate(timeout=5)
+                    self.assertEqual(server.returncode, 0, stdout + stderr)
+                finally:
+                    if server.poll() is None:
+                        server.kill()
+                        server.communicate(timeout=5)
+
+    def test_real_ipv4_ipv6_probe_sender_matches_historical_exact_digest(self):
+        self.check_real_probe_sender(4, socket.AF_INET, '127.0.0.1')
+        self.check_real_probe_sender(6, socket.AF_INET6, '::1')
+
+    def test_ipv6_probe_cannot_fall_back_to_mapped_ipv4(self):
+        tool = Path(__file__).with_name('tcp_probe.py')
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen(1)
+            result = subprocess.run([sys.executable, str(tool), 'send', '::ffff:127.0.0.1',
+                                     '--family', '6', '--port', str(server.getsockname()[1])],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            server.settimeout(.1)
+            with self.assertRaises(TimeoutError):
+                server.accept()
+
+    def test_real_ipv6_probe_rejects_corrupted_return_checksum(self):
+        self.check_real_probe_sender(6, socket.AF_INET6, '::1', corrupt=True)
+
+    def check_real_probe_sender(self, version, family, host, corrupt=False):
+        from .native_smoke import verify_tcp_payload
+        # The unchanged fixed-seed 64KiB digest is preserved in native-wave4's receipt.
+        expected = 'a863d4360888ecceb6f59e575cd4eaa590b127c5a096a43e92d1274b5dccb5c9'
+        tool = Path(__file__).with_name('tcp_probe.py')
+        with self.subTest(version=version, corrupt=corrupt), socket.socket(family, socket.SOCK_STREAM) as server:
+            server.settimeout(5)
+            server.bind((host, 0))
+            server.listen(1)
+            with subprocess.Popen([sys.executable, str(tool), 'send', host, '--family', str(version),
+                                   '--port', str(server.getsockname()[1])],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as client:
+                try:
+                    connection, _peer = server.accept()
+                    with connection:
+                        connection.settimeout(5)
+                        count = int.from_bytes(self.receive_exact(connection, 4), 'big')
+                        self.assertEqual(count, 65536)
+                        payload = self.receive_exact(connection, count)
+                        self.assertEqual(hashlib.sha256(payload).hexdigest(), expected)
+                        connection.sendall(bytes(32) if corrupt else bytes.fromhex(expected))
+                    stdout, stderr = client.communicate(timeout=5)
+                    if corrupt:
+                        self.assertNotEqual(client.returncode, 0)
+                        self.assertIn('checksum mismatch', stderr)
+                    else:
+                        self.assertEqual(client.returncode, 0, stderr)
+                        result = json.loads(stdout)
+                        verify_tcp_payload(result, version, 65536)
+                        self.assertEqual(result['sha256'], expected)
+                finally:
+                    if client.poll() is None:
+                        client.kill()
+                        client.communicate(timeout=5)
+
+    def test_tcp_family_witness_mismatch_is_rejected(self):
+        from .native_smoke import verify_tcp_payload
+        valid = {'status': 'passed', 'ip_version': 6, 'bytes': 65536, 'sha256': 'a' * 64}
+        verify_tcp_payload(valid, 6, 65536)
+        for key, value in (('status', 'failed'), ('ip_version', 4), ('ip_version', True),
+                           ('bytes', 65535), ('sha256', 'a' * 63)):
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                verify_tcp_payload({**valid, key: value}, 6, 65536)
+
     def test_separate_outage_timing_and_terminal_predicates_are_strict(self):
         short = {'a': {'install_started': 0., 'installed': .01, 'remove_started': .26, 'removed': .3}}
         self.assertEqual(outage_timing(short, 'short-recovery')['joint_blocked_seconds_lower_bound'], .25)
@@ -383,7 +522,7 @@ class PackedAcceptanceTests(unittest.TestCase):
         settings = native.PACKED_DEFAULTS
         self.assertEqual(native.packed_options(settings), ['--record-profile', 'packed', '--packed-channels', '4', '--packed-hold-micros', '1000', '--packed-max-units', '4', '--packed-work-limit', '16'])
         value = native.packed_config('vxlan', 'half', 'udp', 1200, 'quic-like', 'integrity', (4, 2, 5), settings)
-        self.assertEqual(value, {'version': 1, 'layer': 'tap', 'duplex': 'half', 'carrier': 'udp', 'path_mtu': 1200, 'max_packet': 1600, **settings, 'fec_sources': 4, 'fec_repairs': 2, 'fec_flush_ms': 5, 'cover': 'quic-like', 'protection': 'integrity'})
+        self.assertEqual(value, {'version': 2, 'delivery': native.DELIVERY_POLICY, 'layer': 'tap', 'duplex': 'half', 'carrier': 'udp', 'path_mtu': 1200, 'max_packet': 1600, **settings, 'fec_sources': 4, 'fec_repairs': 2, 'fec_flush_ms': 5, 'cover': 'quic-like', 'protection': 'integrity'})
         quic = native.packed_config('tun', 'full', 'quic', 1228, 'unused', 'unused', (4, 2, 5), settings)
         self.assertIsNone(quic['cover']); self.assertIsNone(quic['protection'])
 

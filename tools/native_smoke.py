@@ -426,6 +426,16 @@ def switch_active(binary: Path, path: Path, policy: dict, *, rejected: bool = Fa
     return response
 
 
+def verify_tcp_payload(value: dict, family: int, count: int) -> None:
+    """Require the selected real socket family and complete checksum result."""
+    if (not isinstance(value, dict) or value.get('status') != 'passed'
+            or type(value.get('ip_version')) is not int or value['ip_version'] != family
+            or type(value.get('bytes')) is not int or value['bytes'] != count
+            or not isinstance(value.get('sha256'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', value['sha256']) is None):
+        raise RuntimeError('TCP probe family/status/byte/checksum witness mismatch')
+
+
 def case_name(layer: str, duplex: str, impaired: bool, path_probe: str = 'original-2s') -> str:
     base = f"{layer}-{duplex}-{'netem' if impaired else 'clean'}"
     return base if path_probe == 'original-2s' else f'{base}-{path_probe}'
@@ -458,8 +468,28 @@ def namespace_changes(before, after):
             for name in before if before[name] != after[name]}
 
 
+# Canonical directions match the lab's100/10Mbit/s shapers, including clean controls.
+DELIVERY_POLICY = {
+    'forward_bandwidth_bps': 100_000_000, 'reverse_bandwidth_bps': 10_000_000,
+    'bootstrap_rtt_micros': 70_000, 'min_rtt_micros': 1000, 'max_rtt_micros': 2_000_000,
+    'headroom_percent': 125, 'minimum_bytes': 3200, 'max_inflight_bytes': 4 * 1024 * 1024,
+    'max_records': 8192, 'metadata_limit_bytes': 2 * 1024 * 1024,
+    'sample_ttl_micros': 4_000_000, 'flush_timeout_micros': 10_000_000,
+}
+
+
+def delivery_options():
+    return ['--delivery-window', 'bdp',
+            '--forward-mbps', str(DELIVERY_POLICY['forward_bandwidth_bps'] // 1_000_000),
+            '--reverse-mbps', str(DELIVERY_POLICY['reverse_bandwidth_bps'] // 1_000_000),
+            '--bootstrap-rtt-ms', str(DELIVERY_POLICY['bootstrap_rtt_micros'] // 1000),
+            '--bdp-headroom-percent', str(DELIVERY_POLICY['headroom_percent']),
+            '--inflight-max-bytes', str(DELIVERY_POLICY['max_inflight_bytes']),
+            '--inflight-max-records', str(DELIVERY_POLICY['max_records'])]
+
+
 def packed_config(layer, duplex, carrier, mtu, cover, protection, fec, settings):
-    return {'version': 1, 'layer': 'tun' if layer == 'tun' else 'tap', 'duplex': duplex,
+    return {'version': 2, 'delivery': dict(DELIVERY_POLICY), 'layer': 'tun' if layer == 'tun' else 'tap', 'duplex': duplex,
             'carrier': carrier, 'path_mtu': mtu, 'max_packet': 1600, **settings,
             'fec_sources': fec[0], 'fec_repairs': fec[1], 'fec_flush_ms': fec[2],
             'cover': cover if carrier == 'udp' else None,
@@ -729,7 +759,9 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
              layer: str, duplex: str, impaired: bool, compression: str, hot_switch: bool,
              carrier: str = 'tcp', udp_cover: str = 'quic-like', udp_protection: str = 'aead', path_mtu: int = 1500,
              traffic: str = 'system', fec: tuple[int, int, int] | None = None,
-             flow_churn: bool = False, adaptive: bool = False, active_policy_switch: bool = False, active_transfer_timeout: int = 60, active_switch_timing: str = 'default', active_progress: bool = False, record_profile: str = 'frame', aligned_channels: int | None = None, path_probe: str = 'original-2s', packed: dict | None = None, packed_auditor: Path | None = None) -> dict:
+             flow_churn: bool = False, adaptive: bool = False, active_policy_switch: bool = False, active_transfer_timeout: int = 60, active_switch_timing: str = 'default', active_progress: bool = False, record_profile: str = 'frame', aligned_channels: int | None = None, path_probe: str = 'original-2s', packed: dict | None = None, packed_auditor: Path | None = None, tcp_family: int = 4) -> dict:
+    if tcp_family not in (4, 6):
+        raise ValueError('TCP probe family must be 4 or 6')
     ns = spec.namespaces
     name = case_name(layer, duplex, impaired, path_probe)
     for side in ('a', 'b'):
@@ -745,6 +777,8 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
         common.extend(packed_options(packed))
     if record_profile == 'aligned':
         common.extend(['--record-profile', 'aligned', '--aligned-channels', str(aligned_channels)])
+    if record_profile in ('aligned', 'packed'):
+        common.extend(delivery_options())
     if traffic == 'active':
         common.extend(['--traffic', 'active', '--active-stats-ms', '250'])
     if active_policy_switch:
@@ -910,13 +944,14 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
             stage('native_tcp_payload')
             source = ns['host_a' if layer != 'tun' else 'endpoint_a']
             destination = ns['host_b' if layer != 'tun' else 'endpoint_b']
-            address = subnet + '2'
+            address = (subnet if tcp_family == 4 else subnet6) + '2'
+            tcp_options = ['--family', str(tcp_family)]
             tcp_log = output / f'{name}-tcp.log'
             with tcp_log.open('w') as tcp_output:
-                tcp_server = subprocess.Popen(['ip', 'netns', 'exec', destination, 'python3', str(output / 'tcp_probe.py'), 'listen', address] + (['--progress'] if active_progress else []), stdout=tcp_output, stderr=subprocess.STDOUT)
+                tcp_server = subprocess.Popen(['ip', 'netns', 'exec', destination, 'python3', str(output / 'tcp_probe.py'), 'listen', address, *tcp_options] + (['--progress'] if active_progress else []), stdout=tcp_output, stderr=subprocess.STDOUT)
                 processes.append(tcp_server)
                 wait_log(tcp_server, tcp_log, 'Listening', 5)
-                sender = ['ip', 'netns', 'exec', source, 'python3', str(output / 'tcp_probe.py'), 'send', address] + (['--progress', '--progress-file', str(output / f'{name}-tcp-progress.jsonl')] if active_progress else [])
+                sender = ['ip', 'netns', 'exec', source, 'python3', str(output / 'tcp_probe.py'), 'send', address, *tcp_options] + (['--progress', '--progress-file', str(output / f'{name}-tcp-progress.jsonl')] if active_progress else [])
                 if hot_switch or active_policy_switch:
                     marker = output / f'{name}-tcp-started'
                     tcp_client_log = output / f'{name}-tcp-client.log'
@@ -949,7 +984,9 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
                 evidence.record('tcp_sender_stdout', tcp_result)
                 if tcp_server.wait(timeout=5) != 0:
                     raise RuntimeError(f'TCP probe server failed: {tcp_log.read_text()}')
-                evidence.record('tcp_payload', json.loads(tcp_result))
+                tcp_payload = json.loads(tcp_result)
+                verify_tcp_payload(tcp_payload, tcp_family, 524288 if hot_switch or active_policy_switch else 65536)
+                evidence.record('tcp_payload', tcp_payload)
             ipv6_results = []
             stage('native_ipv6_probes')
             for side, address in [('a', subnet6 + '2'), ('b', subnet6 + '1')]:
@@ -1084,7 +1121,7 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
             evidence.update(status='passed')
             return {'case': name, 'status': 'passed', 'layer': layer, 'duplex': duplex,
                     'compression': compression, 'netem_loss_percent': 15 if impaired else 0, 'base_rtt_ms': 70 if impaired else 2,
-                    'elapsed_seconds': time.monotonic() - started, 'ping': ping_results, 'ipv6_ping': ipv6_results, 'tcp_payload': json.loads(tcp_result), 'qdisc': stats, 'vxlan_offloads': offloads,
+                    'elapsed_seconds': time.monotonic() - started, 'ping': ping_results, 'ipv6_ping': ipv6_results, 'tcp_payload': tcp_payload, 'tcp_family': tcp_family, 'qdisc': stats, 'vxlan_offloads': offloads,
                     'hot_switch': switches if hot_switch else [],
                     'active_policy_switch': switches if active_policy_switch else [],
                     'active_transaction': transaction_timing(active_switch_timing) if active_policy_switch else None,
@@ -1093,6 +1130,7 @@ def run_case(spec: netns_lab.LabSpec, binary: Path, secrets: Path, output: Path,
                     'tcp_probe_protocol': 'progress32k-v1' if active_progress else 'final-checksum-v1',
                     'follower_rejection': follower_rejection,
                     'carrier': carrier, 'traffic': traffic, 'record_profile': record_profile,
+                    'delivery': DELIVERY_POLICY if record_profile in ('aligned', 'packed') else None,
                     'aligned_channels': aligned_channels,
                     **({'packed': packed, 'packed_burst': burst_result} if record_profile == 'packed' else {}),
                     'flow_churn': churn_result,
@@ -1164,7 +1202,9 @@ def main() -> int:
     parser.add_argument('--output', type=Path, default=ROOT / 'work/native-smoke')
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/l2tunneld')
     parser.add_argument('--include-netem', action='store_true')
-    parser.add_argument('--only-case', choices=[f'{layer}-{duplex}-{kind}' for layer in ('tap', 'tun', 'vxlan') for duplex, kind in (('full', 'clean'), ('half', 'clean'), ('half', 'netem'))])
+    parser.add_argument('--netem-duplex', choices=['half', 'full', 'both'])
+    parser.add_argument('--tcp-family', type=int, choices=[4, 6], default=4)
+    parser.add_argument('--only-case', choices=[f'{layer}-{duplex}-{kind}' for layer in ('tap', 'tun', 'vxlan') for duplex, kind in (('full', 'clean'), ('half', 'clean'), ('half', 'netem'), ('full', 'netem'))])
     parser.add_argument('--record-profile', choices=['frame', 'aligned', 'packed'], default='frame')
     parser.add_argument('--aligned-channels', type=int)
     for key in PACKED_DEFAULTS:
@@ -1191,6 +1231,9 @@ def main() -> int:
     parser.add_argument('--compression', choices=['off', 'lz4'], default='off')
     parser.add_argument('--layers', nargs='+', choices=['tap', 'tun', 'vxlan'], default=['tap', 'tun'])
     args = parser.parse_args()
+    if args.netem_duplex is not None and not args.include_netem:
+        parser.error('--netem-duplex requires --include-netem')
+    args.netem_duplex = args.netem_duplex or 'half'
     packed = None
     packed_values = {key: getattr(args, 'packed_' + key) for key in PACKED_DEFAULTS}
     if args.record_profile == 'packed':
@@ -1260,7 +1303,8 @@ def main() -> int:
     spec = netns_lab.LabSpec(args.lab_id)
     cases = [(layer, duplex, False) for layer in args.layers for duplex in ('half', 'full')]
     if args.include_netem:
-        cases.extend((layer, 'half', True) for layer in args.layers)
+        impaired_duplex = ('half', 'full') if args.netem_duplex == 'both' else (args.netem_duplex,)
+        cases.extend((layer, duplex, True) for layer in args.layers for duplex in impaired_duplex)
     if args.only_case:
         cases = [case for case in cases if f'{case[0]}-{case[1]}-{"netem" if case[2] else "clean"}' == args.only_case]
         if not cases:
@@ -1268,8 +1312,10 @@ def main() -> int:
     if not args.apply:
         print(json.dumps({'status': 'dry_run', 'namespaces': spec.namespaces, 'cases': cases,
                           'binary': str(args.binary), 'carrier': args.carrier, 'record_profile': args.record_profile,
+                          'netem_duplex': args.netem_duplex, 'tcp_family': args.tcp_family,
                           'openvpn_path_probe': args.openvpn_path_probe if args.carrier == 'openvpn-like' else None,
                           'aligned_channels': args.aligned_channels,
+                          'delivery': DELIVERY_POLICY if args.record_profile in ('aligned', 'packed') else None,
                           **({'packed': packed, 'packed_preflight': 'reviewed immutable daemon/auditor/build/helpers plus validation-only geometry required before namespace work'} if packed is not None else {}),
                           'traffic': args.traffic, 'fec': fec, 'flow_churn': args.flow_churn, 'adaptive': args.adaptive,
                           'active_policy_switch': args.active_policy_switch,
@@ -1303,9 +1349,10 @@ def main() -> int:
     # Every endpoint and keygen invocation uses this immutable test-run copy.
     binary = output / 'l2tunneld-tested'
     if packed is None: shutil.copy2(args.binary.resolve(), binary)
-    receipt = {'status': 'running', 'cases': [], 'planned_cases': [case_name(layer, duplex, impaired, args.openvpn_path_probe) for layer, duplex, impaired in cases],
+    receipt = {'status': 'running', 'cases': [], 'netem_duplex': args.netem_duplex, 'tcp_family': args.tcp_family, 'planned_cases': [case_name(layer, duplex, impaired, args.openvpn_path_probe) for layer, duplex, impaired in cases],
                'openvpn_path_probe': args.openvpn_path_probe if args.carrier == 'openvpn-like' else None,
-               'record_profile': args.record_profile, 'aligned_channels': args.aligned_channels, 'scope': f'native Linux {args.carrier} device forwarding with retained authenticated ' + ('QUIC control and TCP explicitly blocked' if args.carrier == 'quic' else 'standalone TLS over UDP control and TCP explicitly blocked' if args.carrier == 'openvpn-like' else 'TCP/TLS control'),
+               'record_profile': args.record_profile, 'aligned_channels': args.aligned_channels,
+               'delivery': DELIVERY_POLICY if args.record_profile in ('aligned', 'packed') else None, 'scope': f'native Linux {args.carrier} device forwarding with retained authenticated ' + ('QUIC control and TCP explicitly blocked' if args.carrier == 'quic' else 'standalone TLS over UDP control and TCP explicitly blocked' if args.carrier == 'openvpn-like' else 'TCP/TLS control'),
                'active_transaction': transaction_timing(args.active_switch_timing) if args.active_policy_switch else None,
                'active_transfer_timeout_seconds': args.active_transfer_timeout if args.active_policy_switch else None,
                'tcp_io_inactivity_timeout_seconds': 45,
@@ -1391,7 +1438,7 @@ def main() -> int:
             for layer, duplex, impaired in cases:
                 receipt['current_case'] = case_name(layer, duplex, impaired, args.openvpn_path_probe)
                 receipt['cases'].append(run_case(spec, binary, secrets, output, layer, duplex, impaired, args.compression, args.hot_switch,
-                                                args.carrier, args.udp_cover, args.udp_protection, args.path_mtu, args.traffic, fec, args.flow_churn, args.adaptive, args.active_policy_switch, args.active_transfer_timeout, args.active_switch_timing, args.active_progress, args.record_profile, args.aligned_channels, args.openvpn_path_probe, packed, output / 'packed_capture_audit' if packed is not None else None))
+                                                args.carrier, args.udp_cover, args.udp_protection, args.path_mtu, args.traffic, fec, args.flow_churn, args.adaptive, args.active_policy_switch, args.active_transfer_timeout, args.active_switch_timing, args.active_progress, args.record_profile, args.aligned_channels, args.openvpn_path_probe, packed, output / 'packed_capture_audit' if packed is not None else None, args.tcp_family))
                 if packed_publication is not None: packed_publication.update(**receipt)
                 print(f"Passed {receipt['cases'][-1]['case']}", flush=True)
             receipt.pop('current_case', None)

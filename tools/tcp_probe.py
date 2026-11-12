@@ -57,6 +57,7 @@ def main():
     parser.add_argument('role', choices=['listen', 'send'])
     parser.add_argument('address')
     parser.add_argument('--port', type=int, default=29001)
+    parser.add_argument('--family', type=int, choices=[4, 6], default=4)
     parser.add_argument('--bytes', type=int, default=65536)
     parser.add_argument('--chunk-delay', type=float, default=0)
     parser.add_argument('--started-file', type=Path)
@@ -71,13 +72,20 @@ def main():
         parser.error('progress-file requires the progress sender')
     started = time.monotonic()
     overall_deadline = started + 180
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock, (args.progress_file.open('x') if args.progress_file is not None else nullcontext()) as journal:
+    family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock, (args.progress_file.open('x') if args.progress_file is not None else nullcontext()) as journal:
         sock.settimeout(45)
+        if family == socket.AF_INET6:
+            # A selected IPv6 witness cannot be satisfied by a mapped IPv4 peer.
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         if args.role == 'listen':
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((args.address, args.port))
             sock.listen(1)
-            print('Listening', flush=True)
+            # Port zero is useful for isolated loopback tests without a bind race.
+            ready = (' ' + json.dumps({'port': sock.getsockname()[1], 'ip_version': args.family})
+                     if args.port == 0 else '')
+            print('Listening' + ready, flush=True)
             connection, _ = sock.accept()
             with connection:
                 connection.settimeout(45)
@@ -131,7 +139,7 @@ def main():
                         progress_deadline = min(overall_deadline, time.monotonic() + 45)
             elif receive(sock, 32) != checksum:
                 raise ValueError('end-to-end payload checksum mismatch')
-            result = {'status': 'passed', 'bytes': len(payload), 'sha256': checksum.hex(), 'elapsed_seconds': time.monotonic() - started}
+            result = {'status': 'passed', 'ip_version': 6 if sock.family == socket.AF_INET6 else 4, 'bytes': len(payload), 'sha256': checksum.hex(), 'elapsed_seconds': time.monotonic() - started}
             if args.progress:
                 result.update({'protocol': 'progress32k-v1', 'progress': progress, 'overall_timeout_seconds': 180, 'no_progress_timeout_seconds': 45})
             print(json.dumps(result))

@@ -72,6 +72,43 @@ class FullSimulatorGateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'importable aioquic'):
                 check.verify_dependencies()
 
+    def test_installed_package_root_cannot_hide_broken_quic_adapter(self):
+        # Real imports and real distribution metadata: the package root remains
+        # importable while one deeper adapter raises the same kind of ImportError
+        # as a missing native cryptography extension. No global env is changed.
+        for broken in ['configuration', 'connection']:
+            with self.subTest(adapter=broken), tempfile.TemporaryDirectory(
+                    prefix='l2t-quic-import-') as directory:
+                root = Path(directory)
+                (root / 'aioquic/quic').mkdir(parents=True)
+                (root / 'aioquic/__init__.py').write_text('')
+                (root / 'aioquic/quic/__init__.py').write_text('')
+                for adapter in ['configuration', 'connection']:
+                    text = ('raise ImportError("missing test native binding")\n'
+                            if adapter == broken else '')
+                    (root / f'aioquic/quic/{adapter}.py').write_text(text)
+                (root / 'aioquic-1.3.0.dist-info').mkdir()
+                (root / 'aioquic-1.3.0.dist-info/METADATA').write_text(
+                    'Metadata-Version: 2.1\nName: aioquic\nVersion: 1.3.0\n')
+                code = ('import aioquic\n'
+                        'from tools import check_simulator as gate\n'
+                        'gate.DEPENDENCIES = ("aioquic",)\n'
+                        'gate.verify_dependencies()\n')
+                result = subprocess.run([sys.executable, '-c', code], cwd=root,
+                    env={**os.environ, 'PYTHONPATH': os.pathsep.join(
+                        [str(root), str(check.ROOT)]), 'PYTHONDONTWRITEBYTECODE': '1'},
+                    capture_output=True, text=True, timeout=10, check=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f'importable aioquic (aioquic.quic.{broken})', result.stderr)
+                self.assertIn('missing test native binding', result.stderr)
+
+    def test_dependency_only_mode_does_not_start_pytest(self):
+        with patch.object(check, 'verify_dependencies') as verify, \
+                patch.object(check.subprocess, 'run') as run:
+            self.assertEqual(check.main(['--check-dependencies']), 0)
+        verify.assert_called_once_with()
+        run.assert_not_called()
+
     def test_missing_plot_dependency_fails_full_gate(self):
         def version(name):
             if name == 'matplotlib':
@@ -89,10 +126,23 @@ class FullSimulatorGateTests(unittest.TestCase):
             (root / 'simulator/pyproject.toml').write_text('[tool.pytest.ini_options]\n')
             (root / 'simulator/tests/test_cases.py').write_text(
                 'import pytest\ndef test_selected(): assert True\ndef test_omitted(): pytest.skip("must be observed")\n')
+            actual_run = check.subprocess.run
+            children = []
+
+            def capture_child(*args, **kwargs):
+                # Keep this real pytest run, but do not count its synthetic test
+                # summary as part of the aggregate simulator campaign.
+                child = actual_run(*args, **kwargs, capture_output=True, text=True)
+                children.append(child)
+                return child
+
             with patch.object(check, 'ROOT', root), patch.object(check, 'verify_dependencies'), \
+                    patch.object(check.subprocess, 'run', side_effect=capture_child), \
                     patch.dict(os.environ, {'PYTHONPATH': str(Path(__file__).resolve().parents[1]),
                                            'PYTEST_ADDOPTS': '-k test_selected'}):
-                self.assertEqual(check.main(), 1)
+                self.assertEqual(check.main([]), 1)
+            self.assertEqual(len(children), 1)
+            self.assertEqual(children[0].returncode, 1, children[0].stdout + children[0].stderr)
 
 
 if __name__ == '__main__':

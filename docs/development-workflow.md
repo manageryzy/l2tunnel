@@ -57,16 +57,20 @@ API. No task is complete just because its enum/trait or crate compiles.
    files, CI/Cargo configuration, root manifests and `.editorconfig`, and the
    complete `simulator/src` oracle tree used by golden checks (excluding caches).
    Earlier receipts retain their original recorded scope and are not rewritten.
-   Freeze a copied source snapshot, verify its file hashes against the selected
-   workspace checkpoint, and release module workers immediately after the copy.
-   Run the aggregate and exact-source build in that snapshot, with exclusive
-   access to the workspace's shared Cargo target directory; native tests execute only its immutable daemon,
-   verifier and copied helper tree. Do not require the live development workspace
-   to stay frozen during validation. A receipt qualifies its recorded snapshot,
-   not concurrent later edits. Run privileged/native tests only for a runnable feature
+   Freeze the recorded source inputs during aggregate checks and builds in the
+   live checkout. Workers may inspect or design in `work/`, but must not edit
+   those inputs until the integrator releases them. Source copies can archive
+   evidence; do not alternate compilation between them and the live checkout.
+   After an exact-source native build, retain an immutable daemon, verifier,
+   helper tree and source manifest before releasing workers. A receipt qualifies
+   its recorded inputs, not later edits. Run privileged/native tests only for a runnable feature
    within the authorized isolated lab. Keep unsupported/skipped gates unchecked.
-   Use the shared target through `CARGO_TARGET_DIR` or a snapshot symlink; wait
+   Use the shared target through `CARGO_TARGET_DIR`; wait
    for Cargo's lock instead of creating a target per worker, source copy or retry.
+   The integrator grants one active source tree the build directory at a time;
+   do not alternate live and frozen trees concurrently. Before a source-tree
+   switch, stop builds and invalidate affected workspace package artifacts;
+   Cargo's lock alone does not establish source identity across copied trees.
    Preserve small source manifests, logs and receipts outside the target. Remove
    obsolete compiler output after its processes exit; it is not evidence.
 8. **Commit coherent checkpoints.** Create a local Git commit after a module has

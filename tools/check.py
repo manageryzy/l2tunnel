@@ -32,6 +32,8 @@ def main() -> None:
     for path in (ROOT / 'tools').glob('*.py'):
         ast.parse(path.read_text(), filename=str(path))
     print(f'Validated {len(modes)} mode entries and Python tool syntax.', flush=True)
+    if sys.platform == 'linux':
+        run(sys.executable, 'tools/check_simulator.py', '--check-dependencies')
     run(sys.executable, 'tools/check_checklists.py')
     run(sys.executable, '-m', 'unittest', 'tools.test_record_check', '-v')
     run(sys.executable, 'tools/check_smoltcp_source.py')
