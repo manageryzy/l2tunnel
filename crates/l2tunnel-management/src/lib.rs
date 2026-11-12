@@ -13,6 +13,9 @@ use l2tunnel_session::Ticket;
 /// Bounded coordinated configuration transactions with injected time and drain evidence.
 pub mod transaction;
 
+/// Versioned mode-independent authenticated session-control envelopes.
+pub mod session_control;
+
 /// Fixed header size of the internal draft format, excluding protection outside this crate.
 pub const HEADER_LEN: usize = 112;
 /// Current draft format version; not a final network interoperability commitment.

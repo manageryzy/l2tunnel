@@ -1,29 +1,16 @@
 use super::*;
 use crate::field;
 
-struct Bank {
-    data: Vec<u8>,
-    known: Vec<Option<u32>>,
-    pivots: Vec<Option<u32>>,
-    map: Vec<Option<usize>>,
+mod transaction;
+use transaction::{Cell, Pool, Ticket};
+
+#[derive(Clone, Copy, Default)]
+struct Header {
     prefix: u32,
     observed: u32,
     rank: usize,
     known_count: usize,
-}
-impl Bank {
-    fn new(c: Config, width: usize) -> Result<Self, Error> {
-        Ok(Self {
-            data: bytes(mul(c.max_rows, add(c.window, width)?)?)?,
-            known: slots(2 * c.window, None)?,
-            pivots: slots(c.max_rows, None)?,
-            map: slots(c.window, None)?,
-            prefix: 0,
-            observed: 0,
-            rank: 0,
-            known_count: 0,
-        })
-    }
+    evicted_before: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Descriptor {
@@ -57,8 +44,12 @@ impl Input {
 }
 #[derive(Clone, Copy)]
 enum Phase {
-    CopyData(usize),
-    CopyMeta(usize),
+    CopyRow {
+        row: usize,
+        from: usize,
+        to: usize,
+        index: usize,
+    },
     Clear(usize),
     Load(usize),
     Support(u32),
@@ -134,11 +125,13 @@ enum Phase {
         index: usize,
     },
     Advance,
-    Evict(usize),
+    Evict(u32),
     History(usize),
     Commit,
 }
 struct Job {
+    ticket: Ticket,
+    resume: Option<Phase>,
     input: Input,
     phase: Phase,
     deadline: Tick,
@@ -199,8 +192,15 @@ pub struct Decoder {
     config: Config,
     scope: Scope,
     width: usize,
-    live: Bank,
-    shadow: Bank,
+    live: Header,
+    shadow: Header,
+    data: [Vec<u8>; 2],
+    known: Vec<Cell<Option<u32>>>,
+    pivots: Vec<Cell<Option<u32>>>,
+    map: Vec<Cell<Option<usize>>>,
+    rows: Vec<Cell<()>>,
+    decisions: Pool,
+    active: Option<Ticket>,
     // Immutable while referenced by committed identities. Candidate recovery may
     // stage only into vacant slots; publication is the identity-bank commit.
     known_data: Vec<u8>,
@@ -224,30 +224,35 @@ enum Action {
     Capacity,
 }
 impl Decoder {
-    /// Conservative fixed allocations including both banks and exact repair history.
+    /// Fixed equation versions, metadata decisions and history, checked before allocation.
     pub fn memory_bound(c: Config) -> Result<usize, Error> {
         let width = c.width()?;
-        let bank = add(
-            mul(c.max_rows, add(c.window, width)?)?,
+        let rows = mul(c.max_rows, add(c.window, width)?)?;
+        let cells = add(mul(3, c.window)?, mul(2, c.max_rows)?)?;
+        let metadata = add(
             add(
                 mul(
-                    2 * c.window + c.max_rows,
-                    std::mem::size_of::<Option<u32>>(),
+                    add(mul(2, c.window)?, c.max_rows)?,
+                    std::mem::size_of::<Cell<Option<u32>>>(),
                 )?,
-                mul(c.window, std::mem::size_of::<Option<usize>>())?,
+                mul(c.window, std::mem::size_of::<Cell<Option<usize>>>())?,
+            )?,
+            add(
+                mul(c.max_rows, std::mem::size_of::<Cell<()>>())?,
+                Pool::memory_bound(cells)?,
             )?,
         )?;
         add(
+            add(mul(2, rows)?, metadata)?,
             add(
-                mul(2, bank)?,
                 mul(
                     c.repair_history,
                     add(width, std::mem::size_of::<Option<Descriptor>>())?,
                 )?,
-            )?,
-            add(
-                mul(2 * c.window, width)?,
-                add(add(width, c.window + width)?, std::mem::size_of::<Self>())?,
+                add(
+                    mul(2 * c.window, width)?,
+                    add(add(width, c.window + width)?, std::mem::size_of::<Self>())?,
+                )?,
             )?,
         )
     }
@@ -264,8 +269,18 @@ impl Decoder {
             config,
             scope,
             width,
-            live: Bank::new(config, width)?,
-            shadow: Bank::new(config, width)?,
+            live: Header::default(),
+            shadow: Header::default(),
+            data: [
+                bytes(mul(config.max_rows, add(config.window, width)?)?)?,
+                bytes(mul(config.max_rows, add(config.window, width)?)?)?,
+            ],
+            known: slots(2 * config.window, Cell::new())?,
+            pivots: slots(config.max_rows, Cell::new())?,
+            map: slots(config.window, Cell::new())?,
+            rows: slots(config.max_rows, Cell::new())?,
+            decisions: Pool::new(add(mul(3, config.window)?, mul(2, config.max_rows)?)?)?,
+            active: None,
             known_data: bytes(mul(2 * config.window, width)?)?,
             input: bytes(width)?,
             candidate: bytes(config.window + width)?,
@@ -319,14 +334,15 @@ impl Decoder {
             }
             None => None,
         };
-        let vacant_source = matches!(input, Input::Source(_)) && self.live.rank == 0;
+        let ticket = self.decisions.begin()?;
+        self.active = Some(ticket);
+        self.shadow = self.live;
+        self.shadow.observed = self.shadow.observed.max(input.end());
         self.job = Some(Job {
+            ticket,
+            resume: None,
             input,
-            phase: if vacant_source {
-                Phase::CopyMeta(0)
-            } else {
-                Phase::CopyData(0)
-            },
+            phase: Phase::Clear(0),
             deadline: job_end,
             debt,
             recovered: 0,
@@ -363,7 +379,7 @@ impl Decoder {
             return Err(Error::Identity);
         }
         let slot = id.0 as usize % (2 * self.config.window);
-        if self.live.known[slot] == Some(id.0) {
+        if self.known[slot].get(&self.decisions, None)? == Some(id.0) {
             let data = &self.known_data[slot * self.width..(slot + 1) * self.width];
             let len = usize::from(u16::from_be_bytes([data[0], data[1]]));
             return if len == original.len() && data[2..2 + len] == *original {
@@ -435,20 +451,83 @@ impl Decoder {
     fn row_start(&self, row: usize) -> usize {
         row * (self.config.window + self.width)
     }
-    fn known(&self, id: u32) -> Option<usize> {
+    fn known_at(&self, slot: usize) -> Result<Option<u32>, Error> {
+        self.known[slot].get(&self.decisions, self.active)
+    }
+    fn live_known(&self, slot: usize) -> Result<Option<u32>, Error> {
+        self.known[slot].get(&self.decisions, None)
+    }
+    fn pivot_at(&self, row: usize) -> Result<Option<u32>, Error> {
+        self.pivots[row].get(&self.decisions, self.active)
+    }
+    fn map_at(&self, column: usize) -> Result<Option<usize>, Error> {
+        self.map[column].get(&self.decisions, self.active)
+    }
+    fn set_known(&mut self, slot: usize, value: Option<u32>) -> Result<(), Error> {
+        self.known[slot].set(
+            &mut self.decisions,
+            self.active.ok_or(Error::Identity)?,
+            value,
+        )
+    }
+    fn set_pivot(&mut self, row: usize, value: Option<u32>) -> Result<(), Error> {
+        self.pivots[row].set(
+            &mut self.decisions,
+            self.active.ok_or(Error::Identity)?,
+            value,
+        )
+    }
+    fn set_map(&mut self, column: usize, value: Option<usize>) -> Result<(), Error> {
+        self.map[column].set(
+            &mut self.decisions,
+            self.active.ok_or(Error::Identity)?,
+            value,
+        )
+    }
+    fn known(&self, id: u32) -> Result<Option<usize>, Error> {
         let slot = id as usize % (2 * self.config.window);
-        (self.shadow.known[slot] == Some(id)).then_some(slot * self.width)
+        Ok((self.known_at(slot)? == Some(id)).then_some(slot * self.width))
     }
-    fn payload_start(&self, row: Option<usize>) -> usize {
-        row.map_or(self.config.window, |row| {
-            self.row_start(row) + self.config.window
-        })
+    fn row_bank(&self, row: usize, active: Option<Ticket>) -> Result<usize, Error> {
+        self.rows[row]
+            .selected(&self.decisions, active)?
+            .ok_or(Error::Identity)
     }
-    fn payload_byte(&self, row: Option<usize>, index: usize) -> u8 {
-        let start = self.payload_start(row);
+    fn row_byte(&self, row: usize, index: usize) -> Result<u8, Error> {
+        let bank = self.row_bank(row, self.active)?;
+        Ok(self.data[bank][self.row_start(row) + index])
+    }
+    fn set_row_byte(&mut self, row: usize, index: usize, value: u8) -> Result<(), Error> {
+        let bank = self.row_bank(row, self.active)?;
+        let at = self.row_start(row) + index;
+        self.data[bank][at] = value;
+        Ok(())
+    }
+    fn prepare_row(
+        &mut self,
+        job: &mut Job,
+        row: usize,
+        copy_old: bool,
+        next: Phase,
+    ) -> Result<(), Error> {
+        let (to, from) = self.rows[row].prepare(&mut self.decisions, job.ticket)?;
+        if copy_old && let Some(from) = from {
+            job.resume = Some(next);
+            job.phase = Phase::CopyRow {
+                row,
+                from,
+                to,
+                index: 0,
+            };
+        } else {
+            job.phase = next;
+        }
+        Ok(())
+    }
+    fn payload_byte(&self, row: Option<usize>, index: usize) -> Result<u8, Error> {
         match row {
-            Some(_) => self.shadow.data[start + index],
-            None => self.candidate[start + index],
+            Some(row) => self.row_byte(row, self.config.window + index),
+            None => Ok(self.candidate[self.config.window + index]),
         }
     }
     fn advance(
@@ -460,35 +539,27 @@ impl Decoder {
         let w = self.config.window;
         let width = self.width;
         match job.phase {
-            Phase::CopyData(i) => {
-                if i == self.live.data.len() {
-                    job.phase = Phase::CopyMeta(0);
+            Phase::CopyRow {
+                row,
+                from,
+                to,
+                index,
+            } => {
+                if index == w + width {
+                    job.phase = job.resume.take().ok_or(Error::Identity)?;
                 } else {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    self.shadow.data[i] = self.live.data[i];
-                    job.phase = Phase::CopyData(i + 1);
+                    let at = self.row_start(row) + index;
+                    self.data[to][at] = self.data[from][at];
+                    job.phase = Phase::CopyRow {
+                        row,
+                        from,
+                        to,
+                        index: index + 1,
+                    };
                 }
-            }
-            Phase::CopyMeta(i) => {
-                if i < 2 * w {
-                    self.shadow.known[i] = self.live.known[i];
-                } else if i < 2 * w + self.config.max_rows {
-                    let n = i - 2 * w;
-                    self.shadow.pivots[n] = self.live.pivots[n];
-                } else if i < 3 * w + self.config.max_rows {
-                    let n = i - 2 * w - self.config.max_rows;
-                    self.shadow.map[n] = self.live.map[n];
-                } else {
-                    self.shadow.prefix = self.live.prefix;
-                    self.shadow.observed = self.live.observed.max(job.input.end());
-                    self.shadow.rank = self.live.rank;
-                    self.shadow.known_count = self.live.known_count;
-                    job.phase = Phase::Clear(0);
-                    return Ok(Action::Continue);
-                }
-                job.phase = Phase::CopyMeta(i + 1);
             }
             Phase::Clear(i) => {
                 if i == self.candidate.len() {
@@ -519,7 +590,7 @@ impl Decoder {
                     let factor = job.input.coefficient(id);
                     if factor == 0 {
                         job.phase = Phase::Support(id + 1);
-                    } else if self.known(id).is_some() {
+                    } else if self.known(id)?.is_some() {
                         job.phase = Phase::Known {
                             source: id,
                             factor,
@@ -545,7 +616,7 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    let start = self.known(source).ok_or(Error::Identity)?;
+                    let start = self.known(source)?.ok_or(Error::Identity)?;
                     self.candidate[w + column] ^=
                         field::multiply(factor, self.known_data[start + column]);
                     job.phase = Phase::Known {
@@ -561,9 +632,9 @@ impl Decoder {
                 } else {
                     let factor = self.candidate[id as usize % w];
                     if factor != 0
-                        && let Some(row) = self.shadow.map[id as usize % w]
+                        && let Some(row) = self.map_at(id as usize % w)?
                     {
-                        if self.shadow.pivots[row] != Some(id) {
+                        if self.pivot_at(row)? != Some(id) {
                             return Err(Error::Identity);
                         }
                         job.phase = Phase::Eliminate {
@@ -589,8 +660,7 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    self.candidate[index] ^=
-                        field::multiply(factor, self.shadow.data[self.row_start(row) + index]);
+                    self.candidate[index] ^= field::multiply(factor, self.row_byte(row, index)?);
                     job.phase = Phase::Eliminate {
                         row,
                         factor,
@@ -698,25 +768,30 @@ impl Decoder {
                         index: 0,
                         count: 0,
                     };
-                } else if self.shadow.pivots[row].is_none() {
+                } else if self.pivot_at(row)?.is_none() {
                     job.phase = Phase::Others {
                         pivot,
                         row: row + 1,
                     };
                 } else {
-                    let factor = self.shadow.data[self.row_start(row) + pivot as usize % w];
+                    let factor = self.row_byte(row, pivot as usize % w)?;
                     if factor == 0 {
                         job.phase = Phase::Others {
                             pivot,
                             row: row + 1,
                         };
                     } else {
-                        job.phase = Phase::OtherEliminate {
-                            pivot,
+                        self.prepare_row(
+                            job,
                             row,
-                            factor,
-                            index: 0,
-                        };
+                            true,
+                            Phase::OtherEliminate {
+                                pivot,
+                                row,
+                                factor,
+                                index: 0,
+                            },
+                        )?;
                     }
                 }
             }
@@ -735,8 +810,9 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    let target = self.row_start(row) + index;
-                    self.shadow.data[target] ^= field::multiply(factor, self.candidate[index]);
+                    let value =
+                        self.row_byte(row, index)? ^ field::multiply(factor, self.candidate[index]);
+                    self.set_row_byte(row, index, value)?;
                     job.phase = Phase::OtherEliminate {
                         pivot,
                         row,
@@ -773,12 +849,17 @@ impl Decoder {
                 if row == self.config.max_rows {
                     return Ok(Action::Capacity);
                 }
-                if self.shadow.pivots[row].is_none() {
-                    job.phase = Phase::Insert {
-                        pivot,
+                if self.pivot_at(row)?.is_none() {
+                    self.prepare_row(
+                        job,
                         row,
-                        index: 0,
-                    };
+                        false,
+                        Phase::Insert {
+                            pivot,
+                            row,
+                            index: 0,
+                        },
+                    )?;
                 } else {
                     job.phase = Phase::FindSlot {
                         pivot,
@@ -788,8 +869,8 @@ impl Decoder {
             }
             Phase::Insert { pivot, row, index } => {
                 if index == w + width {
-                    self.shadow.pivots[row] = Some(pivot);
-                    self.shadow.map[pivot as usize % w] = Some(row);
+                    self.set_pivot(row, Some(pivot))?;
+                    self.set_map(pivot as usize % w, Some(row))?;
                     self.shadow.rank += 1;
                     job.phase = Phase::Scan {
                         row: 0,
@@ -800,8 +881,7 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    let target = self.row_start(row) + index;
-                    self.shadow.data[target] = self.candidate[index];
+                    self.set_row_byte(row, index, self.candidate[index])?;
                     job.phase = Phase::Insert {
                         pivot,
                         row,
@@ -812,7 +892,7 @@ impl Decoder {
             Phase::Scan { row, index, count } => {
                 if row == self.config.max_rows {
                     job.phase = Phase::Advance;
-                } else if self.shadow.pivots[row].is_none() {
+                } else if self.pivot_at(row)?.is_none() {
                     job.phase = Phase::Scan {
                         row: row + 1,
                         index: 0,
@@ -822,7 +902,7 @@ impl Decoder {
                     if count == 1 {
                         job.phase = Phase::Validate {
                             row: Some(row),
-                            id: self.shadow.pivots[row].ok_or(Error::Identity)?,
+                            id: self.pivot_at(row)?.ok_or(Error::Identity)?,
                             index: 0,
                             length: 0,
                         };
@@ -834,7 +914,7 @@ impl Decoder {
                         };
                     }
                 } else {
-                    let byte = self.shadow.data[self.row_start(row) + index];
+                    let byte = self.row_byte(row, index)?;
                     job.phase = Phase::Scan {
                         row,
                         index: index + 1,
@@ -850,8 +930,8 @@ impl Decoder {
             } => {
                 if index == 0 {
                     let length = usize::from(u16::from_be_bytes([
-                        self.payload_byte(row, 0),
-                        self.payload_byte(row, 1),
+                        self.payload_byte(row, 0)?,
+                        self.payload_byte(row, 1)?,
                     ]));
                     if length == 0 || length > self.config.max_payload {
                         return Err(Error::Length);
@@ -864,7 +944,7 @@ impl Decoder {
                     };
                 } else if index == width {
                     let slot = id as usize % (2 * w);
-                    if let Some(old) = self.shadow.known[slot]
+                    if let Some(old) = self.known_at(slot)?
                         && old >= self.shadow.prefix.saturating_sub(w as u32)
                     {
                         return Err(Error::Identity);
@@ -873,7 +953,8 @@ impl Decoder {
                     // committed metadata. The authenticated horizon guarantees this
                     // for new identities even if candidate prefix advancement evicts
                     // additional shadow identities before commit.
-                    if self.live.known[slot]
+                    if self
+                        .live_known(slot)?
                         .is_some_and(|old| old >= self.live.prefix.saturating_sub(w as u32))
                     {
                         return Err(Error::Identity);
@@ -883,7 +964,7 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    if index >= length + 2 && self.payload_byte(row, index) != 0 {
+                    if index >= length + 2 && self.payload_byte(row, index)? != 0 {
                         return Err(Error::Length);
                     }
                     job.phase = Phase::Validate {
@@ -897,14 +978,14 @@ impl Decoder {
             Phase::Store { row, id, index } => {
                 let slot = id as usize % (2 * w);
                 if index == width {
-                    if self.shadow.known[slot].is_none() {
+                    if self.known_at(slot)?.is_none() {
                         self.shadow.known_count += 1;
                     }
-                    self.shadow.known[slot] = Some(id);
+                    self.set_known(slot, Some(id))?;
                     job.recovered += 1;
                     if let Some(row) = row {
-                        self.shadow.pivots[row] = None;
-                        self.shadow.map[id as usize % w] = None;
+                        self.set_pivot(row, None)?;
+                        self.set_map(id as usize % w, None)?;
                         self.shadow.rank -= 1;
                         job.phase = Phase::Scan {
                             row: row + 1,
@@ -922,7 +1003,7 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    let value = self.payload_byte(row, index);
+                    let value = self.payload_byte(row, index)?;
                     // Both identity banks proved this slot unreferenced. Partial
                     // payload writes are invisible until the identity bank commits.
                     self.known_data[slot * width + index] = value;
@@ -936,24 +1017,25 @@ impl Decoder {
             Phase::Advance => {
                 let id = self.shadow.prefix;
                 if ((id - self.handoff) as usize) < self.config.handoff_sources
-                    && self.shadow.known[id as usize % (2 * w)] == Some(id)
+                    && self.known_at(id as usize % (2 * w))? == Some(id)
                 {
                     self.shadow.prefix = id.checked_add(1).ok_or(Error::Exhausted)?;
                 } else {
-                    job.phase = Phase::Evict(0);
+                    job.phase = Phase::Evict(self.live.evicted_before);
                 }
             }
-            Phase::Evict(i) => {
-                if i == 2 * w {
+            Phase::Evict(id) => {
+                let floor = self.shadow.prefix.saturating_sub(w as u32);
+                if id == floor {
+                    self.shadow.evicted_before = floor;
                     job.phase = Phase::History(0);
                 } else {
-                    if self.shadow.known[i]
-                        .is_some_and(|id| id < self.shadow.prefix.saturating_sub(w as u32))
-                    {
-                        self.shadow.known[i] = None;
+                    let slot = id as usize % (2 * w);
+                    if self.known_at(slot)? == Some(id) {
+                        self.set_known(slot, None)?;
                         self.shadow.known_count -= 1;
                     }
-                    job.phase = Phase::Evict(i + 1);
+                    job.phase = Phase::Evict(id.checked_add(1).ok_or(Error::Exhausted)?);
                 }
             }
             Phase::History(i) => {
@@ -990,7 +1072,9 @@ impl Decoder {
                         .saturating_sub(self.config.repair_history as u64 - 1)
                         .max(1);
                 }
-                std::mem::swap(&mut self.live, &mut self.shadow);
+                self.decisions.commit(job.ticket)?;
+                self.active = None;
+                self.live = self.shadow;
                 self.debt = if self.live.prefix < self.live.observed {
                     job.debt
                 } else {
@@ -1013,7 +1097,7 @@ impl Decoder {
             while budget.metadata > 0
                 && ((self.live.prefix - self.handoff) as usize) < self.config.handoff_sources
             {
-                if self.live.known[self.live.prefix as usize % (2 * self.config.window)]
+                if self.live_known(self.live.prefix as usize % (2 * self.config.window))?
                     != Some(self.live.prefix)
                 {
                     break;
@@ -1050,7 +1134,11 @@ impl Decoder {
                         prefix: self.live.prefix,
                     });
                 }
-                Ok(Action::Capacity) => return Ok(DecodeStep::Capacity(used(before, budget))),
+                Ok(Action::Capacity) => {
+                    self.active = None;
+                    self.decisions.release(job.ticket)?;
+                    return Ok(DecodeStep::Capacity(used(before, budget)));
+                }
                 Err(error) => {
                     self.job = Some(job);
                     return self.fail(error);
@@ -1066,7 +1154,7 @@ impl Decoder {
             return None;
         }
         let slot = self.handoff as usize % (2 * self.config.window);
-        if self.live.known[slot] != Some(self.handoff) {
+        if self.live_known(slot).ok()? != Some(self.handoff) {
             return None;
         }
         let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
@@ -1083,7 +1171,7 @@ impl Decoder {
         // A pending job owns a snapshot of prefix metadata; only its separate
         // handoff watermark may change until the bank is atomically committed.
         if self.job.is_none()
-            && self.live.known[self.live.prefix as usize % (2 * self.config.window)]
+            && self.live_known(self.live.prefix as usize % (2 * self.config.window))?
                 == Some(self.live.prefix)
         {
             self.live.prefix = self.live.prefix.checked_add(1).ok_or(Error::Exhausted)?;
@@ -1092,7 +1180,7 @@ impl Decoder {
             self.debt = None;
         }
         if self.handoff == self.live.prefix
-            && self.live.known[self.live.prefix as usize % (2 * self.config.window)]
+            && self.live_known(self.live.prefix as usize % (2 * self.config.window))?
                 != Some(self.live.prefix)
         {
             self.delivery = None;
@@ -1110,7 +1198,10 @@ impl Decoder {
     // Scheduler scans only committed columns while it freezes new decoder work.
     // No payload or sender ledger is exposed, and each lookup is constant work.
     pub(super) fn committed_known(&self, id: SourceId) -> bool {
-        self.live.known[id.0 as usize % (2 * self.config.window)] == Some(id.0)
+        self.live_known(id.0 as usize % (2 * self.config.window))
+            .ok()
+            .flatten()
+            == Some(id.0)
     }
     /// Constant-size ownership snapshot without allocating or scanning payloads.
     pub fn status(&self) -> DecoderStatus {
@@ -1129,3 +1220,6 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sparse_work_tests;

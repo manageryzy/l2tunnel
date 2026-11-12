@@ -20,11 +20,14 @@ is reused. Original vectors contain a u16 length, exact bytes and zero padding.
 The initial primitive carries complete vectors; repair-padding trimming is absent.
 
 The decoder keeps historical and future known columns across nearly 2W slots,
-plus bounded rows and duplicate history. It prepares a preallocated shadow bank
-using resumable copy/metadata/field work, and publishes accepted state atomically.
-Known payloads occupy one shared preallocated ring; only equation rows and
-identity metadata are transactional. Staging never overwrites an identity still
-referenced by the committed history. Rank-zero systematic input skips row copies.
+plus bounded rows and duplicate history. It stages changed metadata in two-version
+cells and copies only equation rows first mutated by a job. One preallocated
+transaction decision publishes those versions atomically; abort leaves the prior
+committed versions selected. Known payloads occupy one shared preallocated ring;
+staging never overwrites an identity still referenced by committed history.
+Rank-zero systematic input skips row copies. Unchanged rows and metadata are
+neither copied nor swept at publication. Fixed version descriptors and decision
+references/free slots are included in `Decoder::memory_bound` before allocation.
 Every useful repair end is bounded by decoded-prefix+W before work. Repairs ending
 at/before the decoded prefix are stale. Recovered source handoff is separate from
 native delivery; only the upper owner can prove native delivery. The public `decoded_prefix` is the contiguous **published receipt** prefix,
@@ -136,16 +139,24 @@ is supplied. Gates 06/07 remain open after this finite subgate.
 - [x] [MOD-LGR-06A] Implement and test the additive bounded structural source/repair wire codec without granting authentication or replay authority. Evidence: [focused wire checks](../../work/rolling-wire15/validation.json), nine literal/parser/output-atomicity and independent received-wire recovery tests, strict FEC Clippy, warning-denied rustdoc and Cargo formatting. This is a structural contract, not authenticated transport integration.
 - [x] [MOD-LGR-06B] Implement causal bounded repair-credit/tail/identified cumulative feedback scheduling over actual rolling owners and wire; verify independent two-owner exact bytes under data/repair/feedback loss, reorder, output pressure, tiny work and original expiry. Evidence: [scoped exact-file receipt](../../work/rolling-scheduler16/validation.json), 49 FEC unit and 16 independent integration cases (13 scheduler / 3 existing stream), strict FEC lint/docs and formatting. New maintained-Python repair/feedback literals pin actual deficit/rank and full structural bytes; W8 budget1/17/65536 exchanges cross eight windows. This finite pure slice does not complete either parent gate.
 - [x] [MOD-LGR-06C] Remove complete known-payload bank copies while preserving bounded work, retained history and atomic recovery publication. Evidence: [focused optimization receipt](../../work/fix03-shared26/RECEIPT.md),69 FEC tests, strict Clippy and formatting; partial rank-positive recovery preserves exact committed payload/rows/identities through original expiry. At G8192/width1450 the reservation drops23,756,800 bytes. This is a pure-module checkpoint; FIX-03 still requires measured large-window service cost and runtime qualification.
+- [x] [MOD-LGR-06D] Remove whole-capacity equation and metadata transaction snapshots with preallocated two-version cells, first-mutation row copies and constant-size publish/abort. Verify actual W8192/2048-row clean and rank-one work, repeated Capacity rollback/retry, partial-copy original expiry, delayed-handoff ring wrap and commit-token reuse/exhaustion. Evidence: [scoped before/after report](../../work/rolling-sparse29/REPORT.md), [exact receipt](../../work/rolling-sparse29/validation.json). This pure work reduction leaves the runtime global-support128 guard, remaining algebra/window scans and FIX-03/FIX-09 parent gates open.
 - [ ] [MOD-LGR-07] Integrate explicit aligned/packed selection, runtime/client/native qualification and complete Python family parity.
 
-The implementation checks the configured reservation before allocating two fixed
-banks, input/candidate scratch and exact repair history. The bound includes owned
-vector capacities and inline metadata, excluding allocator bookkeeping, caller
-buffers and the bounded call stack. Construction is fallible. Bank copies and
-GF elimination/normalization advance under separate byte, field and metadata
-budgets; a budget of one field operation still progresses. The initial dense
-two-bank algorithm is correctness-oriented; W8192 memory/CPU performance and
-runtime service rates are not qualified by small-window tests.
+The implementation checks the configured reservation before allocating two row
+versions, versioned metadata, a bounded decision/reference/free-slot pool,
+input/candidate scratch and exact repair history. The bound includes owned vector
+capacities and inline metadata, excluding allocator bookkeeping, caller buffers
+and the bounded call stack. Construction is fallible. No per-job allocation is
+introduced. First row mutation copies the selected committed version under copy
+budget; later mutations reuse the staged version. Zero-change decisions are
+immediately reclaimed; aborted versions release their references when overwritten.
+Nonwrapping transaction serial exhaustion is checked before decision allocation.
+A cursor evicts only newly expired known identities, including prefix advancement
+that occurred during idle handoff service. Row copies and GF elimination advance
+under separate byte, field and metadata budgets; a budget of one still progresses.
+Candidate clearing, coefficient normalization/reduction/counting and row scans
+remain dense work. W8192 native service rates and matched Python throughput remain
+unqualified; finite work counters are not CPU or real-kernel measurements.
 
 Independent received-byte fixtures use literal maintained Python GF equations,
 including four lost originals, zero coefficients, exact zero tails and nearly 2W

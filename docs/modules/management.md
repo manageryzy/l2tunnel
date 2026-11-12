@@ -213,3 +213,19 @@ and bounded frame delivery; the module does not fabricate those facts.
 Evidence for MOD-MGMT-01..04: [canonical codec](../../crates/l2tunnel-management/src/transaction/config.rs), [transaction state machine](../../crates/l2tunnel-management/src/transaction/mod.rs), and [focused tests](../../crates/l2tunnel-management/src/transaction/tests.rs). The tests include 100 consecutive transitions with constant reply/request retention, independent barriers, loss/reordering/retries, timeout abort and uncertainty, stale-session rejection and packet-counter exhaustion.
 
 The [managed runtime](managed-runtime.md) now supplies the actual TLS origin adapter and injected-device delivery barriers for the supported one-channel None/LZ4 family in both duplex modes. That integration does not implement persistent crash resume or qualify UDP/raw control delivery.
+
+## Mode-independent control codec and admission (pure checkpoint29)
+
+`session_control` adds a separately versioned80-byte `L2SC` envelope without
+changing the existing `L2MC` codec, request ledger or transaction engine. Its
+borrowed parser bounds lengths before owned allocation and distinguishes
+management, actual feedback grammar, native receipt and liveness bodies.
+Physical primary-control lane and target data lane are separate. One ordered
+primary stream per session/direction supplies packet identities; scope changes
+retain its counter/gate. Exactly one active and one draining scope can be
+registered, with matching epoch/digest, feedback tag and native receipt policy.
+No primary migration, runtime I/O, authentication adapter, original-time service,
+mode switch or OpenVPN recovery composition is implemented by this pure module.
+Those FIX-10/FIX-11 gates remain open.
+
+- [x] [MOD-MGMT-06] Implement and test the pure versioned session-control codec/admission contract: borrowed payloads, byte-exact golden vectors, atomic output rejection, trusted-origin/session/primary/target binding, fixed active/draining scope ownership, no-state-change errors and nonwrapping ordered counters. Evidence: [source and eight new focused tests](../../crates/l2tunnel-management/src/session_control.rs), [exact contract/wire specification](../../work/control29/wire-and-admission.md), and [26-case scoped receipt](../../work/control29/RECEIPT.md). This leaf does not complete runtime integration or stable switching.
