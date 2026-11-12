@@ -70,6 +70,11 @@ TAP/TUN measurements. The [base deadline](modules/base-handshake-deadline.md) an
 The [native throughput harness](modules/native-throughput.md) records matched
 TAP/TUN delay/loss, actual directional goodput and sampled TCP windows; its
 privileged measurement gates are separate from loopback accounting tests.
+The [managed profiling and performance gate](modules/managed-profiling.md) tracks
+the observed slow native baseline and the required 80 Mbit/s forward target.
+The [delivery-window contract](modules/delivery-window.md) separates bandwidth/RTT
+outstanding credit from local queue capacity. Its pure tests do not imply runtime
+integration or performance acceptance.
 
 ## Tested native vertical slice
 

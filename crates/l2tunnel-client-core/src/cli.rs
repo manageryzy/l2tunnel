@@ -23,6 +23,8 @@ mod raw_packet_frontend;
 mod rolling_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
+#[path = "profiling_cli.rs"]
+mod profiling;
 #[path = "openvpn/cli.rs"]
 mod standalone;
 
@@ -579,6 +581,7 @@ impl DeviceSpec {
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
+    let profile_interval = profiling::interval(options)?;
     if let Some(path) = rolling_frontend::selection(options, config)? {
         return rolling_frontend::execute(command, options, config, path).await;
     }
@@ -911,7 +914,13 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
     };
     use l2tunnel_runtime::managed::{self, ManagedConfig, Role, TransactionSettings};
     let (handle, requests) = managed::channel();
-    let runtime = managed::run_managed(
+    let (profile_handle, profile_sink) = if let Some(interval) = profile_interval {
+        let (handle, sink) = managed::profiling_channel(interval)?;
+        (Some(handle), Some(sink))
+    } else {
+        (None, None)
+    };
+    let runtime = managed::run_managed_with_profile(
         device,
         link,
         config.runtime(),
@@ -925,7 +934,9 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             transaction_settings: TransactionSettings::default(),
         },
         requests,
+        profile_sink,
     );
+    let runtime = profiling::observe(runtime, profile_handle);
     if let Some(api) = api {
         tokio::select! {
             result = runtime => result,
@@ -1253,6 +1264,9 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", packed_frontend::HELP);
         println!("\n{}", rolling_frontend::HELP);
         println!("\n{}", raw_packet_frontend::HELP);
+        println!(
+            "\nProfiling: --profile-ms 0|100..60000 (default off), currently system traffic over TCP/TLS frame records only. Emits bounded cumulative runtime_profile JSON snapshots; transport timing includes async waits."
+        );
         return ExitCode::SUCCESS;
     }
     if args.as_slice() == ["--version"] {
@@ -1309,6 +1323,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     };
     if matches!(command.as_str(), "connect" | "serve") {
         allowed.push("--carrier");
+        allowed.push("--profile-ms");
         allowed.push("--quic-application-id");
         allowed.push("--record-profile");
         allowed.push("--aligned-channels");

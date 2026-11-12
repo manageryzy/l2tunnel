@@ -5,6 +5,17 @@ checklists remain authoritative for unfinished requirements and mode parity.
 
 ## Current parallel checkpoint
 
+The [source23c aggregate](../work/implementation-wave23c/validation.json) passes
+1055 Rust and 198 Python tool cases with all 658 inputs stable. Its exact release
+build completed twelve matched native half-duplex cases: six system and three
+measured-proxy transfers passed exact-byte/EOF measurement; the three 15%-loss
+cases failed their original probe deadlines. All owned cleanup passed. Every
+accepted forward rate fails the owner's 80 Mbit/s target. See the
+[profiling ledger](modules/managed-profiling.md) for separate integrity and
+performance evidence. Runtime profiling and bandwidth/RTT-based outstanding
+credit are the current priority. The five new test-review repairs are tracked
+in [review follow-ups](review-followups.md); their combined gate remains pending.
+
 The [source23b aggregate](../work/implementation-wave23b/validation.json) passes
 1055 Rust and 195 Python cases with all 658 copied inputs stable. Proxy control
 pacing and rolling/raw registration retirement are committed. Its

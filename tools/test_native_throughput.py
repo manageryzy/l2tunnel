@@ -28,6 +28,16 @@ QDISC_JSON = json.dumps([
 
 
 class ContractTests(unittest.TestCase):
+    def test_profiling_validation_and_explicit_performance_gate(self):
+        for profile in ('tap-system', 'tun-system'):
+            p = h.plan('profile24', profile, 'half', 'delay', 1, profile_ms=500)
+            self.assertEqual(p['runtime_profile_interval_ms'], 500)
+            self.assertEqual(p['forward_acceptance_mbps'], 80)
+        for profile, millis in [('tun-active', 500), ('tun-measured-proxy', 500),
+                                ('tap-system', True), ('tap-system', 99), ('tun-system', 60001)]:
+            with self.assertRaises(ValueError):
+                h.plan('profile24', profile, 'half', 'delay', 1, profile_ms=millis)
+
     def test_wan_policy_is_explicit_coherent_and_historical_policy_unchanged(self):
         old = h.measured.policy()
         policy = h.wan_measured_policy()
@@ -124,6 +134,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result['directions']['a_to_b']['receiver_unique_bytes'], 10)
         self.assertEqual(result['directions']['a_to_b']['postwindow_drain_bytes'], 15)
         self.assertEqual(result['directions']['a_to_b']['goodput_mbps'], 0.00008)
+        self.assertEqual(result['performance_acceptance']['status'], 'failed')
         bad = copy.deepcopy(value); bad['flows'][0]['received_sha256'] = 'b'
         with self.assertRaises(ValueError): h.compare(value, bad, 1)
         bad = copy.deepcopy(value); bad['flows'][0]['eof'] = False
