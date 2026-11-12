@@ -273,6 +273,11 @@ impl FlowTable {
             .map(|(key, entry)| (*key, entry.binding)))
     }
 
+    /// Check injected time without scanning, refreshing or mutating any entry.
+    pub fn validate_time(&self, now: Duration) -> Result<(), FlowError> {
+        self.check_time(now)
+    }
+
     /// Remove an idle flow only after the caller establishes all downstream drain.
     pub fn retire_idle(&mut self, key: &FlowKey, now: Duration) -> Result<Binding, FlowError> {
         self.check_time(now)?;

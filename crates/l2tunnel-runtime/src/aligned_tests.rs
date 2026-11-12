@@ -645,3 +645,6 @@ async fn native_wouldblock_expires_without_fabricating_delivery_credit() -> Test
     let _ = a_task.await;
     Ok(())
 }
+
+#[path = "aligned_flow_tests.rs"]
+mod flow_retirement;

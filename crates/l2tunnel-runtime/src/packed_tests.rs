@@ -765,3 +765,47 @@ async fn native_wouldblock_expires_without_fabricating_delivery_credit() -> Test
     let _ = a_task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn packed_retirement_churn_keeps_recovery_and_native_held_bytes() -> TestResult {
+    for duplex in [Duplex::Full, Duplex::Half] {
+        let mut rt = runtime(PacketLayer::Ip);
+        rt.queue_packets = 2;
+        let transport = udp_transport(duplex, CoverProfile::QuicLike, Protection::HmacSha256)?;
+        let mut config = Config::for_udp(rt, transport, 4, options())?;
+        config.pipeline.flows.capacity = 4;
+        config.pipeline.flows.idle_timeout = Duration::from_millis(10);
+        let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
+        let a = Device::new(rt.layer);
+        let b = Device::new(rt.layer);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(run_udp(a.clone(), a_link, rt, transport, config));
+        tasks.spawn(run_udp(b.clone(), b_link, rt, transport, config));
+        let input = (1..17)
+            .map(|n| packet(rt.layer, n, 100 + usize::from(n)))
+            .collect::<Vec<_>>();
+        let reverse = (21..37)
+            .map(|n| packet(rt.layer, n, 100 + usize::from(n)))
+            .collect::<Vec<_>>();
+        a.change(|state| state.outgoing.extend(input.iter().cloned()))?;
+        b.change(|state| {
+            state.blocked = true;
+            state.outgoing.extend(reverse.iter().cloned());
+        })?;
+        sleep(Duration::from_millis(70)).await;
+        assert!(b.change(|state| state.delivered.is_empty())?);
+        b.change(|state| state.blocked = false)?;
+        wait_delivery(&mut tasks, &a, &b, input.len()).await?;
+        for (device, mut expected) in [(&a, reverse), (&b, input)] {
+            let mut actual = device.change(|state| state.delivered.clone())?;
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+        assert!(relays.observations.dropped.load(Ordering::Relaxed) > 0);
+        assert!(relays.observations.reordered.load(Ordering::Relaxed) > 0);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    Ok(())
+}

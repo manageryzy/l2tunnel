@@ -707,3 +707,58 @@ fn read_only_heads_preserve_fifo_deficit_and_tap_policy() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn bounded_idle_scan_preserves_pins_queues_cursor_and_time() -> TestResult {
+    let mut pipeline = Pipeline::new(config(tun()))?;
+    let mut keys = Vec::new();
+    for port in 1000..1005 {
+        let metadata = pipeline.enqueue(ip(port, 100, false, 7), Duration::ZERO)?;
+        keys.push(metadata.classification.key);
+    }
+    while pipeline.dequeue()?.is_some() {}
+    keys.sort();
+    pipeline.enqueue(ip(1004, 100, false, 8), Duration::ZERO)?;
+    let queued = pipeline.classify(&ip(1004, 100, false, 8))?.key;
+    let pinned = keys[0];
+    let mut cursor = None;
+    let mut retired = Vec::new();
+    for _ in 0..12 {
+        let scan = pipeline.idle_step(Duration::from_secs(5), cursor, 1, Some(pinned))?;
+        assert!(scan.examined <= 1);
+        cursor = scan.after;
+        if let Some((key, binding)) = scan.candidate {
+            assert_ne!(key, pinned);
+            assert_ne!(key, queued);
+            assert_eq!(
+                pipeline.retire_idle_drained(&key, Duration::from_secs(5))?,
+                binding
+            );
+            retired.push(key);
+        }
+    }
+    assert_eq!(retired.len(), 3);
+    assert_eq!(pipeline.registered_flows(), 2);
+    let usage = pipeline.usage();
+    assert_eq!(
+        pipeline.idle_step(Duration::from_secs(4), cursor, 0, None),
+        Err(PipelineError::Flow(
+            l2tunnel_packet::FlowError::TimeRegression
+        ))
+    );
+    let zero = pipeline.idle_step(Duration::from_secs(5), cursor, 0, None)?;
+    assert_eq!(zero.examined, 0);
+    assert_eq!(zero.after, cursor);
+    assert_eq!(pipeline.usage(), usage);
+    assert_eq!(
+        pipeline.dequeue()?.ok_or("queued packet")?.payload,
+        ip(1004, 100, false, 8)
+    );
+    assert_eq!(
+        pipeline.idle_step(Duration::from_secs(4), None, 16, None),
+        Err(PipelineError::Flow(
+            l2tunnel_packet::FlowError::TimeRegression
+        ))
+    );
+    Ok(())
+}

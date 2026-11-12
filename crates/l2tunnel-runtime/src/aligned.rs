@@ -612,6 +612,7 @@ where
     let mut encoded = vec![0; policy.payload_bytes];
     let mut ingress: Option<Vec<u8>> = None;
     let mut selected: Option<pipeline::Packet> = None;
+    let mut idle_cursor = None;
     let result = async {
     loop {
         let packing_wake = states.iter().filter_map(|state| state.endpoint.packing_wake()).min();
@@ -630,6 +631,7 @@ where
             },
             _=ticker.tick()=>{},
         }
+        retire_registration(&mut pipeline, selected.as_ref(), &mut idle_cursor, started.elapsed())?;
         // Only the explicit packed profile batches native ingress with common
         // MUX admission. Fresh time per operation prevents a slow burst from
         // admitting later units against an expired first-unit packing deadline.
@@ -671,9 +673,11 @@ where
                         .classify(frame.bytes)
                         .map_err(io::Error::other)?
                         .key;
-                    pipeline
-                        .learn(key, u16::from(frame.channel.0), 1, now)
-                        .map_err(io::Error::other)?;
+                    match pipeline.learn(key, u16::from(frame.channel.0), 1, now) {
+                        Ok(_) => {},
+                        Err(error) if flow_capacity(&error) => break,
+                        Err(error) => return Err(io::Error::other(error)),
+                    }
                     match device.transmit(frame.bytes) {
                         Ok(()) => {
                             state
@@ -782,6 +786,41 @@ fn admit_native(
         Err(error) => Err(io::Error::other(error)),
     }
 }
+
+fn flow_capacity(error: &pipeline::PipelineError) -> bool {
+    matches!(
+        error,
+        pipeline::PipelineError::Flow(l2tunnel_packet::FlowError::Capacity)
+    )
+}
+
+fn retire_registration(
+    pipeline: &mut Pipeline,
+    selected: Option<&pipeline::Packet>,
+    cursor: &mut Option<pipeline::FlowKey>,
+    now: Duration,
+) -> io::Result<()> {
+    // Selected packets retain a local Binding until admission. Thereafter the
+    // aligned/packed endpoints, recovery and native handoff own only channel and
+    // bytes, never FlowId. Fixed CRC mapping (validated at startup) preserves that
+    // channel on relearn; retirement cannot alter their contexts or delivery debt.
+    // This proves registration dependencies drained, not delivery of owned bytes.
+    let scan = pipeline
+        .idle_step(
+            now,
+            *cursor,
+            16,
+            selected.map(|packet| packet.metadata.classification.key),
+        )
+        .map_err(io::Error::other)?;
+    *cursor = scan.after;
+    if let Some((key, _)) = scan.candidate {
+        pipeline
+            .retire_idle_drained(&key, now)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
 fn ingress_step<D: PacketDevice<Error = io::Error>>(
     device: &mut D,
     pipeline: &mut Pipeline,
@@ -805,7 +844,10 @@ fn ingress_step<D: PacketDevice<Error = io::Error>>(
     if let Some(bytes) = ingress.take() {
         match pipeline.enqueue(bytes, now) {
             Ok(_) => progress = true,
-            Err(error) if matches!(error.kind, pipeline::PipelineError::Budget(_)) => {
+            Err(error)
+                if matches!(error.kind, pipeline::PipelineError::Budget(_))
+                    || flow_capacity(&error.kind) =>
+            {
                 *ingress = Some(error.payload)
             }
             Err(error) => return Err(io::Error::other(error)),

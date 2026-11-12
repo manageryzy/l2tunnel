@@ -106,6 +106,17 @@ pub struct Packet {
     pub metadata: PacketMetadata,
 }
 
+/// One bounded, nonmutating idle-registration scan; retirement still needs drain proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleScan {
+    /// Resume strictly after this key; `None` starts a new pass.
+    pub after: Option<FlowKey>,
+    /// Number of registrations examined, never greater than the supplied work.
+    pub examined: usize,
+    /// First idle locally empty candidate, excluding the caller's pinned key.
+    pub candidate: Option<(FlowKey, Binding)>,
+}
+
 /// A FIFO head offered to a pure credit-eligibility check and later commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Candidate {
@@ -635,6 +646,48 @@ impl Pipeline {
             })
             .min_by_key(|(_, state)| state.snapshot.last_activity)
             .map(|(key, state)| (*key, state.snapshot.binding)))
+    }
+
+    /// Examine at most `work` registrations in canonical key order, without allocation.
+    ///
+    /// A removed cursor key remains valid. Reaching the end resets the cursor for
+    /// the next call; zero work still validates time. `excluded` pins a selected
+    /// packet whose queue accounting has already been released. The caller must
+    /// separately prove downstream registration dependencies drained before using
+    /// `retire_idle_drained`; this observation grants no delivery or drain credit.
+    pub fn idle_step(
+        &self,
+        now: Duration,
+        after: Option<FlowKey>,
+        work: usize,
+        excluded: Option<FlowKey>,
+    ) -> Result<IdleScan, PipelineError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.flows.validate_time(now).map_err(PipelineError::Flow)?;
+        let mut result = IdleScan {
+            after,
+            examined: 0,
+            candidate: None,
+        };
+        let mut entries = self
+            .states
+            .range((after.map_or(Unbounded, Excluded), Unbounded));
+        for _ in 0..work {
+            let Some((key, state)) = entries.next() else {
+                result.after = None;
+                break;
+            };
+            result.after = Some(*key);
+            result.examined += 1;
+            if Some(*key) != excluded
+                && state.snapshot.queued.packets == 0
+                && now - state.snapshot.last_activity >= self.config.flows.idle_timeout
+            {
+                result.candidate = Some((*key, state.snapshot.binding));
+                break;
+            }
+        }
+        Ok(result)
     }
 
     /// Retire only an idle locally empty flow after caller-established external drain.
