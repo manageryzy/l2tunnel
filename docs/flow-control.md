@@ -1,8 +1,12 @@
 # TUN active flow control and cross-flow QoS
 
-Status: design and policy contracts only. The active controller, TCP proxy and QoS
-scheduler are not implemented. This document adds requirements beyond the Python
-experiments; their throughput numbers do not validate these mechanisms.
+Status: parent requirements with partial implemented and independently tested
+modules. Bounded credit/QoS, measured relay targets and a runnable fixed-buffer
+Linux TCP proxy exist; actual adaptive native receive-window control, sustained
+performance and the complete FC gates remain open. See the
+[implementation evidence](implementation-status.md) and
+[native window qualification](modules/native-window-qualification.md).
+Python throughput results do not validate these mechanisms.
 
 ## Profiles and ownership
 
@@ -102,8 +106,10 @@ opening flows cannot multiply the destination/path's permitted load.
 
 The `tun_tcp_proxy` module owns two TCP legs and the reliable intermediate stream.
 A [bounded maintained-TCP relay primitive](modules/tcp-proxy.md) is now implemented
-and tested independently; remote-open admission and the native proxy profile are
-still planned.
+and tested independently. Explicit remote-open admission and clean Linux TUN
+full/half forwarding have finite native evidence. The current proxy preallocates
+fixed native buffers and adjusts relay targets; exact adaptive TCP receive-window
+control remains a required unfinished deliverable.
 A caller must select it explicitly; do not splice it into established transparent
 flows during hot reload. Application TLS remains opaque end-to-end unless the
 application itself terminates it; this module terminates TCP, not application TLS.

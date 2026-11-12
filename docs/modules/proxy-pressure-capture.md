@@ -61,3 +61,14 @@ they cannot claim immutable build18 identity.
 - [x] [MOD-PRESSCAP-01] Preserve original16b packet/byte/time/class evidence and freeze reviewed independent capture-allocation contract. Evidence: [forensic proposal](../../work/native-pressure16b-audit/wan-budget-proposal.json) and [original failed audit](../../work/native-pressure16b-audit/validation.json).
 - [x] [MOD-PRESSCAP-02] Implement explicit per-call limits through parser/counter/finish/audit and pressure surface map without changing historical defaults or semantic acceptance. Evidence: [unchanged acceptance/resource/deadline AST audit](../../work/proxy-pressure-capture19/unchanged-acceptance.json) and [focused receipt](../../work/proxy-pressure-capture19/validation.json).
 - [x] [MOD-PRESSCAP-03] Pass focused boundary/default/propagation/safe-ownership tests and freeze exact helper hashes; root owns new aggregate/build/native qualification. Evidence: [147-test Linux group](../../work/proxy-pressure-capture19/focused-python.log) and [five-file frozen overlay](../../work/proxy-pressure-capture19/validation.json).
+
+The [source19 aggregate](../../work/implementation-wave19/validation.json) and
+[exact build](../../work/native-build19/receipt.json) passed. In subsequent
+pressure executions, full WAN captures contained 24158 packets per side and
+half contained 25022, below the fixed 32768 allocation, with zero kernel drops.
+Native captures also stayed below 8192. These solve the observed collection
+bound for these runs, not the separate growth gate: both executions still failed
+because no candidate exceeded the initial 32768-byte target. See the independent
+[full](../../work/native-pressure19-audit/full-audit.json) and
+[half](../../work/native-pressure19-audit/half-audit.json) audits. Their failures
+are preserved, and no further allocation increase or deadline change is proposed.

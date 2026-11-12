@@ -52,8 +52,24 @@ separate execution gates. The [rolling-frame runtime](modules/rolling-runtime.md
 tracks common MUX, authenticated UDP/QUIC composition and exact shared budgets;
 its finite tests do not close the complete Python-family gates.
 The [rolling client](modules/rolling-client.md) records explicit API/CLI activation,
-while [pressure capture allocation](modules/proxy-pressure-capture.md) records the
+and the [rolling native harness](modules/rolling-native.md) tracks owned device,
+loss and cross-capture acceptance separately.
+The [pressure capture allocation](modules/proxy-pressure-capture.md) records the
 bounded native evidence collection required for the corrected proxy pressure run.
+The [independent review follow-ups](review-followups.md) track control pacing,
+aligned flow retirement and the original base handshake deadline. The
+[HTTPS carrier](modules/https-carrier.md) has a separate integration ledger.
+The [native window investigation](modules/native-window-qualification.md) separates
+actual TCP receive-window control from relay targets and requires sustained
+TAP/TUN measurements. The [base deadline](modules/base-handshake-deadline.md) and
+[aligned/packed retirement](modules/aligned-flow-retirement.md) passed the
+[source22 combined check](../work/implementation-wave22/validation.json).
+[Proxy control pacing](modules/proxy-control-pacing.md) and
+[rolling/raw retirement](modules/rolling-raw-flow-retirement.md) passed the
+[source23b combined check](../work/implementation-wave23b/validation.json).
+The [native throughput harness](modules/native-throughput.md) records matched
+TAP/TUN delay/loss, actual directional goodput and sampled TCP windows; its
+privileged measurement gates are separate from loopback accounting tests.
 
 ## Tested native vertical slice
 

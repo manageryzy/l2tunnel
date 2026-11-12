@@ -5,6 +5,63 @@ checklists remain authoritative for unfinished requirements and mode parity.
 
 ## Current parallel checkpoint
 
+The [source23b aggregate](../work/implementation-wave23b/validation.json) passes
+1055 Rust and 195 Python cases with all 658 copied inputs stable. Proxy control
+pacing and rolling/raw registration retirement are committed. Its
+[release build](../work/native-build23b/receipt.json) matches the checked source.
+The first eight native throughput attempts authenticated and connected their
+application sockets, but stopped before measurement: this host's iproute2 6.1
+prints plain text for `tc -j class`. All owned namespaces were cleaned up and
+these attempts supply no accepted speed or window measurements. The
+[independent audit](../work/throughput23-analysis/system-half-first-failed-v2/report.md)
+preserves this tool-compatibility failure separately from protocol results.
+The corrected harness also replaces the clean-lab measured-proxy timing policy
+with one explicit WAN policy shared by every comparison path. Historical
+pressure policies and their original receipts remain unchanged.
+
+The [source22 aggregate](../work/implementation-wave22/validation.json) passed
+1034 Rust and 183 Python cases with all 649 copied inputs stable. It includes
+the base absolute handshake deadline and aligned/packed idle-flow retirement
+repairs. Both fixes are committed; the subsequent source23b check above adds
+proxy control pacing and rolling/raw flow retirement.
+The owner's current priority is actual directional throughput and window traces
+under matched delay/loss profiles; clean same-host transfers are only a baseline.
+
+The first [source23 aggregate](../work/implementation-wave23/validation.json)
+failed two client-control deadline fixtures: their 100 ms shutdown limit with
+the default 256 control records/s no longer fits the validated pacing policy.
+The original stable failed snapshot is retained. A derived correction keeps the
+same 100 ms deadline and retry/failure assertions, selects an explicit matching
+512 records/s test policy on both peers, and separately tests rejection of the
+old infeasible combination. It does not change production defaults or renew
+network deadlines. The throughput harness has independent kernel-loopback
+accounting evidence; native performance remains pending the combined gate.
+
+The [source21 aggregate](../work/implementation-wave21/validation.json) passed
+1017 Rust and 183 Python cases with all 642 copied inputs stable. It integrates
+the real TLS/HTTP2 carrier and final rolling protected-counter capture agreement.
+These are committed module checkpoints, not native or performance qualifications.
+The [native window investigation](modules/native-window-qualification.md) tracks
+the owner's priority on actual TCP-window ownership and measured TAP/TUN speed.
+
+The [source20 aggregate](../work/implementation-wave20/validation.json) passed
+999 Rust and 183 Python cases, formatting, strict lint/docs, golden and CLI
+checks with all 632 copied inputs stable. It includes the raw AEAD capture
+harness, first rolling native harness and matching rust-analyzer toolchain
+components. It excludes the subsequent rolling protected-counter agreement
+correction, HTTPS integration and three [review fixes](review-followups.md).
+No source20 native build or execution is qualified by this aggregate.
+
+The [rolling-client/native-harness aggregate](../work/implementation-wave19/validation.json)
+passed 999 Rust and 154 Python cases plus required formatting, strict lint/docs,
+golden and CLI checks. All 629 copied inputs remained unchanged. It includes the
+explicit rolling client, bounded pressure-only WAN capture allocation, corrected
+raw capture/startup audit and deterministic oversized-RPC fixture correction.
+The [exact native build](../work/native-build19/receipt.json) passed and matches
+the complete checked source map. The raw finite native result is recorded below;
+the corrected proxy pressure reruns failed growth acceptance, as recorded below.
+Concurrent HTTPS and rolling native harness work is excluded from this snapshot.
+
 The [wave18 frozen aggregate](../work/implementation-wave18/validation.json)
 passed 987 Rust and 142 Python cases, formatting, strict workspace Clippy,
 warning-denied rustdoc, golden vectors and CLI checks. All 620 source inputs
@@ -41,8 +98,8 @@ authentication binding, original setup expiry and cancellation are covered.
 The [pressure capture allocation](../work/proxy-pressure-capture19/validation.json)
 adds an explicit 32768-packet WAN allocation only for pressure profiles; native,
 fixed and clean captures retain 8192, with unchanged payload/growth/window gates
-and file/child/deadline limits. Both bundles await a new copied aggregate and
-exact native build; they are not part of wave18 or new native qualifications.
+and file/child/deadline limits. Both bundles passed the new copied source19
+aggregate; they are not part of wave18 or new native qualifications.
 
 The first copied wave14 failed because source identity collection excluded any
 directory named `target`, including the real Rust module
@@ -96,9 +153,14 @@ TUN/full/half reached exact native transfer, confirmed fences and natural bounde
 carrier-loss termination, then failed the capture auditor's hardcoded requested
 horizon. Their actual effective horizon is 18560 bytes, bounded by the maintained
 TCP window; the configured 32768 is a ceiling. TAP/half instead stopped at the
-startup descriptor-count observation. Corrected independent audit and startup
-sampling regressions remain pending; none is yet counted as qualified native
-packet-phase evidence. Every owned namespace was independently confirmed absent.
+startup descriptor-count observation. The [corrected independent four-case
+audit](../work/raw-native-matrix19-audit.json) now passes those three saved
+executions plus the new source19 TAP/half execution. The auditor derives the
+horizon from original captured TCP/SYN/Hello evidence; the startup fix samples
+descriptors after actual Active status. Exact native bytes, original lane
+continuity, natural bounded carrier-loss failure and all owned cleanup passed.
+Original failed receipts remain unchanged. This finite clean integrity profile
+does not qualify graceful close, congestion, AEAD or broader paths/platforms.
 
 The source-stable wave15 aggregate failed in a paired OpenVPN-like UDP close;
 its unchanged isolated rerun passed, leaving the original cause unattributed.
@@ -151,6 +213,20 @@ these later captures; all four WAN captures reached their unchanged 8192-packet
 bound, so complete carrier capture qualification is separately bound-exhausted.
 See the [audit](../work/native-pressure16b-audit/REPORT.md). Native pressure,
 adaptive window growth and QoS/fairness qualification remain open.
+
+The exact source19 pressure reruns also remain failed: independent
+[full](../work/native-pressure19-audit/full-audit.json) and
+[half](../work/native-pressure19-audit/half-audit.json) readback shows all four
+endpoint candidate peaks stayed at the initial 32768 bytes. Two-flow demand and
+actual paused downstream pressure were observed, so growth is the missing
+measurement gate. Exact application probes and all eight first-reopen/new-ACK
+proofs passed. WAN captures now fit the explicitly bounded allocation (24158
+packets per side in full, 25022 in half, below 32768), with zero kernel drops;
+the earlier capture-cap exhaustion is resolved for these executions. Half's
+structural capture audit passed; full separately lacks complete native
+handshake/bidirectional-FIN evidence on one flow. Both cases stopped before
+drain acceptance and completed owned cleanup. No pressure qualification or
+unchanged rerun is inferred from the successful payloads.
 
 ## First native vertical slice
 
