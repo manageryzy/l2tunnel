@@ -1,7 +1,7 @@
 # Authenticated packed runtime composition
 
 Status: required v2 native identity/byte-budget integration is implemented and
-locally integration-tested; its combined aggregate is pending. The historical v1 [wave11](../../work/implementation-wave11/validation.json)
+locally integration-tested with [the source27e aggregate](../../work/implementation-wave27e/validation.json). The historical v1 [wave11](../../work/implementation-wave11/validation.json)
 remains valid for its stated nine packed tests and ordinary aligned regressions;
 it does not qualify changed v2 authentication/control or native performance.
 The [pure composition](packed-recovery.md) and one shared aligned actor retain

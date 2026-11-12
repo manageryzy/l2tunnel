@@ -1,7 +1,7 @@
 # Native aligned-symbol runtime composition
 
 Status: required v2 native identity/byte-budget integration is implemented and
-locally integration-tested; its combined aggregate is pending. Native v2 qualification and throughput remain open. The historical
+locally integration-tested with [the source27e aggregate](../../work/implementation-wave27e/validation.json). Native v2 qualification and throughput remain open. The historical
 v1 [client selection](aligned-client.md) and
 [capture audit](../../work/native-aligned-matrix-audit.json) cover18 owned Linux
 UDP/QUIC, TAP/TUN/VXLAN and duplex/impairment cases; those receipts are preserved
@@ -255,5 +255,5 @@ prefix counterexample are preserved in
 The current runtime identity ledger also covers missing earlier fragments, early
 ACK, duplicate/context/future/wrong-channel identities, real send failures and
 bounded event-queue ownership before send. The complete actor receipt is under
-[delivery work](../../work/aligned-delivery27/); root owns the combined frozen
-`tools/check.py` gate. The v2 integration/native parent remains unchecked.
+[delivery work](../../work/aligned-delivery27/); the combined frozen
+`tools/check.py` gate passed in source27e. The v2 native parent remains unchecked.

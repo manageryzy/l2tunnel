@@ -8,22 +8,21 @@ percentage. All 47 complete Python mode gates remain open.
 
 ## Current verification
 
-The current repair checkpoint is not aggregate-qualified. The
-[source27d check](../work/implementation-wave27d/validation.json) stopped at an
-OpenVPN-like paired impairment test returning `IncompleteClose` under its
-original five-second deadline. Its fixture continues counter-based packet loss
-through final control exchange, so clean close is not guaranteed within that
-bound. The [independent review](../work/openvpn-paired-close27d-review/REPORT.md)
-does not attribute the saved failure to a particular lost ACK. A causal fixture
-correction and subsequent stable aggregate check are required.
+The [source27e aggregate check](../work/implementation-wave27e/validation.json)
+passed on code commit `ff20bc2`: 1206 Rust test executions, 218 Python tool
+executions and 1658 simulator cases, without skips. All recorded source inputs
+stayed unchanged. Formatting, strict Clippy and rustdoc passed. This local check
+includes real loopback carriers and injected devices; privileged native tests,
+remote CI and Windows/Android device qualification remain separate.
 
-The preceding [source27c check](../work/implementation-wave27c/validation.json)
-passed 1205 Rust test executions and 216 Python tool test executions, then failed
-simulator collection because disk cleanup had incorrectly removed an installed
-cryptography extension. The exact dependency was restored and its RECORD hash
-verified; the independent [full simulator rerun](../work/check-python-repair27/full-simulator.log)
-passes all 1658 cases without skips. Component results do not turn the failed
-aggregate into a pass. Remote CI and Windows/Android device tests remain separate.
+The earlier [source27d failure](../work/implementation-wave27d/validation.json)
+and [causal close-test correction](../work/openvpn-close28/RECEIPT.md) remain
+preserved. The positive test now witnesses impaired user transfer and complete
+pre-close recovery/held-output drain before requiring clean shutdown. The
+negative test requires `IncompleteClose` under continuing final-ACK loss at the
+original five-second bound. Production close deadlines and quiet requirements
+are unchanged. The earlier simulator dependency failure and exact cleanup repair
+are recorded below; this aggregate uses the repaired, verified dependency.
 
 ## Latest native measurements
 
