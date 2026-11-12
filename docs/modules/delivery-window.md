@@ -6,6 +6,7 @@ Status: pure controller, authenticated bidirectional policy, shared client API a
 - [x] [MOD-BDP-02] Causal full-flush-to-authenticated-device-feedback observations, clamps, EWMA, stale fallback and checked cumulative boundaries. Evidence: [focused test source](../../crates/l2tunnel-flow-control/src/delivery_window/tests.rs), `cumulative_feedback_uses_actual_small_bytes_and_latest_known_full_flush`, `measured_rtt_grows_shrinks_clamps_and_stales_without_revoking_debt`, `sample_clamps_ring_wrap_and_cumulative_overflow_are_bounded`.
 - [x] [MOD-BDP-03] Original absolute full-flush deadlines and failure/overflow paths. Evidence: [focused test source](../../crates/l2tunnel-flow-control/src/delivery_window/tests.rs), `retries_cannot_renew_original_flush_deadline_and_expiry_is_terminal`, `invalid_bounds_time_and_feedback_preserve_accounting`.
 - [x] [MOD-BDP-04] Authenticated immutable per-direction policy, runtime full-flush/delivery wiring and independently observable byte target/record cap/local queue. Evidence: [runtime receipt](../../work/managed-delivery25/validation.json), 204 runtime tests including six new delivery cases; [client receipt](../../work/client-delivery25/RECEIPT.md), five focused API tests. Real authenticated TLS with mock TAP/TUN devices covers full/paired-half modes, exact mixed-size packet delivery, 128 outstanding records with local queues of two, recycling and authenticated reload barriers. This is local integration evidence, not native kernel throughput.
+- [x] [MOD-BDP-06] Selective exact-native delivery and first-flight accounting preserve independent completion order, bounded retained span and original deadlines, while cumulative callers retain their API behavior. Evidence: [pure-stage receipt](../../work/aligned-delivery27/pure-validation.json),49 unit tests plus one doctest, including 1500/40-byte reordering, ACK-before-flush, selective/cumulative overlap, ring reuse and128 mixed-size records. This checks the pure primitive only; aligned/packed actor and native integration remain pending.
 - [ ] [MOD-BDP-05] Actual loaded native80Mbps A→B acceptance with exact payload, cleanup and both-direction wire accounting. Evidence: planned; unit tests do not prove throughput.
 
 ## Contract
@@ -56,3 +57,38 @@ exposes current target bytes, outstanding bytes/records, retained metadata,
 RTT freshness and staged bytes separately from local-queue high-water marks.
 The source24 legacy comparison remains preserved; source25 must independently
 pass exact payload, cleanup and actual80Mbit/s forward acceptance.
+
+
+## Selective native identities (source27 pure integration stage)
+
+Aligned and packed records may complete on independent channels. Their scalar
+native delivery count is not a cumulative admission prefix: delivering a later
+40-byte frame must not release an earlier 1500-byte frame. The shared controller
+therefore provides `delivered_record_at(admission_ordinal, actual_receipt,
+observed_at)` and `confirm_record_flushed_at(admission_ordinal, actual_send,
+observed_at)`. The immediate-time conveniences are `delivered_record` and
+`confirm_record_flushed`. Integrators must resolve an authenticated native
+channel/record identity through their own bounded original-admission ledger;
+peers never supply an authoritative byte length.
+
+`Status.delivered` counts unique actual delivered bytes and records, while
+`delivered_prefix` separately identifies the contiguous completed admission
+boundary. `Status.flushed` remains the true contiguous full-send prefix;
+`flushed_total` counts actual confirmed native completions beyond that prefix.
+A later packed completion cannot confirm a missing earlier frame. Cumulative
+APIs retain their previous behavior and can overlap selective operations without
+double release or replacing an original timestamp. A duplicate selective receipt
+never creates a service sample, including an ACK preceding its send callback.
+
+The original preallocated `max_records` bounds the entire retained ordinal span,
+including selectively delivered holes. Releasing byte debt does not reclaim a
+metadata slot across a missing earlier delivery/send callback. The earliest
+unconfirmed original admission deadline remains authoritative, and callbacks
+observed at or after expiry cannot revive the owner. Added metadata is included
+in `Config::metadata_bytes` before allocation. This pure extension does not yet
+qualify aligned/packed runtime integration or native performance. The focused pure package passes49 unit tests and one doctest, strict Clippy,
+rustdoc and formatting. The immutable-source26 scalar-mapping probes fail both
+expected assertions. Results are recorded in
+[the pure-stage receipt](../../work/aligned-delivery27/pure-validation.json);
+the first49-test run retained one test-only observation-clock ordering failure,
+corrected before the final run. No whole-workspace or native claim is made.

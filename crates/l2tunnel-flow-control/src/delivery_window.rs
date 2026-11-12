@@ -71,6 +71,7 @@ pub enum Update {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Entry {
     end: Credit,
+    bytes: u64,
     flushed_at: Option<Micros>,
     delivered: bool,
     flush_deadline: Micros,
@@ -92,12 +93,18 @@ pub struct Sample {
 pub struct Status {
     /// Monotonic actual-byte and record admission prefix.
     pub admitted: Credit,
-    /// Monotonic authenticated remote-device delivery prefix.
+    /// Total unique authenticated remote-device delivered bytes and records.
+    /// Selective completion can exceed the contiguous delivered prefix.
     pub delivered: Credit,
+    /// Highest admission boundary with every earlier record delivered.
+    pub delivered_prefix: Credit,
     /// Original-byte/count prefix whose full flush is confirmed. This can lag
     /// delivered when authenticated feedback is observed before the callback.
     /// Full TLS flush is a handoff boundary, not proof of physical wire flight.
     pub flushed: Credit,
+    /// Exact total full-flush confirmations, including out-of-prefix identities.
+    /// A later native completion never implies an earlier record was flushed.
+    pub flushed_total: Credit,
     /// Admitted minus delivered original bytes and records. This reservation
     /// includes local queued/writer bytes not yet confirmed fully flushed.
     pub outstanding: Credit,
@@ -123,8 +130,10 @@ pub struct Controller {
     len: usize,
     admitted: Credit,
     delivered: Credit,
+    delivered_prefix: Credit,
     flushed_records: u64,
     flushed_bytes: u64,
+    flushed_total: Credit,
     last_flush_at: Option<Micros>,
     last_feedback_at: Option<Micros>,
     sample: Option<Sample>,
@@ -191,8 +200,10 @@ impl Controller {
             len: 0,
             admitted: Credit::default(),
             delivered: Credit::default(),
+            delivered_prefix: Credit::default(),
             flushed_records: 0,
             flushed_bytes: 0,
+            flushed_total: Credit::default(),
             last_flush_at: None,
             last_feedback_at: None,
             sample: None,
@@ -230,10 +241,10 @@ impl Controller {
     /// Resolve an authenticated ordinal to the original actual-byte boundary.
     /// This lookup creates no peer authority and never estimates bytes by MTU.
     pub fn credit_at_record(&self, record: u64) -> Result<Credit, Error> {
-        if record == self.delivered.records {
-            return Ok(self.delivered);
+        if record == self.delivered_prefix.records {
+            return Ok(self.delivered_prefix);
         }
-        if record < self.delivered.records {
+        if record < self.delivered_prefix.records {
             return Err(Error::Stale);
         }
         self.index(record)
@@ -262,10 +273,12 @@ impl Controller {
         Ok(Status {
             admitted: self.admitted,
             delivered: self.delivered,
+            delivered_prefix: self.delivered_prefix,
             flushed: Credit {
                 bytes: self.flushed_bytes,
                 records: self.flushed_records,
             },
+            flushed_total: self.flushed_total,
             outstanding: Credit {
                 bytes: self.admitted.bytes - self.delivered.bytes,
                 records: self.admitted.records - self.delivered.records,
@@ -315,6 +328,7 @@ impl Controller {
         let index = (self.head + self.len) % self.entries.len();
         self.entries[index] = Some(Entry {
             end,
+            bytes,
             flushed_at: None,
             delivered: false,
             flush_deadline: Micros(now.0 + self.config.flush_timeout_micros),
@@ -361,28 +375,84 @@ impl Controller {
                 .and_then(|i| self.entries[i])
                 .ok_or(Error::Flush)?;
             let admitted_at = e.flush_deadline.0 - self.config.flush_timeout_micros;
-            if actual_flush_at.0 < admitted_at || actual_flush_at >= e.flush_deadline {
+            if e.flushed_at.is_none()
+                && (actual_flush_at.0 < admitted_at || actual_flush_at >= e.flush_deadline)
+            {
                 return Err(Error::Time);
             }
         }
-        let flushed_bytes = self
-            .index(records)
-            .and_then(|i| self.entries[i])
-            .ok_or(Error::Flush)?
-            .end
-            .bytes;
         for record in self.flushed_records + 1..=records {
             let i = self.index(record).ok_or(Error::Flush)?;
-            if let Some(e) = &mut self.entries[i] {
+            if let Some(e) = &mut self.entries[i]
+                && e.flushed_at.is_none()
+            {
                 e.flushed_at = Some(actual_flush_at);
+                self.flushed_total.bytes += e.bytes;
+                self.flushed_total.records += 1;
             }
         }
-        self.flushed_records = records;
-        self.flushed_bytes = flushed_bytes;
+        self.advance_flushed_prefix();
         self.last_flush_at = Some(actual_flush_at);
         self.at = observed_at;
         self.prune();
         Ok(Update::Advanced)
+    }
+    /// Confirm only one native record at the current observation time.
+    pub fn confirm_record_flushed(&mut self, record: u64, now: Micros) -> Result<Update, Error> {
+        self.confirm_record_flushed_at(record, now, now)
+    }
+    /// Confirm one actual full-native-send identity without inferring that earlier
+    /// admissions were sent. Packed/fragmented native completions may reorder.
+    /// Its original admission deadline still governs delayed callback application.
+    pub fn confirm_record_flushed_at(
+        &mut self,
+        record: u64,
+        actual_flush_at: Micros,
+        observed_at: Micros,
+    ) -> Result<Update, Error> {
+        self.check(observed_at)?;
+        if actual_flush_at > observed_at {
+            return Err(Error::Time);
+        }
+        if record == 0 || record > self.admitted.records {
+            return Err(Error::Flush);
+        }
+        if record <= self.flushed_records {
+            self.at = observed_at;
+            return Ok(Update::Duplicate);
+        }
+        let index = self.index(record).ok_or(Error::Flush)?;
+        let entry = self.entries[index].ok_or(Error::Flush)?;
+        if entry.flushed_at.is_some() {
+            self.at = observed_at;
+            return Ok(Update::Duplicate);
+        }
+        if actual_flush_at.0 < entry.flush_deadline.0 - self.config.flush_timeout_micros
+            || actual_flush_at >= entry.flush_deadline
+        {
+            return Err(Error::Time);
+        }
+        if let Some(entry) = &mut self.entries[index] {
+            entry.flushed_at = Some(actual_flush_at);
+        }
+        self.flushed_total.bytes += entry.bytes;
+        self.flushed_total.records += 1;
+        self.advance_flushed_prefix();
+        self.at = observed_at;
+        self.prune();
+        Ok(Update::Advanced)
+    }
+    fn advance_flushed_prefix(&mut self) {
+        while let Some(next) = self.flushed_records.checked_add(1) {
+            let Some(entry) = self.index(next).and_then(|i| self.entries[i]) else {
+                break;
+            };
+            if entry.flushed_at.is_none() {
+                break;
+            }
+            self.flushed_records = next;
+            self.flushed_bytes = entry.end.bytes;
+        }
     }
     /// Apply an authenticated boundary when original receipt is observed immediately.
     pub fn delivered(&mut self, end: Credit, now: Micros) -> Result<Update, Error> {
@@ -401,14 +471,14 @@ impl Controller {
         if feedback_at > observed_at {
             return Err(Error::Time);
         }
-        if end.records < self.delivered.records {
+        if end.records < self.delivered_prefix.records {
             return Err(Error::Stale);
         }
-        if end == self.delivered {
+        if end == self.delivered_prefix {
             self.at = observed_at;
             return Ok(Update::Duplicate);
         }
-        if end.records <= self.delivered.records
+        if end.records <= self.delivered_prefix.records
             || end.records > self.admitted.records
             || self.credit_at_record(end.records)? != end
         {
@@ -423,45 +493,119 @@ impl Controller {
         {
             return Err(Error::Time);
         }
-        let latest = (self.delivered.records + 1..=end.records)
+        let latest = (self.delivered_prefix.records + 1..=end.records)
             .rev()
             .filter_map(|record| {
                 self.index(record)
                     .and_then(|i| self.entries[i])
                     .and_then(|e| {
                         e.flushed_at
+                            .filter(|_| !e.delivered)
                             .filter(|t| feedback_at > *t)
                             .map(|t| (record, t))
                     })
             })
             .next();
         if let Some((_, flushed)) = latest {
-            let raw = feedback_at.0 - flushed.0;
-            let bounded = raw.clamp(self.config.min_rtt_micros, self.config.max_rtt_micros);
-            let smooth = self
-                .sample
-                .filter(|_| self.fresh(observed_at))
-                .map_or(bounded, |s| {
-                    ((7 * u128::from(s.smoothed_micros) + u128::from(bounded)) / 8) as u64
-                });
-            self.sample = Some(Sample {
-                flushed_at: flushed,
-                feedback_at,
-                raw_micros: raw,
-                smoothed_micros: smooth,
-            });
+            self.observe_sample(flushed, feedback_at, observed_at);
         }
-        for record in self.delivered.records + 1..=end.records {
+        for record in self.delivered_prefix.records + 1..=end.records {
             let i = self.index(record).ok_or(Error::Feedback)?;
-            if let Some(e) = &mut self.entries[i] {
+            if let Some(e) = &mut self.entries[i]
+                && !e.delivered
+            {
                 e.delivered = true;
+                // Every entry is charged exactly once by admit. Validated
+                // identities can therefore never exceed the admitted totals.
+                self.delivered.bytes += e.bytes;
+                self.delivered.records += 1;
             }
         }
-        self.delivered = end;
+        self.advance_delivered_prefix();
         self.last_feedback_at = Some(feedback_at);
         self.at = observed_at;
         self.prune();
         Ok(Update::Advanced)
+    }
+    /// Apply one authenticated native identity at the current observation time.
+    pub fn delivered_record(&mut self, record: u64, now: Micros) -> Result<Update, Error> {
+        self.delivered_record_at(record, now, now)
+    }
+    /// Release exactly one originally admitted native record, independently of
+    /// channel completion order. The caller resolves the authenticated channel
+    /// identity to this sender-owned admission ordinal; peers never supply bytes.
+    /// A delivered record retains its original full-flush deadline and metadata
+    /// until that callback is known. Duplicate receipts cannot create RTT samples.
+    pub fn delivered_record_at(
+        &mut self,
+        record: u64,
+        feedback_at: Micros,
+        observed_at: Micros,
+    ) -> Result<Update, Error> {
+        self.check(observed_at)?;
+        if feedback_at > observed_at {
+            return Err(Error::Time);
+        }
+        if record == 0 || record > self.admitted.records {
+            return Err(Error::Feedback);
+        }
+        if record <= self.delivered_prefix.records {
+            self.at = observed_at;
+            return Ok(Update::Duplicate);
+        }
+        let index = self.index(record).ok_or(Error::Feedback)?;
+        let entry = self.entries[index].ok_or(Error::Feedback)?;
+        if entry.delivered {
+            self.at = observed_at;
+            return Ok(Update::Duplicate);
+        }
+        if feedback_at.0 < entry.flush_deadline.0 - self.config.flush_timeout_micros
+            || self.last_feedback_at.is_some_and(|t| feedback_at < t)
+        {
+            return Err(Error::Time);
+        }
+        if let Some(flushed) = entry.flushed_at.filter(|t| feedback_at > *t) {
+            self.observe_sample(flushed, feedback_at, observed_at);
+        }
+        if let Some(entry) = &mut self.entries[index] {
+            entry.delivered = true;
+        }
+        self.delivered.bytes += entry.bytes;
+        self.delivered.records += 1;
+        self.advance_delivered_prefix();
+        self.last_feedback_at = Some(feedback_at);
+        self.at = observed_at;
+        self.prune();
+        Ok(Update::Advanced)
+    }
+    fn observe_sample(&mut self, flushed: Micros, feedback_at: Micros, observed_at: Micros) {
+        let raw = feedback_at.0 - flushed.0;
+        let bounded = raw.clamp(self.config.min_rtt_micros, self.config.max_rtt_micros);
+        let smooth = self
+            .sample
+            .filter(|_| self.fresh(observed_at))
+            .map_or(bounded, |s| {
+                ((7 * u128::from(s.smoothed_micros) + u128::from(bounded)) / 8) as u64
+            });
+        self.sample = Some(Sample {
+            flushed_at: flushed,
+            feedback_at,
+            raw_micros: raw,
+            smoothed_micros: smooth,
+        });
+    }
+    fn advance_delivered_prefix(&mut self) {
+        // The retained ordinal span, including delivered holes, is bounded by
+        // max_records. Never infer a prefix from aggregate delivered counts.
+        while let Some(next) = self.delivered_prefix.records.checked_add(1) {
+            let Some(entry) = self.index(next).and_then(|i| self.entries[i]) else {
+                break;
+            };
+            if !entry.delivered {
+                break;
+            }
+            self.delivered_prefix = entry.end;
+        }
     }
     fn prune(&mut self) {
         while self.len > 0
