@@ -1,10 +1,9 @@
 # Packed native qualification checkpoint
 
-Status: additive harness and offline audit implementation passed focused tests,
-independent source review and stable wave12. The first native attempt failed at
-startup readiness; its evidence and successful cleanup are retained below.
-The [packed client](packed-client.md) and shared runtime passed stable wave11;
-this does not yet qualify a physical TAP/TUN/VXLAN path or multi-unit captures.
+Status: the six clean Linux TAP/TUN/VXLAN full/half visible-integrity UDP
+packed cases passed native checks and independent saved-capture audits using the
+exact source-stable wave14b build. Historical failed attempts remain below.
+Other carriers, impairment, broad mode parity and performance remain open.
 
 ## First finite case and later expansion
 
@@ -23,10 +22,12 @@ Only owned namespace routes/bridges/qdiscs/offloads may change. No new clean-clo
 native window-control, throughput, fairness, hard realtime or parity claim follows.
 
 Use a new immutable daemon build and source-stable receipt, fresh output and lab
-ID. Do not overwrite aligned/frame evidence. Review the first result before any
-additional case; a failed case is preserved and investigated without extending
-deadlines. The later finite matrix would cover TAP/TUN/VXLAN full/half on protected
-UDP and genuine QUIC, then separately reviewed impairments. AEAD/QUIC captures
+ID. Do not overwrite aligned/frame evidence. Following the explicit request to
+increase parallel execution, the reviewed six clean TAP/TUN/VXLAN full/half
+visible-integrity UDP cases may run concurrently with disjoint lab IDs and output
+directories. Each keeps the same independent acceptance bounds and cleanup. A
+failure is preserved and investigated without extending deadlines or blocking an
+unrelated case. Genuine QUIC and impairment expansion remain separate gates. AEAD/QUIC captures
 prove packet shape/size/path evidence only, never unencrypted packed content.
 
 ## Additive CLI and harness interface
@@ -211,8 +212,9 @@ fragments as packets. Native TAP/VXLAN acceptance remains separately pending.
 - [x] [MOD-PACKNATIVE-03] Implement bounded native burst helper with exact bidirectional multisets and owned-process cleanup. Evidence: [bounded helper](../../tools/udp_burst_probe.py), [eight tests including the real four-process loopback](../../tools/test_udp_burst_probe.py), [focused receipt](../../work/packed-native-python-checkpoint/validation.json); independent source review accepted the original shared observation/reap deadlines, fixed bitmap, late/excess rejection and cleanup.
 - [x] [MOD-PACKNATIVE-04] Implement bounded offline maintained-parser audit with direct/systematic nesting, deduplication, malformed/conflict rejection and explicit nonauthentication scope. Evidence: [offline auditor](../../crates/l2tunnel-client-core/examples/packed_capture_audit.rs), [128 affected-package tests and CLI checks](../../work/packed-capture-audit/validation.json); independent source review accepted maintained structural inspectors, exact nested geometry, source deduplication, cross-symbol FEC generation consistency and explicit structural-only results.
 - [x] [MOD-PACKNATIVE-05] Pass unprivileged parser/harness tests, strict Rust lint/docs and independent source review before a privileged case. Evidence: [source-stable wave12](../../work/implementation-wave12/validation.json) passed 787 Rust and 105 Python cases, strict workspace lint/docs and CLI/golden checks; [immutable build12](../../work/packed-native-build12/receipt.json) uses exactly the aggregate's checked source map and retained helper hashes.
-- [ ] [MOD-PACKNATIVE-06] Build immutable reviewed binaries and run the one clean TUN/half visible-integrity case under unchanged bounds; retain exact captures, payloads, both-direction multi-unit evidence and cleanup.
-- [ ] [MOD-PACKNATIVE-07] Independently audit the first receipt and review a finite later TAP/TUN/VXLAN/carrier/impairment matrix before expansion.
+- [x] [MOD-PACKNATIVE-06] Build immutable reviewed binaries and run the one clean TUN/half visible-integrity case under unchanged bounds; retain exact captures, payloads, both-direction multi-unit evidence and cleanup. Evidence: [immutable wave14b build](../../work/packed-native-build14b/receipt.json), [fresh native receipt](../../work/packed-native-tun-half14b/receipt.json), [independent audit](../../work/packed-native-tun-half14b-audit/receipt.json).
+- [ ] [MOD-PACKNATIVE-07] Complete independent carrier and impairment expansion beyond the six qualified clean visible-integrity UDP cases.
+- [x] [MOD-PACKNATIVE-07A] Independently audit six clean TAP/TUN/VXLAN full/half cases using unchanged payload, burst, capture and cleanup bounds. Evidence: [six-case result](../../work/packed-clean-matrix14b/receipt.json) and individual audits below; cases ran three at a time in disjoint owned namespaces.
 - [x] [MOD-PACKNATIVE-08] Correct actual full/half UDP lane scope bindings in the offline auditor and fixtures, add substitution regressions, and independently inspect the unchanged failed capture without rewriting its native verdict. Evidence: [independent source/capture review](../../work/packed-scope-review13/REPORT.md), [focused strict checks and offline reinspection](../../work/packed-scope-fix13/validation.json), twelve passing auditor tests including three new session-substitution regressions. Both unchanged captures show eighteen/twenty complete-packet aggregation sources in the two directions. Native run13 remains failed; a fresh stable build/native acceptance is separate.
 
 ## First native attempt
@@ -235,8 +237,10 @@ unchanged historical files. Both packed CLI branches now print their actual
 passed. The readiness check and deadlines are unchanged. The correction is now
 included in [source-stable wave13](../../work/implementation-wave13/validation.json)
 (805 Rust and 105 Python cases) and its [exact immutable build13](../../work/packed-native-build13/receipt.json).
-A fresh native output is still required for the retry. No later
-TAP/TUN/VXLAN/carrier/impairment expansion is authorized by the failed first case.
+A fresh native output is still required for the retry. The failed first case
+does not qualify any profile. The later reviewed six-profile clean audit and
+explicit parallel-execution instruction permit independent fresh clean cases;
+other carriers and impairment remain separate qualification work.
 
 ## Second native attempt and scope correction
 
@@ -268,3 +272,23 @@ found eighteen complete-packet aggregation sources in direction zero and twenty
 in direction one, with at most four units per source and whole-IP packets no
 larger than 1176 bytes. This reinspection is separate from a fresh source-stable
 build and native acceptance, and does not change the original failed verdict.
+
+## Clean parallel native qualification
+
+The exact [wave14b build](../../work/packed-native-build14b/receipt.json) passed
+all six independently owned clean cases, three at a time while module coding
+continued. Every case passed twelve IPv4 and six IPv6 probes, a checksum-verified
+65,536-byte TCP transfer, sixty-four distinct 64-byte UDP payloads in each
+direction, negative UDP-path/restoration checks, complete-packet aggregation in
+both directions, 1200-byte underlay MTU bounds, zero kernel capture drops and
+owned namespace cleanup. Structural inspection does not independently verify
+HMACs. This is finite connectivity/integrity evidence, not throughput or fairness.
+
+| Layer | Duplex | Result | Evidence |
+| --- | --- | --- | --- |
+| tun | half | passed | [independent audit](../../work/packed-native-tun-half14b-audit/receipt.json) |
+| tun | full | passed | [independent audit](../../work/packed-native-tun-full14b-audit/receipt.json) |
+| tap | half | passed | [independent audit](../../work/packed-native-tap-half14b-audit/receipt.json) |
+| tap | full | passed | [independent audit](../../work/packed-native-tap-full14b-audit/receipt.json) |
+| vxlan | half | passed | [independent audit](../../work/packed-native-vxlan-half14b-audit/receipt.json) |
+| vxlan | full | passed | [independent audit](../../work/packed-native-vxlan-full14b-audit/receipt.json) |

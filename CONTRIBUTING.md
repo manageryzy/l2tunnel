@@ -7,6 +7,12 @@ with the mode catalog.
 Documentation and comments use English. Keep simulator evidence unchanged unless
 an experiment change is explicitly part of the task; save new runs separately.
 
+Commit each coherent module checkpoint locally with its scoped validation and
+remaining limitations. The integrator stages verified source bytes and preserves
+concurrent working-tree edits; generated evidence/build outputs and private
+credentials stay excluded. Do not defer all commits until the whole product is
+finished, or describe a checkpoint commit as a fully qualified release.
+
 ## Rust conventions
 
 - Rust 2024, pinned toolchain in `rust-toolchain.toml`; public errors are explicit.

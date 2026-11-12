@@ -63,7 +63,16 @@ API. No task is complete just because its enum/trait or crate compiles.
    to stay frozen during validation. A receipt qualifies its recorded snapshot,
    not concurrent later edits. Run privileged/native tests only for a runnable feature
    within the authorized isolated lab. Keep unsupported/skipped gates unchecked.
-8. **Select the next wave.** Use dependency readiness and test results, not the
+8. **Commit coherent checkpoints.** Create a local Git commit after a module has
+   concrete code, its scoped checks and updated evidence. Do not accumulate all
+   work until the complete product is ready. The integrator owns staging and
+   commits; workers keep editing their exclusive files. When live edits have
+   advanced, stage the verified snapshot bytes without overwriting the working
+   tree. Record unresolved aggregate/native failures in the commit description;
+   a checkpoint commit is not a release or a declaration that every gate passed.
+   Keep generated outputs, private credentials and in-flight module edits out of
+   the checkpoint. Remote publication remains a separate action.
+9. **Select the next wave.** Use dependency readiness and test results, not the
    number of unchecked boxes alone. Retain design/API/test receipts for the next
    agent so work can continue without reconstructing chat history.
 
@@ -135,8 +144,9 @@ and the module ledgers for evidence, failures and remaining tasks.
 
 ## Integration rules
 
-Keep module changes isolated when a managed worktree is available; this directory
-currently lacks Git metadata, so workers use exclusive path ownership. Never
+Keep module changes isolated when a managed worktree is available. The local Git
+repository is initialized; concurrent workers use exclusive path ownership and
+the integrator alone owns the index and checkpoint commits. Never
 create a second runtime or overwrite another worker's changes. Create a complete
 crate manifest/source pair before starting Cargo checks. The integrator owns any
 manual lockfile decisions; ordinary Cargo lockfile updates are inspected together.

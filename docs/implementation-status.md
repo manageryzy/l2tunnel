@@ -3,6 +3,48 @@
 This page records finite implemented scope. The master checklist and module
 checklists remain authoritative for unfinished requirements and mode parity.
 
+## Current parallel checkpoint
+
+The [wave14b frozen aggregate](../work/implementation-wave14b/validation.json)
+passed 858 Rust and 107 Python cases, formatting, strict workspace Clippy,
+warning-denied rustdoc, golden vectors and CLI checks. Its 562 source inputs
+were unchanged during the run. It includes the held raw pairing, measured proxy
+runtime and packed Ethernet audit checkpoints; subsequent concurrent module edits
+are not covered by that receipt.
+
+The [active workflow](development-workflow.md#current-composition-wave) now runs
+raw TLS-to-packet transition, measured proxy client/API integration and rolling
+local/global RLNC in three independent source/build lanes. Aggregate/build/native
+qualification uses a copied source checkpoint, releasing developers immediately
+after copy verification. Clean native profiles use disjoint owned namespaces;
+concurrent runs qualify finite connectivity/integrity, not performance.
+
+The first copied wave14 failed because source identity collection excluded any
+directory named `target`, including the real Rust module
+`crates/l2tunnel-flow-control/src/target/tests.rs`. The correction includes that
+source and adds two regression tests. [Snapshot lineage](../work/source-snapshot14b.json)
+records the four-file derived correction; the original failed receipt is retained.
+Historical source maps omitted this test file even when the original live-tree
+checks executed it, so they do not establish its hash identity. No historical
+receipt has been rewritten.
+
+The [six clean packed native cases](../work/packed-clean-matrix14b/receipt.json)
+passed for TAP/TUN/VXLAN in full and paired-half modes using that immutable build.
+All six independent audits passed exact payloads, positive aggregation in both
+directions, MTU/capture requirements and namespace cleanup. See the
+[case evidence](modules/packed-native.md#clean-parallel-native-qualification).
+Other carriers, impairment, performance and complete Python parity stay open.
+
+The [rolling equation checkpoint](../work/rolling-recovery-checkpoint15/validation.json)
+now passes 39 FEC unit and three two-owner integration cases. It reconstructs
+actual bytes from independent received equations, retains fixed-support known
+columns, bounds incremental work, and handles output pressure/deadlines. It has
+no integrated repair scheduler or transport yet. The measured proxy
+[shared client checkpoint](../work/proxy-measured-client/validation.json) passes
+95 library and 19 example cases and invokes the actual measured runtime through
+an explicit CLI profile. Both await the next whole-workspace snapshot; measured
+native window/fairness qualification remains pending.
+
 ## First native vertical slice
 
 - Real maintained TCP/TLS 1.3, verified server identity/name without SNI, and

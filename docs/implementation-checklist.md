@@ -38,7 +38,10 @@ Current composition work is tracked in the narrower module ledgers:
 [native UDP drain](modules/openvpn-native-drain.md),
 [raw packet-phase design](modules/raw-packet-phase.md) and
 [raw owner handoff](modules/raw-owner-handoff.md). Their finite checkpoints
-do not automatically complete the broader parent or P-* gates below.
+do not automatically complete the broader parent or P-* gates below. New active composition ledgers are
+[rolling local/global recovery](modules/local-global-rlnc.md),
+[measured proxy client](modules/proxy-measured-client.md) and
+[raw TLS transition](modules/raw-tls-transition.md).
 
 ## Tested native vertical slice
 
@@ -53,6 +56,7 @@ do not automatically complete the broader parent or P-* gates below.
 - [x] [SLICE-10] Integrate authenticated measured demand/RTT/native delivery feedback and exact idle retirement; qualify more flows than slots with None/LZ4. Evidence: [None audit](../work/native-active-measured-audit.json), [LZ4 audit](../work/native-active-measured-lz4-audit.json), six native TUN cases, finite measured-growth/retirement scope.
 - [x] [SLICE-11] Qualify genuine standalone QUIC authentication and packet forwarding on TAP/TUN/VXLAN with outer TCP blocked, full/paired-half and impaired links. Evidence: [36-case QUIC audit](../work/native-quic-matrix-audit.json), None/LZ4, ARQ/Cauchy, maintained QUIC AEAD, exact probes/TCP payloads, UDP path failure/restoration, actual MTU 1228 with offloads disabled and owned cleanup.
 - [x] [SLICE-12] Qualify explicit fixed-credit native TUN TCP proxy in clean full and paired-half modes, with independent IPv4/IPv6 TCP legs, transparent bypass, exact bytes/FIN/native fences and original TLS lane closure. Evidence: [two-case independent audit](../work/native-proxy-clean-audit.json), [stable binary build](../work/native-proxy-full-build/receipt.json); adaptive window growth, impairment and broad platform support remain separate.
+- [x] [SLICE-13] Qualify packed records over authenticated custom UDP in six clean Linux TAP/TUN/VXLAN full/half cases with exact payloads, bidirectional complete-packet aggregation, MTU/capture checks and owned cleanup. Evidence: [parallel six-case result](../work/packed-clean-matrix14b/receipt.json), [independent audits](modules/packed-native.md#clean-parallel-native-qualification); other carriers, impairment and complete Python packed parity remain separate.
 - [ ] [SLICE-04] Integrate active credit/QoS, distributed reload, recovery and VXLAN with authenticated native forwarding.
 
 ## Existing foundation versus outstanding M0 work
