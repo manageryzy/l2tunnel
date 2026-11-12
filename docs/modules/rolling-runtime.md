@@ -105,10 +105,12 @@ actual recovery matrices use W8. Both pure scheduler total reservations and
 primitive reservations are checked before link/device ownership. Native queue,
 Pipeline, one selected/ingress packet, one frame fragment batch per sender,
 rolling storage and authenticated receive channels remain independently bounded.
-Flow registrations have a finite lifetime capacity; automatic idle retirement is
-not implemented by this pump. These finite tests do not qualify W8192 memory/CPU,
-long-lived flow churn, pacing/congestion fairness, native namespace/device
-activation, clean shutdown or complete local/global Python-family parity.
+Flow registrations are a concurrent retained-registration bound. Bounded idle
+retirement, exact temporary capacity backpressure and finite beyond-capacity flow
+churn are tracked in the [rolling/raw retirement ledger](rolling-raw-flow-retirement.md).
+These finite tests do not qualify W8192 memory/CPU, unbounded flow churn,
+pacing/congestion fairness, native namespace/device activation, clean shutdown
+or complete local/global Python-family parity.
 
 ## Finite verification gates
 

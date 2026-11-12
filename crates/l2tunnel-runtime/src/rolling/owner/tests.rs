@@ -174,3 +174,147 @@ fn prepared_wouldblock_retains_bytes_deadline_and_late_success_never_publishes_c
     assert_eq!(state.native.len(), 1);
     Ok(())
 }
+
+#[test]
+fn rolling_reverse_capacity_retains_original_native_without_credit() -> io::Result<()> {
+    let (mut state, _) = state()?;
+    let mut cache = config()?.1.pipeline;
+    cache.flows.idle_timeout = Duration::from_millis(1);
+    let mut pipeline = Pipeline::new(cache).map_err(io::Error::other)?;
+    for port in 10000..11024u16 {
+        let mut bytes = packet(false);
+        bytes[20..22].copy_from_slice(&port.to_be_bytes());
+        pipeline
+            .enqueue(bytes, Duration::ZERO)
+            .map_err(io::Error::other)?;
+        pipeline.dequeue().map_err(io::Error::other)?;
+    }
+    let bytes = packet(false);
+    let mut expected = Pipeline::new(config()?.1.pipeline).map_err(io::Error::other)?;
+    let channel = expected
+        .enqueue(bytes.clone(), Duration::ZERO)
+        .map_err(io::Error::other)?
+        .binding
+        .channel;
+    state.native.push_back(Native {
+        bytes: bytes.clone(),
+        channel,
+        deadline: protocol::Tick(5),
+        prepared: false,
+    });
+    let clock = Cell::new(1);
+    let mut device = Device {
+        calls: 0,
+        clock: &clock,
+        advance: false,
+        blocked: false,
+    };
+    state.deliver(&mut device, &mut pipeline, || {
+        Ok(protocol::Tick(clock.get()))
+    })?;
+    assert_eq!(device.calls, 0);
+    assert_eq!(
+        state.native.front().map(|v| v.bytes.as_slice()),
+        Some(bytes.as_slice())
+    );
+    assert_eq!(state.feedback.borrow().credit, 0);
+    let mut cursor = None;
+    pump::retire_registration(&mut pipeline, None, &mut cursor, Duration::from_millis(1))?;
+    clock.set(2);
+    state.deliver(&mut device, &mut pipeline, || {
+        Ok(protocol::Tick(clock.get()))
+    })?;
+    assert_eq!(device.calls, 1);
+    assert!(state.native.is_empty());
+    assert_eq!(state.feedback.borrow().credit, 1);
+    for offset in 0..1100u16 {
+        let now = u64::from(offset) + 3;
+        pump::retire_registration(&mut pipeline, None, &mut cursor, Duration::from_millis(now))?;
+        let mut bytes = packet(false);
+        bytes[20..22].copy_from_slice(&(20000 + offset).to_be_bytes());
+        let mut expected = Pipeline::new(cache).map_err(io::Error::other)?;
+        let channel = expected
+            .enqueue(bytes.clone(), Duration::ZERO)
+            .map_err(io::Error::other)?
+            .binding
+            .channel;
+        state.native.push_back(Native {
+            bytes: bytes.clone(),
+            channel,
+            deadline: protocol::Tick(now + 5),
+            prepared: false,
+        });
+        clock.set(now);
+        state.deliver(&mut device, &mut pipeline, || {
+            Ok(protocol::Tick(clock.get()))
+        })?;
+        assert!(state.native.is_empty());
+    }
+    assert_eq!(device.calls, 1101);
+    assert_eq!(state.feedback.borrow().credit, 1101);
+    Ok(())
+}
+
+#[test]
+fn rolling_prepared_native_survives_retirement_and_original_expiry() -> io::Result<()> {
+    let (mut state, _) = state()?;
+    let mut cache = config()?.1.pipeline;
+    cache.flows.idle_timeout = Duration::from_millis(1);
+    let mut pipeline = Pipeline::new(cache).map_err(io::Error::other)?;
+    let bytes = packet(false);
+    let metadata = pipeline
+        .enqueue(bytes.clone(), Duration::ZERO)
+        .map_err(io::Error::other)?;
+    pipeline.dequeue().map_err(io::Error::other)?;
+    let now = 0;
+    state.native.push_back(Native {
+        bytes: bytes.clone(),
+        channel: metadata.binding.channel,
+        deadline: protocol::Tick(now + 5),
+        prepared: false,
+    });
+    let clock = Cell::new(now);
+    let mut device = Device {
+        calls: 0,
+        clock: &clock,
+        advance: false,
+        blocked: true,
+    };
+    state.deliver(&mut device, &mut pipeline, || {
+        Ok(protocol::Tick(clock.get()))
+    })?;
+    let deadline = state
+        .native
+        .front()
+        .ok_or_else(|| invalid("held"))?
+        .deadline;
+    let mut cursor = None;
+    for _ in 0..2 {
+        pump::retire_registration(
+            &mut pipeline,
+            None,
+            &mut cursor,
+            Duration::from_millis(now + 1),
+        )?;
+    }
+    assert_eq!(pipeline.registered_flows(), 0);
+    assert_eq!(
+        state.native.front().map(|v| v.bytes.as_slice()),
+        Some(bytes.as_slice())
+    );
+    assert_eq!(state.native.front().map(|v| v.deadline), Some(deadline));
+    // Cache retirement never renews the original handoff timer or grants credit.
+    clock.set(now + 5);
+    assert_eq!(
+        state
+            .deliver(&mut device, &mut pipeline, || Ok(protocol::Tick(
+                clock.get()
+            )))
+            .err()
+            .map(|v| v.kind()),
+        Some(io::ErrorKind::TimedOut)
+    );
+    assert_eq!(state.delivered, 0);
+    assert_eq!(state.feedback.borrow().credit, 0);
+    Ok(())
+}

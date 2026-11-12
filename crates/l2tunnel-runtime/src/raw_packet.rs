@@ -331,12 +331,17 @@ fn decode(bytes: &[u8]) -> io::Result<(u8, &[u8])> {
     Ok((bytes[5], &bytes[HEADER..]))
 }
 
+struct NativeFrame {
+    bytes: Vec<u8>,
+    channel: u16,
+    prepared: bool,
+}
 struct Lane {
     engine: udp::Engine,
     fragmenter: Fragmenter,
     reassembly: Reassembler,
     fragments: VecDeque<Vec<u8>>,
-    native: VecDeque<Vec<u8>>,
+    native: VecDeque<NativeFrame>,
     pending: Option<(carrier::RecordKind, Vec<u8>)>,
     pending_data: Option<Vec<u8>>,
     sends: bool,
@@ -362,6 +367,7 @@ struct Owner<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> {
     status: Status,
     publisher: watch::Sender<Status>,
     cursor: usize,
+    idle_cursor: Option<pipeline::FlowKey>,
 }
 impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Drop for Owner<I, D> {
     fn drop(&mut self) {
@@ -485,6 +491,7 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
             status,
             publisher,
             cursor: 0,
+            idle_cursor: None,
         })
     }
     fn live(&mut self) -> io::Result<()> {
@@ -557,11 +564,23 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
                 "raw native reassembly expired",
             ));
         }
-        if let Some(packet) = self.lanes[index].native.front() {
+        if let Some(packet) = self.lanes[index].native.front_mut() {
+            if !packet.prepared {
+                let key = self
+                    .pipeline
+                    .classify(&packet.bytes)
+                    .map_err(io::Error::other)?
+                    .key;
+                match self.pipeline.learn(key, packet.channel, 1, now) {
+                    Ok(_) => packet.prepared = true,
+                    Err(error) if flow_capacity(&error) => return Ok(false),
+                    Err(error) => return Err(io::Error::other(error)),
+                }
+            }
             let next = self.status.delivered[index]
                 .checked_add(1)
                 .ok_or_else(|| invalid("raw native delivered counter exhausted"))?;
-            match self.device.transmit(packet) {
+            match self.device.transmit(&packet.bytes) {
                 Ok(()) => {
                     self.lanes[index].native.pop_front();
                     self.status.delivered[index] = next;
@@ -606,11 +625,15 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
                 {
                     return Err(invalid("raw native channel or layer mismatch"));
                 }
-                let classification = self.pipeline.classify(&packet).map_err(io::Error::other)?;
-                self.pipeline
-                    .learn(classification.key, channel, 1, now)
-                    .map_err(io::Error::other)?;
-                self.lanes[index].native.push_back(packet);
+                // Complete reassembly has consumed its source. Retain these exact
+                // bytes in the existing native FIFO even if flow learning must
+                // wait for an idle registration. Validation/learning still occurs
+                // before the first native device side effect.
+                self.lanes[index].native.push_back(NativeFrame {
+                    bytes: packet,
+                    channel,
+                    prepared: false,
+                });
                 increment(&mut self.status.received[index])?;
             }
         }
@@ -637,7 +660,10 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
         if let Some(bytes) = self.ingress.take() {
             match self.pipeline.enqueue(bytes, now) {
                 Ok(_) => progress = true,
-                Err(e) if matches!(e.kind, pipeline::PipelineError::Budget(_)) => {
+                Err(e)
+                    if matches!(e.kind, pipeline::PipelineError::Budget(_))
+                        || flow_capacity(&e.kind) =>
+                {
                     self.ingress = Some(e.payload)
                 }
                 Err(e) => return Err(io::Error::other(e)),
@@ -788,6 +814,7 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
         }
         self.live()?;
         let now = self.started.elapsed();
+        progress |= self.retire_registration(now)?;
         for _ in 0..8 {
             if !self.receive(now)? {
                 break;
@@ -821,6 +848,38 @@ impl<I: PacketIo + Send + 'static, D: PacketDevice<Error = io::Error>> Owner<I, 
         }
         Ok(progress)
     }
+
+    fn retire_registration(&mut self, now: Duration) -> io::Result<bool> {
+        // Only selected retains a local Binding outside Pipeline. Recovery,
+        // fragment and native ownership is bytes plus immutable CRC channel;
+        // prepared means validated, not a reference to a cached FlowId.
+        let scan = self
+            .pipeline
+            .idle_step(
+                now,
+                self.idle_cursor,
+                16,
+                self.selected
+                    .as_ref()
+                    .map(|packet| packet.metadata.classification.key),
+            )
+            .map_err(io::Error::other)?;
+        self.idle_cursor = scan.after;
+        if let Some((key, _)) = scan.candidate {
+            self.pipeline
+                .retire_idle_drained(&key, now)
+                .map_err(io::Error::other)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+fn flow_capacity(error: &pipeline::PipelineError) -> bool {
+    matches!(
+        error,
+        pipeline::PipelineError::Flow(l2tunnel_packet::FlowError::Capacity)
+    )
 }
 /// Forward real native frames through the authenticated common-MUX/recovery path.
 /// Cancellation or any error drops the exact original I/O without clean-close claims.

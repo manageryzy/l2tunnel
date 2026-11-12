@@ -688,3 +688,46 @@ async fn actual_blocked_native_expires_at_original_handoff_without_delivery() ->
     let _ = a_task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn rolling_flow_churn_preserves_full_half_recovery_native_and_reverse_affinity() -> TestResult
+{
+    for duplex in [Duplex::Full, Duplex::Half] {
+        let rt = runtime(PacketLayer::Ip);
+        let transport = udp_transport(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?;
+        let mut config = small(Config::for_udp(rt, transport, 4)?);
+        config.pipeline.flows.capacity = 4;
+        config.pipeline.flows.idle_timeout = Duration::from_millis(10);
+        let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
+        let a = Device::new(rt.layer);
+        let b = Device::new(rt.layer);
+        let forward = (1..17)
+            .map(|n| packet(rt.layer, n, 100 + usize::from(n)))
+            .collect::<Vec<_>>();
+        let reverse = (21..37)
+            .map(|n| packet(rt.layer, n, 100 + usize::from(n)))
+            .collect::<Vec<_>>();
+        a.change(|v| v.outgoing.extend(forward.iter().cloned()))?;
+        b.change(|v| {
+            v.blocked = true;
+            v.outgoing.extend(reverse.iter().cloned());
+        })?;
+        let mut tasks = JoinSet::new();
+        tasks.spawn(run_udp(a.clone(), a_link, rt, transport, config));
+        tasks.spawn(run_udp(b.clone(), b_link, rt, transport, config));
+        sleep(Duration::from_millis(70)).await;
+        assert!(b.change(|v| v.delivered.is_empty())?);
+        b.change(|v| v.blocked = false)?;
+        wait_delivery(&mut tasks, &a, &b, forward.len()).await?;
+        for (device, mut expected) in [(&a, reverse), (&b, forward)] {
+            let mut actual = device.change(|v| v.delivered.clone())?;
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+        assert!(relays.observations.dropped.load(Ordering::Relaxed) > 0);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    Ok(())
+}

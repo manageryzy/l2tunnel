@@ -90,6 +90,7 @@ where
     let mut encoded = vec![0; policy.payload_bytes];
     let mut ingress = None;
     let mut selected = None;
+    let mut idle_cursor = None;
     let result = async {
         loop {
             tokio::select! {
@@ -101,6 +102,7 @@ where
                 Some((lane,bytes)) = data_rx.recv() => states[lane].data(&bytes,ticks(started.elapsed())?,config)?,
                 _ = ticker.tick() => (),
             }
+            retire_registration(&mut pipeline, selected.as_ref(), &mut idle_cursor, started.elapsed())?;
             ingress_step(&mut device, &mut pipeline, &mut ingress, &mut packet, runtime, config, started.elapsed())?;
             for _ in 0..config.passes_per_turn {
                 for state in &mut states {
@@ -178,7 +180,10 @@ fn ingress_step<D: PacketDevice<Error = io::Error>>(
     if let Some(bytes) = ingress.take() {
         match pipeline.enqueue(bytes, now) {
             Ok(_) => (),
-            Err(error) if matches!(error.kind, pipeline::PipelineError::Budget(_)) => {
+            Err(error)
+                if matches!(error.kind, pipeline::PipelineError::Budget(_))
+                    || flow_capacity(&error.kind) =>
+            {
                 *ingress = Some(error.payload)
             }
             Err(error) => return Err(io::Error::other(error)),
@@ -186,3 +191,42 @@ fn ingress_step<D: PacketDevice<Error = io::Error>>(
     }
     Ok(())
 }
+
+pub(super) fn flow_capacity(error: &pipeline::PipelineError) -> bool {
+    matches!(
+        error,
+        pipeline::PipelineError::Flow(l2tunnel_packet::FlowError::Capacity)
+    )
+}
+
+pub(super) fn retire_registration(
+    pipeline: &mut Pipeline,
+    selected: Option<&pipeline::Packet>,
+    cursor: &mut Option<pipeline::FlowKey>,
+    now: Duration,
+) -> io::Result<()> {
+    // Only the selected packet retains a local FlowId outside Pipeline. Sender
+    // fragments, recovery and prepared native frames retain immutable channel
+    // and bytes. Fixed CRC mapping preserves channel affinity across relearn;
+    // retiring registration metadata neither releases bytes nor grants credit.
+    let now = Duration::from_millis(ticks(now)?.0);
+    let scan = pipeline
+        .idle_step(
+            now,
+            *cursor,
+            16,
+            selected.map(|packet| packet.metadata.classification.key),
+        )
+        .map_err(io::Error::other)?;
+    *cursor = scan.after;
+    if let Some((key, _)) = scan.candidate {
+        pipeline
+            .retire_idle_drained(&key, now)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "flow_tests.rs"]
+mod flow_retirement_tests;

@@ -333,9 +333,11 @@ impl State {
                 .classify(&front.bytes)
                 .map_err(io::Error::other)?
                 .key;
-            pipeline
-                .learn(key, front.channel, 1, Duration::from_millis(now.0))
-                .map_err(io::Error::other)?;
+            match pipeline.learn(key, front.channel, 1, Duration::from_millis(now.0)) {
+                Ok(_) => (),
+                Err(error) if pump::flow_capacity(&error) => return Ok(()),
+                Err(error) => return Err(io::Error::other(error)),
+            }
             front.prepared = true;
         }
         if clock()? >= front.deadline {

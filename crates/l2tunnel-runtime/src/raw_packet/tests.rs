@@ -806,3 +806,6 @@ async fn lz4_large_native_frames_include_actual_small_mtu_fragmentation() -> R {
     }
     Ok(())
 }
+
+#[path = "flow_tests.rs"]
+mod flow_retirement;
