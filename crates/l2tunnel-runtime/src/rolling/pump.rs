@@ -81,7 +81,17 @@ where
             ));
         }
         if let Some(output) = output {
-            tasks.spawn(write_datagrams(part.sender, output, index, sent_tx.clone()));
+            let recycled = states[index]
+                .recycle_outbound
+                .take()
+                .ok_or_else(|| invalid("rolling outbound recycle owner"))?;
+            tasks.spawn(write_datagrams(
+                part.sender,
+                output,
+                index,
+                sent_tx.clone(),
+                recycled,
+            ));
         }
     }
     drop(sent_tx);
@@ -118,14 +128,16 @@ where
                         if let Some(item) = &selected && state.admit(item,micros(started,Instant::now())?)? { selected = None; }
                         state.submit(ticks(started.elapsed())?)?;
                     }
+                    state.reclaim_outbound()?;
                     let mut queued=None;
                     if let Some(outbound) = &state.outbound {
                         match outbound.try_reserve() {
                             Ok(permit) => {
+                                if let Some(mut buffer) = state.free_outbound.pop() {
                                 let now = started.elapsed();
                                 let mut emitted=None;
                                 let sender = state.sender.as_mut().ok_or_else(|| invalid("rolling missing sender"))?;
-                                if let Some(length) = budget.poll_with(false, now, &mut encoded, |output, allowance| {
+                                if let Some(length) = budget.poll_with(false, now, &mut buffer, |output, allowance| {
                                     let Some(value) = sender.pending_output() else { return Ok(None); };
                                     let length = config.scheduler.recovery.width().map_err(io::Error::other)? + protocol::wire::HEADER_BYTES;
                                     if allowance.packets == 0 || allowance.wire_bytes < length { return Ok(None); }
@@ -140,8 +152,12 @@ where
                                 })? {
                                     let id=emitted.ok_or_else(||invalid("rolling output identity missing"))?;
                                     let native_complete=state.completion(id);
-                                    permit.send(owner::Outbound{bytes:encoded[..length].to_vec(),native_complete});
+                                    if buffer.len() != length { return Err(invalid("rolling outbound slot length mismatch")); }
+                                    permit.send(owner::Outbound{bytes:buffer,native_complete});
                                     queued=Some(id);
+                                } else {
+                                    state.free_outbound.push(buffer);
+                                }
                                 }
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => (),
@@ -182,6 +198,7 @@ async fn write_datagrams(
     mut output: mpsc::Receiver<owner::Outbound>,
     lane: usize,
     sent: mpsc::Sender<(usize, u64, Instant)>,
+    recycled: mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
     while let Some(packet) = output.recv().await {
         // Reserve the non-coalescing completion slot before physical handoff.
@@ -199,6 +216,9 @@ async fn write_datagrams(
         if let (Some(ordinal), Some(permit)) = (packet.native_complete, permit) {
             permit.send((lane, ordinal, completed));
         }
+        recycled
+            .try_send(packet.bytes)
+            .map_err(|_| invalid("rolling outbound recycle channel bound or closure"))?;
     }
     Err(invalid("rolling datagram producer closed"))
 }

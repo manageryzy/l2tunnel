@@ -29,6 +29,10 @@ pub(super) struct State {
     record: Vec<u8>,
     codec: l2tunnel_codec::FrameCodec,
     pub outbound: Option<mpsc::Sender<Outbound>>,
+    pub free_outbound: Vec<Vec<u8>>,
+    pub recycle_outbound: Option<mpsc::Sender<Vec<u8>>>,
+    recycled_outbound: mpsc::Receiver<Vec<u8>>,
+    outbound_capacity: usize,
     pub feedback: watch::Sender<udp::Feedback>,
     pub admitted: u64,
     received: u64,
@@ -95,7 +99,30 @@ impl State {
                 .try_reserve_exact(outgoing_delivery.max_records)
                 .map_err(io::Error::other)?;
         }
+        let outbound_capacity = config
+            .scheduler
+            .recovery
+            .width()
+            .map_err(io::Error::other)?
+            .checked_add(protocol::wire::HEADER_BYTES)
+            .ok_or_else(|| invalid("rolling outbound wire length overflow"))?;
+        if outbound_capacity > policy.payload_bytes {
+            return Err(invalid(
+                "rolling outbound wire length exceeds payload budget",
+            ));
+        }
+        let (recycle_outbound, recycled_outbound) = mpsc::channel(2);
+        let mut free_outbound = Vec::with_capacity(if sends { 2 } else { 0 });
+        if sends {
+            for _ in 0..2 {
+                free_outbound.push(vec![0; outbound_capacity]);
+            }
+        }
         Ok(Self {
+            free_outbound,
+            recycle_outbound: sends.then_some(recycle_outbound),
+            recycled_outbound,
+            outbound_capacity,
             sender: sends
                 .then(|| scheduler::Sender::new(config.scheduler, scope, protocol::Tick(0)))
                 .transpose()
@@ -152,6 +179,18 @@ impl State {
             native_pending_bytes: 0,
             frame_ends,
         })
+    }
+    pub fn reclaim_outbound(&mut self) -> io::Result<()> {
+        while let Ok(bytes) = self.recycled_outbound.try_recv() {
+            if self.free_outbound.len() >= 2
+                || bytes.len() != self.outbound_capacity
+                || bytes.capacity() < self.outbound_capacity
+            {
+                return Err(invalid("rolling outbound buffer ownership bound"));
+            }
+            self.free_outbound.push(bytes);
+        }
+        Ok(())
     }
     pub fn control(
         &mut self,
