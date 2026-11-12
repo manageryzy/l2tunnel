@@ -4,6 +4,8 @@ import copy
 import hashlib
 import io
 import json
+import os
+import selectors
 from pathlib import Path
 import socket
 import struct
@@ -16,6 +18,34 @@ from unittest.mock import patch
 
 from . import proxy_measured_native_smoke as h
 from . import test_proxy_native_smoke as fixtures
+
+
+def wait_ready_line(child, deadline):
+    """Read one bounded readiness line within an original monotonic deadline."""
+    output = bytearray()
+    with selectors.DefaultSelector() as ready:
+        ready.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not ready.select(remaining):
+                raise TimeoutError('pressure helper readiness deadline expired')
+            byte = os.read(child.stdout.fileno(), 1)
+            if not byte:
+                raise RuntimeError('pressure helper exited before readiness')
+            output.extend(byte)
+            if len(output) > 128:
+                raise ValueError('pressure helper readiness line exceeds bound')
+            if byte == b'\n':
+                return output.decode('utf-8').strip()
+
+
+def stop_child(child):
+    """Kill and reap even a silent helper after readiness or assertion failure."""
+    if child.poll() is None:
+        child.kill()
+    child.communicate(timeout=2)
+    child.stdout.close()
+    child.stderr.close()
 
 
 def snapshot(side='a', phase='Forwarding', terminal=False, lanes=1):
@@ -463,6 +493,18 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
         peers['b']['state']['proxy']['terminal']['report']['peer_user_records'] += 1
         with self.assertRaises(ValueError): h.verify_peer_closures(peers, 2)
 
+    def test_silent_pressure_helper_readiness_expires_and_is_reaped(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                wait_ready_line(child, started + 0.1)
+        finally:
+            stop_child(child)
+        self.assertIsNotNone(child.returncode)
+        self.assertLess(time.monotonic() - started, 2)
+
     def test_real_pressure_kernel_loopback_both_families(self):
         harness = Path(h.__file__).resolve()
         for family, address in [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')]:
@@ -478,7 +520,7 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
             server = subprocess.Popen([sys.executable, str(harness), 'pressure-probe', 'listen', *args],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
-                self.assertEqual(server.stdout.readline().strip(), 'Listening')
+                self.assertEqual(wait_ready_line(server, time.monotonic() + 5), 'Listening')
                 client = subprocess.run([sys.executable, str(harness), 'pressure-probe', 'connect', *args],
                                         capture_output=True, text=True, timeout=35, check=True)
                 stdout, stderr = server.communicate(timeout=35)
@@ -487,8 +529,7 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
                 h.verify_probe(json.loads(client.stdout.splitlines()[-1]), flow, 'connect', True)
                 h.verify_probe(json.loads(stdout.splitlines()[-1]), flow, 'listen', True)
             finally:
-                if server.poll() is None: server.kill(); server.communicate()
-                server.stdout.close(); server.stderr.close()
+                stop_child(server)
 
 
 if __name__ == '__main__':

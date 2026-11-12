@@ -7,8 +7,6 @@ import pytest
 
 from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.model import Simulation
-from l2tunnel_sim.tcp_syn_baseline import ProbeQUIC
-from test_tcp_syn_baseline import quic, task as baseline_task
 from test_tcp_syn_probe import case as shared_task
 
 
@@ -31,6 +29,9 @@ def test_serialization_counts_partial_packets_and_excludes_queued_bytes():
 
 
 def test_quic_warmup_leaves_runtime_serialization_counters_empty():
+    pytest.importorskip("aioquic")
+    from l2tunnel_sim.tcp_syn_baseline import ProbeQUIC
+    from test_tcp_syn_baseline import quic
     sim = quic(ProbeQUIC)
     for direction in sim.links:
         for link in direction:
@@ -46,7 +47,17 @@ def test_probe_exports_one_interval_for_payload_and_both_wire_directions(monkeyp
         task = shared_task()
     else:
         study = importlib.import_module("tcp_syn_baseline_regression")
-        task = baseline_task(study, kind="quic" if kind == "quic" else "tcp")
+        if kind == "quic":
+            pytest.importorskip("aioquic")
+        profile = next(dict(item) for item in study.profiles()
+                       if item["kind"] == ("quic" if kind == "quic" else "tcp"))
+        profile.update(flow_count=2, window_bytes=1448 * 40, payload_rate_mbps=1)
+        profile["tcp_syn_probe"] = dict(interval_ms=100, timeout_ms=100, reverse_copies=1,
+            stability_window_s=.02, stability_windows=2, throughput_tolerance_pct=100,
+            queue_tolerance_ms=10)
+        task = dict(profile=profile, run_id=1, payload_bytes=1448, duration_s=.3,
+            warmup_s=.01, drain_s=2, forward_mbps=100, reverse_mbps=10, rtt_ms=20,
+            loss_rate=0, loss_model="iid", mtu=1500, seed=42, replication=1)
         if kind == "compact":
             profile = dict(study.compact_profiles()[0])
             profile.update(flow_count=2, window_bytes=1448 * 40, payload_rate_mbps=1,

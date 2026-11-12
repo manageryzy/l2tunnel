@@ -1,3 +1,4 @@
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_udp_bind.rs"));
 use super::*;
 use crate::Compression;
 use l2tunnel_core::Duplex;
@@ -154,36 +155,39 @@ async fn rolling_actual_udp_and_quic_shared_api_both_layers_and_duplexes() -> Te
             for duplex in [Duplex::Full, Duplex::Half] {
                 let config = connection(layer, duplex);
                 let settings = settings()?;
-                let (a, b) = endpoints(duplex)?;
-                let (first, second) = if is_quic {
-                    let listener =
-                        QuicListener::bind(&c.chain, &c.key, config, as_quic(b), &settings)?;
-                    tokio::try_join!(
-                        connect_quic(
-                            &c.chain,
-                            "rolling-client.test",
-                            &c.member,
-                            config,
-                            as_quic(a),
-                            &settings
-                        ),
-                        listener.accept(&c.members)
-                    )?
-                } else {
-                    let listener = TcpListener::bind("127.0.0.1:0").await?;
-                    tokio::try_join!(
-                        connect_udp(
-                            listener.local_addr()?,
-                            &client,
-                            "rolling-client.test",
-                            &c.member,
-                            config,
-                            a,
-                            &settings
-                        ),
-                        accept_udp(&listener, &server, &c.members, config, b, &settings)
-                    )?
-                };
+                let (first, second) = retry_udp_startup!(8, {
+                    let (a, b) = endpoints(duplex)?;
+                    let pair = if is_quic {
+                        let listener =
+                            QuicListener::bind(&c.chain, &c.key, config, as_quic(b), &settings)?;
+                        tokio::try_join!(
+                            connect_quic(
+                                &c.chain,
+                                "rolling-client.test",
+                                &c.member,
+                                config,
+                                as_quic(a),
+                                &settings
+                            ),
+                            listener.accept(&c.members)
+                        )?
+                    } else {
+                        let listener = TcpListener::bind("127.0.0.1:0").await?;
+                        tokio::try_join!(
+                            connect_udp(
+                                listener.local_addr()?,
+                                &client,
+                                "rolling-client.test",
+                                &c.member,
+                                config,
+                                a,
+                                &settings
+                            ),
+                            accept_udp(&listener, &server, &c.members, config, b, &settings)
+                        )?
+                    };
+                    Ok(pair)
+                })?;
                 let observers = [first.observer(), second.observer()];
                 assert_eq!(observers[0].snapshot().phase, Phase::Authenticated);
                 assert_eq!(

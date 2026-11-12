@@ -20,19 +20,34 @@ from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.multiflow import MultiFlow
 from l2tunnel_sim.compact import CompactConfig
 from l2tunnel_sim.mux_tcp import MuxTCP
-from l2tunnel_sim.reliable_tunnel import ReliableTunnelMultiFlow, TunnelHandshakeProbe
-from l2tunnel_sim.tcp_syn_baseline import BaselineHandshakeProbe, CompactHandshakeProbe, ProbeQUIC, compact_confirmed
+from l2tunnel_sim.tcp_syn_baseline import BaselineHandshakeProbe, CompactHandshakeProbe, compact_confirmed
 from l2tunnel_sim.tcp_syn_probe import SYNProbeConfig
-from payload_sizes import ObservedTCP, RTTLogger, TCPRTTObserver, default_profiles, make_simulation as make_compact_simulation, rtt_metrics, write_csv
+from payload_sizes import ObservedTCP, TCPRTTObserver, default_profiles, make_simulation as make_compact_simulation, rtt_metrics, write_csv
 
 
 PAYLOADS = (64, 256, 512, 1024, 1228, 1448)
 
 
-class ObservedProbeQUIC(ProbeQUIC):
-    def configuration(self, reverse):
-        self.loggers[reverse] = RTTLogger(self)
-        return super().configuration(reverse)
+def _load_probe_quic():
+    if "ObservedProbeQUIC" in globals():
+        return
+    from l2tunnel_sim.tcp_syn_baseline import ProbeQUIC
+    from payload_sizes import RTTLogger
+
+    class ObservedProbeQUIC(ProbeQUIC):
+        def configuration(self, reverse):
+            self.loggers[reverse] = RTTLogger(self)
+            return super().configuration(reverse)
+
+    ObservedProbeQUIC.__qualname__ = "ObservedProbeQUIC"
+    globals()["ObservedProbeQUIC"] = ObservedProbeQUIC
+
+
+def __getattr__(name):
+    if name == "ObservedProbeQUIC":
+        _load_probe_quic()
+        return globals()[name]
+    raise AttributeError(name)
 
 
 class ObservedTunnelTCP(TCPRTTObserver, MuxTCP):
@@ -81,6 +96,7 @@ def make_simulation(task):
     if profile["kind"] == "compact":
         return make_compact_simulation(task)
     if profile['kind'] in ('quic_inner', 'kcp_inner'):
+        from l2tunnel_sim.reliable_tunnel import ReliableTunnelMultiFlow
         payload = task['payload_bytes']
         rate = profile.get('payload_rate_mbps')
         traffic = Traffic(duration_s=task['duration_s'], drain_s=task['drain_s'], frame_bytes=payload + 66,
@@ -101,6 +117,8 @@ def make_simulation(task):
     traffic = Traffic(duration_s=task["duration_s"], drain_s=task["drain_s"], frame_bytes=payload + 66,
                       payload_bytes=payload, window_bytes=profile["window_bytes"],
                       frame_interval_ms=payload * 8 / (rate * 1000) if rate else 0)
+    if profile["kind"] == "quic":
+        _load_probe_quic()
     return MultiFlow(Scenario(task["rtt_ms"], task["loss_rate"], task["loss_model"], mtu=task["mtu"]),
         traffic, (PathConfig(task["forward_mbps"], task["reverse_mbps"]),),
         Strategy(profile["name"], mode=profile["kind"], tcp_cc=profile["controller"],
@@ -112,7 +130,10 @@ def make_simulation(task):
 def execute(task):
     started = perf_counter()
     sim = make_simulation(task)
-    probe_type = (TunnelHandshakeProbe if isinstance(sim, ReliableTunnelMultiFlow) else
+    tunnel = task["profile"]["kind"] in ("quic_inner", "kcp_inner")
+    if tunnel:
+        from l2tunnel_sim.reliable_tunnel import TunnelHandshakeProbe
+    probe_type = (TunnelHandshakeProbe if tunnel else
                   CompactHandshakeProbe if task["profile"]["kind"] == "compact" else BaselineHandshakeProbe)
     probe = probe_type(sim, SYNProbeConfig(**task["profile"]["tcp_syn_probe"]), start_s=task["warmup_s"])
     snapshots = {}
@@ -132,7 +153,7 @@ def execute(task):
         * task["payload_bytes"] * 8 / ((task["duration_s"] - task["warmup_s"]) * 1e6))
     row["tcp_all_acknowledged"] = all(flow.tcp_acked == len(flow.sent_times) for flow in sim.flows)
     row["outer_all_confirmed"] = all(flow.control_confirmed for flow in sim.flows) if probe.quic else True
-    if isinstance(sim, ReliableTunnelMultiFlow):
+    if tunnel:
         row['outer_all_confirmed'] = sim.tunnel_confirmed
     if isinstance(probe, CompactHandshakeProbe):
         row["outer_all_confirmed"] = all(compact_confirmed(transport) for flow in sim.flows

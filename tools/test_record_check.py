@@ -9,6 +9,18 @@ from tools import record_check
 
 
 class SourceIdentityTests(unittest.TestCase):
+    def test_simulator_test_fixture_study_and_manifest_are_source_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = ('simulator/tests/test_example.py', 'simulator/tests/fixtures/example.json',
+                     'simulator/studies/example.py', 'simulator/pyproject.toml')
+            for relative in files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'checked input')
+            with patch.object(record_check, 'ROOT', root):
+                self.assertEqual(set(record_check.hashes()), set(files))
+
     def test_source_target_module_is_hashed_and_mutations_change_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

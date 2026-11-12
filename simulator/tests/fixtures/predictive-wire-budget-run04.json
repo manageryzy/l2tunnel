@@ -1,0 +1,39 @@
+{
+  "run_id": 4,
+  "seed": 11891353551447149637,
+  "profile": {
+    "flow_count": 64
+  },
+  "tcp_retransmissions": 1,
+  "offered_frames": 415285,
+  "forward_source_datagrams": 415351,
+  "shared_tail_repairs": 1,
+  "forward_source_bytes": 620227492,
+  "forward_wire_bytes": 749818492,
+  "shared_scheduled_repairs": 86393,
+  "application_goodput_mbps": 80.02999466666667,
+  "with_drain_tcp_all_segment_ack_rtt_p99_ms": 169.9349782640487,
+  "_fixture_provenance": {
+    "kind": "minimal exact historical projection; analytical accounting only",
+    "source_path": "work/results-20261110/tcp-latency/aligned-record-elision-long/runs/00004.json",
+    "source_sha256": "3131d4dbb475a64f1576f37933f59c6002af186091039898887d709a7f06f4a2",
+    "retained_fields": [
+      "run_id",
+      "seed",
+      "profile",
+      "tcp_retransmissions",
+      "offered_frames",
+      "forward_source_datagrams",
+      "shared_tail_repairs",
+      "forward_source_bytes",
+      "forward_wire_bytes",
+      "shared_scheduled_repairs",
+      "application_goodput_mbps",
+      "with_drain_tcp_all_segment_ack_rtt_p99_ms"
+    ],
+    "profile_projection": [
+      "flow_count"
+    ],
+    "not_a_new_experiment": true
+  }
+}

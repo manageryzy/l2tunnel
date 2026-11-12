@@ -31,3 +31,18 @@ original deadlines. Source23b passes the combined check with the client fixtures
 original 100 ms deadlines and explicitly compatible test control rate preserved.
 This closes the three finite review defects, not native throughput or broad mode
 qualification.
+
+## Test-entry and fixture review
+
+The subsequent review found five test reliability defects. Its first aggregate
+failed with `AddrInUse`; later retries do not erase that original failure.
+A silent child also reproduced an unbounded readiness `readline()`. The clean
+simulator copy needed ignored historical data and a complete optional dependency
+environment. Repairs preserve the original behavioral assertions and historical
+receipts, rather than treating a successful retry as proof of stability.
+
+- [x] [REVIEW-04] Bound pre-start UDP/QUIC fixture retries specifically to actual AddrInUse errors under one original deadline; never retry forwarding or count a bind collision as expected authentication failure. Evidence: [scoped tests](../work/review-tests24/RECEIPT.md), [test helper](../crates/l2tunnel-client-core/src/test_udp_bind.rs).
+- [x] [REVIEW-05] Bound child readiness by an absolute deadline and reap it on failure; retain real IPv4/IPv6 pressure checks and add a silent-child regression. Evidence: [scoped tests](../work/review-tests24/RECEIPT.md), [harness tests](../tools/test_proxy_measured_native_smoke.py).
+- [x] [REVIEW-06] Replace implicit ignored historical-result dependencies with a minimal version-controlled fixture and provenance without weakening original assertions. Evidence: [simulator receipt](../work/review-simulator24/validation.json), [test](../simulator/tests/test_predictive_wire_budget.py).
+- [ ] [REVIEW-07] Execute simulator tests, raw-native example tests and the codec no-default-features branch in the maintained check/CI entry; hash all new test inputs and run the combined check.
+- [x] [REVIEW-08] Defer optional QUIC imports to selected adapters and prove absent aioquic does not block non-QUIC execution. Evidence: [1654-case simulator receipt](../work/review-simulator24/validation.json), [isolated absence regression](../simulator/tests/test_optional_quic_collection.py).

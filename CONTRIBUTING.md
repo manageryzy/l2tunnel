@@ -38,11 +38,20 @@ and restart the rust-analyzer server if the editor was already running. Check
 ## Required checks
 
 ```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e './simulator[dev,quic]'
+.venv/bin/python tools/check.py
+# With that environment already activated:
 python3 tools/check.py
 ```
 
-This runs formatting, Clippy, Rust tests and rustdoc, catalog validation, CLI
-status/failure checks and Linux-only unprivileged lab tests. It does not run
+This runs formatting, Clippy, Rust tests including the raw-native example and
+the codec's no-default-features branch, rustdoc, catalog validation, CLI
+status/failure checks, Linux-only unprivileged lab tests and, on Linux, the complete
+simulator test suite including its native KCP C adapter. The full Linux check requires the simulator's dev and QUIC
+dependencies; it fails explicitly if these are missing. Ordinary simulator
+users may still run non-QUIC tests without the optional QUIC dependency.
+It does not run
 privileged networking, install drivers, rerun the simulator sweeps or certify
 cross-platform execution. `.github/workflows/checks.yml` additionally defines
 Windows host checks and an Android compile-only job.

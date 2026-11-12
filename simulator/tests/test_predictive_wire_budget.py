@@ -10,8 +10,8 @@ from predictive_wire_budget import FORMATS, budget, ideal_bound, prediction_savi
 
 @pytest.fixture
 def source_run():
-    root = Path(__file__).resolve().parents[2]
-    return json.loads((root / 'work/results-20261110/tcp-latency/aligned-record-elision-long/runs/00004.json').read_text())
+    fixture = Path(__file__).with_name('fixtures') / 'predictive-wire-budget-run04.json'
+    return json.loads(fixture.read_text(encoding='utf-8'))
 
 
 def test_predictive_savings_excludes_initial_and_retry_neighbors(source_run):

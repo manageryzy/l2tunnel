@@ -25,7 +25,6 @@ from l2tunnel_sim.compact_tcp import CompactTCP
 from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.experiment import measure
 from l2tunnel_sim.multiflow import MultiFlow
-from l2tunnel_sim.quic import PacketLogger, PacketTrace, QUIC
 from l2tunnel_sim.stats import mean_ci
 from l2tunnel_sim.tcp import PlainTCP
 
@@ -60,35 +59,54 @@ class ObservedCompactTCP(TCPRTTObserver, CompactTCP):
     pass
 
 
-class RTTTrace(PacketTrace):
-    def __init__(self, simulation, **kwargs):
-        super().__init__(**kwargs)
-        self.simulation = simulation
-        self.rtt_observations = []
+def _load_quic():
+    """Import the optional maintained QUIC adapter only for QUIC consumers."""
+    if "ObservedQUIC" in globals():
+        return
+    from l2tunnel_sim.quic import PacketLogger, PacketTrace, QUIC
 
-    def log_event(self, *, category, event, data):
-        super().log_event(category=category, event=event, data=data)
-        if (category == "recovery" and event == "metrics_updated" and "latest_rtt" in data
-                and not getattr(self.simulation, "warming_up", True)):
-            # aioquic emits RTT keys only when ACK processing produces a new
-            # sample. qlog encodes seconds as milliseconds in these fields.
-            self.rtt_observations.append((self.simulation.now, data["latest_rtt"], data["smoothed_rtt"]))
+    class RTTTrace(PacketTrace):
+        def __init__(self, simulation, **kwargs):
+            super().__init__(**kwargs)
+            self.simulation = simulation
+            self.rtt_observations = []
 
-
-class RTTLogger(PacketLogger):
-    def __init__(self, simulation):
-        super().__init__()
-        self.simulation = simulation
-
-    def start_trace(self, is_client, odcid):
-        self.trace = RTTTrace(self.simulation, is_client=is_client, odcid=odcid)
-        return self.trace
+        def log_event(self, *, category, event, data):
+            super().log_event(category=category, event=event, data=data)
+            if (category == "recovery" and event == "metrics_updated" and "latest_rtt" in data
+                    and not getattr(self.simulation, "warming_up", True)):
+                # aioquic emits RTT keys only when ACK processing produces a new
+                # sample. qlog encodes seconds as milliseconds in these fields.
+                self.rtt_observations.append((self.simulation.now, data["latest_rtt"], data["smoothed_rtt"]))
 
 
-class ObservedQUIC(QUIC):
-    def configuration(self, reverse):
-        self.loggers[reverse] = RTTLogger(self)
-        return super().configuration(reverse)
+    class RTTLogger(PacketLogger):
+        def __init__(self, simulation):
+            super().__init__()
+            self.simulation = simulation
+
+        def start_trace(self, is_client, odcid):
+            self.trace = RTTTrace(self.simulation, is_client=is_client, odcid=odcid)
+            return self.trace
+
+
+    class ObservedQUIC(QUIC):
+        def configuration(self, reverse):
+            self.loggers[reverse] = RTTLogger(self)
+            return super().configuration(reverse)
+
+    for name, value in (("RTTTrace", RTTTrace), ("RTTLogger", RTTLogger),
+                        ("ObservedQUIC", ObservedQUIC)):
+        value.__qualname__ = name
+        globals()[name] = value
+    globals()["QUIC"] = QUIC
+
+
+def __getattr__(name):
+    if name in {"RTTTrace", "RTTLogger", "ObservedQUIC", "QUIC"}:
+        _load_quic()
+        return globals()[name]
+    raise AttributeError(name)
 
 
 def default_profiles():
@@ -120,6 +138,7 @@ def make_simulation(task):
                         tcp_cc=profile.get("controller", "cubic"), tcp_rto_min_ms=profile.get("rto_min_ms", 200))
     args = (scenario, traffic, (PathConfig(task["forward_mbps"], task["reverse_mbps"]),), strategy, task["seed"])
     if kind == "quic":
+        _load_quic()
         factory = ObservedQUIC
     elif kind == "tcp":
         factory = ObservedTCP
@@ -146,9 +165,16 @@ def quantiles(values):
     return np.percentile(values, PERCENTILES).tolist() if values else [None] * len(PERCENTILES)
 
 
+def _is_quic(flow):
+    # An actual QUIC instance necessarily loaded its adapter already.
+    import sys
+    adapter = sys.modules.get("l2tunnel_sim.quic")
+    return adapter is not None and isinstance(flow, adapter.QUIC)
+
+
 def rtt_metrics(sim, warmup):
     flows = sim.flows if isinstance(sim, MultiFlow) else [sim]
-    is_quic = isinstance(flows[0], QUIC)
+    is_quic = _is_quic(flows[0])
     tcp = [sample for flow in flows for sample in getattr(flow, "ack_rtt_observations", [])]
     timestamp = [sample for flow in flows for sample in getattr(flow, "timestamp_rtt_observations", [])]
     smoothed = [(record[0], record[2]) for record in timestamp]
@@ -207,7 +233,7 @@ def execute(task):
     row["flow_count"] = len(flows)
     row["total_window_bytes"] = sum(flow.traffic.window_bytes for flow in flows)
     for name in ("tcp_timeouts", "tcp_retransmissions", "tcp_fast_retransmits"):
-        row[name] = sum(getattr(flow, name) for flow in flows) if not isinstance(flows[0], QUIC) else None
+        row[name] = sum(getattr(flow, name) for flow in flows) if not _is_quic(flows[0]) else None
     start, end = snapshots[task["warmup_s"]], snapshots[task["duration_s"]]
     steady_frames = end[0] - start[0]
     row["application_goodput_mbps"] = row["tcp_goodput_mbps"]
@@ -232,7 +258,7 @@ def execute(task):
         dict(flow_id=index, offered=len(flow.sent_times), received=flow.tcp_received, acknowledged=flow.tcp_acked,
              final_srtt_ms=flow.srtt * 1000 if getattr(flow, "srtt", None) is not None else None)
         for index, flow in enumerate(flows, 1)])
-    row["measurement_payload_kind"] = "QUIC L2 record payload equivalent" if isinstance(flows[0], QUIC) else "modeled TCP application data"
+    row["measurement_payload_kind"] = "QUIC L2 record payload equivalent" if _is_quic(flows[0]) else "modeled TCP application data"
     row["compute_seconds"] = perf_counter() - started
     assert row["tcp_acked_frames"] <= row["tcp_delivered_frames"] <= row["offered_frames"]
     assert row["forward_l2_bytes"] == row["released_frames"] * (task["payload_bytes"] + 66)

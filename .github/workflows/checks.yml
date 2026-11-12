@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+      - run: python -m pip install -e "./simulator[dev,quic]"
+        if: runner.os == 'Linux'
       - run: python tools/check.py
   android-contracts:
     runs-on: ubuntu-latest

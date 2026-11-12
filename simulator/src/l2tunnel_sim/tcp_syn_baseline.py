@@ -4,11 +4,7 @@ from collections import defaultdict, deque
 from struct import Struct
 from types import SimpleNamespace
 
-from aioquic.quic.events import ConnectionTerminated, HandshakeCompleted, StreamDataReceived
-from aioquic.quic.rangeset import RangeSet
-
 from .compact_tcp import CompactTCP
-from .quic import IP_UDP_BYTES, QUIC
 from .tcp import ETHERNET_BYTES, PlainTCP
 from .tcp_syn_probe import EVENT_HEADER, SYNProbeConfig, TCPHandshakeProbe, handshake_frame
 
@@ -21,154 +17,172 @@ def range_prefix(ranges):
     return ranges[0].stop if len(ranges) and ranges[0].start == 0 else 0
 
 
-class ProbeQUIC(QUIC):
-    """Keep bulk stream zero intact and carry framed control records on stream four.
+def _load_probe_quic():
+    """Load QUIC classes without making native TCP depend on the QUIC extra."""
+    if "ProbeQUIC" in globals():
+        return
+    from aioquic.quic.events import ConnectionTerminated, HandshakeCompleted, StreamDataReceived
+    from aioquic.quic.rangeset import RangeSet
+    from .quic import IP_UDP_BYTES, QUIC
 
-    Both streams use the same established QUIC connection, congestion controller,
-    connection flow control, packet scheduler, physical queues and erasures.
-    qlog offsets are tracked separately so control records cannot become bulk data.
-    """
+    class ProbeQUIC(QUIC):
+        """Keep bulk stream zero intact and carry framed control records on stream four.
 
-    def __init__(self, *args, **kwargs):
-        self.control_started = False
-        self.stream_sent_ends = [defaultdict(int), defaultdict(int)]
-        self.control_packets = [{}, {}]
-        self.control_acknowledged = [RangeSet(), RangeSet()]
-        self.control_submitted = [0, 0]
-        self.control_received = [0, 0]
-        self.control_callbacks = [deque(), deque()]
-        self.control_buffers = [bytearray(), bytearray()]
-        self.control_retransmitted = [0, 0]
-        self.control_departed_datagrams = [0, 0]
-        self.control_departed_packet_bytes = [0, 0]
-        super().__init__(*args, **kwargs)
-        if not self.strategy.quic_l2:
-            raise ValueError("TCP handshake adapter requires QUIC L2 mode")
+        Both streams use the same established QUIC connection, congestion controller,
+        connection flow control, packet scheduler, physical queues and erasures.
+        qlog offsets are tracked separately so control records cannot become bulk data.
+        """
 
-    def submit_control(self, reverse, body, callback):
-        body = bytes(body)
-        if not body or len(body) > 65535:
-            raise ValueError("QUIC control record length must fit a nonzero uint16")
-        self.control_started = True
-        encoded = RECORD_LENGTH.pack(len(body)) + body
-        self.control_callbacks[reverse].append(callback)
-        self.control_submitted[reverse] += len(encoded)
-        self.connections[reverse].send_stream_data(CONTROL_STREAM, encoded)
-        self.flush(reverse)
+        def __init__(self, *args, **kwargs):
+            self.control_started = False
+            self.stream_sent_ends = [defaultdict(int), defaultdict(int)]
+            self.control_packets = [{}, {}]
+            self.control_acknowledged = [RangeSet(), RangeSet()]
+            self.control_submitted = [0, 0]
+            self.control_received = [0, 0]
+            self.control_callbacks = [deque(), deque()]
+            self.control_buffers = [bytearray(), bytearray()]
+            self.control_retransmitted = [0, 0]
+            self.control_departed_datagrams = [0, 0]
+            self.control_departed_packet_bytes = [0, 0]
+            super().__init__(*args, **kwargs)
+            if not self.strategy.quic_l2:
+                raise ValueError("TCP handshake adapter requires QUIC L2 mode")
 
-    def flush(self, reverse):
-        if self.warming_up:
-            return super().flush(reverse)
-        connection = self.connections[reverse]
-        datagrams = connection.datagrams_to_send(now=self.protocol_time)
-        trace = self.loggers[reverse].trace
-        packets = list(trace.sent)
-        trace.sent.clear()
-        if len(datagrams) != len(packets):
-            raise RuntimeError("unexpected QUIC packet coalescing after warmup")
-        for (data, _), packet in zip(datagrams, packets):
-            streams = [frame for frame in packet["frames"] if frame["frame_type"] == "stream"]
-            bulk = [frame for frame in streams if frame["stream_id"] == 0]
-            control = [frame for frame in streams if frame["stream_id"] == CONTROL_STREAM]
-            if len(bulk) + len(control) != len(streams):
-                raise ValueError("unexpected stream in QUIC handshake adapter")
-            number = packet["header"]["packet_number"]
-            if not reverse:
-                self.sent_packets[number] = bulk
-            if control:
-                self.control_packets[reverse][number] = [
-                    (frame["offset"], frame["offset"] + frame["length"]) for frame in control if frame["length"]]
-            repeated = defaultdict(int)
-            for frame in streams:
-                stream = frame["stream_id"]
-                repeated[stream] += min(frame["length"], max(0, self.stream_sent_ends[reverse][stream] - frame["offset"]))
-                self.stream_sent_ends[reverse][stream] = max(
-                    self.stream_sent_ends[reverse][stream], frame["offset"] + frame["length"])
-            if not reverse:
-                self.stream_sent_end = self.stream_sent_ends[False][0]
-            kind = "retry" if sum(repeated.values()) else "source" if streams else "feedback"
-            self.send_datagram(reverse, data, kind, repeated[0] if not reverse else 0)
-            if control:
-                self.at(self.links[reverse][0].free_at, self.record_control_departure,
-                        reverse, len(data) + IP_UDP_BYTES, repeated[CONTROL_STREAM])
-        self.quic_cwnd_bytes = self.loggers[False].trace.congestion_window
-        self.timer_versions[reverse] += 1
-        when = connection.get_timer()
-        if when is not None:
-            self.at(max(when - self.clock_offset, self.now + 1e-9),
-                    self.on_timer, reverse, self.timer_versions[reverse])
+        def submit_control(self, reverse, body, callback):
+            body = bytes(body)
+            if not body or len(body) > 65535:
+                raise ValueError("QUIC control record length must fit a nonzero uint16")
+            self.control_started = True
+            encoded = RECORD_LENGTH.pack(len(body)) + body
+            self.control_callbacks[reverse].append(callback)
+            self.control_submitted[reverse] += len(encoded)
+            self.connections[reverse].send_stream_data(CONTROL_STREAM, encoded)
+            self.flush(reverse)
 
-    def record_control_departure(self, reverse, size, repeated):
-        self.control_departed_datagrams[reverse] += 1
-        self.control_departed_packet_bytes[reverse] += size
-        self.control_retransmitted[reverse] += repeated
+        def flush(self, reverse):
+            if self.warming_up:
+                return super().flush(reverse)
+            connection = self.connections[reverse]
+            datagrams = connection.datagrams_to_send(now=self.protocol_time)
+            trace = self.loggers[reverse].trace
+            packets = list(trace.sent)
+            trace.sent.clear()
+            if len(datagrams) != len(packets):
+                raise RuntimeError("unexpected QUIC packet coalescing after warmup")
+            for (data, _), packet in zip(datagrams, packets):
+                streams = [frame for frame in packet["frames"] if frame["frame_type"] == "stream"]
+                bulk = [frame for frame in streams if frame["stream_id"] == 0]
+                control = [frame for frame in streams if frame["stream_id"] == CONTROL_STREAM]
+                if len(bulk) + len(control) != len(streams):
+                    raise ValueError("unexpected stream in QUIC handshake adapter")
+                number = packet["header"]["packet_number"]
+                if not reverse:
+                    self.sent_packets[number] = bulk
+                if control:
+                    self.control_packets[reverse][number] = [
+                        (frame["offset"], frame["offset"] + frame["length"]) for frame in control if frame["length"]]
+                repeated = defaultdict(int)
+                for frame in streams:
+                    stream = frame["stream_id"]
+                    repeated[stream] += min(frame["length"], max(0, self.stream_sent_ends[reverse][stream] - frame["offset"]))
+                    self.stream_sent_ends[reverse][stream] = max(
+                        self.stream_sent_ends[reverse][stream], frame["offset"] + frame["length"])
+                if not reverse:
+                    self.stream_sent_end = self.stream_sent_ends[False][0]
+                kind = "retry" if sum(repeated.values()) else "source" if streams else "feedback"
+                self.send_datagram(reverse, data, kind, repeated[0] if not reverse else 0)
+                if control:
+                    self.at(self.links[reverse][0].free_at, self.record_control_departure,
+                            reverse, len(data) + IP_UDP_BYTES, repeated[CONTROL_STREAM])
+            self.quic_cwnd_bytes = self.loggers[False].trace.congestion_window
+            self.timer_versions[reverse] += 1
+            when = connection.get_timer()
+            if when is not None:
+                self.at(max(when - self.clock_offset, self.now + 1e-9),
+                        self.on_timer, reverse, self.timer_versions[reverse])
 
-    def observe_packet(self, reverse, packet):
-        # Preserve the established bulk observer, including its cumulative credit.
-        bulk_packet = dict(packet, frames=[frame for frame in packet["frames"]
-            if frame["frame_type"] != "stream" or frame["stream_id"] == 0])
-        super().observe_packet(reverse, bulk_packet)
-        for frame in packet["frames"]:
-            if frame["frame_type"] != "ack":
-                continue
-            for number in list(self.control_packets[reverse]):
-                if any(low <= number <= high for low, high in frame["acked_ranges"]):
-                    for start, end in self.control_packets[reverse].pop(number):
-                        self.control_acknowledged[reverse].add(start, end)
+        def record_control_departure(self, reverse, size, repeated):
+            self.control_departed_datagrams[reverse] += 1
+            self.control_departed_packet_bytes[reverse] += size
+            self.control_retransmitted[reverse] += repeated
 
-    def receive_control(self, reverse, data):
-        sender = not reverse
-        self.control_received[sender] += len(data)
-        buffer = self.control_buffers[reverse]
-        buffer.extend(data)
-        while len(buffer) >= RECORD_LENGTH.size:
-            size, = RECORD_LENGTH.unpack_from(buffer)
-            if not size:
-                raise ValueError("empty QUIC control record")
-            end = RECORD_LENGTH.size + size
-            if len(buffer) < end:
-                break
-            body = bytes(buffer[RECORD_LENGTH.size:end])
-            del buffer[:end]
-            if not self.control_callbacks[sender]:
-                raise ValueError("unexpected QUIC control record")
-            callback = self.control_callbacks[sender].popleft()
-            callback(body)
-
-    def handle_events(self, reverse):
-        if not self.control_started:
-            return super().handle_events(reverse)
-        while (event := self.connections[reverse].next_event()) is not None:
-            if isinstance(event, HandshakeCompleted):
-                self.handshakes[reverse] = True
-            elif isinstance(event, ConnectionTerminated):
-                raise RuntimeError(f"QUIC connection terminated: {event.error_code} {event.reason_phrase}")
-            elif isinstance(event, StreamDataReceived):
-                if event.stream_id == CONTROL_STREAM:
-                    self.receive_control(reverse, event.data)
+        def observe_packet(self, reverse, packet):
+            # Preserve the established bulk observer, including its cumulative credit.
+            bulk_packet = dict(packet, frames=[frame for frame in packet["frames"]
+                if frame["frame_type"] != "stream" or frame["stream_id"] == 0])
+            super().observe_packet(reverse, bulk_packet)
+            for frame in packet["frames"]:
+                if frame["frame_type"] != "ack":
                     continue
-                if event.stream_id != 0 or not reverse:
-                    raise ValueError("unexpected bulk stream event")
-                self.stream_received_bytes += len(event.data)
-                received = self.stream_received_bytes // self.record_bytes
-                advanced = received - self.tcp_received
-                for index in range(self.tcp_received, received):
-                    self.forward.delays.append((self.now - self.sent_times[index]) * 1000)
-                self.forward.delivered_bytes += advanced * self.traffic.frame_bytes
-                if self.now <= self.traffic.duration_s:
-                    self.tcp_payload_bytes += advanced * self.traffic.payload_bytes
-                    self.forward.delivered_during_measurement_bytes += advanced * self.traffic.frame_bytes
-                self.tcp_received = received
-        if reverse and not self.warming_up:
-            buffered = sum(part.stop - max(part.start, self.stream_received_bytes)
-                           for part in self.received_ranges if part.stop > self.stream_received_bytes)
-            self.forward.peak_reorder_bytes = max(self.forward.peak_reorder_bytes, buffered)
+                for number in list(self.control_packets[reverse]):
+                    if any(low <= number <= high for low, high in frame["acked_ranges"]):
+                        for start, end in self.control_packets[reverse].pop(number):
+                            self.control_acknowledged[reverse].add(start, end)
 
-    @property
-    def control_confirmed(self):
-        return (not any(self.control_callbacks) and not any(self.control_buffers)
-                and all(range_prefix(self.control_acknowledged[direction]) == self.control_submitted[direction]
-                        for direction in (False, True)))
+        def receive_control(self, reverse, data):
+            sender = not reverse
+            self.control_received[sender] += len(data)
+            buffer = self.control_buffers[reverse]
+            buffer.extend(data)
+            while len(buffer) >= RECORD_LENGTH.size:
+                size, = RECORD_LENGTH.unpack_from(buffer)
+                if not size:
+                    raise ValueError("empty QUIC control record")
+                end = RECORD_LENGTH.size + size
+                if len(buffer) < end:
+                    break
+                body = bytes(buffer[RECORD_LENGTH.size:end])
+                del buffer[:end]
+                if not self.control_callbacks[sender]:
+                    raise ValueError("unexpected QUIC control record")
+                callback = self.control_callbacks[sender].popleft()
+                callback(body)
+
+        def handle_events(self, reverse):
+            if not self.control_started:
+                return super().handle_events(reverse)
+            while (event := self.connections[reverse].next_event()) is not None:
+                if isinstance(event, HandshakeCompleted):
+                    self.handshakes[reverse] = True
+                elif isinstance(event, ConnectionTerminated):
+                    raise RuntimeError(f"QUIC connection terminated: {event.error_code} {event.reason_phrase}")
+                elif isinstance(event, StreamDataReceived):
+                    if event.stream_id == CONTROL_STREAM:
+                        self.receive_control(reverse, event.data)
+                        continue
+                    if event.stream_id != 0 or not reverse:
+                        raise ValueError("unexpected bulk stream event")
+                    self.stream_received_bytes += len(event.data)
+                    received = self.stream_received_bytes // self.record_bytes
+                    advanced = received - self.tcp_received
+                    for index in range(self.tcp_received, received):
+                        self.forward.delays.append((self.now - self.sent_times[index]) * 1000)
+                    self.forward.delivered_bytes += advanced * self.traffic.frame_bytes
+                    if self.now <= self.traffic.duration_s:
+                        self.tcp_payload_bytes += advanced * self.traffic.payload_bytes
+                        self.forward.delivered_during_measurement_bytes += advanced * self.traffic.frame_bytes
+                    self.tcp_received = received
+            if reverse and not self.warming_up:
+                buffered = sum(part.stop - max(part.start, self.stream_received_bytes)
+                               for part in self.received_ranges if part.stop > self.stream_received_bytes)
+                self.forward.peak_reorder_bytes = max(self.forward.peak_reorder_bytes, buffered)
+
+        @property
+        def control_confirmed(self):
+            return (not any(self.control_callbacks) and not any(self.control_buffers)
+                    and all(range_prefix(self.control_acknowledged[direction]) == self.control_submitted[direction]
+                            for direction in (False, True)))
+
+    ProbeQUIC.__qualname__ = "ProbeQUIC"
+    globals()["ProbeQUIC"] = ProbeQUIC
+
+
+def __getattr__(name):
+    if name == "ProbeQUIC":
+        _load_probe_quic()
+        return globals()[name]
+    raise AttributeError(name)
 
 
 class BaselineHandshakeProbe(TCPHandshakeProbe):
@@ -177,8 +191,9 @@ class BaselineHandshakeProbe(TCPHandshakeProbe):
     def __init__(self, simulation, config=SYNProbeConfig(), **kwargs):
         if config.reverse_copies != 1:
             raise ValueError("baseline probes use one native TCP response or one reliable QUIC record")
-        self.quic = isinstance(simulation.flows[0], ProbeQUIC)
-        expected = ProbeQUIC if self.quic else PlainTCP
+        probe_type = globals().get("ProbeQUIC")
+        self.quic = probe_type is not None and isinstance(simulation.flows[0], probe_type)
+        expected = probe_type if self.quic else PlainTCP
         if any(not isinstance(flow, expected) or hasattr(flow, "compact_config") for flow in simulation.flows):
             raise ValueError("baseline probes require homogeneous native TCP or ProbeQUIC flows")
         # The parent only uses the shared endpoint for its default transmit path.

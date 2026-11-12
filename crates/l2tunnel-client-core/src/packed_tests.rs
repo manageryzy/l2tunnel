@@ -1,4 +1,5 @@
 //! Real client entry points, canonical bindings and nonblocking native endpoints.
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_udp_bind.rs"));
 use super::*;
 use l2tunnel_core::Duplex;
 use l2tunnel_device::{PacketDevice, PacketLayer};
@@ -232,10 +233,10 @@ async fn packed_udp_clients_forward_both_layers_and_duplex_modes() -> TestResult
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
             let settings = settings();
-            let (a, b) = endpoints(duplex)?;
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let ((a_link, transport, records), (b_link, _, _)) =
-                timeout(Duration::from_secs(8), async {
+            let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
+                let (a, b) = endpoints(duplex)?;
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let links = timeout(Duration::from_secs(8), async {
                     tokio::try_join!(
                         connect_udp(
                             listener.local_addr()?,
@@ -257,6 +258,8 @@ async fn packed_udp_clients_forward_both_layers_and_duplex_modes() -> TestResult
                     )
                 })
                 .await??;
+                Ok(links)
+            })?;
             let first = frames(layer, 1)?;
             let second = frames(layer, 2)?;
             let an = Native::default();
@@ -296,16 +299,16 @@ async fn packed_quic_clients_forward_both_layers_and_duplex_modes() -> TestResul
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
             let settings = settings();
-            let (a, b) = endpoints(duplex)?;
-            let listener = QuicListener::bind(
-                &credentials.chain,
-                &credentials.key,
-                config,
-                as_quic(b),
-                settings,
-            )?;
-            let ((a_link, transport, records), (b_link, _, _)) =
-                timeout(Duration::from_secs(8), async {
+            let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
+                let (a, b) = endpoints(duplex)?;
+                let listener = QuicListener::bind(
+                    &credentials.chain,
+                    &credentials.key,
+                    config,
+                    as_quic(b),
+                    settings,
+                )?;
+                let links = timeout(Duration::from_secs(8), async {
                     tokio::try_join!(
                         connect_quic(
                             &credentials.chain,
@@ -319,6 +322,8 @@ async fn packed_quic_clients_forward_both_layers_and_duplex_modes() -> TestResul
                     )
                 })
                 .await??;
+                Ok(links)
+            })?;
             let first = frames(layer, 1)?;
             let second = frames(layer, 2)?;
             let an = Native::default();

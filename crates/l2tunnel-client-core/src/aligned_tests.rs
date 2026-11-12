@@ -1,4 +1,5 @@
 //! Real client entry points, canonical bindings and nonblocking native endpoints.
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_udp_bind.rs"));
 use super::*;
 use l2tunnel_core::Duplex;
 use l2tunnel_device::{PacketDevice, PacketLayer};
@@ -181,10 +182,10 @@ async fn aligned_udp_clients_forward_both_layers_and_duplex_modes() -> TestResul
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
             let settings = Settings { channels: 4 };
-            let (a, b) = endpoints(duplex)?;
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let ((a_link, transport, records), (b_link, _, _)) =
-                timeout(Duration::from_secs(8), async {
+            let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
+                let (a, b) = endpoints(duplex)?;
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let links = timeout(Duration::from_secs(8), async {
                     tokio::try_join!(
                         connect_udp(
                             listener.local_addr()?,
@@ -206,6 +207,8 @@ async fn aligned_udp_clients_forward_both_layers_and_duplex_modes() -> TestResul
                     )
                 })
                 .await??;
+                Ok(links)
+            })?;
             let first = frame(layer, 1);
             let second = frame(layer, 2);
             let an = Native::default();
@@ -245,16 +248,16 @@ async fn aligned_quic_clients_forward_both_layers_and_duplex_modes() -> TestResu
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
             let settings = Settings { channels: 4 };
-            let (a, b) = endpoints(duplex)?;
-            let listener = QuicListener::bind(
-                &credentials.chain,
-                &credentials.key,
-                config,
-                as_quic(b),
-                settings,
-            )?;
-            let ((a_link, transport, records), (b_link, _, _)) =
-                timeout(Duration::from_secs(8), async {
+            let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
+                let (a, b) = endpoints(duplex)?;
+                let listener = QuicListener::bind(
+                    &credentials.chain,
+                    &credentials.key,
+                    config,
+                    as_quic(b),
+                    settings,
+                )?;
+                let links = timeout(Duration::from_secs(8), async {
                     tokio::try_join!(
                         connect_quic(
                             &credentials.chain,
@@ -268,6 +271,8 @@ async fn aligned_quic_clients_forward_both_layers_and_duplex_modes() -> TestResu
                     )
                 })
                 .await??;
+                Ok(links)
+            })?;
             let first = frame(layer, 1);
             let second = frame(layer, 2);
             let an = Native::default();
@@ -356,56 +361,88 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
     let config = connection(PacketLayer::Ethernet, Duplex::Full);
     let client = ClientTls::from_der_roots(&credentials.chain)?;
     let server = ServerTls::from_der(&credentials.chain, &credentials.key)?;
-    let (a, b) = endpoints(Duplex::Full)?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let results = timeout(Duration::from_secs(5), async {
-        tokio::join!(
-            connect_udp(
-                address,
-                &client,
-                "aligned-client.test",
-                &credentials.member,
-                config,
-                a,
-                Settings { channels: 4 }
-            ),
-            accept_udp(
-                &listener,
-                &server,
-                &credentials.members,
-                config,
-                b,
-                Settings { channels: 2 }
+    let (first, second) = retry_udp_startup!(5, {
+        let (a, b) = endpoints(Duplex::Full)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let results = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                connect_udp(
+                    address,
+                    &client,
+                    "aligned-client.test",
+                    &credentials.member,
+                    config,
+                    a,
+                    Settings { channels: 4 }
+                ),
+                accept_udp(
+                    &listener,
+                    &server,
+                    &credentials.members,
+                    config,
+                    b,
+                    Settings { channels: 2 }
+                )
             )
-        )
-    });
-    // Resolve local address before the joined operations so both paths must actually fail.
-    let (first, second) = results.await?;
+        });
+        // Resolve local address before the joined operations so both paths must actually fail.
+        let (first, second) = results.await?;
+        if first
+            .as_ref()
+            .err()
+            .is_some_and(|e| udp_startup_addr_in_use(e))
+            || second
+                .as_ref()
+                .err()
+                .is_some_and(|e| udp_startup_addr_in_use(e))
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::AddrInUse, "test startup bind collision").into(),
+            );
+        }
+        Ok((first, second))
+    })?;
     assert!(first.is_err());
     assert!(second.is_err());
-    let (a, b) = endpoints(Duplex::Full)?;
-    let listener = QuicListener::bind(
-        &credentials.chain,
-        &credentials.key,
-        config,
-        as_quic(b),
-        Settings { channels: 2 },
-    )?;
-    let (first, second) = timeout(Duration::from_secs(5), async {
-        tokio::join!(
-            connect_quic(
-                &credentials.chain,
-                "aligned-client.test",
-                &credentials.member,
-                config,
-                as_quic(a),
-                Settings { channels: 4 }
-            ),
-            listener.accept(&credentials.members)
-        )
-    })
-    .await?;
+    let (first, second) = retry_udp_startup!(5, {
+        let (a, b) = endpoints(Duplex::Full)?;
+        let listener = QuicListener::bind(
+            &credentials.chain,
+            &credentials.key,
+            config,
+            as_quic(b),
+            Settings { channels: 2 },
+        )?;
+        let (first, second) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                connect_quic(
+                    &credentials.chain,
+                    "aligned-client.test",
+                    &credentials.member,
+                    config,
+                    as_quic(a),
+                    Settings { channels: 4 }
+                ),
+                listener.accept(&credentials.members)
+            )
+        })
+        .await?;
+        if first
+            .as_ref()
+            .err()
+            .is_some_and(|e| udp_startup_addr_in_use(e))
+            || second
+                .as_ref()
+                .err()
+                .is_some_and(|e| udp_startup_addr_in_use(e))
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::AddrInUse, "test startup bind collision").into(),
+            );
+        }
+        Ok((first, second))
+    })?;
     assert!(first.is_err());
     assert!(second.is_err());
     Ok(())
@@ -417,38 +454,44 @@ async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> Test
     let server = ServerTls::from_der(&credentials.chain, &credentials.key)?;
     for duplex in [Duplex::Full, Duplex::Half] {
         let config = connection(PacketLayer::Ethernet, duplex);
-        let (a, b) = endpoints(duplex)?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        timeout(Duration::from_secs(8), async {
-            tokio::try_join!(
-                udp::connect(
-                    listener.local_addr()?,
-                    &client,
-                    "aligned-client.test",
-                    &credentials.member,
-                    config,
-                    a
-                ),
-                udp::accept(&listener, &server, &credentials.members, config, b)
-            )
-        })
-        .await??;
-        let (a, b) = endpoints(duplex)?;
-        let listener =
-            quic::Listener::bind(&credentials.chain, &credentials.key, config, as_quic(b))?;
-        timeout(Duration::from_secs(8), async {
-            tokio::try_join!(
-                quic::connect(
-                    &credentials.chain,
-                    "aligned-client.test",
-                    &credentials.member,
-                    config,
-                    as_quic(a)
-                ),
-                listener.accept(&credentials.members)
-            )
-        })
-        .await??;
+        retry_udp_startup!(8, {
+            let (a, b) = endpoints(duplex)?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            timeout(Duration::from_secs(8), async {
+                tokio::try_join!(
+                    udp::connect(
+                        listener.local_addr()?,
+                        &client,
+                        "aligned-client.test",
+                        &credentials.member,
+                        config,
+                        a
+                    ),
+                    udp::accept(&listener, &server, &credentials.members, config, b)
+                )
+            })
+            .await??;
+            Ok(())
+        })?;
+        retry_udp_startup!(8, {
+            let (a, b) = endpoints(duplex)?;
+            let listener =
+                quic::Listener::bind(&credentials.chain, &credentials.key, config, as_quic(b))?;
+            timeout(Duration::from_secs(8), async {
+                tokio::try_join!(
+                    quic::connect(
+                        &credentials.chain,
+                        "aligned-client.test",
+                        &credentials.member,
+                        config,
+                        as_quic(a)
+                    ),
+                    listener.accept(&credentials.members)
+                )
+            })
+            .await??;
+            Ok(())
+        })?;
     }
     assert!(
         quic::finish_pair(
@@ -459,4 +502,51 @@ async fn frame_client_helpers_preserve_original_full_and_half_bindings() -> Test
         .is_err()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn udp_startup_retry_is_bounded_and_only_retries_bind_collisions() -> TestResult {
+    let attempts = std::cell::Cell::new(0);
+    let value = retry_udp_startup!(1, {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "injected pre-start bind").into());
+        }
+        Ok(7)
+    })?;
+    assert_eq!(value, 7);
+    assert_eq!(attempts.get(), 2);
+    for (kind, expected) in [
+        (io::ErrorKind::AddrInUse, 4),
+        (io::ErrorKind::PermissionDenied, 1),
+    ] {
+        attempts.set(0);
+        let result: Result<(), TestError> = retry_udp_startup!(1, {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(kind, "injected startup error").into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_startup_retries_cannot_renew_original_deadline() {
+    let attempts = std::cell::Cell::new(0);
+    let result: Result<(), TestError> = async {
+        retry_udp_startup!(1, {
+            attempts.set(attempts.get() + 1);
+            sleep(Duration::from_millis(300)).await;
+            Err::<(), _>(io::Error::new(io::ErrorKind::AddrInUse, "injected bind collision").into())
+        })?;
+        Ok(())
+    }
+    .await;
+    assert!(result.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    }));
+    assert_eq!(attempts.get(), 4);
 }

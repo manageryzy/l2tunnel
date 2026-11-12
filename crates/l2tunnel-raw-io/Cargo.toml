@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "raw-native"
+test = true
+
 [lints]
 workspace = true
 
