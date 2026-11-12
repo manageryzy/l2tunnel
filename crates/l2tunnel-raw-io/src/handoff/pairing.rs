@@ -20,6 +20,9 @@ use std::{
 use tokio::time::{Instant, Sleep};
 use tokio_rustls::rustls::pki_types::ServerName;
 mod keys;
+/// Experimental original-owner TLS to protected packet transition.
+pub mod packet;
+mod phase_wire;
 mod profile;
 use keys::{Keys, Roots};
 use profile::{Profile, RECORD, TRANSCRIPT};
@@ -710,7 +713,14 @@ fn build<'a, I: PacketIo + Send + 'static>(
     credentials: Credentials<'a>,
     config: PairConfig,
 ) -> Result<PairSetup<'a, I>, PairStartFailure<I>> {
-    let start = Instant::now();
+    build_at(inputs, credentials, config, Instant::now())
+}
+fn build_at<'a, I: PacketIo + Send + 'static>(
+    inputs: RawInputs<I>,
+    credentials: Credentials<'a>,
+    config: PairConfig,
+    start: Instant,
+) -> Result<PairSetup<'a, I>, PairStartFailure<I>> {
     let prepared = (|| {
         tokio::runtime::Handle::try_current().map_err(|_| PairError::Runtime)?;
         if let Credentials::Client(_, name, _) = credentials

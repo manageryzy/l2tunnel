@@ -2,12 +2,15 @@
 
 Status: the pure tracked engine, counted stream gate and separate switchable I/O
 driver are implemented. Pure/mock tests cover local transfer; authenticated TLS
-freeze, packet-phase integration and native transfer remain planned. The [reviewed stack getter](raw-stack-handoff.md) observes
+freeze and startup packet-phase integration now have finite full/half mock
+evidence in [checkpoint 15](../../work/raw-transition-checkpoint15/REPORT.md);
+native transfer remains unqualified. The [reviewed stack getter](raw-stack-handoff.md) observes
 logical TCP state; external ownership is a separate proof. Existing `TcpEngine`,
 `bridge`, `Driver::run`, `open` and `open_marked` contracts remain unchanged.
 No native packet-phase test or client capability is authorized by this document.
 The next [authenticated TLS/peer transition contract](raw-tls-transition.md) is
-design only and keeps its TLS-buffer feasibility and native gates explicit.
+implemented for bounded startup use; its larger TLS/failure/native acceptance
+gates remain explicit and open.
 
 ## Pure tracked owner
 
@@ -233,7 +236,7 @@ full peer/native queue cannot postpone the deadline indefinitely. A partially
 transferred object is never exposed through a notification before the driver
 actually returns its unique handoff result.
 
-This slice does not yet implement the required pre-Seal authenticated packet
+That earlier slice did not implement the required pre-Seal authenticated packet
 classifier/quarantine, old-prefix responder, all-lane Prepare/Seal/Hello/Commit,
 packet crypto metadata validator or native drain. In the final profile, early
 protected phase packets must never enter the old TCP/TLS stream. The classifier
@@ -305,3 +308,22 @@ physical send subsequently lost in transit; it does not mean peer receipt. A
 WouldBlock packet remains byte-identical and owned until that send succeeds.
 The identity test uses the original mock owner's allocation, not a Linux file
 descriptor. Tests emit no privileged network operations and do not run TLS.
+
+## Startup transition checkpoint 15
+
+The from-birth packet wrapper now moves through actual `HandoffParts` with the
+same original I/O, opener/replay state and frozen TLS object. The maintained
+snapshot remains authoritative for TCP acceptance/frontiers. Its
+`last_window_sent` precedes a pinned smoltcp interface encoder clamp, so the
+wrapper additionally records the last **physically successful encoded** ACK/window
+and verifies its sequence end and ACK against the final maintained snapshot.
+This is a narrow original-send witness, not an independent TCP acceptance model.
+The actual emitted window controls the finite receive horizon, old-prefix ACK and
+Hello proof. A packet-slot/window profile too small for eight maximum controls
+plus one data cell is rejected terminally after consume.
+
+The focused raw crates passed 147 tests (126 raw-I/O, 21 raw-TCP), with one explicit
+privileged raw descriptor test ignored. The full/half transition, loss/retry,
+replay/range conservation, cancelled WouldBlock, early-data ordering and cached
+control expiry details are in the checkpoint report. These are local unprivileged
+mock links with real maintained TCP/TLS/authentication, not kernel/native tests.

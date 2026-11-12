@@ -536,6 +536,7 @@ version = "0.1.0"
 dependencies = [
  "l2tunnel-auth",
  "l2tunnel-core",
+ "l2tunnel-datagram",
  "l2tunnel-device",
  "l2tunnel-platform-linux",
  "l2tunnel-raw-tcp",

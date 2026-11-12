@@ -1,14 +1,16 @@
 # Authenticated raw TCP packet-phase proposal
 
-Status: design only. The custom semantics and authoritative snapshot approach
-were reviewed; the concrete dependency seam below awaits separate review.
-The maintained-stack getter was separately reviewed, tested and activated in
-the pinned local dependency; actual ownership transfer is still unimplemented. No raw handoff, new carrier,
-client option or native packet-phase test is implemented. The retained
-`TcpEngine`/TLS stream remains the default RFC TCP carrier. Its historical failed
-and successful receipts remain separate from this proposed mode. The recent
-[marked native audit](../../work/raw-native-marked-audit.json) does not qualify
-packet-phase performance, neighbor-discovery latency or middlebox passage.
+Status: **implemented and locally integration-tested as a bounded startup-only
+primitive**, with broader acceptance gates still open. The actual from-birth
+TLS/member pairing, all-lane Prepare/Prepared/Armed/Seal, original-driver consume,
+protected Hello/Commit and full/half record delivery are implemented in
+`l2tunnel_raw_io::handoff::pairing::packet`. See the
+[checkpoint 15 evidence](../../work/raw-transition-checkpoint15/REPORT.md).
+No runtime/CLI/native packet-phase capability, upper recovery integration, clean
+protected close, general-network congestion safety or middlebox qualification is
+claimed. Retained TCP/TLS remains the default. Earlier saved native results are
+unchanged. The remaining sections preserve the design contract; the concrete
+startup-only failure/window decisions below supersede the earlier fallback target.
 
 ## Decision and compatibility boundary
 
@@ -55,7 +57,8 @@ The inspected pinned smoltcp `socket/tcp.rs` exposes state, endpoints, ring size
 ACK policy and `timestamp_enabled()`. Sequence frontiers, window scales, peer
 MSS, negotiated SACK, last window and timestamp state are private; even
 `flight_size()` is private. `send_queue() == 0` is useful but is not a complete
-transferable connection state. There is currently **no safe supported handoff**.
+transferable connection state. At the original design checkpoint there was no supported handoff; the tracked
+consume and original-driver transfer are now implemented and locally tested.
 
 Compare two ways to obtain one:
 
@@ -257,8 +260,10 @@ controls described below; those retain exact ciphertext and nonce.
 The first qualification profile stops **before the first wire sequence wrap**.
 After snapshot, negotiate the smaller remaining per-direction budget, reserving
 space for all bounded transition/drain/close copies. Reject activation if that
-budget cannot hold at least the configured minimum useful transfer. Near-wrap
-bootstrap uses retained mode or fails negotiation before Seal; it must not reset
+budget cannot hold transition reserves and the configured minimum useful
+transfer. The final authoritative budget is available only after actual consume;
+this startup-only primitive therefore fails terminally after Seal if it is
+insufficient. It does not promise pre-Seal retained fallback and must not reset
 sequence. Exhaustion after commit freezes admission and requests finite drain.
 Supporting wire wrap is a separate gate requiring authenticated extended-offset
 mapping, serial-distance proofs below `2^31`, old-duplicate tests and middlebox
@@ -388,7 +393,10 @@ window inflation, probe bypass or timeout increase is authorized by this design.
 
 ## Implementation and evidence checklist
 
-All tasks below remain unchecked. Documentation/review is not implementation.
+The stable tasks below remain open because their full deliverables extend beyond
+the finite checkpoint. Partial implementation/evidence for MOD-RAWPHASE-03 through
+06, 08, 09 and 14 is recorded in the checkpoint 15 report; the remaining edge,
+close, recovery, runtime, native and path gates are not implied by those tests.
 
 - [ ] [MOD-RAWPHASE-01] Review the custom gap-retirement semantics, retained default, exact configuration/profile digest and middlebox/HTTPS limitations.
 - [ ] [MOD-RAWPHASE-02] Resolve the supported authoritative smoltcp snapshot/consume feasibility gate; review any narrow upstream change before dependency edits.

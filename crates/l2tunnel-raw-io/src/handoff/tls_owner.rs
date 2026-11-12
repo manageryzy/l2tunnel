@@ -898,6 +898,108 @@ impl TlsMessageOwner {
         self.checked()?;
         self.exact.consume()
     }
+
+    pub(super) fn freeze_terminal(
+        mut self: Box<Self>,
+        permit: super::pairing::packet::ArmedLane,
+    ) -> Result<FrozenTls, super::pairing::packet::Error> {
+        use super::pairing::packet::Error;
+        self.checked()
+            .map_err(|e| Error::Pair(super::pairing::PairError::Message(e)))?;
+        if self.exact.outgoing.length != 0
+            || !self.exact.incoming.complete
+            || !permit.matches(&self.handle, self.exact.message().ok_or(Error::TlsFreeze)?)
+        {
+            return Err(Error::TlsFreeze);
+        }
+        let before = self.status().records;
+        if before.fault.is_some()
+            || before.read_eof
+            || before.shutdown_started
+            || before.shutdown_completed
+            || !before.incoming.at_boundary()
+            || !before.outgoing.at_boundary()
+        {
+            return Err(Error::TlsFreeze);
+        }
+        // Exact reads stopped at the terminal frame. No transport read or flush
+        // occurs here. The empty backend write exposes deferred KeyUpdate output;
+        // newly produced output is rejected, never discarded or silently flushed.
+        macro_rules! check {
+            ($stream:expr) => {{
+                use std::io::Write;
+                let connection = $stream.get_mut().1;
+                if connection.is_handshaking() || connection.wants_write() {
+                    return Err(Error::TlsFreeze);
+                }
+                let state = connection
+                    .process_new_packets()
+                    .map_err(|_| Error::TlsFreeze)?;
+                if state.plaintext_bytes_to_read() != 0
+                    || state.tls_bytes_to_write() != 0
+                    || state.peer_has_closed()
+                {
+                    return Err(Error::TlsFreeze);
+                }
+                if connection
+                    .writer()
+                    .write(&[])
+                    .map_err(|_| Error::TlsFreeze)?
+                    != 0
+                    || connection.wants_write()
+                {
+                    return Err(Error::TlsFreeze);
+                }
+                let state = connection
+                    .process_new_packets()
+                    .map_err(|_| Error::TlsFreeze)?;
+                if state.plaintext_bytes_to_read() != 0
+                    || state.tls_bytes_to_write() != 0
+                    || state.peer_has_closed()
+                {
+                    return Err(Error::TlsFreeze);
+                }
+            }};
+        }
+        match &mut self.exact.io {
+            TlsStream::Client(stream) => check!(stream),
+            TlsStream::Server(stream) => check!(stream),
+        }
+        self.checked()
+            .map_err(|e| Error::Pair(super::pairing::PairError::Message(e)))?;
+        if self.status().records != before {
+            return Err(Error::TlsFreeze);
+        }
+        // Keep the complete TLS object and terminal parser bytes. There is no
+        // public accessor or further TLS poll on FrozenTls.
+        Ok(FrozenTls { owner: self })
+    }
+}
+
+pub(super) struct FrozenTls {
+    owner: Box<TlsMessageOwner>,
+}
+impl FrozenTls {
+    pub(super) fn status(&self) -> MessageStatus {
+        self.owner.status()
+    }
+    pub(super) fn request(&mut self) -> Result<(), super::pairing::packet::Error> {
+        let deadline = self.owner.exact.deadline;
+        if Instant::now() >= deadline {
+            return Err(super::pairing::packet::Error::Expired);
+        }
+        let start = super::stream::lock(&self.owner.handle.shared)?
+            .started
+            .ok_or(super::pairing::packet::Error::Proof)?;
+        let duration = deadline
+            .checked_duration_since(start)
+            .ok_or(super::pairing::packet::Error::Expired)?;
+        self.owner.handle.request_handoff(duration)?;
+        if Instant::now() >= deadline {
+            return Err(super::pairing::packet::Error::Expired);
+        }
+        Ok(())
+    }
 }
 #[cfg(test)]
 #[path = "tls_owner_tests.rs"]

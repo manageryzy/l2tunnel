@@ -17,6 +17,8 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
 /// Opt-in checked stream ownership and logical quiescent consume capability.
 pub mod handoff;
+/// Bounded IPv4/TCP packet inspection and emission using the maintained wire codec.
+pub mod packet;
 
 /// Maintained TCP state; independent from authenticated tunnel session state.
 pub use smoltcp::socket::tcp::State;

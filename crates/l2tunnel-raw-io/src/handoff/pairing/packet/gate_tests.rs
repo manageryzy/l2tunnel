@@ -1,0 +1,251 @@
+//! Packet-kernel tests do not construct a TLS freeze or transferable owner.
+use super::super::super::test_support::{R, raw};
+use super::*;
+const TX: [u8; 16] = [9; 16];
+fn fixture() -> R<(GateState, PacketSealer)> {
+    let policy = PacketPolicy::new(576);
+    let mut state = GateState::new(
+        raw(true, 0),
+        policy,
+        Instant::now() + Duration::from_secs(10),
+    );
+    state.client = true;
+    state.active = true;
+    state.transaction = TX;
+    state.session = [1; 16];
+    state.opener = Some(PacketOpener::new(
+        policy.datagram([1; 16], 0, Direction::ServerToClient),
+        &[3; 32],
+    )?);
+    state.fence = Some(Fence {
+        local: 1000,
+        peer: 2000,
+        receive_prefix: 400,
+        local_horizon: 32768,
+        peer_horizon: 32768,
+        peer_scale: 0,
+        window: 32768,
+        sent: 0,
+        allocated: 0,
+        retired: 0,
+        peer_retired: 0,
+    });
+    let sealer = PacketSealer::new(
+        policy.datagram([1; 16], 0, Direction::ServerToClient),
+        &[3; 32],
+    )?;
+    Ok((state, sealer))
+}
+fn seal(sealer: &mut PacketSealer, kind: wire::Kind, offset: u64, body: &[u8]) -> R<Vec<u8>> {
+    let plain = wire::Header {
+        kind,
+        transaction: TX,
+        offset,
+        retired: 0,
+        right_edge: 32768,
+        body: body.len() as u16,
+    }
+    .encode(body)?;
+    Ok(sealer.seal_vec(&plain)?.bytes)
+}
+fn outer(protected: &[u8], sequence: u32, ack: u32, window: u16) -> R<Vec<u8>> {
+    let mut output = vec![0; 40 + protected.len()];
+    packet::encode(raw(false, 0), sequence, ack, window, protected, &mut output)?;
+    Ok(output)
+}
+#[test]
+fn mirror_rejections_preserve_original_opener_replay_and_usage() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    let protected = seal(&mut sealer, wire::Kind::Data, 0, b"kept")?;
+    for (seq, ack, window) in [
+        (2001, 1000, 32768),
+        (2000, 1001, 32768),
+        (2000, 1000, 32767),
+    ] {
+        state.ingest_phase(&outer(&protected, seq, ack, window)?)?;
+        assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 0);
+        assert!(state.incoming.is_empty());
+        assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, 0);
+    }
+    state.ingest_phase(&outer(&protected, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    assert_eq!(state.incoming.pop_front().ok_or("cell")?.body, b"kept");
+    state.ingest_phase(&outer(&protected, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    Ok(())
+}
+#[test]
+fn fresh_nonce_cannot_reuse_or_overlap_any_accepted_byte_range() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    let a = seal(&mut sealer, wire::Kind::Data, 0, b"first")?;
+    state.ingest_phase(&outer(&a, 2000, 1000, 32768)?)?;
+    for offset in [0, 1, a.len() as u64 - 1] {
+        let b = seal(&mut sealer, wire::Kind::Data, offset, b"conflicting bytes")?;
+        state.ingest_phase(&outer(&b, 2000 + offset as u32, 1000, 32768)?)?;
+        assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    }
+    let c = seal(&mut sealer, wire::Kind::Data, a.len() as u64, b"adjacent")?;
+    state.ingest_phase(&outer(&c, 2000 + a.len() as u32, 1000, 32768)?)?;
+    assert_eq!(state.ranges.len, 1);
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    Ok(())
+}
+#[test]
+fn disjoint_reorder_is_accepted_but_range_table_is_finite() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    let a = seal(&mut sealer, wire::Kind::Data, 500, b"later")?;
+    let b = seal(&mut sealer, wire::Kind::Data, 0, b"older")?;
+    state.ingest_phase(&outer(&a, 2500, 1000, 32768)?)?;
+    state.ingest_phase(&outer(&b, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    let mut ranges = Ranges::new();
+    for i in 0..128 {
+        ranges = ranges.propose(i * 10, i * 10 + 1, 1280, 32768)?;
+    }
+    assert!(matches!(
+        ranges.propose(1280, 1281, 1281, 32768),
+        Err(Error::Capacity)
+    ));
+    assert_eq!(ranges.len, 128);
+    let merged = ranges.propose(1, 10, 1281, 32768)?;
+    assert_eq!(merged.len, 127);
+    let advanced = ranges.propose(40000, 40001, 40001, 32768)?;
+    assert_eq!(advanced.len, 1);
+    Ok(())
+}
+#[test]
+fn full_delivery_slot_does_not_burn_a_valid_nonce() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    state.policy.queue_packets = 1;
+    let a = seal(&mut sealer, wire::Kind::Data, 0, b"one")?;
+    state.ingest_phase(&outer(&a, 2000, 1000, 32768)?)?;
+    let b = seal(&mut sealer, wire::Kind::Data, a.len() as u64, b"two")?;
+    let b = outer(&b, 2000 + a.len() as u32, 1000, 32768)?;
+    state.ingest_phase(&b)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    state.incoming.pop_front();
+    state.records_outstanding = 0;
+    state.ingest_phase(&b)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    Ok(())
+}
+fn hello() -> wire::Hello {
+    wire::Hello {
+        count: 1,
+        pair: [7; 32],
+        armed: [8; 32],
+        lanes: [
+            Some(wire::LaneProof {
+                lane: 0,
+                bulk: 0,
+                role: 2,
+                options: 0,
+                session: [1; 16],
+                written: 400,
+                read: 500,
+                una: 2000,
+                next: 2000,
+                receive: 1000,
+                ack: 1000,
+                window: 32768,
+                scale: 0,
+                peer_scale: 0,
+                peer_window: 32768,
+                mss: 536,
+                available: u32::MAX - 2000,
+                counters: [4; 32],
+            }),
+            None,
+        ],
+    }
+}
+#[test]
+fn early_hello_uses_same_opener_range_table_and_one_coalesced_cell() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    state.fence = None;
+    state.active = false;
+    state.hello_allowed = true;
+    state.expected_pair = [7; 32];
+    state.expected_armed = [8; 32];
+    let body = hello().encode()?;
+    let a = seal(&mut sealer, wire::Kind::Hello, 0, &body)?;
+    state.ingest_phase(&outer(&a, 2000, 1000, 32768)?)?;
+    assert!(state.early.is_some());
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    let overlap = seal(&mut sealer, wire::Kind::Hello, 0, &body)?;
+    state.ingest_phase(&outer(&overlap, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    let b = seal(&mut sealer, wire::Kind::Hello, a.len() as u64, &body)?;
+    state.ingest_phase(&outer(&b, 2000 + a.len() as u32, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    assert_eq!(state.ranges.len, 1);
+    state.fence = fixture()?.0.fence;
+    state.release_early()?;
+    assert!(state.early.is_none());
+    assert_eq!(state.incoming.len(), 1);
+    assert_eq!(
+        state.fence.as_ref().ok_or("fence")?.retired,
+        (a.len() + b.len()) as u64
+    );
+    Ok(())
+}
+#[test]
+fn authenticated_hello_before_armed_is_terminal_without_usage_commit() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    state.fence = None;
+    state.expected_pair = [7; 32];
+    state.expected_armed = [8; 32];
+    let protected = seal(&mut sealer, wire::Kind::Hello, 0, &hello().encode()?)?;
+    assert!(matches!(
+        state.ingest_phase(&outer(&protected, 2000, 1000, 32768)?),
+        Err(Error::Proof)
+    ));
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 0);
+    assert!(state.fault.is_some());
+    Ok(())
+}
+#[test]
+fn old_prefix_responder_accepts_wrapped_consumed_bytes_but_never_crossings_or_ack_only() -> R {
+    let (mut state, _) = fixture()?;
+    state.fence.as_mut().ok_or("fence")?.peer = 5;
+    state.fence.as_mut().ok_or("fence")?.receive_prefix = 10;
+    let duplicate = outer(b"old", u32::MAX - 2, 1000, 32768)?;
+    state.old(&duplicate, Instant::now())?;
+    let reply = state.old_reply.take().ok_or("old reply")?;
+    let inspected = packet::inspect(raw(false, 0), &reply)?;
+    assert_eq!(
+        (
+            inspected.sequence,
+            inspected.acknowledgment,
+            inspected.window
+        ),
+        (1000, 5, 32768)
+    );
+    assert!(inspected.payload.is_empty());
+    for bytes in [
+        outer(b"crossing", 2, 1000, 32768)?,
+        outer(b"too old", u32::MAX - 20, 1000, 32768)?,
+        outer(b"", 3, 1000, 32768)?,
+    ] {
+        state.old(&bytes, Instant::now())?;
+        assert!(state.old_reply.is_none());
+    }
+    state.old(&duplicate, state.deadline)?;
+    assert!(state.old_reply.is_none());
+    Ok(())
+}
+#[test]
+fn budget_has_one_shared_turn_and_finite_held_allowance() {
+    let now = Instant::now();
+    let mut p = PacketPolicy::new(576);
+    p.burst_bytes = 576;
+    p.burst_packets = 1;
+    let mut b = Budget::new(p, now);
+    assert!(b.take(31));
+    assert!(!b.take(2));
+    assert!(b.take(1));
+    assert!(!b.take(1));
+    assert!(b.reserve(576, now));
+    assert!(!b.reserve(40, now));
+    assert!(b.reserve(40, now + Duration::from_secs(1)));
+}

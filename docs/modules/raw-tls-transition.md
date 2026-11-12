@@ -1,9 +1,10 @@
 # Authenticated raw TLS freeze and peer transition
 
-Status: design checkpoint awaiting review; no implementation or native activation.
+Status: bounded startup-only implementation with real full/half local integration
+tests; no native activation. See [checkpoint 15](../../work/raw-transition-checkpoint15/REPORT.md).
 The [tracked owner and switchable driver](raw-owner-handoff.md) prove local
 ownership using maintained TCP and mock packet I/O. This document specifies the
-missing TLS, peer and ingress boundaries needed by the experimental
+TLS, peer and ingress boundaries now implemented for the bounded experimental
 [raw packet phase](raw-packet-phase.md). Retained TCP/TLS remains the default.
 The packet phase is custom TCP-shaped datagrams; it does not retain RFC TCP or
 HTTPS semantics and does not guarantee passage through middleboxes.
@@ -21,9 +22,10 @@ input; a caller-provided `empty: true` assertion is not a proof.
 
 A new runtime owner must construct each lane from birth. It owns the original
 packet I/O, classifier wrapper, switchable bridge, tracked stream, real
-`AuthenticatedIo`, unique switch handle and driver task. It never accepts an
+`AuthenticatedIo`, unique switch handle and owned driver future. It never accepts an
 independently supplied authenticated stream plus a possibly unrelated handle.
-Failure or cancellation joins/aborts every owned worker. No detached driver,
+Failure or cancellation synchronously drops every original owner; no driver
+worker task is spawned. No detached driver,
 mutable raw handle, adopted counter snapshot or status-to-capability conversion
 is exposed. The original mark and reserved local tuple move with the I/O owner;
 the numeric mark remains local, while the marked-policy kind is authenticated.
@@ -287,34 +289,35 @@ contiguous prefix and cannot release new-phase/recovery/native credit.
 
 ## Failure and cancellation contract
 
-Before Seal, allocation/validation rejection leaves the original retained owner
-intact. Resuming retained traffic requires a coordinated Abort/AbortAck proving
-both peers are still pre-Seal; rejection alone is not permission to resume. A
-lost/uncertain Abort, any locally emitted or received Seal, frozen bridge, consumed
-lane or protected phase output makes the transition irreversible for this tuple.
-If one lane fails after another transfers, terminate the complete paired session;
-do not run a mixed retained/packet session.
+Only local rejection before the irreversible attachment boundary returns the
+exact unpolled `RawInputs`. After attachment every setup failure or owner drop is
+terminal, including before Seal; there is no implemented reusable retained-owner
+variant or Abort/AbortAck. Choosing retained mode or fallback therefore occurs
+before this factory or through a new independently authenticated connection.
+The final no-wrap capacity is authoritative only after actual consume and can
+reject terminally after Seal. This explicitly supersedes the earlier pre-Seal
+rollback target; no copied sequence observation can provide that authority.
 
-`TransitionFailure` must distinguish reusable pre-Seal ownership from terminal
-failure. A reusable variant contains the same original all-lane owner, and can
-be created only after the authenticated abort proof. A terminal variant reports
-failure and bounded cleanup completion, never a reconstructed owner. Caller
-cancellation before that returned proof is terminal even if no local Seal was
-observed: the caller cannot infer what the peer received. Future fallback opens
-a fresh independently negotiated connection; it does not reuse this tuple's
-sequence/TLS state.
+The original setup deadline is unchanged across authentication, all-lane controls,
+freeze, consume and packet commit. Local activation does not renew the old-prefix
+responder or transition-reply expiry. An already sealed WouldBlock control or old
+ACK is discarded at that original expiry before another actual send; active
+recovery records retain their distinct liveness deadline. The work bound checks
+time around each bounded I/O, including ready operations.
 
-Every terminal path cancels and joins all tasks, retains ownership until cleanup
-or the fixed cleanup bound, and drops packet I/O outside shared locks. Preserve
-original I/O error kinds/errno and stage diagnostics without keys or user bytes.
-Dropping the frozen TLS wrapper does not poll shutdown; dropping capabilities
-does not generate FIN/RST. A timed-out task or local ownership handoff is not a
-successful clean TCP close. Existing retained clean-close behavior stays separate.
+Every terminal path drops original generic I/O outside shared locks and retains
+the actual I/O category/errno. Frozen TLS has no I/O accessor and is never polled
+after freeze. Dropping it does not poll shutdown; dropping capabilities emits no
+FIN/RST and never claims a maintained clean close. Existing retained close behavior
+stays separate. A future coordinated Abort and protected clean drain remain
+separate reviewed gates.
 
 ## Required implementation and validation gates
 
-All work below is planned. Existing local mock handoff evidence does not check
-any box here. The failed source-stable wave 10 aggregate remains a failed receipt;
+Stable task IDs below remain open for their complete stated acceptance matrix.
+Checkpoint 15 partially implements/tests MOD-RAWTRANS-03 through 09 with real
+authentication and mock packet I/O; it does not check those broader boxes merely
+because the startup path succeeds. The failed source-stable wave 10 aggregate remains a failed receipt;
 it does not establish the new contract or revoke the focused raw mock results.
 
 - [ ] [MOD-RAWTRANS-01] Review this ownership, startup-only scope, all-peer transaction, finite budgets and no-rollback contract before implementation.

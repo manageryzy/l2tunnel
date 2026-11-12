@@ -1,0 +1,1304 @@
+//! Exclusive transaction over actual original TLS and raw owners.
+use super::super::super::{BridgeProof, SwitchExit, tls_owner::FrozenTls};
+use super::*;
+use gate::{Budget, Cell, Fence};
+use l2tunnel_raw_tcp::{handoff::QuiescentTcp, packet};
+use tokio::time::{sleep, sleep_until};
+
+struct Detached<I: PacketIo> {
+    io: GateIo<I>,
+    _tcp: QuiescentTcp,
+    _frozen: FrozenTls,
+    proof: wire::LaneProof,
+    sealer: PacketSealer,
+    pending: Option<Pending>,
+    last_transition: Option<Instant>,
+    last_transition_kind: Option<wire::Kind>,
+    copies: u16,
+    sent_hello: bool,
+    sent_commit: bool,
+    sent_ack: bool,
+    hello: bool,
+    hello_reply: bool,
+    commit: bool,
+    ack: bool,
+    last_alive: Instant,
+    last_ping: Instant,
+    ping: Option<[u8; 8]>,
+    pong: Option<[u8; 8]>,
+    early: Option<Cell>,
+}
+struct Pending {
+    bytes: Vec<u8>,
+    end: u64,
+    kind: wire::Kind,
+}
+impl<I: PacketIo> Detached<I> {
+    fn stage(&mut self, kind: wire::Kind, body: &[u8], tx: [u8; 16]) -> Result<(), Error> {
+        if self.pending.is_some() || self.io.pending() {
+            return Err(Error::Busy);
+        }
+        let mut state = lock(&self.io.state)?;
+        let policy = state.policy;
+        let config = state.config;
+        if body.len() > policy.body_limit() {
+            return Err(Error::Capacity);
+        }
+        let f = state.fence.as_mut().ok_or(Error::Proof)?;
+        let payload_len = policy.overhead() - 40 + wire::HEADER + body.len();
+        let end = f
+            .allocated
+            .checked_add(payload_len as u64)
+            .ok_or(Error::Exhausted)?;
+        let reserve = if kind.control() {
+            0
+        } else {
+            8 * (u64::from(policy.mtu) - 40)
+        };
+        if end >= u64::from(u32::MAX - f.local) {
+            return Err(Error::Exhausted);
+        }
+        if end
+            > f.peer_retired
+                .checked_add(f.peer_horizon)
+                .ok_or(Error::Exhausted)?
+                .saturating_sub(reserve)
+        {
+            return Err(Error::Busy);
+        }
+        if !self.hello && end > u64::from(self.proof.peer_window) {
+            return Err(Error::Exhausted);
+        }
+        let h = wire::Header {
+            kind,
+            transaction: tx,
+            offset: f.allocated,
+            retired: f.retired,
+            right_edge: f
+                .retired
+                .checked_add(f.local_horizon)
+                .ok_or(Error::Exhausted)?,
+            body: u16::try_from(body.len()).map_err(|_| Error::Capacity)?,
+        };
+        let plain = h.encode(body)?;
+        let protected = self.sealer.seal_vec(&plain)?;
+        if protected.bytes.len() != payload_len {
+            return Err(Error::Proof);
+        }
+        let sequence = f
+            .local
+            .checked_add(u32::try_from(f.allocated).map_err(|_| Error::Exhausted)?)
+            .ok_or(Error::Exhausted)?;
+        let ack = f
+            .peer
+            .checked_add(u32::try_from(f.retired).map_err(|_| Error::Exhausted)?)
+            .ok_or(Error::Exhausted)?;
+        let mut bytes = vec![0; payload_len + 40];
+        packet::encode(
+            config,
+            sequence,
+            ack,
+            u16::try_from(f.local_horizon >> self.proof.scale).map_err(|_| Error::Proof)?,
+            &protected.bytes,
+            &mut bytes,
+        )
+        .map_err(|_| Error::Proof)?;
+        state.fence.as_mut().ok_or(Error::Proof)?.allocated = end;
+        self.pending = Some(Pending { bytes, end, kind });
+        Ok(())
+    }
+    fn expire_controls(&mut self) -> Result<(), Error> {
+        if Instant::now() >= lock(&self.io.state)?.deadline {
+            if self.pending.as_ref().is_some_and(|p| {
+                matches!(
+                    p.kind,
+                    wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck
+                )
+            }) {
+                self.pending = None;
+                self.io.cancel_pending();
+            }
+            lock(&self.io.state)?.old_reply = None;
+            if self.pending.is_none() {
+                self.io.cancel_pending();
+            }
+        }
+        Ok(())
+    }
+    fn progress(&mut self) -> Result<bool, Error> {
+        self.expire_controls()?;
+        self.io.drain_early()?;
+        let mut progress = false;
+        let mut input = [0; 65_536];
+        self.io.receive(&mut input)?;
+        self.expire_controls()?;
+        if let Some(p) = self.pending.as_ref() {
+            match self.io.send(&p.bytes) {
+                Ok(()) => {
+                    let p = self.pending.take().ok_or(Error::Proof)?;
+                    lock(&self.io.state)?
+                        .fence
+                        .as_mut()
+                        .ok_or(Error::Proof)?
+                        .sent = p.end;
+                    match p.kind {
+                        wire::Kind::Hello => self.sent_hello = true,
+                        wire::Kind::Commit => self.sent_commit = true,
+                        wire::Kind::CommitAck => self.sent_ack = true,
+                        _ => {}
+                    }
+                    if matches!(
+                        p.kind,
+                        wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck
+                    ) {
+                        self.copies = self.copies.checked_add(1).ok_or(Error::Exhausted)?;
+                        self.last_transition = Some(Instant::now());
+                        self.last_transition_kind = Some(p.kind);
+                    }
+                    progress = true;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.expire_controls()?;
+        // An exact retained old-ACK send shares the same one pending I/O token.
+        // Never send it while a protected output is blocked.
+        if self.pending.is_none() {
+            let old = lock(&self.io.state)?.old_reply.take();
+            if let Some(old) = old {
+                match self.io.send(&old) {
+                    Ok(()) => {
+                        lock(&self.io.state)?.last_old = Some(Instant::now());
+                        progress = true;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        lock(&self.io.state)?.old_reply = Some(old);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(progress)
+    }
+    fn retry_due(&self, now: Instant) -> bool {
+        self.pending.is_none()
+            && self.copies < 32
+            && self
+                .last_transition
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250))
+    }
+}
+
+/// From-birth setup future. Dropping it synchronously drops every original owner.
+/// Borrowed polling cancellation retains all partial TLS and packet output.
+pub struct PacketSetup<'a, I: PacketIo + Send + 'static> {
+    setup: Option<PairSetup<'a, GateIo<I>>>,
+    paired: Option<PairedRaw<GateIo<I>>>,
+    states: [Option<Arc<Mutex<GateState>>>; 2],
+    budget: SharedBudget,
+    policy: PacketPolicy,
+    policy_digest: [u8; 32],
+    deadline: Instant,
+    timer: Pin<Box<Sleep>>,
+    tick: Pin<Box<Sleep>>,
+    count: usize,
+    client: bool,
+    transaction: [u8; 16],
+    stage: u8,
+    staged: [bool; 2],
+    received: [bool; 2],
+    preparation: [u8; 32],
+    armed: [u8; 32],
+    frozen: [Option<FrozenTls>; 2],
+    detached: [Option<Detached<I>>; 2],
+    carrier: Option<PacketCarrier<I>>,
+    done: bool,
+}
+// No field is structurally pinned: every polled backend future/timer is in its
+// own pinned allocation, and PacketIo is only called through ordinary &mut.
+impl<I: PacketIo + Send + 'static> Unpin for PacketSetup<'_, I> {}
+/// Live experimental protected carrier; no native credit or clean-close authority.
+/// The caller must continue polling it while another peer is still setting up.
+pub struct PacketCarrier<I: PacketIo + Send + 'static> {
+    lanes: [Option<Detached<I>>; 2],
+    info: PairInfo,
+    policy: PacketPolicy,
+    policy_digest: [u8; 32],
+    transaction: [u8; 16],
+    armed: [u8; 32],
+    local_hello: [u8; wire::HELLO],
+    peer_hello: Option<[u8; wire::HELLO]>,
+    commit_proof: Option<[u8; 32]>,
+    deadline: Instant,
+    timer: Pin<Box<Sleep>>,
+    tick: Pin<Box<Sleep>>,
+    budget: SharedBudget,
+    records: VecDeque<ReceivedRecord>,
+    ready: bool,
+    fault: Option<Error>,
+    cursor: usize,
+}
+fn recover<I: PacketIo>(inputs: RawInputs<GateIo<I>>) -> RawInputs<I> {
+    let raw = |input: RawInput<GateIo<I>>| RawInput {
+        config: input.config,
+        io: input.io.original(),
+    };
+    match inputs {
+        RawInputs::Full(a) => RawInputs::Full(raw(a)),
+        RawInputs::Half { forward, reverse } => RawInputs::Half {
+            forward: raw(forward),
+            reverse: raw(reverse),
+        },
+    }
+}
+fn begin<'a, I: PacketIo + Send + 'static>(
+    inputs: RawInputs<I>,
+    credentials: Credentials<'a>,
+    config: PacketPhaseConfig,
+) -> Result<PacketSetup<'a, I>, PacketStartFailure<I>> {
+    let start = Instant::now();
+    let prepared = (|| {
+        config.packet.validate()?;
+        if config.pair.messages.max_payload < 244
+            || config.pair.messages.messages_per_direction < 5
+            || config.pair.messages.bytes_per_direction < 912
+        {
+            return Err(Error::Configuration);
+        }
+        let (a, b) = inputs.configs();
+        if a.mtu != usize::from(config.packet.mtu) || b.is_some_and(|b| b.mtu != a.mtu) {
+            return Err(Error::Configuration);
+        }
+        let policy = config.packet.digest(config.pair.session.digest)?;
+        let mut pair = config.pair;
+        pair.session.digest =
+            ConfigDigest(hash_parts(b"l2tunnel/raw-packet-pair/v1\0", &[&policy]));
+        let profile = profile::validate(&inputs, pair)?;
+        let retained = (profile.count as u64)
+            .checked_mul(
+                (u64::from(config.packet.queue_packets) + 11) * u64::from(config.packet.mtu)
+                    + 65_536
+                    + 2 * 128
+                    + 104,
+            )
+            .and_then(|n| n.checked_add(2 * 280 + 2 * 104))
+            .ok_or(Error::Capacity)?;
+        let peak = retained
+            .checked_add(profile.count as u64 * (2 * u64::from(config.packet.mtu) + 64) + 512)
+            .ok_or(Error::Capacity)?;
+        if retained > 1_048_576 || peak > 2_097_152 {
+            return Err(Error::Capacity);
+        }
+        profile
+            .resources
+            .retained_payload
+            .checked_add(retained)
+            .ok_or(Error::Capacity)?;
+        profile
+            .resources
+            .peak_payload
+            .checked_add(peak)
+            .ok_or(Error::Capacity)?;
+        // Concrete owner/future/crypto descriptor charges, before attachment.
+        let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
+            + std::mem::size_of::<PacketCarrier<I>>()
+            + profile.count
+                * (std::mem::size_of::<GateIo<I>>()
+                    + std::mem::size_of::<GateState>()
+                    + std::mem::size_of::<PacketOpener>()
+                    + std::mem::size_of::<PacketSealer>()
+                    + std::mem::size_of::<Detached<I>>()
+                    + 2 * std::mem::size_of::<Sleep>()
+                    + (usize::from(config.packet.queue_packets) + 16)
+                        * std::mem::size_of::<Cell>());
+        if metadata > 1_048_576 {
+            return Err(Error::Capacity);
+        }
+        let deadline = start.checked_add(pair.timeout).ok_or(Error::Expired)?;
+        Ok((pair, policy, deadline, profile.count))
+    })();
+    let (pair, policy_digest, deadline, count) = match prepared {
+        Ok(p) => p,
+        Err(error) => {
+            return Err(PacketStartFailure {
+                inputs: Box::new(inputs),
+                error,
+            });
+        }
+    };
+    let budget = Arc::new(Mutex::new(Budget::new(config.packet, start)));
+    let mut states = [None, None];
+    let client = matches!(credentials, Credentials::Client(..));
+    let mut wrap = |input: RawInput<I>, index: usize| {
+        let io = GateIo::new(
+            input.io,
+            input.config,
+            config.packet,
+            deadline,
+            budget.clone(),
+        );
+        if let Ok(mut state) = io.state.lock() {
+            state.half = count == 2;
+            state.lane = index;
+            state.client = client;
+        }
+        states[index] = Some(io.state.clone());
+        RawInput {
+            config: input.config,
+            io,
+        }
+    };
+    let wrapped = match inputs {
+        RawInputs::Full(a) => RawInputs::Full(wrap(a, 0)),
+        RawInputs::Half { forward, reverse } => RawInputs::Half {
+            forward: wrap(forward, 0),
+            reverse: wrap(reverse, 1),
+        },
+    };
+    let setup = match build_at(wrapped, credentials, pair, start) {
+        Ok(setup) => setup,
+        Err(f) => {
+            return Err(PacketStartFailure {
+                inputs: Box::new(recover(*f.inputs)),
+                error: Error::Pair(f.error),
+            });
+        }
+    };
+    Ok(PacketSetup {
+        setup: Some(setup),
+        paired: None,
+        states,
+        budget,
+        policy: config.packet,
+        policy_digest,
+        deadline,
+        timer: Box::pin(sleep_until(deadline)),
+        tick: Box::pin(sleep(Duration::from_millis(1))),
+        count,
+        client,
+        transaction: [0; 16],
+        stage: 0,
+        staged: [false; 2],
+        received: [false; 2],
+        preparation: [0; 32],
+        armed: [0; 32],
+        frozen: [None, None],
+        detached: [None, None],
+        carrier: None,
+        done: false,
+    })
+}
+/// Construct all original client owners with a single absolute transition deadline.
+///
+/// # Panics
+/// The current Tokio runtime must have its time driver enabled.
+pub fn begin_packet_client<'a, I: PacketIo + Send + 'static>(
+    inputs: RawInputs<I>,
+    tls: &'a ClientTls,
+    name: &'a str,
+    member: &'a MemberKey,
+    config: PacketPhaseConfig,
+) -> Result<PacketSetup<'a, I>, PacketStartFailure<I>> {
+    begin(inputs, Credentials::Client(tls, name, member), config)
+}
+/// Construct all original server owners and finite protected packet policy.
+///
+/// # Panics
+/// The current Tokio runtime must have its time driver enabled.
+pub fn begin_packet_server<'a, I: PacketIo + Send + 'static>(
+    inputs: RawInputs<I>,
+    tls: &'a ServerTls,
+    members: &'a MemberAllowlist,
+    config: PacketPhaseConfig,
+) -> Result<PacketSetup<'a, I>, PacketStartFailure<I>> {
+    begin(inputs, Credentials::Server(tls, members), config)
+}
+
+impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
+    fn check(&self) -> Result<(), Error> {
+        if Instant::now() >= self.deadline {
+            Err(Error::Expired)
+        } else {
+            Ok(())
+        }
+    }
+    fn install(&mut self) -> Result<(), Error> {
+        let paired = self.paired.as_ref().ok_or(Error::Proof)?;
+        self.transaction = wire::array(
+            &hash_parts(
+                b"l2tunnel/raw-packet-transaction/v1\0",
+                &[&paired.info.transcript_digest, &self.policy_digest],
+            )[..16],
+        )?;
+        let keys = &paired.group.keys.as_ref().ok_or(Error::Proof)?._values;
+        for i in 0..self.count {
+            let info = paired.info.lanes[i].ok_or(Error::Proof)?;
+            let direction = if self.client {
+                Direction::ServerToClient
+            } else {
+                Direction::ClientToServer
+            };
+            let index = i * 6 + if self.client { 5 } else { 4 };
+            let mut state = lock(self.states[i].as_ref().ok_or(Error::Proof)?)?;
+            state.transaction = self.transaction;
+            state.expected_pair = paired.info.transcript_digest;
+            state.session = info.session_id;
+            state.opener = Some(PacketOpener::new(
+                self.policy.datagram(info.session_id, i, direction),
+                &keys[index],
+            )?);
+        }
+        Ok(())
+    }
+    fn controls(&self, kind: u8, stage: [u8; 32]) -> Result<[[u8; wire::CONTROL]; 2], Error> {
+        let pair = self
+            .paired
+            .as_ref()
+            .ok_or(Error::Proof)?
+            .info
+            .transcript_digest;
+        Ok(std::array::from_fn(|i| {
+            if i < self.count {
+                wire::control(kind, i, self.transaction, pair, self.policy_digest, stage)
+            } else {
+                [0; wire::CONTROL]
+            }
+        }))
+    }
+    fn control_turn(&mut self, cx: &mut Context<'_>) -> Result<bool, Error> {
+        let kind = match self.stage {
+            1 => {
+                if self.client {
+                    1
+                } else {
+                    2
+                }
+            }
+            2 => 3,
+            3 => 4,
+            _ => return Err(Error::Proof),
+        };
+        let peer_kind = if self.stage == 1 {
+            if self.client { 2 } else { 1 }
+        } else {
+            kind
+        };
+        let digest = match self.stage {
+            1 => [0; 32],
+            2 => self.preparation,
+            3 => self.armed,
+            _ => return Err(Error::Proof),
+        };
+        let own = self.controls(kind, digest)?;
+        let peer = self.controls(peer_kind, digest)?;
+        let allow_send =
+            self.stage != 1 || self.client || self.received[..self.count].iter().all(|b| *b);
+        let paired = self.paired.as_mut().ok_or(Error::Proof)?;
+        if allow_send {
+            for (i, bytes) in own.iter().enumerate().take(self.count) {
+                if !self.staged[i] {
+                    paired.group.owners[i]
+                        .as_mut()
+                        .ok_or(Error::Proof)?
+                        .stage_message(bytes)
+                        .map_err(PairError::Message)?;
+                    self.staged[i] = true;
+                }
+            }
+        }
+        paired.group.drive(cx)?;
+        for (i, expected) in peer.iter().enumerate().take(self.count) {
+            self.check()?;
+            let paired = self.paired.as_mut().ok_or(Error::Proof)?;
+            let owner = paired.group.owners[i].as_mut().ok_or(Error::Proof)?;
+            if owner.status().send_pending
+                && let Poll::Ready(r) = owner.poll_send(cx)
+            {
+                r.map_err(PairError::Message)?;
+            }
+            if !self.received[i] {
+                if owner.message().is_none()
+                    && let Poll::Ready(r) = owner.poll_receive(cx)
+                {
+                    r.map_err(PairError::Message)?;
+                }
+                if let Some(message) = owner.message() {
+                    if message != expected {
+                        return Err(Error::Proof);
+                    }
+                    self.received[i] = true;
+                    if self.stage != 3 {
+                        owner.consume_message().map_err(PairError::Message)?;
+                    }
+                }
+            }
+            self.check()?;
+        }
+        let paired = self.paired.as_ref().ok_or(Error::Proof)?;
+        Ok(self.received[..self.count].iter().all(|b| *b)
+            && self.staged[..self.count].iter().all(|b| *b)
+            && paired.group.owners[..self.count]
+                .iter()
+                .all(|o| o.as_ref().is_some_and(|o| !o.status().send_pending)))
+    }
+    fn freeze(&mut self) -> Result<(), Error> {
+        let seals = self.controls(4, self.armed)?;
+        for (i, seal) in seals.into_iter().enumerate().take(self.count) {
+            let paired = self.paired.as_mut().ok_or(Error::Proof)?;
+            let shared = paired.group.observers[i]
+                .as_ref()
+                .ok_or(Error::Proof)?
+                .clone();
+            let owner = paired.group.owners[i].take().ok_or(Error::Proof)?;
+            self.frozen[i] = Some(owner.freeze_terminal(ArmedLane { shared, seal })?);
+            self.check()?;
+        }
+        for lane in self.frozen.iter_mut().flatten() {
+            lane.request()?;
+        }
+        self.check()
+    }
+    fn collect(&mut self, cx: &mut Context<'_>) -> Result<bool, Error> {
+        for i in 0..self.count {
+            self.check()?;
+            if self.detached[i].is_some() {
+                self.detached[i].as_mut().ok_or(Error::Proof)?.progress()?;
+                continue;
+            }
+            let paired = self.paired.as_mut().ok_or(Error::Proof)?;
+            let result = paired.group.drivers[i]
+                .as_mut()
+                .ok_or(Error::Proof)?
+                .as_mut()
+                .poll(cx);
+            self.check()?;
+            if let Poll::Ready(result) = result {
+                let parts = match result? {
+                    SwitchExit::Handoff(p) => p,
+                    SwitchExit::Clean(_) => return Err(Error::Proof),
+                };
+                self.paired.as_mut().ok_or(Error::Proof)?.group.drivers[i] = None;
+                let frozen = self.frozen[i].take().ok_or(Error::Proof)?;
+                let detached = self.detach(i, parts, frozen)?;
+                self.detached[i] = Some(detached);
+            }
+            self.check()?;
+        }
+        Ok(self.detached[..self.count].iter().all(Option::is_some))
+    }
+    fn detach(
+        &self,
+        i: usize,
+        parts: super::super::super::HandoffParts<GateIo<I>>,
+        frozen: FrozenTls,
+    ) -> Result<Detached<I>, Error> {
+        let (io, tcp, bridge) = parts.into_parts();
+        if !Arc::ptr_eq(&io.state, self.states[i].as_ref().ok_or(Error::Proof)?) {
+            return Err(Error::Proof);
+        }
+        let snapshot = *tcp.snapshot();
+        let t = snapshot.tcp;
+        let messages = frozen.status();
+        let records = messages.records;
+        let written = records.outgoing.wire_bytes;
+        let read = records.incoming.wire_bytes;
+        if written == 0
+            || read == 0
+            || written >= 1 << 31
+            || read >= 1 << 31
+            || bridge.endpoint().written != written
+            || bridge.endpoint().read != read
+            || snapshot.progress.send_admitted != written
+            || snapshot.progress.receive_consumed != read
+            || t.timestamps_enabled
+        {
+            return Err(Error::Proof);
+        }
+        let local = t.send_next.0 as u32;
+        let peer = t.receive_next.0 as u32;
+        let (wire_next, wire_ack, wire_window) = lock(&io.state)?.last_wire.ok_or(Error::Proof)?;
+        if wire_next != local || wire_ack != peer {
+            return Err(Error::Proof);
+        }
+        let horizon = horizon(self.policy, wire_window, t.local_window_shift)?;
+        let peer_scale = t.peer_window_shift.unwrap_or(0);
+        let peer_horizon = horizon_bytes(self.policy, t.peer_window_bytes as u64, peer_scale)?;
+        let reserve = 8 * (u64::from(self.policy.mtu) - 40);
+        let required = reserve
+            .checked_add(u64::from(self.policy.minimum_transfer_bytes))
+            .and_then(|n| n.checked_add(32 * (u64::from(self.policy.mtu) - 40)))
+            .ok_or(Error::Exhausted)?;
+        if u64::from(u32::MAX - local) <= required || u64::from(u32::MAX - peer) <= required {
+            return Err(Error::Exhausted);
+        }
+        let pair = self.paired.as_ref().ok_or(Error::Proof)?;
+        let actual = pair.info.lanes[i].ok_or(Error::Proof)?;
+        let proof = wire::LaneProof {
+            lane: i as u8,
+            bulk: if self.count == 1 { 0 } else { i as u8 + 1 },
+            role: if self.client { 1 } else { 2 },
+            options: u8::from(t.peer_sack_permitted),
+            session: actual.session_id,
+            written,
+            read,
+            una: t.send_unacknowledged.0 as u32,
+            next: local,
+            receive: peer,
+            ack: t.last_ack_sent.0 as u32,
+            window: wire_window,
+            scale: t.local_window_shift,
+            peer_scale: t.peer_window_shift.unwrap_or(255),
+            peer_window: u32::try_from(t.peer_window_bytes).map_err(|_| Error::Proof)?,
+            mss: u16::try_from(t.peer_mss).map_err(|_| Error::Proof)?,
+            available: u32::MAX - local,
+            counters: counter_digest(messages, bridge),
+        };
+        wire::LaneProof::parse(&proof.encode())?;
+        lock(&io.state)?.local_proof = Some(proof);
+        let hello_payload = self.policy.overhead() - 40 + wire::HEADER + wire::HELLO;
+        if hello_payload > t.peer_mss || hello_payload > t.peer_window_bytes {
+            return Err(Error::Exhausted);
+        }
+        lock(&io.state)?.fence = Some(Fence {
+            local,
+            peer,
+            receive_prefix: read,
+            local_horizon: horizon,
+            peer_horizon,
+            peer_scale,
+            window: wire_window,
+            sent: 0,
+            allocated: 0,
+            retired: 0,
+            peer_retired: 0,
+        });
+        let direction = if self.client {
+            Direction::ClientToServer
+        } else {
+            Direction::ServerToClient
+        };
+        let key_index = i * 6 + if self.client { 4 } else { 5 };
+        let sealer = PacketSealer::new(
+            self.policy.datagram(actual.session_id, i, direction),
+            &pair.group.keys.as_ref().ok_or(Error::Proof)?._values[key_index],
+        )?;
+        Ok(Detached {
+            io,
+            _tcp: tcp,
+            _frozen: frozen,
+            proof,
+            sealer,
+            pending: None,
+            last_transition: None,
+            last_transition_kind: None,
+            copies: 0,
+            sent_hello: false,
+            sent_commit: false,
+            sent_ack: false,
+            hello: false,
+            hello_reply: false,
+            commit: false,
+            ack: false,
+            last_alive: Instant::now(),
+            last_ping: Instant::now(),
+            ping: None,
+            pong: None,
+            early: None,
+        })
+    }
+    fn make_carrier(&mut self) -> Result<(), Error> {
+        let info = self.paired.as_ref().ok_or(Error::Proof)?.info.clone();
+        let hello = wire::Hello {
+            count: self.count,
+            pair: info.transcript_digest,
+            armed: self.armed,
+            lanes: std::array::from_fn(|i| self.detached[i].as_ref().map(|d| d.proof)),
+        }
+        .encode()?;
+        self.carrier = Some(PacketCarrier {
+            lanes: std::mem::take(&mut self.detached),
+            info,
+            policy: self.policy,
+            policy_digest: self.policy_digest,
+            transaction: self.transaction,
+            armed: self.armed,
+            local_hello: hello,
+            peer_hello: None,
+            commit_proof: None,
+            deadline: self.deadline,
+            timer: Box::pin(sleep_until(self.deadline)),
+            tick: Box::pin(sleep(Duration::from_millis(1))),
+            budget: self.budget.clone(),
+            records: VecDeque::with_capacity(self.count * usize::from(self.policy.queue_packets)),
+            ready: false,
+            fault: None,
+            cursor: 0,
+        });
+        self.paired = None;
+        Ok(())
+    }
+    fn turn(&mut self, cx: &mut Context<'_>) -> Result<Option<PacketCarrier<I>>, Error> {
+        self.check()?;
+        lock(&self.budget)?.quota = 32;
+        if self.stage == 0 {
+            let setup = self.setup.as_mut().ok_or(Error::Proof)?;
+            if let Poll::Ready(result) = Pin::new(setup).poll(cx) {
+                self.paired = Some(result?);
+                self.setup = None;
+                self.install()?;
+                self.stage = 1;
+                cx.waker().wake_by_ref();
+            }
+        } else if self.stage <= 3 {
+            if self.stage == 2
+                && !self
+                    .states
+                    .iter()
+                    .flatten()
+                    .all(|s| lock(s).is_ok_and(|s| s.installed))
+            {
+                self.paired.as_mut().ok_or(Error::Proof)?.group.drive(cx)?;
+            } else if self.control_turn(cx)? {
+                match self.stage {
+                    1 => {
+                        let a = self.controls(1, [0; 32])?;
+                        let b = self.controls(2, [0; 32])?;
+                        self.preparation = wire::set_hash(
+                            b"l2tunnel/raw-packet-prepared-set/v1\0",
+                            &[a[0], a[1], b[0], b[1]],
+                        );
+                    }
+                    2 => {
+                        let a = self.controls(3, self.preparation)?;
+                        self.armed = wire::set_hash(
+                            b"l2tunnel/raw-packet-armed-set/v1\0",
+                            &[a[0], a[1], a[0], a[1]],
+                        );
+                        for state in self.states.iter().flatten() {
+                            let mut state = lock(state)?;
+                            state.hello_allowed = true;
+                            state.expected_armed = self.armed;
+                        }
+                    }
+                    3 => self.freeze()?,
+                    _ => return Err(Error::Proof),
+                }
+                self.stage += 1;
+                self.staged = [false; 2];
+                self.received = [false; 2];
+                cx.waker().wake_by_ref();
+            }
+        } else if self.stage == 4 {
+            if self.collect(cx)? {
+                self.make_carrier()?;
+                self.stage = 5;
+                cx.waker().wake_by_ref();
+            }
+        } else {
+            let carrier = self.carrier.as_mut().ok_or(Error::Proof)?;
+            carrier.turn(cx)?;
+            if carrier.ready {
+                self.check()?;
+                return Ok(self.carrier.take());
+            }
+        }
+        self.check()?;
+        Ok(None)
+    }
+}
+impl<I: PacketIo + Send + 'static> Future for PacketSetup<'_, I> {
+    type Output = Result<PacketCarrier<I>, Error>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(Err(Error::Proof));
+        }
+        match this.turn(cx) {
+            Ok(Some(carrier)) => {
+                this.done = true;
+                Poll::Ready(Ok(carrier))
+            }
+            Ok(None) => {
+                if this.timer.as_mut().poll(cx).is_ready() {
+                    this.done = true;
+                    this.setup = None;
+                    this.paired = None;
+                    this.frozen = [None, None];
+                    this.detached = [None, None];
+                    this.carrier = None;
+                    return Poll::Ready(Err(Error::Expired));
+                }
+                if this.tick.as_mut().poll(cx).is_ready() {
+                    this.tick
+                        .as_mut()
+                        .reset(Instant::now() + Duration::from_millis(1));
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            Err(e) => {
+                this.done = true;
+                this.setup = None;
+                this.paired = None;
+                this.frozen = [None, None];
+                this.detached = [None, None];
+                this.carrier = None;
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+}
+pub(super) fn horizon(policy: PacketPolicy, window: u16, shift: u8) -> Result<u64, Error> {
+    horizon_bytes(policy, u64::from(window) << shift, shift)
+}
+fn horizon_bytes(policy: PacketPolicy, bytes: u64, shift: u8) -> Result<u64, Error> {
+    if shift > 14 {
+        return Err(Error::Proof);
+    }
+    let h = (u64::from(policy.horizon_bytes).min(bytes) >> shift) << shift;
+    if h < 9 * (u64::from(policy.mtu) - 40) || h >> shift > u64::from(u16::MAX) {
+        return Err(Error::Exhausted);
+    }
+    Ok(h)
+}
+fn counter_digest(m: MessageStatus, b: BridgeProof) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(400);
+    for p in [m.records.incoming, m.records.outgoing] {
+        for n in [
+            p.wire_bytes,
+            p.started_records,
+            p.completed_records,
+            u64::from(p.header_bytes),
+            u64::from(p.body_remaining),
+        ] {
+            bytes.extend_from_slice(&n.to_be_bytes());
+        }
+    }
+    for p in [m.incoming, m.outgoing] {
+        for n in [
+            p.reserved_bytes,
+            p.reserved_messages,
+            p.plaintext_bytes,
+            p.started_messages,
+            p.completed_messages,
+        ] {
+            bytes.extend_from_slice(&n.to_be_bytes());
+        }
+    }
+    let e = b.endpoint();
+    let d = b.driver();
+    let engine = b.engine();
+    for n in [
+        m.incoming_offset as u64,
+        m.outgoing_offset as u64,
+        e.written,
+        e.read,
+        d.outbound_read,
+        d.inbound_written,
+        d.raw_received_packets,
+        d.raw_received_bytes,
+        d.raw_popped_packets,
+        d.raw_popped_bytes,
+        d.raw_sent_packets,
+        d.raw_sent_bytes,
+        d.discarded_packets,
+        engine.send_admitted,
+        engine.receive_consumed,
+    ] {
+        bytes.extend_from_slice(&n.to_be_bytes());
+    }
+    bytes.extend_from_slice(&[
+        u8::from(m.message_available),
+        u8::from(m.send_pending),
+        u8::from(m.records.read_eof),
+        u8::from(m.records.shutdown_started),
+        u8::from(m.records.shutdown_completed),
+        u8::from(m.fault.is_some()),
+        u8::from(m.records.fault.is_some()),
+    ]);
+    hash_parts(b"l2tunnel/raw-packet-freeze-counters/v1\0", &[&bytes])
+}
+
+impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
+    fn count(&self) -> usize {
+        if self.info.duplex == Duplex::Full {
+            1
+        } else {
+            2
+        }
+    }
+    fn check(&self) -> Result<(), Error> {
+        if let Some(e) = &self.fault {
+            return Err(e.clone());
+        }
+        let now = Instant::now();
+        if !self.ready && now >= self.deadline {
+            return Err(Error::Expired);
+        }
+        if self.ready
+            && self
+                .lanes
+                .iter()
+                .flatten()
+                .any(|d| now.saturating_duration_since(d.last_alive) >= Duration::from_secs(15))
+        {
+            return Err(Error::Expired);
+        }
+        Ok(())
+    }
+    fn receive_cell(&mut self, i: usize, cell: Cell) -> Result<(), Error> {
+        match cell.header.kind {
+            wire::Kind::Hello => {
+                let bytes: [u8; wire::HELLO] = wire::array(&cell.body)?;
+                let hello = wire::Hello::parse(&bytes)?;
+                if hello.count != self.count()
+                    || hello.pair != self.info.transcript_digest
+                    || hello.armed != self.armed
+                {
+                    return Err(Error::Proof);
+                }
+                for j in 0..self.count() {
+                    self.lanes[j]
+                        .as_ref()
+                        .ok_or(Error::Proof)?
+                        .proof
+                        .complementary(hello.lanes[j].ok_or(Error::Proof)?)?;
+                }
+                if self.peer_hello.is_some_and(|old| old != bytes) {
+                    return Err(Error::Proof);
+                }
+                self.peer_hello = Some(bytes);
+                let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+                lane.hello_reply |= lane.hello;
+                lane.hello = true;
+                let (client, server) = if self.info.is_client {
+                    (&self.local_hello, &bytes)
+                } else {
+                    (&bytes, &self.local_hello)
+                };
+                self.commit_proof = Some(hash_parts(
+                    b"l2tunnel/raw-packet-commit-proof/v1\0",
+                    &[
+                        &self.info.transcript_digest,
+                        &self.policy_digest,
+                        &self.armed,
+                        client,
+                        server,
+                    ],
+                ));
+            }
+            wire::Kind::Commit | wire::Kind::CommitAck => {
+                let kind = cell.header.kind;
+                if (kind == wire::Kind::Commit) == self.info.is_client {
+                    return Err(Error::Proof);
+                }
+                let proof = self.commit_proof.ok_or(Error::Proof)?;
+                if cell.body
+                    != wire::commit(
+                        kind,
+                        self.count(),
+                        proof,
+                        self.info.transcript_digest,
+                        self.policy_digest,
+                    )
+                {
+                    return Err(Error::Proof);
+                }
+                let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+                if kind == wire::Kind::Commit {
+                    lane.commit = true;
+                } else {
+                    lane.ack = true;
+                }
+            }
+            wire::Kind::Data | wire::Kind::Feedback => {
+                if !self.ready {
+                    self.lanes[i].as_mut().ok_or(Error::Proof)?.early = Some(cell);
+                    return Ok(());
+                }
+                self.records.push_back(ReceivedRecord {
+                    lane: if i == 0 {
+                        PairLane::First
+                    } else {
+                        PairLane::Second
+                    },
+                    kind: if cell.header.kind == wire::Kind::Data {
+                        RecordKind::Data
+                    } else {
+                        RecordKind::Feedback
+                    },
+                    bytes: cell.body,
+                });
+            }
+            wire::Kind::Ping => {
+                self.lanes[i].as_mut().ok_or(Error::Proof)?.pong = Some(wire::array(&cell.body)?);
+            }
+            wire::Kind::Pong => {
+                let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+                if lane.ping == Some(wire::array(&cell.body)?) {
+                    lane.ping = None;
+                    lane.last_alive = Instant::now();
+                }
+            }
+            wire::Kind::Window => {}
+        }
+        Ok(())
+    }
+    fn turn(&mut self, cx: &mut Context<'_>) -> Result<bool, Error> {
+        self.check()?;
+        let count = self.count();
+        let mut progress = false;
+        for offset in 0..count {
+            let i = (self.cursor + offset) % count;
+            self.check()?;
+            progress |= self.lanes[i].as_mut().ok_or(Error::Proof)?.progress()?;
+            self.check()?;
+            for _ in 0..(usize::from(self.policy.queue_packets) + 4) {
+                let cell = lock(&self.lanes[i].as_ref().ok_or(Error::Proof)?.io.state)?
+                    .incoming
+                    .pop_front();
+                let Some(cell) = cell else {
+                    break;
+                };
+                self.receive_cell(i, cell)?;
+                progress = true;
+                self.check()?;
+            }
+        }
+        self.cursor = (self.cursor + 1) % count;
+        let all_hello = self.lanes[..count]
+            .iter()
+            .all(|d| d.as_ref().is_some_and(|d| d.hello && d.sent_hello));
+        if all_hello {
+            let proof = self.commit_proof.ok_or(Error::Proof)?;
+            for lane in self.lanes.iter().flatten() {
+                let mut state = lock(&lane.io.state)?;
+                state.peer_hello = self.peer_hello;
+                state.commit_body = Some(wire::commit(
+                    wire::Kind::Commit,
+                    count,
+                    proof,
+                    self.info.transcript_digest,
+                    self.policy_digest,
+                ));
+                state.ack_body = Some(wire::commit(
+                    wire::Kind::CommitAck,
+                    count,
+                    proof,
+                    self.info.transcript_digest,
+                    self.policy_digest,
+                ));
+            }
+        }
+        let all_commit = self.lanes[..count]
+            .iter()
+            .all(|d| d.as_ref().is_some_and(|d| d.commit));
+        let now = Instant::now();
+        for i in 0..count {
+            let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+            if self.ready && lane.pending.is_none() {
+                if let Some(pong) = lane.pong {
+                    match lane.stage(wire::Kind::Pong, &pong, self.transaction) {
+                        Ok(()) => {
+                            lane.pong = None;
+                            progress = true;
+                        }
+                        Err(Error::Busy) => {}
+                        Err(e) => return Err(e),
+                    }
+                } else if now.saturating_duration_since(lane.last_ping) >= Duration::from_secs(5)
+                    && lane.ping.is_none()
+                {
+                    let mut nonce = [0; 8];
+                    SystemRandom::new()
+                        .fill(&mut nonce)
+                        .map_err(|_| Error::Proof)?;
+                    match lane.stage(wire::Kind::Ping, &nonce, self.transaction) {
+                        Ok(()) => {
+                            lane.ping = Some(nonce);
+                            lane.last_ping = now;
+                            progress = true;
+                        }
+                        Err(Error::Busy) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            if now < self.deadline && lane.retry_due(now) {
+                let (kind, body) = if !all_hello
+                    || (lane.hello_reply
+                        && (!self.info.is_client
+                            || lane.last_transition_kind != Some(wire::Kind::Hello)))
+                {
+                    (wire::Kind::Hello, self.local_hello.to_vec())
+                } else if self.info.is_client && !self.ready {
+                    (
+                        wire::Kind::Commit,
+                        wire::commit(
+                            wire::Kind::Commit,
+                            count,
+                            self.commit_proof.ok_or(Error::Proof)?,
+                            self.info.transcript_digest,
+                            self.policy_digest,
+                        )
+                        .to_vec(),
+                    )
+                } else if !self.info.is_client && all_commit {
+                    (
+                        wire::Kind::CommitAck,
+                        wire::commit(
+                            wire::Kind::CommitAck,
+                            count,
+                            self.commit_proof.ok_or(Error::Proof)?,
+                            self.info.transcript_digest,
+                            self.policy_digest,
+                        )
+                        .to_vec(),
+                    )
+                } else {
+                    continue;
+                };
+                match lane.stage(kind, &body, self.transaction) {
+                    Ok(()) => {
+                        if kind == wire::Kind::Hello {
+                            lane.hello_reply = false;
+                        }
+                        progress = true;
+                    }
+                    Err(Error::Busy) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            self.check()?;
+        }
+        let committed = if self.info.is_client {
+            self.lanes[..count]
+                .iter()
+                .all(|d| d.as_ref().is_some_and(|d| d.ack))
+        } else {
+            all_commit
+                && self.lanes[..count]
+                    .iter()
+                    .all(|d| d.as_ref().is_some_and(|d| d.sent_ack))
+        };
+        if !self.ready && committed {
+            self.check()?;
+            self.ready = true;
+            for lane in self.lanes.iter_mut().flatten() {
+                lock(&lane.io.state)?.active = true;
+                lane.last_alive = Instant::now();
+                lane.last_ping = Instant::now();
+            }
+            progress = true;
+        }
+        if self.ready {
+            for i in 0..count {
+                let early = self.lanes[i].as_mut().ok_or(Error::Proof)?.early.take();
+                if let Some(cell) = early {
+                    self.receive_cell(i, cell)?;
+                    progress = true;
+                }
+            }
+        }
+        self.check()?;
+        if self.tick.as_mut().poll(cx).is_ready() {
+            self.tick
+                .as_mut()
+                .reset(Instant::now() + Duration::from_millis(1));
+            cx.waker().wake_by_ref();
+        }
+        if !self.ready && self.timer.as_mut().poll(cx).is_ready() {
+            return Err(Error::Expired);
+        }
+        Ok(progress)
+    }
+    fn fail(&mut self, e: Error) -> Error {
+        let e = self.fault.get_or_insert(e).clone();
+        self.lanes = [None, None];
+        self.records.clear();
+        e
+    }
+    /// Actual accepted pair metadata; it contains no keys or handoff capability.
+    pub fn info(&self) -> &PairInfo {
+        &self.info
+    }
+    /// Copy one admitted upper recovery record into the finite carrier slot.
+    pub fn stage_record(
+        &mut self,
+        lane: PairLane,
+        kind: RecordKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if let Err(e) = self.check() {
+            return Err(self.fail(e));
+        }
+        let i = lane.index();
+        if i >= self.count() || bytes.is_empty() || bytes.len() > self.policy.body_limit() {
+            return Err(Error::Configuration);
+        }
+        if kind == RecordKind::Data && self.count() == 2 && (i == 0) != self.info.is_client {
+            return Err(Error::Configuration);
+        }
+        let wire_kind = if kind == RecordKind::Data {
+            wire::Kind::Data
+        } else {
+            wire::Kind::Feedback
+        };
+        match self.lanes[i]
+            .as_mut()
+            .ok_or(Error::Proof)?
+            .stage(wire_kind, bytes, self.transaction)
+        {
+            Err(Error::Busy) => Err(Error::Busy),
+            Err(e) => Err(self.fail(e)),
+            Ok(()) => Ok(()),
+        }
+    }
+    /// Bounded fair physical progress, transition replies and authenticated liveness.
+    pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        if let Err(e) = lock(&self.budget).map(|mut b| b.quota = 32) {
+            return Poll::Ready(Err(self.fail(e)));
+        }
+        match self.turn(cx) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(self.fail(e))),
+        }
+    }
+    /// Borrow the oldest locally committed authenticated recovery record.
+    pub fn record(&self) -> Option<&ReceivedRecord> {
+        if self.check().is_ok() {
+            self.records.front()
+        } else {
+            None
+        }
+    }
+    /// Release one local carrier delivery cell, never native delivery credit.
+    pub fn consume_record(&mut self) -> Result<(), Error> {
+        if let Err(e) = self.check() {
+            return Err(self.fail(e));
+        }
+        let record = self.records.pop_front().ok_or(Error::Busy)?;
+        let state = &self.lanes[record.lane.index()]
+            .as_ref()
+            .ok_or(Error::Proof)?
+            .io
+            .state;
+        let mut state = lock(state)?;
+        state.records_outstanding = state
+            .records_outstanding
+            .checked_sub(1)
+            .ok_or(Error::Proof)?;
+        Ok(())
+    }
+    /// Drop all originals without polling a TCP shutdown or claiming a clean close.
+    pub fn abort(mut self) {
+        self.lanes = [None, None];
+        self.records.clear();
+    }
+}
+
+#[cfg(test)]
+#[path = "transaction_tests.rs"]
+mod tests;
