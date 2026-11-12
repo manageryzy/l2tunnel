@@ -7,10 +7,12 @@ pub use l2tunnel_codec::Compression;
 use l2tunnel_core::{Duplex, ModeConfig};
 use l2tunnel_device::PacketLayer;
 use l2tunnel_runtime::{Link, RuntimeConfig};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Instant, timeout_at};
 
 /// Explicit transparent-TUN credit and QoS client profile.
 pub mod active;
@@ -49,7 +51,8 @@ pub struct ConnectionConfig {
     pub max_packet: usize,
     /// Negotiated stateless compression policy.
     pub compression: Compression,
-    /// Whole handshake/second-lane deadline.
+    /// One whole-attempt deadline from validated helper entry, including the
+    /// first server accept, all TCP/TLS/member setup and half-duplex pairing.
     pub handshake_timeout: Duration,
 }
 impl ConnectionConfig {
@@ -82,6 +85,44 @@ impl ConnectionConfig {
 fn auth_error(error: auth::Error) -> io::Error {
     io::Error::other(error)
 }
+fn base_expired() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "original TCP handshake deadline elapsed",
+    )
+}
+#[derive(Clone, Copy)]
+struct HandshakeDeadline(Instant);
+impl HandshakeDeadline {
+    fn start(limit: Duration) -> io::Result<Self> {
+        Instant::now()
+            .checked_add(limit)
+            .map(Self)
+            .ok_or_else(base_expired)
+    }
+    fn remaining(self) -> io::Result<Duration> {
+        self.0
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(base_expired)
+    }
+    async fn within<T>(self, future: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+        self.remaining()?;
+        let result = timeout_at(self.0, future)
+            .await
+            .map_err(|_| base_expired())?;
+        // A ready I/O poll can cross the deadline before Tokio checks its timer.
+        // Drop even a successful retained owner instead of accepting it late.
+        self.remaining()?;
+        result
+    }
+}
+fn base_auth_error(error: auth::Error) -> io::Error {
+    match error {
+        auth::Error::TimedOut => base_expired(),
+        other => auth_error(other),
+    }
+}
 async fn socket(address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
         .await
@@ -89,7 +130,15 @@ async fn socket(address: SocketAddr, timeout: Duration) -> io::Result<TcpStream>
     stream.set_nodelay(true)?;
     Ok(stream)
 }
+async fn base_socket(address: SocketAddr, deadline: HandshakeDeadline) -> io::Result<TcpStream> {
+    deadline.remaining()?;
+    let stream = TcpStream::connect(address).await?;
+    deadline.remaining()?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
 /// Authenticate and retain one full-duplex connection or a paired half-duplex set.
+/// One original deadline includes all TCP connects, TLS/member setup and pairing.
 pub async fn connect(
     address: SocketAddr,
     tls: &ClientTls,
@@ -123,35 +172,40 @@ pub(crate) async fn connect_session(
             "authenticated profile and native layer differ",
         ));
     }
-    let first = auth::client_connect(
-        socket(address, config.handshake_timeout).await?,
-        tls,
-        server_name,
-        identity,
-        session,
-        config.handshake_timeout,
-    )
-    .await
-    .map_err(auth_error)?;
-    match config.duplex {
-        Duplex::Full => Ok(Link::full(first)),
-        Duplex::Half => {
-            let second = auth::client_connect(
-                socket(address, config.handshake_timeout).await?,
-                tls,
-                server_name,
-                identity,
-                session,
-                config.handshake_timeout,
-            )
-            .await
-            .map_err(auth_error)?;
-            l2tunnel_runtime::client_pair(first, second).await
-        }
-    }
+    let deadline = HandshakeDeadline::start(config.handshake_timeout)?;
+    deadline
+        .within(async {
+            let lane = async || {
+                let stream = base_socket(address, deadline).await?;
+                let connection = auth::client_connect(
+                    stream,
+                    tls,
+                    server_name,
+                    identity,
+                    session,
+                    deadline.remaining()?,
+                )
+                .await
+                .map_err(base_auth_error)?;
+                deadline.remaining()?;
+                Ok::<_, io::Error>(connection)
+            };
+            let first = lane().await?;
+            match config.duplex {
+                Duplex::Full => Ok(Link::full(first)),
+                Duplex::Half => {
+                    let second = lane().await?;
+                    deadline.remaining()?;
+                    l2tunnel_runtime::client_pair(first, second).await
+                }
+            }
+        })
+        .await
 }
 /// Accept one peer/pair. A failed or mismatched handshake returns an error.
-/// Multi-peer arbitration and reconnect policy are higher-level future work.
+/// The deadline starts at validated helper entry and includes the first accept.
+/// Timeout/cancellation closes accepted sockets and leaves the caller-owned listener
+/// usable. Persistent idle waiting, multi-peer arbitration and retries are caller policy.
 pub async fn accept(
     listener: &TcpListener,
     tls: &ServerTls,
@@ -175,25 +229,32 @@ pub(crate) async fn accept_session(
             "authenticated profile and native layer differ",
         ));
     }
-    let (first, _) = listener.accept().await?;
-    first.set_nodelay(true)?;
-    let first = auth::server_accept(first, tls, allowlist, session, config.handshake_timeout)
+    let deadline = HandshakeDeadline::start(config.handshake_timeout)?;
+    deadline
+        .within(async {
+            let lane = async || {
+                deadline.remaining()?;
+                let (stream, _) = listener.accept().await?;
+                deadline.remaining()?;
+                stream.set_nodelay(true)?;
+                let connection =
+                    auth::server_accept(stream, tls, allowlist, session, deadline.remaining()?)
+                        .await
+                        .map_err(base_auth_error)?;
+                deadline.remaining()?;
+                Ok::<_, io::Error>(connection)
+            };
+            let first = lane().await?;
+            match config.duplex {
+                Duplex::Full => Ok(Link::full(first)),
+                Duplex::Half => {
+                    let second = lane().await?;
+                    deadline.remaining()?;
+                    l2tunnel_runtime::server_pair(first, second).await
+                }
+            }
+        })
         .await
-        .map_err(auth_error)?;
-    match config.duplex {
-        Duplex::Full => Ok(Link::full(first)),
-        Duplex::Half => {
-            let (second, _) = tokio::time::timeout(config.handshake_timeout, listener.accept())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "second carrier timeout"))??;
-            second.set_nodelay(true)?;
-            let second =
-                auth::server_accept(second, tls, allowlist, session, config.handshake_timeout)
-                    .await
-                    .map_err(auth_error)?;
-            l2tunnel_runtime::server_pair(first, second).await
-        }
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -243,3 +304,7 @@ mod tests {
 
 /// Explicit startup-bound rolling source/frame client and lifecycle observation.
 pub mod rolling;
+
+#[cfg(test)]
+#[path = "base_deadline_tests.rs"]
+mod base_deadline_tests;
