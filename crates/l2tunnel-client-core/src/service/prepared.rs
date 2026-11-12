@@ -59,13 +59,23 @@ pub(super) enum Endpoint {
     Client(Client),
     Server(Server),
 }
+/// Selected setup backend. Each variant names one existing authenticated factory;
+/// this is not a carrier preference list and never falls back to another variant.
+#[derive(Clone, Copy)]
+pub(super) enum Transport {
+    Managed(Options),
+    UdpFrame {
+        settings: crate::udp::Settings,
+        delivery: managed::DeliveryConfig,
+    },
+}
 pub(super) struct Data {
     pub connection: ConnectionConfig,
     pub endpoint: Endpoint,
     pub attachment: Attachment,
-    pub options: Options,
+    pub transport: Transport,
 }
-/// Immutable validated managed-TCP plan. Clone retains exact identity. A newly
+/// Immutable validated plan for one explicit backend. Clone retains exact identity. A newly
 /// prepared plan is a different operation even with equivalent visible settings.
 #[derive(Clone)]
 pub struct Prepared {
@@ -80,6 +90,50 @@ impl Prepared {
         attachment: Attachment,
         options: Options,
     ) -> io::Result<Self> {
+        Self::client_endpoint(&credentials)?;
+        Self::new(
+            connection,
+            Endpoint::Client(credentials),
+            attachment,
+            Transport::Managed(options),
+        )
+    }
+    /// Base system/frame UDP initiator with TLS-bootstrapped authentication. The
+    /// native delivery policy is mandatory; there is no legacy default. Pure
+    /// validation of the exact settings and canonical binding precedes any
+    /// credential use, socket bind or device work.
+    pub fn udp_client(
+        connection: ConnectionConfig,
+        credentials: Client,
+        settings: crate::udp::Settings,
+        delivery: managed::DeliveryConfig,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&credentials)?;
+        Self::new(
+            connection,
+            Endpoint::Client(credentials),
+            attachment,
+            Transport::UdpFrame { settings, delivery },
+        )
+    }
+    /// Base system/frame UDP acceptor; same validation order as [`Self::udp_client`].
+    /// Does not bind the TCP bootstrap listener, a UDP socket or a native device.
+    pub fn udp_server(
+        connection: ConnectionConfig,
+        credentials: Server,
+        settings: crate::udp::Settings,
+        delivery: managed::DeliveryConfig,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            connection,
+            Endpoint::Server(credentials),
+            attachment,
+            Transport::UdpFrame { settings, delivery },
+        )
+    }
+    fn client_endpoint(credentials: &Client) -> io::Result<()> {
         if credentials.remote.port() == 0
             || credentials.remote.ip().is_unspecified()
             || credentials.server_name.is_empty()
@@ -90,12 +144,7 @@ impl Prepared {
                 "invalid fixed client endpoint/name",
             ));
         }
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            options,
-        )
+        Ok(())
     }
     /// Pure validation; does not bind listener or open a native device.
     pub fn server(
@@ -108,26 +157,40 @@ impl Prepared {
             connection,
             Endpoint::Server(credentials),
             attachment,
-            options,
+            Transport::Managed(options),
         )
     }
     fn new(
         connection: ConnectionConfig,
         endpoint: Endpoint,
         attachment: Attachment,
-        options: Options,
+        transport: Transport,
     ) -> io::Result<Self> {
-        match options.delivery {
-            Some(delivery) => {
-                connection.session_with_delivery(delivery)?;
+        let profile_interval = match transport {
+            Transport::Managed(options) => {
+                match options.delivery {
+                    Some(delivery) => {
+                        connection.session_with_delivery(delivery)?;
+                    }
+                    None => {
+                        connection.session()?;
+                    }
+                }
+                options.profile_interval
             }
-            None => {
-                connection.session()?;
+            Transport::UdpFrame { settings, delivery } => {
+                // Same exact checks the authenticated factory repeats before I/O.
+                let profile = crate::udp::runtime_config(connection, settings)?;
+                l2tunnel_runtime::udp::base_session_config(
+                    connection.runtime(),
+                    profile,
+                    delivery,
+                )?;
+                None
             }
-        }
+        };
         if attachment.layer != connection.layer
-            || options
-                .profile_interval
+            || profile_interval
                 .is_some_and(|d| d < Duration::from_millis(100) || d > Duration::from_secs(60))
         {
             return Err(io::Error::new(
@@ -141,7 +204,7 @@ impl Prepared {
                 connection,
                 endpoint,
                 attachment,
-                options,
+                transport,
             }),
         })
     }

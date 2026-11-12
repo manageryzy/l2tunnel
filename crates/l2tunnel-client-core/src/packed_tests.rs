@@ -50,7 +50,7 @@ fn reverse(value: udp::Endpoints) -> udp::Endpoints {
 fn endpoints(duplex: Duplex) -> io::Result<(udp::Settings, udp::Settings)> {
     // Keep every reservation alive while choosing ports; only then hand them to the clients.
     let sockets = (0..4)
-        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0"))
+        .map(|_| crate::test_ports::reserve(false))
         .collect::<io::Result<Vec<_>>>()?;
     let first = udp::Endpoints {
         local: sockets[0].local_addr()?,

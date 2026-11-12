@@ -26,14 +26,13 @@ async fn endpoints(
     ipv6: bool,
     duplex: Duplex,
 ) -> io::Result<(Settings, Settings, Vec<SocketAddr>)> {
-    let host = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
     let mut sockets = Vec::new();
     for _ in 0..if duplex == Duplex::Half { 4 } else { 2 } {
-        sockets.push(UdpSocket::bind(host).await?);
+        sockets.push(crate::test_ports::reserve(ipv6)?);
     }
     let addresses = sockets
         .iter()
-        .map(UdpSocket::local_addr)
+        .map(std::net::UdpSocket::local_addr)
         .collect::<io::Result<Vec<_>>>()?;
     let a = Settings {
         forward: Endpoints {

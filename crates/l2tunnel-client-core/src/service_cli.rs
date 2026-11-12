@@ -1,4 +1,4 @@
-//! Presentation adapter for the shared managed-TCP lifecycle owner.
+//! Presentation adapter for the managed-TCP profile of the shared lifecycle owner.
 use super::*;
 use crate::service::{self, Completed, Terminal};
 use std::sync::Arc;

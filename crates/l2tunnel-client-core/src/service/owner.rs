@@ -1,12 +1,11 @@
 use super::*;
-use prepared::Endpoint;
+use prepared::{Endpoint, Transport};
 use std::task::Poll;
 use tokio::net::TcpListener;
 pub(super) struct Active {
     runtime: RunFuture,
-    control: managed::ControlHandle,
+    backend: ObservedBackend,
     generation: OperationId,
-    profile: Option<managed::ProfileHandle>,
 }
 fn cancelled(shared: &Shared, id: OperationId) -> bool {
     shared
@@ -18,7 +17,7 @@ fn cancelled(shared: &Shared, id: OperationId) -> bool {
 fn finish(shared: &Shared, id: OperationId, result: Completed) {
     let mut state = shared.lock();
     let failed = matches!(result, Completed::Failed(_))
-        || (state.control.is_none()
+        || (state.backend.is_none()
             && matches!(state.snapshot.terminal, Some(Terminal::Failed(_))));
     if let Some(entry) = state
         .entries
@@ -28,10 +27,10 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
         entry.result = Some(result);
     }
     state.snapshot.operation = None;
-    if state.control.is_none() {
+    if state.backend.is_none() {
         state.snapshot.listening = None;
     }
-    state.snapshot.phase = if state.control.is_some() {
+    state.snapshot.phase = if state.backend.is_some() {
         Phase::Connected
     } else if failed {
         Phase::Failed
@@ -43,13 +42,14 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
 }
 fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     let generation = active.as_ref().map(|a| a.generation);
-    let control = active.as_ref().map(|a| a.control.clone());
-    // Actual managed branches are inline futures, without spawned children. Drop
-    // every original socket/device owner before publishing release or reconnect.
+    let backend = active.as_ref().map(|a| a.backend.clone());
+    // Managed branches and the inline base UDP runtime own their I/O futures
+    // without spawned children. Drop every original socket/device owner before
+    // publishing release or reconnect.
     drop(active.take());
     let mut state = shared.lock();
-    state.control = None;
-    state.snapshot.runtime = control.and_then(|control| control.status());
+    state.backend = None;
+    state.snapshot.runtime = backend.and_then(|backend| backend.observe());
     state.snapshot.listening = None;
     if let Some(generation) = generation {
         if state.terminals.len() == RETAINED {
@@ -85,9 +85,19 @@ pub(super) async fn establish(
     let deadline = accepted.deadline.ok_or_else(expired)?;
     check(deadline)?;
     let config = plan.data.connection;
-    let options = plan.data.options;
     shared.lock().snapshot.phase = Phase::Authenticating;
     shared.changed();
+    let options = match plan.data.transport {
+        Transport::Managed(options) => options,
+        Transport::UdpFrame { settings, delivery } => {
+            let setup = establish_udp(&shared, &plan, accepted, deadline, settings, delivery);
+            let result = tokio::time::timeout_at(deadline, setup)
+                .await
+                .map_err(|_| expired())?;
+            check(deadline)?;
+            return result;
+        }
+    };
     let setup = async {
         let (link, role) = match &plan.data.endpoint {
             Endpoint::Client(c) => {
@@ -191,9 +201,8 @@ pub(super) async fn establish(
         check(deadline)?;
         Ok(Active {
             runtime,
-            control,
+            backend: ObservedBackend::Managed { control, profile },
             generation: accepted.operation,
-            profile,
         })
     };
     let result = tokio::time::timeout_at(deadline, setup)
@@ -201,6 +210,90 @@ pub(super) async fn establish(
         .map_err(|_| expired())?;
     check(deadline)?;
     result
+}
+/// Full publishes exactly the first lane; half publishes both fixed lanes. The
+/// default empty snapshot or a partially populated one is not readiness.
+pub(super) fn lanes_ready(
+    duplex: l2tunnel_core::Duplex,
+    lanes: l2tunnel_runtime::udp::Snapshot,
+) -> bool {
+    match duplex {
+        l2tunnel_core::Duplex::Full => lanes.lanes[0].is_some() && lanes.lanes[1].is_none(),
+        l2tunnel_core::Duplex::Half => lanes.lanes.iter().all(Option::is_some),
+    }
+}
+/// Existing public UDP factories under the already accepted absolute deadline.
+/// The runtime keeps every reader/writer inline, so dropping it releases the
+/// bootstrap TLS streams, UDP sockets and device before any later publication.
+async fn establish_udp(
+    shared: &Shared,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    settings: crate::udp::Settings,
+    delivery: managed::DeliveryConfig,
+) -> io::Result<Active> {
+    let config = plan.data.connection;
+    let (link, effective) = match &plan.data.endpoint {
+        Endpoint::Client(c) => {
+            crate::udp::connect(
+                c.remote,
+                &c.tls,
+                &c.server_name,
+                &c.member,
+                config,
+                settings,
+                delivery,
+            )
+            .await?
+        }
+        Endpoint::Server(s) => {
+            check(deadline)?;
+            let listener = TcpListener::bind(s.listen).await?;
+            check(deadline)?;
+            shared.lock().snapshot.listening = Some(Listening {
+                operation: accepted.operation,
+                address: listener.local_addr()?,
+            });
+            shared.changed();
+            crate::udp::accept(&listener, &s.tls, &s.members, config, settings, delivery).await?
+        }
+    };
+    check(deadline)?;
+    let device = plan.open()?;
+    check(deadline)?;
+    let (observer, reporter) = l2tunnel_runtime::udp::observations();
+    let mut runtime: RunFuture = Box::pin(l2tunnel_runtime::udp::run_observed_inline(
+        device,
+        link,
+        config.runtime(),
+        effective,
+        Some(reporter),
+        delivery,
+    ));
+    // Authentication and a constructed future are insufficient: wait for the
+    // actual runtime to publish every required physical lane.
+    std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "UDP runtime ended during readiness",
+        ))),
+        Poll::Pending if lanes_ready(config.duplex, observer.status()) => Poll::Ready(Ok(())),
+        Poll::Pending => Poll::Pending,
+    })
+    .await?;
+    check(deadline)?;
+    Ok(Active {
+        runtime,
+        backend: ObservedBackend::UdpFrame(Arc::new(UdpBackend {
+            observer,
+            requested: settings,
+            effective,
+            delivery,
+        })),
+        generation: accepted.operation,
+    })
 }
 // One commit point for cancellation, generation, profile and actual readiness.
 // The helper is shared with a real-TLS late-cancel regression, not a test-only hook.
@@ -229,10 +322,9 @@ pub(super) fn publish_ready(
         finish(shared, accepted.operation, Completed::Cancelled);
         return None;
     }
-    state.profile = session.profile.clone();
     state.snapshot.listening = None;
-    state.snapshot.runtime = session.control.status();
-    state.control = Some(session.control.clone());
+    state.snapshot.runtime = session.backend.observe();
+    state.backend = Some(session.backend.clone());
     state.snapshot.generation = Some(session.generation);
     state.snapshot.terminal = None;
     state.snapshot.operation = None;
@@ -336,8 +428,19 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         );
                         continue;
                     };
-                    let apply = crate::session_control::Control::managed(session.control.clone())
-                        .request(request);
+                    // Submission already rejects apply on a datagram backend; this
+                    // keeps the owner total without sending any protocol input.
+                    let Some(control) = session.backend.managed().cloned() else {
+                        finish(
+                            &shared,
+                            accepted.operation,
+                            Completed::Failed(Failure {
+                                kind: io::ErrorKind::Unsupported,
+                            }),
+                        );
+                        continue;
+                    };
+                    let apply = crate::session_control::Control::managed(control).request(request);
                     tokio::pin!(apply);
                     let result = tokio::select! {
                         response=&mut apply=>classify_apply(response),

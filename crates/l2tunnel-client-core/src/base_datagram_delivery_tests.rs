@@ -1,7 +1,6 @@
 //! Boundary regressions for explicitly bound base-native UDP/QUIC delivery.
 use super::*;
 use l2tunnel_runtime::managed::DeliveryConfig;
-use std::net::UdpSocket as Reservation;
 use tokio::time::timeout;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<T = ()> = std::result::Result<T, Failure>;
@@ -30,8 +29,8 @@ fn invalid_delivery() -> DeliveryConfig {
 }
 #[tokio::test]
 async fn invalid_base_quic_delivery_precedes_bad_certificates_and_occupied_socket() -> Result {
-    let held = Reservation::bind("127.0.0.1:0")?;
-    let peer = Reservation::bind("127.0.0.1:0")?;
+    let held = crate::test_ports::reserve(false)?;
+    let peer = crate::test_ports::reserve(false)?;
     let settings = settings(held.local_addr()?, peer.local_addr()?);
     let cfg = config();
     let profile = quic::runtime_config(cfg, settings)?;
@@ -54,8 +53,8 @@ async fn invalid_base_quic_delivery_precedes_bad_certificates_and_occupied_socke
 }
 #[tokio::test]
 async fn derived_quic_listener_public_base_accept_rejects_without_waiting_for_peer() -> Result {
-    let local = Reservation::bind("127.0.0.1:0")?;
-    let peer = Reservation::bind("127.0.0.1:0")?;
+    let local = crate::test_ports::reserve(false)?;
+    let peer = crate::test_ports::reserve(false)?;
     let settings = settings(local.local_addr()?, peer.local_addr()?);
     drop(local);
     let cert = rcgen::generate_simple_self_signed(vec!["base-delivery.test".into()])?;
@@ -98,8 +97,8 @@ async fn base_udp_and_quic_idle_accepts_share_the_original_entry_deadline() -> R
         }
     });
     for genuine in [false, true] {
-        let local = Reservation::bind("127.0.0.1:0")?;
-        let peer = Reservation::bind("127.0.0.1:0")?;
+        let local = crate::test_ports::reserve(false)?;
+        let peer = crate::test_ports::reserve(false)?;
         let settings = settings(local.local_addr()?, peer.local_addr()?);
         drop(local);
         let cfg = ConnectionConfig {

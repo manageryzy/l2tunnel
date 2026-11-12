@@ -39,7 +39,7 @@ fn reverse(value: udp::Endpoints) -> udp::Endpoints {
 fn endpoints(duplex: Duplex) -> io::Result<(udp::Settings, udp::Settings)> {
     // Keep every reservation alive while choosing ports; only then hand them to the clients.
     let sockets = (0..4)
-        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0"))
+        .map(|_| crate::test_ports::reserve(false))
         .collect::<io::Result<Vec<_>>>()?;
     let first = udp::Endpoints {
         local: sockets[0].local_addr()?,
@@ -598,7 +598,7 @@ async fn udp_startup_retry_is_bounded_and_only_retries_bind_collisions() -> Test
 #[tokio::test]
 async fn udp_startup_classifies_actual_wrapped_quic_bind_without_retrying_auth() -> TestResult {
     let credentials = credentials()?;
-    let held = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let held = crate::test_ports::reserve(false)?;
     let held_address = held.local_addr()?;
     let (mut a, _) = endpoints(Duplex::Full)?;
     a.forward.local = held_address;

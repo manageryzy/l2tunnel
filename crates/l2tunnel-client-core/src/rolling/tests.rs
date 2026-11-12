@@ -27,7 +27,7 @@ fn connection(layer: PacketLayer, duplex: Duplex) -> ConnectionConfig {
 }
 fn endpoints(duplex: Duplex) -> io::Result<(udp::Settings, udp::Settings)> {
     let sockets = (0..4)
-        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0"))
+        .map(|_| crate::test_ports::reserve(false))
         .collect::<io::Result<Vec<_>>>()?;
     let forward = udp::Endpoints {
         local: sockets[0].local_addr()?,
@@ -434,3 +434,52 @@ async fn rolling_original_deadline_rejects_pending_and_ready_overrun() -> TestRe
 
 #[path = "failure_tests.rs"]
 mod failure;
+
+#[test]
+fn rolling_source_wire_is_explicit_optional_and_selects_the_scheduler_format() -> TestResult {
+    let value: serde_json::Value = serde_json::from_slice(include_bytes!("test-policy.json"))?;
+    let with = |text: Option<&str>| -> Result<Vec<u8>, serde_json::Error> {
+        let mut changed = value.clone();
+        if let (Some(text), Some(object)) = (
+            text,
+            changed
+                .pointer_mut("/scheduling")
+                .and_then(serde_json::Value::as_object_mut),
+        ) {
+            object.insert("source_wire".into(), text.into());
+        }
+        serde_json::to_vec(&changed)
+    };
+    // An existing policy file without the field keeps the padded format, and
+    // serialising it again does not introduce the field.
+    let absent = Settings::from_json(&with(None)?)?;
+    let padded = Settings::from_json(&with(Some("padded"))?)?;
+    assert_eq!(absent, padded);
+    assert!(!serde_json::to_string(&absent)?.contains("source_wire"));
+    let exact = Settings::from_json(&with(Some("exact"))?)?;
+    assert!(serde_json::to_string(&exact)?.contains("\"source_wire\":\"exact\""));
+    for unknown in ["Exact", "trimmed", ""] {
+        assert!(
+            Settings::from_json(&with(Some(unknown))?).is_err(),
+            "{unknown}"
+        );
+    }
+    let padded_policy = absent.apply_scheduler_for_test();
+    let exact_policy = exact.apply_scheduler_for_test();
+    assert_eq!(
+        padded_policy.source_wire,
+        l2tunnel_fec::rolling::wire::SourceWire::Padded
+    );
+    assert_eq!(
+        exact_policy.source_wire,
+        l2tunnel_fec::rolling::wire::SourceWire::Exact
+    );
+    assert_eq!(
+        l2tunnel_fec::rolling::scheduler::Policy {
+            source_wire: padded_policy.source_wire,
+            ..exact_policy
+        },
+        padded_policy
+    );
+    Ok(())
+}

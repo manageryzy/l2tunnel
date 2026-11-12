@@ -1,8 +1,10 @@
-//! One retained managed-TCP lifecycle for authorized local frontends.
+//! One retained lifecycle owner for authorized local frontends.
 //!
-//! This first slice supports the existing managed TCP/frame profile only. Other
-//! profile factories remain independent; there is no implicit fallback. Handles
-//! and waiters do not own or cancel the actor. The caller retains and polls Run.
+//! Supported backends are the existing managed TCP/frame profile and base
+//! system/frame UDP with TLS-bootstrapped authentication. Genuine QUIC and every
+//! other profile factory remain independent; there is no implicit fallback.
+//! Handles and waiters do not own or cancel the actor. The caller retains and
+//! polls Run.
 use crate::{ConnectionConfig, local};
 use l2tunnel_runtime::managed;
 use std::{
@@ -118,6 +120,78 @@ pub struct Listening {
     /// Actual kernel-bound address.
     pub address: std::net::SocketAddr,
 }
+/// Requested and effective base UDP profile with the latest actual lane status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpFrame {
+    /// Settings the caller prepared, including custom cover and protection suite.
+    pub requested: crate::udp::Settings,
+    /// Runtime profile returned by the authenticated factory for this generation.
+    pub effective: l2tunnel_runtime::udp::Config,
+    /// Canonical native delivery policy bound into authentication.
+    pub delivery: managed::DeliveryConfig,
+    /// Last published lanes. An absent lane is unknown, never zero or ready.
+    /// Local queue, native delivery flight and recovery retention stay separate.
+    pub lanes: l2tunnel_runtime::udp::Snapshot,
+}
+/// Actual observation of the one live or last backend; variants are never merged.
+#[derive(Clone, Debug)]
+pub enum Observation {
+    /// Existing managed TCP/TLS runtime status.
+    Managed(managed::Status),
+    /// Base system/frame UDP runtime status, boxed because it carries two lanes.
+    UdpFrame(Box<UdpFrame>),
+}
+impl Observation {
+    /// Managed status, absent for every other backend.
+    pub fn managed(&self) -> Option<&managed::Status> {
+        match self {
+            Self::Managed(status) => Some(status),
+            Self::UdpFrame(_) => None,
+        }
+    }
+    /// Base UDP observation, absent for every other backend.
+    pub fn udp_frame(&self) -> Option<&UdpFrame> {
+        match self {
+            Self::UdpFrame(frame) => Some(frame),
+            Self::Managed(_) => None,
+        }
+    }
+}
+/// Authoritative handles of the live backend. Its presence is the live-session
+/// predicate; it is not a capability flag or a second lifecycle state machine.
+#[derive(Clone)]
+enum ObservedBackend {
+    Managed {
+        control: managed::ControlHandle,
+        profile: Option<managed::ProfileHandle>,
+    },
+    UdpFrame(Arc<UdpBackend>),
+}
+struct UdpBackend {
+    observer: l2tunnel_runtime::udp::Observer,
+    requested: crate::udp::Settings,
+    effective: l2tunnel_runtime::udp::Config,
+    delivery: managed::DeliveryConfig,
+}
+impl ObservedBackend {
+    fn observe(&self) -> Option<Observation> {
+        match self {
+            Self::Managed { control, .. } => control.status().map(Observation::Managed),
+            Self::UdpFrame(udp) => Some(Observation::UdpFrame(Box::new(UdpFrame {
+                requested: udp.requested,
+                effective: udp.effective,
+                delivery: udp.delivery,
+                lanes: udp.observer.status(),
+            }))),
+        }
+    }
+    fn managed(&self) -> Option<&managed::ControlHandle> {
+        match self {
+            Self::Managed { control, .. } => Some(control),
+            Self::UdpFrame(_) => None,
+        }
+    }
+}
 /// Latest lifecycle plus the existing actual runtime observation.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -129,8 +203,8 @@ pub struct Snapshot {
     pub generation: Option<OperationId>,
     /// Actual bound listener address, useful before first peer arrives.
     pub listening: Option<Listening>,
-    /// Current actual managed status, never inferred from the requested profile.
-    pub runtime: Option<managed::Status>,
+    /// Current actual backend status, never inferred from the requested profile.
+    pub runtime: Option<Observation>,
     /// Latest actual generation termination.
     pub terminal: Option<Terminal>,
 }
@@ -189,8 +263,7 @@ struct Job {
 }
 struct State {
     snapshot: Snapshot,
-    control: Option<managed::ControlHandle>,
-    profile: Option<managed::ProfileHandle>,
+    backend: Option<ObservedBackend>,
     queued: Option<Job>,
     entries: VecDeque<Entry>,
     terminals: VecDeque<(OperationId, Terminal)>,
@@ -240,9 +313,9 @@ impl Handle {
         let state = self.0.lock();
         let mut snapshot = state.snapshot.clone();
         snapshot.runtime = state
-            .control
+            .backend
             .as_ref()
-            .and_then(managed::ControlHandle::status)
+            .and_then(ObservedBackend::observe)
             .or(snapshot.runtime);
         snapshot
     }
@@ -256,9 +329,27 @@ impl Handle {
         if state.snapshot.generation != Some(generation) {
             return Err(SubmitError::State);
         }
-        Ok(state.profile.clone())
+        Ok(match &state.backend {
+            Some(ObservedBackend::Managed { profile, .. }) => profile.clone(),
+            _ => None,
+        })
     }
-    /// Submit managed TCP setup; clones of Prepared retain the exact identity.
+    /// Latest-snapshot subscription for exactly this live base UDP generation.
+    /// It has no history queue and reading it refreshes no timer or counter.
+    pub fn datagram_observer(
+        &self,
+        generation: OperationId,
+    ) -> Result<Option<l2tunnel_runtime::udp::Observer>, SubmitError> {
+        let state = self.0.lock();
+        if state.snapshot.generation != Some(generation) {
+            return Err(SubmitError::State);
+        }
+        Ok(match &state.backend {
+            Some(ObservedBackend::UdpFrame(udp)) => Some(udp.observer.clone()),
+            _ => None,
+        })
+    }
+    /// Submit setup for the prepared backend; clones of Prepared retain the exact identity.
     /// Caller credential parsing precedes Prepared/acceptance and is excluded
     /// from this bound. Acceptance starts it before queued socket/device work.
     pub fn connect(&self, plan: Prepared, key: RequestKey) -> Result<Accepted, SubmitError> {
@@ -268,7 +359,7 @@ impl Handle {
             key,
         )
     }
-    /// Abort original owners. Managed TCP has no clean-drain implementation.
+    /// Abort original owners. No supported backend has a clean-drain implementation.
     pub fn disconnect(&self, key: RequestKey) -> Result<Accepted, SubmitError> {
         self.submit(Fingerprint::Disconnect, Command::Disconnect, key)
     }
@@ -282,6 +373,9 @@ impl Handle {
     }
     /// Submit the existing compression action; no cancellation/rollback is exposed.
     /// Peer transaction deadlines and commit reconciliation remain runtime-owned.
+    /// A live datagram backend has a fixed profile: a new key is rejected as
+    /// Unsupported without consuming it, queueing a command or sending anything.
+    /// Retained keys still replay their original acceptance.
     pub fn apply(&self, request: local::Request, key: RequestKey) -> Result<Accepted, SubmitError> {
         if request.version != local::VERSION
             || !matches!(request.action, local::Action::SwitchCompression { .. })
@@ -325,7 +419,12 @@ impl Handle {
         if state.snapshot.operation.is_some() {
             return Err(SubmitError::Busy);
         }
-        let connected = state.control.is_some();
+        let connected = state.backend.is_some();
+        if matches!(command, Command::Apply(_))
+            && matches!(state.backend, Some(ObservedBackend::UdpFrame(_)))
+        {
+            return Err(SubmitError::Unsupported);
+        }
         match &command {
             Command::Connect(_) if connected => return Err(SubmitError::State),
             Command::Reconnect(_) | Command::Disconnect | Command::Apply(_) if !connected => {
@@ -455,13 +554,16 @@ impl Handle {
             return response("unsupported_version");
         }
         if matches!(request.action, local::Action::Status {}) {
-            let control = self.0.lock().control.clone();
-            return match control {
-                Some(control) => {
+            let backend = self.0.lock().backend.clone();
+            return match backend {
+                Some(ObservedBackend::Managed { control, .. }) => {
                     crate::session_control::Control::managed(control)
                         .request(request)
                         .await
                 }
+                // The local v1 status schema describes managed sessions only.
+                // Typed in-process status is Handle::snapshot, not a new IPC wire.
+                Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
                 None => response("closed"),
             };
         }
@@ -490,7 +592,8 @@ fn response(code: &str) -> local::Response {
 }
 type RunFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 /// Sole lifecycle actor. No task is implicitly spawned. Original inline managed
-/// socket/device futures drop before the completion guard publishes cancellation.
+/// and base UDP socket/device futures drop before the completion guard publishes
+/// cancellation.
 pub struct Run {
     future: RunFuture,
     _completion: Completion,
@@ -507,8 +610,8 @@ impl Drop for Completion {
         let mut state = self.0.lock();
         state.snapshot.phase = Phase::Closed;
         state.snapshot.listening = None;
-        if let Some(control) = state.control.take() {
-            state.snapshot.runtime = control.status();
+        if let Some(backend) = state.backend.take() {
+            state.snapshot.runtime = backend.observe();
         }
         if let Some(generation) = state.snapshot.generation
             && !state.terminals.iter().any(|(id, _)| *id == generation)
@@ -557,8 +660,7 @@ pub fn channel() -> (Handle, Run) {
                 runtime: None,
                 terminal: None,
             },
-            control: None,
-            profile: None,
+            backend: None,
             queued: None,
             entries: VecDeque::with_capacity(RETAINED),
             terminals: VecDeque::with_capacity(RETAINED),

@@ -11,6 +11,7 @@ use std::{
 use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T = ()> = std::result::Result<T, Error>;
+mod datagram;
 fn cfg(duplex: Duplex) -> ConnectionConfig {
     ConnectionConfig {
         layer: PacketLayer::Ip,
@@ -395,7 +396,12 @@ async fn real_reconnect_releases_device_and_old_tls_before_replacement_bytes_and
                 Completed::Connected { generation } => generation,
                 other => return Err(format!("setup: {other:?}").into()),
             };
-            assert!(handle.snapshot().runtime.is_some_and(|s| s.running));
+            assert!(
+                handle
+                    .snapshot()
+                    .runtime
+                    .is_some_and(|s| s.managed().is_some_and(|s| s.running))
+            );
             native
                 .incoming
                 .lock()
@@ -453,7 +459,12 @@ async fn real_reconnect_releases_device_and_old_tls_before_replacement_bytes_and
             assert_eq!(events, vec![(true, 1), (false, 1), (true, 2)]);
             assert_eq!(native.live.load(Ordering::SeqCst), 1);
             assert_eq!(
-                handle.snapshot().runtime.as_ref().map(|s| s.epoch.0),
+                handle
+                    .snapshot()
+                    .runtime
+                    .as_ref()
+                    .and_then(|s| s.managed())
+                    .map(|s| s.epoch.0),
                 Some(1)
             );
             native
@@ -686,7 +697,7 @@ async fn real_ready_then_cancel_never_publishes_unconnected_profile_or_generatio
     let mut peer = peer?;
     assert_eq!(native.live.load(Ordering::SeqCst), 1);
     assert!(
-        handle.0.lock().profile.is_none(),
+        handle.0.lock().backend.is_none(),
         "uncommitted setup leaked its profiler"
     );
     assert!(handle.snapshot().generation.is_none());
@@ -696,7 +707,7 @@ async fn real_ready_then_cancel_never_publishes_unconnected_profile_or_generatio
         handle.wait(accepted.operation).await.map_err(submit)?,
         Completed::Cancelled
     );
-    assert!(handle.0.lock().profile.is_none());
+    assert!(handle.0.lock().backend.is_none());
     assert!(handle.snapshot().generation.is_none());
     assert!(handle.snapshot().listening.is_none());
     assert_eq!(native.live.load(Ordering::SeqCst), 0);
