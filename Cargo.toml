@@ -22,6 +22,10 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 
+[profile.dev]
+debug = 1
+incremental = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

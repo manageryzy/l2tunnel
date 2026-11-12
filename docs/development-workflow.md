@@ -59,12 +59,16 @@ API. No task is complete just because its enum/trait or crate compiles.
    Earlier receipts retain their original recorded scope and are not rewritten.
    Freeze a copied source snapshot, verify its file hashes against the selected
    workspace checkpoint, and release module workers immediately after the copy.
-   Run the aggregate and exact-source build in that snapshot, with an exclusive
-   Cargo target directory; native tests execute only its immutable daemon,
+   Run the aggregate and exact-source build in that snapshot, with exclusive
+   access to the workspace's shared Cargo target directory; native tests execute only its immutable daemon,
    verifier and copied helper tree. Do not require the live development workspace
    to stay frozen during validation. A receipt qualifies its recorded snapshot,
    not concurrent later edits. Run privileged/native tests only for a runnable feature
    within the authorized isolated lab. Keep unsupported/skipped gates unchecked.
+   Use the shared target through `CARGO_TARGET_DIR` or a snapshot symlink; wait
+   for Cargo's lock instead of creating a target per worker, source copy or retry.
+   Preserve small source manifests, logs and receipts outside the target. Remove
+   obsolete compiler output after its processes exit; it is not evidence.
 8. **Commit coherent checkpoints.** Create a local Git commit after a module has
    concrete code, its scoped checks and updated evidence. Do not accumulate all
    work until the complete product is ready. The integrator owns staging and

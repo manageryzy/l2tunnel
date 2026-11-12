@@ -35,6 +35,13 @@ and restart the rust-analyzer server if the editor was already running. Check
 - Avoid ABI/semver promises while the wire and embedding contracts remain draft.
   An unused enum or trait cannot satisfy a mode-completion requirement.
 
+Development and test builds use line-level debug information and disable
+incremental compilation to bound disk use. Workers and validation snapshots
+share the workspace `target` directory instead of retaining separate build
+trees. Wait for Cargo's lock; preserve receipts outside the disposable target.
+Use `CARGO_PROFILE_DEV_DEBUG=2` explicitly when full variable debug information
+is needed for a debugging session.
+
 ## Required checks
 
 ```sh
