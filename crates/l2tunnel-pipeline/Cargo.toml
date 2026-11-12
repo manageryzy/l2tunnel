@@ -1,0 +1,17 @@
+[package]
+name = "l2tunnel-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-packet = { path = "../l2tunnel-packet" }
+l2tunnel-qos = { path = "../l2tunnel-qos" }
+l2tunnel-mux = { path = "../l2tunnel-mux" }
+
+[dev-dependencies]
+l2tunnel-flow-control = { path = "../l2tunnel-flow-control" }

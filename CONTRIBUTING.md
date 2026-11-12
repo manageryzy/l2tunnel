@@ -1,0 +1,50 @@
+# Contributing
+
+Read [AGENTS.md](AGENTS.md), the architecture and the
+[implementation checklist](docs/implementation-checklist.md) first. Update stable
+task IDs and evidence in the same change; keep all P-* mode gates synchronized
+with the mode catalog.
+Documentation and comments use English. Keep simulator evidence unchanged unless
+an experiment change is explicitly part of the task; save new runs separately.
+
+## Rust conventions
+
+- Rust 2024, pinned toolchain in `rust-toolchain.toml`; public errors are explicit.
+- `cargo fmt` is authoritative. Clippy warnings are errors in checks/CI. Public
+  items require docs. Runtime code may not use unwrap, expect, panic or unsafe.
+- No implicit network/device side effects in library constructors; inject time,
+  I/O and bounded buffers. Use newtypes for unrelated sequence spaces.
+- Validate external lengths before indexing/allocation. Bound retained bytes,
+  packet counts, decoding work, timers and contexts. Use checked arithmetic.
+- Never log private keys, exporter secrets or raw authentication tokens. Use
+  maintained crypto implementations; no homegrown primitives or accept-all TLS.
+- Keep wire parsing, transport delivery and native device ownership separate.
+  A new native FFI crate needs an isolated documented unsafe policy/review.
+- Avoid ABI/semver promises while the wire and embedding contracts remain draft.
+  An unused enum or trait cannot satisfy a mode-completion requirement.
+
+## Required checks
+
+```sh
+python3 tools/check.py
+```
+
+This runs formatting, Clippy, Rust tests and rustdoc, catalog validation, CLI
+status/failure checks and Linux-only unprivileged lab tests. It does not run
+privileged networking, install drivers, rerun the simulator sweeps or certify
+cross-platform execution. `.github/workflows/checks.yml` additionally defines
+Windows host checks and an Android compile-only job.
+
+Use focused behavioral tests for parsing, recovery, cryptographic failures and
+state transitions. Golden codec vectors must include arbitrary nonzero payloads,
+unsupported frames, length boundaries and loss/reorder/context-reset cases.
+Fuzz unauthenticated entry points and replay/epoch handling before release.
+
+New Python tooling uses Python 3.11+, standard-library-only where practical,
+4-space indentation and explicit argument vectors rather than shell execution.
+`tools/check.py` checks compilation and the focused tooling tests; it does not
+apply a new formatter/linter policy to the existing simulator history.
+
+Report actual commands and scope. A dry run is not an integration test, a Linux
+compile is not a Windows/Android device test, and a finite simulation result is
+not a deployment performance guarantee.

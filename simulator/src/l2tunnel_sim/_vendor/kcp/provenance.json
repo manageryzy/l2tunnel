@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/skywind3000/kcp",
+  "ref": "v1",
+  "commit": "8004f7eba5d1bf33f0691eef5f887f2cd3140cb5",
+  "files": {
+    "ikcp.c": {
+      "url": "https://raw.githubusercontent.com/skywind3000/kcp/8004f7eba5d1bf33f0691eef5f887f2cd3140cb5/ikcp.c",
+      "sha256": "b476f4ae41b555f28e819f3a6f34b7e2307c93e17875b4864a8f5fc217f67f60"
+    },
+    "ikcp.h": {
+      "url": "https://raw.githubusercontent.com/skywind3000/kcp/8004f7eba5d1bf33f0691eef5f887f2cd3140cb5/ikcp.h",
+      "sha256": "f04f978a0893a8209d7b82095d19c38cefcf8f30bc932a85bb7fa53b33f9e76c"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/skywind3000/kcp/8004f7eba5d1bf33f0691eef5f887f2cd3140cb5/LICENSE",
+      "sha256": "6587fd02a924b97dbd6758b0573ddec056fb494a84f3709c5aaa33ce1f7f029c"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "l2tunnel-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-openvpn = { path = "../l2tunnel-openvpn" }
+l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
+l2tunnel-qos = { path = "../l2tunnel-qos" }
+l2tunnel-aligned = { path = "../l2tunnel-aligned" }
+l2tunnel-quic = { path = "../l2tunnel-quic" }
+l2tunnel-active = { path = "../l2tunnel-active" }
+l2tunnel-flow-control = { path = "../l2tunnel-flow-control" }
+l2tunnel-pipeline = { path = "../l2tunnel-pipeline" }
+l2tunnel-packet = { path = "../l2tunnel-packet" }
+l2tunnel-udp = { path = "../l2tunnel-udp" }
+l2tunnel-datagram = { path = "../l2tunnel-datagram" }
+l2tunnel-recovery = { path = "../l2tunnel-recovery" }
+l2tunnel-reliable = { path = "../l2tunnel-reliable" }
+l2tunnel-fec = { path = "../l2tunnel-fec" }
+l2tunnel-codec = { path = "../l2tunnel-codec" }
+l2tunnel-auth = { path = "../l2tunnel-auth" }
+l2tunnel-core = { path = "../l2tunnel-core" }
+l2tunnel-device = { path = "../l2tunnel-device" }
+l2tunnel-wire = { path = "../l2tunnel-wire" }
+l2tunnel-management = { path = "../l2tunnel-management" }
+ring = "=0.17.14"
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "=1.53.1", features = ["test-util"] }
+l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
+l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

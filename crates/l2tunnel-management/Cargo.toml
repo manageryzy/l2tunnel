@@ -1,0 +1,14 @@
+[package]
+name = "l2tunnel-management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+l2tunnel-core = { path = "../l2tunnel-core" }
+l2tunnel-session = { path = "../l2tunnel-session" }
+ring = "=0.17.14"
+
+[lints]
+workspace = true

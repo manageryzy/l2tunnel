@@ -1,0 +1,848 @@
+use crate::RecoveryEngine;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::time::Duration;
+
+/// Bytes preceding one source payload in the draft authenticated inner encoding.
+pub const DATA_HEADER_BYTES: usize = 44;
+/// Exact byte size of the bounded cumulative/bitmap ACK packet.
+pub const ACK_PACKET_BYTES: usize = 48;
+const COMMON_HEADER_BYTES: usize = 32;
+const WINDOW_LIMIT: usize = 64;
+
+/// Independent endpoint role; accepting reflected local packets is forbidden.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointRole {
+    /// Session initiator, encoded as zero.
+    Initiator,
+    /// Session responder, encoded as one.
+    Responder,
+}
+
+impl EndpointRole {
+    fn code(self) -> u8 {
+        match self {
+            Self::Initiator => 0,
+            Self::Responder => 1,
+        }
+    }
+}
+
+/// Binding checked after the caller authenticates an incoming complete packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryContext {
+    /// Authenticated session identity.
+    pub session: u128,
+    /// Negotiated configuration epoch; old engine state must be drained separately.
+    pub epoch: u64,
+    /// Local role; peer packets must carry the opposite role.
+    pub role: EndpointRole,
+}
+
+/// Nonwrapping source identity in one sending direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SourceId(pub u64);
+
+/// Finite source, retention and retry budgets for one bidirectional engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArqConfig {
+    /// Largest admitted or received source payload; at most 65,535 bytes.
+    pub max_source_bytes: usize,
+    /// Maximum retained send-payload bytes, independent of source count.
+    pub send_bytes: usize,
+    /// Maximum retained receive-payload bytes, including pending application delivery.
+    pub receive_bytes: usize,
+    /// Maximum unconfirmed source count and source-ID span, in 1..=64.
+    pub send_records: usize,
+    /// Maximum retained source count and receive-ID window, in 1..=64.
+    pub receive_records: usize,
+    /// Timeout from the first transmission to its first retry.
+    pub initial_rto: Duration,
+    /// Maximum exponentially backed-off retry timeout.
+    pub maximum_rto: Duration,
+    /// Maximum delay before emitting pending receipt feedback.
+    pub ack_delay: Duration,
+    /// Maximum retransmissions after the initial attempt; zero is permitted.
+    pub max_retries: u16,
+}
+
+impl Default for ArqConfig {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: 1_200,
+            send_bytes: 76_800,
+            receive_bytes: 76_800,
+            send_records: 64,
+            receive_records: 64,
+            initial_rto: Duration::from_millis(200),
+            maximum_rto: Duration::from_secs(3),
+            ack_delay: Duration::from_millis(5),
+            max_retries: 8,
+        }
+    }
+}
+
+impl ArqConfig {
+    fn validate(self) -> Result<(), RecoveryError> {
+        if !(1..=65_535).contains(&self.max_source_bytes)
+            || self.send_bytes < self.max_source_bytes
+            || self.receive_bytes < self.max_source_bytes
+            || !(1..=WINDOW_LIMIT).contains(&self.send_records)
+            || !(1..=WINDOW_LIMIT).contains(&self.receive_records)
+            || self.initial_rto.is_zero()
+            || self.maximum_rto < self.initial_rto
+            || self.ack_delay > self.initial_rto
+        {
+            return Err(RecoveryError::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+/// Which owned payload buffer requires backpressure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferSide {
+    /// Outbound sources waiting for transmission or confirmation.
+    Send,
+    /// Inbound sources waiting for earlier gaps or application delivery.
+    Receive,
+}
+
+/// Explicit errors; only retry exhaustion makes an engine terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryError {
+    /// Invalid local timing, window or memory configuration.
+    InvalidConfig,
+    /// Packet is truncated, has trailing bytes or violates the draft encoding.
+    MalformedPacket,
+    /// Peer role, session or epoch does not match this engine.
+    WrongContext,
+    /// Carrier-only and selective-repeat profiles cannot be silently mixed.
+    WrongProfile,
+    /// Source exceeds the configured payload-size cap.
+    SourceTooLarge,
+    /// A byte/count payload budget is full; retry admission after draining.
+    Capacity(BufferSide),
+    /// Source-ID distance exceeds the bounded send/receive reorder window.
+    SequenceWindow,
+    /// Carrier-only received a new source out of reliable-stream order.
+    UnexpectedSequence,
+    /// Same retained source identity was supplied with different payload bytes.
+    ConflictingDuplicate,
+    /// ACK claims a source not yet submitted or transmitted.
+    UnsentAcknowledgement,
+    /// Caller output capacity is insufficient; queued work remains unchanged.
+    OutputTooSmall {
+        /// Exact required output size.
+        required: usize,
+    },
+    /// Injected time moved backwards.
+    NonMonotonicTime,
+    /// Computing a future deadline exceeded Duration's representable range.
+    TimeOverflow,
+    /// A source ID or checked byte counter would overflow.
+    CounterExhausted,
+    /// The source's finite retry budget expired without confirmation.
+    RetryExhausted {
+        /// Source whose final retry deadline expired.
+        source: SourceId,
+    },
+}
+
+impl fmt::Display for RecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+/// Saturating diagnostics only; counters never decide protocol behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Statistics {
+    /// Unique sources admitted locally.
+    pub submitted: u64,
+    /// Source packet emissions, including retries.
+    pub transmissions: u64,
+    /// Source retransmissions after their initial packet emission.
+    pub retransmissions: u64,
+    /// Recovery ACK packets emitted.
+    pub feedback_sent: u64,
+    /// Valid recovery ACK packets consumed, including repeated ACKs.
+    pub feedback_received: u64,
+    /// Unique received sources stored from packet bytes.
+    pub received_unique: u64,
+    /// Duplicate data packets ignored without redelivery.
+    pub duplicates: u64,
+    /// Sources copied to application delivery buffers.
+    pub delivered: u64,
+    /// Full source and feedback packet bytes emitted, before outer protection.
+    pub wire_bytes_emitted: u64,
+}
+
+/// Current owned payload retention, excluding fixed-size metadata.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Retained {
+    /// Unconfirmed/unhanded-off outbound source count.
+    pub send_records: usize,
+    /// Retained outbound payload bytes.
+    pub send_bytes: usize,
+    /// Undelivered inbound source count.
+    pub receive_records: usize,
+    /// Retained inbound payload bytes.
+    pub receive_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Profile {
+    Selective,
+    CarrierOnly,
+}
+
+impl Profile {
+    fn code(self) -> u8 {
+        match self {
+            Self::Selective => 1,
+            Self::CarrierOnly => 2,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Flight {
+    payload: Box<[u8]>,
+    attempts: u32,
+    retry_at: Option<Duration>,
+    rto: Duration,
+}
+
+#[derive(Debug)]
+struct Engine {
+    config: ArqConfig,
+    context: RecoveryContext,
+    profile: Profile,
+    sent: BTreeMap<SourceId, Flight>,
+    received: BTreeMap<SourceId, Box<[u8]>>,
+    next_source: u64,
+    receive_prefix: u64,
+    deliver_next: u64,
+    send_bytes: usize,
+    receive_bytes: usize,
+    ack_at: Option<Duration>,
+    prefer_data: bool,
+    last_now: Duration,
+    failure: Option<RecoveryError>,
+    statistics: Statistics,
+}
+
+/// Actual-payload selective-repeat ARQ for an authenticated datagram carrier.
+/// This baseline has bounded selective ACKs and timeout recovery, not Python
+/// wire parity, FEC, fast retransmit, a clock or a congestion controller.
+///
+/// ```
+/// use l2tunnel_recovery::{
+///     ArqConfig, EndpointRole, RecoveryContext, RecoveryEngine, SelectiveRepeat,
+/// };
+/// use std::time::Duration;
+/// # fn main() -> Result<(), l2tunnel_recovery::RecoveryError> {
+/// let context = RecoveryContext { session: 1, epoch: 0, role: EndpointRole::Initiator };
+/// let mut sender = SelectiveRepeat::new(ArqConfig::default(), context)?;
+/// let mut receiver = SelectiveRepeat::new(
+///     ArqConfig::default(), RecoveryContext { role: EndpointRole::Responder, ..context },
+/// )?;
+/// sender.submit(b"actual payload", Duration::ZERO)?;
+/// let mut packet = vec![0; sender.max_packet_bytes()];
+/// if let Some(size) = sender.poll(Duration::ZERO, &mut packet)? {
+///     // Authenticate the transferred packet with the session layer before receive.
+///     receiver.receive(&packet[..size], Duration::ZERO)?;
+/// }
+/// let mut delivered = [0; 128];
+/// assert_eq!(receiver.poll_delivered(&mut delivered)?, Some((0, 14)));
+/// assert_eq!(&delivered[..14], b"actual payload");
+/// let ack_time = Duration::from_millis(5);
+/// if let Some(size) = receiver.poll(ack_time, &mut packet)? {
+///     sender.receive(&packet[..size], ack_time)?;
+/// }
+/// assert!(sender.drained());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct SelectiveRepeat(Engine);
+
+/// Bounded forwarding for an authenticated reliable ordered carrier, without ARQ.
+/// `poll` transfers send ownership to the caller; it does not prove peer receipt.
+#[derive(Debug)]
+pub struct CarrierOnly(Engine);
+
+/// Borrowed syntactically valid selective-repeat record in the supplied peer context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketView<'a> {
+    /// Complete original source identity and opaque source payload.
+    Data {
+        /// Nonwrapping source identity.
+        source: SourceId,
+        /// Original source payload without the recovery header.
+        payload: &'a [u8],
+    },
+    /// Bounded receipt feedback; sender-state validity is checked by receive.
+    Ack {
+        /// First missing contiguous received source ID.
+        prefix: u64,
+        /// Selective receipt bits relative to prefix; bit zero is clear.
+        bitmap: u64,
+    },
+}
+
+/// Inspect a selective-repeat peer packet using the engine's authoritative parser.
+///
+/// This validates encoding, profile, role/session/epoch and source size, but does
+/// not authenticate bytes or validate feedback against a particular send ledger.
+pub fn inspect_packet(
+    packet: &[u8],
+    context: RecoveryContext,
+    max_source_bytes: usize,
+) -> Result<PacketView<'_>, RecoveryError> {
+    if !(1..=65_535).contains(&max_source_bytes) {
+        return Err(RecoveryError::InvalidConfig);
+    }
+    parse(packet, context, Profile::Selective, max_source_bytes)
+}
+
+impl SelectiveRepeat {
+    /// Emit due feedback only, without advancing source attempts or source timers.
+    /// Caller must charge this output to the same wire budget as data/repair copies.
+    pub fn poll_feedback(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+    ) -> Result<Option<usize>, RecoveryError> {
+        self.0.poll_selected(now, output, true, false)
+    }
+
+    /// Emit a ready first source or retry only; due feedback remains pending.
+    /// Small output buffers leave source attempts and deadlines unchanged.
+    pub fn poll_source(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+    ) -> Result<Option<usize>, RecoveryError> {
+        self.0.poll_selected(now, output, false, true)
+    }
+}
+
+macro_rules! engine_api {
+    ($engine:ident, $profile:expr) => {
+        impl $engine {
+            /// Construct an empty engine with independent bounded direction state.
+            pub fn new(config: ArqConfig, context: RecoveryContext) -> Result<Self, RecoveryError> {
+                Ok(Self(Engine::new(config, context, $profile)?))
+            }
+
+            /// Snapshot of the sole source allocator, valid until the next successful submit.
+            /// Exclusive ownership is required between this read and submission.
+            pub fn next_source_id(&self) -> Result<SourceId, RecoveryError> {
+                self.0.running()?;
+                self.0
+                    .next_source
+                    .checked_add(1)
+                    .ok_or(RecoveryError::CounterExhausted)?;
+                Ok(SourceId(self.0.next_source))
+            }
+
+            /// Largest packet the caller must be able to hold for this instance.
+            pub fn max_packet_bytes(&self) -> usize {
+                (DATA_HEADER_BYTES + self.0.config.max_source_bytes).max(ACK_PACKET_BYTES)
+            }
+
+            /// Saturating diagnostic counters for emitted/received/delivered work.
+            pub fn statistics(&self) -> Statistics {
+                self.0.statistics
+            }
+
+            /// Current bounded owned payload retention.
+            pub fn retained(&self) -> Retained {
+                Retained {
+                    send_records: self.0.sent.len(),
+                    send_bytes: self.0.send_bytes,
+                    receive_records: self.0.received.len(),
+                    receive_bytes: self.0.receive_bytes,
+                }
+            }
+
+            /// Sticky retry-exhaustion failure, if any. Drop/reconcile the session;
+            /// constructing a replacement engine alone cannot authorize ID reuse.
+            pub fn failure(&self) -> Option<RecoveryError> {
+                self.0.failure
+            }
+        }
+
+        impl RecoveryEngine for $engine {
+            type Error = RecoveryError;
+            fn submit(&mut self, source: &[u8], now: Duration) -> Result<u64, Self::Error> {
+                self.0.submit(source, now)
+            }
+            fn receive(&mut self, packet: &[u8], now: Duration) -> Result<(), Self::Error> {
+                self.0.receive(packet, now)
+            }
+            fn poll(
+                &mut self,
+                now: Duration,
+                output: &mut [u8],
+            ) -> Result<Option<usize>, Self::Error> {
+                self.0.poll(now, output)
+            }
+            fn poll_delivered(
+                &mut self,
+                output: &mut [u8],
+            ) -> Result<Option<(u64, usize)>, Self::Error> {
+                self.0.poll_delivered(output)
+            }
+            fn deadline(&self) -> Option<Duration> {
+                self.0.deadline()
+            }
+            fn drained(&self) -> bool {
+                self.0.failure.is_none()
+                    && self.0.sent.is_empty()
+                    && self.0.received.is_empty()
+                    && self.0.ack_at.is_none()
+            }
+        }
+    };
+}
+
+engine_api!(SelectiveRepeat, Profile::Selective);
+engine_api!(CarrierOnly, Profile::CarrierOnly);
+
+impl Engine {
+    fn new(
+        config: ArqConfig,
+        context: RecoveryContext,
+        profile: Profile,
+    ) -> Result<Self, RecoveryError> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            context,
+            profile,
+            sent: BTreeMap::new(),
+            received: BTreeMap::new(),
+            next_source: 0,
+            receive_prefix: 0,
+            deliver_next: 0,
+            send_bytes: 0,
+            receive_bytes: 0,
+            ack_at: None,
+            prefer_data: false,
+            last_now: Duration::ZERO,
+            failure: None,
+            statistics: Statistics::default(),
+        })
+    }
+
+    fn running(&self) -> Result<(), RecoveryError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn check_time(&self, now: Duration) -> Result<(), RecoveryError> {
+        self.running()?;
+        if now < self.last_now {
+            return Err(RecoveryError::NonMonotonicTime);
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, source: &[u8], now: Duration) -> Result<u64, RecoveryError> {
+        self.check_time(now)?;
+        if source.len() > self.config.max_source_bytes {
+            return Err(RecoveryError::SourceTooLarge);
+        }
+        let bytes = self
+            .send_bytes
+            .checked_add(source.len())
+            .ok_or(RecoveryError::CounterExhausted)?;
+        if self.sent.len() >= self.config.send_records || bytes > self.config.send_bytes {
+            return Err(RecoveryError::Capacity(BufferSide::Send));
+        }
+        if let Some((first, _)) = self.sent.first_key_value()
+            && self.next_source - first.0 >= self.config.send_records as u64
+        {
+            return Err(RecoveryError::SequenceWindow);
+        }
+        let next = self
+            .next_source
+            .checked_add(1)
+            .ok_or(RecoveryError::CounterExhausted)?;
+        let source_id = self.next_source;
+        self.sent.insert(
+            SourceId(source_id),
+            Flight {
+                payload: source.to_vec().into_boxed_slice(),
+                attempts: 0,
+                retry_at: None,
+                rto: self.config.initial_rto,
+            },
+        );
+        self.next_source = next;
+        self.send_bytes = bytes;
+        self.last_now = now;
+        self.statistics.submitted = self.statistics.submitted.saturating_add(1);
+        Ok(source_id)
+    }
+
+    fn receive(&mut self, packet: &[u8], now: Duration) -> Result<(), RecoveryError> {
+        self.check_time(now)?;
+        let parsed = parse(
+            packet,
+            self.context,
+            self.profile,
+            self.config.max_source_bytes,
+        )?;
+        match parsed {
+            PacketView::Data { source, payload } => self.receive_source(source, payload, now)?,
+            PacketView::Ack { prefix, bitmap } => self.receive_ack(prefix, bitmap)?,
+        }
+        self.last_now = now;
+        Ok(())
+    }
+
+    fn receive_source(
+        &mut self,
+        source: SourceId,
+        payload: &[u8],
+        now: Duration,
+    ) -> Result<(), RecoveryError> {
+        let ack_at = if self.profile == Profile::Selective {
+            Some(
+                now.checked_add(self.config.ack_delay)
+                    .ok_or(RecoveryError::TimeOverflow)?,
+            )
+        } else {
+            None
+        };
+        if let Some(previous) = self.received.get(&source) {
+            if previous.as_ref() != payload {
+                return Err(RecoveryError::ConflictingDuplicate);
+            }
+            self.schedule_ack(ack_at);
+            self.statistics.duplicates = self.statistics.duplicates.saturating_add(1);
+            return Ok(());
+        }
+        if source.0 < self.receive_prefix {
+            self.schedule_ack(ack_at);
+            self.statistics.duplicates = self.statistics.duplicates.saturating_add(1);
+            return Ok(());
+        }
+        if self.profile == Profile::CarrierOnly && source.0 != self.receive_prefix {
+            return Err(RecoveryError::UnexpectedSequence);
+        }
+        if source.0 - self.deliver_next >= self.config.receive_records as u64 {
+            return Err(RecoveryError::SequenceWindow);
+        }
+        let bytes = self
+            .receive_bytes
+            .checked_add(payload.len())
+            .ok_or(RecoveryError::CounterExhausted)?;
+        if self.received.len() >= self.config.receive_records || bytes > self.config.receive_bytes {
+            return Err(RecoveryError::Capacity(BufferSide::Receive));
+        }
+        self.received
+            .insert(source, payload.to_vec().into_boxed_slice());
+        self.receive_bytes = bytes;
+        while self.received.contains_key(&SourceId(self.receive_prefix)) {
+            // Source u64::MAX is rejected by the codec, so advancing is safe.
+            self.receive_prefix += 1;
+        }
+        self.schedule_ack(ack_at);
+        self.statistics.received_unique = self.statistics.received_unique.saturating_add(1);
+        Ok(())
+    }
+
+    fn schedule_ack(&mut self, deadline: Option<Duration>) {
+        if let Some(deadline) = deadline {
+            self.ack_at = Some(
+                self.ack_at
+                    .map_or(deadline, |previous| previous.min(deadline)),
+            );
+        }
+    }
+
+    fn receive_ack(&mut self, prefix: u64, bitmap: u64) -> Result<(), RecoveryError> {
+        if prefix > self.next_source {
+            return Err(RecoveryError::UnsentAcknowledgement);
+        }
+        if bitmap != 0 {
+            let highest = 63 - u64::from(bitmap.leading_zeros());
+            let last = prefix
+                .checked_add(highest)
+                .ok_or(RecoveryError::UnsentAcknowledgement)?;
+            if last >= self.next_source {
+                return Err(RecoveryError::UnsentAcknowledgement);
+            }
+        }
+        if self
+            .sent
+            .iter()
+            .any(|(source, flight)| acknowledged(*source, prefix, bitmap) && flight.attempts == 0)
+        {
+            return Err(RecoveryError::UnsentAcknowledgement);
+        }
+        let mut released_bytes = 0;
+        self.sent.retain(|source, flight| {
+            if acknowledged(*source, prefix, bitmap) {
+                released_bytes += flight.payload.len();
+                false
+            } else {
+                true
+            }
+        });
+        // The removed payload subset cannot exceed the previously accounted sum.
+        self.send_bytes -= released_bytes;
+        self.statistics.feedback_received = self.statistics.feedback_received.saturating_add(1);
+        Ok(())
+    }
+
+    fn ready_source(&self, now: Duration) -> Option<SourceId> {
+        self.sent
+            .iter()
+            .filter_map(|(source, flight)| {
+                flight
+                    .retry_at
+                    .filter(|deadline| *deadline <= now)
+                    .map(|deadline| (deadline, *source))
+            })
+            .min()
+            .map(|(_, source)| source)
+            .or_else(|| {
+                self.sent
+                    .iter()
+                    .find(|(_, flight)| flight.attempts == 0)
+                    .map(|(source, _)| *source)
+            })
+    }
+
+    fn poll(&mut self, now: Duration, output: &mut [u8]) -> Result<Option<usize>, RecoveryError> {
+        self.poll_selected(now, output, true, true)
+    }
+
+    fn poll_selected(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        allow_feedback: bool,
+        allow_sources: bool,
+    ) -> Result<Option<usize>, RecoveryError> {
+        self.check_time(now)?;
+        let ack_ready = allow_feedback && self.ack_at.is_some_and(|deadline| deadline <= now);
+        let data = if allow_sources {
+            self.ready_source(now)
+        } else {
+            None
+        };
+        if ack_ready && (!self.prefer_data || data.is_none()) {
+            ensure_output(output, ACK_PACKET_BYTES)?;
+            let mut bitmap = 0;
+            for source in self.received.keys() {
+                if source.0 >= self.receive_prefix {
+                    let offset = source.0 - self.receive_prefix;
+                    if offset < 64 {
+                        bitmap |= 1_u64 << offset;
+                    }
+                }
+            }
+            write_common(output, self.context, self.profile, 2);
+            output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
+            output[40..48].copy_from_slice(&bitmap.to_be_bytes());
+            self.ack_at = None;
+            self.prefer_data = true;
+            self.last_now = now;
+            self.statistics.feedback_sent = self.statistics.feedback_sent.saturating_add(1);
+            self.statistics.wire_bytes_emitted = self
+                .statistics
+                .wire_bytes_emitted
+                .saturating_add(ACK_PACKET_BYTES as u64);
+            return Ok(Some(ACK_PACKET_BYTES));
+        }
+        let Some(source) = data else {
+            self.last_now = now;
+            return Ok(None);
+        };
+        let flight = self
+            .sent
+            .get(&source)
+            .ok_or(RecoveryError::MalformedPacket)?;
+        if flight.attempts > u32::from(self.config.max_retries) {
+            let error = RecoveryError::RetryExhausted { source };
+            self.failure = Some(error);
+            self.last_now = now;
+            return Err(error);
+        }
+        let required = DATA_HEADER_BYTES + flight.payload.len();
+        ensure_output(output, required)?;
+        let is_retry = flight.attempts > 0;
+        let rto = if is_retry {
+            flight
+                .rto
+                .checked_mul(2)
+                .unwrap_or(self.config.maximum_rto)
+                .min(self.config.maximum_rto)
+        } else {
+            self.config.initial_rto
+        };
+        let retry_at = if self.profile == Profile::Selective {
+            Some(now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?)
+        } else {
+            None
+        };
+        write_common(output, self.context, self.profile, 1);
+        output[32..40].copy_from_slice(&source.0.to_be_bytes());
+        output[40..44].copy_from_slice(&(flight.payload.len() as u32).to_be_bytes());
+        output[44..required].copy_from_slice(&flight.payload);
+        if self.profile == Profile::CarrierOnly {
+            self.send_bytes -= flight.payload.len();
+            self.sent.remove(&source);
+        } else {
+            let flight = self
+                .sent
+                .get_mut(&source)
+                .ok_or(RecoveryError::MalformedPacket)?;
+            flight.attempts += 1;
+            flight.rto = rto;
+            flight.retry_at = retry_at;
+        }
+        self.prefer_data = false;
+        self.last_now = now;
+        self.statistics.transmissions = self.statistics.transmissions.saturating_add(1);
+        self.statistics.retransmissions = self
+            .statistics
+            .retransmissions
+            .saturating_add(u64::from(is_retry));
+        self.statistics.wire_bytes_emitted = self
+            .statistics
+            .wire_bytes_emitted
+            .saturating_add(required as u64);
+        Ok(Some(required))
+    }
+
+    fn poll_delivered(&mut self, output: &mut [u8]) -> Result<Option<(u64, usize)>, RecoveryError> {
+        self.running()?;
+        let source = SourceId(self.deliver_next);
+        let Some(payload) = self.received.get(&source) else {
+            return Ok(None);
+        };
+        let length = payload.len();
+        ensure_output(output, length)?;
+        let next = self
+            .deliver_next
+            .checked_add(1)
+            .ok_or(RecoveryError::CounterExhausted)?;
+        output[..length].copy_from_slice(payload);
+        self.received.remove(&source);
+        self.receive_bytes -= length;
+        self.deliver_next = next;
+        self.statistics.delivered = self.statistics.delivered.saturating_add(1);
+        Ok(Some((source.0, length)))
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.sent
+            .values()
+            .map(|flight| flight.retry_at.unwrap_or(self.last_now))
+            .chain(self.ack_at)
+            .min()
+    }
+}
+
+fn acknowledged(source: SourceId, prefix: u64, bitmap: u64) -> bool {
+    if source.0 < prefix {
+        return true;
+    }
+    let offset = source.0 - prefix;
+    offset < 64 && bitmap & (1_u64 << offset) != 0
+}
+
+fn ensure_output(output: &[u8], required: usize) -> Result<(), RecoveryError> {
+    if output.len() < required {
+        return Err(RecoveryError::OutputTooSmall { required });
+    }
+    Ok(())
+}
+
+fn write_common(output: &mut [u8], context: RecoveryContext, profile: Profile, kind: u8) {
+    output[..4].copy_from_slice(b"L2AR");
+    output[4] = 1;
+    output[5] = profile.code();
+    output[6] = kind;
+    output[7] = context.role.code();
+    output[8..24].copy_from_slice(&context.session.to_be_bytes());
+    output[24..32].copy_from_slice(&context.epoch.to_be_bytes());
+}
+
+fn field<const N: usize>(packet: &[u8], offset: usize) -> Result<[u8; N], RecoveryError> {
+    packet
+        .get(offset..offset + N)
+        .ok_or(RecoveryError::MalformedPacket)?
+        .try_into()
+        .map_err(|_| RecoveryError::MalformedPacket)
+}
+
+fn parse(
+    packet: &[u8],
+    context: RecoveryContext,
+    profile: Profile,
+    max_source: usize,
+) -> Result<PacketView<'_>, RecoveryError> {
+    if packet.len() < COMMON_HEADER_BYTES || packet.get(..4) != Some(b"L2AR") || packet[4] != 1 {
+        return Err(RecoveryError::MalformedPacket);
+    }
+    if packet[5] != profile.code() {
+        return Err(RecoveryError::WrongProfile);
+    }
+    if packet[7] > 1
+        || packet[7] == context.role.code()
+        || u128::from_be_bytes(field(packet, 8)?) != context.session
+        || u64::from_be_bytes(field(packet, 24)?) != context.epoch
+    {
+        return Err(RecoveryError::WrongContext);
+    }
+    match packet[6] {
+        1 => {
+            let source = u64::from_be_bytes(field(packet, 32)?);
+            if source == u64::MAX {
+                return Err(RecoveryError::CounterExhausted);
+            }
+            let length = u32::from_be_bytes(field(packet, 40)?) as usize;
+            if length > max_source {
+                return Err(RecoveryError::SourceTooLarge);
+            }
+            if packet.len() != DATA_HEADER_BYTES + length {
+                return Err(RecoveryError::MalformedPacket);
+            }
+            Ok(PacketView::Data {
+                source: SourceId(source),
+                payload: &packet[DATA_HEADER_BYTES..],
+            })
+        }
+        2 if profile == Profile::Selective => {
+            if packet.len() != ACK_PACKET_BYTES {
+                return Err(RecoveryError::MalformedPacket);
+            }
+            let prefix = u64::from_be_bytes(field(packet, 32)?);
+            let bitmap = u64::from_be_bytes(field(packet, 40)?);
+            if bitmap & 1 != 0 {
+                return Err(RecoveryError::MalformedPacket);
+            }
+            Ok(PacketView::Ack { prefix, bitmap })
+        }
+        _ => Err(RecoveryError::MalformedPacket),
+    }
+}
+
+#[cfg(test)]
+mod tests;

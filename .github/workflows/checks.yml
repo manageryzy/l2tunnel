@@ -1,0 +1,27 @@
+name: Workspace checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  host:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+      - run: python tools/check.py
+  android-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.92.0 --profile minimal
+      - run: rustup target add --toolchain 1.92.0 aarch64-linux-android
+      # Compile-only: this does not link JNI or validate VpnService/device behavior.
+      - run: cargo check --locked --target aarch64-linux-android -p l2tunnel-android

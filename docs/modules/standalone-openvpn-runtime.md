@@ -1,0 +1,256 @@
+# Standalone OpenVPN-like retained runtime
+
+Status: implemented and loopback integration-tested. The retained standalone UDP
+runtime carries actual verified TLS/member control and protected recovered user
+packets over full or authenticated paired half lanes, without TCP sockets.
+Native TAP/TUN, client selection, production qualification and FEC integration
+remain separate open gates. The pure gate is described in
+[the bootstrap module](standalone-openvpn.md).
+
+A separately negotiated [native-fence capability](openvpn-native-drain.md) adds
+strict OVC2 control and source admission/consumption seals. Its full/paired
+factories use actual verified sessions and preserve all legacy OVC1 factories and
+configuration domains. Its [client/CLI selection](openvpn-drain-client.md) has
+local integration evidence; privileged native clean-close qualification remains open.
+
+## Ownership and public API
+
+`l2tunnel-openvpn` is a Tokio/OS runtime crate distinct from the pure protocol
+libraries. The existing `l2tunnel-udp` retains a concrete TLS/TCP connection and its
+own API; changing that object would conflate two different carrier capabilities.
+The new crate reuses `l2tunnel-udp-control`, maintained auth factories, protected
+datagrams and existing bounded selective repeat. It creates no new cipher,
+handshake primitive or ARQ wire format. Initial data recovery is selective repeat;
+existing Cauchy FEC profiles need an explicit later adapter and parity gate.
+
+Implemented bounded API:
+
+```rust
+pub struct ClientCredentials<'a> {
+    pub tls: &'a ClientTls,
+    pub server_name: &'a str,
+    pub member: &'a MemberKey,
+    pub admission: udp_control::Secret,
+}
+pub struct ServerCredentials<'a> {
+    pub tls: &'a ServerTls,
+    pub members: &'a MemberAllowlist,
+    pub admission: udp_control::Secret,
+    pub cookie: udp_control::Secret,
+}
+pub async fn client_connect(socket: UdpSocket, config: Config,
+    credentials: ClientCredentials<'_>) -> Result<Carrier, Error>;
+pub async fn server_accept(socket: UdpSocket, config: Config,
+    credentials: ServerCredentials<'_>) -> Result<Carrier, Error>;
+Carrier::info() -> &SessionInfo;
+Carrier::split(self) -> (Control, PacketSender, PacketReceiver);
+PacketSender::send(&self, packet: &[u8]) -> Result<(), Error>;
+PacketReceiver::receive(&mut self, output: &mut [u8]) -> Result<usize, Error>;
+Control::status() -> Result<Status, Error>;
+Control::close(self) -> Result<CloseReceipt, Error>;
+```
+
+Factories consume the caller's exact fixed-tuple socket and complete the actual
+admission and TLS/member exchange before returning packet handles. No API accepts
+arbitrary exporter bytes or an asserted authenticated session. Config includes
+the upper `SessionConfig`, fixed client/server tuple, gate bounds, data profile,
+data ARQ bounds, positive auth deadline, absolute authenticated lease, heartbeat
+and inactivity durations, finite stream/application/datagram slots and bytes,
+poll interval/work limit, and aggregate transmission allowance/control reserve.
+All values enter one canonical digest before gate or TLS exchange. The gate's
+base profile hashes that runtime policy and the upper digest; TLS then binds the
+complete gate digest. Key bytes never enter public configuration metadata.
+
+One supervised driver exclusively calls `recv_from` and owns the socket, control
+engine, protected packet sealer/opener, data recovery and bounded retained output.
+A bounded duplex stream connects that driver to the same actual TLS object.
+The auth factory performs TLS on one end; its private success path verifies the
+immutable `OpenVpnLikeTls` profile and exact config, derives purpose/direction/
+lane keys from that object, and sends one private activation command. After
+activation a supervised TLS task owns the same authenticated stream for internal
+heartbeat/close/control frames. Public handles cannot issue activation commands.
+Task guards cancel/abort owned tasks when factories fail or Control is dropped;
+plain detached Tokio tasks are forbidden.
+
+## Lease and uninterrupted state
+
+Bootstrap has its original immutable gate deadline. Actual TLS/member completion
+must occur before that deadline and within the separately bound auth timeout.
+Only the runtime's private authenticated success path calls
+`ControlEngine::promote_authenticated(lease, now)`. The pure method documents a
+trusted-caller precondition; it does not pretend to inspect TLS membership.
+
+The authenticated lease defaults to one hour and is positive and at most 24 hours.
+Promotion is allowed once, checked before bootstrap expiry. It updates only the
+absolute expiry and time watermark. The original bootstrap deadline remains
+observable. Control keys, bootstrap session, outer packet sequence/replay bitmap,
+ARQ source IDs/retry attempts/retained bytes and interval quotas remain intact.
+Late/double/backward-time/overflow promotion fails without resetting anything.
+There is no later absolute renewal or in-place rekey; exhaustion ends the session.
+
+A second, shorter TLS inactivity deadline limits dead peers. The default heartbeat
+interval must be at most one third of that timeout. Only a fresh valid internal
+message actually decrypted/read from the retained TLS object renews inactivity.
+Outer admission MACs, ARQ feedback, data traffic, malformed/repeated heartbeat
+messages and old outer replay cannot renew it. Heartbeat frames bind session,
+message kind, role and nonwrapping sequence; one outstanding request and one
+bounded response slot are allowed. Absolute expiry always takes precedence.
+TLS EOF/error or either supervised task failure revokes both packet handles.
+
+## One socket, common allowance and bounded delivery
+
+Demultiplex by the strict disjoint gate/control/data prefixes, then validate full
+length, configured source tuple, role/profile/session and MAC/AEAD before recovery.
+Before private activation, data datagrams are discarded without payload retention.
+After activation, both cryptographic directions exist even for a one-direction
+bulk lane: reverse recovery feedback is internal control. User admission checks
+the lane's configured bulk direction. The initial profile fixes endpoints and
+does not learn NAT rebinding, allow QUIC-like relabeling, or fall back to TCP.
+
+All outgoing datagrams share one bounded packet/complete-IP-byte allowance per
+interval, including TLS sources, control ACKs, data sources, data ACKs and every
+retry. Data cannot spend a configured mandatory-control reservation. Control also
+has a finite ceiling so a cooperative steady control stream cannot consume every
+data slot. Reserve capacity and verify key-use headroom before polling recovery;
+do not burn a recovery attempt while waiting for allowance or an output slot.
+Seal a retransmission with a fresh packet number while retaining its recovery
+source identity. Exact cost includes cover, common header, tag and IP/UDP bytes.
+Accounting is admission to retained caller output; actual successful socket sends
+are tracked separately. At most a configured fixed number of complete datagrams
+may be held after admission across WouldBlock. A single blocked data output must
+leave room for mandatory control.
+
+Finite packet queues are configured by count and bytes. Admission acquires queue
+capacity before cloning user bytes. The driver keeps an original packet until
+recovery admission succeeds. Recovery delivery is transferred into a bounded
+receiver queue only after its slot is reserved. A too-small receive output keeps
+the same queued packet. `send` completion means bounded recovery admission;
+`receive` transfers packet ownership, not native device acceptance. Higher layers
+must separately account for native delivery. All user TCP control/probe packets
+follow this same data path and configured MUX policy.
+
+The first packet slice enforces a negotiated maximum source that fits the complete
+data datagram after recovery/protection overhead. Oversize packets are explicit
+errors; a production TAP/TUN adapter must compose reviewed fragmentation rather
+than silently truncating a native frame. Kernel offload and path MTU qualification
+remain native gates.
+
+## Close, paired lanes and validation gates
+
+Explicit close first freezes new user admission, then drains queued originals,
+recovery obligations, receiver handoffs and retained socket output. Only then may
+session-bound TLS Close/CloseAck finish. Deadline expiry or an unread application
+queue is a reported failed/incomplete close, not silent successful disposal.
+Dropping the control owner cancels ownership and is not a clean-drain receipt.
+After local TLS EOF/shutdown, data/application drain and control-ARQ drain, the
+same socket/control engine remains alive for a fixed quiet interval equal to the
+negotiated control maximum RTO plus ACK delay plus two driver poll intervals.
+Fresh accepted control input and newly emitted output restart quiet, never the
+original absolute close deadline. `Control::close` applies that same retained
+start/deadline to terminal waiting and every supervised task join; awaiting a join
+never moves its handle out of the owner. Cancellation or an earlier failed join
+therefore aborts both the current and all not-yet-joined tasks. A peer-triggered
+earlier close does not acquire a fresh timeout when the caller later closes.
+This services final source retries after an
+ACK was lost. A short remaining lease or close deadline can still end with an
+explicit failure. This is finite retry/delay protection, not proof of remote
+shutdown under arbitrary packet loss or unbounded network delay.
+
+Implement one full-duplex lane first. Paired half duplex then joins two separately
+authenticated physical lanes using actual exporter-bound member/server/config
+identity and complementary direction, with finite pairing time and no cross-lane
+source/key reuse. Existing UDP pairing helpers can be studied but cannot prove a
+standalone capability while still containing a TCP stream. CLI selection remains disabled pending the native, TLS-allocation and provisioning
+audits below.
+
+### Paired implementation contract
+
+`client_pair([UdpSocket; 2], [Config; 2], ClientPairCredentials)` and
+`server_pair(..., ServerPairCredentials)` accept lanes in canonical order:
+client-to-server bulk first, server-to-client bulk second. Each lane has a distinct
+lane ID, fixed tuple, bootstrap admission key and actual TLS session. Base policy,
+protection, aggregate allowance and final authenticated identities must agree.
+`PairedCarrier::split()` returns a `PairControl`, the locally permitted packet
+sender and the opposite lane's packet receiver. PairControl retains the inactive
+handles and owns both original controls; dropping it cancels both lanes. A bounded
+supervisor propagates any failed lane terminal state to its sibling. Clean close
+waits for both owners and never cancels the sibling merely because one finishes
+its quiet interval first.
+
+One shared monotonic origin and one locked wire ledger are created before either
+gate runs. Every gate or recovery emission checks capacity, polls and charges in
+one synchronous critical section; no socket await holds the ledger lock. The
+pair's aggregate counters are read from that ledger rather than adding duplicate
+per-lane snapshots. Each lane also exposes its own counters; snapshots across
+actors are not instantaneous. Each lane retains at most its two bounded output slots.
+
+After genuine member authentication each private factory promotes its retained
+control lease only. It does not construct data recovery, data keys or payload
+scratch buffers. Both actual TLS capabilities stay private until a fixed-frame
+join over the first TLS stream completes within the canonically bound pairing
+deadline. The join hashes both actual session IDs, lane IDs/directions, exact
+accepted configs and member/server identities. Each side contributes a fresh
+16-byte random challenge. Maintained HMAC under the reverse lane's directional
+LaneJoin exporter authenticates that digest, both ordered challenges and a
+domain-separated HMAC under the forward lane's actual exporter. Thus another
+valid forward session cannot transplant a reverse proof. Hello, Proof and Accept
+have strict roles/order/length/reserved fields and phase-separated proofs; each
+factory consumes the join once. Only mutual acceptance releases private data
+activation and starts normal retained TLS heartbeat tasks. Failure, cancellation,
+wrong identity/config/proof, replay or timeout drops both owned drivers. The
+join is a project protocol over actual TLS, not an OpenVPN interoperability claim.
+
+- [x] [MOD-OVPNRT-01] Implement approved one-shot pure lease promotion preserving transport state and rejecting late/double/time/overflow changes. Evidence: [promotion implementation](../../crates/l2tunnel-udp-control/src/control.rs), [continuity/absolute-expiry tests](../../crates/l2tunnel-udp-control/src/tests.rs).
+- [x] [MOD-OVPNRT-02] Finalize canonical runtime config and private verified-auth activation API, including every queue/lease/pacing bound. Evidence: [canonical config](../../crates/l2tunnel-openvpn/src/config.rs), [private actual-auth preparation/enable](../../crates/l2tunnel-openvpn/src/runtime.rs).
+- [x] [MOD-OVPNRT-03] Implement one supervised fixed-tuple socket owner and bounded duplex control IO with authenticated TLS inactivity and terminal task/error propagation. Evidence: [single reader driver](../../crates/l2tunnel-openvpn/src/driver.rs), [retained TLS heartbeat](../../crates/l2tunnel-openvpn/src/heartbeat.rs), [stale traffic/cancellation tests](../../crates/l2tunnel-openvpn/src/tests.rs).
+- [x] [MOD-OVPNRT-04] Compose exporter-protected user datagrams and existing selective repeat with a common exact allowance and mandatory-control reservation. Evidence: [atomic shared ledger and reserve test](../../crates/l2tunnel-openvpn/src/budget.rs), [protected recovery driver](../../crates/l2tunnel-openvpn/src/driver.rs).
+- [x] [MOD-OVPNRT-05] Prove bounded application packet ownership before native handoff, oversize/backpressure atomicity and explicit bounded close outcomes. Evidence: [retained sender/receiver permits](../../crates/l2tunnel-openvpn/src/runtime.rs), [blocked consumer, small output and final-ACK loss tests](../../crates/l2tunnel-openvpn/src/tests.rs), [quiet versus absolute expiry test](../../crates/l2tunnel-openvpn/src/driver.rs).
+- [x] [MOD-OVPNRT-06] Add authenticated complementary paired half lanes without TCP, then test full/half actual payloads under loss/reorder/replay and stalled consumers. Evidence: [actual two-exporter join and paired owners](../../crates/l2tunnel-openvpn/src/pair.rs), [IPv4 impairment/IPv6 integrity and invalid joins](../../crates/l2tunnel-openvpn/src/pair/tests.rs), [full and half blocked consumer tests](../../crates/l2tunnel-openvpn/src/tests.rs).
+- [x] [MOD-OVPNRT-07] Qualify fixed IPv4/IPv6 tuples, admission/certificate/member failures, timeout/cancellation, wrong-profile demux, stale outer traffic, lease/key exhaustion and strict aggregate checks. Evidence: [configuration/profile rejection](../../crates/l2tunnel-openvpn/src/config.rs), [runtime failures and deadlines](../../crates/l2tunnel-openvpn/src/tests.rs), [IPv4/IPv6 paired tests](../../crates/l2tunnel-openvpn/src/pair/tests.rs), [wave 6 aggregate](../../work/implementation-wave6/validation.json).
+- [ ] [MOD-OVPNRT-08] Integrate reviewed runtime/device/client selection and owned native TAP/TUN capture/MTU tests; keep FEC and mode-parity claims separate.
+- [x] [MOD-OVPNRT-09] Bound terminal waiting and all task joins by the original close deadline while preserving abort ownership during cancellation. Evidence: [close implementation and deadline/cancellation regressions](../../crates/l2tunnel-openvpn/src/runtime.rs).
+
+
+## Focused verification and remaining limits
+
+The current local Linux checkpoint ran `cargo test --offline -p l2tunnel-openvpn`
+(29 passing cases), targeted `cargo fmt`, `cargo clippy --offline -p
+l2tunnel-openvpn --all-targets -- -D warnings`, and strict no-dependency rustdoc.
+The first 24-case runtime checkpoint was included in the stable
+[wave 6 aggregate](../../work/implementation-wave6/validation.json): 492 Rust cases
+including doctests, 36 Python cases, full `tools/check.py`, matching source hashes.
+That receipt predates the narrow close-join ownership/deadline fix and its three
+new regression cases; those subsequently passed the complete 27-case crate suite,
+strict Clippy and rustdoc. The stable [wave-7 aggregate](../../work/implementation-wave7/validation.json)
+now includes the complete subsequent source: 549 Rust cases including doctests,
+39 Python cases and matching source hashes. Auth
+and pure control earlier passed 14 and 10 cases.
+
+The subsequent MTU helper and close-ACK fixture regression bring the current
+crate suite to 29 cases. A parallel 28-case run first failed the persistent
+ACK-loss assertion; an isolated diagnostic rerun passed with unchanged criteria.
+Static review identified a test-only trigger gap: an ACK could leave after close
+initiation but before `tls_finished` activated loss. The fixture now drops ACKs
+from close initiation, with a direct regression for that interval. Production
+close deadlines and clean-drain criteria were not relaxed. The original failure
+is retained as an observation, not claimed to be conclusively attributed.
+
+Actual paired tests use four UDP sockets and independent payloads, with IPv4 AEAD
+under deterministic loss/reordering/duplicates and IPv6 integrity-only packet
+protection. TLS remains encrypted in either mode. Fault injection is test-only,
+bounded to one delayed packet per actor, and does not qualify native network or
+throughput behavior. Separate cases cover real wrong admission/name/member,
+post-cookie cancellation and rebind proof, second-lane failure releasing all four
+socket owners, stale outer traffic with fresh data, absolute lease/key exhaustion,
+invalid/swapped identities/config/roles, forward-exporter transplantation, wrong
+reverse proof, phase replay and join timeout. Small-buffer and stalled-consumer
+cases retain exact packet bytes/permits. One and three lost final ACKs still
+complete cleanly; persistent final ACK loss returns incomplete within the original
+deadline. The latter behavior corrects the initially observed paired close race.
+
+The runtime fixes one peer tuple per physical lane. It has no wildcard listener,
+NAT rebinding, reconnect or in-place rekey. The separate [device adapter](openvpn-device.md)
+now supplies reviewed frame fragmentation and bounded native ownership; the
+[shared client](openvpn-client.md) supplies explicit CLI selection, private key
+provisioning and the pinned TLS resource review. Platform checks, native
+captures/MTU and FEC/mode-parity gates remain open.

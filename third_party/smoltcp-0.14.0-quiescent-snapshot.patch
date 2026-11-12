@@ -1,0 +1,312 @@
+--- a/src/socket/tcp.rs
++++ b/src/socket/tcp.rs
+@@ -458,6 +458,41 @@
+ 
+     #[cfg(feature = "socket-tcp-cubic")]
+     Cubic,
++}
++
++/// Authoritative sequence and window state at a quiescent established boundary.
++///
++/// Emitted acknowledgments may still be queued outside this socket. The caller
++/// must separately drain its interface/device and freeze all socket access before
++/// transferring ownership. This is an observation, not a connection capability.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct QuiescentSnapshot {
++    /// Local endpoint of the established tuple.
++    pub local_endpoint: IpEndpoint,
++    /// Remote endpoint of the established tuple.
++    pub remote_endpoint: IpEndpoint,
++    /// First unacknowledged send sequence; equal to `send_next` here.
++    pub send_unacknowledged: TcpSeqNumber,
++    /// Next send sequence after the acknowledged prefix.
++    pub send_next: TcpSeqNumber,
++    /// Next contiguous receive sequence; no unread or assembled bytes remain.
++    pub receive_next: TcpSeqNumber,
++    /// Last acknowledgment emitted to the interface, not confirmed physical I/O.
++    pub last_ack_sent: TcpSeqNumber,
++    /// Last raw window field emitted to the interface.
++    pub last_window_sent: u16,
++    /// Scale applied by the peer to the locally advertised window.
++    pub local_window_shift: u8,
++    /// Scale applied locally to the peer window, or None when not negotiated.
++    pub peer_window_shift: Option<u8>,
++    /// Accepted peer window in bytes, relative to `send_unacknowledged`.
++    pub peer_window_bytes: usize,
++    /// Peer maximum segment size in bytes.
++    pub peer_mss: usize,
++    /// Whether the peer negotiated selective acknowledgments.
++    pub peer_sack_permitted: bool,
++    /// Whether TCP timestamps are enabled; timestamp continuation is not exported.
++    pub timestamps_enabled: bool,
+ }
+ 
+ /// A Transmission Control Protocol socket.
+@@ -901,6 +936,49 @@
+         self.state
+     }
+ 
++    /// Observe an established socket only when its stream and immediate work are drained.
++    ///
++    /// Returns None for pending bytes, assembly, acknowledgment/window work,
++    /// retransmission/close/probe timers, or due keepalive/timeout work at `now`.
++    /// Callers must poll at the same monotonic time first. This method neither
++    /// advances time nor mutates the socket and cannot prove physical transmission,
++    /// external queue emptiness, application delivery, or safe ownership transfer.
++    pub fn quiescent_snapshot(&self, now: Instant) -> Option<QuiescentSnapshot> {
++        if self.state != State::Established
++            || self.rx_fin_received
++            || !self.tx_buffer.is_empty()
++            || !self.rx_buffer.is_empty()
++            || !self.assembler.is_empty()
++            || self.remote_last_seq != self.local_seq_no
++            || self.remote_last_ack != Some(self.remote_seq_no)
++            || self.ack_delay_timer != AckDelayTimer::Idle
++            || !matches!(self.timer, Timer::Idle { .. })
++            || self.pending_fast_retransmit
++            || self.ack_to_transmit()
++            || self.window_to_update()
++            || self.timer.should_keep_alive(now)
++            || self.timed_out(now)
++        {
++            return None;
++        }
++        let tuple = self.tuple?;
++        Some(QuiescentSnapshot {
++            local_endpoint: tuple.local,
++            remote_endpoint: tuple.remote,
++            send_unacknowledged: self.local_seq_no,
++            send_next: self.remote_last_seq,
++            receive_next: self.remote_seq_no,
++            last_ack_sent: self.remote_last_ack?,
++            last_window_sent: self.remote_last_win,
++            local_window_shift: self.remote_win_shift,
++            peer_window_shift: self.remote_win_scale,
++            peer_window_bytes: self.remote_win_len,
++            peer_mss: self.remote_mss,
++            peer_sack_permitted: self.remote_has_sack,
++            timestamps_enabled: self.timestamp_enabled(),
++        })
++    }
++
+     fn reset(&mut self) {
+         let rx_cap_log2 =
+             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
+@@ -3310,6 +3388,217 @@
+         s
+     }
+ 
++    #[test]
++    fn test_quiescent_snapshot_handshake_and_bidirectional_prefix() {
++        for (capacity, scale, sack) in [(64, None, false), (131_072, Some(7), true)] {
++            let mut s = socket_with_buffer_sizes(64, capacity);
++            s.listen(LOCAL_END).unwrap();
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            send!(
++                s,
++                TcpRepr {
++                    control: TcpControl::Syn,
++                    seq_number: REMOTE_SEQ,
++                    ack_number: None,
++                    window_scale: scale,
++                    sack_permitted: sack,
++                    max_seg_size: Some(1200),
++                    ..SEND_TEMPL
++                }
++            );
++            let mut initial = None;
++            recv(&mut s, Instant::ZERO, |result| {
++                let repr = result.unwrap();
++                assert_eq!(repr.control, TcpControl::Syn);
++                initial = Some(repr.seq_number);
++            });
++            let local = initial.unwrap() + 1;
++            send!(
++                s,
++                TcpRepr {
++                    seq_number: REMOTE_SEQ + 1,
++                    ack_number: Some(local),
++                    window_len: 42,
++                    ..SEND_TEMPL
++                }
++            );
++            let snapshot = s.quiescent_snapshot(Instant::ZERO).unwrap();
++            assert_eq!(snapshot.local_endpoint, LOCAL_END);
++            assert_eq!(snapshot.remote_endpoint, REMOTE_END);
++            assert_eq!(snapshot.send_unacknowledged, local);
++            assert_eq!(snapshot.send_next, local);
++            assert_eq!(snapshot.receive_next, REMOTE_SEQ + 1);
++            assert_eq!(snapshot.last_ack_sent, REMOTE_SEQ + 1);
++            assert_eq!(snapshot.peer_window_shift, scale);
++            assert_eq!(
++                snapshot.local_window_shift,
++                if scale.is_some() { 2 } else { 0 }
++            );
++            assert_eq!(snapshot.peer_window_bytes, 42 << scale.unwrap_or(0));
++            assert_eq!(snapshot.peer_mss, 1200);
++            assert_eq!(snapshot.peer_sack_permitted, sack);
++            assert!(!snapshot.timestamps_enabled);
++            assert_eq!(s.send_slice(b"abc"), Ok(3));
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            recv(&mut s, Instant::ZERO, |result| {
++                assert_eq!(result.unwrap().payload, b"abc");
++            });
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            send!(
++                s,
++                TcpRepr {
++                    seq_number: REMOTE_SEQ + 1,
++                    ack_number: Some(local + 3),
++                    window_len: 43,
++                    payload: b"abcdef",
++                    ..SEND_TEMPL
++                }
++            );
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            recv(&mut s, Instant::ZERO, |result| {
++                assert_eq!(result.unwrap().ack_number, Some(REMOTE_SEQ + 7));
++            });
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            let mut bytes = [0; 6];
++            assert_eq!(s.recv_slice(&mut bytes), Ok(6));
++            assert_eq!(&bytes, b"abcdef");
++            let before = format!("{:?}", s.socket);
++            let snapshot = s.quiescent_snapshot(Instant::ZERO).unwrap();
++            assert_eq!(snapshot.send_next, local + 3);
++            assert_eq!(snapshot.send_unacknowledged, local + 3);
++            assert_eq!(snapshot.receive_next, REMOTE_SEQ + 7);
++            assert_eq!(snapshot.last_ack_sent, REMOTE_SEQ + 7);
++            assert_eq!(
++                snapshot.last_window_sent,
++                ((capacity - 6) >> snapshot.local_window_shift) as u16
++            );
++            assert_eq!(snapshot.peer_window_bytes, 43 << scale.unwrap_or(0));
++            assert_eq!(s.quiescent_snapshot(Instant::ZERO), Some(snapshot));
++            assert_eq!(format!("{:?}", s.socket), before);
++        }
++    }
++
++    #[test]
++    fn test_quiescent_snapshot_rejects_assembly_without_readable_bytes() {
++        let mut s = socket_established();
++        let reply = send(
++            &mut s,
++            Instant::ZERO,
++            &TcpRepr {
++                seq_number: REMOTE_SEQ + 5,
++                ack_number: Some(LOCAL_SEQ + 1),
++                payload: b"out of order",
++                ..SEND_TEMPL
++            },
++        );
++        assert!(reply.is_some());
++        assert_eq!(s.recv_queue(), 0);
++        assert!(!s.assembler.is_empty());
++        let before = format!("{:?}", s.socket);
++        assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++        assert_eq!(format!("{:?}", s.socket), before);
++    }
++
++    #[test]
++    fn test_quiescent_snapshot_rejects_every_non_established_state() {
++        for state in [
++            State::Closed,
++            State::Listen,
++            State::SynSent,
++            State::SynReceived,
++            State::FinWait1,
++            State::FinWait2,
++            State::Closing,
++            State::TimeWait,
++            State::CloseWait,
++            State::LastAck,
++        ] {
++            let mut s = socket_established();
++            s.state = state;
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none(), "{state:?}");
++        }
++        for alter in [
++            (|s: &mut TestSocket| s.tuple = None) as fn(&mut TestSocket),
++            |s| s.rx_fin_received = true,
++            |s| s.remote_last_seq += 1,
++            |s| s.remote_last_ack = None,
++            |s| s.remote_last_ack = Some(REMOTE_SEQ),
++            |s| s.pending_fast_retransmit = true,
++        ] {
++            let mut s = socket_established();
++            alter(&mut s);
++            let before = format!("{:?}", s.socket);
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++            assert_eq!(format!("{:?}", s.socket), before);
++        }
++    }
++
++    #[test]
++    fn test_quiescent_snapshot_rejects_pending_and_due_timers() {
++        for timer in [
++            Timer::Retransmit {
++                expires_at: Instant::from_millis(100),
++            },
++            Timer::FastRetransmit,
++            Timer::ZeroWindowProbe {
++                expires_at: Instant::from_millis(100),
++                delay: Duration::from_millis(50),
++            },
++            Timer::Close {
++                expires_at: Instant::from_millis(100),
++            },
++        ] {
++            let mut s = socket_established();
++            s.timer = timer;
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++        }
++        for timer in [
++            AckDelayTimer::Waiting(Instant::from_millis(100)),
++            AckDelayTimer::Immediate,
++        ] {
++            let mut s = socket_established();
++            s.ack_delay_timer = timer;
++            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++        }
++        let mut s = socket_established();
++        s.timer = Timer::Idle {
++            keep_alive_at: Some(Instant::from_millis(100)),
++        };
++        assert!(s.quiescent_snapshot(Instant::from_millis(99)).is_some());
++        assert!(s.quiescent_snapshot(Instant::from_millis(100)).is_none());
++        assert!(s.quiescent_snapshot(Instant::from_millis(101)).is_none());
++        s.timer = Timer::new();
++        s.timeout = Some(Duration::from_millis(100));
++        s.remote_last_ts = Some(Instant::ZERO);
++        assert!(s.quiescent_snapshot(Instant::from_millis(99)).is_some());
++        assert!(s.quiescent_snapshot(Instant::from_millis(100)).is_none());
++        assert!(s.quiescent_snapshot(Instant::from_millis(101)).is_none());
++    }
++
++    #[test]
++    fn test_quiescent_snapshot_preserves_advertised_window_and_timestamp_flag() {
++        let mut s = socket_established();
++        s.remote_last_win = 63;
++        let snapshot = s.quiescent_snapshot(Instant::ZERO).unwrap();
++        assert_eq!(snapshot.last_window_sent, 63);
++        // A significant window update is pending; do not invent its transmission.
++        s.remote_last_win = 32;
++        assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
++        s.remote_last_win = 64;
++        s.set_tsval_generator(Some(|| 7));
++        assert!(
++            s.quiescent_snapshot(Instant::ZERO)
++                .unwrap()
++                .timestamps_enabled
++        );
++        s.set_tsval_generator(None);
++        assert!(
++            !s.quiescent_snapshot(Instant::ZERO)
++                .unwrap()
++                .timestamps_enabled
++        );
++    }
++
+     // =========================================================================================//
+     // Tests for the CLOSED state.
+     // =========================================================================================//

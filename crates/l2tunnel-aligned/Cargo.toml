@@ -1,0 +1,20 @@
+[package]
+name = "l2tunnel-aligned"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-codec = { path = "../l2tunnel-codec", default-features = false }
+l2tunnel-core = { path = "../l2tunnel-core" }
+l2tunnel-recovery = { path = "../l2tunnel-recovery" }
+l2tunnel-reliable = { path = "../l2tunnel-reliable" }
+ring = "=0.17.14"
+
+[dev-dependencies]
+l2tunnel-datagram = { path = "../l2tunnel-datagram" }
+l2tunnel-fec = { path = "../l2tunnel-fec" }

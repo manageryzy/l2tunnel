@@ -1,0 +1,76 @@
+# A short multipath experiment. Remove --config for the full built-in RTT/loss sweep.
+seed = 20261110
+replications = 3
+rtt_ms = [70]
+loss_rates = [0.20]
+loss_models = ["iid", "burst"]
+mtus = [1280, 1500]
+mean_burst = 4
+
+[traffic]
+duration_s = 0.5
+drain_s = 1
+window_bytes = 262144
+
+[[paths]]
+forward_mbps = 60
+reverse_mbps = 6
+
+[[paths]]
+forward_mbps = 40
+reverse_mbps = 4
+rtt_factor = 1.4
+jitter_ms = 0.5
+
+[[strategies]]
+name = "Selective ARQ"
+mode = "arq"
+
+[[strategies]]
+name = "Block 20+10"
+mode = "block"
+
+[[strategies]]
+name = "Sliding 33% with feedback"
+mode = "sliding"
+repair_every = 3
+long_window = 64
+feedback_repair = true
+
+[[strategies]]
+name = "Hybrid 50% with feedback"
+mode = "hybrid"
+repair_every = 2
+short_window = 16
+long_window = 64
+long_every = 20
+feedback_repair = true
+
+[[strategies]]
+name = "Hybrid 50% with packing and striping"
+mode = "hybrid"
+streams = 4
+fragments = 4
+source_batch = 3
+repair_batch = 2
+reverse_fec = true
+reverse_batch = 4
+reverse_repair_batch = 4
+feedback_repair = true
+decode_us_per_symbol = 0.2
+
+[[strategies]]
+name = "Plain TCP CUBIC path 1"
+mode = "tcp"
+tcp_path = 0
+
+[[strategies]]
+name = "Plain TCP CUBIC path 2"
+mode = "tcp"
+tcp_path = 1
+
+[[strategies]]
+name = "Plain TCP NewReno path 1"
+mode = "tcp"
+tcp_cc = "reno"
+tcp_path = 0

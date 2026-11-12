@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "crate": "smoltcp",
+  "version": "0.14.0",
+  "registry": "https://github.com/rust-lang/crates.io-index",
+  "upstream_repository": "https://github.com/smoltcp-rs/smoltcp",
+  "archive_sha256": "b6f8b28ad56c6e35524a37dd492af5d1a47e31e1a4d175cd12f89c075f01980f",
+  "upstream_vcs": {
+    "git": {
+      "sha1": "cbfe05f835cfc75bf781addc1c0eb2e1a0df1ea3"
+    },
+    "path_in_vcs": ""
+  },
+  "license_file": "smoltcp/LICENSE-0BSD.txt",
+  "license_sha256": "beb2cad88fab8447f7975564e21f9506e733e14c344836f146fa02e811216694",
+  "patch_file": "smoltcp-0.14.0-quiescent-snapshot.patch",
+  "patch_sha256": "0cbe61961c3b2f1e19028e55fbf9daff3f2f3536f8444f32b15a3efc93d0bcdd",
+  "changed_upstream_files": [
+    "src/socket/tcp.rs"
+  ],
+  "file_manifest": "smoltcp-file-manifest.json",
+  "file_manifest_sha256": "4294706becb5cfe712acc8308e5a6c63ad5d9a21cdb29b08d4acb02683b5564a",
+  "upstream_file_count": 134,
+  "archive_missing_files": [],
+  "unexpected_files_in_source": [],
+  "review": {
+    "scope": "Independent local review of the exact additive getter, five tests, authoritative field comments and maintained ACK/window/timeout helper semantics. Approved exact patch before this source import.",
+    "not_claimed": [
+      "upstream acceptance",
+      "general TCP migration support",
+      "raw packet-phase integration",
+      "native or middlebox qualification"
+    ]
+  },
+  "dependency_activation": "Root separately owns Cargo/lock selection and aggregate source hashing."
+}

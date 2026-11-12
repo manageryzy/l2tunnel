@@ -1,0 +1,27 @@
+# Established QUIC streams carrying complete Ethernet frames.
+seed = 20261110
+replications = 5
+rtt_ms = [20, 70, 150]
+loss_rates = [0.10, 0.20]
+loss_models = ["iid"]
+mtus = [1500]
+
+[traffic]
+duration_s = 10
+drain_s = 5
+
+[[strategies]]
+name = "QUIC L2 CUBIC"
+mode = "quic"
+
+[[strategies]]
+name = "QUIC L2 Reno"
+mode = "quic"
+tcp_cc = "reno"
+
+[[strategies]]
+name = "Sliding 33% with cumulative feedback"
+mode = "sliding"
+repair_every = 3
+feedback_repair = true
+cumulative_feedback = true

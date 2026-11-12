@@ -1,0 +1,397 @@
+schema_version = 1
+inventory = "python-mode-parity"
+rust_status = "planned"
+status_note = "Contracts and scaffolding do not implement a transport. See docs/mode-parity.md."
+evidence_audited_utc = "2026-11-11"
+
+[[mode]]
+id = "legacy-arq"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "src/l2tunnel_sim/model.py:Tunnel"
+parity_contract = "Selective symbol retransmission, timeout guard; rto_factor, rto_min_ms; per-batch exact IDs or cumulative_feedback; feedback_batch, feedback_wait_ms."
+
+[[mode]]
+id = "legacy-block-fec"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "model.py:Tunnel.add_to_code/flush_code; coding.py:block_coefficients"
+parity_contract = "Systematic GF(256) Cauchy blocks; block_size, block_repairs, partial-block proportional rounding, fec_wait_ms, repair_spacing_ms; residual ARQ. Total Cauchy symbols at most 256."
+
+[[mode]]
+id = "legacy-sliding-fec"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "model.py:Tunnel.flush_code/queue_repair"
+parity_contract = "Random linear sliding window; long_window, repair_every, repairs_per_group; optional integer-credit interleave_repairs, causal feedback_repair, residual ARQ."
+
+[[mode]]
+id = "legacy-hybrid-fec"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "model.py:Tunnel.flush_code"
+parity_contract = "Short-window repairs with every long_every repair using long_window; short_window, plus sliding-mode timing and feedback knobs."
+
+[[mode]]
+id = "compact-rlnc"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "compact.py:CompactTransport/coefficient/CompactConfig"
+parity_contract = "Elastic GF(256) window; repair_ratio, block_sources, flush_ms, feedback_ms, feedback_packets, tail_repair_delay_ms; cumulative confirmation, retained source window, feedback/tail repairs."
+
+[[mode]]
+id = "compact-arq"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "compact_arq.py:CompactARQTransport/ARQFlight"
+parity_contract = "Selective repeat, cumulative prefix plus receipt bitmap, transmission serial/ACK echo, receiver delay subtraction, RTT estimation, guarded retries and timeout backoff."
+
+[[mode]]
+id = "first-flight-arq"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "compact_lowlatency.py:FirstFlightARQTransport"
+parity_contract = "Fresh feedback acknowledging at least three later sources may expedite only the first retry; repeated retries keep the RTT guard."
+
+[[mode]]
+id = "bounded-gap-arq"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "compact_lowlatency.py:BoundedGapARQTransport"
+parity_contract = "First-flight recovery plus rate-limited feedback for an advancing qualified gap; gap_feedback_min_interval_ms. Feedback consumes opposite-direction service."
+
+[[mode]]
+id = "compact-block-fec"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "compact_block.py:CompactBlockTransport/CompactBlockConfig"
+parity_contract = "Bounded GF(256) generations, initial repair ratio, rank-deficit feedback and in-flight repair subtraction by transmission serial. generation_sources, idle_flush_ms, maximum_block_ms, assumed_loss_rate, repair_margin."
+
+[[mode]]
+id = "local-global-rlnc"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "shared_records.py:SharedRecordTransport._repair"
+parity_contract = "Shared coding with repair_window_sources and global_repair_every; periodic global repair protects older debt. compact_wire.py specializes this to W128/G16 and an 8192-source bound."
+
+[[mode]]
+id = "path-scheduling"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "model.py:Simulation.send; multiflow.py:MultiFlow"
+parity_contract = "Earliest estimated arrival over reserved FIFO paths, forward/reverse rates and RTT factors; application pacing; independent sessions sharing service. flow_count differs from ordering lanes and MUX channels. Preserve fixed-total and per-flow window policies."
+
+[[mode]]
+id = "legacy-fragment-packing"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "model.py:Tunnel.frame/Packer"
+parity_contract = "fragments, source_batch, repair_batch, reverse equivalents, pack_wait_ms, MTU-aware fragmentation; shared loss event for packed symbols; forward streams round-robin ordered lanes and reverse_ordered."
+
+[[mode]]
+id = "compact-cross-frame"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "compact.py:CompactTransport"
+parity_contract = "Records span symbols and share datagrams; reliable context and ordered stream release; valid-length metadata and tail flush."
+
+[[mode]]
+id = "full-l2"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "compact.py:CompactHeaderCodec.encode/decode; CompactConfig.header_profile"
+parity_contract = "full_l2, and raw kind-2 fallback for unsupported headers. Complete original Ethernet bytes must round-trip."
+
+[[mode]]
+id = "tcp-header-codecs"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "compact.py:CompactHeaderCodec"
+parity_contract = "tcp_timestamp context + 23 dynamic bytes; tcp_delta masked modular varint deltas. Ethernet/IPv4/TCP with 12-byte timestamp option; validate regenerable checksums and lengths, otherwise full-frame fallback. Payload bytes remain opaque."
+
+[[mode]]
+id = "independent-record-arq"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2 + M3"
+python_reference = "compact_unordered.py:IndependentRecordARQ/IndependentRecordTCP"
+parity_contract = "Explicit record ID and fragment descriptors, independent completion, selectable ordered/unordered delivery. These are distinct from per-channel delta contexts."
+
+[[mode]]
+id = "shared-context-mux"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "shared_compact.py:MultiplexedHeaderCodec/MultiplexedCompactTransport/SharedCompactMultiFlow"
+parity_contract = "Multiple flow contexts in a shared compact coding stream. Retain as an earlier reference mode."
+
+[[mode]]
+id = "shared-records"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "shared_records.py:SharedRecordReceiver/SharedRecordTransport"
+parity_contract = "Channel + wrapping channel sequence + encoded length, valid-byte/anchor symbol header; independent ordered release per channel or global ordered delivery via independent_delivery. Half-range channel serial bounds apply."
+
+[[mode]]
+id = "aligned-records"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "aligned_records.py:AlignedRecordTransport/AlignedRecordReceiver"
+parity_contract = "Channel records aligned to coding symbols, implicit zero extension and explicit record fragments; elide_payload_length, packed_predictive_records, timestamp_pair_dictionary; exceptional records keep ordinary codec path."
+
+[[mode]]
+id = "independent-short-records"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4"
+python_reference = "aligned_records.py:AlignedRecordReceiver.receive; AlignedRecordConfig.independent_short_frame_bytes"
+parity_contract = "Self-contained kind-2 short frames can release before older channel records without advancing the contiguous watermark past gaps. Preserve deduplication tombstones and original context. Selection is by generic size, not SYN-only privilege."
+
+[[mode]]
+id = "compact-wire"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2 + M3"
+python_reference = "compact_wire.py:encode_source/encode_repair/decode_packet/CompactWireTransport"
+parity_contract = "Executable typed source/repair/tail headers; simulated udp or raw_ipv4_crc32 envelopes, trim_repair_padding, short-source copies and scope. Current wire requires MTU1500, one FIFO, zero jitter, 1460-byte symbols, W128/G16, window8192, zero authentication budget."
+
+[[mode]]
+id = "packed-wire"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4"
+python_reference = "packed_wire.py:PackedWireTransport/PackedAlignedReceiver/packed_units"
+parity_contract = "Pack actual aligned record units, including context/fragment units; bounded pack_sources_max_delay_ms; preserve decoding and per-channel admission constraints."
+
+[[mode]]
+id = "unified-duplex-mux"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M2"
+python_reference = "mux.py:DuplexMux; mux_tcp.py:UnifiedMuxMultiFlow/MuxTCP"
+parity_contract = "Same ingress classifier/arbiter for bulk and probes in both directions; FIFO per channel and round-robin admission; configurable 1..256 channels, current publication cap16. mapping=crc32 or connection_round_robin; learned reverse affinity comes from decoded frames."
+
+[[mode]]
+id = "payload-compression"
+status = "planned"
+category = "new-requirement"
+milestone = "M4"
+python_reference = "No general payload compressor in Python"
+parity_contract = "Explicitly new work: disabled/pass-through baseline, bounded optional payload compression, expansion fallback, frame-length limits, no cross-peer unauthenticated dictionary state. Header compression above is the actual Python parity requirement."
+
+[[mode]]
+id = "inner-ack-controls"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4 + M5"
+python_reference = "tcp.py:PlainTCP; compact_tcp.py:CompactTCP"
+parity_contract = "ack_every, ack_delay_ms; reliable reverse coded stream or native complete 66-byte lossy ACK records. This is inner workload behavior, not permission to disable kernel outer TCP ACKs."
+
+[[mode]]
+id = "ack-coalescing"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4"
+python_reference = "compact_ack.py:CoalescedACKTCP"
+parity_contract = "Supersede only unsent advancing cumulative ACKs; preserve each distinct duplicate ACK and selected timestamp echo; ack_coalesce_ms. Optional acknowledged-segment slow-start is a **workload controller** variant, not tunnel behavior."
+
+[[mode]]
+id = "ack-copies"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4"
+python_reference = "compact_ack.py:CoalescedACKTCP.transmit_ack"
+parity_contract = "1..4 copies with ack_copy_spacing_ms, charged full records and deduplication IDs. Separately retain short_source_copies at transport level; do not count either as free recovery."
+
+[[mode]]
+id = "aggregate-acks"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M4"
+python_reference = "aggregate_ack.py:ACKAggregator/encode_batch/decode_batch/AggregateACKTCP"
+parity_contract = "Cross-flow hold timer; record_encoding=full, batch_delta, or batch_varint. Datagrams independently contain full first-frame/context state; byte patches and event-ID varints select the smallest valid envelope; exact 66-byte frame reconstruction."
+
+[[mode]]
+id = "reverse-fec"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "config.py:Strategy; model.py:Simulation.make_transports"
+parity_contract = "reverse_fec, reverse source/repair batching, reverse order policy. Reverse recovery and its feedback consume both directions' budgets."
+
+[[mode]]
+id = "direct-tcp-baseline"
+status = "planned"
+category = "comparison-baseline"
+milestone = "M5"
+python_reference = "tcp.py:PlainTCP; tcp_syn_baseline.py"
+parity_contract = "Direct CUBIC/Reno with NewReno cumulative recovery, delayed ACK and RTO knobs; compare against actual OS TCP in integration tests. Python lacks Linux SACK/RACK-TLP/PRR/HyStart++ fidelity."
+
+[[mode]]
+id = "quic-baseline"
+status = "planned"
+category = "comparison-baseline"
+milestone = "M5"
+python_reference = "quic.py:QUIC; reliable_tunnel.py:RecordQUIC/ReliableTunnelMultiFlow"
+parity_contract = "Actual pinned aioquic transport with CUBIC/Reno; direct application or complete-L2 stream; separate TCP-over-QUIC shared ordered-stream reference. Preserve auxiliary probe-stream versus same-stream labels."
+
+[[mode]]
+id = "kcp-baseline"
+status = "planned"
+category = "comparison-baseline"
+milestone = "M5"
+python_reference = "kcp.py:KCPContext; reliable_tunnel.py:RecordKCP/ReliableTunnelMultiFlow"
+parity_contract = "Actual pinned upstream C KCP; ordered messages, window, nodelay, interval, resend, nocwnd, MTU. Current inner-TCP reference shares a queue with probes."
+
+[[mode]]
+id = "research-age-support"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "studies/rtt_age_support.py:support/profiles"
+parity_contract = "Age-selected repair supports with local/global-window variants."
+
+[[mode]]
+id = "research-age-coefficients"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_age_coefficients.py:repair_coefficient"
+parity_contract = "Age-band/lane coefficient taps and periodic dense refresh."
+
+[[mode]]
+id = "research-mixed-degree"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_mixed_degree.py:sparse_support"
+parity_contract = "Sparse-degree repairs interleaved with dense repairs."
+
+[[mode]]
+id = "research-recursive-parity"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_recursive_parity.py:source_taps/check_equation/expanded_coefficient"
+parity_contract = "Source-regular recursive parity, tap count/width and periodic reset."
+
+[[mode]]
+id = "research-recursive-fallback"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_recursive_fallback.py:repair_mode/repair_coefficient"
+parity_contract = "Periodic charged fresh-prefix repair in recursive parity."
+
+[[mode]]
+id = "research-rolling-accumulator"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_rolling_accumulator.py:repair_coefficient/repair_support"
+parity_contract = "Repeated-coefficient rolling supports."
+
+[[mode]]
+id = "research-spatial-coupling"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_spatial_coupling.py:section_constraints/repair_slot"
+parity_contract = "Finite GF(256) spatially coupled parity pipeline."
+
+[[mode]]
+id = "research-checkpoint-repair"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_checkpoint_repairs.py:support"
+parity_contract = "Delayed-prefix-feedback checkpoint repair."
+
+[[mode]]
+id = "research-feedback-gate"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_feedback_gate.py:SenderGate/Snapshot"
+parity_contract = "Repair eligibility from causal feedback age, with charged slots."
+
+[[mode]]
+id = "research-selective-fallback"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_selective_fallback.py:SelectiveSender/repair_equation"
+parity_contract = "Causal selective-feedback fallback on the fixed repair schedule."
+
+[[mode]]
+id = "research-bitmap-fallback"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "rtt_bitmap_coded_fallback.py:BitmapSender/repair_equation"
+parity_contract = "Old-debt coded equations reconstructed from received receipt bitmaps."
+
+[[mode]]
+id = "research-subpacket-convolutional"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "subpacket_convolutional.py:coefficient_bytes/parity_equation"
+parity_contract = "Systematic finite-memory subpacket convolutional code; time-varying and invariant coefficients."
+
+[[mode]]
+id = "research-lrsc-staircase"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "lrsc_staircase.py:coefficients/parity_equation"
+parity_contract = "Finite GF(256) Cauchy staircase heuristic; not an established universal LRSC guarantee."
+
+[[mode]]
+id = "research-partial-repair"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "partial_repair_screen.py:CoupledDecoder/HalfDecoder/repair_header"
+parity_contract = "Full-vector controls, coupled-half parity, and partial-half packetization."
+
+[[mode]]
+id = "research-source-bridge"
+status = "planned"
+category = "causal-research-algorithm"
+milestone = "M6"
+python_reference = "source_bridge_diagnostic.py:source_equation/source_header"
+parity_contract = "Causal D128 source-side precoding, separately tested from ordinary systematic sources."
+
+[[diagnostic]]
+id = "analysis-only"
+category = "diagnostic-only"
+status = "not-a-deployable-mode"
+sources = [
+  "simulator/studies/rtt_busy_period.py",
+  "simulator/studies/rtt_deadline_converse.py",
+  "simulator/studies/oracle_repair_diagnostic.py",
+  "simulator/studies/latency_counterfactual.py",
+  "simulator/studies/predictive_wire_budget.py",
+  "simulator/studies/repair_extent_audit.py",
+  "simulator/studies/rtt_budget_analysis.py",
+  "simulator/studies/rtt_budget_analysis_v2.py",
+]
+note = "Preserve controls, bounds and provenance in selftest/research tools; never expose noncausal oracles as wire capabilities."

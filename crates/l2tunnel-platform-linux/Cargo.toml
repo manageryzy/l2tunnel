@@ -1,0 +1,21 @@
+[package]
+name = "l2tunnel-platform-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Audited ioctl exception documented in docs/modules/linux-device.md.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.186"
+l2tunnel-device = { path = "../l2tunnel-device" }

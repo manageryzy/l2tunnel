@@ -1,0 +1,17 @@
+[package]
+name = "l2tunnel-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-core = { path = "../l2tunnel-core" }
+lz4_flex = { version = "=0.14.0", optional = true, default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+
+[features]
+default = ["lz4"]
+lz4 = ["dep:lz4_flex"]

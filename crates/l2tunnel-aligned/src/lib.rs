@@ -1,0 +1,784 @@
+//! Bounded aligned Python symbols composed with the existing reliable FEC engine.
+//!
+//! All ingress recovery packets require prior carrier integrity/replay validation.
+//! Enqueue accepts only frames already admitted by the common MUX/QoS policy.
+//! This crate opens no device/socket and supplies no authentication or congestion
+//! controller. Global ordered recovery does not provide early-short gap bypass.
+
+use l2tunnel_codec::{
+    aligned_envelope as envelope, aligned_receiver as receiver, aligned_sender as sender,
+};
+use l2tunnel_core::{ConfigDigest, Epoch};
+use l2tunnel_recovery::{BufferSide, EndpointRole, RecoveryContext, RecoveryError};
+use l2tunnel_reliable::{OutboundBudget, Reliable, ReliableConfig};
+use std::{fmt, time::Duration};
+
+/// Explicit timed packed-source composition over the same reliable owner.
+pub mod packed;
+
+pub use l2tunnel_codec::aligned_receiver::{ChannelId, Delivery, Prepared};
+
+/// Explicit authenticated native interpretation; never inferred from packet bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePolicy {
+    /// Ethernet eligibility checks select header compression or exact raw fallback.
+    EthernetHeaders,
+    /// Native IP is always an exact kind-2 raw body, including fragmented packets.
+    RawIp,
+}
+
+/// Complete immutable policy, including exact external wire charges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Config {
+    /// Authenticated native-layer/body-selection policy.
+    pub native_policy: NativePolicy,
+    /// Body, ordering, replay, storage and native-delivery limits.
+    pub receiver: receiver::Limits,
+    /// Existing Cauchy/ARQ engine, without an alternate implementation here.
+    pub recovery: ReliableConfig,
+    /// Maximum complete recovery packet before carrier protection/underlay overhead.
+    pub max_recovery_packet_bytes: usize,
+}
+impl Config {
+    /// Validate all cross-module geometry, storage and configured lifetime bounds.
+    pub fn validate(self) -> Result<(), Error> {
+        let held = self
+            .recovery
+            .arq
+            .receive_records
+            .checked_add(self.recovery.max_restored_packets)
+            .ok_or(Error::Configuration)?;
+        self.validate_geometry(
+            envelope::HEADER_BYTES + self.receiver.body.symbol_bytes,
+            held,
+        )
+    }
+    fn validate_geometry(self, original: usize, minimum_source_window: usize) -> Result<(), Error> {
+        self.receiver
+            .memory_bound_bytes()
+            .map_err(Error::Receiver)?;
+        sender_config(self)
+            .memory_bound_bytes()
+            .map_err(Error::Sender)?;
+        if self.native_policy == NativePolicy::RawIp
+            && (self.receiver.body.elide_payload_length
+                || self.receiver.body.predictive
+                || self.receiver.body.timestamp_pair_dictionary)
+        {
+            return Err(Error::Configuration);
+        }
+        let largest_body = (self.receiver.body.max_frame_bytes + 29).clamp(69, 65535);
+        let fragments = largest_body.div_ceil(self.receiver.body.symbol_bytes - 8);
+        if self.receiver.first_source.0 != 0
+            || self.receiver.source_window < minimum_source_window
+            || self.receiver.max_fragments_per_record < fragments
+            || self.recovery.arq.max_source_bytes != original
+            || self.recovery.arq.max_retries > 256
+            || self.max_recovery_packet_bytes > 65_507
+            || Duration::from_millis(self.receiver.lifetime_ticks) <= self.recovery_horizon()?
+        {
+            return Err(Error::Configuration);
+        }
+        let maximum = 8usize
+            .checked_add(56)
+            .and_then(|n| n.checked_add(self.recovery.fec.block.max_sources))
+            .and_then(|n| n.checked_add(2 + 44 + original))
+            .ok_or(Error::Configuration)?;
+        if maximum > self.max_recovery_packet_bytes {
+            return Err(Error::Configuration);
+        }
+        // The authoritative engine validates all own invariants before allocation use.
+        Reliable::new(
+            self.recovery,
+            RecoveryContext {
+                session: 1,
+                epoch: 0,
+                role: EndpointRole::Initiator,
+            },
+        )
+        .map_err(Error::Recovery)?;
+        Ok(())
+    }
+    /// Maximum configured retry timer sum plus partial-block flush duration.
+    /// External send/device backpressure has no bounded delivery guarantee.
+    pub fn recovery_horizon(self) -> Result<Duration, Error> {
+        if self.recovery.arq.max_retries > 256 {
+            return Err(Error::Configuration);
+        }
+        let mut sum = self.recovery.flush_after;
+        let mut rto = self.recovery.arq.initial_rto;
+        for _ in 0..=self.recovery.arq.max_retries {
+            sum = sum.checked_add(rto).ok_or(Error::Configuration)?;
+            rto = rto
+                .checked_mul(2)
+                .unwrap_or(Duration::MAX)
+                .min(self.recovery.arq.maximum_rto);
+        }
+        Ok(sum)
+    }
+    /// Canonical version/domain-separated SHA-256 of every policy/bound field.
+    /// This digest must be authenticated by the embedding session negotiation.
+    pub fn digest(self) -> Result<ConfigDigest, Error> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(640);
+        bytes.extend_from_slice(b"l2tunnel/aligned-envelope-v1/reliable-v1/config-v1\0");
+        self.append_fields(&mut bytes);
+        Ok(config_hash(&bytes))
+    }
+    fn append_fields(self, bytes: &mut Vec<u8>) {
+        bytes.push(match self.native_policy {
+            NativePolicy::EthernetHeaders => 1,
+            NativePolicy::RawIp => 2,
+        });
+        let limits = self.receiver;
+        let body = limits.body;
+        for value in [
+            body.max_frame_bytes,
+            body.symbol_bytes,
+            body.independent_short_frame_bytes,
+        ] {
+            number(bytes, value as u64);
+        }
+        bytes.extend_from_slice(&[
+            u8::from(body.elide_payload_length),
+            u8::from(body.predictive),
+            u8::from(body.timestamp_pair_dictionary),
+        ]);
+        for value in [
+            u64::from(limits.channels),
+            limits.first_record.0,
+            limits.first_source.0,
+            u64::from(limits.record_window),
+            limits.source_window as u64,
+            limits.lookahead_records as u64,
+            limits.lookahead_bytes as u64,
+            limits.lookahead_fragments as u64,
+            limits.max_fragments_per_record as u64,
+            limits.lifetime_ticks,
+        ] {
+            number(bytes, value);
+        }
+        let recovery = self.recovery;
+        let arq = recovery.arq;
+        for value in [
+            arq.max_source_bytes,
+            arq.send_bytes,
+            arq.receive_bytes,
+            arq.send_records,
+            arq.receive_records,
+        ] {
+            number(bytes, value as u64);
+        }
+        for value in [arq.initial_rto, arq.maximum_rto, arq.ack_delay] {
+            duration(bytes, value);
+        }
+        number(bytes, u64::from(arq.max_retries));
+        let fec = recovery.fec;
+        for value in [
+            fec.block.max_sources as u64,
+            fec.block.max_source_bytes as u64,
+            fec.block.max_packet_bytes as u64,
+            fec.block.max_work_per_symbol,
+            fec.max_generations as u64,
+            fec.max_symbols_per_generation as u64,
+            fec.max_reserved_bytes as u64,
+            fec.max_lifetime_ticks,
+            fec.generation_window,
+            recovery.repair_symbols as u64,
+        ] {
+            number(bytes, value);
+        }
+        duration(bytes, recovery.flush_after);
+        for value in [
+            recovery.max_restored_packets,
+            recovery.max_restored_bytes,
+            recovery.outer_overhead_bytes,
+            self.max_recovery_packet_bytes,
+        ] {
+            number(bytes, value as u64);
+        }
+    }
+    /// Configured full application emission ceiling including external overhead.
+    pub fn maximum_charged_bytes(self) -> Result<usize, Error> {
+        self.validate()?;
+        self.max_recovery_packet_bytes
+            .checked_add(self.recovery.outer_overhead_bytes)
+            .ok_or(Error::Configuration)
+    }
+}
+
+/// Explicit ownership, configuration and terminal protocol failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Contradictory or excessive local limits.
+    Configuration,
+    /// The single frame stage is occupied; no new frame was admitted.
+    Busy,
+    /// Time moved backwards or exceeds the injected millisecond domain.
+    Time,
+    /// An immutable receiver handoff expired under backpressure.
+    Expired,
+    /// Recovered/source allocator identity disagrees with its envelope.
+    Identity,
+    /// Received body violates the authenticated raw-IP versus header policy.
+    Policy,
+    /// Sender body/fragment staging failure.
+    Sender(sender::Error),
+    /// Timed packed sender ownership or first-unit clock failure.
+    PackedSender(l2tunnel_codec::packed_sender::Error),
+    /// Invalid enclosing identity encoding.
+    Envelope(envelope::Error),
+    /// Packed container scope, unit/record identity or canonical format failure.
+    PackedEnvelope(l2tunnel_codec::packed_envelope::Error),
+    /// Receiver admission/native ownership failure.
+    Receiver(receiver::Error),
+    /// Authoritative recovery failure or retryable resource pressure.
+    Recovery(l2tunnel_reliable::Error),
+}
+impl Error {
+    /// Whether the caller may retain the exact input and retry after draining.
+    pub fn is_backpressure(self) -> bool {
+        matches!(
+            self,
+            Self::Busy
+                | Self::Recovery(
+                    l2tunnel_reliable::Error::RestoredCapacity
+                        | l2tunnel_reliable::Error::Arq(RecoveryError::Capacity(_))
+                )
+        )
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "aligned endpoint: {self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
+/// Bounded pipeline ownership snapshot, not peer native-delivery acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Status {
+    /// A local admitted frame still has symbols not copied into recovery.
+    pub staged_frame: bool,
+    /// Present only for the explicit packed profile, with distinct unit ownership.
+    pub packing: Option<l2tunnel_codec::packed_sender::Status>,
+    /// Ordered recovered source waiting for receiver storage.
+    pub retained_handoff: bool,
+    /// Receiver record/native ownership counters.
+    pub receiver: receiver::Status,
+    /// Existing reliable engine retention counters.
+    pub recovery: l2tunnel_reliable::Storage,
+    /// Sticky terminal failure, if any.
+    pub failure: Option<Error>,
+}
+
+/// Pure exclusive owner of codec/recovery/native handoffs for both directions.
+pub struct Endpoint {
+    config: Config,
+    receive_scope: receiver::Scope,
+    sender: packed::SenderOwner,
+    packing: Option<packed::Options>,
+    packed_symbols: Vec<u8>,
+    recovery: Reliable,
+    receiver: receiver::Receiver,
+    send_buffer: Vec<u8>,
+    receive_buffer: Vec<u8>,
+    handoff: Option<(u64, usize, Duration)>,
+    now: Duration,
+    failure: Option<Error>,
+}
+impl Endpoint {
+    /// Construct opposite direction domains from the authenticated local role.
+    pub fn new(config: Config, context: RecoveryContext) -> Result<Self, Error> {
+        Self::new_profile(config, context, None)
+    }
+    fn new_profile(
+        config: Config,
+        context: RecoveryContext,
+        packing: Option<packed::Options>,
+    ) -> Result<Self, Error> {
+        match packing {
+            Some(p) => p.config(config).validate()?,
+            None => config.validate()?,
+        }
+        if context.session == 0 {
+            return Err(Error::Configuration);
+        }
+        let send_direction = match context.role {
+            EndpointRole::Initiator => receiver::Direction::InitiatorToResponder,
+            EndpointRole::Responder => receiver::Direction::ResponderToInitiator,
+        };
+        let receive_direction = match context.role {
+            EndpointRole::Initiator => receiver::Direction::ResponderToInitiator,
+            EndpointRole::Responder => receiver::Direction::InitiatorToResponder,
+        };
+        let send_scope = receiver::Scope {
+            session: context.session.to_be_bytes(),
+            epoch: Epoch(context.epoch),
+            direction: send_direction,
+        };
+        let receive_scope = receiver::Scope {
+            direction: receive_direction,
+            ..send_scope
+        };
+        let bytes = config.recovery.arq.max_source_bytes;
+        Ok(Self {
+            config,
+            receive_scope,
+            sender: match packing {
+                Some(p) => packed::SenderOwner::Packed(Box::new(
+                    l2tunnel_codec::packed_sender::Sender::new(
+                        send_scope,
+                        p.config(config).sender(),
+                    )
+                    .map_err(Error::PackedSender)?,
+                )),
+                None => packed::SenderOwner::Aligned(Box::new(
+                    sender::Sender::new(send_scope, sender_config(config))
+                        .map_err(Error::Sender)?,
+                )),
+            },
+            packing,
+            packed_symbols: vec![
+                0;
+                packing.map_or(0, |p| usize::from(p.max_units)
+                    * config.receiver.body.symbol_bytes)
+            ],
+            recovery: Reliable::new(config.recovery, context).map_err(Error::Recovery)?,
+            receiver: receiver::Receiver::new(receive_scope, config.receiver)
+                .map_err(Error::Receiver)?,
+            send_buffer: vec![0; bytes],
+            receive_buffer: vec![0; bytes],
+            handoff: None,
+            now: Duration::ZERO,
+            failure: None,
+        })
+    }
+    /// Retain one already-MUX-admitted native frame; success is not peer delivery.
+    /// A busy/invalid enqueue consumes neither codec context nor source identity.
+    pub fn enqueue_admitted(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<(), Error> {
+        if let Some(options) = self.packing {
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            packed::micros(now)?
+                .checked_add(options.hold_micros)
+                .ok_or(Error::PackedSender(
+                    l2tunnel_codec::packed_sender::Error::Packing(
+                        l2tunnel_codec::packed::Error::ClockExhausted,
+                    ),
+                ))?;
+        }
+        self.advance(now)?;
+        let staged = self
+            .sender
+            .stage(self.config.native_policy, channel, frame, now);
+        if self.sender.packing().is_some_and(|s| s.failure.is_some()) {
+            self.terminal_result(staged)?;
+        } else {
+            staged?;
+        }
+        if self.packing.is_some() {
+            self.submit_packed()
+        } else {
+            self.pump_send()
+        }
+    }
+    /// Explicit raw-IP enqueue; reject a session bound to Ethernet header policy.
+    pub fn enqueue_admitted_raw(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<(), Error> {
+        if self.config.native_policy != NativePolicy::RawIp {
+            return Err(Error::Configuration);
+        }
+        self.enqueue_admitted(channel, frame, now)
+    }
+    /// Emit at most one source/repair/retry under the caller's shared wire budget.
+    /// The caller retains returned bytes until its carrier accepts them.
+    pub fn poll_data(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.advance(now)?;
+        self.pump_send()?;
+        let result = self
+            .recovery
+            .poll_data(now, output, budget)
+            .map_err(Error::Recovery);
+        self.recovery_result(result)
+    }
+    /// Emit only feedback, using the same common budget as all data emissions.
+    pub fn poll_feedback(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.advance(now)?;
+        let result = self
+            .recovery
+            .poll_feedback(now, output, budget)
+            .map_err(Error::Recovery);
+        self.recovery_result(result)
+    }
+    /// Admit complete recovery bytes only after carrier integrity/replay checks.
+    /// Retryable pressure leaves ownership of the exact input with the caller.
+    pub fn receive_authenticated(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
+        self.advance(now)?;
+        let result = self.recovery.receive(packet, now).map_err(Error::Recovery);
+        self.recovery_result(result)?;
+        self.pump_receive()
+    }
+    /// Bounded receiver work selected by the caller's common channel scheduler.
+    pub fn prepare(
+        &mut self,
+        channel: ChannelId,
+        now: Duration,
+        max_records: usize,
+    ) -> Result<Prepared, Error> {
+        self.advance(now)?;
+        self.pump_receive()?;
+        let result = self
+            .receiver
+            .prepare(channel, ticks(now)?, max_records)
+            .map_err(Error::Receiver);
+        self.terminal_result(result)
+    }
+    /// Immutable native bytes; never hiddenly retired by polling or WouldBlock.
+    pub fn pending(&self) -> Option<Delivery<'_>> {
+        if self.failure.is_some() {
+            None
+        } else {
+            self.receiver.pending()
+        }
+    }
+    /// Commit only after complete native-device acceptance, checking expiry first.
+    pub fn commit_delivery(&mut self, now: Duration) -> Result<(), Error> {
+        self.advance(now)?;
+        let result = self
+            .receiver
+            .commit_delivery(ticks(now)?)
+            .map_err(Error::Receiver);
+        self.terminal_result(result)?;
+        self.pump_receive()
+    }
+    /// Service injected receiver/handoff time while idle; recovery needs polls too.
+    pub fn tick(&mut self, now: Duration) -> Result<(), Error> {
+        self.advance(now)?;
+        if self.packing.is_some() {
+            self.pump_send()?;
+        }
+        self.pump_receive()
+    }
+    /// Next recovery, receiver or retained-handoff deadline; poll it even while idle.
+    pub fn deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.recovery
+            .deadline()
+            .into_iter()
+            .chain(self.handoff.map(|(_, _, deadline)| deadline))
+            .chain(
+                self.sender
+                    .packing()
+                    .and_then(|s| s.packing.deadline_micros)
+                    .map(Duration::from_micros),
+            )
+            .chain(
+                self.receiver
+                    .deadline()
+                    .map(|tick| Duration::from_millis(tick.0)),
+            )
+            .min()
+    }
+    /// True only after all local staging, recovery and native record ownership drains.
+    pub fn drained(&self) -> bool {
+        let status = self.receiver.status();
+        self.failure.is_none()
+            && !self.sender.is_pending()
+            && self.recovery.drained()
+            && self.handoff.is_none()
+            && status.retained_records == 0
+            && status.retained_sources == 0
+            && status.pending_bytes.is_none()
+    }
+    /// Exact maximum complete recovery output, excluding configured carrier overhead.
+    pub fn max_packet_bytes(&self) -> usize {
+        self.recovery.max_packet_bytes()
+    }
+    /// Existing engine's classification for routing data/feedback after authentication.
+    pub fn inspect_peer(&self, packet: &[u8]) -> Result<l2tunnel_reliable::RecordKind, Error> {
+        self.recovery.inspect_peer(packet).map_err(Error::Recovery)
+    }
+    /// Existing engine's classification of an emitted local record.
+    pub fn inspect_output(&self, packet: &[u8]) -> Result<l2tunnel_reliable::RecordKind, Error> {
+        self.recovery
+            .inspect_output(packet)
+            .map_err(Error::Recovery)
+    }
+    /// Actual reliable FEC/ARQ emission and restoration counters.
+    pub fn statistics(&self) -> l2tunnel_reliable::Statistics {
+        self.recovery.statistics()
+    }
+    /// Actual ARQ timeout and source ownership counters.
+    pub fn arq_statistics(&self) -> l2tunnel_recovery::Statistics {
+        self.recovery.arq_statistics()
+    }
+    /// Snapshot of retained local state without releasing any ownership.
+    pub fn status(&self) -> Status {
+        Status {
+            staged_frame: self.sender.staged_frame(),
+            packing: self.sender.packing(),
+            retained_handoff: self.handoff.is_some(),
+            receiver: self.receiver.status(),
+            recovery: self.recovery.storage(),
+            failure: self.failure,
+        }
+    }
+    fn advance(&mut self, now: Duration) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if now < self.now {
+            return Err(Error::Time);
+        }
+        if self.packing.is_some() && packed::micros(now).is_err() {
+            return if self.drained() {
+                Err(Error::Time)
+            } else {
+                self.fail(Error::Time)
+            };
+        }
+        let tick = ticks(now)?;
+        self.now = now;
+        if self.handoff.is_some_and(|(_, _, deadline)| now >= deadline) {
+            return self.fail(Error::Expired);
+        }
+        let result = self.receiver.tick(tick).map_err(Error::Receiver);
+        self.terminal_result(result)
+    }
+    fn pump_send(&mut self) -> Result<(), Error> {
+        if let packed::SenderOwner::Packed(sender) = &mut self.sender {
+            let result = sender
+                .poll(packed::micros(self.now)?)
+                .map_err(Error::PackedSender);
+            self.terminal_result(result)?;
+            return self.submit_packed();
+        }
+        for _ in 0..self.config.recovery.arq.send_records {
+            if !self.sender.is_pending() {
+                break;
+            }
+            let result = self.recovery.next_source_id().map_err(Error::Recovery);
+            let id = self.terminal_result(result)?;
+            let length = self
+                .sender
+                .write_pending(receiver::SourceId(id), &mut self.send_buffer)?;
+            match self.recovery.submit(&self.send_buffer[..length], self.now) {
+                Ok(actual) if actual == id => self.sender.commit_source()?,
+                Ok(_) => return self.fail(Error::Identity),
+                Err(l2tunnel_reliable::Error::Arq(
+                    RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow,
+                )) => break,
+                Err(error) => return self.fail(Error::Recovery(error)),
+            }
+        }
+        Ok(())
+    }
+    fn submit_packed(&mut self) -> Result<(), Error> {
+        if !self.sender.packing().is_some_and(|s| s.packing.sealed) {
+            return Ok(());
+        }
+        let result = self.recovery.next_source_id().map_err(Error::Recovery);
+        let id = self.terminal_result(result)?;
+        let result = self
+            .sender
+            .write_pending(receiver::SourceId(id), &mut self.send_buffer);
+        let length = self.terminal_result(result)?;
+        match self.recovery.submit(&self.send_buffer[..length], self.now) {
+            Ok(actual) if actual == id => {
+                let result = self.sender.commit_source();
+                self.terminal_result(result)
+            }
+            Ok(_) => self.fail(Error::Identity),
+            Err(l2tunnel_reliable::Error::Arq(
+                RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow,
+            )) => Ok(()),
+            Err(error) => self.fail(Error::Recovery(error)),
+        }
+    }
+    fn pump_receive(&mut self) -> Result<(), Error> {
+        for _ in 0..self.config.recovery.arq.receive_records {
+            if self.handoff.is_none() {
+                let result = self
+                    .recovery
+                    .poll_delivered(&mut self.receive_buffer)
+                    .map_err(Error::Recovery);
+                let Some((id, length)) = self.recovery_result(result)? else {
+                    break;
+                };
+                let deadline = self
+                    .now
+                    .checked_add(Duration::from_millis(self.config.receiver.lifetime_ticks))
+                    .ok_or(Error::Time)?;
+                self.handoff = Some((id, length, deadline));
+            }
+            let Some((id, length, _)) = self.handoff else {
+                break;
+            };
+            if let Some(options) = self.packing {
+                match self.admit_packed(options, id, length) {
+                    Ok(()) => {
+                        self.handoff = None;
+                        continue;
+                    }
+                    Err(Error::Receiver(
+                        receiver::Error::Capacity | receiver::Error::RecordWindow,
+                    )) => break,
+                    Err(error) => return self.fail(error),
+                }
+            }
+            let view = match envelope::decode(
+                self.receive_scope,
+                self.config.receiver.body.symbol_bytes,
+                self.config.receiver.channels,
+                &self.receive_buffer[..length],
+            ) {
+                Ok(view) => view,
+                Err(error) => return self.fail(Error::Envelope(error)),
+            };
+            if view.identity.source.0 != id {
+                return self.fail(Error::Identity);
+            }
+            if self.config.native_policy == NativePolicy::RawIp {
+                let symbol = view.symbol;
+                let raw = symbol[3] == 2;
+                let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
+                if !raw && !fragment {
+                    return self.fail(Error::Policy);
+                }
+            }
+            match self
+                .receiver
+                .admit_authenticated(view.identity, view.symbol, ticks(self.now)?)
+            {
+                Ok(receiver::Admission::Accepted) => self.handoff = None,
+                Ok(_) => return self.fail(Error::Identity),
+                Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                Err(error) => return self.fail(Error::Receiver(error)),
+            }
+        }
+        Ok(())
+    }
+    fn admit_packed(
+        &mut self,
+        options: packed::Options,
+        id: u64,
+        length: usize,
+    ) -> Result<(), Error> {
+        let view = l2tunnel_codec::packed_envelope::decode(
+            options.config(self.config).envelope(),
+            self.receive_scope,
+            &self.receive_buffer[..length],
+        )
+        .map_err(Error::PackedEnvelope)?;
+        if view.identity().source.0 != id
+            || Some(view.identity().first_unit) != self.receiver.status().source_floor
+        {
+            return Err(Error::Identity);
+        }
+        let width = self.config.receiver.body.symbol_bytes;
+        let units = view.units().map_err(Error::PackedEnvelope)?;
+        let count = units.len();
+        let mut inputs = Vec::with_capacity(count);
+        for (unit, symbol) in units.zip(self.packed_symbols.chunks_exact_mut(width)) {
+            symbol.fill(0);
+            symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
+            if self.config.native_policy == NativePolicy::RawIp {
+                let raw = symbol[3] == 2;
+                let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
+                if !raw && !fragment {
+                    return Err(Error::Policy);
+                }
+            }
+            inputs.push(receiver::AuthenticatedSymbol {
+                identity: unit.identity,
+                bytes: symbol,
+            });
+        }
+        if inputs.len() != count {
+            return Err(Error::Identity);
+        }
+        let outcomes = self
+            .receiver
+            .admit_validated_batch_authenticated(&inputs, ticks(self.now)?)
+            .map_err(Error::Receiver)?;
+        if outcomes.iter().any(|a| *a != receiver::Admission::Accepted) {
+            return Err(Error::Identity);
+        }
+        Ok(())
+    }
+    fn recovery_result<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        match result {
+            Err(error)
+                if error.is_backpressure()
+                    || matches!(
+                        error,
+                        Error::Recovery(l2tunnel_reliable::Error::OutputTooSmall { .. })
+                    ) =>
+            {
+                Err(error)
+            }
+            other => self.terminal_result(other),
+        }
+    }
+    fn terminal_result<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        result.or_else(|error| self.fail(error))
+    }
+    fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
+        self.failure = Some(error);
+        Err(error)
+    }
+}
+
+fn sender_config(config: Config) -> sender::Config {
+    sender::Config {
+        body: config.receiver.body,
+        channels: config.receiver.channels,
+        first_record: config.receiver.first_record,
+    }
+}
+fn ticks(now: Duration) -> Result<receiver::Tick, Error> {
+    Ok(receiver::Tick(
+        u64::try_from(now.as_millis()).map_err(|_| Error::Time)?,
+    ))
+}
+fn config_hash(bytes: &[u8]) -> ConfigDigest {
+    let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut result = [0; 32];
+    result.copy_from_slice(hash.as_ref());
+    ConfigDigest(result)
+}
+fn number(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+fn duration(output: &mut Vec<u8>, value: Duration) {
+    number(output, value.as_secs());
+    number(output, u64::from(value.subsec_nanos()));
+}
+
+#[cfg(test)]
+mod packed_tests;
+#[cfg(test)]
+mod tests;

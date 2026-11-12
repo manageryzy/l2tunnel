@@ -1,0 +1,16 @@
+[package]
+name = "l2tunnel-reliable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-fec = { path = "../l2tunnel-fec" }
+l2tunnel-recovery = { path = "../l2tunnel-recovery" }
+
+[dev-dependencies]
+l2tunnel-datagram = { path = "../l2tunnel-datagram" }

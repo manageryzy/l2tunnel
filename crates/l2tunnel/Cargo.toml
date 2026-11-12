@@ -1,0 +1,34 @@
+[package]
+name = "l2tunnel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-core = { path = "../l2tunnel-core" }
+l2tunnel-wire = { path = "../l2tunnel-wire" }
+l2tunnel-session = { path = "../l2tunnel-session" }
+l2tunnel-transport = { path = "../l2tunnel-transport" }
+l2tunnel-device = { path = "../l2tunnel-device" }
+l2tunnel-codec = { path = "../l2tunnel-codec" }
+l2tunnel-recovery = { path = "../l2tunnel-recovery" }
+l2tunnel-mux = { path = "../l2tunnel-mux" }
+
+l2tunnel-flow-control = { path = "../l2tunnel-flow-control" }
+l2tunnel-qos = { path = "../l2tunnel-qos" }
+l2tunnel-management = { path = "../l2tunnel-management" }
+l2tunnel-vxlan = { path = "../l2tunnel-vxlan" }
+l2tunnel-packet = { path = "../l2tunnel-packet" }
+l2tunnel-pipeline = { path = "../l2tunnel-pipeline" }
+l2tunnel-fec = { path = "../l2tunnel-fec" }
+l2tunnel-datagram = { path = "../l2tunnel-datagram" }
+l2tunnel-active = { path = "../l2tunnel-active" }
+l2tunnel-reliable = { path = "../l2tunnel-reliable" }
+l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
+l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
+l2tunnel-aligned = { path = "../l2tunnel-aligned" }
+l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }

@@ -1,0 +1,21 @@
+[package]
+name = "l2tunnel-udp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+l2tunnel-auth = { path = "../l2tunnel-auth" }
+l2tunnel-core = { path = "../l2tunnel-core" }
+l2tunnel-device = { path = "../l2tunnel-device" }
+l2tunnel-datagram = { path = "../l2tunnel-datagram" }
+ring = "=0.17.14"
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "sync", "time"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }

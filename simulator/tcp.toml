@@ -1,0 +1,20 @@
+# Longer direct-TCP check for the same single-path RTT and loss matrix.
+seed = 20261110
+replications = 20
+rtt_ms = [20, 70, 150]
+loss_rates = [0.10, 0.15, 0.20]
+loss_models = ["iid"]
+mtus = [1500]
+
+[traffic]
+duration_s = 30
+drain_s = 5
+
+[[strategies]]
+name = "Plain TCP CUBIC"
+mode = "tcp"
+
+[[strategies]]
+name = "Plain TCP NewReno"
+mode = "tcp"
+tcp_cc = "reno"
