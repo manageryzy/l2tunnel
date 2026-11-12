@@ -8,8 +8,9 @@ percentage. All 47 complete Python mode gates remain open.
 
 ## Current verification
 
-The [source29 aggregate check](../work/implementation-wave29/validation.json)
-passed on code commit `d3c7321`: 1246 Rust test executions, 222 Python tool
+The [source30 aggregate check](../work/implementation-wave30/validation.json)
+passed on code commit `10d4a0b`, including decoder commit `1c98510`:
+1263 Rust test executions, 222 Python tool
 executions and 1658 simulator cases. All recorded source inputs stayed unchanged;
 formatting, strict Clippy and rustdoc passed. Two existing Rust descriptor tests
 remain ignored because they require explicit owned namespaces. The simulator
@@ -17,14 +18,26 @@ suite had no skips. This local check includes real loopback carriers and injecte
 devices; privileged native tests, remote CI and Windows/Android qualification
 remain separate.
 
-This adds [sparse decoder transactions](modules/local-global-rlnc.md) and the
-[pure common control envelope](modules/management.md). The same rank-one
-W8192/rows2048 witness reduced charged copies from 19,788,352 to 26,614 bytes per
-job; checked preallocated memory increased from 64,160,116 to 67,371,516 bytes.
-The shared known ring and two equation versions remain bounded reservations.
-Window scans, other packet copies, actual CPU/wire throughput and runtime
-global-support expansion remain separate work. The common codec/admission gate
-does not yet negotiate or dispatch control on a live carrier.
+This contains [sparse decoder transactions and the systematic fast path](modules/local-global-rlnc.md),
+the [pure common control envelope](modules/management.md), and the actual
+[managed TCP shared service](modules/client-runtime.md). The same rank-one
+W8192/rows2048 witness reduced charged copies from 19,788,352 to 26,614 per job.
+Clean width1462 originals now charge 2,922 copies and no GF operations, versus
+14,038 copies and 9,669 GF operations before the fast path. Checked decoder
+reservation for this geometry is 67,371,524 bytes, including fixed versions and
+decision metadata. These are logical work/reservation measures, not CPU time,
+RSS or throughput. General repair algebra, other packet copies and runtime
+global-support expansion remain open. The common control codec does not yet
+negotiate or dispatch on a live carrier.
+
+The [service receipt](../work/service29/validation.json) includes real half-lane
+setup cancellation, full/half reconnect after original owner release, exact
+replacement bytes, compression apply and interrupted-apply uncertainty. Its
+32-entry terminal history no longer grows allocation during teardown. Portable
+local command types retain exact serde bytes and old exports; only Unix transport
+is gated. Other profile lifecycles and Windows/Android qualification remain open.
+The [source29 check](../work/implementation-wave29/validation.json) preserves the
+preceding sparse-row and pure-control checkpoint.
 
 The prior [source28 aggregate](../work/implementation-wave28/validation.json),
 [base UDP/QUIC receipt](../work/base-delivery28/validation.json),
@@ -78,8 +91,8 @@ measurement; two TLS writes alone have not been proved the throughput cause.
 | Python high-performance composition | Codec/recovery libraries and separate aligned/packed/rolling clients exist | No qualified matching native composition; FIX-02 through FIX-04 |
 | TUN flow control and QoS | Transparent active-credit path and fixed TCP-proxy slices | Adaptive native-window growth and complete fairness/pressure gates still fail or remain unrun |
 | Hot mode switching | Authenticated compression changes and finite active-TUN switches | Full codec/recovery/MUX switching matrix and control-under-load correctness remain open |
-| Shared clients | Runnable Linux shared CLI/local API profiles and reusable existing-session commands | Full service lifecycle remains private CLI orchestration; FIX-12, GUI and native Windows/Android remain open |
-| Carrier/recovery and stable control boundaries | Independent pure protocol crates; multiple fixed runtime compositions | OpenVPN-like user recovery and data-mode-dependent control framing require FIX-10/FIX-11 |
+| Shared clients | Managed TCP CLI and embedding frontend use one typed retained lifecycle; portable local schema is separate from Unix transport | Other profile lifecycle migration, richer local lifecycle commands, GUI and native Windows/Android remain open under FIX-12 |
+| Carrier/recovery and stable control boundaries | Independent pure crates, fixed runtime compositions and a bounded common control codec | Actual OpenVPN-like recovery composition and negotiated stable control dispatch still require FIX-10/FIX-11 |
 
 Use [the architecture](architecture.md), [project boundaries](implementation-plan.md),
 [Python parity contracts](mode-parity.md) and the stable task IDs in the master
@@ -109,6 +122,16 @@ a local queue of two and larger native flight; original send completion, receive
 pressure and deadlines remain explicit. They passed the source28
 aggregate. The independently bounded recovery source window and
 new native performance qualification remain part of FIX-01.
+
+The [source-pinned framing assessment](../work/rolling-fast30/next-step.md)
+identifies another blocking FIX-02 defect: at the audited MTU1500 geometry,
+a 1500-byte TUN packet becomes two full 1500-byte outer IPv4 datagrams because
+the short final source is also serialized at the full coded width. Removing that padding and
+composing compact records are first-priority implementation work. This is static
+byte accounting, not a new native measurement. FIX-03 also requires separating
+wire-ingress queue storage from recovery support and qualifying full8192-support
+recovery, repair CPU cost and feedback-induced Busy loss before lifting the
+current128 runtime guard. The fast-path tests do not satisfy those gates.
 
 The [audit inventory](../work/deep-audit26/checked-index.json) is navigation for
 unreviewed evidence, not a completion percentage. Confirmed discrepancies require
