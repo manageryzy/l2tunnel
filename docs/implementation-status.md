@@ -8,8 +8,8 @@ percentage. All 47 complete Python mode gates remain open.
 
 ## Current verification
 
-The [source28 aggregate check](../work/implementation-wave28/validation.json)
-passed on code commit `00cfa2a`: 1231 Rust test executions, 222 Python tool
+The [source29 aggregate check](../work/implementation-wave29/validation.json)
+passed on code commit `d3c7321`: 1246 Rust test executions, 222 Python tool
 executions and 1658 simulator cases. All recorded source inputs stayed unchanged;
 formatting, strict Clippy and rustdoc passed. Two existing Rust descriptor tests
 remain ignored because they require explicit owned namespaces. The simulator
@@ -17,7 +17,17 @@ suite had no skips. This local check includes real loopback carriers and injecte
 devices; privileged native tests, remote CI and Windows/Android qualification
 remain separate.
 
-The [base UDP/QUIC receipt](../work/base-delivery28/validation.json),
+This adds [sparse decoder transactions](modules/local-global-rlnc.md) and the
+[pure common control envelope](modules/management.md). The same rank-one
+W8192/rows2048 witness reduced charged copies from 19,788,352 to 26,614 bytes per
+job; checked preallocated memory increased from 64,160,116 to 67,371,516 bytes.
+The shared known ring and two equation versions remain bounded reservations.
+Window scans, other packet copies, actual CPU/wire throughput and runtime
+global-support expansion remain separate work. The common codec/admission gate
+does not yet negotiate or dispatch control on a live carrier.
+
+The prior [source28 aggregate](../work/implementation-wave28/validation.json),
+[base UDP/QUIC receipt](../work/base-delivery28/validation.json),
 [client receipt and negative proofs](../work/base-delivery28/client-validation.json),
 [raw receipt](../work/raw-delivery28/RECEIPT.md) and
 [harness receipt](../work/base-delivery28/root-harness-receipt.json) bind the
@@ -82,14 +92,16 @@ The blocking fixes remain in the master checklist. Tested changes include
 independent native byte delivery budgets for rolling/aligned/packed and base
 UDP/QUIC/raw, shared
 immutable FEC history, bounded reusable rolling output buffers, one contiguous
-TLS framing write, and explicit pressure/deadline witnesses. These do not prove
+TLS framing write, sparse equation-row publication, and explicit pressure/deadline witnesses. These do not prove
 end-to-end zero copy or the native performance target.
 
 The legacy retained-control parser now lives outside UDP, protected OpenVPN-like
 datagrams have a separate internal owner, and existing-session command handling
 is public in client-core. These are real extractions with unchanged wire
-identities; the public interchangeable recovery composition, negotiated stable
-control envelope and complete client lifecycle API are still required by
+identities. A separately versioned, borrowed common-control codec now binds
+session, primary/target lanes, active/draining epoch and configuration digest.
+The public interchangeable recovery composition, actual negotiated control
+service and complete client lifecycle API are still required by
 FIX-10 through FIX-12. The current [base UDP/QUIC](modules/packet-delivery.md)
 and [raw](modules/raw-runtime.md) changes replace local-queue admission limits
 with authenticated original-byte/record budgets. Their actual-carrier tests use
