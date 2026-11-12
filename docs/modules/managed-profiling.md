@@ -1,7 +1,7 @@
 # Managed TCP/TLS profiling and performance acceptance
 
-Status: opt-in runtime instrumentation implemented; native profiling and the
-80 Mbit/s forward performance gate remain open. This is separate from exact
+Status: opt-in runtime instrumentation integration-tested on four finite native
+cases; the 80 Mbit/s forward performance gate remains open. This is separate from exact
 payload, authentication and cleanup acceptance.
 
 The ordinary client currently sets a local queue of 64 packets. The managed
@@ -46,6 +46,20 @@ All twelve owned case cleanups passed. See the
 The saved 80 Mbit/s simulator uses a different raw/CRC/RLNC protocol and a
 16-flow forward workload; that distinction does not waive the native target.
 
-- [ ] [MOD-PROFILE-01] Check bounded opt-in instrumentation and CLI/harness selection together, including unchanged full/half exact traffic and disabled behavior.
-- [ ] [MOD-PROFILE-02] Run matched immutable profiled native cases and quantify actual blocking, queue occupancy and stage timing without conflating asynchronous wait with CPU.
+- [x] [MOD-PROFILE-01] Check bounded opt-in instrumentation and CLI/harness selection together, including unchanged full/half exact traffic and disabled behavior. Evidence: [source24 aggregate](../../work/implementation-wave24/validation.json), [focused runtime proof](../../work/managed-profiling24/validation.json).
+- [x] [MOD-PROFILE-02] Run matched immutable profiled native cases and quantify actual blocking, queue occupancy and stage timing without conflating asynchronous wait with CPU. Evidence: [four-case independent audit](../../work/throughput24-analysis/24p-final4/report.md), [exact release build](../../work/native-build24/receipt.json).
 - [ ] [MOD-PROFILE-03] Verify the causal outstanding-budget and record-emission corrections against the original slow baseline; require actual forward goodput at least 80 Mbit/s and preserve data/deadline/cleanup checks.
+
+The source24 profile-enabled baseline reports 54.6%..89.2% completed credit-blocked
+elapsed time over each process's observed 16.5..18.0-second profile lifetime.
+All eight endpoints reach 64 unconfirmed packets, while local queue-full events
+remain zero and outgoing queue maxima are 10..30. Mean actual native frame sizes
+are 1004..1184 bytes, so 64 records are not necessarily 96 KB of application data.
+Prefix/body/flush elapsed totals are short relative to the observed lifetime;
+sampled process CPU is 12.4%..17.8% of one core. These observations identify the
+credit limit as the leading constraint, but only a matched budget intervention
+can establish the resulting throughput gain. Feedback/data record ratios of
+0.733..1.078 also leave reverse-path overhead to investigate. All four measured
+forward goodputs remain below 80 Mbit/s. The original diagnostic clock is relative
+to profile start, so these ratios are not asserted to cover the exact shared
+ten-second application measurement window.

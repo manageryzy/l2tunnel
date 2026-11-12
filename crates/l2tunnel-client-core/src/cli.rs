@@ -23,6 +23,8 @@ mod raw_packet_frontend;
 mod rolling_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
+#[path = "delivery_cli.rs"]
+mod delivery_frontend;
 #[path = "profiling_cli.rs"]
 mod profiling;
 #[path = "openvpn/cli.rs"]
@@ -582,6 +584,7 @@ impl DeviceSpec {
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
     let profile_interval = profiling::interval(options)?;
+    let delivery = delivery_frontend::settings(options, config)?;
     if let Some(path) = rolling_frontend::selection(options, config)? {
         return rolling_frontend::execute(command, options, config, path).await;
     }
@@ -701,7 +704,19 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     settings,
                 )
             } else {
-                Connected::Tcp(connect(remote, &tls, server_name, &identity, config).await?)
+                Connected::Tcp(if let Some(delivery) = delivery {
+                    super::connect_with_delivery(
+                        remote,
+                        &tls,
+                        server_name,
+                        &identity,
+                        config,
+                        delivery,
+                    )
+                    .await?
+                } else {
+                    connect(remote, &tls, server_name, &identity, config).await?
+                })
             }
         }
         "serve" => {
@@ -778,7 +793,12 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                         settings,
                     )
                 } else {
-                    Connected::Tcp(accept(&listener, &tls, &allowlist, config).await?)
+                    Connected::Tcp(if let Some(delivery) = delivery {
+                        super::accept_with_delivery(&listener, &tls, &allowlist, config, delivery)
+                            .await?
+                    } else {
+                        accept(&listener, &tls, &allowlist, config).await?
+                    })
                 }
             }
         }
@@ -920,22 +940,52 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
     } else {
         (None, None)
     };
-    let runtime = managed::run_managed_with_profile(
-        device,
-        link,
-        config.runtime(),
-        ManagedConfig {
-            role: if command == "connect" {
-                Role::Client
-            } else {
-                Role::Server
-            },
-            initial_mode: config.mode()?,
-            transaction_settings: TransactionSettings::default(),
+    let managed_config = ManagedConfig {
+        role: if command == "connect" {
+            Role::Client
+        } else {
+            Role::Server
         },
-        requests,
-        profile_sink,
-    );
+        initial_mode: if let Some(delivery) = delivery {
+            config.mode_with_delivery(delivery)?
+        } else {
+            config.mode()?
+        },
+        transaction_settings: TransactionSettings::default(),
+    };
+    let runtime = async move {
+        if let Some(delivery) = delivery {
+            println!(
+                "Delivery window: bandwidth-RTT; forward {} bps; reverse {} bps; bootstrap {} us; receive cap {} bytes/{} records; local queue {} packets",
+                delivery.forward.target_bandwidth_bps,
+                delivery.reverse.target_bandwidth_bps,
+                delivery.forward.bootstrap_rtt_micros,
+                delivery.forward.max_inflight_bytes,
+                delivery.forward.max_records,
+                config.runtime().queue_packets
+            );
+            managed::run_managed_with_delivery(
+                device,
+                link,
+                config.runtime(),
+                managed_config,
+                requests,
+                delivery,
+                profile_sink,
+            )
+            .await
+        } else {
+            managed::run_managed_with_profile(
+                device,
+                link,
+                config.runtime(),
+                managed_config,
+                requests,
+                profile_sink,
+            )
+            .await
+        }
+    };
     let runtime = profiling::observe(runtime, profile_handle);
     if let Some(api) = api {
         tokio::select! {
@@ -1264,6 +1314,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", packed_frontend::HELP);
         println!("\n{}", rolling_frontend::HELP);
         println!("\n{}", raw_packet_frontend::HELP);
+        println!("\n{}", delivery_frontend::HELP);
         println!(
             "\nProfiling: --profile-ms 0|100..60000 (default off), currently system traffic over TCP/TLS frame records only. Emits bounded cumulative runtime_profile JSON snapshots; transport timing includes async waits."
         );
@@ -1324,6 +1375,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     if matches!(command.as_str(), "connect" | "serve") {
         allowed.push("--carrier");
         allowed.push("--profile-ms");
+        allowed.extend_from_slice(delivery_frontend::OPTIONS);
         allowed.push("--quic-application-id");
         allowed.push("--record-profile");
         allowed.push("--aligned-channels");

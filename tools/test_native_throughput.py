@@ -38,6 +38,17 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 h.plan('profile24', profile, 'half', 'delay', 1, profile_ms=millis)
 
+    def test_delivery_budget_uses_same_explicit_policy_across_paths(self):
+        policies = [h.plan('bdp25', 'tap-system', 'half', path, 1, delivery_window='bdp')['delivery_policy']
+                    for path in ('clean', 'delay', 'loss1', 'impaired')]
+        self.assertTrue(all(value == policies[0] for value in policies))
+        self.assertEqual(policies[0]['forward_mbps'], 100)
+        self.assertEqual(policies[0]['reverse_mbps'], 10)
+        self.assertEqual(policies[0]['bootstrap_rtt_ms'], 70)
+        for profile in ('tun-active', 'tun-measured-proxy'):
+            with self.assertRaises(ValueError):
+                h.plan('bdp25', profile, 'half', 'delay', 1, delivery_window='bdp')
+
     def test_wan_policy_is_explicit_coherent_and_historical_policy_unchanged(self):
         old = h.measured.policy()
         policy = h.wan_measured_policy()

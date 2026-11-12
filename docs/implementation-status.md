@@ -5,6 +5,20 @@ checklists remain authoritative for unfinished requirements and mode parity.
 
 ## Current parallel checkpoint
 
+The [source24 aggregate](../work/implementation-wave24/validation.json) passes
+1144 Rust test executions including explicit feature variants, 201 Python tool
+cases, and 1654 simulator cases with all 795 copied inputs stable. The test-review
+repairs, pure bandwidth/RTT delivery controller, and opt-in runtime profiling are
+committed separately. Its [exact release build](../work/native-build24/receipt.json)
+completed four serial TAP/TUN clean/delay half-duplex profiling cases with exact
+payload and owned cleanup. All four still fail the 80 Mbit/s forward target.
+[Independent profiling](../work/throughput24-analysis/24p-final4/report.md) observes
+the 64-record credit limit blocking admission despite no local queue-full events.
+The source25 runtime integration separates local queues from the authenticated
+BDP budget and has passed204 focused runtime tests plus shared-client policy
+tests. Its aggregate and native throughput checks remain pending and are not
+covered by source24's acceptance.
+
 The [source23c aggregate](../work/implementation-wave23c/validation.json) passes
 1055 Rust and 198 Python tool cases with all 658 inputs stable. Its exact release
 build completed twelve matched native half-duplex cases: six system and three
@@ -14,7 +28,7 @@ accepted forward rate fails the owner's 80 Mbit/s target. See the
 [profiling ledger](modules/managed-profiling.md) for separate integrity and
 performance evidence. Runtime profiling and bandwidth/RTT-based outstanding
 credit are the current priority. The five new test-review repairs are tracked
-in [review follow-ups](review-followups.md); their combined gate remains pending.
+in [review follow-ups](review-followups.md); their combined gate passed in source24.
 
 The [source23b aggregate](../work/implementation-wave23b/validation.json) passes
 1055 Rust and 195 Python cases with all 658 copied inputs stable. Proxy control

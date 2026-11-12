@@ -87,13 +87,16 @@ def failure_status(error: Exception) -> str:
 
 
 def plan(lab_id: str, profile: str, duplex: str, path: str, flows: int,
-         family: int = 4, maximum: int = 256 * 1024 * 1024, profile_ms: int = 0) -> dict:
+         family: int = 4, maximum: int = 256 * 1024 * 1024, profile_ms: int = 0,
+         delivery_window: str = 'legacy') -> dict:
     probe.validate(flows, maximum)
     if profile not in PROFILES or duplex not in ('full', 'half') or path not in ('clean', 'delay', 'loss1', 'impaired') or family not in (4, 6):
         raise ValueError('explicit supported profile/duplex/path/family required')
     if (type(profile_ms) is not int or (profile_ms != 0 and not 100 <= profile_ms <= 60000)
             or (profile_ms and profile not in ('tap-system', 'tun-system'))):
         raise ValueError('profiling requires system TCP/TLS and interval0|100..60000ms')
+    if delivery_window not in ('legacy', 'bdp') or (delivery_window == 'bdp' and profile not in ('tap-system', 'tun-system')):
+        raise ValueError('explicit BDP delivery window requires system TCP/TLS')
     spec = lab.LabSpec(lab_id)
     tap = profile == 'tap-system'
     value = {'lab_id': lab_id, 'namespaces': spec.namespaces, 'profile': profile,
@@ -106,12 +109,17 @@ def plan(lab_id: str, profile: str, duplex: str, path: str, flows: int,
             'loss_percent_per_direction': {'clean': 0, 'delay': 0, 'loss1': 1, 'impaired': 15}[path],
             'shared_htb_mbps': {'a_to_b': 100, 'b_to_a': 10},
             'forward_acceptance_mbps': 80, 'runtime_profile_interval_ms': profile_ms,
+            'delivery_window': delivery_window,
             'warmup_seconds': 2, 'measurement_seconds': 10, 'probe_original_seconds': 30,
             'max_bytes_per_direction_flow': maximum, 'max_probe_processes': 2,
             'max_daemons': 2, 'max_status_samples': MAX_SAMPLES, 'capture': 'disabled',
             'initial_topology_commands': lab.plan_document(spec)['commands']}
     if profile == 'tun-measured-proxy':
         value['measured_policy'] = wan_measured_policy()
+    if delivery_window == 'bdp':
+        value['delivery_policy'] = {'forward_mbps': 100, 'reverse_mbps': 10,
+            'bootstrap_rtt_ms': 70, 'headroom_percent': 125,
+            'max_inflight_bytes': 4 * 1024 * 1024, 'max_records': 8192}
     return value
 
 
@@ -433,6 +441,12 @@ def run_case(p: dict, output: Path, state_dir: Path, build: dict) -> dict:
                       '--record-profile', 'frame', '--compression', 'off', '--max-packet', '1600']
             if p['runtime_profile_interval_ms']:
                 common += ['--profile-ms', str(p['runtime_profile_interval_ms'])]
+            if p['delivery_window'] == 'bdp':
+                selected = p['delivery_policy']
+                common += ['--delivery-window', 'bdp', '--forward-mbps', str(selected['forward_mbps']),
+                    '--reverse-mbps', str(selected['reverse_mbps']), '--bootstrap-rtt-ms', str(selected['bootstrap_rtt_ms']),
+                    '--bdp-headroom-percent', str(selected['headroom_percent']),
+                    '--inflight-max-bytes', str(selected['max_inflight_bytes']), '--inflight-max-records', str(selected['max_records'])]
             if p['profile'] == 'tun-active':
                 common += ['--traffic', 'active', '--adaptive', 'on', '--active-stats-ms', '500']
             elif p['profile'] == 'tun-measured-proxy':
@@ -554,6 +568,7 @@ def main(argv=None) -> int:
     p.add_argument('--family', type=int, choices=[4, 6], default=4)
     p.add_argument('--max-bytes', type=int, default=256 * 1024 * 1024)
     p.add_argument('--profile-ms', type=int, default=0)
+    p.add_argument('--delivery-window', choices=['legacy', 'bdp'], default='legacy')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--binary', type=Path, required=True)
     p.add_argument('--build-receipt', type=Path)
@@ -561,7 +576,7 @@ def main(argv=None) -> int:
     p.add_argument('--apply', action='store_true')
     p.add_argument('--frozen-worker', help=argparse.SUPPRESS)
     a = p.parse_args(argv)
-    case = plan(a.lab_id, a.profile, a.duplex, a.path, a.flows, a.family, a.max_bytes, a.profile_ms)
+    case = plan(a.lab_id, a.profile, a.duplex, a.path, a.flows, a.family, a.max_bytes, a.profile_ms, a.delivery_window)
     if not a.apply:
         print(json.dumps({'status': 'dry_run', 'case': case, 'mutations': 'none'}, indent=2))
         return 0
@@ -587,6 +602,7 @@ def main(argv=None) -> int:
             '--profile', a.profile, '--duplex', a.duplex, '--path', a.path, '--flows', str(a.flows),
             '--family', str(a.family), '--max-bytes', str(a.max_bytes), '--output', str(output),
             '--profile-ms', str(a.profile_ms),
+            '--delivery-window', a.delivery_window,
             '--binary', str(output / 'l2tunnel-native'), '--build-receipt', str(output / 'build-receipt.json'),
             '--state-dir', str(a.state_dir.resolve()), '--frozen-worker', f'{st.st_dev}:{st.st_ino}', '--apply']
         os.execve(sys.executable, args, {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
