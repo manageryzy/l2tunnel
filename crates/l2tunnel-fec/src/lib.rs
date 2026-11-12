@@ -6,6 +6,7 @@ use std::fmt;
 
 mod decoder;
 pub mod field;
+pub mod rolling;
 mod wire;
 
 pub use decoder::{
