@@ -4,6 +4,7 @@
 
 mod budget;
 mod config;
+mod data;
 mod driver;
 mod heartbeat;
 mod native;

@@ -114,9 +114,8 @@ pub(crate) async fn run(
                         },
                         Some(0x48) => {
                             if let Some(data) = &mut data {
-                                match data.opener.open(bytes, &mut data_buffer) {
-                                    Ok(packet) => {
-                                        let payload = &data_buffer[..packet.payload_len];
+                                match data.protected.open(bytes) {
+                                    Ok(payload) => {
                                         let source=match inspect_packet(payload, data.context, config.arq.max_source_bytes)? {
                                             PacketView::Data { source, .. } => { if !data.may_receive { return Err(Error::DirectionDisabled); } Some(source.0) },
                                             _=>None,
@@ -271,10 +270,10 @@ pub(crate) async fn run(
                             control_output = Some(control_buffer[..length].to_vec());
                         }
                     } else if let Some(data) = &mut data {
-                        check_key(data, config)?;
+                        data.protected.reserve_maximum_send()?;
                         if let Some(length) = data.recovery.poll_feedback(now, &mut data_buffer)? {
                             let packet =
-                                data.sealer.seal_into(&data_buffer[..length], &mut sealed)?;
+                                data.protected.seal(&data_buffer[..length], &mut sealed)?;
                             budget.charge(
                                 true,
                                 packet.wire_len + config.bootstrap.outer_overhead,
@@ -292,9 +291,9 @@ pub(crate) async fn run(
                 && budget.permits(false, config.bootstrap.path_mtu)
                 && let Some(data) = &mut data
             {
-                check_key(data, config)?;
+                data.protected.reserve_maximum_send()?;
                 if let Some(length) = data.recovery.poll_source(now, &mut data_buffer)? {
-                    let packet = data.sealer.seal_into(&data_buffer[..length], &mut sealed)?;
+                    let packet = data.protected.seal(&data_buffer[..length], &mut sealed)?;
                     budget.charge(
                         false,
                         packet.wire_len + config.bootstrap.outer_overhead,
@@ -385,19 +384,6 @@ pub(crate) async fn run(
             return Ok(());
         }
     }
-}
-
-fn check_key(data: &DataState, config: Config) -> Result<(), Error> {
-    let usage = data.sealer.usage();
-    if usage.packets >= config.profile.max_packets_per_key
-        || usage
-            .payload_bytes
-            .checked_add(config.profile.max_payload_bytes as u64)
-            .is_none_or(|bytes| bytes > config.profile.max_payload_bytes_per_key)
-    {
-        return Err(Error::Datagram(l2tunnel_datagram::Error::KeyUsageExhausted));
-    }
-    Ok(())
 }
 
 // A fixed quiet interval keeps the same owner available for the peer's final

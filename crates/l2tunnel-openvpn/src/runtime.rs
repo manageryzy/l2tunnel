@@ -3,7 +3,7 @@ use l2tunnel_auth::{
     AuthenticatedIo, ClientTls, Direction, KeyPurpose, MemberAllowlist, MemberKey, ServerTls,
     SessionInfo, TlsIoProfile,
 };
-use l2tunnel_datagram::{DatagramConfig, KeyContext, PacketOpener, PacketSealer, SessionId};
+use l2tunnel_datagram::{DatagramConfig, KeyContext, SessionId};
 use l2tunnel_recovery::{EndpointRole, RecoveryContext, SelectiveRepeat};
 use l2tunnel_udp_control::{ClientGate, ControlEngine, GateEvent, Secret, ServerGate};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -161,8 +161,7 @@ pub(crate) struct Received {
     pub _slot: OwnedSemaphorePermit,
 }
 pub(crate) struct DataState {
-    pub sealer: PacketSealer,
-    pub opener: PacketOpener,
+    pub protected: crate::data::ProtectedDatagrams,
     pub recovery: SelectiveRepeat,
     pub may_send: bool,
     pub may_receive: bool,
@@ -722,8 +721,12 @@ pub(crate) async fn enable_native(
         config.profile.lane.0,
     )?;
     let data = DataState {
-        sealer: PacketSealer::new(packet_config(config, info, send), outbound.expose_bytes())?,
-        opener: PacketOpener::new(packet_config(config, info, receive), inbound.expose_bytes())?,
+        protected: crate::data::ProtectedDatagrams::new(
+            packet_config(config, info, send),
+            outbound.expose_bytes(),
+            packet_config(config, info, receive),
+            inbound.expose_bytes(),
+        )?,
         recovery: SelectiveRepeat::new(
             config.arq,
             RecoveryContext {

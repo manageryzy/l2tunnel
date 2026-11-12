@@ -72,6 +72,64 @@ heartbeat/close/control frames. Public handles cannot issue activation commands.
 Task guards cancel/abort owned tasks when factories fail or Control is dropped;
 plain detached Tokio tasks are forbidden.
 
+## USER recovery separation (FIX-10)
+
+The current public `Carrier` supplies ordered recovered packets, not loss-visible
+USER datagrams. This is a composition limitation, not a property of UDP or a
+requirement of reliable bootstrap TLS. In the running path,
+`runtime::enable_native` constructs `SelectiveRepeat`; `PacketSender::send`
+queues originals for `driver::run` to submit to that engine. The sole socket
+reader authenticates each data packet, then applies `inspect_packet` and
+`SelectiveRepeat::receive`. Only `poll_delivered` reaches `PacketReceiver`.
+`l2tunnel-runtime::openvpn` places FrameCodec/Fragmenter above this recovered
+packet service. Consequently these handles cannot implement the loss-visible
+`DatagramSend`/`DatagramReceive` boundary used by the UDP/QUIC aligned, packed and
+rolling owners. Passing their frames through this public API would add forced
+Selective Repeat underneath the selected recovery.
+
+The private `data::ProtectedDatagrams` owner separates maintained packet
+protection from USER recovery in that actual driver path. It owns the sealer,
+opener and one maximum-payload receive buffer, separate from the driver's existing
+fixed send scratch. This adds one bounded payload buffer and no packet queue. Its
+interface is:
+
+```text
+new(send_config, actual_outbound_key, receive_config, actual_inbound_key)
+open(authenticated_wire) -> borrowed exact opaque payload
+reserve_maximum_send() -> checked key-use headroom, without a nonce allocation
+seal(opaque_payload, caller_output) -> exact sealed packet metadata
+```
+
+Only the existing verified factory constructs it from the actual directional
+Data exporters. It authenticates context and payload and commits replay state
+before exposing plaintext; it does not parse recovery headers or maintain USER
+source IDs, ACKs, retries or ordering. The current `DataState` still explicitly
+owns a Selective Repeat adapter above that boundary. Bootstrap control reliability,
+private post-pair activation, retained output slots, exact wire charging and the
+original deadlines remain in their existing owners. This extraction is a private
+implementation stage: it does not enable a public datagram factory or complete
+FIX-10. Existing factories and their authenticated policy/wire bytes remain the
+recovered-packet service.
+
+The minimal remaining interface is an additive, explicitly selected authenticated
+USER-datagram factory returning the existing control owner plus bounded sender
+and receiver handles. Its sender completion must mean transfer into a retained
+wire-output slot, not delivery or USER-recovery admission. Its receiver must expose
+accepted datagrams independently despite loss/reordering, retaining an exact packet
+on small output. Reuse the runtime's existing `DatagramParts` adapter boundary and
+`l2tunnel-transport::Requirement::Datagrams`; do not add a parallel carrier enum or
+claim a cover name proves those semantics. A datagram adapter must validate its
+actual factory/config before satisfying that requirement. Unsupported recovery
+combinations remain errors before authentication and cannot silently fall back
+to the legacy recovered-packet factory.
+
+- [ ] [MOD-OVPNRT-10] Complete FIX-10: expose a genuinely loss-visible authenticated USER-datagram service and compose selected user recovery above it, preserving reliable bootstrap control. The private extraction alone does not satisfy this parent gate.
+- [x] [MOD-OVPNRT-10A] Extract the protected USER-datagram owner into the running driver and verify arbitrary non-ARQ payloads, independent loss/reordering, replay/authentication rejection, fixed storage and unchanged legacy runtime behavior. Evidence: [private owner and four boundary tests](../../crates/l2tunnel-openvpn/src/data.rs), [running driver integration](../../crates/l2tunnel-openvpn/src/driver.rs), [53-case focused crate checks and exact source receipt](../../work/openvpn-data-boundary27/validation.json). This private stage does not expose the public datagram capability required by FIX-10.
+- [ ] [MOD-OVPNRT-10B] Add an explicit versioned pre-auth configuration/factory domain for USER datagrams. Bind full selected recovery, payload/feedback limits, layer, duplex, queues and shared allowance before authentication; preserve the legacy canonical domain. Do not discard the legacy `Config::arq` fields or reinterpret its source limit as a raw payload limit.
+- [ ] [MOD-OVPNRT-10C] Implement bounded datagram admission/delivery and runtime adapters using the same sole socket owner. Preserve control reservation, physical-lane direction, authentic replay protection, original deadlines and immutable held output across WouldBlock; charge selected-recovery feedback and retries to the common allowance exactly once.
+- [ ] [MOD-OVPNRT-10D] Move legacy Selective Repeat to an explicit upper adapter and qualify selected aligned/packed/rolling recovery over the new service with independent exact bytes, loss/reorder, feedback loss and backpressure. Sender recovery state must never be available to the receiver. Do not count a capability flag, enum or compile as integration evidence.
+- [ ] [MOD-OVPNRT-10E] Bind native close fences to the selected upper recovery's actual accepted/consumed source identity. Current native fence counters are Selective Repeat source counters; draining raw datagram queues does not establish native delivery or recovered-source completion. Qualify original-deadline full/paired close before enabling that combination.
+
 ## Lease and uninterrupted state
 
 Bootstrap has its original immutable gate deadline. Actual TLS/member completion
