@@ -25,6 +25,7 @@ l2tunnel-vxlan = { path = "../l2tunnel-vxlan" }
 l2tunnel-packet = { path = "../l2tunnel-packet" }
 l2tunnel-pipeline = { path = "../l2tunnel-pipeline" }
 l2tunnel-fec = { path = "../l2tunnel-fec" }
+l2tunnel-swift = { path = "../l2tunnel-swift" }
 l2tunnel-datagram = { path = "../l2tunnel-datagram" }
 l2tunnel-active = { path = "../l2tunnel-active" }
 l2tunnel-reliable = { path = "../l2tunnel-reliable" }

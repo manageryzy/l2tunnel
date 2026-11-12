@@ -58,6 +58,7 @@ Running and lab tooling:
 ```sh
 cargo run -p l2tunneld -- --help
 cargo run -p l2tunnelctl -- status --control-socket /private/owned-directory/service.sock
+python3 tools/selftest.py             # unprivileged TAP/tc self-test of the swift profile (release build)
 python3 tools/netns_lab.py            # prints a plan only; changes no network state
 python3 tools/native_smoke.py ...     # dry run unless --apply (needs sudo, owned namespaces)
 ```
@@ -102,7 +103,7 @@ into four tiers:
    `wire`, `codec`, `mux`, `recovery`, `fec`, `reliable`, `flow-control`, `qos`,
    `packet`, `pipeline`, `active`, `aligned`, `datagram`, `management`,
    `udp-control`, `vxlan`, `raw-tcp`, `tcp-proxy`, `session`, `transport`,
-   `device` (all prefixed `l2tunnel-`). The `l2tunnel` crate is a facade that
+   `device`, `swift` (all prefixed `l2tunnel-`). The `l2tunnel` crate is a facade that
    re-exports them; `crates/l2tunnel/tests/pipeline.rs` holds cross-module
    tests.
 2. **I/O adapters**: `l2tunnel-auth` (rustls TLS 1.3 plus Ed25519 member
@@ -110,7 +111,7 @@ into four tiers:
    `-platform-linux` (TAP/TUN) and `-platform-vxlan`.
 3. **`l2tunnel-runtime`**: Tokio runtimes that compose tiers 1 and 2, one
    module per profile (`managed`, `udp`, `quic`, `active`, `aligned`, `packed`,
-   `rolling`, `proxy`, `openvpn`, `raw_packet`, `drained`).
+   `rolling`, `proxy`, `openvpn`, `raw_packet`, `drained`, `swift`).
 4. **`l2tunnel-client-core`**: the shared client lifecycle, with a matching
    module per profile, the versioned private local control API (`local`), the
    shared service (`service`) and the CLI adapter (`cli`).

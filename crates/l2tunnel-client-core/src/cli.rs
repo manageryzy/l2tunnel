@@ -21,6 +21,9 @@ mod packed_frontend;
 mod raw_packet_frontend;
 #[path = "rolling/cli.rs"]
 mod rolling_frontend;
+#[cfg(unix)]
+#[path = "swift/cli.rs"]
+mod swift_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
 #[path = "datagram_profiling_cli.rs"]
@@ -594,6 +597,9 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
     let config = configuration(options)?;
     let profile_interval = profiling::interval(options)?;
     let delivery = delivery_frontend::settings(options, config)?;
+    if let Some(settings) = swift_frontend::selection(options, config)? {
+        return swift_frontend::execute(command, options, config, settings).await;
+    }
     if let Some(path) = rolling_frontend::selection(options, config)? {
         return rolling_frontend::execute(command, options, config, path).await;
     }
@@ -1086,6 +1092,13 @@ async fn run_active_managed<D: l2tunnel_device::PacketDevice<Error = io::Error>>
 #[cfg(not(target_os = "linux"))]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
+    #[cfg(unix)]
+    if swift_frontend::selection(options, config)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native swift CLI is implemented on Linux only",
+        ));
+    }
     if rolling_frontend::selection(options, config)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1179,6 +1192,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", proxy_frontend::HELP);
         println!("\n{}", packed_frontend::HELP);
         println!("\n{}", rolling_frontend::HELP);
+        #[cfg(unix)]
+        println!("\n{}", swift_frontend::HELP);
         println!("\n{}", raw_packet_frontend::HELP);
         println!("\n{}", delivery_frontend::HELP);
         println!(
@@ -1251,6 +1266,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         allowed.extend_from_slice(standalone::OPTIONS);
         allowed.extend_from_slice(packed_frontend::OPTIONS);
         allowed.extend_from_slice(rolling_frontend::OPTIONS);
+        #[cfg(unix)]
+        allowed.extend_from_slice(swift_frontend::OPTIONS);
         allowed.extend_from_slice(raw_packet_frontend::OPTIONS);
     }
     let result = options(&args[1..], &allowed).and_then(|options| {

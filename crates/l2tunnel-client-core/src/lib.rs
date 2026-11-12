@@ -371,6 +371,10 @@ mod tests {
 /// Explicit startup-bound rolling source/frame client and lifecycle observation.
 pub mod rolling;
 
+/// Explicit lean paced packed-stream profile over protected UDP.
+#[cfg(unix)]
+pub mod swift;
+
 #[cfg(test)]
 #[path = "base_deadline_tests.rs"]
 mod base_deadline_tests;

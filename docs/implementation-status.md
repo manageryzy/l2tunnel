@@ -6,6 +6,20 @@ performance requirement. Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+## Swift profile
+
+The explicit [swift profile](modules/swift.md) is the first client path that
+reaches the reference workload. In `tools/selftest.py` (Linux TAP, unprivileged
+namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
+RTT, 15% loss each way) it measured 79.21, 79.92 and 79.57 Mbit/s forward
+goodput against 80.72 Mbit/s from the Python simulator rerun at the tunnel's
+real per-datagram overhead, and 80.56 against 79.04 with the kernel's default
+minimum RTO. [Receipts](../work/swift-selftest39/impaired-1.json) and the
+[simulator runs](../work/swift-simulator-reference38/output.log) are saved.
+This is integration-tested in one local environment only: real devices,
+privileged host namespaces, soak, the shared service API and the other profiles'
+blocking corrections remain open, and no Python mode gate is closed by it.
+
 ## Current verification
 
 The [source30 aggregate check](../work/implementation-wave30/validation.json)

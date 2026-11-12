@@ -42,6 +42,8 @@ pub use l2tunnel_qos as qos;
 pub use l2tunnel_raw_tcp as raw_tcp;
 /// Systematic block FEC with bounded selective-repeat fallback.
 pub use l2tunnel_reliable as reliable;
+/// Lean packed ordered-channel engine with requested retransmission and exact header records.
+pub use l2tunnel_swift as swift;
 /// Explicit maintained TCP relay primitive; native interception remains separate.
 pub use l2tunnel_tcp_proxy as tcp_proxy;
 /// Provisioned UDP admission and bounded reliable bootstrap, without native sockets.

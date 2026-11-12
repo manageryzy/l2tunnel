@@ -21,6 +21,9 @@ pub mod quic;
 pub mod raw_packet;
 /// Explicit rolling-frame recovery over retained authenticated UDP/QUIC owners.
 pub mod rolling;
+/// Lean paced packed-stream profile over protected UDP with readiness-driven I/O.
+#[cfg(unix)]
+pub mod swift;
 /// Fixed-mode authenticated UDP with selective repeat and native packet framing.
 pub mod udp;
 #[cfg(test)]

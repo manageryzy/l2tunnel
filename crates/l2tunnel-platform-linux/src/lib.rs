@@ -103,6 +103,12 @@ impl TunTap {
         &self.name
     }
 }
+impl AsRawFd for TunTap {
+    /// Borrowed descriptor for readiness registration; the device keeps ownership.
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
 impl PacketDevice for TunTap {
     type Error = io::Error;
     fn layer(&self) -> PacketLayer {

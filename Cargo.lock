@@ -389,6 +389,7 @@ dependencies = [
  "l2tunnel-recovery",
  "l2tunnel-reliable",
  "l2tunnel-session",
+ "l2tunnel-swift",
  "l2tunnel-tcp-proxy",
  "l2tunnel-transport",
  "l2tunnel-udp-control",
@@ -460,6 +461,7 @@ dependencies = [
  "l2tunnel-recovery",
  "l2tunnel-reliable",
  "l2tunnel-runtime",
+ "l2tunnel-swift",
  "l2tunnel-tcp-proxy",
  "l2tunnel-udp",
  "l2tunnel-udp-control",
@@ -687,6 +689,7 @@ dependencies = [
  "l2tunnel-raw-tcp",
  "l2tunnel-recovery",
  "l2tunnel-reliable",
+ "l2tunnel-swift",
  "l2tunnel-tcp-proxy",
  "l2tunnel-udp",
  "l2tunnel-udp-control",
@@ -702,6 +705,10 @@ version = "0.1.0"
 dependencies = [
  "l2tunnel-core",
 ]
+
+[[package]]
+name = "l2tunnel-swift"
+version = "0.1.0"
 
 [[package]]
 name = "l2tunnel-tcp-proxy"

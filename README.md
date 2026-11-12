@@ -48,6 +48,33 @@ L2 management, VXLAN, UDP covers and GUI/CLI work with stable task IDs and evide
 - [Bridge and tc/netem self-test plan](docs/testing.md)
 - [Coding and verification conventions](CONTRIBUTING.md)
 
+## Self-test on Linux TAP
+
+`tools/selftest.py` builds five private network namespaces inside an
+unprivileged user namespace, shapes the path with HTB and netem, runs real
+`serve` and `connect` endpoints on TAP devices and measures verified TCP flows.
+It needs no sudo and changes nothing on the host.
+
+```sh
+cargo build --release -p l2tunneld
+python3 tools/selftest.py                      # 16 flows, 100/10 Mbit/s, 70 ms, 15% loss
+python3 tools/selftest.py --path clean --flows 4 --duration 10
+python3 tools/selftest.py --require-reference  # fail unless within 2.5% of the simulator
+```
+
+The default `swift` profile is selected on the CLI with:
+
+```sh
+l2tunneld serve --listen IP:PORT --device tap0 --layer tap --duplex full \
+  --cert server.der --key server.pkcs8 --allow-key member.pub \
+  --carrier udp --record-profile swift --udp-bind IP:PORT --udp-peer IP:PORT \
+  --swift-forward-kbit 99000 --swift-reverse-kbit 9900
+```
+
+`connect` takes the same swift options. Budgets are IP kilobits per second,
+client-to-server then server-to-client, and both peers must state both. See
+[the swift module](docs/modules/swift.md) for the design, bounds and results.
+
 ## Build and check
 
 Rust 1.92.0 and Python 3.11+ are required. Crypto/runtime/codec dependencies are
