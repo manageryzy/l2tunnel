@@ -195,6 +195,7 @@ mod service {
                 compression: local::Compression::Off,
                 active: None,
                 openvpn_drain: None,
+                raw_packet: None,
                 proxy: Some(ProxySnapshot {
                     digest: self.digest.clone(),
                     drain_accepted: self.accepted,

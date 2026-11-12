@@ -116,16 +116,17 @@ impl State {
         self.controller
             .observe_table(table, now)
             .map_err(io::Error::other)?;
-        // Successful packet-device writes do not prove that the maintained
-        // receive ring can be consumed. The ordered relay can be waiting for
-        // cumulative peer credit while actual native stream bytes remain unread.
-        // Derive that current capacity stall from the real active owner; neither
-        // a target nor an idle zero-credit stream is pressure or a TCP rwnd value.
+        // Source-native unread bytes at exhausted peer relay credit are already
+        // authenticated Demand, which qualifies sender growth. They are not local
+        // downstream receiver pressure. Observe the opposite direction here:
+        // pending maintained native sends blocked by that native peer's actual
+        // scaled advertised receive window. Idle zero windows cannot reduce a
+        // target; no receive-window value or target is synthesized by this actor.
         pressure.receiver_pressure |= (1..=table.status().flows as u64).any(|id| {
             table.relay_status(id).is_some_and(|relay| {
-                relay.native.receive_bytes != 0
-                    && (relay.produced.bytes == relay.peer_granted.bytes
-                        || relay.produced.records == relay.peer_granted.records)
+                relay.native.established
+                    && relay.native.send_bytes != 0
+                    && relay.native.peer_receive_window_bytes == Some(0)
             })
         });
         self.pressure = pressure;

@@ -98,10 +98,10 @@ Native qualification is recorded separately from primitive acceptance.
 
 | Owner slot | Exclusive work | Frozen upstream interfaces | Acceptance before runtime integration |
 | --- | --- | --- | --- |
-| Worker A | Native original raw packet descriptor opener | Tested packet runtime and existing exact namespace/RST-policy/mark validation | Return the untouched original descriptor and port reservation; preserve old retained-stream entry points and fail closed without host mutation |
-| Worker B | Explicit raw packet shared client/CLI/API | Focused-tested raw runtime and agreed native packet opener | Validate configuration before I/O, retain the original setup deadline and expose actual requested/effective lifecycle; qualify native behavior separately |
-| Worker C | Causal local/global repair-credit, tail and feedback scheduling | Actual bounded rolling encoder/decoder, structural wire codec and Python scheduling source | Implement bounded injected-time scheduling and independent received-byte recovery under data/feedback loss without sender-ledger access |
-| Integrator | Frozen aggregate/build, measured native pressure diagnosis and local Git checkpoints | Exact copied completed bundles, isolated build target, immutable native helpers and structural auditor | Run full checks, retain failed acceptance evidence, commit coherent validated snapshots and qualify native profiles while workers continue |
+| Worker A | Genuine HTTPS carrier contract and implementation | Existing maintained TLS/member/session APIs; raw packet results stay separate | Specify valid HTTP streaming and bounded ordinary unauthenticated handling, then preserve original TLS/socket ownership and explicit ALPN/SNI/authentication binding |
+| Worker B | Measured native capture allocation diagnosis and corrected pressure qualification | Frozen directional pressure correction and unchanged payload/growth/first-reopen acceptance | Explain the historical WAN capture bound with actual packet classes and phase timing before proposing any new finite allocation; rerun only an exact root-verified build |
+| Worker C | Explicit rolling-frame shared client/CLI/API | Frozen tested UDP/QUIC rolling runtime and common client service | Bind strict bounded configuration before authentication, preserve original setup/cancellation, expose requested/effective capabilities and keep unsupported reload/drain explicit |
+| Integrator | Frozen aggregate/build, shared integration helpers and local Git checkpoints | Exact copied completed bundles, isolated build target, immutable native helpers and structural auditor | Review interfaces, run full checks, retain failed acceptance evidence, commit coherent validated snapshots and qualify native profiles while workers continue |
 
 All four slots carry implementation or executable validation work. Module design
 stays in the module ledger and is followed directly by code and focused tests;
@@ -116,10 +116,13 @@ when they have disjoint lab IDs, namespace ownership and output directories;
 serialize only cases that share mutable resources or deliberately measure a
 common host load. Preserve failed receipts before making the next attempt.
 
-The derived wave16 input checkpoint includes the executable raw packet runtime,
-rolling wire codec, measured ring/credit pressure observation, and bounded QUIC
-owner cleanup. Its aggregate and native receipts remain separate acceptance
-gates. Existing fixed-credit proxy,
+The wave16b aggregate passed on its frozen source; the derived wave17 aggregate
+failed a raw paired-lane review assertion and remains preserved. Wave18 composes
+the focused-tested causal fixture fix, raw native harness, rolling runtime and
+directional native-pressure correction while these next worker lanes continue.
+The previous measured native pressure rerun exposed a directional classification
+defect despite focused tests passing, so native acceptance remains a separate gate.
+Existing fixed-credit proxy,
 aligned UDP/QUIC, standalone OpenVPN-like clean drain and other native receipts
 retain their documented finite scope. All 47 complete Python family gates remain
 open until their own requirements pass. See [current evidence](implementation-status.md)

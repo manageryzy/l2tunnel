@@ -5,16 +5,29 @@ checklists remain authoritative for unfinished requirements and mode parity.
 
 ## Current parallel checkpoint
 
-The [wave14b frozen aggregate](../work/implementation-wave14b/validation.json)
-passed 858 Rust and 107 Python cases, formatting, strict workspace Clippy,
-warning-denied rustdoc, golden vectors and CLI checks. Its 562 source inputs
-were unchanged during the run. It includes the held raw pairing, measured proxy
-runtime and packed Ethernet audit checkpoints; subsequent concurrent module edits
-are not covered by that receipt.
+The [wave16b frozen aggregate](../work/implementation-wave16b/validation.json)
+passed 949 Rust and 126 Python cases, formatting, strict workspace Clippy,
+warning-denied rustdoc, golden vectors and CLI checks. Its 593 source inputs
+were unchanged during the run. It includes the raw packet runtime, QUIC ownership
+cleanup, rolling structural wire codec and measured pressure/fixture corrections.
+Subsequent native raw opener/client and rolling scheduler edits are not covered.
+The derived [wave17 aggregate](../work/implementation-wave17/validation.json)
+kept all 608 inputs stable but failed the raw paired-lane review test's pending
+message precondition (`pairing_review_tests.rs:299`), after 524 Rust and two
+Python cases. Its original receipt is retained. It is not a passing aggregate.
+The [derived pairing fixture](../work/raw-pairing-precondition18/validation.json)
+now reproduces the early observation deterministically and waits for the original
+driver's actual blocked send, keeping all original authority/deadline assertions.
+Its 152 focused cases and strict lint pass. Wave18 composes that two-file fix,
+the raw native harness, rolling runtime and directional pressure correction;
+its aggregate/build/native gates remain separate from their focused results.
+The earlier [wave14b aggregate](../work/implementation-wave14b/validation.json)
+remains the 562-input, 858 Rust/107 Python checkpoint for its historical native
+builds; later results do not rewrite that evidence.
 
 The [active workflow](development-workflow.md#current-composition-wave) now runs
-native raw packet ownership, its shared client/API integration and causal rolling
-repair scheduling in three independent source/build lanes. Aggregate/build/native
+raw packet native qualification, measured native pressure diagnosis and rolling
+runtime integration in three independent source/build lanes. Aggregate/build/native
 qualification uses a copied source checkpoint, releasing developers immediately
 after copy verification. Clean native profiles use disjoint owned namespaces;
 concurrent runs qualify finite connectivity/integrity, not performance.
@@ -39,11 +52,31 @@ The [rolling equation checkpoint](../work/rolling-recovery-checkpoint15/validati
 now passes 39 FEC unit and three two-owner integration cases. It reconstructs
 actual bytes from independent received equations, retains fixed-support known
 columns, bounds incremental work, and handles output pressure/deadlines. It has
-no integrated repair scheduler or transport yet. The measured proxy
+no integrated repair scheduler or transport at that checkpoint. The subsequent
+[pure scheduler checkpoint](../work/rolling-scheduler16/validation.json) passes
+65 FEC cases, including bounded repair credit, idle tails, full-scope cumulative
+feedback, lost final receipts and published-prefix pressure. The subsequent
+[rolling runtime](modules/rolling-runtime.md) passes nine focused tests covering
+16 actual authenticated UDP and four genuine QUIC scenarios, plus two shared
+budget tests. It retains common MUX, bounded feedback/native ownership and original
+deadlines. An observed Pipeline clock-domain mismatch and pre-native validation
+ordering were corrected with regression evidence. Client activation, native
+qualification and large-window deployment remain separate. The measured proxy
 [shared client checkpoint](../work/proxy-measured-client/validation.json) passes
 95 library and 19 example cases and invokes the actual measured runtime through
 an explicit CLI profile. The subsequent wire codec adds nine focused cases.
 These finite modules do not close the complete Python-family gates.
+
+The [native original-packet opener](modules/raw-native-packet.md) passes 152
+raw-I/O/raw-TCP cases with two privileged probes ignored. It returns the unchanged
+descriptor and port reservation from the shared namespace/policy-validated
+constructor. The [explicit shared raw client](modules/raw-packet-client.md)
+passes 101 client and 19 example cases, selecting the actual authenticated packet
+runtime with strict bounded settings, original setup deadlines and observable
+capabilities. Its native qualification, congestion controller, clean drain and
+hot reload are explicitly unavailable. These completed bundles entered wave17,
+whose aggregate failed as recorded above; no native result follows from their
+focused compilation or tests.
 
 The source-stable wave15 aggregate failed in a paired OpenVPN-like UDP close;
 its unchanged isolated rerun passed, leaving the original cause unattributed.
@@ -68,7 +101,9 @@ the fixture's ordering mistake: native EOF can arrive in 210 ms before a coalesc
 measurement snapshot. The corrected fixture keeps its measurement workload
 active until both real samples are observed, within the unchanged five-second
 transfer bound, then checks exact FIN/drain within its unchanged fifteen-second
-bound. All 158 runtime cases pass; a derived aggregate remains separate.
+bound. All 158 runtime cases and the complete wave16b aggregate now pass. The
+original wave15/15b/16 failures remain preserved; a finite pass does not attribute
+the older OpenVPN paired-close timeout or qualify a native pressure profile.
 
 Both [measured native clean cases](modules/proxy-measured-native.md) and their
 independent audits passed on the exact observation build. Both pressure cases
@@ -77,8 +112,23 @@ show actual zero windows on all eight native legs; three reopen before the reade
 release and fail the unchanged first-reopen condition. A real maintained-stack
 regression now fixes the missing observation of unread native bytes stalled by
 exhausted peer credit; 157 runtime and 36 harness tests pass, including pressure
-clearing and ownership-safe failed-case socket cleanup. Native pressure, adaptive
-window growth and QoS/fairness qualification remain open.
+clearing and ownership-safe failed-case socket cleanup. The subsequent exact-build
+[full](../work/native-proxy-measured-full-pressure16b/receipt.json) and
+[half](../work/native-proxy-measured-half-pressure16b/receipt.json) pressure runs
+still failed acceptance: native payloads and owned cleanup passed, but growth was
+suppressed. A directional audit found that the new pressure predicate duplicates
+existing sender-credit demand, which must remain eligible for startup growth.
+The [directional correction](modules/proxy-directional-pressure.md) separates that
+source-side signal from downstream pressure using the maintained native peer's
+actual advertised window and pending send bytes. Its 252 affected Rust cases,
+435 vendor cases, two focused IPv6 vendor cases and strict checks pass; the
+read-only observation uses a separately pinned incremental vendor patch and
+preserves the original patch/archive. No corrected native rerun is claimed yet.
+All eight independently audited first-reopen/ACK conditions passed in
+these later captures; all four WAN captures reached their unchanged 8192-packet
+bound, so complete carrier capture qualification is separately bound-exhausted.
+See the [audit](../work/native-pressure16b-audit/REPORT.md). Native pressure,
+adaptive window growth and QoS/fairness qualification remain open.
 
 ## First native vertical slice
 

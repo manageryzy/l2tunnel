@@ -1090,6 +1090,11 @@ impl Decoder {
             .chain(self.job.as_ref().map(|job| job.deadline))
             .min()
     }
+    // Scheduler scans only committed columns while it freezes new decoder work.
+    // No payload or sender ledger is exposed, and each lookup is constant work.
+    pub(super) fn committed_known(&self, id: SourceId) -> bool {
+        self.live.known[id.0 as usize % (2 * self.config.window)] == Some(id.0)
+    }
     /// Constant-size ownership snapshot without allocating or scanning payloads.
     pub fn status(&self) -> DecoderStatus {
         DecoderStatus {

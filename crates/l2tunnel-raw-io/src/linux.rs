@@ -8,7 +8,11 @@ use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
 use tokio::io::DuplexStream;
 
-/// Owned raw descriptor plus a bound, non-listening TCP port reservation.
+/// Original nonblocking raw descriptor and its unmarked TCP port reservation.
+///
+/// This opaque owner implements [`PacketIo`]. Moving it into the from-birth
+/// handoff runtime preserves both original descriptors; dropping it releases
+/// both. No descriptor cloning, mark mutation or TCP processing is exposed.
 pub struct RawSocket {
     raw: Socket,
     peer: SockAddr,
@@ -37,13 +41,31 @@ pub fn open_marked(
     role: Role,
     mark: u32,
 ) -> io::Result<(DuplexStream, Driver<RawSocket>)> {
-    let mark = NonZeroU32::new(mark).ok_or_else(|| {
+    open_socket(config, role, Some(owned_mark(mark)?))
+}
+
+/// Open original marked packet I/O without creating a stream or TCP driver.
+///
+/// All configured bounds are validated before external inspection or socket
+/// creation. Namespace, exact-tuple OUTPUT policy and mark readback requirements
+/// match [`open_marked`]. The returned owner retains the same raw descriptor and
+/// unmarked bound port reservation, with no packet reads, writes or tasks. Move
+/// it directly into the from-birth handoff runtime before driving TCP or TLS.
+/// The caller must preserve its owned namespace and policy for the entire owner
+/// lifetime. This function does not qualify the native packet-phase profile.
+///
+/// Errors drop all partially created descriptors and never select a fallback.
+pub fn open_packet_marked(config: Config, role: Role, mark: u32) -> io::Result<RawSocket> {
+    prepare_socket(config, role, Some(owned_mark(mark)?))
+}
+
+fn owned_mark(mark: u32) -> io::Result<NonZeroU32> {
+    NonZeroU32::new(mark).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "owned raw mark must be nonzero",
         )
-    })?;
-    open_socket(config, role, Some(mark))
+    })
 }
 
 fn open_socket(
@@ -51,29 +73,23 @@ fn open_socket(
     role: Role,
     mark: Option<NonZeroU32>,
 ) -> io::Result<(DuplexStream, Driver<RawSocket>)> {
-    // Validate all capacities before any socket or external inspection.
+    bridge(config, role, prepare_socket(config, role, mark)?)
+}
+
+fn prepare_socket(config: Config, role: Role, mark: Option<NonZeroU32>) -> io::Result<RawSocket> {
+    // Validate all capacities and maintained TCP setup before any socket or
+    // external inspection. This temporary owner has no packet I/O and is never
+    // polled; the original native descriptor is created only below.
     let _validated = TcpEngine::new(config, role, Millis(0)).map_err(io::Error::other)?;
     let current = std::fs::metadata("/proc/self/ns/net")?.ino();
     let initial = std::fs::metadata("/proc/1/ns/net")?.ino();
-    if current == initial {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "raw profile requires a separate owned network namespace",
-        ));
-    }
+    validate_namespace(current, initial)?;
     if let Some(mark) = mark {
         let output = read_marked_policy()?;
         let text = std::str::from_utf8(&output).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 marked OUTPUT policy")
         })?;
-        let target = format!(
-            "-A OUTPUT -s {}/32 -d {}/32 -p tcp -m tcp --sport {} --dport {} --tcp-flags RST RST -m mark ! --mark {:#x} -j DROP",
-            config.local.ip(),
-            config.peer.ip(),
-            config.local.port(),
-            config.peer.port(),
-            mark.get()
-        );
+        let target = marked_target(config, mark);
         validate_marked_policy(text, &target, mark)?;
     } else {
         let policy = Command::new("/usr/sbin/iptables")
@@ -106,8 +122,7 @@ fn open_socket(
             ));
         }
     }
-    let reservation = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    reservation.bind(&SockAddr::from(SocketAddr::V4(config.local)))?;
+    let reservation = reserve_port(config.local)?;
     let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
     if let Some(mark) = mark {
         raw.set_mark(mark.get())?;
@@ -127,15 +142,38 @@ fn open_socket(
         0,
     ))))?;
     let peer = SockAddr::from(SocketAddr::V4(SocketAddrV4::new(*config.peer.ip(), 0)));
-    bridge(
-        config,
-        role,
-        RawSocket {
-            raw,
-            peer,
-            ports: (config.local.port(), config.peer.port()),
-            _reservation: reservation,
-        },
+    Ok(RawSocket {
+        raw,
+        peer,
+        ports: (config.local.port(), config.peer.port()),
+        _reservation: reservation,
+    })
+}
+
+fn reserve_port(local: SocketAddrV4) -> io::Result<Socket> {
+    let reservation = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    reservation.bind(&SockAddr::from(SocketAddr::V4(local)))?;
+    Ok(reservation)
+}
+
+fn validate_namespace(current: u64, initial: u64) -> io::Result<()> {
+    if current == initial {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "raw profile requires a separate owned network namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn marked_target(config: Config, mark: NonZeroU32) -> String {
+    format!(
+        "-A OUTPUT -s {}/32 -d {}/32 -p tcp -m tcp --sport {} --dport {} --tcp-flags RST RST -m mark ! --mark {:#x} -j DROP",
+        config.local.ip(),
+        config.peer.ip(),
+        config.local.port(),
+        config.peer.port(),
+        mark.get()
     )
 }
 
@@ -355,3 +393,7 @@ impl PacketIo for RawSocket {
 #[cfg(test)]
 #[path = "linux_native_tests.rs"]
 mod native_policy_tests;
+
+#[cfg(test)]
+#[path = "linux_packet_tests.rs"]
+mod packet_open_tests;

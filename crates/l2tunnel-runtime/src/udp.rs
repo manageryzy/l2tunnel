@@ -875,6 +875,9 @@ struct Ledger {
 }
 impl Ledger {
     fn new(config: DatagramPolicy) -> Self {
+        Self::with_reservation(config, config.control_reservation())
+    }
+    fn with_reservation(config: DatagramPolicy, reservation: OutboundBudget) -> Self {
         let total = OutboundBudget {
             packets: config.wire_budget.packets,
             wire_bytes: config.wire_budget.wire_bytes,
@@ -882,8 +885,8 @@ impl Ledger {
         Self {
             limits: config.wire_budget,
             remaining: total,
-            reservation: config.control_reservation(),
-            reserved: config.control_reservation(),
+            reservation,
+            reserved: reservation,
             next: config.wire_budget.interval,
         }
     }
@@ -972,6 +975,49 @@ impl SharedBudget {
             data_overhead: config.data_overhead,
             control_overhead: config.control_overhead,
         }
+    }
+    /// Reserve the selected recovery feedback shape on the same finite lane ledger.
+    pub(super) fn from_policy_feedback(
+        config: DatagramPolicy,
+        started: Instant,
+        feedback_bytes: usize,
+    ) -> io::Result<Self> {
+        if !(1..=usize::from(u16::MAX)).contains(&feedback_bytes)
+            || !(1..=usize::from(u16::MAX)).contains(&config.payload_bytes)
+        {
+            return Err(invalid("invalid shared feedback or data payload bound"));
+        }
+        let packets = 3 * if config.duplex == Duplex::Full { 1 } else { 2 };
+        let wire_bytes = config
+            .control_overhead
+            .checked_add(feedback_bytes)
+            .and_then(|bytes| bytes.checked_mul(packets))
+            .ok_or_else(|| invalid("shared feedback reservation overflow"))?;
+        let required = config
+            .data_overhead
+            .checked_add(config.payload_bytes)
+            .and_then(|bytes| bytes.checked_add(wire_bytes))
+            .ok_or_else(|| invalid("shared maximum packet allowance overflow"))?;
+        if config.wire_budget.interval.is_zero()
+            || config.wire_budget.interval > config.control_timeout / 8
+            || config.wire_budget.interval > Duration::from_secs(1)
+            || config.wire_budget.packets <= packets
+            || config.wire_budget.packets > 65_536
+            || config.wire_budget.wire_bytes < required
+            || config.wire_budget.wire_bytes > 256 * 1024 * 1024
+        {
+            return Err(invalid("invalid shared feedback allowance or reservation"));
+        }
+        let reservation = OutboundBudget {
+            packets,
+            wire_bytes,
+        };
+        Ok(Self {
+            ledger: Arc::new(Mutex::new(Ledger::with_reservation(config, reservation))),
+            started,
+            data_overhead: config.data_overhead,
+            control_overhead: config.control_overhead,
+        })
     }
     fn poll(
         &self,

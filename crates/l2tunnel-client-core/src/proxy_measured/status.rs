@@ -301,6 +301,7 @@ mod tests {
                 compression: crate::local::Compression::Off,
                 active: None,
                 openvpn_drain: None,
+                raw_packet: None,
                 proxy: Some(crate::local::ProxySnapshot {
                     digest: "ff".repeat(32),
                     drain_accepted: true,

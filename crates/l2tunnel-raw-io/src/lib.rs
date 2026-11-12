@@ -13,7 +13,7 @@ pub mod handoff;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{open, open_marked};
+pub use linux::{RawSocket, open, open_marked, open_packet_marked};
 
 /// Atomic nonblocking packet I/O; used by the driver and finite test links.
 pub trait PacketIo {

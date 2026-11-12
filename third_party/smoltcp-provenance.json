@@ -19,7 +19,7 @@
     "src/socket/tcp.rs"
   ],
   "file_manifest": "smoltcp-file-manifest.json",
-  "file_manifest_sha256": "4294706becb5cfe712acc8308e5a6c63ad5d9a21cdb29b08d4acb02683b5564a",
+  "file_manifest_sha256": "117a509241904952bc681ef5af3707fe41a2129d7dcf716175d52b210f0f23bb",
   "upstream_file_count": 134,
   "archive_missing_files": [],
   "unexpected_files_in_source": [],
@@ -32,5 +32,13 @@
       "native or middlebox qualification"
     ]
   },
-  "dependency_activation": "Root separately owns Cargo/lock selection and aggregate source hashing."
+  "dependency_activation": "Root separately owns Cargo/lock selection and aggregate source hashing.",
+  "peer_window_observation_patch": {
+    "file": "smoltcp-0.14.0-peer-window-observation.patch",
+    "sha256": "83cb38885005a7b294c367facdfc4445262a032fa96b3e2d694a1117aded786b",
+    "base_tcp_sha256": "0bb6cc1ee4f82be71bec947953c4cc5fd51a33508f76fb696366b7d7b0ea190c",
+    "result_tcp_sha256": "ba2b4b1f1cf9adca3b7e01dbf699058aa01ecbfaa666369c7396605f2887189d",
+    "scope": "Read-only current scaled maintained peer receive window, absent before establishment/after closed; two tests. No queue, timer, transition, congestion or window algorithm change.",
+    "review": "Root independently reviewed exact patch 83cb38885005a7b294c367facdfc4445262a032fa96b3e2d694a1117aded786b, checker pins, raw Status and measured direction mapping; accepted with no material issue."
+  }
 }

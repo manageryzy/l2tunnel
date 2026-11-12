@@ -1,7 +1,8 @@
 # Fixed-window local/global full-byte recovery
 
-Status: the pure encoder/decoder and finite end-to-end recovery slice are implemented; focused checks and aggregate evidence are recorded below. This is a separate pure rolling equation
-primitive; existing sealed block FEC, ARQ, wire formats and defaults are unchanged.
+Status: the pure encoder/decoder, additive causal scheduler and finite full-byte
+recovery slices are implemented; their separately scoped evidence is recorded
+below. Existing sealed block FEC, ARQ, wire formats and defaults are unchanged.
 The complete local-global-rlnc/compact-wire catalog gates remain open.
 
 The reviewed work direction is recorded in
@@ -63,11 +64,73 @@ padding`; repair bodies carry the full equation width. Trimming is absent.
 The codec and nine focused tests implement subgate 06A. Independent complete
 Python-packed source/repair literals recover each missing original through the
 actual decoder with small work budgets. TODO: authenticated transport framing,
-causal repair scheduling, large-window qualification and runtime selection remain
-open under gates 06/07.
+runtime composition of the pure scheduler, large-window qualification and runtime
+selection remain open under gates 06/07.
+
+## Bounded causal scheduler API (06B)
+
+The additive pure layer is `rolling::scheduler::{Policy, Sender, Receiver}`.
+`Policy` embeds the unchanged rolling Config, an exact repair numerator /
+denominator (0 <= numerator <= denominator <= 65536), explicit positive tail
+and feedback tick intervals, a bounded feedback event threshold, and a total
+owner memory ceiling. There are no inferred RTTs, clocks or I/O handles.
+
+`Sender` owns the actual Encoder and one immutable systematic/repair descriptor.
+`admit_source`, budgeted `step`, borrowed `pending_output`, failure-atomic
+`encode_pending`, and identity-checked `confirm_output` separate local admission,
+real caller handoff and repair work. Only successful source handoff earns repair
+credit. A regular repair is serviced before another source; full nonwrapping
+repair IDs retain the existing local/global/seed rules. Tail service uses the
+latest authenticated deficit (at least one, at most W), repeats after actual
+tail handoff, and stops only at a cumulative receipt. Polling, zero work,
+WouldBlock and duplicate feedback do not reset original debt/output deadlines.
+New successful source handoff supersedes the idle-tail due time, as Python's
+source serialization finish supersedes its tail generation. A due time is a
+service trigger; original debt/output deadlines remain hard expiry bounds.
+
+`Receiver` owns the actual Decoder, one budgeted feedback scan and one immutable
+feedback output, without a sender payload ledger. Complete received source/repair
+wire bytes enter through the existing codec. Feedback carries full Scope, an
+independent nonwrapping feedback ID, actual published cumulative prefix,
+committed observed end and `max(unknown sources - independent rank, 0)` deficit.
+Count or first-event timeout triggers feedback; a repeated/stale tail can cause
+a fresh cumulative receipt after feedback loss. Feedback scans freeze new decode
+admission while visiting at most W known-column identities under metadata work;
+serialization advances under byte-copy work. A retained feedback output does
+not freeze independent decoder progress and never changes bytes. Its original
+handoff deadline remains fixed. Receiver handoff remains distinct from native
+delivery. An additive fixed 64-byte structural `L2RF` version-one feedback codec
+carries these fields; all reserved bytes and unsupported versions/kinds fail.
+Outer authentication/replay/domain binding remains mandatory caller authority.
+Feedback header offsets are magic `L2RF` 0..4, version 1 at 4, kind 3 at 5,
+reserved zero 6..8, session 8..24, epoch 24..32, stream 32..36, direction 36,
+reserved zero 37..40, feedback ID 40..48, prefix 48..52, observed end 52..56,
+deficit 56..60 and reserved zero 60..64. Integers are unsigned big-endian.
+A prefix/deficit is checked against actual successful source handoffs before
+sender retention changes. Same retained identity/body is a duplicate, a changed
+body conflicts, and older identities/regressed prefixes cannot change debt.
+
+`encode_pending` writes a complete data record to caller-reserved storage using
+the unchanged wire codec; it does not consume the borrowed descriptor. This is
+a separate bounded atomic serialization call (at most 4162 bytes), like the
+primitive's bounded input copy. `step` contains only resumable GF/metadata/copy
+work. `Encoder::confirm_repair` provides identity-checked no-copy consumption
+only after full external handoff; undersized encode attempts and WouldBlock
+never invoke it. No additional payload queue or packet allocation is introduced.
+
+Python references are CompactTransport `_source`, `_tail`, `_advance`,
+`_feedback`, `_receive_feedback`, SharedRecordTransport `_repair`, and fixed
+CompactWireTransport support/retention. Engineering differences are deliberate:
+exact integer ratio instead of parsed float, explicit caller handoff instead of
+simulated serialization finish, bounded resumable work/output storage, identified
+feedback with strict stale/conflict handling, original hard deadlines, full-byte
+GF recovery and structural enclosing wire. No inferred known link RTT, source
+ledger materialization, implicit packet packing or complete Python-family parity
+is supplied. Gates 06/07 remain open after this finite subgate.
 
 - [ ] [MOD-LGR-06] Add causal repair-credit/tail/feedback scheduling, authenticated wire framing and large-window qualification as separate gates.
 - [x] [MOD-LGR-06A] Implement and test the additive bounded structural source/repair wire codec without granting authentication or replay authority. Evidence: [focused wire checks](../../work/rolling-wire15/validation.json), nine literal/parser/output-atomicity and independent received-wire recovery tests, strict FEC Clippy, warning-denied rustdoc and Cargo formatting. This is a structural contract, not authenticated transport integration.
+- [x] [MOD-LGR-06B] Implement causal bounded repair-credit/tail/identified cumulative feedback scheduling over actual rolling owners and wire; verify independent two-owner exact bytes under data/repair/feedback loss, reorder, output pressure, tiny work and original expiry. Evidence: [scoped exact-file receipt](../../work/rolling-scheduler16/validation.json), 49 FEC unit and 16 independent integration cases (13 scheduler / 3 existing stream), strict FEC lint/docs and formatting. New maintained-Python repair/feedback literals pin actual deficit/rank and full structural bytes; W8 budget1/17/65536 exchanges cross eight windows. This finite pure slice does not complete either parent gate.
 - [ ] [MOD-LGR-07] Integrate explicit aligned/packed selection, runtime/client/native qualification and complete Python family parity.
 
 The implementation checks the configured reservation before allocating two fixed

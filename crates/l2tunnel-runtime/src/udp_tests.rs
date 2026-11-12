@@ -904,6 +904,143 @@ fn shared_allowance_does_not_reset_per_lane_or_poll_and_reserves_control() -> Te
 }
 
 #[test]
+fn selected_feedback_reservation_shares_all_lanes_and_refills_exactly() -> TestResult {
+    for duplex in [Duplex::Full, Duplex::Half] {
+        let mut policy =
+            config(duplex, CoverProfile::QuicLike, Protection::HmacSha256)?.policy()?;
+        let feedback = 64;
+        let control_packets = if duplex == Duplex::Full { 3 } else { 6 };
+        policy.wire_budget = WireBudget {
+            interval: Duration::from_millis(10),
+            packets: control_packets + 1,
+            wire_bytes: control_packets * (feedback + policy.control_overhead)
+                + policy.payload_bytes
+                + policy.data_overhead,
+        };
+        let shared = SharedBudget::from_policy_feedback(policy, Instant::now(), feedback)?;
+        let other_lane = shared.clone();
+        let mut output = vec![0; policy.payload_bytes];
+        let emit = |size: usize, allowance: &mut OutboundBudget| {
+            if allowance.packets == 0 || allowance.wire_bytes < size {
+                return Ok(None);
+            }
+            allowance.packets -= 1;
+            allowance.wire_bytes -= size;
+            Ok(Some(size))
+        };
+        assert_eq!(
+            shared.poll_with(false, Duration::ZERO, &mut output, |_, allowance| {
+                emit(policy.payload_bytes, allowance)
+            })?,
+            Some(policy.payload_bytes)
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                other_lane.poll_with(false, Duration::ZERO, &mut output, |_, allowance| {
+                    emit(1, allowance)
+                })?,
+                None
+            );
+        }
+        for _ in 0..control_packets {
+            assert_eq!(
+                other_lane.poll_with(true, Duration::ZERO, &mut output, |_, allowance| {
+                    emit(feedback, allowance)
+                })?,
+                Some(feedback)
+            );
+        }
+        for control in [true, false] {
+            assert_eq!(
+                shared.poll_with(
+                    control,
+                    Duration::from_millis(9),
+                    &mut output,
+                    |_, allowance| { emit(1, allowance) }
+                )?,
+                None
+            );
+        }
+        assert_eq!(
+            other_lane.poll_with(
+                false,
+                Duration::from_millis(10),
+                &mut output,
+                |_, allowance| { emit(policy.payload_bytes, allowance) }
+            )?,
+            Some(policy.payload_bytes)
+        );
+        let ledger = shared
+            .ledger
+            .lock()
+            .map_err(|_| invalid("test ledger poisoned"))?;
+        assert_eq!(ledger.remaining.packets, control_packets);
+        assert_eq!(
+            ledger.remaining.wire_bytes,
+            control_packets * (feedback + policy.control_overhead)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn selected_feedback_reservation_rejects_shortage_overflow_and_unbounded_limits() -> TestResult {
+    for duplex in [Duplex::Full, Duplex::Half] {
+        let mut policy =
+            config(duplex, CoverProfile::QuicLike, Protection::HmacSha256)?.policy()?;
+        let packets = if duplex == Duplex::Full { 3 } else { 6 };
+        let required =
+            packets * (policy.control_overhead + 64) + policy.payload_bytes + policy.data_overhead;
+        policy.wire_budget.packets = packets + 1;
+        policy.wire_budget.wire_bytes = required;
+        let started = Instant::now();
+        assert!(SharedBudget::from_policy_feedback(policy, started, 64).is_ok());
+        for feedback in [0, usize::from(u16::MAX) + 1, usize::MAX] {
+            assert!(SharedBudget::from_policy_feedback(policy, started, feedback).is_err());
+        }
+        let mut invalid_policies = Vec::new();
+        for bytes in [required - 1, 256 * 1024 * 1024 + 1] {
+            let mut bad = policy;
+            bad.wire_budget.wire_bytes = bytes;
+            invalid_policies.push(bad);
+        }
+        for count in [packets, 65_537] {
+            let mut bad = policy;
+            bad.wire_budget.packets = count;
+            invalid_policies.push(bad);
+        }
+        for interval in [
+            Duration::ZERO,
+            policy.control_timeout / 8 + Duration::from_nanos(1),
+            Duration::from_secs(2),
+        ] {
+            let mut bad = policy;
+            bad.wire_budget.interval = interval;
+            invalid_policies.push(bad);
+        }
+        for payload in [0, usize::from(u16::MAX) + 1] {
+            let mut bad = policy;
+            bad.payload_bytes = payload;
+            invalid_policies.push(bad);
+        }
+        let mut bad = policy;
+        bad.control_overhead = usize::MAX;
+        invalid_policies.push(bad);
+        bad.control_overhead = usize::MAX / packets;
+        invalid_policies.push(bad);
+        bad = policy;
+        bad.data_overhead = usize::MAX;
+        invalid_policies.push(bad);
+        bad.data_overhead = usize::MAX - policy.payload_bytes;
+        invalid_policies.push(bad);
+        for bad in invalid_policies {
+            assert!(SharedBudget::from_policy_feedback(bad, started, 64).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn cauchy_dimensions_and_every_budget_are_authentication_bound() -> TestResult {
     let runtime = runtime(PacketLayer::Ip);
     let config = config(

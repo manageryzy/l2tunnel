@@ -158,6 +158,9 @@ pub struct Status {
     pub send_bytes: usize,
     /// Received stream bytes awaiting caller consumption.
     pub receive_bytes: usize,
+    /// Actual scaled maintained peer receive window; absent before establishment
+    /// or after closed. This is native flow control, never endpoint cwnd.
+    pub peer_receive_window_bytes: Option<usize>,
 }
 
 fn time(value: Millis) -> Result<Instant, Error> {
@@ -541,6 +544,7 @@ impl TcpEngine {
             outgoing_packets: self.queues.outgoing.len(),
             send_bytes: self.endpoint().send_queue(),
             receive_bytes: self.endpoint().recv_queue(),
+            peer_receive_window_bytes: self.endpoint().peer_receive_window(),
         }
     }
     fn endpoint(&self) -> &tcp::Socket<'static> {

@@ -44,7 +44,13 @@ do not automatically complete the broader parent or P-* gates below. New active 
 [raw TLS transition](modules/raw-tls-transition.md). Completed follow-on bundles
 are tracked in [raw packet runtime](modules/raw-runtime.md),
 [QUIC owner cleanup](modules/quic-owner-cleanup.md), and
-[measured proxy native checks](modules/proxy-measured-native.md).
+[measured proxy native checks](modules/proxy-measured-native.md). The next raw
+composition uses [original native packet opening](modules/raw-native-packet.md)
+and the [shared raw client](modules/raw-packet-client.md), with the
+[owned raw packet native harness](modules/raw-packet-native.md) tracking its
+separate execution gates. The [rolling-frame runtime](modules/rolling-runtime.md)
+tracks common MUX, authenticated UDP/QUIC composition and exact shared budgets;
+its finite tests do not close the complete Python-family gates.
 
 ## Tested native vertical slice
 

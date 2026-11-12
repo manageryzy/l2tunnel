@@ -160,10 +160,11 @@ these observations are not a pressure qualification.
 Both peers had qualified ACK/service observations, two-flow demand and candidate
 growth, but no receiver/carrier pressure status samples. Source readback and a
 failing-before/passing-after real-stack regression identify missing observation
-of native unread bytes blocked at exhausted authenticated relay credit. The
-runtime now reports this current local receive-consumption stall even when all
-packet-device writes succeed, and clears it after actual reader progress. This
-is a ring/credit fact, separate from captured TCP window fields. See the
+of native unread bytes blocked at exhausted authenticated relay credit. Checkpoint16
+reported this current local receive-consumption stall even when all packet-device
+writes succeeded, and cleared it after actual reader progress. Its pressure-control
+classification was superseded by the directional follow-up below. The original
+ring/credit observation remains separate from captured TCP window fields. See the
 [diagnosis and focused validation](../../work/measured-pressure16/REPORT.md).
 No pressure rerun or passing native pressure result is implied by this fix.
 
@@ -192,3 +193,24 @@ pressure endpoints.
 - [x] [MOD-PROXY-MEASURED-NATIVE-04] Pass the same actual clean paired-half case, preserving both original authenticated lanes and reverse service. Evidence: [original paired-half receipt](../../work/native-proxy-measured-half15/receipt.json) and [independent audit3](../../work/native-proxy-measured-half15-audit3.json), on the same immutable binary/helpers.
 - [ ] [MOD-PROXY-MEASURED-NATIVE-05] After clean cases pass, independently audit full/half pressure captures, mapped first reopen/new ACK, measured few-flow growth, two-flow demand/completion and all final fences.
 - [ ] [MOD-PROXY-MEASURED-NATIVE-06] Design and qualify separate weighted/many-flow fairness and impaired comparisons against unchanged fixed-credit baselines. Do not infer a speedup or broad native capability from this finite harness.
+
+
+## Immutable16b pressure follow-up
+
+The [independent full/half audit](../../work/native-pressure16b-audit/validation.json)
+preserves both failed immutable16b pressure runs. Actual receiver-pressure flags,
+two-flow demand, qualified ACK/service records and all twelve exact native TCP
+probe results were observed in each run. Growth stayed at initial on both full
+peers and half A; only half B briefly grew. Online rejection occurred before
+drain. All eight unchanged mapped first-reopen/new-ACK window gates pass offline,
+but both WAN captures in each run reached the unchanged 8,192-packet cap, so the
+complete capture gate is independently bound exhausted. Owned child/socket and
+namespace cleanup passed in both cases. No pressure qualification is implied.
+
+The checkpoint16 stall observation above belongs to source-native demand, which
+is already authenticated as Demand and used for sender growth. Reusing that same
+fact as local receiver pressure suppresses probing. The [directional correction](proxy-directional-pressure.md)
+keeps source demand and instead requires pending downstream send bytes plus an
+actual maintained peer zero receive window for receiver pressure. All native
+workloads, timestamps, first-reopen acceptance, original deadlines and capture
+caps remain unchanged for a future separately frozen run.

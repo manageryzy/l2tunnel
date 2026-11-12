@@ -670,3 +670,51 @@ fn optional_timewait_policy_filters_at_each_ingress_step_without_clean_shortcuts
     }
     Ok(())
 }
+
+#[test]
+fn maintained_peer_window_is_absent_before_establishment_and_tracks_real_zero_reopen() -> ResultTest
+{
+    for ipv6 in [false, true] {
+        let (mut a, mut b) = if ipv6 { pair6()? } else { pair()? };
+        assert_eq!(a.status().peer_receive_window_bytes, None);
+        assert_eq!(b.status().peer_receive_window_bytes, None);
+        let mut network = Network::default();
+        let start = connect(&mut a, &mut b, &mut network)?;
+        assert!(a.status().peer_receive_window_bytes.is_some_and(|w| w > 0));
+        let payload = vec![0x39; 8192];
+        let mut written = 0;
+        let mut stopped = None;
+        for now in start..start + 4000 {
+            written += a.write(&payload[written..])?;
+            network.step(&mut a, &mut b, now, false)?;
+            if a.status().peer_receive_window_bytes == Some(0) && a.status().send_bytes > 0 {
+                stopped = Some(now);
+                break;
+            }
+        }
+        let stopped = stopped.ok_or("actual downstream zero receive window")?;
+        let status = a.status();
+        assert_eq!(status, a.status());
+        assert!(status.established);
+        assert_eq!(status.peer_receive_window_bytes, Some(0));
+        assert!(status.send_bytes > 0);
+        let mut received = Vec::new();
+        for now in stopped + 1..stopped + 4000 {
+            written += a.write(&payload[written..])?;
+            drain(&mut b, &mut received)?;
+            network.step(&mut a, &mut b, now, false)?;
+            if received.len() == payload.len()
+                && a.status().send_bytes == 0
+                && a.status().peer_receive_window_bytes.is_some_and(|w| w > 0)
+            {
+                break;
+            }
+        }
+        assert_eq!(received, payload);
+        assert_eq!(written, payload.len());
+        assert!(a.status().peer_receive_window_bytes.is_some_and(|w| w > 0));
+        a.abort();
+        assert_eq!(a.status().peer_receive_window_bytes, None);
+    }
+    Ok(())
+}

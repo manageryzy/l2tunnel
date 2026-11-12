@@ -193,3 +193,19 @@ excluded it from workspace membership, and extended source recording to include
 third_party. Root reported successful local-source checks of raw-tcp and tcp-proxy.
 The next source-stable aggregate must qualify this activated tree; wave8 predates
 it. Pure checked counters and actual I/O ownership transfer remain unimplemented.
+
+
+## Incremental current peer-window observation
+
+A later [directional measured-pressure correction](proxy-directional-pressure.md)
+adds a second, separately pinned [incremental patch](../../third_party/smoltcp-0.14.0-peer-window-observation.patch).
+The original archive, license, quiescent patch, five tests and historical receipt
+above remain unchanged. This increment exposes only current maintained scaled
+peer receive-window bytes, including while stream bytes are retained. It returns
+None in Closed/Listen/SynSent/SynReceived, and does not poll, mutate state, read a
+clock or create transfer authority. Two new native socket tests exercise actual
+scaled ACK updates, pending bytes, zero/reopen, repeated nonmutating observation
+and every startup state. The full same-feature vendor suite passes 435 tests;
+an IPv6-only build passes both new tests. Integrity checks pin the original
+archive/patch and incremental patch/base/result hashes. This observation is not
+cwnd, quiescence, migration or native qualification.

@@ -33,6 +33,8 @@ pub mod proxy;
 pub mod proxy_measured;
 /// Explicit genuine QUIC endpoint/profile configuration, independent of TCP.
 pub mod quic;
+/// Explicit original-owner raw packet runtime; native qualification remains separate.
+pub mod raw_packet;
 /// Explicit authenticated UDP endpoint/profile configuration.
 pub mod udp;
 

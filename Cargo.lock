@@ -386,6 +386,8 @@ dependencies = [
  "l2tunnel-platform-linux",
  "l2tunnel-platform-vxlan",
  "l2tunnel-quic",
+ "l2tunnel-raw-io",
+ "l2tunnel-raw-tcp",
  "l2tunnel-recovery",
  "l2tunnel-reliable",
  "l2tunnel-runtime",

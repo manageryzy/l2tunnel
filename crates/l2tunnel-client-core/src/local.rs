@@ -70,6 +70,9 @@ pub struct Snapshot {
     /// Present only for the explicit standalone native-drain profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openvpn_drain: Option<crate::openvpn::drain::Snapshot>,
+    /// Actual explicit raw packet selection and bounded logical runtime status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_packet: Option<crate::raw_packet::Snapshot>,
 }
 /// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

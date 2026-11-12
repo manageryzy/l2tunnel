@@ -279,6 +279,22 @@ impl Encoder {
         self.job = None;
         Ok(value)
     }
+    /// Confirm complete external ownership of the borrowed pending repair without copying.
+    /// Call only after its entire immutable descriptor/vector has been handed off.
+    pub fn confirm_repair(&mut self, id: RepairId, now: Tick) -> Result<(), Error> {
+        self.time(now)?;
+        let job = self
+            .job
+            .as_ref()
+            .filter(|job| job.ready)
+            .ok_or(Error::Busy)?;
+        if job.id != id {
+            return Err(Error::Identity);
+        }
+        self.next_repair += 1;
+        self.job = None;
+        Ok(())
+    }
     /// Original earliest owned deadline; no timer is renewed by polling.
     pub fn deadline(&self) -> Option<Tick> {
         self.debt

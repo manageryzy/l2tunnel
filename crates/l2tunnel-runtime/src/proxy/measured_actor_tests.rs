@@ -17,12 +17,24 @@ struct Side {
     _controls: mpsc::Receiver<Output>,
 }
 fn side(originator: bool) -> Result<Side> {
+    side_with_initial(originator, None)
+}
+fn side_with_initial(originator: bool, initial: Option<Window>) -> Result<Side> {
     let (mut actor, users, controls) = actor(originator)?;
+    if let Some(initial) = initial {
+        actor.config.relay.initial = initial;
+    }
     actor.config.relay.admission_timeout = Duration::from_secs(3);
     actor.table =
         session::Table::new(actor.config.table(actor.logical, originator, 17), Millis(0))?;
     let mut config = profile::config_tests::config()?;
     config.fixed = actor.config.clone();
+    if let Some(initial) = initial {
+        config.measured.allocation.target.initial = l2tunnel_flow_control::Credit {
+            bytes: initial.bytes,
+            records: initial.records,
+        };
+    }
     actor.measured = Some(profile::State::new(config, &actor.table)?);
     let (progress, receiver) = watch::channel(Progress {
         ready: true,
@@ -56,9 +68,18 @@ struct Lab {
 }
 impl Lab {
     async fn active() -> Result<Self> {
-        let a = side(true)?;
-        let b = side(false)?;
+        Self::active_with_receive_bytes(None, None).await
+    }
+    async fn active_with_receive_bytes(
+        receive_bytes: Option<usize>,
+        initial: Option<Window>,
+    ) -> Result<Self> {
+        let a = side_with_initial(true, initial)?;
+        let b = side_with_initial(false, initial)?;
         let mut config = a.actor.config.table(a.actor.logical, true, 31).native;
+        if let Some(bytes) = receive_bytes {
+            config.receive_bytes = bytes;
+        }
         config.local = ([10, 112, 0, 1], 32001).into();
         config.peer = ([10, 112, 0, 2], 443).into();
         let first = Native(l2tunnel_raw_tcp::TcpEngine::new_ip(
@@ -665,7 +686,8 @@ async fn measured_actual_writer_partial_body_and_pending_flush_retain_token_in_b
 }
 
 #[tokio::test(start_paused = true)]
-async fn measured_native_credit_stall_is_visible_without_device_backpressure() -> Result {
+async fn measured_native_credit_demand_and_downstream_zero_window_pressure_are_distinct() -> Result
+{
     let mut lab = Lab::active().await?;
     lab.a.actor.measured_service()?;
     assert!(
@@ -687,6 +709,8 @@ async fn measured_native_credit_stall_is_visible_without_device_backpressure() -
             written += lab.hosts[0].0.write(&bytes)?;
         }
         lab.step().await?;
+        lab.a.actor.measured_service()?;
+        lab.b.actor.measured_service()?;
     }
     let relay = lab.a.actor.table.relay_status(1).ok_or("relay")?;
     assert_eq!(
@@ -703,9 +727,10 @@ async fn measured_native_credit_stall_is_visible_without_device_backpressure() -
         assert!(!state.receiver_pressure);
         assert!(!state.wire_pressure);
     }
-    lab.a.actor.measured_service()?;
+    // A's receive ring is source demand for A->B, while B's send ring is
+    // blocked by the actual B application peer's advertised zero receive window.
     assert!(
-        lab.a
+        !lab.a
             .actor
             .measured
             .as_ref()
@@ -714,6 +739,24 @@ async fn measured_native_credit_stall_is_visible_without_device_backpressure() -
             .pressure
             .receiver_pressure
     );
+    let downstream = lab
+        .b
+        .actor
+        .table
+        .relay_status(1)
+        .ok_or("downstream relay")?;
+    assert_eq!(downstream.native.peer_receive_window_bytes, Some(0));
+    assert!(downstream.native.send_bytes > 0);
+    let downstream = lab
+        .b
+        .actor
+        .measured
+        .as_ref()
+        .ok_or("Controller")?
+        .snapshot(&lab.b.actor.table, lab.b.actor.micros()?)?;
+    assert!(downstream.pressure.receiver_pressure);
+    assert!(downstream.observations.grant_exhausted);
+
     let mut received = Vec::new();
     for _ in 0..600 {
         let mut buffer = [0; 4096];
@@ -721,6 +764,8 @@ async fn measured_native_credit_stall_is_visible_without_device_backpressure() -
             received.extend_from_slice(&buffer[..count]);
         }
         lab.step().await?;
+        lab.a.actor.measured_service()?;
+        lab.b.actor.measured_service()?;
     }
     assert_eq!(received, vec![0x9d; written]);
     assert_eq!(
@@ -741,6 +786,144 @@ async fn measured_native_credit_stall_is_visible_without_device_backpressure() -
             .as_ref()
             .ok_or("Controller")?
             .snapshot(&lab.a.actor.table, lab.a.actor.micros()?)?
+            .pressure
+            .receiver_pressure
+    );
+    let downstream = lab
+        .b
+        .actor
+        .table
+        .relay_status(1)
+        .ok_or("downstream relay")?;
+    assert_eq!(downstream.native.send_bytes, 0);
+    assert!(
+        downstream
+            .native
+            .peer_receive_window_bytes
+            .is_some_and(|w| w > 0)
+    );
+    assert!(
+        !lab.b
+            .actor
+            .measured
+            .as_ref()
+            .ok_or("Controller")?
+            .snapshot(&lab.b.actor.table, lab.b.actor.micros()?)?
+            .pressure
+            .receiver_pressure
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn measured_continuous_native_readers_keep_source_grant_stall_as_growth_demand() -> Result {
+    // Real native receivers have ample externally owned capacity and consume
+    // every byte. Source demand may still exhaust a deliberately finite relay
+    // grant; that fact must not masquerade as downstream receiver pressure.
+    let mut lab = Lab::active_with_receive_bytes(
+        Some(1_048_576),
+        Some(Window {
+            bytes: 2048,
+            records: 1,
+        }),
+    )
+    .await?;
+    let maximum = 524288;
+    let (mut written, mut received) = ([0usize; 2], [Vec::new(), Vec::new()]);
+    let mut source_stalls = [false; 2];
+    let mut grew = [false; 2];
+    for _ in 0..4000 {
+        for (index, host) in lab.hosts.iter_mut().enumerate() {
+            if written[index] < maximum {
+                written[index] += host
+                    .0
+                    .write(&vec![index as u8 + 1; (maximum - written[index]).min(8192)])?;
+            }
+            let mut buffer = [0; 8192];
+            while let l2tunnel_raw_tcp::ReadOutcome::Data(count) = host.0.read(&mut buffer)? {
+                received[index].extend_from_slice(&buffer[..count]);
+            }
+        }
+        lab.step().await?;
+        for (index, side) in [&mut lab.a, &mut lab.b].into_iter().enumerate() {
+            side.actor.measured_service()?;
+            let relay = side.actor.table.relay_status(1).ok_or("actual relay")?;
+            let stall = relay.native.receive_bytes != 0
+                && (relay.produced.bytes == relay.peer_granted.bytes
+                    || relay.produced.records == relay.peer_granted.records);
+            let state = side.actor.measured.as_ref().ok_or("Controller")?;
+            let snapshot = state.snapshot(&side.actor.table, side.actor.micros()?)?;
+            assert!(
+                relay
+                    .native
+                    .peer_receive_window_bytes
+                    .is_some_and(|w| w > 0)
+            );
+            if stall {
+                source_stalls[index] = true;
+                assert!(
+                    !snapshot.pressure.receiver_pressure,
+                    "ordinary source grant exhaustion must remain sender demand"
+                );
+            }
+            grew[index] |= snapshot.applied.is_some_and(|a| {
+                a.candidate.bytes > state.config.measured.allocation.target.initial.bytes
+            });
+        }
+        if written == [maximum; 2] && received.iter().all(|v| v.len() == maximum) {
+            break;
+        }
+    }
+    assert_eq!(written, [maximum; 2]);
+    assert_eq!(received[0], vec![2; maximum]);
+    assert_eq!(received[1], vec![1; maximum]);
+    assert_eq!(source_stalls, [true; 2]);
+    assert_eq!(grew, [true; 2]);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn measured_idle_native_zero_window_without_pending_send_is_not_receiver_pressure() -> Result
+{
+    let mut lab = Lab::active().await?;
+    let capacity = lab.b.actor.config.native.receive_bytes;
+    let mut written = 0;
+    for _ in 0..1000 {
+        if written < capacity {
+            written += lab.hosts[0].0.write(&vec![0x71; capacity - written])?;
+        }
+        lab.step().await?;
+        let downstream = lab
+            .b
+            .actor
+            .table
+            .relay_status(1)
+            .ok_or("downstream relay")?;
+        if written == capacity
+            && lab.hosts[1].0.status().receive_bytes == capacity
+            && downstream.native.send_bytes == 0
+            && downstream.native.peer_receive_window_bytes == Some(0)
+        {
+            break;
+        }
+    }
+    assert_eq!(written, capacity);
+    let downstream = lab
+        .b
+        .actor
+        .table
+        .relay_status(1)
+        .ok_or("downstream relay")?;
+    assert_eq!(downstream.native.peer_receive_window_bytes, Some(0));
+    assert_eq!(downstream.native.send_bytes, 0);
+    lab.b.actor.measured_service()?;
+    assert!(
+        !lab.b
+            .actor
+            .measured
+            .as_ref()
+            .ok_or("Controller")?
+            .snapshot(&lab.b.actor.table, lab.b.actor.micros()?)?
             .pressure
             .receiver_pressure
     );

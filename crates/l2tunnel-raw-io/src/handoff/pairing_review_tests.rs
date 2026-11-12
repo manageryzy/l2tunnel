@@ -1,7 +1,14 @@
 //! Independent owner-boundary regressions using the original TLS and raw drivers.
 use super::test_support::*;
 use super::*;
-use std::{future::poll_fn, sync::atomic::Ordering, task::Waker};
+use std::{
+    future::poll_fn,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Waker,
+};
 
 fn poll_setup(
     setup: &mut PairSetup<'_, PacketLink>,
@@ -275,8 +282,24 @@ async fn one_received_accepted_lane_never_becomes_paired_before_original_expiry(
     assert_eq!(b.phase, 3);
     assert_eq!(a.phase, 3);
     assert_eq!(b.staged, [false; 2]);
+    // Keep the exact original reverse driver unpolled while the server's local
+    // TLS Accepted flush and the other lane complete. A stream flush does not
+    // establish that this later raw send/WouldBlock boundary has been reached.
+    let reverse_service = Arc::new(AtomicBool::new(false));
+    let service = reverse_service.clone();
+    let mut original_driver = b.group.as_mut().ok_or("group")?.drivers[1]
+        .take()
+        .ok_or("original reverse driver")?;
+    b.group.as_mut().ok_or("group")?.drivers[1] = Some(Box::pin(poll_fn(move |cx| {
+        if service.load(Ordering::SeqCst) {
+            original_driver.as_mut().poll(cx)
+        } else {
+            Poll::Pending
+        }
+    })));
     probes[3].blocked.store(true, Ordering::SeqCst);
     let mut ready = None;
+    let mut observed_local_only = false;
     for _ in 0..2000 {
         pending_setup(&mut a)?;
         if let Some(owner) = ready.as_mut() {
@@ -285,10 +308,21 @@ async fn one_received_accepted_lane_never_becomes_paired_before_original_expiry(
             ready = Some(result?);
         }
         if a.finished == [true, false] && ready.is_some() {
-            break;
+            if !observed_local_only {
+                assert!(probes[3].pending.lock().map_err(|_| "lock")?.is_none());
+                observed_local_only = true;
+                reverse_service.store(true, Ordering::SeqCst);
+            }
+            // Local TLS completion cannot stand in for the later raw packet
+            // boundary. Keep the same ready owner alive until that exact send
+            // has actually encountered WouldBlock, under the original bounds.
+            if probes[3].pending.lock().map_err(|_| "lock")?.is_some() {
+                break;
+            }
         }
         tick().await;
     }
+    assert!(observed_local_only);
     let ready = ready.ok_or("server did not finish local TLS flush")?;
     assert!(ready.status().paired);
     assert_eq!(a.finished, [true, false]);

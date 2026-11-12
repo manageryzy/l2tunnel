@@ -9,6 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+l2tunnel-raw-io = { path = "../l2tunnel-raw-io" }
+l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
 l2tunnel-flow-control = { path = "../l2tunnel-flow-control" }
 l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
 zeroize = "=1.9.0"

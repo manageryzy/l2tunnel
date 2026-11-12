@@ -936,6 +936,26 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Current scaled receive window advertised by the maintained peer.
+    ///
+    /// Returns None before establishment or after the socket is closed. This is
+    /// peer flow-control state, not congestion window, queue capacity, delivery,
+    /// or application consumption. Unlike quiescent_snapshot, pending stream
+    /// bytes and timers do not prevent this read-only observation. Reading it
+    /// neither polls the socket nor advances time or any protocol state.
+    pub fn peer_receive_window(&self) -> Option<usize> {
+        match self.state {
+            State::Established
+            | State::FinWait1
+            | State::FinWait2
+            | State::CloseWait
+            | State::Closing
+            | State::LastAck
+            | State::TimeWait => Some(self.remote_win_len),
+            State::Closed | State::Listen | State::SynSent | State::SynReceived => None,
+        }
+    }
+
     /// Observe an established socket only when its stream and immediate work are drained.
     ///
     /// Returns None for pending bytes, assembly, acknowledgment/window work,
@@ -3386,6 +3406,97 @@ mod test {
             }]
         );
         s
+    }
+
+    #[test]
+    fn test_peer_receive_window_tracks_scaled_updates_with_pending_stream_bytes() {
+        for scale in [None, Some(7)] {
+            let mut s = socket_with_buffer_sizes(64, 131_072);
+            assert_eq!(s.peer_receive_window(), None);
+            s.listen(LOCAL_END).unwrap();
+            assert_eq!(s.peer_receive_window(), None);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: None,
+                    window_scale: scale,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.peer_receive_window(), None);
+            let mut initial = None;
+            recv(&mut s, Instant::ZERO, |result| {
+                initial = Some(result.unwrap().seq_number);
+            });
+            let local = initial.unwrap() + 1;
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(local),
+                    window_len: 42,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.peer_receive_window(), Some(42 << scale.unwrap_or(0)));
+            assert_eq!(s.send_slice(b"retained"), Ok(8));
+            assert!(s.quiescent_snapshot(Instant::ZERO).is_none());
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(local),
+                    window_len: 0,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.peer_receive_window(), Some(0));
+            assert_eq!(s.send_queue(), 8);
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(local),
+                    window_len: 43,
+                    ..SEND_TEMPL
+                }
+            );
+            let before = (s.state(), s.send_queue(), s.recv_queue());
+            assert_eq!(s.peer_receive_window(), Some(43 << scale.unwrap_or(0)));
+            assert_eq!(s.peer_receive_window(), Some(43 << scale.unwrap_or(0)));
+            assert_eq!((s.state(), s.send_queue(), s.recv_queue()), before);
+            s.abort();
+            assert_eq!(s.peer_receive_window(), None);
+        }
+    }
+
+    #[test]
+    fn test_peer_receive_window_is_absent_in_every_unestablished_state() {
+        let mut s = socket();
+        for state in [
+            State::Closed,
+            State::Listen,
+            State::SynSent,
+            State::SynReceived,
+        ] {
+            s.state = state;
+            s.remote_win_len = 1234;
+            assert_eq!(s.peer_receive_window(), None);
+        }
+        for state in [
+            State::Established,
+            State::FinWait1,
+            State::FinWait2,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+            State::TimeWait,
+        ] {
+            s.state = state;
+            assert_eq!(s.peer_receive_window(), Some(1234));
+        }
     }
 
     #[test]

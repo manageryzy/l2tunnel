@@ -17,6 +17,8 @@ pub mod proxy;
 pub mod quic;
 /// Explicit original-owner raw packet phase with common MUX and maintained recovery.
 pub mod raw_packet;
+/// Explicit rolling-frame recovery over retained authenticated UDP/QUIC owners.
+pub mod rolling;
 /// Fixed-mode authenticated UDP with selective repeat and native packet framing.
 pub mod udp;
 #[cfg(test)]

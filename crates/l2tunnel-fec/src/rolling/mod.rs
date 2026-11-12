@@ -1,11 +1,13 @@
 //! Bounded fixed-window equations over real bytes, separate from sealed block FEC.
 //!
 //! Authenticate and replay-check enclosing records before admission. This module
-//! has no wire transport, clock, retransmission scheduler or native-delivery proof.
+//! has no wire transport, clock or native-delivery proof. The additive pure
+//! scheduler owns causal repair/feedback timing at explicit caller handoffs.
 use std::fmt;
 
 mod decoder;
 mod encoder;
+pub mod scheduler;
 pub mod wire;
 pub use decoder::{Begin, DecodeStep, Decoder, DecoderStatus};
 pub use encoder::{Encoder, EncoderStatus};
