@@ -2,7 +2,7 @@
 
 Status: the new base profile requires authenticated native-byte delivery policy,
 with focused real TCP/TLS/UDP loopback tests using independent memory packet
-devices. Its stable combined aggregate and native qualification remain pending.
+devices. The [source28 aggregate](../../work/implementation-wave28/validation.json) passed; new-profile native qualification remains pending.
 The historical native receipts below cover the earlier fixed-count profile, not
 the newly authenticated delivery profile. See [current delivery contract](packet-delivery.md).
 The design was written before implementation. This adapter composes existing authenticated
@@ -211,4 +211,4 @@ separate evidence for the complete concurrent implementation wave.
 
 ## Mandatory byte-delivery profile migration
 
-- [ ] [MOD-UDP-RUNTIME-07] Qualify the new mandatory delivery-policy profile in a stable aggregate and separately bound native runs. Focused [shared delivery tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) do not replace the historical native gates or establish80Mbit/s. See [packet-delivery contract](packet-delivery.md) and [FIX-01](../implementation-checklist.md).
+- [ ] [MOD-UDP-RUNTIME-07] Qualify the new mandatory delivery-policy profile in separately bound native runs; its [source28 aggregate](../../work/implementation-wave28/validation.json) passed. Focused [shared delivery tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) do not replace the historical native gates or establish80Mbit/s. See [packet-delivery contract](packet-delivery.md) and [FIX-01](../implementation-checklist.md).

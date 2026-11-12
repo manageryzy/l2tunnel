@@ -1,13 +1,13 @@
 # Shared native packet delivery ownership
 
-Status: base UDP/genuine-QUIC integration has focused passing tests. Stable
-combined aggregate, new native profile qualification, recovery-window expansion
-and 80 Mbit/s acceptance remain open. Raw uses the shared helper through its own
+Status: base UDP/genuine-QUIC integration passed focused tests and the
+[source28 aggregate](../../work/implementation-wave28/validation.json). New native
+profile qualification, recovery-window expansion and 80 Mbit/s acceptance remain open. Raw uses the shared helper through its own
 original-owner completion adapter; that integration has separate evidence.
 
 - [x] [MOD-PACKET-DELIVERY-01] Track exact original bytes and all original fragment send completions using sender-owned identities and the existing pure controller, with bounded metadata and original deadlines. Evidence: [shared helper](../../crates/l2tunnel-runtime/src/packet_delivery.rs), [nine focused ownership tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [scoped work](../../work/base-delivery28/).
 - [x] [MOD-PACKET-DELIVERY-02] Locally test native flight larger than 64 packets with queue two over actual authenticated UDP and genuine QUIC, both duplex modes, TAP/TUN contracts, None/LZ4 and ARQ/Cauchy. Evidence: [single actual-carrier contract instantiated twice](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), [UDP fixture](../../crates/l2tunnel-runtime/src/udp_tests.rs), [QUIC fixture](../../crates/l2tunnel-runtime/src/quic_tests.rs), [scoped results](../../work/base-delivery28/scoped-results.json).
-- [ ] [MOD-PACKET-DELIVERY-03] Complete the coordinated stable aggregate and separately qualified native/capacity gates before closing the base portion of [FIX-01](../implementation-checklist.md). Native debt larger than 64 does not imply recovery debt larger than 64 or80Mbit/s.
+- [ ] [MOD-PACKET-DELIVERY-03] Complete the separately qualified native/capacity gates after the passing [source28 aggregate](../../work/implementation-wave28/validation.json) before closing the base portion of [FIX-01](../implementation-checklist.md). Native debt larger than 64 does not imply recovery debt larger than 64 or80Mbit/s.
 
 ## Distinct domains and authentication
 

@@ -11,6 +11,12 @@ raw TCP/TLS profile and defaults are unchanged. Evidence is recorded in
 [startup transition checkpoint](../../work/raw-transition-checkpoint15/REPORT.md)
 remains historical evidence for its own exact source.
 
+The v2 native-delivery integration and coherent terminal snapshots passed the
+[source28 aggregate](../../work/implementation-wave28/validation.json). The
+[current scoped receipt](../../work/raw-delivery28/RECEIPT.md) covers exact local
+queue/flight accounting and original deadlines; new-profile native qualification
+and the independent recovery-capacity limit remain open.
+
 ## Explicit shared runtime API
 
 `l2tunnel_runtime::raw_packet` exports validated `Config`, from-birth

@@ -1,7 +1,7 @@
 # Native packets over genuine standalone QUIC
 
 Status: the new mandatory native-byte delivery profile passes focused memory-device
-carrier tests; its combined aggregate and native qualification remain pending.
+carrier tests and the [source28 aggregate](../../work/implementation-wave28/validation.json); new-profile native qualification remains pending.
 The 36 native Linux TAP/TUN/VXLAN scenarios below are historical receipts for the
 earlier fixed-count profile. See [current delivery contract](packet-delivery.md). This runtime
 uses genuine UDP-only QUIC authentication, a retained reliable control stream and
@@ -110,7 +110,7 @@ domains; it cannot be selected by changing custom UDP header appearance.
 
 ## Mandatory byte-delivery profile migration
 
-- [ ] [MOD-QUIC-RUNTIME-08] Qualify the new mandatory delivery-policy profile through a stable aggregate and separately scoped native runs. Focused [shared ownership tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [same actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) cover local integration only; the historical 36-case audit does not qualify the changed profile. The existing64-source recovery bank and QUIC congestion/queue limits remain independent and do not establish80Mbit/s or close [FIX-01](../implementation-checklist.md).
+- [ ] [MOD-QUIC-RUNTIME-08] Qualify the new mandatory delivery-policy profile through separately scoped native runs; its [source28 aggregate](../../work/implementation-wave28/validation.json) passed. Focused [shared ownership tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [same actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) cover local integration only; the historical 36-case audit does not qualify the changed profile. The existing64-source recovery bank and QUIC congestion/queue limits remain independent and do not establish80Mbit/s or close [FIX-01](../implementation-checklist.md).
 
 Successful `DatagramSender::send` is the maintained QUIC
 `send_datagram_wait` handoff, not captured UDP kernel transmission. The native

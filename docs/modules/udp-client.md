@@ -1,7 +1,7 @@
 # Explicit UDP client selection
 
 Status: the explicit base-frame delivery migration passed 144 local client tests, strict
-Clippy, rustdoc and formatting. Aggregate and new-profile native qualification are pending. Earlier Linux native receipts below qualify their
+Clippy, rustdoc and formatting, plus the [source28 aggregate](../../work/implementation-wave28/validation.json). New-profile native qualification remains pending. Earlier Linux native receipts below qualify their
 recorded transport profiles, not the new delivery-bound base identity. Both custom
 covers and protection suites retain the shared carrier/client implementation.
 
@@ -33,8 +33,8 @@ operation ended, not clean close. TCP retains `runtime_profile` schema3. Other
 record/traffic profiles reject enabled profiling. No configured target is an
 endpoint TCP cwnd/rwnd or measured throughput result.
 
-- [ ] [MOD-UCLIENT-09] Qualify mandatory base-frame delivery policy and shared CLI selection before I/O, original UDP setup/idle-accept deadlines, real full/half authentication and mismatch rejection; preserve derived bindings and record exact scoped/aggregate evidence.
-- [ ] [MOD-UCLIENT-10] Qualify bounded opt-in base UDP/QUIC datagram observations with typed independent local/recovery/native fields and unchanged managed profiling; require formatter, flag-boundary and actor evidence without a native throughput claim.
+- [x] [MOD-UCLIENT-09] Qualify mandatory base-frame delivery policy and shared CLI selection before I/O, original UDP setup/idle-accept deadlines, real full/half authentication and mismatch rejection; preserve derived bindings and record exact scoped/aggregate evidence. Evidence: [scoped client checks](../../work/base-delivery28/client-validation.json), [source28 aggregate](../../work/implementation-wave28/validation.json).
+- [x] [MOD-UCLIENT-10] Qualify bounded opt-in base UDP/QUIC datagram observations with typed independent local/recovery/native fields and unchanged managed profiling; require formatter, flag-boundary and actor evidence without a native throughput claim. Evidence: [scoped client checks](../../work/base-delivery28/client-validation.json), [source28 aggregate](../../work/implementation-wave28/validation.json).
 
 Scoped evidence: [client receipt](../../work/base-delivery28/client-validation.json),
 [144-case result](../../work/base-delivery28/client-all-final.log),

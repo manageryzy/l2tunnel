@@ -1,7 +1,7 @@
 # Explicit genuine QUIC client composition
 
 Status: the explicit base-frame delivery migration passed 144 local client tests, strict
-Clippy, rustdoc and formatting. Aggregate and new-profile native qualification are pending. The historical 36-case finite Linux native matrix
+Clippy, rustdoc and formatting, plus the [source28 aggregate](../../work/implementation-wave28/validation.json). New-profile native qualification remains pending. The historical 36-case finite Linux native matrix
 below qualifies its recorded earlier identity. Genuine QUIC remains UDP-only;
 custom `--carrier udp --udp-cover quic-like` is a separate selection.
 
@@ -16,7 +16,7 @@ InvalidInput before endpoint I/O; derived record owners continue using their own
 private authenticated lane path. No accept-time override or capability flag can
 replace a bound base policy.
 
-- [ ] [MOD-QCLIENT-06] Qualify mandatory QUIC base policy binding, private-derived/public-base rejection before I/O, original full/half setup deadline with actual first-auth/second-Initial witnesses, and exact existing derived identities. Record scoped and aggregate evidence separately from historical native receipts.
+- [x] [MOD-QCLIENT-06] Qualify mandatory QUIC base policy binding, private-derived/public-base rejection before I/O, original full/half setup deadline with actual first-auth/second-Initial witnesses, and exact existing derived identities. Record scoped and aggregate evidence separately from historical native receipts. Evidence: [scoped client checks](../../work/base-delivery28/client-validation.json), [source28 aggregate](../../work/implementation-wave28/validation.json).
 
 Local evidence is recorded in the [client receipt](../../work/base-delivery28/client-validation.json)
 and the [shared scoped evidence](udp-client.md#mandatory-base-frame-delivery-policy).

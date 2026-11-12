@@ -8,21 +8,30 @@ percentage. All 47 complete Python mode gates remain open.
 
 ## Current verification
 
-The [source27e aggregate check](../work/implementation-wave27e/validation.json)
-passed on code commit `ff20bc2`: 1206 Rust test executions, 218 Python tool
-executions and 1658 simulator cases, without skips. All recorded source inputs
-stayed unchanged. Formatting, strict Clippy and rustdoc passed. This local check
-includes real loopback carriers and injected devices; privileged native tests,
-remote CI and Windows/Android device qualification remain separate.
+The [source28 aggregate check](../work/implementation-wave28/validation.json)
+passed on code commit `00cfa2a`: 1231 Rust test executions, 222 Python tool
+executions and 1658 simulator cases. All recorded source inputs stayed unchanged;
+formatting, strict Clippy and rustdoc passed. Two existing Rust descriptor tests
+remain ignored because they require explicit owned namespaces. The simulator
+suite had no skips. This local check includes real loopback carriers and injected
+devices; privileged native tests, remote CI and Windows/Android qualification
+remain separate.
 
-The earlier [source27d failure](../work/implementation-wave27d/validation.json)
-and [causal close-test correction](../work/openvpn-close28/RECEIPT.md) remain
-preserved. The positive test now witnesses impaired user transfer and complete
-pre-close recovery/held-output drain before requiring clean shutdown. The
-negative test requires `IncompleteClose` under continuing final-ACK loss at the
-original five-second bound. Production close deadlines and quiet requirements
-are unchanged. The earlier simulator dependency failure and exact cleanup repair
-are recorded below; this aggregate uses the repaired, verified dependency.
+The [base UDP/QUIC receipt](../work/base-delivery28/validation.json),
+[client receipt and negative proofs](../work/base-delivery28/client-validation.json),
+[raw receipt](../work/raw-delivery28/RECEIPT.md) and
+[harness receipt](../work/base-delivery28/root-harness-receipt.json) bind the
+scoped changes. Raw terminal snapshots retain the last complete accounting turn
+and original fault, rather than combining partially updated counters. The actual
+QUIC bind-classifier regression and original 200 ms setup deadline both reject
+their old behavior; the original rolling early-return cause remains unconfirmed.
+
+The [previous source27e check](../work/implementation-wave27e/validation.json)
+and [causal OpenVPN close correction](../work/openvpn-close28/RECEIPT.md) remain
+historical receipts. The positive close case drains actual impaired user/control
+work before requiring clean shutdown; continuing final-ACK loss must still return
+`IncompleteClose` at the original five-second bound. Production close bounds are
+unchanged. Earlier dependency failure and exact cleanup repair are recorded below.
 
 ## Latest native measurements
 
@@ -55,7 +64,7 @@ measurement; two TLS writes alone have not been proved the throughput cause.
 | --- | --- | --- |
 | Verified handshake, member identity, full/paired-half ownership | Real retained TLS and authenticated UDP/QUIC/raw slices | Broader carrier/path security, cover and resource gates remain in CONN-* |
 | TAP/TUN and fixed-peer VXLAN | Finite native Linux connectivity/data-integrity matrices | Broad VTEP/MTU/offload/platform behavior and performance remain open |
-| Local queue versus link flight budget | TCP/TLS frame BDP; focused rolling/aligned/packed and base UDP/QUIC/raw byte-credit integration | New base/raw aggregate and native qualification remain open; recovery still has an independent 64-source ceiling, so FIX-01 remains open |
+| Local queue versus link flight budget | TCP/TLS frame BDP; focused rolling/aligned/packed and base UDP/QUIC/raw byte-credit integration | Source28 aggregate passed; new-profile native qualification remains open. Recovery still has an independent 64-source ceiling, so FIX-01 remains open |
 | Python high-performance composition | Codec/recovery libraries and separate aligned/packed/rolling clients exist | No qualified matching native composition; FIX-02 through FIX-04 |
 | TUN flow control and QoS | Transparent active-credit path and fixed TCP-proxy slices | Adaptive native-window growth and complete fairness/pressure gates still fail or remain unrun |
 | Hot mode switching | Authenticated compression changes and finite active-TUN switches | Full codec/recovery/MUX switching matrix and control-under-load correctness remain open |
@@ -85,8 +94,8 @@ FIX-10 through FIX-12. The current [base UDP/QUIC](modules/packet-delivery.md)
 and [raw](modules/raw-runtime.md) changes replace local-queue admission limits
 with authenticated original-byte/record budgets. Their actual-carrier tests use
 a local queue of two and larger native flight; original send completion, receiver
-pressure and deadlines remain explicit. They are newer than source27e and await
-the coordinated aggregate. The independently bounded recovery source window and
+pressure and deadlines remain explicit. They passed the source28
+aggregate. The independently bounded recovery source window and
 new native performance qualification remain part of FIX-01.
 
 The [audit inventory](../work/deep-audit26/checked-index.json) is navigation for

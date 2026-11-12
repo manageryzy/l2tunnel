@@ -2,9 +2,9 @@
 
 Status: implemented with real original-owner TCP/TLS transition and native runtime
 integration over finite mock PacketIo. Independent final source review accepted.
-Existing retained raw/TCP defaults remain unchanged. Native packet qualification
-and root stable aggregate are separate gates; see the
-[scoped receipt](../../work/raw-packet-client/validation.json).
+Existing retained raw/TCP defaults remain unchanged. The v2 delivery profile passed the
+[source28 aggregate](../../work/implementation-wave28/validation.json); new-profile
+native packet qualification remains open. See the [current scoped receipt](../../work/raw-delivery28/RECEIPT.md).
 
 The shared API accepts a strict JSON policy of at most 65,536 bytes. Version 2
 profile `raw-packet-runtime-v2` specifies explicit IPv4 forward/reverse tuples,
