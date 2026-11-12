@@ -15,6 +15,12 @@ finished, or describe a checkpoint commit as a fully qualified release.
 
 ## Rust conventions
 
+The pinned toolchain includes `rust-analyzer` and `rust-src` so VS Code can use
+the matching language server instead of an incompatible extension-bundled server.
+After opening the repository, run `rustup show` to install declared components
+and restart the rust-analyzer server if the editor was already running. Check
+`rustup which rust-analyzer` from this directory when diagnosing server selection.
+
 - Rust 2024, pinned toolchain in `rust-toolchain.toml`; public errors are explicit.
 - `cargo fmt` is authoritative. Clippy warnings are errors in checks/CI. Public
   items require docs. Runtime code may not use unwrap, expect, panic or unsafe.
