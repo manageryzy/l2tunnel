@@ -11,8 +11,10 @@ use std::fmt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
+mod delivery;
 /// Optional bounded observations of the original retained TCP/TLS path.
 pub mod profiling;
+pub use delivery::{DeliveryConfig, mode_config_with_delivery, session_config_with_delivery};
 use profiling::{Counter as PC, HighWater as PH, Stage as PS};
 pub use profiling::{
     ProfileHandle, ProfileSink, ProfileSnapshot, ProfileTiming, channel as profiling_channel,
@@ -236,6 +238,7 @@ fn tick(start: Instant) -> io::Result<Tick> {
 }
 
 struct Record {
+    received_at: Option<Instant>,
     header: Header,
     payload: Vec<u8>,
 }
@@ -338,6 +341,7 @@ async fn read_records<R: AsyncRead + Unpin>(
     maximum: usize,
     sender: mpsc::Sender<Incoming>,
     profile: Option<ProfileSink>,
+    delivery: bool,
 ) -> io::Result<()> {
     let mut expected = 0;
     loop {
@@ -380,9 +384,11 @@ async fn read_records<R: AsyncRead + Unpin>(
             return Err(invalid("unsupported managed record kind or length"));
         }
         expected = increment(expected)?;
+        let received_at = delivery.then(Instant::now);
         let send_span = profile.as_ref().map(|p| p.span(PS::IncomingQueue));
         sender
             .send(Incoming::Record(Record {
+                received_at,
                 header,
                 payload: payload.to_vec(),
             }))
@@ -451,6 +457,7 @@ struct WriterProgress {
     control: watch::Sender<u64>,
     credit: watch::Sender<u64>,
     data: watch::Sender<u64>,
+    delivery: Option<mpsc::Sender<delivery::FlushEvent>>,
 }
 async fn write_records<W: AsyncWrite + Unpin>(
     mut writer: W,
@@ -526,6 +533,17 @@ async fn write_records<W: AsyncWrite + Unpin>(
                     profile.as_ref(),
                 )
                 .await?;
+                // Timestamp every original successful full flush before any later I/O.
+                if let Some(events) = &progress.delivery {
+                    events
+                        .try_send(delivery::FlushEvent {
+                            ordinal: packet.admitted,
+                            at: Instant::now(),
+                        })
+                        .map_err(|_| {
+                            invalid("bounded delivery flush event queue exhausted or closed")
+                        })?;
+                }
                 progress.data.send_replace(packet.admitted);
             }
         }
@@ -546,6 +564,7 @@ struct Driver {
     pending: Option<oneshot::Sender<Result<SwitchOutcome, ControlError>>>,
     control_out: ControlSender,
     native_pending: VecDeque<Vec<u8>>,
+    delivery: Option<delivery::Window>,
     rate_start: Tick,
     controls_received: usize,
 }
@@ -639,8 +658,9 @@ impl Driver {
                     return Err(invalid("compressed data in an uncompressed epoch"));
                 }
                 if record.header.epoch != self.peer.active_epoch()
-                    || self.received.saturating_sub(self.delivered)
-                        >= self.runtime.queue_packets as u64
+                    || (self.delivery.is_none()
+                        && self.received.saturating_sub(self.delivered)
+                            >= self.runtime.queue_packets as u64)
                 {
                     return Err(invalid("data epoch or delivery-credit window violation"));
                 }
@@ -664,6 +684,9 @@ impl Driver {
                 if !packet_valid(self.runtime.layer, &packet) {
                     return Err(invalid("invalid managed native packet"));
                 }
+                if let Some(window) = &mut self.delivery {
+                    window.receive(packet.len(), self.native_pending.len())?;
+                }
                 self.received = increment(self.received)?;
                 self.native_pending.push_back(packet);
                 if let Some(p) = profile {
@@ -680,6 +703,14 @@ impl Driver {
                 );
                 if delivered < self.peer_delivered || delivered > self.admitted {
                     return Err(invalid("invalid cumulative native delivery credit"));
+                }
+                if let Some(window) = &mut self.delivery {
+                    window.feedback(
+                        delivered,
+                        record
+                            .received_at
+                            .ok_or_else(|| invalid("missing original feedback timestamp"))?,
+                    )?;
                 }
                 self.peer_delivered = delivered;
             }
@@ -729,6 +760,7 @@ struct DriverIo {
     flushed: watch::Receiver<u64>,
     credit_flushed: watch::Receiver<u64>,
     local: ControlReceiver,
+    delivery_flushes: Option<mpsc::Receiver<delivery::FlushEvent>>,
 }
 
 struct StatusLifetime(watch::Sender<Option<Status>>);
@@ -765,6 +797,7 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
             Incoming(Incoming),
             Local(Option<Request>),
             DataFlush,
+            DeliveryFlush(delivery::FlushEvent),
             FeedbackFlush,
             Timer,
         }
@@ -773,9 +806,29 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
             request = ports.local.requests.recv(), if local_open && eof.is_none() => Wake::Local(request),
             changed = ports.flushed.changed() => { changed.map_err(|_| invalid("managed writer stopped"))?; Wake::DataFlush },
             changed = ports.credit_flushed.changed() => { changed.map_err(|_| invalid("managed feedback writer stopped"))?; Wake::FeedbackFlush },
+            event = async { match &mut ports.delivery_flushes { Some(events) => events.recv().await, None => std::future::pending().await } } => Wake::DeliveryFlush(event.ok_or_else(|| invalid("delivery flush producer stopped"))?),
             _ = timer.tick() => Wake::Timer,
         };
         drop(wait);
+        // Apply every original completion before processing newly observed feedback.
+        // Original receipt times still exclude callbacks that happened afterward.
+        if let Wake::DeliveryFlush(event) = &wake
+            && let Some(window) = &mut state.delivery
+        {
+            window.flush(delivery::FlushEvent {
+                ordinal: event.ordinal,
+                at: event.at,
+            })?;
+        }
+        if let (Some(window), Some(events)) = (&mut state.delivery, &mut ports.delivery_flushes) {
+            // Static per-turn bound, even if a separately polled writer replenishes.
+            for _ in 0..events.max_capacity() {
+                let Ok(event) = events.try_recv() else {
+                    break;
+                };
+                window.flush(event)?;
+            }
+        }
         match wake {
             Wake::Incoming(incoming) => {
                 if let Some(p) = &profile {
@@ -798,7 +851,7 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
                     local_open = false;
                 }
             }
-            Wake::DataFlush => {
+            Wake::DeliveryFlush(_) | Wake::DataFlush => {
                 if let Some(p) = &profile {
                     p.count(PC::WakeDataFlush, 1);
                 }
@@ -834,8 +887,9 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
                 PH::Unflushed,
                 state.admitted.saturating_sub(*ports.flushed.borrow()),
             );
-            if state.admitted.saturating_sub(state.peer_delivered)
-                >= state.runtime.queue_packets as u64
+            if state.delivery.is_none()
+                && state.admitted.saturating_sub(state.peer_delivered)
+                    >= state.runtime.queue_packets as u64
             {
                 if credit_blocked_span.is_none() {
                     credit_blocked_span = Some(p.span(PS::CreditBlocked));
@@ -844,6 +898,9 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
                 credit_blocked_span = None;
             }
             p.publish(false);
+        }
+        if let Some(window) = &mut state.delivery {
+            window.publish(profile.as_ref())?;
         }
         let now = tick(start)?;
         let effects = state.peer.poll(now).map_err(io::Error::other)?;
@@ -865,6 +922,12 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
                         p.count(PC::DeviceWriteFrames, 1);
                         p.count(PC::DeviceWriteBytes, packet.len() as u64);
                         p.count(PC::FeedbackUpdates, 1);
+                    }
+                    if let Some(window) = &mut state.delivery {
+                        window.pending_bytes = window
+                            .pending_bytes
+                            .checked_sub(packet.len() as u64)
+                            .ok_or_else(|| invalid("native delivery byte accounting underflow"))?;
                     }
                     state.native_pending.pop_front();
                     state.delivered = increment(state.delivered)?;
@@ -901,7 +964,10 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
         if let Some(closed_at) = eof {
             state.publish(flushed, &ports.local.status)?;
             if state.native_pending.is_empty() {
-                if state.peer.phase() != Phase::Idle || state.peer_delivered != state.admitted {
+                if state.peer.phase() != Phase::Idle
+                    || state.peer_delivered != state.admitted
+                    || state.delivery.as_ref().is_some_and(|w| w.staged.is_some())
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "carrier closed with unfinished data or transaction",
@@ -920,8 +986,9 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
         }
         if state.peer.can_admit_data() && eof.is_none() {
             for _ in 0..state.runtime.queue_packets.min(32) {
-                if state.admitted.saturating_sub(state.peer_delivered)
-                    >= state.runtime.queue_packets as u64
+                if state.delivery.is_none()
+                    && state.admitted.saturating_sub(state.peer_delivered)
+                        >= state.runtime.queue_packets as u64
                 {
                     if let Some(p) = &profile {
                         p.count(PC::CreditBlocked, 1);
@@ -940,35 +1007,59 @@ async fn drive<D: PacketDevice<Error = io::Error>>(
                         return Err(invalid("managed data writer stopped"));
                     }
                 };
-                if let Some(p) = &profile {
-                    p.count(PC::DeviceReadCalls, 1);
-                }
-                let received = {
-                    let _span = profile.as_ref().map(|p| p.span(PS::DeviceRead));
-                    device.receive(&mut buffer)?
-                };
-                let Some(size) = received else {
+                let staged = state.delivery.as_mut().and_then(|w| w.staged.take());
+                let packet = if let Some(packet) = &staged {
+                    packet.as_slice()
+                } else {
                     if let Some(p) = &profile {
-                        p.count(PC::DeviceReadNone, 1);
+                        p.count(PC::DeviceReadCalls, 1);
                     }
-                    break;
+                    let received = {
+                        let _span = profile.as_ref().map(|p| p.span(PS::DeviceRead));
+                        device.receive(&mut buffer)?
+                    };
+                    let Some(size) = received else {
+                        if let Some(p) = &profile {
+                            p.count(PC::DeviceReadNone, 1);
+                        }
+                        break;
+                    };
+                    if size > state.runtime.max_packet
+                        || size > buffer.len()
+                        || !packet_valid(state.runtime.layer, &buffer[..size])
+                    {
+                        return Err(invalid("invalid managed native input"));
+                    }
+                    if let Some(p) = &profile {
+                        p.count(PC::DeviceReadFrames, 1);
+                        p.count(PC::DeviceReadBytes, size as u64);
+                        p.high(PH::NativeBytes, size as u64);
+                    }
+                    &buffer[..size]
                 };
-                if let Some(p) = &profile {
-                    p.count(PC::DeviceReadFrames, 1);
-                    p.count(PC::DeviceReadBytes, size as u64);
-                    p.high(PH::NativeBytes, size as u64);
+                if let Some(window) = &mut state.delivery {
+                    if !window.admit(packet.len())? {
+                        window.staged = if staged.is_some() {
+                            staged
+                        } else {
+                            Some(packet.to_vec())
+                        };
+                        if let Some(p) = &profile {
+                            p.count(PC::CreditBlocked, 1);
+                            if credit_blocked_span.is_none() {
+                                credit_blocked_span = Some(p.span(PS::CreditBlocked));
+                            }
+                        }
+                        break;
+                    }
+                    credit_blocked_span = None;
                 }
-                if size > state.runtime.max_packet
-                    || size > buffer.len()
-                    || !packet_valid(state.runtime.layer, &buffer[..size])
-                {
-                    return Err(invalid("invalid managed native input"));
-                }
+                let size = packet.len();
                 let payload = {
                     let _span = profile.as_ref().map(|p| p.span(PS::CodecEncode));
                     state
                         .codec()?
-                        .encode_vec(&buffer[..size])
+                        .encode_vec(packet)
                         .map_err(io::Error::other)?
                 };
                 if let Some(p) = &profile {
@@ -1012,12 +1103,53 @@ pub async fn run_managed_with_profile<D: PacketDevice<Error = io::Error>>(
     local: ControlReceiver,
     profile: Option<ProfileSink>,
 ) -> io::Result<()> {
+    run_managed_inner(device, link, runtime, config, local, None, profile).await
+}
+/// Run an explicitly authenticated directional byte window on the retained path.
+/// Local queues and original transaction deadlines remain independent and unchanged.
+pub async fn run_managed_with_delivery<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: ManagedConfig,
+    local: ControlReceiver,
+    delivery: DeliveryConfig,
+    profile: Option<ProfileSink>,
+) -> io::Result<()> {
+    run_managed_inner(
+        device,
+        link,
+        runtime,
+        config,
+        local,
+        Some(delivery),
+        profile,
+    )
+    .await
+}
+async fn run_managed_inner<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    runtime: RuntimeConfig,
+    config: ManagedConfig,
+    local: ControlReceiver,
+    delivery: Option<DeliveryConfig>,
+    profile: Option<ProfileSink>,
+) -> io::Result<()> {
     let _profile_lifetime = profiling::Lifetime(profile.clone());
     if let Some(p) = &profile {
         p.high(PH::LocalQueueLimit, runtime.queue_packets as u64);
-        p.high(PH::DeliveryCreditLimit, runtime.queue_packets as u64);
+        p.high(
+            PH::DeliveryCreditLimit,
+            delivery.map_or(runtime.queue_packets, |d| {
+                d.outgoing(config.role).max_records
+            }) as u64,
+        );
     }
-    let negotiated = session_config(runtime, &config.initial_mode)?;
+    let negotiated = match delivery {
+        Some(delivery) => session_config_with_delivery(runtime, &config.initial_mode, delivery)?,
+        None => session_config(runtime, &config.initial_mode)?,
+    };
     let metadata = link
         .managed_metadata
         .as_ref()
@@ -1067,6 +1199,23 @@ pub async fn run_managed_with_profile<D: PacketDevice<Error = io::Error>>(
     let (credit, credit_rx) = watch::channel(0);
     let (flushed_tx, flushed) = watch::channel(0);
     let _status_lifetime = StatusLifetime(local.status.clone());
+    let window = delivery
+        .map(|d| delivery::Window::new(d, config.role, Instant::now()))
+        .transpose()?;
+    let (delivery_tx, delivery_flushes) = match delivery {
+        Some(d) => {
+            let (tx, rx) = mpsc::channel(d.outgoing(config.role).max_records);
+            (Some(tx), Some(rx))
+        }
+        None => (None, None),
+    };
+    let native_capacity = delivery.map_or(runtime.queue_packets, |d| {
+        d.incoming(config.role).max_records
+    });
+    let mut native_pending = VecDeque::new();
+    native_pending
+        .try_reserve_exact(native_capacity)
+        .map_err(io::Error::other)?;
     let driver = Driver {
         peer,
         codecs,
@@ -1093,7 +1242,8 @@ pub async fn run_managed_with_profile<D: PacketDevice<Error = io::Error>>(
             pending: VecDeque::with_capacity(CONTROL_SLOTS),
             next: 0,
         },
-        native_pending: VecDeque::with_capacity(runtime.queue_packets),
+        native_pending,
+        delivery: window,
         rate_start: Tick(0),
         controls_received: 0,
     };
@@ -1116,9 +1266,9 @@ pub async fn run_managed_with_profile<D: PacketDevice<Error = io::Error>>(
     };
     tokio::select! {
         result = reverse => result,
-        result = read_records(link.reader, link.receive_session, maximum, in_tx, profile.clone()) => result,
-        result = write_records(link.writer, link.send_session, out_rx, control_rx, credit_rx, WriterProgress { control: control_flushed, credit: credit_flushed_tx, data: flushed_tx }, profile.clone()) => result,
-        result = drive(device, driver, DriverIo { incoming, outgoing, credit, flushed, credit_flushed, local }, profile.clone()) => result,
+        result = read_records(link.reader, link.receive_session, maximum, in_tx, profile.clone(), delivery.is_some()) => result,
+        result = write_records(link.writer, link.send_session, out_rx, control_rx, credit_rx, WriterProgress { control: control_flushed, credit: credit_flushed_tx, data: flushed_tx, delivery: delivery_tx }, profile.clone()) => result,
+        result = drive(device, driver, DriverIo { incoming, outgoing, credit, flushed, credit_flushed, local, delivery_flushes }, profile.clone()) => result,
     }
 }
 
@@ -1276,3 +1426,7 @@ mod control_backpressure_tests {
 #[cfg(test)]
 #[path = "managed/profiling_tests.rs"]
 mod profiling_tests;
+
+#[cfg(test)]
+#[path = "managed/delivery_tests.rs"]
+mod delivery_tests;

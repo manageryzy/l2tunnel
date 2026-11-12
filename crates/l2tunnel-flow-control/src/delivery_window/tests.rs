@@ -222,3 +222,76 @@ fn sample_clamps_ring_wrap_and_cumulative_overflow_are_bounded() -> TestResult {
     assert_eq!(c.preview_admit(1, Micros(2_500_192)), Err(Error::Exhausted));
     Ok(())
 }
+
+#[test]
+fn original_flush_and_feedback_timestamps_survive_later_actor_operations() -> TestResult {
+    let mut c = Controller::new(config(), Micros(0))?;
+    let first = c.admit(100, Micros(100))?;
+    c.admit(200, Micros(200))?;
+    // Actual writer completion precedes a later admission, but callback arrives later.
+    c.confirm_flushed_at(first.records, Micros(150), Micros(300))?;
+    c.tick(Micros(400))?;
+    c.delivered_at(first, Micros(250), Micros(500))?;
+    let sample = c.status(Micros(500))?.sample.ok_or("original sample")?;
+    assert_eq!(
+        (sample.flushed_at, sample.feedback_at, sample.raw_micros),
+        (Micros(150), Micros(250), 100)
+    );
+    assert!(!c.status(Micros(1_000_250))?.sample_fresh);
+    assert_eq!(c.status(Micros(1_000_250))?.target_bytes, 875_000);
+    Ok(())
+}
+#[test]
+fn forged_actual_event_times_fail_before_accounting_mutation() -> TestResult {
+    let mut c = Controller::new(config(), Micros(0))?;
+    let end = c.admit(100, Micros(100))?;
+    let before = c.status(Micros(100))?;
+    assert_eq!(
+        c.confirm_flushed_at(1, Micros(99), Micros(200)),
+        Err(Error::Time)
+    );
+    assert_eq!(
+        c.confirm_flushed_at(1, Micros(201), Micros(200)),
+        Err(Error::Time)
+    );
+    assert_eq!(
+        c.delivered_at(end, Micros(99), Micros(200)),
+        Err(Error::Time)
+    );
+    assert_eq!(
+        c.delivered_at(end, Micros(201), Micros(200)),
+        Err(Error::Time)
+    );
+    assert_eq!(c.status(Micros(100))?, before);
+    c.confirm_flushed_at(1, Micros(150), Micros(200))?;
+    assert_eq!(
+        c.delivered_at(end, Micros(190), Micros(199)),
+        Err(Error::Time)
+    );
+    Ok(())
+}
+#[test]
+fn delayed_actual_flush_never_resamples_old_feedback_or_revives_expiry() -> TestResult {
+    let mut c = Controller::new(config(), Micros(0))?;
+    let end = c.admit(100, Micros(100))?;
+    c.delivered_at(end, Micros(200), Micros(300))?;
+    c.confirm_flushed_at(1, Micros(150), Micros(400))?;
+    assert_eq!(c.status(Micros(400))?.sample, None);
+    c.delivered_at(end, Micros(200), Micros(500))?;
+    assert_eq!(c.status(Micros(500))?.sample, None);
+    let mut expired = Controller::new(config(), Micros(0))?;
+    expired.admit(100, Micros(100))?;
+    assert_eq!(
+        expired.confirm_flushed_at(1, Micros(150), Micros(2_000_100)),
+        Err(Error::FlushExpired)
+    );
+    assert_eq!(
+        expired.confirm_flushed_at(1, Micros(150), Micros(2_000_101)),
+        Err(Error::FlushExpired)
+    );
+    assert_eq!(
+        expired.status(Micros(2_000_101))?.next_flush_deadline,
+        Some(Micros(2_000_100))
+    );
+    Ok(())
+}

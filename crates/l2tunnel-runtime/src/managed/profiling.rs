@@ -47,6 +47,13 @@ labels!(HighWater, HIGH_WATER,
     RecordBytes => "plaintext_record_bytes", NativeBytes => "native_frame_bytes",
     LocalQueueLimit => "configured_local_queue_packets", DeliveryCreditLimit => "configured_delivery_credit_packets",
 );
+labels!(Value, VALUES,
+    Enabled => "delivery_enabled", Target => "delivery_target_bytes",
+    OutstandingBytes => "delivery_outstanding_bytes", OutstandingRecords => "delivery_outstanding_records",
+    RetainedRecords => "delivery_retained_records", Rtt => "delivery_service_rtt_micros",
+    RttFresh => "delivery_service_rtt_fresh", PendingBytes => "delivery_native_pending_bytes",
+    StagedBytes => "delivery_staged_native_bytes",
+);
 labels!(Stage, STAGES,
     DriverWait => "driver_select_wait", WriterWait => "writer_select_wait",
     DeviceRead => "device_read", DeviceWrite => "device_write",
@@ -79,6 +86,8 @@ pub struct ProfileSnapshot {
     pub counters: BTreeMap<&'static str, u64>,
     /// Maximum observed bounded queue/record values plus explicit configured limits.
     pub high_water: BTreeMap<&'static str, u64>,
+    /// Current fixed-label delivery observations; delivery_enabled=0 means legacy policy.
+    pub values: BTreeMap<&'static str, u64>,
     /// Fixed label set of stage attempt timings.
     pub timings: BTreeMap<&'static str, ProfileTiming>,
 }
@@ -92,6 +101,7 @@ struct Inner {
     interval: u64,
     next: AtomicU64,
     counters: [AtomicU64; COUNTERS.len()],
+    values: [AtomicU64; VALUES.len()],
     high: [AtomicU64; HIGH_WATER.len()],
     stages: [Timing; STAGES.len()],
     output: watch::Sender<Option<ProfileSnapshot>>,
@@ -130,6 +140,7 @@ pub fn channel(interval: Duration) -> io::Result<(ProfileHandle, ProfileSink)> {
             interval,
             next: AtomicU64::new(interval),
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            values: std::array::from_fn(|_| AtomicU64::new(0)),
             high: std::array::from_fn(|_| AtomicU64::new(0)),
             stages: std::array::from_fn(|_| Timing {
                 count: AtomicU64::new(0),
@@ -159,6 +170,9 @@ impl Drop for Span<'_> {
     }
 }
 impl ProfileSink {
+    pub(super) fn value(&self, key: Value, value: u64) {
+        self.0.values[key as usize].store(value, Ordering::Relaxed);
+    }
     pub(super) fn count(&self, key: Counter, value: u64) {
         add(&self.0.counters[key as usize], value);
     }
@@ -210,6 +224,11 @@ impl ProfileSink {
                 .iter()
                 .enumerate()
                 .map(|(i, label)| (*label, self.0.high[i].load(Ordering::Relaxed)))
+                .collect(),
+            values: VALUES
+                .iter()
+                .enumerate()
+                .map(|(i, label)| (*label, self.0.values[i].load(Ordering::Relaxed)))
                 .collect(),
             timings: STAGES
                 .iter()

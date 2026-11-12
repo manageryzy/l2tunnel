@@ -119,6 +119,8 @@ pub struct Controller {
     admitted: Credit,
     delivered: Credit,
     flushed_records: u64,
+    last_flush_at: Option<Micros>,
+    last_feedback_at: Option<Micros>,
     sample: Option<Sample>,
     at: Micros,
     failed: bool,
@@ -130,7 +132,8 @@ impl Config {
             .checked_mul(size_of::<Option<Entry>>())
             .ok_or(Error::Configuration)
     }
-    fn validate(self) -> Result<(), Error> {
+    /// Validate finite policy and metadata bounds without allocating or reading time.
+    pub fn validate(self) -> Result<(), Error> {
         if self.target_bandwidth_bps == 0
             || self.min_rtt_micros == 0
             || self.min_rtt_micros > self.bootstrap_rtt_micros
@@ -183,6 +186,8 @@ impl Controller {
             admitted: Credit::default(),
             delivered: Credit::default(),
             flushed_records: 0,
+            last_flush_at: None,
+            last_feedback_at: None,
             sample: None,
             at: now,
             failed: false,
@@ -308,9 +313,23 @@ impl Controller {
         self.at = now;
         Ok(end)
     }
-    /// Confirm an ordered prefix only after the reliable writer fully flushed it.
+    /// Confirm an ordered prefix when actual flush and observation share a timestamp.
     pub fn confirm_flushed(&mut self, records: u64, now: Micros) -> Result<Update, Error> {
-        self.check(now)?;
+        self.confirm_flushed_at(records, now, now)
+    }
+    /// Apply the writer's original full-flush timestamp at a later actor observation.
+    /// Observation time governs health and the unchanged admission-time deadline;
+    /// actual time must follow every covered admission and cannot be in the future.
+    pub fn confirm_flushed_at(
+        &mut self,
+        records: u64,
+        actual_flush_at: Micros,
+        observed_at: Micros,
+    ) -> Result<Update, Error> {
+        self.check(observed_at)?;
+        if actual_flush_at > observed_at {
+            return Err(Error::Time);
+        }
         if records < self.flushed_records {
             return Err(Error::Stale);
         }
@@ -318,29 +337,57 @@ impl Controller {
             return Err(Error::Flush);
         }
         if records == self.flushed_records {
-            self.at = now;
+            self.at = observed_at;
             return Ok(Update::Duplicate);
         }
+        if self.last_flush_at.is_some_and(|t| actual_flush_at < t) {
+            return Err(Error::Time);
+        }
+        // Preflight every original boundary before changing any timestamp.
         for record in self.flushed_records + 1..=records {
-            // Every unflushed entry is retained, even if feedback arrived early.
+            let e = self
+                .index(record)
+                .and_then(|i| self.entries[i])
+                .ok_or(Error::Flush)?;
+            let admitted_at = e.flush_deadline.0 - self.config.flush_timeout_micros;
+            if actual_flush_at.0 < admitted_at || actual_flush_at >= e.flush_deadline {
+                return Err(Error::Time);
+            }
+        }
+        for record in self.flushed_records + 1..=records {
             let i = self.index(record).ok_or(Error::Flush)?;
             if let Some(e) = &mut self.entries[i] {
-                e.flushed_at = Some(now);
+                e.flushed_at = Some(actual_flush_at);
             }
         }
         self.flushed_records = records;
-        self.at = now;
+        self.last_flush_at = Some(actual_flush_at);
+        self.at = observed_at;
         self.prune();
         Ok(Update::Advanced)
     }
-    /// Apply an authenticated cumulative remote-device delivery boundary.
+    /// Apply an authenticated boundary when original receipt is observed immediately.
     pub fn delivered(&mut self, end: Credit, now: Micros) -> Result<Update, Error> {
-        self.check(now)?;
+        self.delivered_at(end, now, now)
+    }
+    /// Apply an original authenticated feedback receipt at a later actor observation.
+    /// Only the original receipt determines service elapsed time and sample age.
+    /// A later flush callback never retroactively samples an already delivered record.
+    pub fn delivered_at(
+        &mut self,
+        end: Credit,
+        feedback_at: Micros,
+        observed_at: Micros,
+    ) -> Result<Update, Error> {
+        self.check(observed_at)?;
+        if feedback_at > observed_at {
+            return Err(Error::Time);
+        }
         if end.records < self.delivered.records {
             return Err(Error::Stale);
         }
         if end == self.delivered {
-            self.at = now;
+            self.at = observed_at;
             return Ok(Update::Duplicate);
         }
         if end.records <= self.delivered.records
@@ -349,26 +396,39 @@ impl Controller {
         {
             return Err(Error::Feedback);
         }
+        let last = self
+            .index(end.records)
+            .and_then(|i| self.entries[i])
+            .ok_or(Error::Feedback)?;
+        if feedback_at.0 < last.flush_deadline.0 - self.config.flush_timeout_micros
+            || self.last_feedback_at.is_some_and(|t| feedback_at < t)
+        {
+            return Err(Error::Time);
+        }
         let latest = (self.delivered.records + 1..=end.records)
             .rev()
             .filter_map(|record| {
                 self.index(record)
                     .and_then(|i| self.entries[i])
-                    .and_then(|e| e.flushed_at.filter(|t| now > *t).map(|t| (record, t)))
+                    .and_then(|e| {
+                        e.flushed_at
+                            .filter(|t| feedback_at > *t)
+                            .map(|t| (record, t))
+                    })
             })
             .next();
         if let Some((_, flushed)) = latest {
-            let raw = now.0 - flushed.0;
+            let raw = feedback_at.0 - flushed.0;
             let bounded = raw.clamp(self.config.min_rtt_micros, self.config.max_rtt_micros);
             let smooth = self
                 .sample
-                .filter(|_| self.fresh(now))
+                .filter(|_| self.fresh(observed_at))
                 .map_or(bounded, |s| {
                     ((7 * u128::from(s.smoothed_micros) + u128::from(bounded)) / 8) as u64
                 });
             self.sample = Some(Sample {
                 flushed_at: flushed,
-                feedback_at: now,
+                feedback_at,
                 raw_micros: raw,
                 smoothed_micros: smooth,
             });
@@ -380,7 +440,8 @@ impl Controller {
             }
         }
         self.delivered = end;
-        self.at = now;
+        self.last_feedback_at = Some(feedback_at);
+        self.at = observed_at;
         self.prune();
         Ok(Update::Advanced)
     }

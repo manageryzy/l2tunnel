@@ -71,6 +71,27 @@ impl ConnectionConfig {
     pub fn mode(self) -> io::Result<ModeConfig> {
         l2tunnel_runtime::managed::mode_config(self.runtime(), self.duplex)
     }
+    /// Derive an explicitly selected delivery policy binding, shared by GUI and CLI.
+    /// Forward/reverse policies use canonical client-to-server/server-to-client order.
+    pub fn session_with_delivery(
+        self,
+        delivery: l2tunnel_runtime::managed::DeliveryConfig,
+    ) -> io::Result<SessionConfig> {
+        // Preserve the exact existing validation, including the whole-attempt limit.
+        self.session()?;
+        l2tunnel_runtime::managed::session_config_with_delivery(
+            self.runtime(),
+            &self.mode_with_delivery(delivery)?,
+            delivery,
+        )
+    }
+    /// Keep local queue geometry separate from authenticated delivery-window limits.
+    pub fn mode_with_delivery(
+        self,
+        delivery: l2tunnel_runtime::managed::DeliveryConfig,
+    ) -> io::Result<ModeConfig> {
+        l2tunnel_runtime::managed::mode_config_with_delivery(self.runtime(), self.duplex, delivery)
+    }
     /// Bounded runtime defaults, independent of the GUI or CLI.
     pub fn runtime(self) -> RuntimeConfig {
         RuntimeConfig {
@@ -157,6 +178,27 @@ pub async fn connect(
     .await
 }
 
+/// Authenticate an explicit bounded delivery profile over the original TCP/TLS lanes.
+/// Uses the same single whole-attempt deadline as [`connect`]; no runtime fallback.
+pub async fn connect_with_delivery(
+    address: SocketAddr,
+    tls: &ClientTls,
+    server_name: &str,
+    identity: &MemberKey,
+    config: ConnectionConfig,
+    delivery: l2tunnel_runtime::managed::DeliveryConfig,
+) -> io::Result<Link> {
+    connect_session(
+        address,
+        tls,
+        server_name,
+        identity,
+        config,
+        config.session_with_delivery(delivery)?,
+    )
+    .await
+}
+
 pub(crate) async fn connect_session(
     address: SocketAddr,
     tls: &ClientTls,
@@ -213,6 +255,25 @@ pub async fn accept(
     config: ConnectionConfig,
 ) -> io::Result<Link> {
     accept_session(listener, tls, allowlist, config, config.session()?).await
+}
+
+/// Accept the matching explicit delivery policy using the original full/half deadline.
+/// A policy mismatch fails authentication; the listener remains caller-owned.
+pub async fn accept_with_delivery(
+    listener: &TcpListener,
+    tls: &ServerTls,
+    allowlist: &MemberAllowlist,
+    config: ConnectionConfig,
+    delivery: l2tunnel_runtime::managed::DeliveryConfig,
+) -> io::Result<Link> {
+    accept_session(
+        listener,
+        tls,
+        allowlist,
+        config,
+        config.session_with_delivery(delivery)?,
+    )
+    .await
 }
 
 pub(crate) async fn accept_session(
@@ -308,3 +369,6 @@ pub mod rolling;
 #[cfg(test)]
 #[path = "base_deadline_tests.rs"]
 mod base_deadline_tests;
+
+#[cfg(test)]
+mod delivery_tests;
