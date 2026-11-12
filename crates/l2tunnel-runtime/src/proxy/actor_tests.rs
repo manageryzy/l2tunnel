@@ -48,6 +48,7 @@ fn actor(originator: bool) -> io::Result<(Actor, mpsc::Receiver<Vec<u8>>, mpsc::
         outstanding: None,
         pending_pong: None,
         queued_pong: 0,
+        credit_due: start,
         close: false,
     };
     Ok((
@@ -318,6 +319,7 @@ async fn writer_flushes_ready_then_previously_owned_user_before_quiesce() -> io:
             session: [9; 16],
             bulk: true,
         },
+        256,
         crx,
         urx,
         ptx,
@@ -423,3 +425,6 @@ fn peer_barrier_can_arrive_before_actor_users_but_not_ack_before_native_write() 
     assert!(a.ack_queued);
     Ok(())
 }
+
+#[path = "control_pacing_tests.rs"]
+mod control_pacing;

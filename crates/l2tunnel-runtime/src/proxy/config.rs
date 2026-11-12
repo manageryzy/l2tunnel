@@ -201,7 +201,8 @@ pub struct Config {
     pub flow_poll_work: usize,
     /// Maintained TCP work steps per visited owner.
     pub stack_poll_work: usize,
-    /// Maximum control records per second per physical direction.
+    /// Per-physical-direction control send/decode service budget per second.
+    /// Buffered arrivals are backpressured, never granted extra processing slots.
     pub control_rate: usize,
 }
 /// Conservative explicit storage bound, excluding maintained TLS/allocator overhead.
@@ -339,6 +340,34 @@ impl Config {
         self.runtime.validate()?;
         if self.max_user()? > super::super::wire::MAX_PAYLOAD {
             return Err(invalid("proxy record ceiling"));
+        }
+        // Supported local service reservations, never renewed deadlines or a
+        // bound on transport buffering/RTT, native work or user-data drainage.
+        // Start/Ready reserve two slots. In normal operation each direction
+        // owns at most one Credit, Ping and Pong; four send/receive service
+        // edges reserve 3 slots each for heartbeat, plus two actor polls.
+        // Shutdown adds the four-slot coalescing wait to all four service
+        // edges for those three normal controls and Quiesce/Barrier/latest
+        // Credit/Ack (4 + 4 * 7 slots), plus four actor polls. This conservative
+        // supported-minimum policy does not assume overlap of those waits.
+        let slot = super::transport::control_interval(self.control_rate)?;
+        let minimum = |slots, polls| {
+            slot.checked_mul(slots)
+                .and_then(|d| {
+                    self.runtime
+                        .poll_interval
+                        .checked_mul(polls)
+                        .and_then(|scheduling| d.checked_add(scheduling))
+                })
+                .ok_or_else(|| invalid("proxy control pacing feasibility overflow"))
+        };
+        if self.timeouts.startup < minimum(2, 0)?
+            || self.timeouts.control_idle < minimum(12, 2)?
+            || self.timeouts.shutdown < minimum(32, 4)?
+        {
+            return Err(invalid(
+                "proxy deadlines cannot service configured control rate",
+            ));
         }
         let durations = [
             self.timeouts.startup,

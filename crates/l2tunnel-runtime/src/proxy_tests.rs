@@ -1025,39 +1025,30 @@ fn common_user_arbiter_has_channel_fifo_and_shared_saturation() -> TestResult {
 }
 
 #[tokio::test]
-async fn pre_start_drain_without_peer_ready_uses_original_deadline_without_quiesce() -> TestResult {
-    use tokio::io::AsyncReadExt;
+async fn infeasible_pre_start_drain_is_rejected_before_device_io() -> TestResult {
     for duplex in [Duplex::Full, Duplex::Half] {
         let mut cfg = config(duplex)?;
+        let (local, _peer) = links(&cfg).await?;
         cfg.timeouts.shutdown = Duration::from_millis(30);
-        let (local, mut peer) = links(&cfg).await?;
         let device = Device::default();
         device.change(|s| s.outgoing.push_back(packet(3)))?;
         let (handle, control) = control_channel();
         let waiter = handle.request_drain()?;
-        let task = tokio::spawn(run(device.clone(), local, cfg, control));
-        let length = timeout(Duration::from_secs(1), peer.inner.reader.read_u32()).await?? as usize;
-        let mut bytes = vec![0; length];
-        peer.inner.reader.read_exact(&mut bytes).await?;
-        let (_, body) =
-            super::super::wire::decode(&bytes, 1600).map_err(super::super::wire_error)?;
-        assert!(matches!(
-            wire::ControlFrame::decode(body)?,
-            wire::ControlFrame::Start(_)
-        ));
-        let failure = timeout(Duration::from_secs(1), task)
-            .await??
+        let failure = run(device.clone(), local, cfg, control)
+            .await
             .err()
-            .ok_or("drain unexpectedly completed")?;
-        assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
-        assert!(failure.to_string().contains("original shutdown"));
+            .ok_or("infeasible drain config accepted")?;
+        assert_eq!(failure.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            failure.to_string(),
+            "proxy deadlines cannot service configured control rate"
+        );
         assert!(waiter.wait().await.is_err());
         assert_eq!(device.change(|s| s.reads)?, 0);
-        // No Ready or Quiesce may have been emitted without peer startup.
-        let mut next = [0; 1];
-        assert!(
-            !matches!(timeout(Duration::from_secs(1), peer.inner.reader.read(&mut next)).await?, Ok(n) if n > 0)
-        );
+        assert_eq!(device.change(|s| s.outgoing.len())?, 1);
     }
     Ok(())
 }
+
+#[path = "proxy_control_pacing_tests.rs"]
+mod control_pacing_cases;

@@ -133,6 +133,10 @@ mod local_control {
         let mut config = runtime_config(cfg, &policy)?;
         if let Some(value) = shutdown {
             config.fixed.timeouts.shutdown = value;
+            // Preserve the original 100ms network deadline with an explicit
+            // authenticated pacing policy: 32 slots at 512/s + 4ms polling
+            // reserves 66.5ms; the default 256/s needs 129ms and is invalid.
+            config.fixed.control_rate = 512;
         }
         let binding = runtime::session_config(&config)?;
         let mut lanes = Vec::new();
@@ -270,6 +274,25 @@ mod local_control {
             assert_eq!(db.change(|s| s.received.clone())?, vec![packet(1)]);
             assert!(!path.exists());
         }
+        Ok(())
+    }
+    #[test]
+    fn original_100ms_deadline_requires_explicit_compatible_pacing() -> TestResult {
+        let mut config = runtime_config(connection(Duplex::Half), &settings()?)?;
+        config.fixed.timeouts.shutdown = Duration::from_millis(100);
+        assert_eq!(config.fixed.control_rate, 256);
+        let failure = config
+            .validate()
+            .err()
+            .ok_or("invalid short policy accepted")?;
+        assert_eq!(failure.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            failure.to_string(),
+            "proxy deadlines cannot service configured control rate"
+        );
+        config.fixed.control_rate = 512;
+        config.validate()?;
+        assert_eq!(config.fixed.timeouts.shutdown, Duration::from_millis(100));
         Ok(())
     }
     #[tokio::test]

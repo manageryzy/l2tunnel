@@ -607,6 +607,7 @@ async fn measured_actual_writer_partial_body_and_pending_flush_retain_token_in_b
                 session: [9; 16],
                 bulk: true,
             },
+            256,
             controls,
             users,
             progress,

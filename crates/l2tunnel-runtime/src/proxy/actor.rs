@@ -26,6 +26,7 @@ struct Writer {
     outstanding: Option<(u64, Instant)>,
     pending_pong: Option<u64>,
     queued_pong: u64,
+    credit_due: Instant,
     close: bool,
 }
 impl Writer {
@@ -165,6 +166,15 @@ impl Actor {
         let now = self.micros()?;
         if let Some(state) = &mut self.measured {
             state.controller.quiesce(now).map_err(error)?;
+        }
+        Ok(())
+    }
+    fn check_shutdown_deadline(&self, now: Instant) -> io::Result<()> {
+        if self.deadline.is_some_and(|end| now >= end) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "proxy original shutdown deadline",
+            ));
         }
         Ok(())
     }
@@ -358,11 +368,19 @@ impl Actor {
             }
         }
         if !self.closing
+            && now >= self.writers[0].credit_due
             && self.delivered != self.queued_credit
             && self.writers[0].progress.borrow().credit == self.queued_credit
             && self.writers[0].control(Frame::Credit(self.delivered))?
         {
             self.queued_credit = self.delivered;
+            self.writers[0].credit_due = now
+                .checked_add(
+                    transport::control_interval(self.config.control_rate)?
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("proxy credit pacing interval overflow"))?,
+                )
+                .ok_or_else(|| invalid("proxy credit pacing deadline overflow"))?;
         }
         Ok(())
     }
@@ -1145,6 +1163,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
         tasks.spawn(transport::writer(
             writer,
             direction,
+            config.control_rate,
             crx,
             urx,
             ptx,
@@ -1161,6 +1180,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
             outstanding: None,
             pending_pong: None,
             queued_pong: 0,
+            credit_due: start,
             close: false,
         });
     }
@@ -1273,12 +1293,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
                     ));
                 }
             }
-            if actor.deadline.is_some_and(|end| Instant::now() >= end) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "proxy original shutdown deadline",
-                ));
-            }
+            actor.check_shutdown_deadline(Instant::now())?;
             while let Some(result) = tasks.try_join_next() {
                 result.map_err(error)??;
             }

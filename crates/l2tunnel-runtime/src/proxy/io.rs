@@ -3,7 +3,7 @@ use super::wire::{ControlFrame, Fence, Start};
 use super::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 
 pub(super) enum Event {
     Control(usize, ControlFrame, u64),
@@ -45,8 +45,8 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
     let mut seen_users = 0u64;
     let mut start = false;
     let mut ready = false;
-    let mut control_count = 0;
-    let mut control_since = Instant::now();
+    let control_interval = control_interval(config.control_rate)?;
+    let mut control_due = Instant::now();
     let mut saw_quiesce = false;
     let mut saw_barrier = false;
     let mut saw_ack = false;
@@ -104,14 +104,14 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
                     .ok_or_else(|| invalid("proxy reader counter exhausted"))?;
             }
             outer::Kind::Control => {
-                if control_since.elapsed() >= Duration::from_secs(1) {
-                    control_since = Instant::now();
-                    control_count = 0;
-                }
-                control_count += 1;
-                if control_count > config.control_rate {
-                    return Err(invalid("proxy control rate"));
-                }
+                // TCP/TLS preserves order, not arrival spacing. Bound decode/actor
+                // work at the negotiated rate without rejecting a compliant sender
+                // whose flushed records were buffered by the transport or scheduler.
+                // Only this already bounded record is retained while backpressured.
+                sleep_until(control_due).await;
+                control_due = Instant::now()
+                    .checked_add(control_interval)
+                    .ok_or_else(|| invalid("proxy receive pacing deadline overflow"))?;
                 let frame = ControlFrame::decode(body)?;
                 match frame {
                     ControlFrame::Start(s) if !start && s == expected => start = true,
@@ -139,9 +139,20 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
         }
     }
 }
+/// One noncatching-up physical control slot. Credit admission uses four slots
+/// between cumulative updates, retaining headroom for liveness and barriers.
+pub(super) fn control_interval(rate: usize) -> io::Result<Duration> {
+    if !(16..=1024).contains(&rate) {
+        return Err(invalid("proxy control pacing rate"));
+    }
+    let rate = u64::try_from(rate).map_err(io::Error::other)?;
+    Ok(Duration::from_nanos(1_000_000_000_u64.div_ceil(rate)))
+}
+
 pub(super) async fn writer<W: AsyncWrite + Unpin>(
     mut stream: W,
     direction: Direction,
+    control_rate: usize,
     mut controls: mpsc::Receiver<Output>,
     mut users: mpsc::Receiver<Vec<u8>>,
     progress: watch::Sender<Progress>,
@@ -151,8 +162,19 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
     let mut state = Progress::default();
     let mut burst = 0;
     let mut delayed = None;
+    let control_interval = control_interval(control_rate)?;
+    let mut control_due = Instant::now();
     loop {
-        let item = if delayed.is_some() {
+        let item = if delayed.is_some() && Instant::now() < control_due {
+            // A paced control frame owns one existing slot, not the user lane.
+            // Keep admitted data/measurement records moving while that slot waits.
+            tokio::select! {
+                _ = sleep_until(control_due) => delayed.take().map(Ok),
+                input = users.recv(), if direction.bulk && state.ready => {
+                    Some(Err(input.ok_or_else(|| invalid("proxy user producer dropped"))?))
+                }
+            }
+        } else if delayed.is_some() {
             delayed.take().map(Ok)
         } else if burst >= 4 && state.ready {
             match users.try_recv() {
@@ -188,6 +210,10 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
                 return Ok(());
             }
             Ok(Output::Control(frame)) => {
+                if Instant::now() < control_due {
+                    delayed = Some(Output::Control(frame));
+                    continue;
+                }
                 if matches!(frame, ControlFrame::Quiesce) && !state.ready {
                     return Err(invalid("proxy writer Quiesce before Ready flush"));
                 }
@@ -239,6 +265,11 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
         )
         .map_err(wire_error)?;
         write_frame(&mut stream, &bytes).await?;
+        if control.is_some() {
+            control_due = Instant::now()
+                .checked_add(control_interval)
+                .ok_or_else(|| invalid("proxy control pacing deadline overflow"))?;
+        }
         sequence = sequence
             .checked_add(1)
             .ok_or_else(|| invalid("proxy sequence exhausted"))?;
