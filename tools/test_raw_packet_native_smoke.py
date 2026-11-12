@@ -114,6 +114,37 @@ def underlay(lanes=1, window=32768, scale=None):
     return packets
 
 
+def opaque_phase(lane, direction, number, length=64):
+    # Deliberately not encrypted plaintext: this fixture tests framing only.
+    header = struct.pack('!2s6B16sIIQH2s', b'LD', 1, 1, 1, direction, 0, 0,
+                         bytes([lane + 1]) * 16, lane, 1, number, length, bytes(2))
+    return bytes([0x48, 0, 0, lane]) + header + bytes([0xa5]) * length + bytes([0x5a]) * 16
+
+
+def opaque_underlay(lanes=1, window=18560, scale=None):
+    packets = []
+    client, server = tls_fixture.streams()
+    options = b'\x02\x04\x04\x88' + (b'' if scale is None else bytes([3, 3, scale, 1]))
+    shift = scale or 0
+    horizon = (min(32768, window << shift) >> shift) << shift
+    for lane in range(lanes):
+        a, b = 100 + lane * 10000, 1000 + lane * 10000
+        ba, bb = a + 1 + len(client), b + 1 + len(server)
+        packets += [outer(lane, 1, a, 2, window=window, options=options),
+                    outer(lane, 2, b, 18, acknowledgment=a + 1, window=window, options=options),
+                    outer(lane, 1, a + 1, 24, client, bb, window=window),
+                    outer(lane, 2, b + 1, 24, server, ba, window=window)]
+        for direction, base, peer in ((1, ba, bb), (2, bb, ba)):
+            offset = 0
+            for number in range(3):
+                data = opaque_phase(lane, direction, number)
+                packets.append(outer(lane, direction, base + offset, 24, data,
+                                     peer + (len(data) if number == 2 else 0), window=horizon >> shift))
+                offset += len(data)
+        packets.append(outer(lane, 1, a + 1, 16, acknowledgment=b + 1, window=window))
+    return packets
+
+
 def native_packets(flows):
     packets = []
     for flow in flows:
@@ -404,12 +435,163 @@ class RawPacketEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError): smoke.cleanup_sockets({path: (0, 0)}, [])
 
 
+class AeadEvidenceTests(unittest.TestCase):
+    def inspect(self, packets, lanes=1):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'capture.pcap'
+            path.write_bytes(tls_fixture.pcap(packets))
+            return smoke.audit_aead_underlay(path, lanes)
+
+    def test_aead_plans_preserve_budgets_and_isolate_namespaces_without_dry_run_mutation(self):
+        stdout = io.StringIO()
+        with (patch.object(smoke.netns_lab, 'require_root', side_effect=AssertionError('no privilege')),
+              patch.object(smoke.bounded, 'command', side_effect=AssertionError('no process')),
+              patch.object(Path, 'mkdir', side_effect=AssertionError('no write')), redirect_stdout(stdout)):
+            self.assertEqual(smoke.main(['--suite', 'aead']), 0)
+        value = json.loads(stdout.getvalue())
+        self.assertEqual(value['mutations'], 'none')
+        self.assertTrue(value['output'].endswith('raw-packet-native-aead'))
+        for plan in value['cases']:
+            baseline = smoke.case_plan('rawpkt', plan['layer'], plan['duplex'])
+            self.assertEqual(plan['suite'], 'aead')
+            self.assertFalse(set(plan['namespaces'].values()) & set(baseline['namespaces'].values()))
+            for key in ('bounds_seconds', 'profile', 'flows', 'lanes', 'graceful_close'):
+                self.assertEqual(plan[key], baseline[key])
+            for side in ('a', 'b'):
+                wanted = copy.deepcopy(baseline['policies'][side]); wanted['packet']['protection'] = 'aead'
+                self.assertEqual(plan['policies'][side], wanted)
+        with self.assertRaises(ValueError): smoke.policy('full', 'a', 'none')
+        with self.assertRaises(ValueError): smoke.case_plan('test', 'tap', 'full', 'none')
+
+    def test_opaque_parser_rejects_downgrade_reserved_context_and_length_without_decrypting(self):
+        valid = opaque_phase(0, 1, 0)
+        expected = smoke.opaque_phase_payload(valid, 0, 1)
+        self.assertEqual(set(expected), {'session', 'number', 'encrypted_payload_bytes'})
+        for index in (1, 6, 7, 8, 9, 10, 11, 28, 32, 44, 46, 47):
+            changed = bytearray(valid); changed[index] ^= 1
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                smoke.opaque_phase_payload(bytes(changed), 0, 1)
+        for bad in (valid[:-1], valid + b'x', opaque_phase(0, 1, 0, 47),
+                    opaque_phase(0, 1, 0, 1097), phase(0, 1, 0, 1)):
+            with self.assertRaises(ValueError): smoke.opaque_phase_payload(bad, 0, 1)
+        for length in (48, 1096): smoke.opaque_phase_payload(opaque_phase(0, 1, 0, length), 0, 1)
+        self.assertIsNone(smoke.opaque_phase_payload(b'\x48ciphertext', 0, 1))
+        # Structural success must not imply cryptographic acceptance.
+        for index in (48, len(valid) - 1):
+            changed = bytearray(valid); changed[index] ^= 1
+            self.assertEqual(smoke.opaque_phase_payload(bytes(changed), 0, 1), expected)
+
+    def test_full_half_original_tls_window_scale_and_opaque_allocation(self):
+        for lanes in (1, 2):
+            for window, scale, expected in ((18560, None, 18560), (9280, 1, 18560), (32768, 1, 32768)):
+                packets = opaque_underlay(lanes, window, scale)
+                result = self.inspect(packets, lanes)
+                self.assertFalse(result['decrypts_or_verifies_tags'])
+                self.assertFalse(result['inspects_transition_or_data_kinds'])
+                self.assertEqual(len(result['streams']), lanes * 2)
+                for row in result['streams']:
+                    self.assertEqual(row['effective_horizon'], expected)
+                    self.assertEqual(row['original_window_candidates'], [window])
+                self.inspect(packets[::-1] + packets, lanes)
+
+    def test_opaque_capture_rejects_nonce_range_ack_window_session_and_bootstrap_changes(self):
+        baseline = opaque_underlay()
+        packet = smoke.bounded.decode_ip(baseline[4][14:]); tcp, data = smoke.tcp_parts(packet)
+        ack = int.from_bytes(tcp[8:12], 'big')
+        mutations = [baseline[1:], baseline[:2] + baseline[3:], baseline[:4] + baseline[5:],
+                     baseline + [outer(0, 1, 9999, 1)], baseline + [outer(0, 1, 9999, 4)],
+                     baseline + [outer(1, 1, 9999, 2)],
+                     baseline + [outer(0, 1, packet.sequence, 24, data, ack, window=18559)]]
+        for sequence, changed_ack, window in ((packet.sequence + 1, ack, 18560),
+                                             (packet.sequence, ack + 1, 18560),
+                                             (packet.sequence, ack, 32768)):
+            changed = baseline.copy()
+            changed[4] = outer(0, 1, sequence, 24, data, changed_ack, window=window)
+            mutations.append(changed)
+        for index in (12, 43):  # Session identity or packet number.
+            changed = baseline.copy(); body = bytearray(data); body[index] ^= 1
+            changed[4] = outer(0, 1, packet.sequence, 24, body, ack, window=18560)
+            mutations.append(changed)
+        # A claimed horizon cannot replace the original window witness.
+        changed = baseline.copy()
+        for index in (2, 3):
+            p = smoke.bounded.decode_ip(changed[index][14:]); header, body = smoke.tcp_parts(p)
+            changed[index] = outer(0, 1 if index == 2 else 2, p.sequence, p.flags, body,
+                                   int.from_bytes(header[8:12], 'big'), window=32768)
+        mutations.append(changed)
+        for index, packets in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError): self.inspect(packets)
+        with self.assertRaises(ValueError): self.inspect(underlay())
+
+    def test_opaque_peer_capture_matches_all_common_counters_but_permits_loss_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {side: Path(directory) / side for side in ('a', 'b')}
+            baseline = opaque_underlay(2)
+            for path in paths.values(): path.write_bytes(tls_fixture.pcap(baseline))
+            result = smoke.audit_captured_peers(paths, 2, 'aead')
+            self.assertEqual(result['common_opaque_phase_packets'], 12)
+            self.assertNotIn('common_protected_data_packets', result)
+            p = smoke.bounded.decode_ip(baseline[6][14:]); tcp, body = smoke.tcp_parts(p)
+            tail = outer(0, 1, p.sequence + len(body), 24, opaque_phase(0, 1, 3),
+                         int.from_bytes(tcp[8:12], 'big'), window=18560)
+            paths['a'].write_bytes(tls_fixture.pcap(baseline + [tail]))
+            smoke.audit_captured_peers(paths, 2, 'aead')
+            changed = baseline.copy(); body = bytearray(body); body[-1] ^= 1
+            changed[6] = outer(0, 1, p.sequence, 24, body, int.from_bytes(tcp[8:12], 'big'), window=18560)
+            # Each individual untrusted opaque structure remains valid.
+            self.inspect(changed, 2)
+            paths['b'].write_bytes(tls_fixture.pcap(changed))
+            with self.assertRaises(ValueError): smoke.audit_captured_peers(paths, 2, 'aead')
+            with self.assertRaises(ValueError): smoke.audit_captured_peers(paths, 2, 'none')
+
+    def test_opaque_allocation_preserves_reserved_terminal_sequence(self):
+        baseline = opaque_underlay()
+        initial = smoke.bounded.decode_ip(baseline[4][14:]).sequence
+        def shifted(delta):
+            result = []
+            for raw in baseline:
+                packet = smoke.bounded.decode_ip(raw[14:]); tcp, body = smoke.tcp_parts(packet)
+                direction = 1 if packet.source == '192.0.2.2' else 2
+                ack = int.from_bytes(tcp[8:12], 'big')
+                result.append(outer(0, direction, packet.sequence + (delta if direction == 1 else 0),
+                    packet.flags, body, ack + (delta if direction == 2 else 0),
+                    window=int.from_bytes(tcp[14:16], 'big'), options=tcp[20:(tcp[12] >> 4) * 4]))
+            return result
+        delta = 0xffffffff - 3 * len(opaque_phase(0, 1, 0)) - initial
+        self.inspect(shifted(delta - 1))
+        with self.assertRaisesRegex(ValueError, 'sequence/window mismatch or wrap'):
+            self.inspect(shifted(delta))
+
+    def test_launcher_preserves_aead_and_verified_copies_before_namespace_mutation(self):
+        class Handoff(BaseException): pass
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); binary = root / 'daemon'; binary.write_bytes(b'fixture executable')
+            receipt = root / 'build.json'; receipt.write_text('{}')
+            output = root / 'output'
+            with (patch.object(smoke.netns_lab, 'require_root'),
+                  patch.object(smoke.shutil, 'which', return_value='/tool'),
+                  patch.object(Path, 'is_file', return_value=True),
+                  patch.object(smoke.bounded, 'verified_build_receipt', return_value={}),
+                  patch.object(smoke, 'verify_helpers', return_value={}) as verify,
+                  patch.object(smoke, 'source_hashes', return_value={}),
+                  patch.object(smoke.netns_lab, 'apply', side_effect=AssertionError('no mutation before exec')),
+                  patch.object(smoke.os, 'execve', side_effect=Handoff) as execute):
+                with self.assertRaises(Handoff):
+                    smoke.main(['--apply', '--suite', 'aead', '--only-case', 'tun-half-clean',
+                                '--binary', str(binary), '--build-receipt', str(receipt), '--output', str(output)])
+                verify.assert_called_once()
+                arguments = execute.call_args.args[1]
+                self.assertEqual(arguments[arguments.index('--suite') + 1], 'aead')
+                self.assertEqual(arguments[arguments.index('--only-case') + 1], 'tun-half-clean')
+                self.assertEqual(Path(arguments[1]).parent, output)
+
+
 class OwnedLifecycleTests(unittest.TestCase):
     """Fake clocks/processes test the supervisor, never assert native qualification."""
-    def exercise(self, layer='tun', duplex='half', natural=True, cleanup_error=False, stale_owner=False, missing_owner=False):
+    def exercise(self, layer='tun', duplex='half', natural=True, cleanup_error=False, stale_owner=False, missing_owner=False, suite='integrity'):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
             output = Path(directory)
-            plan = smoke.case_plan('fixture', layer, duplex)
+            plan = smoke.case_plan('fixture', layer, duplex, suite)
             clock, state, events = [0.], {'loss': None}, []
             sequence = [100]
             def advance(value): clock[0] += value
@@ -533,6 +715,11 @@ class OwnedLifecycleTests(unittest.TestCase):
     def test_active_rpc_requires_fresh_complete_original_descriptor_observation(self):
         self.exercise(stale_owner=True)
         self.exercise(missing_owner=True)
+
+    def test_aead_supervisor_uses_original_delivery_failure_and_cleanup_gates(self):
+        for layer in ('tap', 'tun'):
+            for duplex in ('full', 'half'):
+                self.exercise(layer, duplex, suite='aead')
 
     def test_silent_peers_hit_original_loss_deadline_and_forced_cleanup_cannot_pass(self):
         self.exercise(natural=False)

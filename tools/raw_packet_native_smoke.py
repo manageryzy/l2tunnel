@@ -43,16 +43,16 @@ HELPERS = {'tools/raw_packet_native_smoke.py': Path(__file__),
            'tools/netns_lab.py': Path(netns_lab.__file__)}
 
 
-def policy(duplex: str, side: str) -> dict:
-    if duplex not in ('full', 'half') or side not in ('a', 'b'):
-        raise ValueError('explicit duplex and endpoint required')
+def policy(duplex: str, side: str, suite: str = 'integrity') -> dict:
+    if duplex not in ('full', 'half') or side not in ('a', 'b') or suite not in ('integrity', 'aead'):
+        raise ValueError('explicit duplex, endpoint and supported protection suite required')
     def endpoints(ports):
         a, b = f'192.0.2.2:{ports[0]}', f'192.0.2.6:{ports[1]}'
         return {'local': a if side == 'a' else b, 'peer': b if side == 'a' else a}
     return {'version': 1, 'profile': 'raw-packet-runtime-v1',
             'forward': endpoints(retained.PORTS[0]),
             'reverse': endpoints(retained.PORTS[1]) if duplex == 'half' else None,
-            'channels': 4, 'packet': {'mtu': 1200, 'protection': 'integrity',
+            'channels': 4, 'packet': {'mtu': 1200, 'protection': suite,
                 'queue_packets': 8, 'horizon_bytes': 32768, 'minimum_transfer_bytes': 65536,
                 'bytes_per_second': 1048576, 'packets_per_second': 2048,
                 'burst_bytes': 16384, 'burst_packets': 32,
@@ -60,10 +60,12 @@ def policy(duplex: str, side: str) -> dict:
             'recovery': {'mode': 'selective_repeat'}}
 
 
-def case_plan(lab_id: str, layer: str, duplex: str) -> dict:
+def case_plan(lab_id: str, layer: str, duplex: str, suite: str = 'integrity') -> dict:
     if layer not in ('tap', 'tun') or duplex not in ('full', 'half'):
         raise ValueError('only clean TAP/TUN full/half is supported')
-    spec = netns_lab.LabSpec(f'{lab_id}-{layer[1]}{duplex[0]}')
+    if suite not in ('integrity', 'aead'):
+        raise ValueError('unsupported protection suite')
+    spec = netns_lab.LabSpec(f'{lab_id}-{layer[1]}{duplex[0]}' + ('e' if suite == 'aead' else ''))
     network = 18 if layer == 'tap' else 19
     flows = [{'family': family, 'source': f'198.{network}.0.1' if family == 4 else f'fd42:12:{network}::1',
               'destination': f'198.{network}.0.2' if family == 4 else f'fd42:12:{network}::2',
@@ -72,15 +74,15 @@ def case_plan(lab_id: str, layer: str, duplex: str) -> dict:
     return {'case': f'{layer}-{duplex}-clean', 'lab_id': spec.lab_id, 'layer': layer,
             'duplex': duplex, 'lanes': 1 if duplex == 'full' else 2,
             'namespaces': spec.namespaces, 'bounds_seconds': BOUNDS,
-            'policies': {side: policy(duplex, side) for side in ('a', 'b')},
+            'policies': {side: policy(duplex, side, suite) for side in ('a', 'b')},
             'socket_mark': MARK, 'flows': flows,
             'profile': ['--carrier', 'raw-packet', '--raw-mark', str(MARK),
                         '--layer', layer, '--device', f'{layer}0', '--duplex', duplex,
                         '--max-packet', '1600', '--compression', 'off'],
             'initial_topology_commands': netns_lab.plan_document(spec)['commands'],
             'acceptance': 'same original tuple/SYN/TLS/phase sequences; native exact IPv4/IPv6 and TCP bytes; natural bounded carrier-loss failure; owned cleanup',
-            'graceful_close': False, 'suite': 'integrity',
-            'not_qualified': ['AEAD native confidentiality', 'protected clean close', 'impairment recovery',
+            'graceful_close': False, 'suite': suite,
+            'not_qualified': ['offline cryptographic verification', 'protected clean close', 'impairment recovery',
                               'congestion', 'PMTU/NAT/middleboxes', 'hot switching', 'other platforms']}
 
 
@@ -195,6 +197,23 @@ def phase_payload(data: bytes, lane: int, direction: int) -> dict | None:
             'retired': int.from_bytes(plain[28:36], 'big'), 'right_edge': int.from_bytes(plain[36:44], 'big')}
     if kind == 1: result['hello'] = hello_proofs(body)
     return result
+
+
+def opaque_phase_payload(data: bytes, lane: int, direction: int) -> dict | None:
+    """Read only clear AEAD framing; ciphertext and tag remain unverified opaque bytes."""
+    if not (data[:1] == b'\x48' and data[4:6] == b'LD'):
+        return None
+    if (type(lane) is not int or lane not in (0, 1) or direction not in (1, 2)
+            or not 112 <= len(data) <= 1160 or data[:4] != bytes([0x48, 0, 0, lane])):
+        raise ValueError('invalid opaque protected lane prefix/length')
+    h = data[4:48]
+    length = int.from_bytes(h[40:42], 'big')
+    if (h[:6] != bytes([0x4c, 0x44, 1, 1, 1, direction]) or h[6:8] != bytes(2)
+            or h[42:44] != bytes(2) or int.from_bytes(h[24:28], 'big') != lane
+            or int.from_bytes(h[28:32], 'big') != 1 or len(data) != 48 + length + 16):
+        raise ValueError('invalid fixed AEAD datagram context/length')
+    return {'session': h[8:24].hex(), 'number': int.from_bytes(h[32:40], 'big'),
+            'encrypted_payload_bytes': length}
 
 
 def hello_proofs(body: bytes) -> dict:
@@ -399,6 +418,153 @@ def audit_underlay(path: Path, lanes: int) -> dict:
             'audit': 'untrusted_integrity_structure_plus_actual_authenticated_runtime_outcome'}
 
 
+def audit_aead_underlay(path: Path, lanes: int) -> dict:
+    """Qualify visible continuity only; encrypted transition proofs are runtime-owned."""
+    if type(lanes) is not int or lanes not in (1, 2):
+        raise ValueError('invalid physical lane count')
+    packets, flows = bounded.read_pcap(path), {}
+    wanted = [(('192.0.2.2', a, '192.0.2.6', b), ('192.0.2.6', b, '192.0.2.2', a))
+              for a, b in retained.PORTS[:lanes]]
+    for packet in packets:
+        if packet.protocol != 6 or packet.raw[0] >> 4 != 4 or len(packet.raw) > 1200 or packet.flags & 5:
+            raise ValueError('foreign protocol or outer FIN/RST')
+        key = (packet.source, packet.source_port, packet.destination, packet.destination_port)
+        lane = next((i for i, pair in enumerate(wanted) if key in pair), None)
+        if lane is None:
+            raise ValueError('capture has a new/foreign raw tuple')
+        direction = 1 if key == wanted[lane][0] else 2
+        tcp, data = tcp_parts(packet)
+        ack, window = int.from_bytes(tcp[8:12], 'big'), int.from_bytes(tcp[14:16], 'big')
+        state = flows.setdefault(key, {'lane': lane, 'direction': direction, 'syn': set(),
+            'syn_profiles': set(), 'old_wire': set(), 'tls': [], 'phase': [], 'acks': set()})
+        if packet.flags & 2:
+            if data or packet.flags != (2 if direction == 1 else 18):
+                raise ValueError('invalid original handshake flags')
+            state['syn'].add(packet.sequence)
+            state['syn_profiles'].add(syn_profile(tcp))
+        if packet.flags & 16:
+            state['acks'].add(ack)
+        protected = opaque_phase_payload(data, lane, direction) if data else None
+        if protected is None and packet.flags & 16 and not packet.flags & 2:
+            state['old_wire'].add(((packet.sequence + len(data)) & 0xffffffff, ack, window))
+        if data:
+            if protected is None:
+                state['tls'].append((packet.sequence, data, packet.flags))
+            else:
+                if packet.flags != 24 or len(tcp) - len(data) != 20:
+                    raise ValueError('phase is not the fixed header/MTU profile')
+                state['phase'].append((packet.sequence, ack, data, protected, window))
+    if len(flows) != 2 * lanes:
+        raise ValueError('missing original lane direction')
+    # Finish all TLS streams before relating opaque sequence/ACK ranges to peers.
+    for key, state in flows.items():
+        if len(state['syn']) != 1 or len(state['syn_profiles']) != 1 or not state['phase']:
+            raise ValueError('missing/changed original SYN or phase continuation')
+        base, stream = (next(iter(state['syn'])) + 1) & 0xffffffff, bytearray()
+        peer = flows[(key[2], key[3], key[0], key[1])]
+        if base not in peer['acks']:
+            raise ValueError('original SYN not acknowledged')
+        for sequence, data, flags in sorted(state['tls'], key=lambda row: (row[0] - base) & 0xffffffff):
+            offset = (sequence - base) & 0xffffffff
+            if (flags == 16 and len(data) == 1 and offset < len(stream)
+                    and ((sequence + 1) & 0xffffffff) in peer['acks']):
+                continue
+            if offset > len(stream):
+                raise ValueError('TLS bootstrap sequence gap')
+            overlap = min(len(data), len(stream) - offset)
+            if stream[offset:offset + overlap] != data[:overlap]:
+                raise ValueError('conflicting TLS retransmission')
+            stream.extend(data[overlap:])
+        records = retained.tls_records(bytes(stream))
+        if state['direction'] == 1:
+            retained.client_hello_without_sni(records[0][1])
+        elif records[0][1][:1] != b'\x02':
+            raise ValueError('missing original ServerHello')
+        state.update(base=(base + len(stream)) & 0xffffffff, tls_bytes=len(stream),
+                     tls_records=len(records), tls_sha256=hashlib.sha256(stream).hexdigest())
+    details, sessions = [], {}
+    for key, state in flows.items():
+        peer = flows[(key[2], key[3], key[0], key[1])]
+        own_syn, peer_syn = next(iter(state['syn_profiles'])), next(iter(peer['syn_profiles']))
+        scale = own_syn[0] if own_syn[0] is not None and peer_syn[0] is not None else 0
+        windows = sorted({window for sequence, ack, window in state['old_wire']
+                          if sequence == state['base'] and ack == peer['base']})
+        horizons = {(min(32768, window << scale) >> scale) << scale for window in windows}
+        if len(horizons) != 1:
+            raise ValueError('missing or ambiguous original TCP window witness')
+        effective = next(iter(horizons))
+        if effective < 9 * (1200 - 40) or effective >> scale > 65535:
+            raise ValueError('captured effective horizon outside production bounds')
+        seen, identities = {}, set()
+        for sequence, ack, data, phase, window in state['phase']:
+            number = phase['number']
+            wire = (sequence, ack, data, window)
+            if number in seen:
+                if seen[number] != wire:
+                    raise ValueError('packet nonce reused with different wire bytes')
+                continue
+            seen[number] = wire
+            if sequence < state['base'] or sequence + len(data) >= 0xffffffff or window != effective >> scale:
+                raise ValueError('opaque phase sequence/window mismatch or wrap')
+            identities.add(phase['session'])
+        if len(identities) != 1 or sorted(seen) != list(range(len(seen))):
+            raise ValueError('changed opaque session or missing protected counter prefix')
+        cursor = state['base']
+        for number in range(len(seen)):
+            sequence, _, data, _ = seen[number]
+            if sequence != cursor:
+                raise ValueError('opaque phase byte range reused or sequence gap')
+            cursor += len(data)
+        state['ends'] = {state['base']} | {seq + len(data) for seq, _, data, _ in seen.values()}
+        state['identity'] = next(iter(identities))
+        sessions.setdefault(state['lane'], set()).add(state['identity'])
+        details.append({'tuple': list(key), 'isn': next(iter(state['syn'])),
+                        'tls_bytes': state['tls_bytes'], 'tls_records': state['tls_records'],
+                        'tls_sha256': state['tls_sha256'], 'phase_base': state['base'],
+                        'original_window_candidates': windows, 'negotiated_scale': scale,
+                        'effective_horizon': effective, 'session': state['identity'],
+                        'unique_opaque_phase_packets': len(seen)})
+    if any(len(ids) != 1 for ids in sessions.values()):
+        raise ValueError('peer opaque session identity mismatch')
+    for key, state in flows.items():
+        peer = flows[(key[2], key[3], key[0], key[1])]
+        if any(ack not in peer['ends'] for _, ack, _, _, _ in state['phase']):
+            raise ValueError('opaque phase ACK is not an observed peer boundary')
+    return {'pcap': path.name, 'sha256': bounded.file_hash(path), 'ip_packets': len(packets),
+            'streams': sorted(details, key=lambda row: row['tuple']), 'outer_fin_rst': 0,
+            'audit': 'opaque_AEAD_structure_plus_actual_authenticated_runtime_outcome',
+            'decrypts_or_verifies_tags': False, 'inspects_transition_or_data_kinds': False}
+
+
+def audit_aead_captured_peers(paths: dict[str, Path], lanes: int) -> dict:
+    result = {side: audit_aead_underlay(path, lanes) for side, path in paths.items()}
+    def bootstrap(value):
+        return [{k: v for k, v in row.items() if k != 'unique_opaque_phase_packets'}
+                for row in value['streams']]
+    if set(result) != {'a', 'b'} or bootstrap(result['a']) != bootstrap(result['b']):
+        raise ValueError('captured peers disagree on original bootstrap/opaque session boundaries')
+    seen = {}
+    for side, path in paths.items():
+        records = {}
+        for packet in bounded.read_pcap(path):
+            tcp, data = tcp_parts(packet)
+            lane = next(i for i, ports in enumerate(retained.PORTS[:lanes]) if packet.source_port in ports)
+            direction = 1 if packet.source == '192.0.2.2' else 2
+            item = opaque_phase_payload(data, lane, direction) if data else None
+            if item is not None:
+                records[(lane, direction, item['number'])] = (
+                    packet.sequence, tcp[8:12], tcp[14:16], hashlib.sha256(data).hexdigest())
+        seen[side] = records
+    common = seen['a'].keys() & seen['b'].keys()
+    if any(seen['a'][key] != seen['b'][key] for key in common):
+        raise ValueError('same opaque counter differs across captures')
+    if any(not any(key[:2] == (lane, direction) for key in common)
+           for lane in range(lanes) for direction in (1, 2)):
+        raise ValueError('no identical opaque packets at both original lane owners')
+    return {'peers': result, 'common_opaque_phase_packets': len(common),
+            'scope': 'opaque framing only; authenticated native delivery is checked separately; final loss may change counter tails'}
+
+
 def audit_native(paths: dict[str, Path], flows: list[dict]) -> dict:
     packets = {side: bounded.read_pcap(path) for side, path in paths.items()}
     if set(packets) != {'a', 'b'} or not packets['a']:
@@ -435,7 +601,11 @@ def audit_native(paths: dict[str, Path], flows: list[dict]) -> dict:
     return {'exact_native_packet_multiset': True, 'ip_packets_each_side': len(packets['a']), 'streams': streams}
 
 
-def audit_captured_peers(paths: dict[str, Path], lanes: int) -> dict:
+def audit_captured_peers(paths: dict[str, Path], lanes: int, suite: str = 'integrity') -> dict:
+    if suite == 'aead':
+        return audit_aead_captured_peers(paths, lanes)
+    if suite != 'integrity':
+        raise ValueError('unsupported protection suite')
     result = {side: audit_underlay(path, lanes) for side, path in paths.items()}
     if set(result) != {'a', 'b'} or result['a']['streams'] != result['b']['streams']:
         # Counter tails legitimately differ after intentional loss. Compare the
@@ -771,7 +941,7 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
         for key, value in counts.items():
             if len(bounded.read_pcap(paths[key])) != value['captured']:
                 raise ValueError('capture file/counter mismatch')
-        audit = audit_captured_peers({side: paths[side + '_wan'] for side in ('a', 'b')}, lanes)
+        audit = audit_captured_peers({side: paths[side + '_wan'] for side in ('a', 'b')}, lanes, plan['suite'])
         native = audit_native({side: paths[side + '_native'] for side in ('a', 'b')}, plan['flows'])
         stage('completed', capture_counts=counts, underlay_audit=audit, native_audit=native,
               capture_sha256={key: bounded.file_hash(path) for key, path in paths.items()},
@@ -816,14 +986,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--lab-id', default='rawpkt')
-    parser.add_argument('--output', type=Path, default=ROOT / 'work/raw-packet-native')
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--suite', choices=('integrity', 'aead'), default='integrity')
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/l2tunnel-linux')
     parser.add_argument('--build-receipt', type=Path)
     parser.add_argument('--state-dir', type=Path, default=Path('/run/l2tunnel-labs'))
     parser.add_argument('--only-case', choices=[f'{layer}-{mode}-clean' for layer in ('tap', 'tun') for mode in ('full', 'half')])
     parser.add_argument('--frozen-worker', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    plans = [case_plan(args.lab_id, layer, duplex) for layer in ('tap', 'tun') for duplex in ('full', 'half')
+    args.output = args.output or ROOT / ('work/raw-packet-native' + ('-aead' if args.suite == 'aead' else ''))
+    plans = [case_plan(args.lab_id, layer, duplex, args.suite) for layer in ('tap', 'tun') for duplex in ('full', 'half')
              if args.only_case is None or args.only_case == f'{layer}-{duplex}-clean']
     if not args.apply:
         print(json.dumps({'status': 'dry_run', 'cases': plans, 'output': str(args.output),
@@ -853,6 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         (output / 'launch-sources.json').write_text(json.dumps(source_hashes(), sort_keys=True) + '\n')
         identity = output.stat()
         arguments = [sys.executable, str(harness), '--apply', '--lab-id', args.lab_id, '--output', str(output),
+                     '--suite', args.suite,
                      '--binary', str(binary), '--build-receipt', str(output / 'build-receipt.json'),
                      '--state-dir', str(args.state_dir.resolve()), '--frozen-worker', f'{identity.st_dev}:{identity.st_ino}']
         if args.only_case: arguments.extend(['--only-case', args.only_case])
@@ -875,7 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(launch_sources, dict) or any(launch_sources.get(k) != v for k, v in hashes.items()):
         raise ValueError('launch helper hashes differ from exact build')
     receipt = bounded.Receipt(output / 'receipt.json', {'status': 'running', 'cleanup': 'pending',
-        'scope': 'four clean integrity TAP/TUN full/half raw packet cases with expected carrier-loss failure',
+        'scope': f'clean {args.suite} TAP/TUN full/half raw packet cases with expected carrier-loss failure',
+        'suite': args.suite,
         'graceful_close': False, 'cases': [], 'execution': 'copied_helpers_exact_build_sources',
         'binary_sha256': bounded.file_hash(binary), 'build_receipt_sha256': bounded.file_hash(output / 'build-receipt.json'),
         'executed_helper_sha256': hashes, 'binary_build_source_sha256': build['source_sha256_after'],
