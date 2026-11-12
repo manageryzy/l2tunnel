@@ -25,6 +25,8 @@ use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use zeroize::Zeroizing;
 
+pub mod https_request;
+
 const AUTH_VERSION: u8 = 1;
 const MAX_BODY: usize = 192;
 const CHALLENGE: u8 = 1;
@@ -47,6 +49,8 @@ pub enum ChannelTransport {
     QuicTls,
     /// TLS records over the standalone reliable OpenVPN-like UDP control profile.
     OpenVpnLikeTls,
+    /// Genuine verified TLS with HTTP/2 POST streaming on the same connection.
+    HttpsH2,
 }
 
 impl ChannelTransport {
@@ -56,6 +60,7 @@ impl ChannelTransport {
             Self::TcpTls => EXPORTER_LABEL,
             Self::QuicTls => b"EXPORTER-l2tunnel-quic-member-proof-v1",
             Self::OpenVpnLikeTls => b"EXPORTER-l2tunnel-openvpn-like-member-proof-v1",
+            Self::HttpsH2 => b"EXPORTER-l2tunnel-https-h2-member-proof-v1",
         }
     }
 
@@ -64,6 +69,7 @@ impl ChannelTransport {
             Self::TcpTls => TRANSCRIPT_DOMAIN,
             Self::QuicTls => b"l2tunnel/member-auth/quic/v1\0",
             Self::OpenVpnLikeTls => b"l2tunnel/member-auth/openvpn-like/v1\0",
+            Self::HttpsH2 => b"l2tunnel/member-auth/https-h2/v1\0",
         }
     }
 }
