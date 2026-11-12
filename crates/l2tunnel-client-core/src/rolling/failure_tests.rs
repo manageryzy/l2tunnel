@@ -290,8 +290,36 @@ async fn rolling_actual_connect_cancellation_releases_both_lane_socket_owners() 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> TestResult {
+    use std::{future::Future, task::Poll};
+
+    // Real QUIC I/O must not race a100ms CPU/scheduler allowance. Both Quinn's
+    // TokioRuntime and the client use this injected clock. Keep it from idle
+    // auto-advance, and bound actual socket/crypto progress independently.
+    async fn wall_bound<F: Future>(
+        operation: F,
+        deadline: std::time::Instant,
+    ) -> io::Result<F::Output> {
+        tokio::pin!(operation);
+        std::future::poll_fn(|cx| {
+            if std::time::Instant::now() >= deadline {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "real QUIC fixture wall watchdog exhausted",
+                )));
+            }
+            match operation.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(Ok(value)),
+                Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     let c = credentials()?;
     let settings = settings()?;
     let config = ConnectionConfig {
@@ -300,6 +328,7 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
     };
     let (a, b) = endpoints(Duplex::Half)?;
     let (profile, records) = quic_config(config, as_quic(b), &settings)?;
+    let base = runtime::quic_base_session_config(config.runtime(), profile, records)?;
     let tls = l2tunnel_quic::ServerConfig::from_der(
         &c.chain,
         &c.key,
@@ -311,6 +340,19 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
         },
     )?;
     let listener = l2tunnel_quic::ServerEndpoint::bind(b.forward.local, &tls)?;
+    let reverse = b.reverse.ok_or("server reverse")?;
+    // Receive the second lane's genuine Initial without answering it. This
+    // witnesses completed client first-lane authentication and avoids an ICMP
+    // refusal substituting for the intended incomplete second handshake.
+    let blackhole = tokio::net::UdpSocket::bind(reverse.local).await?;
+    let client_reverse = a.reverse.ok_or("client reverse")?;
+    let mut clock = tokio::task::JoinSet::new();
+    clock.spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let wall_deadline = std::time::Instant::now() + Duration::from_secs(3);
     let started = Instant::now();
     let mut attempt = Box::pin(connect_quic(
         &c.chain,
@@ -320,40 +362,77 @@ async fn rolling_half_quic_first_lane_auth_keeps_original_pair_deadline() -> Tes
         as_quic(a),
         &settings,
     ));
-    let peer = async {
-        sleep(Duration::from_millis(100)).await;
-        listener
-            .accept(
-                &c.members,
-                runtime::quic_base_session_config(config.runtime(), profile, records)?,
-            )
-            .await
-    };
-    let retained = tokio::select! {result=&mut attempt=>return Err(format!("first QUIC lane failed before original pair wait: {:?}",result.err()).into()),result=peer=>result?};
-    assert!(tokio::net::UdpSocket::bind(a.forward.local).await.is_err());
+    // Start the original allowance before delaying the peer's first accept.
+    let initial = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
     assert!(
-        tokio::net::UdpSocket::bind(a.reverse.ok_or("reverse")?.local)
-            .await
-            .is_err()
+        initial.is_pending(),
+        "setup ended before the first peer accept"
     );
-    let result = attempt.await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let retained = wall_bound(
+        async {
+            tokio::select! {
+                result=&mut attempt=>Err(io::Error::other(format!("first QUIC lane failed before original pair wait: {:?}",result.err()))),
+                result=listener.accept(&c.members,base)=>result.map_err(io::Error::other),
+            }
+        },
+        wall_deadline,
+    )
+    .await??;
+    let mut packet = [0; 1500];
+    let (length, peer) = wall_bound(
+        async {
+            tokio::select! {
+                result=&mut attempt=>Err(io::Error::other(format!("setup ended before second Initial: {:?}",result.err()))),
+                result=blackhole.recv_from(&mut packet)=>result,
+            }
+        },
+        wall_deadline,
+    )
+    .await??;
+    assert_eq!(peer, client_reverse.local);
+    assert!(length >= 1200, "missing full QUIC Initial datagram");
+    assert_eq!(packet[0] & 0xf0, 0xc0); // QUIC v1 long-header Initial.
+    assert_eq!(&packet[1..5], &1u32.to_be_bytes());
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    for endpoint in [a.forward.local, client_reverse.local] {
+        assert_eq!(
+            tokio::net::UdpSocket::bind(endpoint)
+                .await
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse)
+        );
+    }
+    tokio::time::advance(Duration::from_millis(99)).await;
+    let early = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+    assert!(early.is_pending(), "original setup ended before200ms");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let expired = std::future::poll_fn(|cx| Poll::Ready(attempt.as_mut().poll(cx))).await;
+    let Poll::Ready(result) = expired else {
+        return Err("original200ms setup bound was renewed after first authentication".into());
+    };
     assert_eq!(
         result.err().ok_or("missing QUIC pair timeout")?.kind(),
         io::ErrorKind::TimedOut
     );
-    assert!(started.elapsed() < Duration::from_millis(275));
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let one = tokio::net::UdpSocket::bind(a.forward.local).await;
-            let two = tokio::net::UdpSocket::bind(a.reverse.ok_or("reverse")?.local).await;
-            if one.is_ok() && two.is_ok() {
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+    assert_eq!(started.elapsed(), config.handshake_timeout);
+    drop(attempt);
+    wall_bound(
+        async {
+            loop {
+                let one = tokio::net::UdpSocket::bind(a.forward.local).await;
+                let two = tokio::net::UdpSocket::bind(client_reverse.local).await;
+                if one.is_ok() && two.is_ok() {
+                    return;
+                }
+                drop((one, two));
+                tokio::task::yield_now().await;
             }
-            drop((one, two));
-            sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await??;
-    drop((retained, listener));
+        },
+        wall_deadline,
+    )
+    .await?;
+    drop((retained, listener, blackhole, clock));
     Ok(())
 }

@@ -88,6 +88,7 @@ opens another socket just to furnish status.
 - [x] [MOD-ROLLINGCL-04A] Pass scoped tests, strict lint/docs/formatting and exact-file review receipt. Evidence: [113 library and 19 example tests, strict checks and exact files](../../work/rolling-client19/validation.json).
 - [ ] [MOD-ROLLINGCL-05] Qualify separately selected native owned-lab/capture, large-window service and full Python-family behavior before closing parent gates.
 - [ ] [MOD-ROLLINGCL-06] Require and bind the version2 canonical bandwidth/RTT/byte/record delivery policy through the shared API, CLI and native harness. Reject old/missing/unknown policies and prove each field changes authentication; pass the actual carrier/layer/duplex matrix and root aggregate before accepting the replacement.
+- [x] [MOD-ROLLINGCL-07] Anchor the paired-QUIC deadline fixture to actual first-lane authentication and second-lane Initial, advancing the controlled clock across the original 200 ms deadline. Reject a renewed inner pairing budget and prove socket release. Evidence: [positive and negative fixture receipt](../../work/client-fixture-deadlines26b/validation.json). No production deadline was increased.
 
 ## Finite evidence and operating boundary
 

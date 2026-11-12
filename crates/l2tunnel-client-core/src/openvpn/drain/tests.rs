@@ -672,8 +672,21 @@ async fn actual_private_socket_acceptance_terminal_and_five_second_local_only_gr
     da.change(|s| s.outgoing.push_back(packet(PacketLayer::Ip, 17)))?;
     db.change(|s| s.blocked = true)?;
     let (ha, ra) = a.into_run(da.clone())?;
-    let (_hb, rb) = b.into_run(db.clone())?;
-    let ja = tokio::spawn(serve(
+    // Record the genuine native future's completion at its source, not after
+    // waiting for the remote runner or a later status poll. The original
+    // completion owner and actual result remain unchanged.
+    let (finished, observed) = tokio::sync::oneshot::channel();
+    let Run { future, completion } = ra;
+    let ra = Run {
+        future: Box::pin(async move {
+            let result = future.await;
+            let _ = finished.send(Instant::now());
+            result
+        }),
+        completion,
+    };
+    let (hb, rb) = b.into_run(db.clone())?;
+    let mut ja = tokio::spawn(serve(
         ra,
         ha.clone(),
         crate::Compression::Lz4IfSmaller,
@@ -681,7 +694,7 @@ async fn actual_private_socket_acceptance_terminal_and_five_second_local_only_gr
         Duration::ZERO,
         Duration::from_secs(5),
     ));
-    let jb = tokio::spawn(rb);
+    let mut jb = tokio::spawn(rb);
     timeout(Duration::from_secs(1), async {
         while da.change(|s| s.reads)? == 0 {
             sleep(Duration::from_millis(1)).await;
@@ -725,15 +738,17 @@ async fn actual_private_socket_acceptance_terminal_and_five_second_local_only_gr
         "unsupported"
     );
     db.change(|s| s.blocked = false)?;
-    timeout(Duration::from_secs(6), jb).await???;
-    timeout(Duration::from_secs(2), async {
-        while ha.snapshot()?.terminal.is_none() {
-            sleep(Duration::from_millis(2)).await;
-        }
-        Ok::<_, io::Error>(())
-    })
-    .await??;
-    let terminal_observed = Instant::now();
+    // One existing six-second network bound covers both actual completions.
+    let network_deadline = Instant::now() + Duration::from_secs(6);
+    let terminal_recorded = tokio::time::timeout_at(network_deadline, observed)
+        .await
+        .map_err(|e| {
+            format!(
+                "local network completion: {e}; local={:?}; peer={:?}",
+                ha.snapshot(),
+                hb.snapshot()
+            )
+        })??;
     let status = api::request(&path, &request(api::Action::Status {})).await?;
     assert!(matches!(
         status
@@ -745,11 +760,28 @@ async fn actual_private_socket_acceptance_terminal_and_five_second_local_only_gr
     let closed = api::request(&path, &request(api::Action::DrainOpenVpn {})).await?;
     assert!(!closed.ok);
     assert_eq!(closed.code, "closed");
+    tokio::time::timeout_at(network_deadline, &mut jb)
+        .await
+        .map_err(|e| {
+            format!(
+                "peer network completion: {e}; local={:?}; peer={:?}",
+                ha.snapshot(),
+                hb.snapshot()
+            )
+        })???;
     // Network owners are gone during local grace; all original UDP tuples can rebind.
     rebind(addresses).await?;
     assert!(!ja.is_finished());
-    timeout(Duration::from_secs(6), ja).await???;
-    assert!(terminal_observed.elapsed() >= Duration::from_secs(4));
+    tokio::time::timeout_at(terminal_recorded + Duration::from_secs(6), &mut ja)
+        .await
+        .map_err(|e| {
+            format!(
+                "local-only grace completion after {:?}: {e}; local={:?}",
+                terminal_recorded.elapsed(),
+                ha.snapshot()
+            )
+        })???;
+    assert!(terminal_recorded.elapsed() >= Duration::from_secs(5));
     assert!(!path.exists());
     Ok(())
 }

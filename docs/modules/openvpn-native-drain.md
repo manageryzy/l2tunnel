@@ -328,3 +328,4 @@ calling native close after its inner carrier is already clean but the original
 native deadline has expired.
 
 - [x] [MOD-OVPNDRAIN-08A] Test secondary Close overtaking a delayed primary native ACK with only one ready peer, retained-close expiry, already-Clean lane waiting, and expired native close after an inner clean carrier. Evidence: [genuine paired skew and deadline tests](../../crates/l2tunnel-openvpn/src/native/tests.rs), [bounded deferred-close owner](../../crates/l2tunnel-openvpn/src/heartbeat.rs).
+- [x] [MOD-OVPNDRAIN-08B] Measure the five-second local API grace from actual runtime completion instead of a potentially late observer after peer completion. Verify the old assertion fails with observer lag and the corrected fixture passes at the same lag without changing runtime deadlines. Evidence: [causal fixture receipt](../../work/client-fixture-deadlines26b/validation.json). The earlier aggregate timeout phase remains unconfirmed.
