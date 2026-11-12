@@ -25,7 +25,7 @@ protocol crates remain independent of Tokio, OS handles, clocks and privileges.
 | Source project | Responsibilities | Consumers and boundary |
 | --- | --- | --- |
 | Existing `crates/l2tunnel*` protocol crates | Packet processing, authenticated session, peer management, MUX, QoS, recovery and codec state machines | Portable embedding API; injected time and I/O |
-| Existing partial `crates/l2tunnel-client-core` | Connection orchestration and shared CLI; full profile/service lifecycle remains planned | Shared by native services and CLI/GUI orchestration; no widgets or shell commands |
+| Existing partial `crates/l2tunnel-client-core` | Shared managed TCP lifecycle and CLI; other profile lifecycles remain separate | Typed service ownership for connect/cancel/abort/reconnect/apply; portable command schema, separate Unix IPC; no widgets |
 | Existing `client-core::local`; possible later `l2tunnel-control-api` crate | Bounded Unix status/switch schema; richer events, revisions and operation IDs remain planned | Service/client boundary; distinct from the peer wire protocol |
 | Existing partial `crates/l2tunnel-runtime` | Async execution, timers, socket ownership and managed device forwarding; persistence/telemetry remain planned | Runtime outside public protocol API; injected backend interfaces for client-core |
 | Existing partial `crates/l2tunnel-platform-linux` | TAP/TUN descriptors; helper, network setup and service lifecycle remain planned | Linux-only adapter with one documented ioctl FFI boundary |

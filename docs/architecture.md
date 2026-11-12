@@ -51,8 +51,10 @@ The current runtime still has four audited integration gaps, tracked as blocking
 storage/native-flight/recovery budgets, interchangeable carrier and user recovery,
 a negotiated stable session control envelope, and a shared client lifecycle.
 Focused base UDP/QUIC/raw delivery integration addresses the first boundary;
-common legacy parser, protected-datagram owner and existing-session command
-extractions address only parts of the other three. These do not complete the
+the pure common-control codec and managed TCP service address parts of the other
+three. The service owns accepted setup deadlines, cancellation and reconnect
+cleanup; portable command types are separate from Unix IPC. Other profile
+lifecycle paths and negotiated common-control dispatch remain open. These do not complete the
 conceptual stack or authorize unchecked combinations. Each composition must
 bind its selected policies before I/O and reject unsupported combinations.
 

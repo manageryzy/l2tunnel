@@ -32,6 +32,9 @@ mod profiling;
 #[path = "openvpn/cli.rs"]
 mod standalone;
 
+#[cfg(target_os = "linux")]
+#[path = "service_cli.rs"]
+mod service_frontend;
 const HELP: &str = "l2tunnel serve --listen IP:PORT --device NAME --layer tap|tun --cert DER --key PKCS8 --allow-key RAW32 [--duplex half|full]\nl2tunnel connect --remote IP:PORT --device NAME --layer tap|tun --ca DER --server-name DNS --identity PKCS8 [--duplex half|full]\nl2tunnel keygen --private NEW_PKCS8_FILE --public NEW_RAW32_FILE\nOptions: --max-packet 40..65519 (default 1600); --compression off|lz4 (default off). Default carrier: TCP/TLS 1.3; no SNI. Default duplex: half (two carriers). Replace --device with --vxlan-bind IP:PORT --vxlan-peer IP:PORT --vni N for a point-to-point Ethernet VTEP. Optional --control-socket PATH exposes a private local service API. Commands: status --control-socket PATH; set-compression --control-socket PATH --compression off|lz4. Interface setup/routes belong to the caller.";
 fn input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -495,7 +498,6 @@ fn aligned_settings(
 }
 #[cfg(target_os = "linux")]
 enum Connected {
-    Tcp(Link),
     Active(Link, super::active::Settings),
     ActiveManaged(Link, super::active_managed::Config),
     Udp(
@@ -530,6 +532,7 @@ enum Connected {
     ),
 }
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 enum DeviceSpec {
     Native(String),
     Vxlan {
@@ -648,6 +651,22 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
         })
         .transpose()?;
     let device_spec = DeviceSpec::parse(options, config)?;
+    if transport.is_none()
+        && quic.is_none()
+        && aligned.is_none()
+        && packed.is_none()
+        && active.is_none()
+    {
+        return service_frontend::execute(
+            command,
+            options,
+            config,
+            device_spec,
+            delivery,
+            profile_interval,
+        )
+        .await;
+    }
     let api = options
         .get("--control-socket")
         .map(super::local::Server::bind)
@@ -760,19 +779,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     settings,
                 )
             } else {
-                Connected::Tcp(if let Some(delivery) = delivery {
-                    super::connect_with_delivery(
-                        remote,
-                        &tls,
-                        server_name,
-                        &identity,
-                        config,
-                        delivery,
-                    )
-                    .await?
-                } else {
-                    connect(remote, &tls, server_name, &identity, config).await?
-                })
+                return Err(input("managed TCP lifecycle selection was not dispatched"));
             }
         }
         "serve" => {
@@ -870,12 +877,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                         settings,
                     )
                 } else {
-                    Connected::Tcp(if let Some(delivery) = delivery {
-                        super::accept_with_delivery(&listener, &tls, &allowlist, config, delivery)
-                            .await?
-                    } else {
-                        accept(&listener, &tls, &allowlist, config).await?
-                    })
+                    return Err(input("managed TCP lifecycle selection was not dispatched"));
                 }
             }
         }
@@ -886,7 +888,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
         "Authenticated {:?} {:?}; forwarding packet device",
         config.layer, config.duplex
     );
-    let link = match link {
+    match link {
         Connected::ActiveManaged(link, settings) => {
             println!(
                 "Carrier: tcp-tls; managed active TUN policy catalog; initial channels {}; {} targets",
@@ -897,7 +899,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     "static bootstrap"
                 }
             );
-            return run_active_managed(
+            run_active_managed(
                 device,
                 link,
                 config.runtime(),
@@ -905,7 +907,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 api,
                 number(options, "--active-stats-ms", 0)?,
             )
-            .await;
+            .await
         }
         Connected::Active(link, settings) => {
             println!(
@@ -917,14 +919,14 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                     "static bootstrap"
                 }
             );
-            return run_active(
+            run_active(
                 device,
                 link,
                 config.runtime(),
                 settings,
                 number(options, "--active-stats-ms", 0)?,
             )
-            .await;
+            .await
         }
         Connected::AlignedUdp(link, profile, records) => {
             delivery_frontend::report(records.delivery);
@@ -932,14 +934,8 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 "Carrier: UDP with retained TCP/TLS bootstrap/control; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
                 records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
             );
-            return l2tunnel_runtime::aligned::run_udp(
-                device,
-                link,
-                config.runtime(),
-                profile,
-                records,
-            )
-            .await;
+            l2tunnel_runtime::aligned::run_udp(device, link, config.runtime(), profile, records)
+                .await
         }
         Connected::PackedUdp(link, profile, records) => {
             delivery_frontend::report(records.delivery);
@@ -951,14 +947,8 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 records.protocol.work_limit,
                 profile.recovery
             );
-            return l2tunnel_runtime::packed::run_udp(
-                device,
-                link,
-                config.runtime(),
-                profile,
-                records,
-            )
-            .await;
+            l2tunnel_runtime::packed::run_udp(device, link, config.runtime(), profile, records)
+                .await
         }
         Connected::PackedQuic(link, profile, records) => {
             delivery_frontend::report(records.delivery);
@@ -970,14 +960,8 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 records.protocol.work_limit,
                 profile.recovery
             );
-            return l2tunnel_runtime::packed::run_quic(
-                device,
-                link,
-                config.runtime(),
-                profile,
-                records,
-            )
-            .await;
+            l2tunnel_runtime::packed::run_quic(device, link, config.runtime(), profile, records)
+                .await
         }
         Connected::AlignedQuic(link, profile, records) => {
             delivery_frontend::report(records.delivery);
@@ -985,18 +969,8 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 "Carrier: genuine QUIC over UDP only; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
                 records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
             );
-            return l2tunnel_runtime::aligned::run_quic(
-                device,
-                link,
-                config.runtime(),
-                profile,
-                records,
-            )
-            .await;
-        }
-        Connected::Tcp(link) => {
-            println!("Carrier: tcp-tls; coordinated compression enabled");
-            link
+            l2tunnel_runtime::aligned::run_quic(device, link, config.runtime(), profile, records)
+                .await
         }
         Connected::Udp(link, profile, delivery) => {
             delivery_frontend::report(delivery);
@@ -1013,7 +987,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 config.runtime().queue_packets
             );
             let (observations, reporter) = datagram_profiling::channel(profile_interval);
-            return datagram_profiling::observe(
+            datagram_profiling::observe(
                 l2tunnel_runtime::udp::run_observed(
                     device,
                     link,
@@ -1025,7 +999,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 observations,
                 datagram_profiling::Runtime::UdpFrame,
             )
-            .await;
+            .await
         }
         Connected::Quic(link, profile, delivery) => {
             delivery_frontend::report(delivery);
@@ -1042,7 +1016,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 config.runtime().queue_packets
             );
             let (observations, reporter) = datagram_profiling::channel(profile_interval);
-            return datagram_profiling::observe(
+            datagram_profiling::observe(
                 l2tunnel_runtime::quic::run_observed(
                     device,
                     link,
@@ -1054,74 +1028,11 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 observations,
                 datagram_profiling::Runtime::QuicFrame,
             )
-            .await;
-        }
-    };
-    use l2tunnel_runtime::managed::{self, ManagedConfig, Role, TransactionSettings};
-    let (handle, requests) = managed::channel();
-    let (profile_handle, profile_sink) = if let Some(interval) = profile_interval {
-        let (handle, sink) = managed::profiling_channel(interval)?;
-        (Some(handle), Some(sink))
-    } else {
-        (None, None)
-    };
-    let managed_config = ManagedConfig {
-        role: if command == "connect" {
-            Role::Client
-        } else {
-            Role::Server
-        },
-        initial_mode: if let Some(delivery) = delivery {
-            config.mode_with_delivery(delivery)?
-        } else {
-            config.mode()?
-        },
-        transaction_settings: TransactionSettings::default(),
-    };
-    let runtime = async move {
-        if let Some(delivery) = delivery {
-            println!(
-                "Delivery window: bandwidth-RTT; forward {} bps; reverse {} bps; bootstrap {} us; receive cap {} bytes/{} records; local queue {} packets",
-                delivery.forward.target_bandwidth_bps,
-                delivery.reverse.target_bandwidth_bps,
-                delivery.forward.bootstrap_rtt_micros,
-                delivery.forward.max_inflight_bytes,
-                delivery.forward.max_records,
-                config.runtime().queue_packets
-            );
-            managed::run_managed_with_delivery(
-                device,
-                link,
-                config.runtime(),
-                managed_config,
-                requests,
-                delivery,
-                profile_sink,
-            )
-            .await
-        } else {
-            managed::run_managed_with_profile(
-                device,
-                link,
-                config.runtime(),
-                managed_config,
-                requests,
-                profile_sink,
-            )
             .await
         }
-    };
-    let runtime = profiling::observe(runtime, profile_handle);
-    if let Some(api) = api {
-        tokio::select! {
-            result = runtime => result,
-            result = api.serve(|request| crate::session_control::Control::managed(handle.clone()).request(request)) => result,
-        }
-    } else {
-        let _keep_control_alive = handle;
-        runtime.await
     }
 }
+
 #[cfg(target_os = "linux")]
 async fn run_active<D: l2tunnel_device::PacketDevice<Error = io::Error>>(
     device: D,
