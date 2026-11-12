@@ -43,8 +43,12 @@ deadline. Peers reject mismatched or reversed policies before user data flows.
 
 The CLI selects this profile with `--delivery-window bdp --forward-mbps N
 --reverse-mbps N --bootstrap-rtt-ms N`. Both peers use identical canonical
-forward/reverse settings. It currently supports system TCP/TLS frame records;
-the explicit legacy profile remains the comparison baseline. Local queue
+forward/reverse settings. System TCP/TLS frame records retain an explicit legacy
+comparison baseline. Aligned/packed client APIs now require `Settings.delivery`;
+their CLI requires explicit BDP selection over UDP or genuine QUIC. The shared
+strict `delivery::Policy` JSON type also serves rolling configuration and the
+packed capture auditor. These new client paths await their integration check;
+MOD-BDP-04's earlier receipt covers TCP/TLS only. Local queue
 capacity stays64 packets. BDP byte and record limits are independent, and
 receiver pending storage is bounded by the negotiated hard limits. A blocked
 packet is staged once, without dropping it or exempting small TCP ACKs.

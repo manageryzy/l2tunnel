@@ -10,11 +10,13 @@ use tokio::net::TcpListener;
 pub struct Settings {
     /// Common native MUX channel pool, shared by every packet and probe.
     pub channels: u16,
+    /// Canonical native delivery credit, independent of local packet queues.
+    pub delivery: l2tunnel_runtime::managed::DeliveryConfig,
 }
 impl Settings {
     /// Validate explicit record compatibility before credentials/socket/device work.
     pub fn validate(self, config: ConnectionConfig, recovery: udp::RecoveryMode) -> io::Result<()> {
-        config.session()?;
+        config.session_with_delivery(self.delivery)?;
         if !(1..=256).contains(&self.channels)
             || config.compression != Compression::None
             || !matches!(recovery, udp::RecoveryMode::Cauchy { .. })
@@ -37,7 +39,12 @@ pub fn udp_config(
     let profile = udp::runtime_config(config, transport)?;
     Ok((
         profile,
-        runtime::Config::for_udp(config.runtime(), profile, settings.channels)?,
+        runtime::Config::for_udp(
+            config.runtime(),
+            profile,
+            settings.channels,
+            settings.delivery,
+        )?,
     ))
 }
 /// Canonical genuine QUIC and aligned limits; no TCP bootstrap is added.
@@ -50,7 +57,12 @@ pub fn quic_config(
     let profile = quic::runtime_config(config, transport)?;
     Ok((
         profile,
-        runtime::Config::for_quic(config.runtime(), profile, settings.channels)?,
+        runtime::Config::for_quic(
+            config.runtime(),
+            profile,
+            settings.channels,
+            settings.delivery,
+        )?,
     ))
 }
 /// Authenticate explicit aligned UDP lanes and retain their TLS control streams.

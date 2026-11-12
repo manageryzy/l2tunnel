@@ -53,6 +53,7 @@ pub(super) struct Configuration {
     path_mtu: usize,
     max_packet: usize,
     channels: u16,
+    delivery: l2tunnel_client_core::delivery::Policy,
     hold_micros: u64,
     max_units: u8,
     work_limit: usize,
@@ -108,8 +109,8 @@ impl Configuration {
         Ok(())
     }
     pub fn derive(&self) -> Result<Derived> {
-        if self.version != 1 || self.max_packet != 1600 {
-            return Err("requires version 1 and max_packet 1600".into());
+        if self.version != 2 || self.max_packet != 1600 {
+            return Err("requires version 2 and max_packet 1600".into());
         }
         let duplex = match self.duplex {
             DuplexChoice::Half => Duplex::Half,
@@ -138,6 +139,7 @@ impl Configuration {
         };
         let settings = packed::Settings {
             channels: self.channels,
+            delivery: self.delivery.config(self.max_packet)?,
             packing: Options {
                 hold_micros: self.hold_micros,
                 max_units: self.max_units,

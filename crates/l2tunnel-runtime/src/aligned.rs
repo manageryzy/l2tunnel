@@ -18,6 +18,8 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval},
 };
 use udp::{DatagramParts, DatagramPolicy, DatagramReceive, DatagramSend, Lane};
+#[path = "aligned_delivery.rs"]
+mod delivery;
 #[path = "aligned_owner.rs"]
 mod owner;
 use owner::Endpoint;
@@ -26,6 +28,8 @@ pub(super) use owner::Selection;
 /// Immutable native scheduling and actual aligned/Cauchy policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
+    /// Required canonical native flight budgets, independent of local queues.
+    pub delivery: crate::managed::DeliveryConfig,
     /// Complete bounded symbol/recovery/native interpretation.
     pub protocol: protocol::Config,
     /// Existing common MUX and explicit TAP or transparent-TUN QoS policy.
@@ -37,25 +41,28 @@ impl Config {
         runtime: RuntimeConfig,
         transport: udp::Config,
         channels: u16,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         udp::base_session_config(runtime, transport)?;
-        Self::from_policy(runtime, transport.policy()?, channels)
+        Self::from_policy(runtime, transport.policy()?, channels, delivery)
     }
     /// Derive exact budgets from an explicitly Cauchy genuine QUIC transport.
     pub fn for_quic(
         runtime: RuntimeConfig,
         transport: quic::Config,
         channels: u16,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         quic::base_session_config(runtime, transport)?;
-        Self::from_policy(runtime, transport.policy()?, channels)
+        Self::from_policy(runtime, transport.policy()?, channels, delivery)
     }
     fn from_policy(
         runtime: RuntimeConfig,
         policy: DatagramPolicy,
         channels: u16,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
-        let value = Self::derive(runtime, policy, channels, 48)?;
+        let value = Self::derive(runtime, policy, channels, 48, delivery)?;
         value.validate(runtime, policy)?;
         Ok(value)
     }
@@ -64,8 +71,10 @@ impl Config {
         policy: DatagramPolicy,
         channels: u16,
         envelope_bytes: usize,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         runtime.validate()?;
+        delivery.validate(runtime)?;
         let recovery = policy
             .reliable
             .ok_or_else(|| invalid("aligned runtime requires Cauchy recovery"))?;
@@ -84,7 +93,31 @@ impl Config {
             .queue_packets
             .checked_mul(runtime.max_packet)
             .ok_or_else(|| invalid("aligned native queue overflow"))?;
+        let records = delivery
+            .forward
+            .max_records
+            .max(delivery.reverse.max_records);
+        // Encoded lookahead has its own finite pure-codec geometry. It is not
+        // the flight grant or the local MUX queue. Lower-layer pressure retains
+        // original ownership when this bank is full.
+        let lookahead = records
+            .min(2048)
+            .checked_mul(2)
+            .ok_or_else(|| invalid("aligned record count overflow"))?
+            .min(1_048_576 / fragments);
+        let body_bytes = delivery
+            .forward
+            .max_inflight_bytes
+            .max(delivery.reverse.max_inflight_bytes)
+            .checked_add(
+                (records as u64)
+                    .checked_mul(98)
+                    .ok_or_else(|| invalid("aligned body overhead overflow"))?,
+            )
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| invalid("aligned body allocation overflow"))?;
         let value = Self {
+            delivery,
             protocol: protocol::Config {
                 native_policy: match runtime.layer {
                     PacketLayer::Ethernet => NativePolicy::EthernetHeaders,
@@ -104,18 +137,10 @@ impl Config {
                     first_source: aligned_receiver::SourceId(0),
                     record_window: 32767,
                     source_window: recovery.arq.receive_records + recovery.max_restored_packets,
-                    lookahead_records: runtime
-                        .queue_packets
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("aligned record count overflow"))?,
-                    lookahead_bytes: runtime
-                        .queue_packets
-                        .checked_mul(runtime.max_packet + 98)
-                        .ok_or_else(|| invalid("aligned body queue overflow"))?,
-                    lookahead_fragments: runtime
-                        .queue_packets
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_mul(fragments))
+                    lookahead_records: lookahead,
+                    lookahead_bytes: body_bytes,
+                    lookahead_fragments: lookahead
+                        .checked_mul(fragments)
                         .ok_or_else(|| invalid("aligned fragment count overflow"))?,
                     max_fragments_per_record: fragments,
                     lifetime_ticks: u64::try_from(policy.reassembly_timeout.as_millis())
@@ -165,6 +190,8 @@ impl Config {
         runtime: RuntimeConfig,
         policy: DatagramPolicy,
     ) -> io::Result<()> {
+        self.delivery.validate(runtime)?;
+        delivery::validate(self)?;
         runtime.validate()?;
         let native = match runtime.layer {
             PacketLayer::Ethernet => NativePolicy::EthernetHeaders,
@@ -195,11 +222,6 @@ impl Config {
                     .queue_packets
                     .checked_mul(runtime.max_packet)
                     .ok_or_else(|| invalid("aligned queue overflow"))?
-            || self.protocol.receiver.lookahead_records < 2 * runtime.queue_packets
-            || self.protocol.receiver.lookahead_bytes
-                < runtime.queue_packets * (runtime.max_packet + 98)
-            || self.protocol.receiver.lookahead_fragments
-                < 2 * runtime.queue_packets * self.protocol.receiver.max_fragments_per_record
         {
             return Err(invalid(
                 "aligned native policy, queue, format or geometry mismatch",
@@ -210,12 +232,34 @@ impl Config {
     }
 }
 fn bind(base: SessionConfig, config: Config) -> io::Result<SessionConfig> {
-    Ok(bind_policy(
-        base,
-        config.protocol.digest().map_err(io::Error::other)?,
-        config.pipeline,
-        b"l2tunnel/aligned-runtime/v1/common-mux-crc32/control-v1\0",
-    ))
+    bind_delivery(
+        bind_policy(
+            base,
+            config.protocol.digest().map_err(io::Error::other)?,
+            config.pipeline,
+            b"l2tunnel/aligned-runtime/v2/common-mux-crc32/native-identity-credit-v2\0",
+        ),
+        config.delivery,
+    )
+}
+pub(super) fn bind_delivery(
+    base: SessionConfig,
+    delivery: crate::managed::DeliveryConfig,
+) -> io::Result<SessionConfig> {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"l2tunnel/aligned-packed/delivery-policy-v2\0");
+    hash.update(&base.digest.0);
+    hash.update(&delivery.canonical()?);
+    let digest = ConfigDigest(
+        hash.finish()
+            .as_ref()
+            .try_into()
+            .map_err(|_| invalid("aligned delivery digest"))?,
+    );
+    Ok(SessionConfig {
+        layer: base.layer,
+        digest,
+    })
 }
 pub(super) fn bind_policy(
     base: SessionConfig,
@@ -481,24 +525,34 @@ pub async fn run_quic<D: PacketDevice<Error = io::Error>>(
 }
 struct State {
     endpoint: Endpoint,
-    outbound: Option<mpsc::Sender<Vec<u8>>>,
+    outbound: Option<mpsc::Sender<delivery::Outbound>>,
     feedback: watch::Sender<udp::Feedback>,
+    native_feedback: mpsc::Sender<protocol::RecordIdentity>,
     receives: bool,
-    admitted: u64,
-    delivered: u64,
-    peer_delivered: u64,
+    flight: Option<delivery::Flight>,
+    incoming: l2tunnel_flow_control::delivery_window::Config,
     next_channel: u16,
 }
 impl State {
     fn check_retention(&self, runtime: RuntimeConfig) -> io::Result<()> {
-        if self.endpoint.status().receiver.native_records > runtime.queue_packets {
-            return Err(invalid("aligned peer exceeded native delivery window"));
+        let retained = self.endpoint.status().receiver;
+        if retained.native_records > self.incoming.max_records
+            || retained.pending_bytes.is_some_and(|bytes| {
+                bytes as u64 > self.incoming.max_inflight_bytes || bytes > runtime.max_packet
+            })
+        {
+            return Err(invalid("aligned peer exceeded native delivery capacity"));
         }
         Ok(())
     }
-    fn control(&mut self, event: udp::ControlEvent, now: Duration) -> io::Result<()> {
+    fn control(
+        &mut self,
+        event: udp::NativeControlEvent,
+        actual: Duration,
+        now: Duration,
+    ) -> io::Result<()> {
         match event {
-            udp::ControlEvent::Ack(bytes) => {
+            udp::NativeControlEvent::Ack(bytes) => {
                 if self
                     .endpoint
                     .inspect_peer(&bytes)
@@ -511,23 +565,49 @@ impl State {
                     .receive_authenticated(&bytes, now)
                     .map_err(io::Error::other)
             }
-            udp::ControlEvent::Credit(value) => {
-                if value < self.peer_delivered || value > self.admitted {
-                    return Err(invalid("aligned native credit beyond admission"));
-                }
-                self.peer_delivered = value;
-                Ok(())
-            }
+            udp::NativeControlEvent::Delivered { channel, record } => self
+                .flight
+                .as_mut()
+                .ok_or_else(|| invalid("aligned native receipt on receive-only lane"))?
+                .delivered(
+                    protocol::RecordIdentity {
+                        channel: protocol::ChannelId(channel),
+                        record: aligned_receiver::RecordId(record),
+                    },
+                    actual,
+                    now,
+                ),
         }
     }
 }
 pub(super) async fn run_parts<D, C, S, R>(
+    device: D,
+    parts: Vec<DatagramParts<C, S, R>>,
+    initiator: bool,
+    runtime: RuntimeConfig,
+    policy: DatagramPolicy,
+    selection: Selection,
+) -> io::Result<()>
+where
+    D: PacketDevice<Error = io::Error>,
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: DatagramSend,
+    R: DatagramReceive,
+{
+    run_parts_observed(device, parts, initiator, runtime, policy, selection, None).await
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ActorStatus {
+    pub flight: [Option<l2tunnel_flow_control::delivery_window::Status>; 2],
+}
+pub(super) async fn run_parts_observed<D, C, S, R>(
     mut device: D,
     parts: Vec<DatagramParts<C, S, R>>,
     initiator: bool,
     runtime: RuntimeConfig,
     mut policy: DatagramPolicy,
     selection: Selection,
+    observer: Option<watch::Sender<ActorStatus>>,
 ) -> io::Result<()>
 where
     D: PacketDevice<Error = io::Error>,
@@ -550,6 +630,13 @@ where
     let budget = udp::SharedBudget::from_policy(policy, started);
     let mut tasks = JoinSet::new();
     let mut states = Vec::new();
+    let sent_capacity = runtime.queue_packets;
+    let (sent_tx, mut sent_rx) = mpsc::channel(sent_capacity);
+    let role = if initiator {
+        crate::managed::Role::Client
+    } else {
+        crate::managed::Role::Server
+    };
     for (index, part) in parts.into_iter().enumerate() {
         let sends = policy.duplex == Duplex::Full || (index == 0) == initiator;
         let receives = policy.duplex == Duplex::Full || !sends;
@@ -564,7 +651,7 @@ where
         };
         let (reader, writer) = tokio::io::split(part.control);
         let (feedback, changes) = watch::channel(udp::Feedback::default());
-        tasks.spawn(udp::read_control_bound(
+        tasks.spawn(udp::read_native_control_bound_timed(
             reader,
             index,
             control_tx.clone(),
@@ -572,9 +659,11 @@ where
             56,
             policy.control_magic,
         ));
-        tasks.spawn(udp::write_control_bound(
+        let (native_feedback, native_changes) = mpsc::channel(runtime.queue_packets);
+        tasks.spawn(delivery::write_control(
             writer,
             changes,
+            native_changes,
             policy,
             budget.clone(),
         ));
@@ -588,7 +677,12 @@ where
         }
         let outbound = if sends {
             let (tx, rx) = mpsc::channel(1);
-            tasks.spawn(udp::write_datagrams(part.sender, rx));
+            tasks.spawn(delivery::write_datagrams(
+                part.sender,
+                rx,
+                index,
+                sent_tx.clone(),
+            ));
             Some(tx)
         } else {
             None
@@ -598,18 +692,38 @@ where
             outbound,
             feedback,
             receives,
-            admitted: 0,
-            delivered: 0,
-            peer_delivered: 0,
+            native_feedback,
+            incoming: config.delivery.incoming(role),
+            flight: sends
+                .then(|| {
+                    delivery::Flight::new(
+                        config.delivery.outgoing(role),
+                        usize::from(config.pipeline.flows.channels),
+                        config.protocol.receiver.max_fragments_per_record,
+                    )
+                })
+                .transpose()?,
             next_channel: 0,
         });
     }
     drop(control_tx);
     drop(data_tx);
+    drop(sent_tx);
     let mut ticker = interval(runtime.poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut packet = vec![0; l2tunnel_device::READ_BUFFER_BYTES];
     let mut encoded = vec![0; policy.payload_bytes];
+    let mut units = vec![
+        protocol::UnitWitness {
+            identity: protocol::RecordIdentity {
+                channel: protocol::ChannelId(0),
+                record: aligned_receiver::RecordId(0)
+            },
+            index: 0,
+            count: 1,
+        };
+        selection.unit_limit()
+    ];
     let mut ingress: Option<Vec<u8>> = None;
     let mut selected: Option<pipeline::Packet> = None;
     let mut idle_cursor = None;
@@ -622,7 +736,8 @@ where
                 None => std::future::pending().await,
             }}=>{},
             Some(result)=tasks.join_next()=>return match result { Ok(Err(error))=>Err(error), Err(error)=>Err(io::Error::other(error)), Ok(Ok(()))=>Err(invalid("aligned carrier task ended")) },
-            Some((lane,event))=control_rx.recv()=>states[lane].control(event,started.elapsed())?,
+            Some((lane,event,actual))=control_rx.recv()=>states[lane].control(event,delivery::since(started, actual)?,started.elapsed())?,
+            Some(sent)=sent_rx.recv()=>states[sent.lane].flight.as_mut().ok_or_else(||invalid("aligned send callback on receive-only lane"))?.sent(&sent.units,delivery::since(started, sent.at)?,started.elapsed())?,
             Some((lane,bytes))=data_rx.recv()=>{
                 let state=&mut states[lane];
                 if !state.receives || state.endpoint.inspect_peer(&bytes).map_err(io::Error::other)? == l2tunnel_reliable::RecordKind::Feedback { return Err(invalid("aligned datagram role or kind")); }
@@ -630,6 +745,16 @@ where
                 state.check_retention(runtime)?;
             },
             _=ticker.tick()=>{},
+        }
+        // At most one static channel capacity is drained per actor turn; a
+        // concurrently producing writer cannot create an unbounded drain loop.
+        for _ in 0..sent_capacity {
+            let Ok(sent) = sent_rx.try_recv() else { break };
+            states[sent.lane].flight.as_mut().ok_or_else(|| invalid("aligned unexpected send callback"))?
+                .sent(&sent.units, delivery::since(started, sent.at)?, started.elapsed())?;
+        }
+        for state in &mut states {
+            if let Some(flight) = &mut state.flight { flight.tick(started.elapsed())?; }
         }
         retire_registration(&mut pipeline, selected.as_ref(), &mut idle_cursor, started.elapsed())?;
         // Only the explicit packed profile batches native ingress with common
@@ -643,7 +768,7 @@ where
                 staged |= state.endpoint.status().staged_frame;
                 state.endpoint.tick(started.elapsed()).map_err(io::Error::other)?;
                 state.check_retention(runtime)?;
-                progress |= admit_native(state, &mut pipeline, &mut selected, runtime, started.elapsed())?;
+                progress |= admit_native(state, &mut pipeline, &mut selected, started.elapsed())?;
             }
             if !progress && !staged { break; }
         }
@@ -678,19 +803,21 @@ where
                         Err(error) if flow_capacity(&error) => break,
                         Err(error) => return Err(io::Error::other(error)),
                     }
+                    let identity = protocol::RecordIdentity { channel: frame.channel, record: frame.record };
+                    // Reserve exact receipt ownership before the irreversible
+                    // native write. A full control queue retains the same frame.
+                    let receipt = match state.native_feedback.try_reserve() {
+                        Ok(permit) => permit,
+                        Err(mpsc::error::TrySendError::Full(_)) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => return Err(invalid("aligned native feedback writer closed")),
+                    };
                     match device.transmit(frame.bytes) {
                         Ok(()) => {
                             state
                                 .endpoint
                                 .commit_delivery(if selection.burst_limit() == 0 { now } else { started.elapsed() })
                                 .map_err(io::Error::other)?;
-                            state.delivered = state
-                                .delivered
-                                .checked_add(1)
-                                .ok_or_else(|| invalid("aligned native counter exhausted"))?;
-                            state
-                                .feedback
-                                .send_modify(|feedback| feedback.credit = state.delivered);
+                            receipt.send(identity);
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) => return Err(error),
@@ -700,7 +827,7 @@ where
             }
             if state.outbound.is_some() {
                 if selection.burst_limit() == 0 {
-                    admit_native(state, &mut pipeline, &mut selected, runtime, now)?;
+                    admit_native(state, &mut pipeline, &mut selected, now)?;
                 }
                 let outbound = state.outbound.as_ref().ok_or_else(|| invalid("missing aligned sender"))?;
                 let now = if selection.burst_limit() == 0 { now } else { started.elapsed() };
@@ -714,7 +841,8 @@ where
                                     .map_err(io::Error::other)
                             })?
                         {
-                            permit.send(encoded[..length].to_vec());
+                            let count = state.endpoint.outgoing_units(&encoded[..length], &mut units).map_err(io::Error::other)?;
+                            permit.send(delivery::Outbound { bytes: encoded[..length].to_vec(), units: units[..count].to_vec() });
                         }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {}
@@ -740,6 +868,13 @@ where
         if selection.burst_limit() == 0 {
             ingress_step(&mut device, &mut pipeline, &mut ingress, &mut packet, runtime, config, now)?;
         }
+        if let Some(observer) = &observer {
+            let mut status = ActorStatus::default();
+            for (index, state) in states.iter().enumerate() {
+                status.flight[index] = state.flight.as_ref().map(|flight| flight.controller.status(delivery::micros(started.elapsed())?).map_err(io::Error::other)).transpose()?;
+            }
+            observer.send_replace(status);
+        }
     }
     }.await;
     tasks.abort_all();
@@ -751,12 +886,9 @@ fn admit_native(
     state: &mut State,
     pipeline: &mut Pipeline,
     selected: &mut Option<pipeline::Packet>,
-    runtime: RuntimeConfig,
     now: Duration,
 ) -> io::Result<bool> {
-    if state.endpoint.status().staged_frame
-        || state.admitted - state.peer_delivered >= runtime.queue_packets as u64
-    {
+    if state.endpoint.status().staged_frame {
         return Ok(false);
     }
     if selected.is_none() {
@@ -765,18 +897,22 @@ fn admit_native(
     let Some(item) = selected.take() else {
         return Ok(false);
     };
-    let next = state
-        .admitted
-        .checked_add(1)
-        .ok_or_else(|| invalid("aligned admission exhausted"))?;
+    let flight = state
+        .flight
+        .as_mut()
+        .ok_or_else(|| invalid("aligned missing native flight owner"))?;
+    if !flight.preview(item.payload.len(), now)? {
+        *selected = Some(item);
+        return Ok(false);
+    }
     let channel = u8::try_from(item.metadata.binding.channel)
         .map_err(|_| invalid("aligned channel range"))?;
     match state
         .endpoint
-        .enqueue_admitted(protocol::ChannelId(channel), &item.payload, now)
+        .enqueue_identified(protocol::ChannelId(channel), &item.payload, now)
     {
-        Ok(()) => {
-            state.admitted = next;
+        Ok(identity) => {
+            flight.admit(identity, item.payload.len(), now)?;
             Ok(true)
         }
         Err(protocol::Error::Busy) => {

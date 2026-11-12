@@ -21,14 +21,20 @@ impl Selection {
     }
     pub(super) fn control_magic(self) -> [u8; 4] {
         match self {
-            Self::Aligned(_) => *b"L2AC",
-            Self::Packed(_) => *b"L2PC",
+            Self::Aligned(_) => *b"L2A2",
+            Self::Packed(_) => *b"L2P2",
         }
     }
     pub(super) fn burst_limit(self) -> usize {
         match self {
             Self::Aligned(_) => 0,
             Self::Packed(c) => c.protocol.work_limit,
+        }
+    }
+    pub(super) fn unit_limit(self) -> usize {
+        match self {
+            Self::Aligned(_) => 1,
+            Self::Packed(c) => usize::from(c.protocol.max_units),
         }
     }
     pub(super) fn endpoint(self, context: RecoveryContext) -> io::Result<Endpoint> {
@@ -59,7 +65,8 @@ macro_rules! forward {
 impl Endpoint {
     forward! {
         fn tick(&mut self, now: Duration) -> Result<(), protocol::Error>;
-        fn enqueue_admitted(&mut self, channel: protocol::ChannelId, bytes: &[u8], now: Duration) -> Result<(), protocol::Error>;
+        fn enqueue_identified(&mut self, channel: protocol::ChannelId, bytes: &[u8], now: Duration) -> Result<protocol::RecordIdentity, protocol::Error>;
+        fn outgoing_units(&mut self, packet: &[u8], output: &mut [protocol::UnitWitness]) -> Result<usize, protocol::Error>;
         fn receive_authenticated(&mut self, bytes: &[u8], now: Duration) -> Result<(), protocol::Error>;
         fn prepare(&mut self, channel: protocol::ChannelId, now: Duration, work: usize) -> Result<protocol::Prepared, protocol::Error>;
         fn commit_delivery(&mut self, now: Duration) -> Result<(), protocol::Error>;

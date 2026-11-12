@@ -17,6 +17,7 @@ type TestResult = Result<(), TestError>;
 fn settings() -> Settings {
     Settings {
         channels: 4,
+        delivery: crate::delivery_tests::policy(),
         packing: runtime::Options {
             hold_micros: 1000,
             max_units: 4,

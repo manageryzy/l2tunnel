@@ -10,13 +10,15 @@ use tokio::{net::TcpListener, time::Instant};
 pub struct Settings {
     /// Common native MUX channel pool; 255 is reserved by the packed wire format.
     pub channels: u16,
+    /// Canonical native delivery credit, independent of local packet queues.
+    pub delivery: l2tunnel_runtime::managed::DeliveryConfig,
     /// Original hold deadline and bounded source/admission work.
     pub packing: runtime::Options,
 }
 impl Settings {
     /// Reject unsupported combinations before credential, socket or native I/O.
     pub fn validate(self, config: ConnectionConfig, recovery: udp::RecoveryMode) -> io::Result<()> {
-        config.session()?;
+        config.session_with_delivery(self.delivery)?;
         if !(1..=255).contains(&self.channels)
             || !(1..=1000).contains(&self.packing.hold_micros)
             || self.packing.max_units == 0
@@ -46,6 +48,7 @@ pub fn udp_config(
             profile,
             settings.channels,
             settings.packing,
+            settings.delivery,
         )?,
     ))
 }
@@ -64,6 +67,7 @@ pub fn quic_config(
             profile,
             settings.channels,
             settings.packing,
+            settings.delivery,
         )?,
     ))
 }

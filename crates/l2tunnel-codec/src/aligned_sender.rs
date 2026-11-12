@@ -4,7 +4,7 @@
 use crate::{
     aligned_body::{self, Encoder},
     aligned_envelope,
-    aligned_receiver::{ChannelId, RecordId, Scope, SourceId, SymbolIdentity},
+    aligned_receiver::{ChannelId, RecordId, RecordIdentity, Scope, SourceId, SymbolIdentity},
 };
 use std::{fmt, mem::size_of};
 
@@ -143,13 +143,34 @@ impl Sender {
     }
     /// Stage one already-MUX-admitted frame. Failure consumes no context or ID.
     pub fn stage(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), Error> {
-        self.stage_selected(channel, frame, false)
+        self.stage_selected(channel, frame, false).map(|_| ())
     }
     /// Stage an explicitly selected raw packet without consuming a header context.
     pub fn stage_raw(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), Error> {
+        self.stage_selected(channel, frame, true).map(|_| ())
+    }
+    /// Stage and return the actual native-body identity, excluding any context.
+    pub fn stage_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<RecordIdentity, Error> {
+        self.stage_selected(channel, frame, false)
+    }
+    /// Stage raw native bytes and return their original channel body identity.
+    pub fn stage_raw_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<RecordIdentity, Error> {
         self.stage_selected(channel, frame, true)
     }
-    fn stage_selected(&mut self, channel: ChannelId, frame: &[u8], raw: bool) -> Result<(), Error> {
+    fn stage_selected(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        raw: bool,
+    ) -> Result<RecordIdentity, Error> {
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -179,7 +200,10 @@ impl Sender {
             context: encoded.context_len != 0,
             offset: 0,
         });
-        Ok(())
+        Ok(RecordIdentity {
+            channel,
+            record: RecordId(last),
+        })
     }
     /// Write immutable pending bytes using the recovery owner's source-ID snapshot.
     /// Failure or success here never consumes a pending symbol.

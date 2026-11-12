@@ -1,6 +1,6 @@
 //! One bounded aligned stage and timed packed source with external recovery IDs.
 use crate::{
-    aligned_receiver::{ChannelId, RecordId, Scope, SourceId},
+    aligned_receiver::{ChannelId, RecordId, RecordIdentity, Scope, SourceId},
     aligned_sender as aligned, packed, packed_envelope as envelope,
 };
 use std::{fmt, mem::size_of};
@@ -123,10 +123,28 @@ impl Sender {
     }
     /// Own one already-MUX-admitted Ethernet frame and service bounded unit work.
     pub fn stage(&mut self, channel: ChannelId, frame: &[u8], now: u64) -> Result<(), Error> {
-        self.stage_selected(channel, frame, now, false)
+        self.stage_selected(channel, frame, now, false).map(|_| ())
     }
     /// Own one explicitly negotiated raw native frame/IP packet without header context.
     pub fn stage_raw(&mut self, channel: ChannelId, frame: &[u8], now: u64) -> Result<(), Error> {
+        self.stage_selected(channel, frame, now, true).map(|_| ())
+    }
+    /// Return the native-body identity before bounded polling can consume its units.
+    pub fn stage_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<RecordIdentity, Error> {
+        self.stage_selected(channel, frame, now, false)
+    }
+    /// Return the exact raw-native body identity before packing advances ownership.
+    pub fn stage_raw_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<RecordIdentity, Error> {
         self.stage_selected(channel, frame, now, true)
     }
     fn stage_selected(
@@ -135,7 +153,7 @@ impl Sender {
         frame: &[u8],
         now: u64,
         raw: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<RecordIdentity, Error> {
         self.live()?;
         // A fresh frame may need a new source even while an older one is sealed.
         // Reject an impossible first-unit deadline before changing time/context.
@@ -148,13 +166,14 @@ impl Sender {
         if self.next_unit.is_none() {
             return Err(Error::Exhausted);
         }
-        if raw {
-            self.aligned.stage_raw(channel, frame)
+        let identity = if raw {
+            self.aligned.stage_raw_identified(channel, frame)
         } else {
-            self.aligned.stage(channel, frame)
+            self.aligned.stage_identified(channel, frame)
         }
         .map_err(Error::Aligned)?;
-        self.poll(now)
+        self.poll(now)?;
+        Ok(identity)
     }
     /// Attempt at most the configured unit work; sealed sources remain immutable.
     pub fn poll(&mut self, now: u64) -> Result<(), Error> {

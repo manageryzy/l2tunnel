@@ -17,6 +17,24 @@ pub struct RecordId(pub u64);
 /// Common MUX channel, never a privileged probe/control path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelId(pub u8);
+/// Absolute identity of one channel record; native bodies exclude context records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordIdentity {
+    /// Common MUX channel assigned by the original sender.
+    pub channel: ChannelId,
+    /// Nonwrapping channel record allocated by the original sender.
+    pub record: RecordId,
+}
+/// One structurally validated original coding unit, not a send confirmation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnitWitness {
+    /// Context or native body identity; the admission owner distinguishes them.
+    pub identity: RecordIdentity,
+    /// Zero-based original fragment index; unfragmented bodies use zero.
+    pub index: usize,
+    /// Complete original fragment count; unfragmented bodies use one.
+    pub count: usize,
+}
 /// Caller-injected monotonic time unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Tick(pub u64);
@@ -797,6 +815,28 @@ impl Receiver {
             self.floor = floor.0.checked_add(1).map(SourceId);
         }
     }
+}
+/// Inspect a complete original symbol using the same bounded receiver parser.
+/// This authenticates nothing and creates no peer byte or delivery authority.
+pub fn unit_witness(
+    identity: SymbolIdentity,
+    symbol: &[u8],
+    limits: Limits,
+) -> Result<UnitWitness, Error> {
+    limits.memory_bound_bytes()?;
+    let parsed = parse(symbol, identity.record, limits)?;
+    Ok(UnitWitness {
+        identity: RecordIdentity {
+            channel: parsed.channel,
+            record: identity.record,
+        },
+        index: if parsed.fragments == 0 {
+            0
+        } else {
+            parsed.offset / parsed.capacity
+        },
+        count: parsed.fragments.max(1),
+    })
 }
 fn parse(symbol: &[u8], record: RecordId, limits: Limits) -> Result<Parsed<'_>, Error> {
     if symbol.len() != limits.body.symbol_bytes

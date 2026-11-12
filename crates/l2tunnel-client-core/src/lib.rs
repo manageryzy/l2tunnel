@@ -22,6 +22,8 @@ pub mod active_managed;
 pub mod aligned;
 /// Strict command-line entry adapter; connection functions remain UI independent.
 pub mod cli;
+/// Shared strict native delivery policy for versioned profile configuration.
+pub mod delivery;
 /// Versioned private local API shared by CLI and future GUI.
 #[cfg(unix)]
 pub mod local;
@@ -37,6 +39,9 @@ pub mod proxy_measured;
 pub mod quic;
 /// Explicit original-owner raw packet runtime; native qualification remains separate.
 pub mod raw_packet;
+/// Shared existing-session command dispatch for authorized local frontends.
+#[cfg(unix)]
+pub mod session_control;
 /// Explicit authenticated UDP endpoint/profile configuration.
 pub mod udp;
 

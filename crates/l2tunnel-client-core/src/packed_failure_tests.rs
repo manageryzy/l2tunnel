@@ -13,8 +13,14 @@ fn options_and_exact_geometry_fail_before_socket_work() -> TestResult {
         binding,
         l2tunnel_runtime::udp::base_session_config(config.runtime(), profile)?
     );
-    let (_, aligned) =
-        crate::aligned::udp_config(config, a, crate::aligned::Settings { channels: 4 })?;
+    let (_, aligned) = crate::aligned::udp_config(
+        config,
+        a,
+        crate::aligned::Settings {
+            channels: 4,
+            delivery: crate::delivery_tests::policy(),
+        },
+    )?;
     assert_ne!(
         binding,
         l2tunnel_runtime::aligned::udp_base_session_config(config.runtime(), profile, aligned)?
@@ -83,13 +89,15 @@ async fn actual_udp_and_quic_reject_every_packing_policy_mismatch_and_wrong_iden
     let config = connection(PacketLayer::Ip, Duplex::Full);
     let client = ClientTls::from_der_roots(&credentials.chain)?;
     let server = ServerTls::from_der(&credentials.chain, &credentials.key)?;
-    for case in 0..6 {
+    for case in 0..8 {
         let mut other = settings();
         match case {
             0 => other.channels = 2,
             1 => other.packing.hold_micros = 500,
             2 => other.packing.max_units = 3,
             3 => other.packing.work_limit = 8,
+            6 => other.delivery.forward.target_bandwidth_bps += 1,
+            7 => other.delivery.reverse.target_bandwidth_bps += 1,
             _ => {}
         }
         let name = if case == 4 {
@@ -151,14 +159,26 @@ async fn actual_udp_and_quic_reject_every_packing_policy_mismatch_and_wrong_iden
 }
 
 #[test]
-fn ordinary_client_bindings_keep_their_separate_fixed_policy_bytes() -> TestResult {
+fn frame_bindings_stay_fixed_and_aligned_v2_binds_explicit_delivery() -> TestResult {
     let config = connection(PacketLayer::Ethernet, Duplex::Full);
     let (a, _) = endpoints(Duplex::Full)?;
     let profile = udp::runtime_config(config, a)?;
-    let (quic, aligned_quic) =
-        crate::aligned::quic_config(config, as_quic(a), crate::aligned::Settings { channels: 4 })?;
-    let (_, aligned_udp) =
-        crate::aligned::udp_config(config, a, crate::aligned::Settings { channels: 4 })?;
+    let (quic, aligned_quic) = crate::aligned::quic_config(
+        config,
+        as_quic(a),
+        crate::aligned::Settings {
+            channels: 4,
+            delivery: crate::delivery_tests::policy(),
+        },
+    )?;
+    let (_, aligned_udp) = crate::aligned::udp_config(
+        config,
+        a,
+        crate::aligned::Settings {
+            channels: 4,
+            delivery: crate::delivery_tests::policy(),
+        },
+    )?;
     let actual = [
         l2tunnel_runtime::udp::base_session_config(config.runtime(), profile)?
             .digest
@@ -173,6 +193,8 @@ fn ordinary_client_bindings_keep_their_separate_fixed_policy_bytes() -> TestResu
             .digest
             .0,
     ];
+    // Entries0/2 preserve the original frame digests. Entries1/3 intentionally
+    // identify aligned v2 with canonical native delivery, never the old v1 profile.
     assert_eq!(
         actual,
         [
@@ -181,16 +203,16 @@ fn ordinary_client_bindings_keep_their_separate_fixed_policy_bytes() -> TestResu
                 134, 130, 15, 72, 63, 209, 35, 220, 30, 167, 43, 173, 94, 215
             ],
             [
-                88, 62, 120, 182, 225, 244, 30, 2, 0, 26, 44, 114, 83, 241, 240, 214, 215, 200,
-                106, 131, 219, 45, 249, 114, 74, 37, 216, 220, 141, 173, 159, 178
+                129, 73, 123, 2, 98, 145, 23, 184, 185, 239, 215, 132, 202, 116, 193, 228, 27, 98,
+                237, 27, 91, 228, 207, 255, 20, 211, 174, 149, 104, 194, 18, 132
             ],
             [
                 215, 222, 43, 32, 176, 189, 36, 11, 58, 36, 90, 12, 141, 155, 219, 230, 87, 94,
                 180, 79, 45, 77, 198, 52, 147, 180, 144, 250, 31, 57, 74, 63
             ],
             [
-                13, 34, 191, 254, 229, 235, 135, 16, 196, 60, 223, 63, 64, 26, 158, 104, 110, 112,
-                92, 158, 166, 175, 88, 37, 246, 85, 63, 19, 80, 195, 72, 160
+                105, 252, 241, 205, 161, 123, 76, 93, 218, 18, 176, 82, 233, 196, 183, 216, 47,
+                125, 240, 159, 91, 181, 129, 252, 165, 225, 255, 254, 26, 135, 101, 67
             ],
         ]
     );

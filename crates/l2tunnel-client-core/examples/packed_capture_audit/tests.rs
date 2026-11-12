@@ -27,10 +27,17 @@ impl Deref for Fixture {
 }
 
 fn settings() -> Value {
-    json!({"version":1,"layer":"tun","duplex":"half","carrier":"udp",
-        "path_mtu":1200,"max_packet":1600,"channels":4,"hold_micros":1000,
-        "max_units":4,"work_limit":16,"fec_sources":4,"fec_repairs":2,
-        "fec_flush_ms":5,"cover":"quic-like","protection":"integrity"})
+    json!({"version":2,"layer":"tun","duplex":"half","carrier":"udp",
+    "path_mtu":1200,"max_packet":1600,"channels":4,"hold_micros":1000,
+    "max_units":4,"work_limit":16,"fec_sources":4,"fec_repairs":2,
+    "fec_flush_ms":5,"cover":"quic-like","protection":"integrity",
+    "delivery": {
+        "forward_bandwidth_bps":100_000_000,"reverse_bandwidth_bps":10_000_000,
+        "bootstrap_rtt_micros":70_000,"min_rtt_micros":1000,"max_rtt_micros":2_000_000,
+        "headroom_percent":125,"minimum_bytes":3200,"max_inflight_bytes":4_194_304,
+        "max_records":8192,"metadata_limit_bytes":2_097_152,
+        "sample_ttl_micros":4_000_000,"flush_timeout_micros":10_000_000
+    }})
 }
 fn configure(value: &Value) -> Result<(Configuration, Fixture)> {
     let config = Configuration::parse(&serde_json::to_vec(value)?)?;
@@ -263,7 +270,7 @@ fn exact_required_configuration_and_authoritative_geometry() -> Result<()> {
     assert!(Configuration::parse(duplicate.as_bytes()).is_err());
     assert!(Configuration::parse(&vec![b' '; CONFIG_LIMIT + 1]).is_err());
     for (field, bad) in [
-        ("version", json!(2)),
+        ("version", json!(1)),
         ("max_packet", json!(1599)),
         ("path_mtu", json!(575)),
         ("channels", json!(256)),

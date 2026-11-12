@@ -1069,7 +1069,7 @@ impl SharedBudget {
         }
         Ok(result)
     }
-    async fn control(&self, body_bytes: usize) -> io::Result<()> {
+    pub(super) async fn control(&self, body_bytes: usize) -> io::Result<()> {
         let charge = self
             .control_overhead
             .checked_add(body_bytes)
@@ -1101,6 +1101,11 @@ pub(super) enum ControlEvent {
     Ack(Vec<u8>),
     Credit(u64),
 }
+/// Exact authenticated native identity receipts for explicit aligned/packed v2.
+pub(super) enum NativeControlEvent {
+    Ack(Vec<u8>),
+    Delivered { channel: u8, record: u64 },
+}
 pub(super) async fn read_control_bound(
     reader: impl AsyncRead + Unpin,
     lane: usize,
@@ -1109,9 +1114,23 @@ pub(super) async fn read_control_bound(
     feedback_bytes: usize,
     magic: [u8; 4],
 ) -> io::Result<()> {
-    read_control_bound_inner(reader, events, duration, feedback_bytes, magic, |event| {
-        (lane, event)
-    })
+    read_control_bound_inner(
+        reader,
+        events,
+        duration,
+        ControlGrammar {
+            feedback_bytes,
+            magic,
+            credit_bytes: 8,
+        },
+        |bytes| (lane, ControlEvent::Ack(bytes)),
+        |[a, b, c, d, e, f, g, h, _]| {
+            (
+                lane,
+                ControlEvent::Credit(u64::from_be_bytes([a, b, c, d, e, f, g, h])),
+            )
+        },
+    )
     .await
 }
 /// Retain the original authenticated parse receipt before bounded event queueing.
@@ -1124,19 +1143,78 @@ pub(super) async fn read_control_bound_timed(
     feedback_bytes: usize,
     magic: [u8; 4],
 ) -> io::Result<()> {
-    read_control_bound_inner(reader, events, duration, feedback_bytes, magic, |event| {
-        (lane, event, Instant::now())
-    })
+    read_control_bound_inner(
+        reader,
+        events,
+        duration,
+        ControlGrammar {
+            feedback_bytes,
+            magic,
+            credit_bytes: 8,
+        },
+        |bytes| (lane, ControlEvent::Ack(bytes), Instant::now()),
+        |[a, b, c, d, e, f, g, h, _]| {
+            (
+                lane,
+                ControlEvent::Credit(u64::from_be_bytes([a, b, c, d, e, f, g, h])),
+                Instant::now(),
+            )
+        },
+    )
     .await
+}
+pub(super) async fn read_native_control_bound_timed(
+    reader: impl AsyncRead + Unpin,
+    lane: usize,
+    events: mpsc::Sender<(usize, NativeControlEvent, Instant)>,
+    duration: Duration,
+    feedback_bytes: usize,
+    magic: [u8; 4],
+) -> io::Result<()> {
+    read_control_bound_inner(
+        reader,
+        events,
+        duration,
+        ControlGrammar {
+            feedback_bytes,
+            magic,
+            credit_bytes: 9,
+        },
+        |bytes| (lane, NativeControlEvent::Ack(bytes), Instant::now()),
+        |[channel, a, b, c, d, e, f, g, h]| {
+            (
+                lane,
+                NativeControlEvent::Delivered {
+                    channel,
+                    record: u64::from_be_bytes([a, b, c, d, e, f, g, h]),
+                },
+                Instant::now(),
+            )
+        },
+    )
+    .await
+}
+struct ControlGrammar {
+    feedback_bytes: usize,
+    magic: [u8; 4],
+    credit_bytes: usize,
 }
 async fn read_control_bound_inner<E>(
     mut reader: impl AsyncRead + Unpin,
     events: mpsc::Sender<E>,
     duration: Duration,
-    feedback_bytes: usize,
-    magic: [u8; 4],
-    mut map: impl FnMut(ControlEvent) -> E,
+    grammar: ControlGrammar,
+    mut ack: impl FnMut(Vec<u8>) -> E,
+    mut credit: impl FnMut([u8; 9]) -> E,
 ) -> io::Result<()> {
+    let ControlGrammar {
+        feedback_bytes,
+        magic,
+        credit_bytes,
+    } = grammar;
+    if !matches!(credit_bytes, 8 | 9) {
+        return Err(invalid("UDP credit grammar"));
+    }
     loop {
         let event = timeout(duration, async {
             let mut header = [0; 8];
@@ -1150,12 +1228,12 @@ async fn read_control_bound_inner<E>(
                 (2, length) if length == feedback_bytes => {
                     let mut bytes = vec![0; feedback_bytes];
                     reader.read_exact(&mut bytes).await?;
-                    Ok(Some(ControlEvent::Ack(bytes)))
+                    Ok(Some(ack(bytes)))
                 }
-                (3, 8) => {
-                    let mut bytes = [0; 8];
-                    reader.read_exact(&mut bytes).await?;
-                    Ok(Some(ControlEvent::Credit(u64::from_be_bytes(bytes))))
+                (3, length) if length == credit_bytes => {
+                    let mut bytes = [0; 9];
+                    reader.read_exact(&mut bytes[..credit_bytes]).await?;
+                    Ok(Some(credit(bytes)))
                 }
                 _ => Err(invalid("UDP control kind or length")),
             }
@@ -1164,13 +1242,13 @@ async fn read_control_bound_inner<E>(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP control read deadline"))??;
         if let Some(event) = event {
             events
-                .send(map(event))
+                .send(event)
                 .await
                 .map_err(|_| invalid("UDP control consumer closed"))?;
         }
     }
 }
-async fn write_control_frame_bound(
+pub(super) async fn write_control_frame_bound(
     writer: &mut (impl AsyncWrite + Unpin),
     kind: u8,
     body: &[u8],

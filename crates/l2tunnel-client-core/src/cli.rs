@@ -437,7 +437,7 @@ fn active_settings(
     l2tunnel_runtime::active::session_config(config.runtime(), settings)?;
     Ok(Some(settings))
 }
-const ALIGNED_HELP: &str = "Records: --record-profile frame|aligned|packed (default frame). Aligned requires explicit --carrier udp|quic, --fec cauchy, --compression off and system traffic; --aligned-channels 1..256 (default4). All native packets share the channel pool. TUN uses raw-IP aligned bodies; TAP/VXLAN use eligible header compression and exact fallback. No local reload or active TUN combination.";
+const ALIGNED_HELP: &str = "Records: --record-profile frame|aligned|packed (default frame). Aligned requires explicit --carrier udp|quic, --fec cauchy, --compression off and system traffic; --aligned-channels 1..256 (default4). Requires explicit --delivery-window bdp with canonical forward/reverse bandwidth and bootstrap RTT. All native packets share the channel pool. TUN uses raw-IP aligned bodies; TAP/VXLAN use eligible header compression and exact fallback. No local reload or active TUN combination.";
 fn aligned_settings(
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
@@ -474,6 +474,7 @@ fn aligned_settings(
             }
             let settings = super::aligned::Settings {
                 channels: number(options, "--aligned-channels", 4)?,
+                delivery: delivery_frontend::required_settings(options, config)?,
             };
             settings.validate(config, recovery_settings(options)?)?;
             if let Some(transport) = udp_settings(options, config)? {
@@ -850,6 +851,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             .await;
         }
         Connected::AlignedUdp(link, profile, records) => {
+            delivery_frontend::report(records.delivery);
             println!(
                 "Carrier: UDP with retained TCP/TLS bootstrap/control; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
                 records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
@@ -864,6 +866,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             .await;
         }
         Connected::PackedUdp(link, profile, records) => {
+            delivery_frontend::report(records.delivery);
             println!(
                 "Carrier: UDP with retained TCP/TLS; record-profile packed; channels {}; hold {} us; maximum units {}; work limit {}; recovery {:?}",
                 records.pipeline.flows.channels,
@@ -882,6 +885,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             .await;
         }
         Connected::PackedQuic(link, profile, records) => {
+            delivery_frontend::report(records.delivery);
             println!(
                 "Carrier: genuine QUIC; record-profile packed; channels {}; hold {} us; maximum units {}; work limit {}; recovery {:?}",
                 records.pipeline.flows.channels,
@@ -900,6 +904,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
             .await;
         }
         Connected::AlignedQuic(link, profile, records) => {
+            delivery_frontend::report(records.delivery);
             println!(
                 "Carrier: genuine QUIC over UDP only; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
                 records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
@@ -990,7 +995,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
     if let Some(api) = api {
         tokio::select! {
             result = runtime => result,
-            result = api.serve(|request| local_action(handle.clone(), request)) => result,
+            result = api.serve(|request| crate::session_control::Control::managed(handle.clone()).request(request)) => result,
         }
     } else {
         let _keep_control_alive = handle;
@@ -1101,72 +1106,11 @@ async fn run_active_managed<D: l2tunnel_device::PacketDevice<Error = io::Error>>
         tokio::select! {
             result = runtime => result,
             result = diagnostics => result,
-            result = api.serve(|request| active_local_action(handle.clone(), runtime_config.compression, request)) => result,
+            result = api.serve(|request| crate::session_control::Control::active(handle.clone(), runtime_config.compression).request(request)) => result,
         }
     } else {
         let _keep_control_alive = handle;
         tokio::select! { result = runtime => result, result = diagnostics => result }
-    }
-}
-
-#[cfg(unix)]
-async fn active_local_action(
-    handle: l2tunnel_runtime::active_management::ControlHandle,
-    compression: Compression,
-    request: super::local::Request,
-) -> super::local::Response {
-    use super::local::{
-        Action, ActiveSnapshot, Compression as ApiCompression, Response, Snapshot, VERSION,
-    };
-    use l2tunnel_runtime::active_management::ControlError;
-    let result = match request.action {
-        Action::Status {} => Ok(()),
-        Action::SwitchCompression { .. } | Action::DrainProxy {} | Action::DrainOpenVpn {} => {
-            Err("unsupported")
-        }
-        Action::SwitchActivePolicy { policy } => match policy.mode() {
-            Err(_) => Err("invalid_policy"),
-            Ok(mode) => handle
-                .switch_policy(mode)
-                .await
-                .map(|_| ())
-                .map_err(|error| match error {
-                    ControlError::Busy => "busy",
-                    ControlError::NotCoordinator => "not_coordinator",
-                    ControlError::Unsupported => "unsupported_policy",
-                    ControlError::Aborted => "aborted",
-                    ControlError::Closed => "closed",
-                }),
-        },
-    };
-    let state = handle.status().map(|status| Snapshot {
-        epoch: status.epoch.0,
-        phase: format!("{:?}", status.phase),
-        compression: match compression {
-            Compression::None => ApiCompression::Off,
-            Compression::Lz4IfSmaller => ApiCompression::Lz4,
-        },
-        active: Some(ActiveSnapshot {
-            policy: super::active_managed::Policy::from_mode(status.mode),
-            admitting: status.admitting,
-            running: status.traffic.running,
-            digest: status
-                .digest
-                .0
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-        }),
-        proxy: None,
-        openvpn_drain: None,
-        raw_packet: None,
-        rolling: None,
-    });
-    Response {
-        version: VERSION,
-        ok: result.is_ok(),
-        code: result.err().unwrap_or("ok").into(),
-        state,
     }
 }
 
@@ -1201,53 +1145,6 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
         io::ErrorKind::Unsupported,
         "native device CLI is currently implemented on Linux only",
     ))
-}
-#[cfg(unix)]
-async fn local_action(
-    handle: l2tunnel_runtime::managed::ControlHandle,
-    request: super::local::Request,
-) -> super::local::Response {
-    use super::local::{Action, Compression as ApiCompression, Response, Snapshot, VERSION};
-    use l2tunnel_runtime::managed::ControlError;
-    let result = match request.action {
-        Action::Status {} => Ok(()),
-        Action::SwitchCompression { compression } => handle
-            .switch_compression(match compression {
-                ApiCompression::Off => Compression::None,
-                ApiCompression::Lz4 => Compression::Lz4IfSmaller,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                ControlError::Busy => "busy",
-                ControlError::NotCoordinator => "not_coordinator",
-                ControlError::Aborted => "aborted",
-                ControlError::Closed => "closed",
-            }),
-        Action::SwitchActivePolicy { .. } | Action::DrainProxy {} | Action::DrainOpenVpn {} => {
-            Err("unsupported")
-        }
-    };
-    let code = result.err().unwrap_or("ok");
-    let state = handle.status().map(|status| Snapshot {
-        epoch: status.epoch.0,
-        phase: format!("{:?}", status.phase),
-        compression: match status.compression {
-            Compression::None => ApiCompression::Off,
-            Compression::Lz4IfSmaller => ApiCompression::Lz4,
-        },
-        active: None,
-        proxy: None,
-        openvpn_drain: None,
-        raw_packet: None,
-        rolling: None,
-    });
-    Response {
-        version: VERSION,
-        ok: result.is_ok(),
-        code: code.into(),
-        state,
-    }
 }
 #[cfg(unix)]
 async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
@@ -1607,6 +1504,15 @@ mod tests {
         values.insert("--aligned-channels".into(), "4".into());
         assert!(aligned_settings(&values, config).is_err());
         values.insert("--record-profile".into(), "aligned".into());
+        assert!(aligned_settings(&values, config).is_err());
+        for (key, value) in [
+            ("--delivery-window", "bdp"),
+            ("--forward-mbps", "100"),
+            ("--reverse-mbps", "10"),
+            ("--bootstrap-rtt-ms", "70"),
+        ] {
+            values.insert(key.into(), value.into());
+        }
         assert_eq!(
             aligned_settings(&values, config)?.map(|s| s.channels),
             Some(4)
@@ -1729,89 +1635,5 @@ mod tests {
         values.insert("--traffic".into(), "system".into());
         assert!(active_settings(&values, config).is_err());
         Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn active_local_requests_wait_for_runtime_and_report_closed_or_busy() {
-        use super::super::local::{Action, Request, VERSION};
-        let (handle, receiver) = l2tunnel_runtime::active_management::channel();
-        let valid = super::super::active_managed::Policy {
-            channels: 2,
-            dscp_weights: vec![1; 64],
-        };
-        for (action, code) in [
-            (Action::DrainProxy {}, "unsupported"),
-            (Action::DrainOpenVpn {}, "unsupported"),
-            (
-                Action::SwitchCompression {
-                    compression: super::super::local::Compression::Off,
-                },
-                "unsupported",
-            ),
-            (
-                Action::SwitchActivePolicy {
-                    policy: super::super::active_managed::Policy {
-                        channels: 0,
-                        ..valid.clone()
-                    },
-                },
-                "invalid_policy",
-            ),
-        ] {
-            let response = active_local_action(
-                handle.clone(),
-                Compression::None,
-                Request {
-                    version: VERSION,
-                    action,
-                },
-            )
-            .await;
-            assert!(!response.ok);
-            assert_eq!(response.code, code);
-            assert!(response.state.is_none());
-        }
-        let request = Request {
-            version: VERSION,
-            action: Action::SwitchActivePolicy { policy: valid },
-        };
-        let mut pending = Box::pin(active_local_action(
-            handle.clone(),
-            Compression::None,
-            request.clone(),
-        ));
-        // Poll exactly once: enqueueing a request is never a successful switch.
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        let busy = active_local_action(handle, Compression::None, request).await;
-        assert!(!busy.ok);
-        assert_eq!(busy.code, "busy");
-        drop(receiver);
-        let closed = pending.await;
-        assert!(!closed.ok);
-        assert_eq!(closed.code, "closed");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_profile_rejects_proxy_drain_without_submission() {
-        use crate::local::{Action, Request, VERSION};
-        let (handle, _control) = l2tunnel_runtime::managed::channel();
-        for action in [Action::DrainProxy {}, Action::DrainOpenVpn {}] {
-            let response = local_action(
-                handle.clone(),
-                Request {
-                    version: VERSION,
-                    action,
-                },
-            )
-            .await;
-            assert!(!response.ok);
-            assert_eq!(response.code, "unsupported");
-        }
     }
 }

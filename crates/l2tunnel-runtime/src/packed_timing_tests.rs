@@ -133,7 +133,7 @@ async fn partial_source_wakes_before_the_later_native_poll_without_new_packets()
         repairs: 1,
         flush_after: Duration::from_millis(2),
     })?;
-    let config = Config::for_udp(rt, transport, 4, options())?;
+    let config = Config::for_udp(rt, transport, 4, options(), delivery(rt))?;
     let device = Device::new(rt.layer);
     device.change(|s| s.outgoing.push_back(packet(rt.layer, 1, 64)))?;
     let pump = Pump::new(device.clone(), rt, transport, config, false)?;
@@ -187,6 +187,7 @@ async fn sealed_output_pressure_does_not_spin_or_hide_earlier_native_expiry() ->
             max_units: 1,
             ..options()
         },
+        delivery(rt),
     )?;
     let device = Device::new(rt.layer);
     device.change(|s| {

@@ -5,7 +5,7 @@ use l2tunnel_runtime::managed::DeliveryConfig;
 use tokio::time::{sleep, timeout};
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<T = ()> = std::result::Result<T, Failure>;
-fn policy() -> DeliveryConfig {
+pub(crate) fn policy() -> DeliveryConfig {
     let forward = Config {
         target_bandwidth_bps: 80_000_000,
         bootstrap_rtt_micros: 70_000,

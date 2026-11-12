@@ -16,7 +16,9 @@ use std::{fmt, time::Duration};
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
 
-pub use l2tunnel_codec::aligned_receiver::{ChannelId, Delivery, Prepared};
+pub use l2tunnel_codec::aligned_receiver::{
+    ChannelId, Delivery, Prepared, RecordIdentity, UnitWitness,
+};
 
 /// Explicit authenticated native interpretation; never inferred from packet bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +278,7 @@ pub struct Status {
 pub struct Endpoint {
     config: Config,
     receive_scope: receiver::Scope,
+    send_scope: receiver::Scope,
     sender: packed::SenderOwner,
     packing: Option<packed::Options>,
     packed_symbols: Vec<u8>,
@@ -325,6 +328,7 @@ impl Endpoint {
         Ok(Self {
             config,
             receive_scope,
+            send_scope,
             sender: match packing {
                 Some(p) => packed::SenderOwner::Packed(Box::new(
                     l2tunnel_codec::packed_sender::Sender::new(
@@ -362,6 +366,16 @@ impl Endpoint {
         frame: &[u8],
         now: Duration,
     ) -> Result<(), Error> {
+        self.enqueue_identified(channel, frame, now).map(|_| ())
+    }
+    /// Return the transactional sender-owned native-body identity. It excludes
+    /// any separate context record and exists before packed polling consumes units.
+    pub fn enqueue_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<RecordIdentity, Error> {
         if let Some(options) = self.packing {
             if let Some(error) = self.failure {
                 return Err(error);
@@ -378,15 +392,85 @@ impl Endpoint {
         let staged = self
             .sender
             .stage(self.config.native_policy, channel, frame, now);
-        if self.sender.packing().is_some_and(|s| s.failure.is_some()) {
-            self.terminal_result(staged)?;
+        let identity = if self.sender.packing().is_some_and(|s| s.failure.is_some()) {
+            self.terminal_result(staged)?
         } else {
-            staged?;
-        }
+            staged?
+        };
         if self.packing.is_some() {
-            self.submit_packed()
+            self.submit_packed()?;
         } else {
-            self.pump_send()
+            self.pump_send()?;
+        }
+        Ok(identity)
+    }
+    /// Borrow exact original record units from a locally generated source or
+    /// systematic emission. Repairs contain no original unit. These are structural
+    /// witnesses only: the runtime must await actual carrier send and match each
+    /// identity to its own native admission before confirming every fragment.
+    /// The caller reserves one slot for aligned or max_units slots for packed.
+    pub fn outgoing_units(
+        &mut self,
+        packet: &[u8],
+        output: &mut [UnitWitness],
+    ) -> Result<usize, Error> {
+        self.recovery
+            .inspect_output(packet)
+            .map_err(Error::Recovery)?;
+        let role = match self.send_scope.direction {
+            receiver::Direction::InitiatorToResponder => EndpointRole::Initiator,
+            receiver::Direction::ResponderToInitiator => EndpointRole::Responder,
+        };
+        let view = l2tunnel_reliable::inspect_structural(
+            packet,
+            role,
+            self.config.max_recovery_packet_bytes,
+            self.config.recovery.arq.max_source_bytes,
+            self.config.recovery.fec.block,
+        )
+        .map_err(Error::Recovery)?;
+        let Some((source, bytes)) = view.source else {
+            return Ok(0);
+        };
+        if let Some(options) = self.packing {
+            let packed = l2tunnel_codec::packed_envelope::decode(
+                options.config(self.config).envelope(),
+                self.send_scope,
+                bytes,
+            )
+            .map_err(Error::PackedEnvelope)?;
+            if packed.identity().source.0 != source.0 {
+                return Err(Error::Identity);
+            }
+            if output.len() < packed.len() {
+                return Err(Error::Configuration);
+            }
+            for (index, unit) in packed.units().map_err(Error::PackedEnvelope)?.enumerate() {
+                let symbol = &mut self.packed_symbols[..self.config.receiver.body.symbol_bytes];
+                symbol.fill(0);
+                symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
+                output[index] = receiver::unit_witness(unit.identity, symbol, self.config.receiver)
+                    .map_err(Error::Receiver)?;
+            }
+            Ok(packed.len())
+        } else {
+            if output.is_empty() {
+                return Err(Error::Configuration);
+            }
+            let aligned = envelope::decode(
+                self.send_scope,
+                self.config.receiver.body.symbol_bytes,
+                self.config.receiver.channels,
+                bytes,
+            )
+            .map_err(Error::Envelope)?;
+            if aligned.identity.source.0 != source.0 {
+                return Err(Error::Identity);
+            }
+            output[0] =
+                receiver::unit_witness(aligned.identity, aligned.symbol, self.config.receiver)
+                    .map_err(Error::Receiver)?;
+            Ok(1)
         }
     }
     /// Explicit raw-IP enqueue; reject a session bound to Ethernet header policy.

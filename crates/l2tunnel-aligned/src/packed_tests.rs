@@ -565,3 +565,53 @@ fn packed_maximum_unit_batch_completes_a_fragment_behind_pending_native() -> Tes
     assert!(right.pending().is_none());
     Ok(())
 }
+
+#[test]
+fn one_packed_source_exposes_both_sender_native_identities_without_context_credit() -> TestResult {
+    // Both real native units fit the unchanged ordinary packed geometry.
+    let cfg = config(256);
+    let (mut endpoint, mut receiver) = peers(cfg)?;
+    let a = endpoint.enqueue_identified(ChannelId(1), &[0x7a; 80], ms(0))?;
+    let b = endpoint.enqueue_identified(ChannelId(0), &[0x6b; 40], ms(0))?;
+    assert_ne!(a, b);
+    endpoint.flush(Duration::from_micros(500))?;
+    let mut witnesses = vec![
+        UnitWitness {
+            identity: a,
+            index: 0,
+            count: 1
+        };
+        4
+    ];
+    let mut together = false;
+    for packet in emissions(&mut endpoint, 1)?
+        .into_iter()
+        .chain(emissions(&mut endpoint, 6)?)
+    {
+        receiver.receive_authenticated(&packet, ms(6))?;
+        let n = endpoint.outgoing_units(&packet, &mut witnesses)?;
+        let ids: Vec<_> = witnesses[..n].iter().map(|w| w.identity).collect();
+        if ids.contains(&a) && ids.contains(&b) {
+            assert_eq!(n, 2);
+            assert!(witnesses[..n].iter().all(|w| w.index == 0 && w.count == 1));
+            together = true;
+        }
+    }
+    assert!(
+        together,
+        "a physical source must retain both native identities"
+    );
+    assert_eq!(receiver.prepare(ChannelId(0), ms(6), 8)?, Prepared::Ready);
+    let small = receiver.pending().ok_or("small native")?;
+    assert_eq!(small.channel, b.channel);
+    assert_eq!(small.record, b.record);
+    assert_eq!(small.bytes, &[0x6b; 40]);
+    receiver.commit_delivery(ms(6))?;
+    assert_eq!(receiver.prepare(ChannelId(1), ms(6), 8)?, Prepared::Ready);
+    let large = receiver.pending().ok_or("large native")?;
+    assert_eq!(large.channel, a.channel);
+    assert_eq!(large.record, a.record);
+    assert_eq!(large.bytes, &[0x7a; 80]);
+    receiver.commit_delivery(ms(6))?;
+    Ok(())
+}

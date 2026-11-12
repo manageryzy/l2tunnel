@@ -27,6 +27,26 @@ fn runtime(layer: PacketLayer) -> RuntimeConfig {
         poll_interval: Duration::from_millis(1),
     }
 }
+fn delivery(runtime: RuntimeConfig) -> crate::managed::DeliveryConfig {
+    let policy = l2tunnel_flow_control::delivery_window::Config {
+        target_bandwidth_bps: 80_000_000,
+        bootstrap_rtt_micros: 70_000,
+        min_rtt_micros: 2_000,
+        max_rtt_micros: 2_000_000,
+        headroom_percent: 125,
+        minimum_bytes: runtime.max_packet as u64,
+        max_inflight_bytes: 4 * 1024 * 1024,
+        max_records: runtime.queue_packets,
+        max_packet_bytes: runtime.max_packet as u64,
+        metadata_limit_bytes: 2 * 1024 * 1024,
+        sample_ttl_micros: 1_000_000,
+        flush_timeout_micros: 10_000_000,
+    };
+    crate::managed::DeliveryConfig {
+        forward: policy,
+        reverse: policy,
+    }
+}
 fn udp_transport(
     duplex: Duplex,
     cover: CoverProfile,
@@ -69,6 +89,7 @@ struct Native {
     delivered: Vec<Vec<u8>>,
     admitted: usize,
     blocked: bool,
+    writes: usize,
 }
 #[derive(Clone)]
 struct Device {
@@ -106,6 +127,7 @@ impl PacketDevice for Device {
     }
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.change(|state| {
+            state.writes += 1;
             if state.blocked {
                 Err(io::ErrorKind::WouldBlock.into())
             } else {
@@ -366,11 +388,19 @@ async fn exercise(
         state.blocked = true;
         state.outgoing.extend(input.iter().cloned());
     })?;
-    sleep(Duration::from_millis(70)).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if b.change(|state| state.writes > 0)? { return Ok::<_, io::Error>(()); }
+            tokio::select! {
+                Some(result) = tasks.join_next() => return Err(io::Error::other(format!("runtime ended before actual native pressure: {result:?}"))),
+                _ = sleep(Duration::from_millis(1)) => {},
+            }
+        }
+    }).await??;
     assert!(b.change(|state| state.delivered.is_empty())?);
     assert!(
-        a.change(|state| state.admitted)? <= 5,
-        "peer native credit and common queue must bound reads"
+        a.change(|state| state.admitted)? <= 2 * runtime(a.layer).queue_packets + 2,
+        "configured flight records plus local queue, ingress and selected packet bound reads"
     );
     b.change(|state| state.blocked = false)?;
     wait_delivery(tasks, a, b, input.len()).await?;
@@ -380,6 +410,28 @@ async fn exercise(
         let mut actual = device.change(|state| state.delivered.clone())?;
         actual.sort();
         assert_eq!(actual, expected);
+        // Classification uses the same parser as the actor. Global channel
+        // interleaving is allowed, but one flow must keep its original order.
+        let actual_order = device.change(|state| state.delivered.clone())?;
+        let rt = runtime(device.layer);
+        let transport = udp_transport(
+            Duplex::Full,
+            CoverProfile::OpenVpnLike,
+            Protection::HmacSha256,
+        )?;
+        let classifier = Pipeline::new(Config::for_udp(rt, transport, 4, delivery(rt))?.pipeline)?;
+        for frame in input {
+            let key = classifier.classify(frame)?.key;
+            let wanted: Vec<_> = input
+                .iter()
+                .filter(|p| classifier.classify(p).is_ok_and(|p| p.key == key))
+                .collect();
+            let observed: Vec<_> = actual_order
+                .iter()
+                .filter(|p| classifier.classify(p).is_ok_and(|p| p.key == key))
+                .collect();
+            assert_eq!(observed, wanted, "one native flow reordered");
+        }
     }
     Ok(())
 }
@@ -392,7 +444,7 @@ async fn actual_udp_aligned_tap_tun_full_half_covers_and_suites_with_loss_and_ba
                 for protection in [Protection::ChaCha20Poly1305, Protection::HmacSha256] {
                     let rt = runtime(layer);
                     let transport = udp_transport(duplex, cover, protection)?;
-                    let config = Config::for_udp(rt, transport, 4)?;
+                    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
                     let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
                     let a = Device::new(layer);
                     let b = Device::new(layer);
@@ -431,7 +483,7 @@ async fn actual_quic_aligned_tap_tun_full_half_without_tcp_with_loss_and_backpre
         for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
             let rt = runtime(layer);
             let transport = quic_transport(duplex)?;
-            let config = Config::for_quic(rt, transport, 4)?;
+            let config = Config::for_quic(rt, transport, 4, delivery(rt))?;
             let (a_link, b_link, relays) = quic_links(rt, transport, config).await?;
             let a = Device::new(layer);
             let b = Device::new(layer);
@@ -455,10 +507,10 @@ fn configuration_rejects_unimplemented_or_inconsistent_policies_and_binds_every_
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
     let base = udp_base_session_config(rt, transport, config)?;
-    // Captured from the ordinary runtime before packed composition was added.
-    assert_eq!(
+    // The required v2 byte/identity policy must reject this historical v1 digest.
+    assert_ne!(
         base.digest.0,
         [
             161, 123, 239, 214, 7, 22, 246, 234, 53, 233, 88, 139, 15, 167, 254, 188, 105, 58, 234,
@@ -485,16 +537,17 @@ fn configuration_rejects_unimplemented_or_inconsistent_policies_and_binds_every_
     assert!(udp_base_session_config(rt, transport, changed).is_err());
     let mut wrong = rt;
     wrong.compression = Compression::Lz4IfSmaller;
-    assert!(Config::for_udp(wrong, transport, 4).is_err());
+    assert!(Config::for_udp(wrong, transport, 4, delivery(wrong)).is_err());
     assert!(
         Config::for_udp(
             rt,
             transport.with_recovery(udp::RecoveryMode::SelectiveRepeat)?,
-            4
+            4,
+            delivery(rt)
         )
         .is_err()
     );
-    assert!(Config::for_udp(rt, transport, 0).is_err());
+    assert!(Config::for_udp(rt, transport, 0, delivery(rt)).is_err());
     assert_eq!(config.protocol.recovery.outer_overhead_bytes, 0);
     assert!(config.protocol.receiver.body.symbol_bytes + 48 == transport.arq.max_source_bytes);
     Ok(())
@@ -508,7 +561,7 @@ async fn wrong_bound_runtime_is_rejected_before_any_device_read_and_control_eof_
         CoverProfile::OpenVpnLike,
         Protection::HmacSha256,
     )?;
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
     let (a, b, _relays) = udp_links(rt, transport, config, false).await?;
     let device = Device::new(rt.layer);
     device.change(|state| state.outgoing.push_back(packet(rt.layer, 1, 100)))?;
@@ -540,7 +593,7 @@ async fn authenticated_raw_policy_and_native_credit_violations_fail_closed() -> 
             CoverProfile::OpenVpnLike,
             Protection::HmacSha256,
         )?;
-        let config = Config::for_udp(rt, transport, 4)?;
+        let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
         let (a, b, _relays) = udp_links(rt, transport, config, false).await?;
         let (mut parts, _) =
             a.0.into_bound_parts(udp_base_session_config(rt, transport, config)?)?;
@@ -600,7 +653,7 @@ async fn authenticated_raw_policy_and_native_credit_violations_fail_closed() -> 
             description.contains(if bad_headers {
                 "Policy"
             } else {
-                "native delivery window"
+                "native delivery capacity"
             }),
             "{description}"
         );
@@ -621,7 +674,7 @@ async fn native_wouldblock_expires_without_fabricating_delivery_credit() -> Test
     transport.arq.maximum_rto = Duration::from_millis(100);
     transport.arq.max_retries = 0;
     transport.reassembly_timeout = Duration::from_millis(200);
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
     let (a_link, b_link, _relays) = udp_links(rt, transport, config, false).await?;
     let a = Device::new(rt.layer);
     let b = Device::new(rt.layer);
@@ -648,3 +701,167 @@ async fn native_wouldblock_expires_without_fabricating_delivery_credit() -> Test
 
 #[path = "aligned_flow_tests.rs"]
 mod flow_retirement;
+
+#[tokio::test]
+async fn actual_byte_flight_exceeds64_with_local2_and_real_native_pressure() -> TestResult {
+    for duplex in [Duplex::Full, Duplex::Half] {
+        for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
+            for use_quic in [false, true] {
+                let mut rt = runtime(layer);
+                rt.queue_packets = 2;
+                let mut native_delivery = delivery(rt);
+                native_delivery.forward.max_records = 128;
+                native_delivery.reverse.max_records = 128;
+                native_delivery.forward.max_inflight_bytes = 131072;
+                native_delivery.reverse.max_inflight_bytes = 131072;
+                let a = Device::new(layer);
+                let b = Device::new(layer);
+                let input: Vec<_> = (0..128)
+                    .map(|index| {
+                        let mut bytes = packet(
+                            layer,
+                            (index % 4 + 1) as u8,
+                            if index % 2 == 0 { 1500 } else { 40 },
+                        );
+                        if let Some(last) = bytes.last_mut() {
+                            *last = index as u8;
+                        }
+                        bytes
+                    })
+                    .collect();
+                let actual_bytes: u64 = input.iter().map(|p| p.len() as u64).sum();
+                assert_eq!(actual_bytes, 64 * 1540);
+                a.change(|n| {
+                    n.blocked = true;
+                    n.outgoing.extend(input.iter().cloned());
+                })?;
+                b.change(|n| {
+                    n.blocked = true;
+                    n.outgoing.extend(input.iter().cloned());
+                })?;
+                let (a_observer, a_status) = tokio::sync::watch::channel(ActorStatus::default());
+                let (b_observer, b_status) = tokio::sync::watch::channel(ActorStatus::default());
+                let mut tasks = JoinSet::new();
+                let relays;
+                if use_quic {
+                    let transport = quic_transport(duplex)?;
+                    let config = Config::for_quic(rt, transport, 4, native_delivery)?;
+                    assert_eq!(config.pipeline.queue.packets, 2);
+                    let (a_link, b_link, owned) = quic_links(rt, transport, config).await?;
+                    relays = owned;
+                    let binding = quic_base_session_config(rt, transport, config)?;
+                    let (a_parts, ai) = a_link.0.into_bound_parts(binding)?;
+                    let (b_parts, bi) = b_link.0.into_bound_parts(binding)?;
+                    tasks.spawn(run_parts_observed(
+                        a.clone(),
+                        a_parts,
+                        ai,
+                        rt,
+                        transport.policy()?,
+                        Selection::Aligned(config),
+                        Some(a_observer),
+                    ));
+                    tasks.spawn(run_parts_observed(
+                        b.clone(),
+                        b_parts,
+                        bi,
+                        rt,
+                        transport.policy()?,
+                        Selection::Aligned(config),
+                        Some(b_observer),
+                    ));
+                } else {
+                    let transport =
+                        udp_transport(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?;
+                    let config = Config::for_udp(rt, transport, 4, native_delivery)?;
+                    assert_eq!(config.pipeline.queue.packets, 2);
+                    let (a_link, b_link, owned) = udp_links(rt, transport, config, false).await?;
+                    relays = owned;
+                    let binding = udp_base_session_config(rt, transport, config)?;
+                    let (a_parts, ai) = a_link.0.into_bound_parts(binding)?;
+                    let (b_parts, bi) = b_link.0.into_bound_parts(binding)?;
+                    tasks.spawn(run_parts_observed(
+                        a.clone(),
+                        a_parts,
+                        ai,
+                        rt,
+                        transport.policy()?,
+                        Selection::Aligned(config),
+                        Some(a_observer),
+                    ));
+                    tasks.spawn(run_parts_observed(
+                        b.clone(),
+                        b_parts,
+                        bi,
+                        rt,
+                        transport.policy()?,
+                        Selection::Aligned(config),
+                        Some(b_observer),
+                    ));
+                }
+                timeout(Duration::from_secs(3), async {
+                    loop {
+                        let ready = [&a_status, &b_status].iter().all(|status| {
+                            status.borrow().flight.iter().flatten().any(|s| s.outstanding.records == 128 && s.flushed_total.records == 128)
+                        });
+                        if ready && a.change(|n| n.writes > 0)? && b.change(|n| n.writes > 0)? { return Ok::<_, io::Error>(()); }
+                        tokio::select! {
+                            Some(result) = tasks.join_next() => return Err(io::Error::other(format!("actor ended under native pressure: {result:?}"))),
+                            _ = sleep(Duration::from_millis(1)) => {},
+                        }
+                    }
+                }).await.map_err(|error| format!("{duplex:?}/{layer:?}/quic={use_quic} pressure/debt: {error}; a={:?}; b={:?}; native_counts={:?}/{:?}", *a_status.borrow(), *b_status.borrow(), a.change(|n| (n.admitted,n.writes,n.delivered.len())), b.change(|n| (n.admitted,n.writes,n.delivered.len()))))??;
+                for status in [&a_status, &b_status] {
+                    let snapshot = *status.borrow();
+                    let flight = snapshot
+                        .flight
+                        .iter()
+                        .flatten()
+                        .find(|s| s.outstanding.records == 128)
+                        .ok_or("missing actual debt")?;
+                    assert_eq!(flight.outstanding.bytes, actual_bytes);
+                    assert_eq!(flight.flushed_total.bytes, actual_bytes);
+                    assert_eq!(flight.delivered.bytes, 0);
+                    assert!(flight.retained_records <= native_delivery.forward.max_records);
+                }
+                for device in [&a, &b] {
+                    assert!(device.change(|n| n.delivered.is_empty())?);
+                    device.change(|n| n.blocked = false)?;
+                }
+                wait_delivery(&mut tasks, &a, &b, input.len()).await.map_err(|error| format!("{duplex:?}/{layer:?}/quic={use_quic} native delivery: {error}; a={:?}; b={:?}", *a_status.borrow(), *b_status.borrow()))?;
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        if [&a_status, &b_status].iter().all(|s| s.borrow().flight.iter().flatten().all(|f| f.outstanding.records == 0 && f.retained_records == 0)) { return Ok::<_, io::Error>(()); }
+                        tokio::select! {
+                            Some(result) = tasks.join_next() => return Err(io::Error::other(format!("actor ended before exact native receipts: {result:?}"))),
+                            _ = sleep(Duration::from_millis(1)) => {},
+                        }
+                    }
+                }).await.map_err(|error| format!("{duplex:?}/{layer:?}/quic={use_quic} native receipt: {error}; a={:?}; b={:?}", *a_status.borrow(), *b_status.borrow()))??;
+                let transport =
+                    udp_transport(duplex, CoverProfile::OpenVpnLike, Protection::HmacSha256)?;
+                let config = Config::for_udp(rt, transport, 4, native_delivery)?;
+                let classifier = l2tunnel_pipeline::Pipeline::new(config.pipeline)?;
+                for device in [&a, &b] {
+                    let delivered = device.change(|n| n.delivered.clone())?;
+                    for frame in &input {
+                        let key = classifier.classify(frame)?.key;
+                        let expected: Vec<_> = input
+                            .iter()
+                            .filter(|p| classifier.classify(p).is_ok_and(|p| p.key == key))
+                            .collect();
+                        let actual: Vec<_> = delivered
+                            .iter()
+                            .filter(|p| classifier.classify(p).is_ok_and(|p| p.key == key))
+                            .collect();
+                        assert_eq!(actual, expected, "native per-flow FIFO changed");
+                    }
+                }
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                drop(relays);
+            }
+        }
+    }
+    Ok(())
+}

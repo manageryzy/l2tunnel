@@ -12,7 +12,16 @@ pub(super) const OPTIONS: &[&str] = &[
     "--inflight-max-bytes",
     "--inflight-max-records",
 ];
-pub(super) const HELP: &str = "Delivery window: --delivery-window bdp selects byte-based bandwidth x observed delivery-feedback RTT over system TCP/TLS frame records. Requires --forward-mbps N --reverse-mbps N --bootstrap-rtt-ms N on both peers (same canonical directions). Optional --bdp-headroom-percent 100..400 (default125), --inflight-max-bytes (default4MiB,maximum64MiB), --inflight-max-records (default8192). Local queue stays64packets. Legacy/default remains available for measured comparisons; this does not control endpoint TCP cwnd.";
+pub(super) const HELP: &str = "Delivery window: --delivery-window bdp selects byte-based bandwidth x observed delivery-feedback RTT over system TCP/TLS frame or UDP/QUIC aligned/packed records. Aligned/packed require this policy. Requires --forward-mbps N --reverse-mbps N --bootstrap-rtt-ms N on both peers (same canonical directions). Optional --bdp-headroom-percent 100..400 (default125), --inflight-max-bytes (default4MiB,maximum64MiB), --inflight-max-records (default8192). Local queue stays64packets. TCP/TLS frame legacy/default remains available for measured comparisons; this does not control endpoint TCP cwnd.";
+
+pub(super) fn required_settings(
+    options: &BTreeMap<String, String>,
+    config: ConnectionConfig,
+) -> io::Result<DeliveryConfig> {
+    settings(options, config)?.ok_or_else(|| {
+        input("aligned/packed require explicit --delivery-window bdp and bandwidth/RTT parameters")
+    })
+}
 
 pub(super) fn settings(
     options: &BTreeMap<String, String>,
@@ -28,16 +37,19 @@ pub(super) fn settings(
         Some("bdp") => {}
         _ => return Err(input("delivery-window must be legacy or bdp")),
     }
-    if options.get("--carrier").is_some_and(|value| value != "tcp")
-        || options
-            .get("--traffic")
-            .is_some_and(|value| value != "system")
-        || options
-            .get("--record-profile")
-            .is_some_and(|value| value != "frame")
+    let carrier = options.get("--carrier").map_or("tcp", String::as_str);
+    let profile = options
+        .get("--record-profile")
+        .map_or("frame", String::as_str);
+    if !matches!(
+        (carrier, profile),
+        ("tcp", "frame") | ("udp" | "quic", "aligned" | "packed")
+    ) || options
+        .get("--traffic")
+        .is_some_and(|value| value != "system")
     {
         return Err(input(
-            "BDP delivery window requires system TCP/TLS frame records",
+            "BDP delivery window requires system TCP/TLS frame or UDP/QUIC aligned/packed records",
         ));
     }
     for key in ["--forward-mbps", "--reverse-mbps", "--bootstrap-rtt-ms"] {
@@ -76,6 +88,18 @@ pub(super) fn settings(
     Ok(Some(selected))
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn report(delivery: DeliveryConfig) {
+    println!(
+        "Delivery: BDP; forward {} bps; reverse {} bps; bootstrap {} us; cap {} bytes/{} records; local queue 64 packets",
+        delivery.forward.target_bandwidth_bps,
+        delivery.reverse.target_bandwidth_bps,
+        delivery.forward.bootstrap_rtt_micros,
+        delivery.forward.max_inflight_bytes,
+        delivery.forward.max_records,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +125,18 @@ mod tests {
         assert_eq!(selected.forward.target_bandwidth_bps, 100_000_000);
         assert_eq!(selected.reverse.target_bandwidth_bps, 10_000_000);
         assert_eq!(config.runtime().queue_packets, 64);
+        for carrier in ["udp", "quic"] {
+            for profile in ["aligned", "packed"] {
+                let mut explicit = options.clone();
+                explicit.insert("--carrier".into(), carrier.into());
+                explicit.insert("--record-profile".into(), profile.into());
+                assert_eq!(required_settings(&explicit, config)?, selected);
+                explicit.remove("--delivery-window");
+                assert!(required_settings(&explicit, config).is_err());
+                explicit.insert("--delivery-window".into(), "legacy".into());
+                assert!(required_settings(&explicit, config).is_err());
+            }
+        }
         for (key, value) in [
             ("--carrier", "udp"),
             ("--traffic", "active"),

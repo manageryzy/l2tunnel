@@ -21,6 +21,8 @@ pub struct Options {
 /// Immutable packed interpretation and the existing common MUX/QoS policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
+    /// Required canonical native flight budgets, independent of local queues.
+    pub delivery: crate::managed::DeliveryConfig,
     /// Exact packing, source, channel, receiver and recovery bounds.
     pub protocol: protocol::Config,
     /// Common scheduling shared by all native user packets.
@@ -33,9 +35,10 @@ impl Config {
         transport: udp::Config,
         channels: u16,
         options: Options,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         udp::base_session_config(runtime, transport)?;
-        Self::from_policy(runtime, transport.policy()?, channels, options)
+        Self::from_policy(runtime, transport.policy()?, channels, options, delivery)
     }
     /// Derive exact packed geometry from an explicitly Cauchy genuine QUIC policy.
     pub fn for_quic(
@@ -43,15 +46,17 @@ impl Config {
         transport: quic::Config,
         channels: u16,
         options: Options,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         quic::base_session_config(runtime, transport)?;
-        Self::from_policy(runtime, transport.policy()?, channels, options)
+        Self::from_policy(runtime, transport.policy()?, channels, options, delivery)
     }
     fn from_policy(
         runtime: RuntimeConfig,
         policy: DatagramPolicy,
         channels: u16,
         options: Options,
+        delivery: crate::managed::DeliveryConfig,
     ) -> io::Result<Self> {
         if !(1..=1000).contains(&options.hold_micros)
             || options.max_units == 0
@@ -61,7 +66,8 @@ impl Config {
             return Err(invalid("packed policy limits"));
         }
         let units = usize::from(options.max_units);
-        let mut base = aligned::Config::derive(runtime, policy, channels, 56 + 8 * units)?;
+        let mut base =
+            aligned::Config::derive(runtime, policy, channels, 56 + 8 * units, delivery)?;
         let limits = &mut base.protocol.receiver;
         let maximum_record = limits
             .max_fragments_per_record
@@ -82,6 +88,7 @@ impl Config {
         );
         limits.source_window = limits.source_window.max(units);
         let value = Self {
+            delivery,
             protocol: protocol::Config {
                 base: base.protocol,
                 hold_micros: options.hold_micros,
@@ -95,6 +102,7 @@ impl Config {
     }
     pub(crate) fn base(self) -> aligned::Config {
         aligned::Config {
+            delivery: self.delivery,
             protocol: self.protocol.base,
             pipeline: self.pipeline,
         }
@@ -105,12 +113,15 @@ impl Config {
     }
 }
 fn bind(base: SessionConfig, config: Config) -> io::Result<SessionConfig> {
-    Ok(aligned::bind_policy(
-        base,
-        config.protocol.digest().map_err(io::Error::other)?,
-        config.pipeline,
-        b"l2tunnel/packed-runtime/v1/common-mux-crc32/control-v1\0",
-    ))
+    aligned::bind_delivery(
+        aligned::bind_policy(
+            base,
+            config.protocol.digest().map_err(io::Error::other)?,
+            config.pipeline,
+            b"l2tunnel/packed-runtime/v2/common-mux-crc32/native-identity-credit-v2\0",
+        ),
+        config.delivery,
+    )
 }
 
 /// Canonical packed policy before applying the selected physical UDP lane.

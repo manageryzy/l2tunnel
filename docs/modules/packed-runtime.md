@@ -1,12 +1,12 @@
 # Authenticated packed runtime composition
 
-Status: implemented and independently reviewed; [wave11](../../work/implementation-wave11/validation.json)
-provides stable aggregate evidence. Nine packed runtime tests and all
-six ordinary aligned runtime regressions pass. The [pure packed composition](packed-recovery.md)
-and the existing aligned actor retain their codec, recovery, authenticated lanes,
-common MUX/QoS, shared wire allowance and native delivery owners. This explicit,
-separately authenticated policy now has a focused-tested [client flag](packed-client.md).
-Native qualification, native quiescence and catalog parity remain open.
+Status: required v2 native identity/byte-budget integration is implemented and
+locally integration-tested; its combined aggregate is pending. The historical v1 [wave11](../../work/implementation-wave11/validation.json)
+remains valid for its stated nine packed tests and ordinary aligned regressions;
+it does not qualify changed v2 authentication/control or native performance.
+The [pure composition](packed-recovery.md) and one shared aligned actor retain
+actual codec, recovery, common MUX/QoS and carrier owners. Native v2 qualification,
+clean distributed drain and full Python composition remain open.
 
 ## Public configuration and authenticated capabilities
 
@@ -19,14 +19,15 @@ pub struct Options {
     pub work_limit: usize, // 1..=255
 }
 pub struct Config {
+    pub delivery: managed::DeliveryConfig, // required canonical forward/reverse policies
     pub protocol: l2tunnel_aligned::packed::Config,
     pub pipeline: l2tunnel_pipeline::PipelineConfig,
 }
 impl Config {
     pub fn for_udp(runtime: RuntimeConfig, transport: udp::Config,
-        channels: u16, options: Options) -> io::Result<Self>;
+        channels: u16, options: Options, delivery: managed::DeliveryConfig) -> io::Result<Self>;
     pub fn for_quic(runtime: RuntimeConfig, transport: quic::Config,
-        channels: u16, options: Options) -> io::Result<Self>;
+        channels: u16, options: Options, delivery: managed::DeliveryConfig) -> io::Result<Self>;
 }
 // Mirror existing aligned helpers with the new Config and distinct link types:
 // udp_base_session_config, udp_session_config, udp_carrier_config,
@@ -41,11 +42,15 @@ protocol digest, complete pipeline policy and existing carrier/native base. Ever
 lane authenticates that digest before native reads. Actual full/paired links
 retain the genuine carrier objects and pair proofs; ordinary aligned links cannot
 be relabeled as packed. Both peers must select identical packing geometry/time.
-Keep the ordinary aligned config, public factories, digest bytes and control magic
-unchanged. Pin a pre-refactor ordinary runtime digest regression.
+The required v2 delivery policy binds every canonical forward/reverse field under
+`l2tunnel/packed-runtime/v2/common-mux-crc32/native-identity-credit-v2`, with the
+shared delivery subdomain. Ordinary aligned and packed remain distinct; both
+explicit v2 profiles reject historical scalar-credit authentication. Existing
+base frame/fragment mode digests stay unchanged.
 
-The fixed packed control magic is `L2PC`; it uses the existing bounded control
-grammar, same real TLS/QUIC control owner and same feedback/credit fields. It is
+The fixed packed control magic is `L2P2`; it reuses the same strict control parser
+and actual TLS/QUIC owner. Recovery ACK and heartbeat retain their bounded forms;
+exact native receipts use9 bytes (channel u8 and absolute native body RecordId u64). It is
 not a second management protocol, reader or retry layer. The first slice requires
 explicit Cauchy recovery, compression off, CRC MUX, TAP system policy or transparent
 TUN DRR, just like the qualified aligned profile. Early-short gap bypass, active
@@ -68,8 +73,12 @@ ordinary envelope validator or silently fall back after an error.
 Native admission remains after common pipeline classification and MUX/QoS. A frame
 increments native admission once only after the selected endpoint retains it.
 Busy preserves the exact selected frame. Neither packed unit count nor recovery
-source count is native credit. Native delivery increments only after a successful
-whole `PacketDevice::transmit`; WouldBlock retains the same frame and credit.
+source count is native credit. A native identity is acknowledged only after successful whole
+`PacketDevice::transmit`; WouldBlock retains the same frame and byte charge.
+Exact receipt ownership is reserved in a bounded queue before device I/O, and no
+watch coalescing discards identities. Native receipts resolve only the original
+sender-owned body ledger; neither contexts nor peer-supplied byte counts create
+credit. Selective per-record completion preserves independent channel delivery.
 All sources, repairs, retries and TLS feedback use the existing shared allowance,
 including actual carrier overhead. No extra probe lane or new sender bypass exists.
 
@@ -91,7 +100,7 @@ validator proves this cross-module geometry and bounds preflight storage.
 
 For the packed selection only, service bounded native/pipeline ingress and
 admission bursts. Each burst is limited by negotiated `work_limit`, native queue,
-peer-confirmed native credit and codec staging. A burst must use the same arbiter
+the authenticated byte/record flight target and codec staging. A burst must use the same arbiter
 as every other user packet. This allows already queued small frames to actually
 share a source; merely polling one frame per millisecond would defeat submillisecond
 packing. Keep an immutable retained ingress/selected frame on admission pressure.
@@ -102,6 +111,28 @@ otherwise one frame per outer ticker would remain an accidental throughput limit
 Sample fresh elapsed monotonic time before each enqueue/service operation. A long
 burst must not keep admitting units against one stale time sampled before the
 original packing deadline. Crossing that deadline seals the old source normally.
+
+## Native first-flight ownership independent of local queues
+
+The shared aligned actor uses the existing pure delivery controller, including
+selective exact-record delivery/send APIs. Local Pipeline queues stay unchanged;
+encoded receive storage and source/recovery windows remain separate bounded
+owners. Receiver native counts and its one prepared frame are checked against the
+incoming hard policy, with separate finite encoded lookahead limits. Sender
+identity entries, per-native fragment bitmaps and the controller's retained span
+fit the explicit metadata allocation budget; an ACK cannot reclaim metadata still
+waiting for an original send callback.
+
+The pure sender returns the native body identity before packed polling can
+consume its units. Maintained recovery/envelope parsers expose typed original-unit
+witnesses, including every native sharing one physical source. The datagram writer
+reserves bounded callback capacity before actual send and records its original
+successful-send Instant. Only all original fragment bits confirm a native first
+flight; one later/final unit cannot imply earlier parts were sent. Retries preserve
+first successful times, failed sends publish no confirmation, and an early ACK
+never creates a later retrospective sample. Original admission-to-send deadlines
+remain terminal, alongside unchanged packing/recovery/reassembly deadlines. No
+native FIFO reorder is imposed to fit cumulative-prefix accounting.
 
 ## Original microsecond deadline and timer service
 
@@ -132,6 +163,10 @@ delivery barrier or a clean TLS shutdown receipt.
 
 ## Checklist and acceptance
 
+The checked original items describe historical v1 deliverables. Their saved
+receipts do not close the new FIX-01 v2 actor/native gate below.
+
+
 - [x] [MOD-PACKRUN-01] Independently review configuration, geometry, shared actor ownership, bounded burst admission and original-deadline wake before implementation. Evidence: [shared actor contract](#one-shared-runtime-actor), [fresh per-operation time and geometry](#geometry-and-bounded-progress), [separate packing wake and unchanged failure deadlines](#original-microsecond-deadline-and-timer-service).
 - [x] [MOD-PACKRUN-02] Implement distinct typed UDP/QUIC packed bindings and exact policy digest, preserving a pinned ordinary aligned runtime digest and failure-before-native-read behavior. Evidence: [typed factories and digest](../../crates/l2tunnel-runtime/src/packed.rs), [configuration and actual-link rejection tests](../../crates/l2tunnel-runtime/src/packed_tests.rs), [pinned ordinary digest](../../crates/l2tunnel-runtime/src/aligned_tests.rs).
 - [x] [MOD-PACKRUN-03] Integrate the existing packed endpoint into the shared actor, with bounded common MUX bursts, exact native credits, retained output and non-spinning timer service. Evidence: [shared actor](../../crates/l2tunnel-runtime/src/aligned.rs), [private endpoint selection](../../crates/l2tunnel-runtime/src/aligned_owner.rs), [deterministic timer/pressure tests](../../crates/l2tunnel-runtime/src/packed_timing_tests.rs).
@@ -139,6 +174,7 @@ delivery barrier or a clean TLS shutdown receipt.
 - [x] [MOD-PACKRUN-05] Test mismatched bound runtime policies, attempted ordinary-link reuse, loss/reorder/repair, blocked native/output, idle partial flush, a burst crossing its original deadline, sealed-pressure/no-spin with earlier receiver expiry, finite failure and cancellation; no false clean result or renewed deadline. Evidence: [seven geometry/real-carrier/failure tests](../../crates/l2tunnel-runtime/src/packed_tests.rs), [two injected-carrier timer tests](../../crates/l2tunnel-runtime/src/packed_timing_tests.rs); all nine passed, with unchanged six ordinary runtime regressions passing.
 - [x] [MOD-PACKRUN-06] Independently review ownership and run all ordinary runtime regressions, focused strict lint/docs and a stable workspace aggregate. Evidence: independent shared-owner and original-deadline review, [ordinary runtime regressions](../../crates/l2tunnel-runtime/src/aligned_tests.rs), [wave11](../../work/implementation-wave11/validation.json) with all nine packed runtime tests and unchanged source hashes.
 - [ ] [MOD-PACKRUN-07] Add [shared client/CLI configuration](packed-client.md) and separately scoped native qualification before claiming packed mode deployment or Python catalog parity.
+- [ ] [MOD-PACKRUN-08] Complete [FIX-01](../implementation-checklist.md) required authenticated v2 byte/record flight budgets, native identities and all-part original-send accounting through the one actor; pass strict aggregate and separately qualify native v2 behavior. Evidence: focused work in progress under [delivery evidence](../../work/aligned-delivery27/), with [pure selective receipt](../../work/aligned-delivery27/pure-validation.json). Native throughput is unqualified.
 
 The integrator owns this shared aligned actor change, new packed runtime module,
 tests and public module registration. Workers must wait for the reviewed API
@@ -169,3 +205,30 @@ handoff and receiver deadlines retain the ordinary ticker/I/O service contract;
 this change does not introduce a universal earliest-deadline timer. The test-only
 Tokio `test-util` feature provides paused time. Production timing still has OS and
 executor latency, and successful cancellation is never a clean native-drain proof.
+
+
+## Required v2 delivery evidence (FIX-01)
+
+The current focused packed actor passes11 tests and shares the six ledger/parser/
+writer regressions in aligned. New real authenticated UDP/QUIC full/half TAP/TUN
+cases keep local queues at two while reserving exactly80 native records/61600
+bytes in each direction. Each blocked-device phase witnesses actual WouldBlock
+and more than64 complete original native sends. After device release, all80
+frames and their exact identities are delivered, per-flow FIFO is checked, and
+all send/delivery metadata must be released. The source256 pure fixture separately
+packs two actual80/40-byte bodies into one source and delivers the later channel
+first without confusing their sender-owned identities. The1500/40 exact byte
+release case remains in the shared controller/runtime ledger regressions.
+
+Failure lineage is retained. The new initial128-record fixture demanded every
+record's first send before a newly chosen3s observation bound; the healthy packed
+actor had116 admitted and95–96 fully sent records at that cutoff. An80-record
+variant also reached exact debt with76/80 complete sends on one QUIC side. The
+final condition requires the stated >64 complete sends while blocked and all
+original records fully confirmed after release. Original3s observation,5s native
+lifetime,10s first-send policy, transport budgets and576-byte UDP MTU are unchanged;
+no production deadline or geometry was raised. These receipts qualify bounded
+flight separation, not throughput. The failed large-symbol pure fixtures were
+corrected to ordinary geometry; no protocol maximum was relaxed. Exact logs are
+preserved under [delivery work](../../work/aligned-delivery27/). The combined
+frozen aggregate and separate native v2 gate remain open.

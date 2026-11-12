@@ -545,3 +545,49 @@ fn raw_ip_policy_is_digest_bound_and_never_uses_ethernet_header_context() -> Tes
     assert_eq!(ethernet.arq_statistics().submitted, 0);
     Ok(())
 }
+
+#[test]
+fn sender_native_identity_and_all_original_fragment_witnesses_survive_retry() -> TestResult {
+    let mut endpoint = Endpoint::new(config(256), context(EndpointRole::Initiator))?;
+    let native = vec![0x7a; 1500];
+    let identity = endpoint.enqueue_identified(ChannelId(1), &native, ms(0))?;
+    assert_eq!(identity.channel, ChannelId(1));
+    let mut slots = [UnitWitness {
+        identity,
+        index: 0,
+        count: 1,
+    }];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut count = None;
+    for packet in emissions(&mut endpoint, 5)?
+        .into_iter()
+        .chain(emissions(&mut endpoint, 10)?)
+    {
+        let n = endpoint.outgoing_units(&packet, &mut slots)?;
+        for witness in &slots[..n] {
+            if witness.identity != identity {
+                continue;
+            }
+            assert!(witness.index < witness.count);
+            assert_eq!(*count.get_or_insert(witness.count), witness.count);
+            seen.insert(witness.index);
+        }
+    }
+    let count = count.ok_or("missing native witnesses")?;
+    assert!(count > 1);
+    assert_eq!(seen, (0..count).collect());
+    let retry = emissions(&mut endpoint, 110)?;
+    let mut retried_native = false;
+    for packet in retry {
+        let n = endpoint.outgoing_units(&packet, &mut slots)?;
+        for witness in &slots[..n] {
+            if witness.identity == identity {
+                retried_native = true;
+                assert_eq!(witness.count, count);
+                assert!(seen.contains(&witness.index));
+            }
+        }
+    }
+    assert!(retried_native);
+    Ok(())
+}

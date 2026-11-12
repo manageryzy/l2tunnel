@@ -161,11 +161,11 @@ impl SenderOwner {
         channel: ChannelId,
         frame: &[u8],
         now: Duration,
-    ) -> Result<(), Error> {
+    ) -> Result<receiver::RecordIdentity, Error> {
         match self {
             Self::Aligned(s) => match policy {
-                NativePolicy::EthernetHeaders => s.stage(channel, frame),
-                NativePolicy::RawIp => s.stage_raw(channel, frame),
+                NativePolicy::EthernetHeaders => s.stage_identified(channel, frame),
+                NativePolicy::RawIp => s.stage_raw_identified(channel, frame),
             }
             .map_err(|e| {
                 if e == sender::Error::Busy {
@@ -175,8 +175,8 @@ impl SenderOwner {
                 }
             }),
             Self::Packed(s) => match policy {
-                NativePolicy::EthernetHeaders => s.stage(channel, frame, micros(now)?),
-                NativePolicy::RawIp => s.stage_raw(channel, frame, micros(now)?),
+                NativePolicy::EthernetHeaders => s.stage_identified(channel, frame, micros(now)?),
+                NativePolicy::RawIp => s.stage_raw_identified(channel, frame, micros(now)?),
             }
             .map_err(|e| {
                 if e == packed_sender::Error::Busy {
@@ -220,6 +220,23 @@ impl Endpoint {
         now: Duration,
     ) -> Result<(), Error> {
         self.0.enqueue_admitted(channel, frame, now)
+    }
+    /// Retain one native frame and return its actual body identity, not a context.
+    pub fn enqueue_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<receiver::RecordIdentity, Error> {
+        self.0.enqueue_identified(channel, frame, now)
+    }
+    /// Inspect source units through the same authoritative recovery/envelope parsers.
+    pub fn outgoing_units(
+        &mut self,
+        packet: &[u8],
+        output: &mut [receiver::UnitWitness],
+    ) -> Result<usize, Error> {
+        self.0.outgoing_units(packet, output)
     }
     /// Explicit raw-IP staging under the authenticated native policy.
     pub fn enqueue_admitted_raw(

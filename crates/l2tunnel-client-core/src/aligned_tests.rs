@@ -181,7 +181,10 @@ async fn aligned_udp_clients_forward_both_layers_and_duplex_modes() -> TestResul
     for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
-            let settings = Settings { channels: 4 };
+            let settings = Settings {
+                channels: 4,
+                delivery: crate::delivery_tests::policy(),
+            };
             let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
                 let (a, b) = endpoints(duplex)?;
                 let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -247,7 +250,10 @@ async fn aligned_quic_clients_forward_both_layers_and_duplex_modes() -> TestResu
     for layer in [PacketLayer::Ethernet, PacketLayer::Ip] {
         for duplex in [Duplex::Full, Duplex::Half] {
             let config = connection(layer, duplex);
-            let settings = Settings { channels: 4 };
+            let settings = Settings {
+                channels: 4,
+                delivery: crate::delivery_tests::policy(),
+            };
             let ((a_link, transport, records), (b_link, _, _)) = retry_udp_startup!(8, {
                 let (a, b) = endpoints(duplex)?;
                 let listener = QuicListener::bind(
@@ -309,20 +315,40 @@ async fn aligned_quic_clients_forward_both_layers_and_duplex_modes() -> TestResu
 fn aligned_limits_and_binding_are_explicit() -> TestResult {
     let config = connection(PacketLayer::Ethernet, Duplex::Full);
     let (a, _) = endpoints(Duplex::Full)?;
-    let settings = Settings { channels: 4 };
+    let settings = Settings {
+        channels: 4,
+        delivery: crate::delivery_tests::policy(),
+    };
     let (transport, records) = udp_config(config, a, settings)?;
     let binding = runtime::udp_base_session_config(config.runtime(), transport, records)?;
     assert_ne!(
         binding,
         l2tunnel_runtime::udp::base_session_config(config.runtime(), transport)?
     );
-    let (_, changed) = udp_config(config, a, Settings { channels: 2 })?;
+    let (_, changed) = udp_config(
+        config,
+        a,
+        Settings {
+            channels: 2,
+            delivery: crate::delivery_tests::policy(),
+        },
+    )?;
     assert_ne!(
         binding,
         runtime::udp_base_session_config(config.runtime(), transport, changed)?
     );
     for channels in [0, 257, u16::MAX] {
-        assert!(udp_config(config, a, Settings { channels }).is_err());
+        assert!(
+            udp_config(
+                config,
+                a,
+                Settings {
+                    channels,
+                    delivery: crate::delivery_tests::policy()
+                }
+            )
+            .is_err()
+        );
     }
     assert!(
         udp_config(
@@ -347,7 +373,11 @@ fn aligned_limits_and_binding_are_explicit() -> TestResult {
         .is_err()
     );
     assert!(udp_config(config, udp::Settings { path_mtu: 575, ..a }, settings).is_err());
-    Settings { channels: 256 }.validate(config, recovery())?;
+    Settings {
+        channels: 256,
+        delivery: crate::delivery_tests::policy(),
+    }
+    .validate(config, recovery())?;
     let (quic, records) = quic_config(config, as_quic(a), settings)?;
     assert_ne!(
         runtime::quic_base_session_config(config.runtime(), quic, records)?,
@@ -374,7 +404,10 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
                     &credentials.member,
                     config,
                     a,
-                    Settings { channels: 4 }
+                    Settings {
+                        channels: 4,
+                        delivery: crate::delivery_tests::policy()
+                    }
                 ),
                 accept_udp(
                     &listener,
@@ -382,7 +415,10 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
                     &credentials.members,
                     config,
                     b,
-                    Settings { channels: 2 }
+                    Settings {
+                        channels: 2,
+                        delivery: crate::delivery_tests::policy()
+                    }
                 )
             )
         });
@@ -412,7 +448,10 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
             &credentials.key,
             config,
             as_quic(b),
-            Settings { channels: 2 },
+            Settings {
+                channels: 2,
+                delivery: crate::delivery_tests::policy(),
+            },
         )?;
         let (first, second) = timeout(Duration::from_secs(5), async {
             tokio::join!(
@@ -422,7 +461,10 @@ async fn mismatched_aligned_channels_fail_authentication() -> TestResult {
                     &credentials.member,
                     config,
                     as_quic(a),
-                    Settings { channels: 4 }
+                    Settings {
+                        channels: 4,
+                        delivery: crate::delivery_tests::policy()
+                    }
                 ),
                 listener.accept(&credentials.members)
             )

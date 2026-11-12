@@ -1,13 +1,13 @@
 # Native aligned-symbol runtime composition
 
-Status: runtime composition implemented, tested over real authenticated loopback
-carriers, and qualified in a finite owned Linux native matrix. The explicit
-[client selection](aligned-client.md) and [capture audit](../../work/native-aligned-matrix-audit.json)
-cover 18 UDP/QUIC, TAP/TUN/VXLAN and duplex/impairment cases. The
-[pure aligned pipeline](aligned-envelope.md) has separate finite tests.
-This slice carries its actual Python-compatible symbols over existing
-TLS-bootstrapped protected UDP and genuine UDP-only QUIC. These remain distinct
-carrier selections. Existing frame/fragment runtime formats stay unchanged.
+Status: required v2 native identity/byte-budget integration is implemented and
+locally integration-tested; its combined aggregate is pending. Native v2 qualification and throughput remain open. The historical
+v1 [client selection](aligned-client.md) and
+[capture audit](../../work/native-aligned-matrix-audit.json) cover18 owned Linux
+UDP/QUIC, TAP/TUN/VXLAN and duplex/impairment cases; those receipts are preserved
+and do not qualify the changed authenticated v2 policy. The
+[pure aligned pipeline](aligned-envelope.md) has separate finite tests. Existing
+frame/fragment runtime formats stay unchanged.
 
 ## Scope and explicit exclusions
 
@@ -35,9 +35,9 @@ constructors and old digest/wire paths continue to call the original base helper
 No authenticated connection is silently reinterpreted as an aligned session.
 
 ```text
-Config { protocol: l2tunnel_aligned::Config, pipeline: PipelineConfig }
-Config::for_udp(runtime, udp::Config, channels) -> Result<Config>
-Config::for_quic(runtime, quic::Config, channels) -> Result<Config>
+Config { delivery: managed::DeliveryConfig, protocol: l2tunnel_aligned::Config, pipeline: PipelineConfig }
+Config::for_udp(runtime, udp::Config, channels, delivery) -> Result<Config>
+Config::for_quic(runtime, quic::Config, channels, delivery) -> Result<Config>
 udp_base_session_config(runtime, transport, config) -> Result<SessionConfig>
 udp_session_config(runtime, transport, config, lane) -> Result<SessionConfig>
 udp_carrier_config(runtime, transport, config, lane, peer) -> Result<udp::Config>
@@ -62,9 +62,12 @@ retained control connections. A link's private bound config is rechecked by run.
 
 ## Authentication and complete configuration
 
-New domain `l2tunnel/aligned-runtime/v1` binds the existing complete transport-base
+Domain `l2tunnel/aligned-runtime/v2/common-mux-crc32/native-identity-credit-v2` binds the existing complete transport-base
 digest, the pure aligned config digest, all common PipelineConfig fields and native
-layer/max-packet/queue/poll policy. Complete profile application is performed once
+layer/max-packet/queue/poll policy. A separate domain-separated canonical binding
+includes all12 fields of each required `managed::DeliveryConfig` direction:
+forward means originator to acceptor, reverse means acceptor to originator.
+There is no omitted-policy or legacy64-record fallback. Complete profile application is performed once
 by the carrier helper, as in the existing runtime. The exact body format, native
 layer, symbol size, channels, first IDs, memory/timing/work caps, mapping/QoS,
 finite common budget and carrier/duplex/ALPN/protection policy therefore cannot
@@ -107,21 +110,41 @@ body/fragment geometry and native preparation. Common channel scheduling chooses
 receiver prepare order. Before device transmission the original packet is validated
 for the negotiated native layer and its authenticated channel is checked against
 the deterministic flow map. An immutable pending frame survives WouldBlock; only
-complete device acceptance calls commit_delivery and publishes cumulative native
-credit. Receipt ACKs alone never release that native admission credit.
+complete device acceptance calls commit_delivery and publishes its exact native
+body identity. Recovery ACKs alone never release native admission credit.
 
-The total sender native admission window is runtime.queue_packets per directional
-lane. Receiver reserved channel heads and lookahead memory are sufficient for that
-window's worst-case context/body records and fragments. More peer work than this
-admission permits fails closed. Counters never reset within a link or alias source,
-record, flow, cryptographic packet or carrier sequence spaces.
+Local Pipeline queues retain `runtime.queue_packets`; admission uses the shared
+actual-byte `delivery_window::Controller` and its independent hard byte/record
+caps, bandwidth and causal service RTT. A staged original packet is retained once
+when the byte target is full. Small TCP ACKs and probes charge their actual bytes
+and one record through the same MUX. The sender-owned `(channel, absolute body
+RecordId)` ledger excludes context records and resolves every authenticated
+receipt to its original admission ordinal. Independent channel delivery is kept:
+a later40-byte delivery releases40 bytes, never an earlier1500-byte charge.
+
+Receiver decoded native pending storage is one immutable frame, checked against
+negotiated maximum packet and incoming hard bytes; encoded native record counts
+are capped by the incoming record policy. Encoded record/context/fragment banks
+have separately checked finite pure-codec limits, derived independently of the
+local queue. A smaller encoded/recovery bank retains original ownership and can
+backpressure; a flight cap is not a promise of unbounded payload storage. The
+maximum pure lookahead remains4096 records/128MiB/1048576 fragment slots. Runtime
+identity slots and original-fragment bitmaps plus the pure controller bank fit the
+explicit metadata budget before device I/O. The entire retained ordinal span is
+bounded even when selective delivery releases bytes around a missing callback.
+Counters never reset within a link or alias source, record, flow, cryptographic
+packet or carrier sequence spaces.
 
 ## Shared carrier tasks, budgets and liveness
 
 Reuse the existing cancellation-safe long-lived control/datagram read/write tasks.
-New control magic distinguishes the aligned runtime while keeping bounded ACK,
-cumulative native-credit and heartbeat classes. Reliable ACK length is 56 bytes.
-Control messages use bounded channels/watch coalescing, and one immutable datagram
+Control magic `L2A2` rejects the historical scalar-credit profile. The shared
+strict parser retains56-byte recovery ACKs and heartbeat; v2 native receipts have
+exact9-byte bodies (channel u8, absolute body RecordId u64). Receipt ownership is
+reserved in a bounded channel before native transmit. These exact identities are
+never dropped by watch coalescing; only cumulative recovery feedback uses watch.
+Each receipt retains its original authenticated parse time before queue waiting.
+One immutable datagram
 handoff is retained while its writer blocks. Control EOF, deadline, malformed
 record, expired receiver stage or retry exhaustion closes the whole link and
 aborts and joins all owned tasks on an ordinary error return. External future
@@ -136,6 +159,17 @@ once. Both zero-overhead engine config and actual external charges are included
 in the authenticated combined digest. Feedback reservation is a portion of this
 same total, never an extra uncharged lane.
 
+A source/systematic packet is inspected using the maintained recovery/envelope
+parsers. Its original unit witnesses do not confirm a send. The writer reserves
+bounded completion-event capacity before carrier I/O and timestamps only after
+`DatagramSend::send` succeeds. The sender records each original fragment bit and
+confirms the native record only after all parts have genuinely sent. A packed
+source may witness multiple records; a later completion never confirms an earlier
+record implicitly. Retries cannot restamp a previously sent part. Failed sends
+publish no completion. ACK-before-callback retains the original send deadline
+and never creates a retrospective RTT sample. This is application carrier-send
+acceptance, not proof of physical wire transmission.
+
 Time is injected from one runtime Instant. Receiver and immutable recovered-source
 handoff have separate stage deadlines; they are not one wire-arrival clock.
 Runtime ticks service endpoint deadlines and the existing recovery poll even with
@@ -143,6 +177,10 @@ no native input. Backpressure remains finite in memory; no delivery guarantee is
 made when device/carrier service stalls past configured expiry.
 
 ## Acceptance ledger
+
+Checked v1 items below retain their stated historical scope. FIX-01 v2 integration
+requires the new separate gate and does not inherit old native/performance results.
+
 
 - [x] [MOD-ALIGNEDRT-01] Freeze public constructors, exact authentication/profile binding and shared-helper ownership before code. Evidence: [runtime](../../crates/l2tunnel-runtime/src/aligned.rs), [actual-carrier tests](../../crates/l2tunnel-runtime/src/aligned_tests.rs), [pure composition](../../crates/l2tunnel-aligned/src/lib.rs).
 - [x] [MOD-ALIGNEDRT-02] Add explicit TUN raw staging and test byte/context/fragment preservation without changing existing APIs. Evidence: [runtime](../../crates/l2tunnel-runtime/src/aligned.rs), [actual-carrier tests](../../crates/l2tunnel-runtime/src/aligned_tests.rs), [pure composition](../../crates/l2tunnel-aligned/src/lib.rs).
@@ -152,6 +190,7 @@ made when device/carrier service stalls past configured expiry.
 - [x] [MOD-ALIGNEDRT-06] Run strict focused checks plus every prior UDP/QUIC regression and a coordinated stable aggregate. Evidence: [wave6 receipt](../../work/implementation-wave6/validation.json), 492 Rust cases including doctests and 36 Python cases with identical before/after source hashes; CLI/native OS qualification is separate.
 - [x] [MOD-ALIGNEDRT-07] Add explicit client configuration and owned native namespace/bridge/qdisc/packet-capture qualification before declaring native integration complete. Evidence: [client design and checks](aligned-client.md), [18-case native audit](../../work/native-aligned-matrix-audit.json), [UDP receipt](../../work/native-aligned-udp-matrix/receipt.json), [QUIC receipt](../../work/native-aligned-quic-matrix/receipt.json).
 - [ ] [MOD-ALIGNEDRT-08] Integrate negotiated mode switching, connection-round-robin arbitration, actual timed packing and unordered early-short recovery before enabling their catalog gates.
+- [ ] [MOD-ALIGNEDRT-09] Complete [FIX-01](../implementation-checklist.md) required authenticated v2 actual-byte/selective-native integration, strict combined aggregate and separately scoped native qualification. Evidence: focused work in progress under [aligned/packed delivery evidence](../../work/aligned-delivery27/); pure selective stage is [frozen](../../work/aligned-delivery27/pure-validation.json), but it does not close this actor/native gate. Native throughput remains unqualified.
 
 ## Finite verification and remaining gates
 
@@ -189,3 +228,25 @@ authentication binding, shared budget debit, RawIp dispatch, common channel
 validation, retained ingress/native credit or task shutdown. That review did not
 rerun the tests. Strict rustdoc and the 2,588-symbol Python sender fixture check
 also pass locally.
+
+
+## Required v2 delivery evidence (FIX-01)
+
+The focused current actor run passes17 aligned cases (including six shared ledger,
+control parser and writer ownership cases), and the packed selection passes11.
+The shared pure codec/aligned packages pass75 and19 tests respectively. The
+actual authenticated larger-flight test covers UDP and genuine QUIC, full/paired
+half modes, TAP/TUN, both directions and real `PacketDevice::transmit` WouldBlock.
+With local queues of two, aligned holds128 records/98560 original native bytes,
+then verifies exact device delivery, per-flow FIFO and all delivery/send metadata
+released. These are actual loopback carriers with injected packet devices, not
+kernel TAP/TUN throughput or advertised-window qualification.
+
+The old scalar mapping's exact1500/40-byte counterexample and original first-send
+prefix counterexample are preserved in
+[the pure-stage receipt](../../work/aligned-delivery27/pure-validation.json).
+The current runtime identity ledger also covers missing earlier fragments, early
+ACK, duplicate/context/future/wrong-channel identities, real send failures and
+bounded event-queue ownership before send. The complete actor receipt is under
+[delivery work](../../work/aligned-delivery27/); root owns the combined frozen
+`tools/check.py` gate. The v2 integration/native parent remains unchecked.

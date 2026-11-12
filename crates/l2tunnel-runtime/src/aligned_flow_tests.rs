@@ -4,7 +4,7 @@ use super::*;
 fn default_flow_capacity_after_idle_must_not_terminate_ingress() -> TestResult {
     let rt = runtime(PacketLayer::Ip);
     let transport = udp_transport(Duplex::Full, CoverProfile::QuicLike, Protection::HmacSha256)?;
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
     assert_eq!(config.pipeline.flows.capacity, 1024);
     let mut pipeline = Pipeline::new(config.pipeline)?;
     let mut device = Device::new(rt.layer);
@@ -67,7 +67,7 @@ fn default_flow_capacity_after_idle_must_not_terminate_ingress() -> TestResult {
 fn selected_binding_is_pinned_then_same_key_relearns_identical_channel() -> TestResult {
     let rt = runtime(PacketLayer::Ip);
     let transport = udp_transport(Duplex::Full, CoverProfile::QuicLike, Protection::HmacSha256)?;
-    let config = Config::for_udp(rt, transport, 4)?;
+    let config = Config::for_udp(rt, transport, 4, delivery(rt))?;
     let mut pipeline = Pipeline::new(config.pipeline)?;
     let bytes = packet(rt.layer, 1, 100);
     let original = pipeline.enqueue(bytes.clone(), Duration::ZERO)?;
@@ -98,7 +98,7 @@ async fn aligned_retirement_churn_keeps_recovery_and_native_held_bytes() -> Test
     for duplex in [Duplex::Full, Duplex::Half] {
         let rt = runtime(PacketLayer::Ip);
         let transport = udp_transport(duplex, CoverProfile::QuicLike, Protection::HmacSha256)?;
-        let mut config = Config::for_udp(rt, transport, 4)?;
+        let mut config = Config::for_udp(rt, transport, 4, delivery(rt))?;
         config.pipeline.flows.capacity = 4;
         config.pipeline.flows.idle_timeout = Duration::from_millis(10);
         let (a_link, b_link, relays) = udp_links(rt, transport, config, true).await?;
@@ -140,7 +140,7 @@ async fn aligned_retirement_churn_keeps_recovery_and_native_held_bytes() -> Test
 fn endpoint_recovery_and_blocked_native_survive_registration_retirement() -> TestResult {
     let rt = runtime(PacketLayer::Ip);
     let transport = udp_transport(Duplex::Full, CoverProfile::QuicLike, Protection::HmacSha256)?;
-    let aligned = Config::for_udp(rt, transport, 4)?;
+    let aligned = Config::for_udp(rt, transport, 4, delivery(rt))?;
     let packed = crate::packed::Config::for_udp(
         rt,
         transport,
@@ -150,6 +150,7 @@ fn endpoint_recovery_and_blocked_native_survive_registration_retirement() -> Tes
             max_units: 4,
             work_limit: 16,
         },
+        delivery(rt),
     )?;
     for selection in [Selection::Aligned(aligned), Selection::Packed(packed)] {
         let mut config = selection.base().pipeline;
@@ -166,7 +167,7 @@ fn endpoint_recovery_and_blocked_native_survive_registration_retirement() -> Tes
         let mut sender = selection.endpoint(context(EndpointRole::Initiator))?;
         let mut receiver = selection.endpoint(context(EndpointRole::Responder))?;
         let channel = protocol::ChannelId(metadata.binding.channel as u8);
-        sender.enqueue_admitted(channel, &selected.payload, Duration::ZERO)?;
+        sender.enqueue_identified(channel, &selected.payload, Duration::ZERO)?;
         let staged = sender.status();
         assert!(
             staged.staged_frame

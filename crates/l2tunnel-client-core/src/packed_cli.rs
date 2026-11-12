@@ -7,7 +7,7 @@ pub(super) const OPTIONS: &[&str] = &[
     "--packed-max-units",
     "--packed-work-limit",
 ];
-pub(super) const HELP: &str = "Packed records: --record-profile packed; explicit --carrier udp|quic, --fec cauchy, --compression off and system traffic. --packed-channels 1..255 (default 4), --packed-hold-micros 1..1000 (default 1000), --packed-max-units 1..255 (default 4, further bounded by MTU), --packed-work-limit 1..255 (default 16). Requires matching peer settings; no local reload or active/proxy composition. All packets share the common channel pool.";
+pub(super) const HELP: &str = "Packed records: --record-profile packed; explicit --carrier udp|quic, --fec cauchy, --compression off and system traffic. --packed-channels 1..255 (default 4), --packed-hold-micros 1..1000 (default 1000), --packed-max-units 1..255 (default 4, further bounded by MTU), --packed-work-limit 1..255 (default 16). Requires explicit --delivery-window bdp with canonical forward/reverse bandwidth and bootstrap RTT. Requires matching peer settings; no local reload or active/proxy composition. All packets share the common channel pool.";
 
 pub(super) fn settings(
     options: &BTreeMap<String, String>,
@@ -36,6 +36,7 @@ pub(super) fn settings(
     }
     let settings = crate::packed::Settings {
         channels: number(options, "--packed-channels", 4)?,
+        delivery: delivery_frontend::required_settings(options, config)?,
         packing: l2tunnel_runtime::packed::Options {
             hold_micros: number(options, "--packed-hold-micros", 1000)?,
             max_units: number(options, "--packed-max-units", 4)?,
@@ -66,6 +67,10 @@ mod tests {
             ("--fec", "cauchy"),
             ("--compression", "off"),
             ("--record-profile", "packed"),
+            ("--delivery-window", "bdp"),
+            ("--forward-mbps", "100"),
+            ("--reverse-mbps", "10"),
+            ("--bootstrap-rtt-ms", "70"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -116,7 +121,14 @@ mod tests {
                 "accepted {key}={value}"
             );
         }
-        for key in ["--carrier", "--fec"] {
+        for key in [
+            "--carrier",
+            "--fec",
+            "--delivery-window",
+            "--forward-mbps",
+            "--reverse-mbps",
+            "--bootstrap-rtt-ms",
+        ] {
             let mut bad = values.clone();
             bad.remove(key);
             assert!(settings(&bad, config).is_err());

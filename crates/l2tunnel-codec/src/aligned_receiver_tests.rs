@@ -554,3 +554,26 @@ fn compressed_header_context_is_committed_only_after_native_acceptance() -> Test
     assert_eq!(receiver.expected(ChannelId(0))?, Some(RecordId(3)));
     Ok(())
 }
+
+#[test]
+fn original_unit_witness_rejects_invalid_geometry_and_truncation() -> TestResult {
+    let policy = limits();
+    let symbol = raw(policy.body.symbol_bytes, 1, 7, b"small native");
+    let witness = unit_witness(identity(0, 7), &symbol, policy)?;
+    assert_eq!(
+        witness.identity,
+        RecordIdentity {
+            channel: ChannelId(1),
+            record: RecordId(7)
+        }
+    );
+    assert_eq!((witness.index, witness.count), (0, 1));
+    for length in 0..symbol.len() {
+        assert!(unit_witness(identity(0, 7), &symbol[..length], policy).is_err());
+    }
+    let mut invalid = policy;
+    invalid.body.symbol_bytes = 0;
+    assert!(unit_witness(identity(0, 7), &[], invalid).is_err());
+    assert!(unit_witness(identity(0, 8), &symbol, policy).is_err());
+    Ok(())
+}
