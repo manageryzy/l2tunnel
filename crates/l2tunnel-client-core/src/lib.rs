@@ -240,3 +240,6 @@ mod tests {
         Ok(())
     }
 }
+
+/// Explicit startup-bound rolling source/frame client and lifecycle observation.
+pub mod rolling;

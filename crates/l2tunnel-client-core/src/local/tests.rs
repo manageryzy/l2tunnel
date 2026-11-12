@@ -36,6 +36,7 @@ fn response() -> Response {
             proxy: None,
             openvpn_drain: None,
             raw_packet: None,
+            rolling: None,
         }),
     }
 }

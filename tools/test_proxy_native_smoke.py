@@ -188,7 +188,7 @@ class ProxyHarnessTests(unittest.TestCase):
                 with self.assertRaises(ValueError): h.read_pcap(path)
             path.write_bytes(pcap([raw]))
             with patch.object(h, 'CAPTURE_LIMIT', 24), self.assertRaises(ValueError): h.read_pcap(path)
-            with patch.object(h, 'PACKET_LIMIT', 1), self.assertRaises(ValueError): h.read_pcap(path)
+            with self.assertRaises(ValueError): h.read_pcap(path, packet_limit=1)
             path.write_bytes(pcap([]))
             with self.assertRaises(ValueError): h.read_pcap(path)
             data = bytearray(pcap([raw])); data[36:40] = struct.pack('<I', len(raw) + 1); path.write_bytes(data)
@@ -197,6 +197,76 @@ class ProxyHarnessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'beyond declared'): h.read_pcap(path)
             path.write_bytes(pcap([raw + bytes(6)], 1))
             self.assertEqual(h.read_pcap(path)[0].raw, raw)
+
+    def test_capture_packet_boundaries_keep_default_and_explicit_allocations(self):
+        raw = ip_packet('198.19.0.1', '198.19.0.2')
+        def counters(count, drops=0):
+            return f'{count} packets captured\n{count} packets received by filter\n{drops} packets dropped by kernel\n'
+        self.assertEqual(h.PACKET_LIMIT, 8192)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bounded.pcap'
+            for limit in (8192, 32768):
+                path.write_bytes(pcap([raw] * (limit - 1)))
+                self.assertEqual(len(h.read_pcap(path, limit)), limit - 1)
+                self.assertEqual(h.capture_counts(counters(limit - 1), limit)['captured'], limit - 1)
+                path.write_bytes(pcap([raw] * limit))
+                with self.assertRaises(h.CaptureBound): h.read_pcap(path, limit)
+                with self.assertRaises(h.CaptureBound): h.capture_counts(counters(limit), limit)
+            # The old cap is still the omitted-argument cap, even after larger reads.
+            path.write_bytes(pcap([raw] * 8192))
+            self.assertEqual(len(h.read_pcap(path, 32768)), 8192)
+            with self.assertRaises(h.CaptureBound): h.read_pcap(path)
+            with self.assertRaises(h.CaptureBound): h.capture_counts(counters(8192))
+            for count, drops in ((0, 0), (32767, 1)):
+                with self.assertRaises(ValueError): h.capture_counts(counters(count, drops), 32768)
+            truncated = pcap([raw])[:-1]
+            path.write_bytes(truncated)
+            with self.assertRaisesRegex(ValueError, 'truncated'): h.read_pcap(path, 32768)
+
+    def test_invalid_capture_limits_fail_before_io_and_never_stop_a_child(self):
+        missing = Path('/not-created-capture-limit-fixture')
+        for limit in (0, 1, -1, 32769, True, False, 1.5, '8192', None):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError): h.read_pcap(missing, limit)
+                with self.assertRaises(ValueError): h.capture_counts('', limit)
+                with patch.object(h, 'stop') as stop, self.assertRaises(ValueError):
+                    h.finish_capture(Mock(), missing, limit)
+                stop.assert_not_called()
+        default = {name: 8192 for name in ('a_native', 'b_native', 'a_wan', 'b_wan')}
+        self.assertEqual(h.validated_capture_limits(), default)
+        self.assertEqual(h.validated_capture_limits(default), default)
+        for limits in ({}, [], {**default, 'unknown': 8192}, {**default, 'a_wan': True},
+                       {**default, 'a_native': 32769}):
+            with self.subTest(limits=limits), patch.object(h, 'read_pcap') as read:
+                with self.assertRaises(ValueError): h.audit_native_captures({key: missing for key in default}, [], 1, limits)
+                read.assert_not_called()
+
+    def test_finish_capture_validates_selected_count_without_weakening_drops(self):
+        for count, drops, error in ((8192, 0, None), (32768, 0, h.CaptureBound),
+                                    (8192, 1, ValueError)):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'capture.log'
+                path.write_text('tcpdump: listening on wan0\n')
+                process = Mock(stderr=io.BytesIO(f'{count} packets captured\n{count} packets received by filter\n{drops} packets dropped by kernel\n'.encode()))
+                with patch.object(h, 'stop') as stop:
+                    if error is None:
+                        self.assertEqual(h.finish_capture(process, path, 32768)['captured'], count)
+                    else:
+                        with self.assertRaises(error): h.finish_capture(process, path, 32768)
+                stop.assert_called_once_with(process, interrupt=True)
+                self.assertTrue(process.stderr.closed)
+                self.assertIn('packets dropped by kernel', path.read_text())
+
+    def test_capture_audit_propagates_each_surface_limit_and_keeps_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, _, flows = fixture_captures(directory)
+            selected = {'a_native': 8192, 'b_native': 8192, 'a_wan': 32768, 'b_wan': 32768}
+            for limits in (None, selected):
+                with patch.object(h, 'read_pcap', wraps=h.read_pcap) as read:
+                    proof = h.audit_native_captures(paths, flows, 1, limits)
+                self.assertEqual(len(proof['flows']), 6)
+                self.assertEqual({call.args[0]: call.args[1] for call in read.call_args_list},
+                    {path: (limits or h.validated_capture_limits())[key] for key, path in paths.items()})
 
     def test_capture_audit_requires_real_split_and_exact_bypass_both_fin_and_lanes(self):
         for lanes in (1, 2):

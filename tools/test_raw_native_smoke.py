@@ -144,17 +144,19 @@ class RawNativeEvidenceTests(unittest.TestCase):
                 smoke.verify_peer_drains(peers, lanes)
 
     def test_both_private_requests_precede_reply_wait_and_replies_are_bounded(self) -> None:
-        for bad in (False, True):
-            with tempfile.TemporaryDirectory(prefix='l2t-drain-test-') as directory:
+        for bad, force_early_close in ((False, False), (True, False), (True, True)):
+            with (self.subTest(bad=bad, force_early_close=force_early_close),
+                  tempfile.TemporaryDirectory(prefix='l2t-drain-test-') as directory):
                 paths = {side: Path(directory) / side for side in ('a', 'b')}
                 listeners = {}
                 for side, path in paths.items():
                     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     listener.bind(str(path)); listener.listen(1); listener.settimeout(2)
                     listeners[side] = listener
-                errors = []
+                errors, disconnects = [], []
+                clients = {}
+                client_finished = threading.Event()
                 def serve() -> None:
-                    clients = {}
                     try:
                         for side, listener in listeners.items():
                             clients[side], _ = listener.accept()
@@ -170,7 +172,20 @@ class RawNativeEvidenceTests(unittest.TestCase):
                         for side, connection in clients.items():
                             proof = drain_proof() if side == 'a' else drain_proof(5, 3)
                             raw = b'X' * 8193 if bad and side == 'a' else json.dumps(proof).encode() + b'\n'
-                            connection.sendall(raw); connection.shutdown(socket.SHUT_WR)
+                            if force_early_close and side == 'b':
+                                # Rejection of A closes both client sockets. Force
+                                # B's write to follow that exact event, not a sleep.
+                                if not client_finished.wait(2):
+                                    raise AssertionError('client rejection did not finish')
+                            try:
+                                connection.sendall(raw)
+                                connection.shutdown(socket.SHUT_WR)
+                            except BrokenPipeError:
+                                # Only the oversized-reply case permits early close;
+                                # valid replies and every other error remain failures.
+                                if not bad or not client_finished.wait(2):
+                                    raise
+                                disconnects.append(side)
                     except Exception as error:
                         errors.append(error)
                     finally:
@@ -180,16 +195,25 @@ class RawNativeEvidenceTests(unittest.TestCase):
                 receipt = {}
                 try:
                     if bad:
-                        with self.assertRaises(ValueError):
+                        with self.assertRaisesRegex(ValueError, '^raw helper reply exceeds bound$'):
                             smoke.drain_helpers(paths, receipt, 1, time.monotonic() + 2)
+                        self.assertEqual(receipt['peers'], {})
                     else:
                         smoke.drain_helpers(paths, receipt, 1, time.monotonic() + 2)
                         smoke.verify_peer_drains(receipt['peers'], 1)
                 finally:
+                    client_finished.set()
                     worker.join(timeout=3)
                     for listener in listeners.values(): listener.close()
                 self.assertFalse(worker.is_alive())
                 self.assertFalse(errors)
+                self.assertEqual(set(clients), {'a', 'b'})
+                self.assertTrue(all(connection.fileno() == -1 for connection in clients.values()))
+                self.assertTrue(all(listener.fileno() == -1 for listener in listeners.values()))
+                if force_early_close:
+                    self.assertIn('b', disconnects)
+                if not bad:
+                    self.assertFalse(disconnects)
 
     def test_dry_run_never_executes_or_writes(self) -> None:
         output = io.StringIO()

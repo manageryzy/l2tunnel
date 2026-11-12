@@ -39,6 +39,7 @@ pub(super) fn action(
                     Compression::Lz4IfSmaller => local::Compression::Lz4,
                 },
                 raw_packet: None,
+                rolling: None,
                 active: None,
                 proxy: None,
                 openvpn_drain: Some(state),

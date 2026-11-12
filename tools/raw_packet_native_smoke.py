@@ -190,9 +190,65 @@ def phase_payload(data: bytes, lane: int, direction: int) -> dict | None:
     if kind in (4, 5) and (len(body) < 8 or body[:4] != b'L2RP' or body[4] != 1
                            or body[6:8] != bytes(2) or body[5] not in ((1,) if kind == 4 else (2, 3))):
         raise ValueError('phase data/control does not carry runtime records')
-    return {'session': h[8:24].hex(), 'number': int.from_bytes(h[32:40], 'big'), 'kind': kind,
+    result = {'session': h[8:24].hex(), 'number': int.from_bytes(h[32:40], 'big'), 'kind': kind,
             'transaction': plain[4:20].hex(), 'offset': int.from_bytes(plain[20:28], 'big'),
             'retired': int.from_bytes(plain[28:36], 'big'), 'right_edge': int.from_bytes(plain[36:44], 'big')}
+    if kind == 1: result['hello'] = hello_proofs(body)
+    return result
+
+
+def hello_proofs(body: bytes) -> dict:
+    """Observe complete fixed Hello fences; authentication remains the runtime's job."""
+    if (len(body) != 280 or body[0] != 1 or body[1] != body[2]
+            or body[2] not in (1, 2) or body[3:8] != bytes(5)):
+        raise ValueError('invalid captured Hello header')
+    count, proofs = body[2], []
+    for lane in range(count):
+        p = body[72 + lane * 104:176 + lane * 104]
+        if (p[0] != lane or p[1] != (0 if count == 1 else lane + 1) or p[2] not in (1, 2)
+                or p[3] & ~1 or p[62:64] != bytes(2) or p[68:72] != bytes(4)
+                or p[54] > 14 or p[55] not in (*range(15), 255)):
+            raise ValueError('invalid captured Hello lane shape')
+        proof = {'lane': p[0], 'bulk': p[1], 'role': p[2], 'options': p[3], 'session': p[4:20].hex(),
+                 'written': int.from_bytes(p[20:28], 'big'), 'read': int.from_bytes(p[28:36], 'big'),
+                 'una': int.from_bytes(p[36:40], 'big'), 'next': int.from_bytes(p[40:44], 'big'),
+                 'receive': int.from_bytes(p[44:48], 'big'), 'ack': int.from_bytes(p[48:52], 'big'),
+                 'window': int.from_bytes(p[52:54], 'big'), 'scale': p[54], 'peer_scale': p[55],
+                 'peer_window': int.from_bytes(p[56:60], 'big'), 'mss': int.from_bytes(p[60:62], 'big'),
+                 'available': int.from_bytes(p[64:68], 'big')}
+        if (not 0 < proof['written'] < 2**31 or not 0 < proof['read'] < 2**31
+                or proof['una'] != proof['next'] or proof['ack'] != proof['receive']
+                or proof['mss'] == 0 or proof['available'] != 0xffffffff - proof['next']):
+            raise ValueError('invalid captured Hello lane fence')
+        proofs.append(proof)
+    if count == 1 and body[176:] != bytes(104):
+        raise ValueError('unexpected unused Hello lane')
+    return {'count': count, 'pair': body[8:40].hex(), 'armed': body[40:72].hex(),
+            'lanes': proofs, 'sha256': hashlib.sha256(body).hexdigest()}
+
+
+def syn_profile(tcp: bytes) -> tuple[int | None, int, bool]:
+    options, cursor, found = tcp[20:(tcp[12] >> 4) * 4], 0, {}
+    while cursor < len(options):
+        kind = options[cursor]
+        if kind == 0:
+            if any(options[cursor:]): raise ValueError('invalid TCP SYN option padding')
+            break
+        if kind == 1:
+            cursor += 1
+            continue
+        if cursor + 2 > len(options): raise ValueError('short TCP SYN option')
+        size = options[cursor + 1]
+        if (kind not in (2, 3, 4) or size != {2: 4, 3: 3, 4: 2}[kind]
+                or cursor + size > len(options) or kind in found):
+            raise ValueError('unsupported/duplicate TCP SYN option')
+        found[kind] = options[cursor + 2:cursor + size]
+        cursor += size
+    shift = found[3][0] if 3 in found else None
+    if shift is not None and shift > 14: raise ValueError('excessive TCP SYN window scale')
+    # These are the pinned maintained TCP defaults/clamp, not an inferred window.
+    mss = max(int.from_bytes(found[2], 'big'), 48) if 2 in found else 536
+    return shift, mss, 4 in found
 
 
 def tcp_parts(packet):
@@ -218,26 +274,30 @@ def audit_underlay(path: Path, lanes: int) -> dict:
         if lane is None:
             raise ValueError('capture has a new/foreign raw tuple')
         tcp, data = tcp_parts(packet)
-        state = flows.setdefault(key, {'lane': lane, 'direction': direction, 'syn': set(), 'tls': [], 'phase': [], 'acks': set()})
+        state = flows.setdefault(key, {'lane': lane, 'direction': direction, 'syn': set(), 'syn_profiles': set(), 'old_wire': set(), 'tls': [], 'phase': [], 'acks': set()})
         if packet.flags & 2:
             if data or packet.flags != (2 if direction == 1 else 18):
                 raise ValueError('invalid original handshake flags')
             state['syn'].add(packet.sequence)
+            state['syn_profiles'].add(syn_profile(tcp))
         if packet.flags & 16:
             state['acks'].add(int.from_bytes(tcp[8:12], 'big'))
+        protected = phase_payload(data, lane, direction) if data else None
+        if protected is None and packet.flags & 16 and not packet.flags & 2:
+            state['old_wire'].add(((packet.sequence + len(data)) & 0xffffffff,
+                                   int.from_bytes(tcp[8:12], 'big'), int.from_bytes(tcp[14:16], 'big')))
         if data:
-            protected = phase_payload(data, lane, direction)
             if protected is None:
                 state['tls'].append((packet.sequence, data, packet.flags))
             else:
                 if len(packet.raw) > 1200 or packet.flags != 24 or len(tcp) - len(data) != 20:
                     raise ValueError('phase is not the fixed header/MTU profile')
-                state['phase'].append((packet.sequence, int.from_bytes(tcp[8:12], 'big'), data, protected))
+                state['phase'].append((packet.sequence, int.from_bytes(tcp[8:12], 'big'), data, protected, int.from_bytes(tcp[14:16], 'big')))
     if len(flows) != 2 * lanes:
         raise ValueError('missing original lane direction')
     details, sessions, transactions = [], {}, set()
     for key, state in flows.items():
-        if len(state['syn']) != 1 or not state['phase']:
+        if len(state['syn']) != 1 or len(state['syn_profiles']) != 1 or not state['phase']:
             raise ValueError('missing/changed original SYN or phase continuation')
         isn = next(iter(state['syn']))
         base = (isn + 1) & 0xffffffff
@@ -262,17 +322,39 @@ def audit_underlay(path: Path, lanes: int) -> dict:
         elif records[0][1][:1] != b'\x02':
             raise ValueError('missing original ServerHello')
         state['base'] = (base + len(stream)) & 0xffffffff
+        hellos = [item['hello'] for _, _, _, item, _ in state['phase'] if item['kind'] == 1]
+        if (not hellos or len({h['sha256'] for h in hellos}) != 1
+                or hellos[0]['count'] != lanes or len(state['syn_profiles']) != 1):
+            raise ValueError('missing/conflicting Hello or SYN option proof')
+        hello = hellos[0]
+        proof = hello['lanes'][state['lane']]
+        peer_profiles = flows[(key[2], key[3], key[0], key[1])]['syn_profiles']
+        if len(peer_profiles) != 1: raise ValueError('missing/conflicting peer SYN options')
+        peer_syn = next(iter(peer_profiles))
+        own_syn = next(iter(state['syn_profiles']))
+        scale = own_syn[0] if own_syn[0] is not None and peer_syn[0] is not None else 0
+        if (proof['role'] != state['direction'] or proof['next'] != state['base']
+                or proof['written'] != len(stream) or proof['scale'] != scale
+                or proof['peer_scale'] != (peer_syn[0] if peer_syn[0] is not None else 255)
+                or proof['mss'] != peer_syn[1] or proof['options'] != int(peer_syn[2])
+                or (proof['next'], proof['receive'], proof['window']) not in state['old_wire']):
+            raise ValueError('Hello fence is not witnessed by original TLS/SYN/window bytes')
+        effective = (min(32768, proof['window'] << scale) >> scale) << scale
+        if effective < 9 * (1200 - 40) or effective >> scale > 65535:
+            raise ValueError('captured effective horizon outside production bounds')
+        state['proof'], state['hello'], state['tls_bytes'] = proof, hello, len(stream)
         seen, intervals, kinds = {}, [], Counter()
-        for sequence, ack, data, phase in state['phase']:
+        for sequence, ack, data, phase, window in state['phase']:
             number, offset = phase['number'], phase['offset']
             if number in seen:
-                if seen[number] != (sequence, ack, data):
+                if seen[number] != (sequence, ack, data, window):
                     raise ValueError('packet nonce reused with different wire bytes')
                 continue
-            seen[number] = (sequence, ack, data)
+            seen[number] = (sequence, ack, data, window)
             end = offset + len(data)
             if (sequence != state['base'] + offset or sequence + len(data) > 0xffffffff
-                    or phase['retired'] > phase['right_edge'] or phase['right_edge'] - phase['retired'] != 32768
+                    or phase['retired'] > phase['right_edge'] or phase['right_edge'] - phase['retired'] != effective
+                    or window != effective >> scale or phase['session'] != proof['session']
                     or any(offset < b and a < end for a, b in intervals)):
                 raise ValueError('phase byte range reused or sequence/window mismatch')
             intervals.append((offset, end))
@@ -287,15 +369,29 @@ def audit_underlay(path: Path, lanes: int) -> dict:
         if (bulk and kinds[4] == 0) or (not bulk and kinds[4] != 0):
             raise ValueError('protected Data missing or on wrong half lane')
         details.append({'tuple': list(key), 'isn': isn, 'tls_bytes': len(stream),
-                        'tls_records': len(records), 'phase_base': state['base'],
+                        'tls_records': len(records), 'phase_base': state['base'], 'frozen_window': proof['window'],
+                        'negotiated_scale': scale, 'effective_horizon': effective,
                         'phase_kinds': dict(kinds), 'unique_phase_packets': len(seen)})
     if any(len(ids) != 1 for ids in sessions.values()) or len(transactions) != 1:
         raise ValueError('changed phase transaction/session identity')
+    for direction in (1, 2):
+        owners = [state for state in flows.values() if state['direction'] == direction]
+        if len({state['hello']['sha256'] for state in owners}) != 1:
+            raise ValueError('Hello does not carry one all-lane fence')
+        for state in owners:
+            if any(state['hello']['lanes'][other['lane']] != other['proof'] for other in owners):
+                raise ValueError('Hello all-lane proof disagrees with original lane')
     for key, state in flows.items():
         peer = flows[(key[2], key[3], key[0], key[1])]
         if (next(iter(state['syn'])) + 1) & 0xffffffff not in peer['acks']:
             raise ValueError('original SYN not acknowledged')
-        for _, ack, _, phase in state['phase']:
+        proof, other = state['proof'], peer['proof']
+        if (proof['read'] != peer['tls_bytes'] or proof['receive'] != peer['base']
+                or proof['session'] != other['session'] or proof['peer_window'] != other['window'] << other['scale']
+                or other['peer_window'] != proof['window'] << proof['scale']
+                or state['hello']['pair'] != peer['hello']['pair'] or state['hello']['armed'] != peer['hello']['armed']):
+            raise ValueError('captured peer Hello fences are not complementary')
+        for _, ack, _, phase, _ in state['phase']:
             if ack != peer['base'] + phase['retired']:
                 raise ValueError('phase ACK not mirrored from original peer sequence')
     return {'pcap': path.name, 'sha256': bounded.file_hash(path), 'ip_packets': len(packets),
@@ -345,7 +441,7 @@ def audit_captured_peers(paths: dict[str, Path], lanes: int) -> dict:
         # Counter tails legitimately differ after intentional loss. Compare the
         # original SYN/TLS boundaries here, then require common actual Data below.
         def bootstrap(value):
-            return [{k: row[k] for k in ('tuple', 'isn', 'tls_bytes', 'tls_records', 'phase_base')}
+            return [{k: row[k] for k in ('tuple', 'isn', 'tls_bytes', 'tls_records', 'phase_base', 'frozen_window', 'negotiated_scale', 'effective_horizon')}
                     for row in value['streams']]
         if set(result) != {'a', 'b'} or bootstrap(result['a']) != bootstrap(result['b']):
             raise ValueError('captured peers disagree on original bootstrap/phase boundaries')
@@ -596,6 +692,9 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
             except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
                 pass
             time.sleep(min(.05, bounded.remaining(ready, .05)))
+        # A status RPC can advance from setup to Active after the prior procfs
+        # sample. Resample the same original owners at the actual Active boundary.
+        inspect_live()
         digest = peers['a']['digest']
         for side, (process, log) in daemons.items():
             proof = event(bounded.read_log(log), 'raw_packet_authenticated')

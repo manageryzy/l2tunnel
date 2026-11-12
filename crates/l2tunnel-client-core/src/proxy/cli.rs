@@ -196,6 +196,7 @@ mod service {
                 active: None,
                 openvpn_drain: None,
                 raw_packet: None,
+                rolling: None,
                 proxy: Some(ProxySnapshot {
                     digest: self.digest.clone(),
                     drain_accepted: self.accepted,

@@ -36,21 +36,39 @@ def response(value=None):
             'state': {'epoch': 1, 'phase': value['phase'], 'compression': 'off', 'raw_packet': value}}
 
 
-def phase(lane, direction, number, kind, offset=0, retired=0, body=None):
+def hello(lanes, direction, window=32768, scale=None):
+    client, server = tls_fixture.streams()
+    result = bytearray(bytes([1, lanes, lanes]) + bytes(5) + bytes([44]) * 32 + bytes([55]) * 32)
+    for lane in range(lanes):
+        a, b = 101 + lane * 10000 + len(client), 1001 + lane * 10000 + len(server)
+        own, peer = (a, b) if direction == 1 else (b, a)
+        written, read = (len(client), len(server)) if direction == 1 else (len(server), len(client))
+        p = bytearray(104)
+        p[:4] = bytes([lane, 0 if lanes == 1 else lane + 1, direction, 0])
+        p[4:20] = bytes([lane + 1]) * 16
+        struct.pack_into('!QQIIIIHBBIHHI', p, 20, written, read, own, own, peer, peer,
+                         window, scale or 0, 255 if scale is None else scale,
+                         window << (scale or 0), 1160, 0, 0xffffffff - own)
+        result.extend(p)
+    if lanes == 1: result.extend(bytes(104))
+    return bytes(result)
+
+
+def phase(lane, direction, number, kind, offset=0, retired=0, body=None, lanes=1, window=32768, scale=None, horizon=None):
     if body is None:
-        body = bytes({1: 280, 2: 104, 3: 104, 6: 8, 7: 8, 8: 0}.get(kind, 0))
+        body = hello(lanes, direction, window, scale) if kind == 1 else bytes({2: 104, 3: 104, 6: 8, 7: 8, 8: 0}.get(kind, 0))
         if kind in (4, 5): body = b'L2RP\x01' + bytes([1 if kind == 4 else 3, 0, 0]) + b'fixture source'
-    plain = struct.pack('!BBH16sQQQHH', 1, kind, 0, bytes([33]) * 16, offset, retired, retired + 32768, len(body), 0) + body
+    plain = struct.pack('!BBH16sQQQHH', 1, kind, 0, bytes([33]) * 16, offset, retired, retired + (32768 if horizon is None else horizon), len(body), 0) + body
     header = struct.pack('!2s6B16sIIQH2s', b'LD', 1, 1, 2, direction, 0, 0,
                          bytes([lane + 1]) * 16, lane, 1, number, len(plain), bytes(2))
     return bytes([0x48, 0, 0, lane]) + header + plain + bytes(32)
 
 
-def ip_packet(source, destination, sport, dport, sequence, flags, data=b'', acknowledgment=0):
+def ip_packet(source, destination, sport, dport, sequence, flags, data=b'', acknowledgment=0, window=32768, options=b''):
     source_ip, destination_ip = smoke.ipaddress.ip_address(source), smoke.ipaddress.ip_address(destination)
     family = source_ip.version
     tcp = bytearray(struct.pack('!HHIIBBHHH', sport, dport, sequence & 0xffffffff,
-                                acknowledgment & 0xffffffff, 0x50, flags, 32768, 0, 0) + data)
+                                acknowledgment & 0xffffffff, ((20 + len(options)) // 4) << 4, flags, window, 0, 0) + options + data)
     pseudo = source_ip.packed + destination_ip.packed
     pseudo += (bytes([0, 6]) + len(tcp).to_bytes(2, 'big') if family == 4
                else len(tcp).to_bytes(4, 'big') + bytes([0, 0, 0, 6]))
@@ -63,29 +81,36 @@ def ip_packet(source, destination, sport, dport, sequence, flags, data=b'', ackn
     return bytes(12) + (b'\x08\x00' if family == 4 else b'\x86\xdd') + ip + tcp
 
 
-def outer(lane, direction, sequence, flags, data=b'', acknowledgment=0):
+def outer(lane, direction, sequence, flags, data=b'', acknowledgment=0, window=32768, options=b''):
     a, b = smoke.retained.PORTS[lane]
     return ip_packet('192.0.2.2' if direction == 1 else '192.0.2.6',
                      '192.0.2.6' if direction == 1 else '192.0.2.2',
                      a if direction == 1 else b, b if direction == 1 else a,
-                     sequence, flags, data, acknowledgment)
+                     sequence, flags, data, acknowledgment, window, options)
 
 
-def underlay(lanes=1):
+def underlay(lanes=1, window=32768, scale=None):
     packets = []
     client, server = tls_fixture.streams()
+    options = b'\x02\x04\x04\x88' + (b'' if scale is None else bytes([3, 3, scale, 1]))
+    shift = scale or 0
+    horizon = (min(32768, window << shift) >> shift) << shift
     for lane in range(lanes):
         a, b = 100 + lane * 10000, 1000 + lane * 10000
         ba, bb = a + 1 + len(client), b + 1 + len(server)
-        packets += [outer(lane, 1, a, 2), outer(lane, 2, b, 18, acknowledgment=a + 1),
-                    outer(lane, 1, a + 1, 24, client, b + 1), outer(lane, 2, b + 1, 24, server, a + 1)]
+        packets += [outer(lane, 1, a, 2, window=window, options=options),
+                    outer(lane, 2, b, 18, acknowledgment=a + 1, window=window, options=options),
+                    outer(lane, 1, a + 1, 24, client, bb, window=window),
+                    outer(lane, 2, b + 1, 24, server, ba, window=window)]
         for direction, base, peer in ((1, ba, bb), (2, bb, ba)):
             offset = 0
             bulk = lanes == 1 or direction == (1 if lane == 0 else 2)
             for number, kind in enumerate((1, 2 if direction == 1 else 3, 4 if bulk else 5)):
-                data = phase(lane, direction, number, kind, offset)
-                packets.append(outer(lane, direction, base + offset, 24, data, peer))
+                data = phase(lane, direction, number, kind, offset, lanes=lanes, window=window, scale=scale, horizon=horizon)
+                packets.append(outer(lane, direction, base + offset, 24, data, peer, window=horizon >> shift))
                 offset += len(data)
+    for lane in range(lanes):
+        packets.append(outer(lane, 1, 101 + lane * 10000, 16, acknowledgment=1001 + lane * 10000, window=window))
     return packets
 
 
@@ -192,6 +217,69 @@ class RawPacketEvidenceTests(unittest.TestCase):
             self.inspect(underlay(lanes)[::-1] + underlay(lanes), lanes)
         # A ciphertext TCP segment can start 0x48 without being a phase frame.
         self.assertIsNone(smoke.phase_payload(b'\x48ciphertext', 0, 1))
+
+    def test_effective_horizon_is_derived_from_original_window_and_negotiated_scale(self):
+        for lanes in (1, 2):
+            for window, scale, expected in ((18560, None, 18560), (18560, 0, 18560),
+                                            (9280, 1, 18560), (32768, 1, 32768)):
+                with self.subTest(lanes=lanes, window=window, scale=scale):
+                    result = self.inspect(underlay(lanes, window, scale), lanes)
+                    for row in result['streams']:
+                        self.assertEqual(row['effective_horizon'], expected)
+                        self.assertEqual(row['negotiated_scale'], scale or 0)
+                        self.assertEqual(row['frozen_window'], window)
+
+    def test_unwitnessed_window_scale_mss_and_all_lane_hello_cannot_authorize_horizon(self):
+        baseline = underlay(2, 18560, 0)
+        # Preserve valid TCP checksums while changing one visible proof field.
+        # The auditor cannot check HMAC: original wire/peer witnesses must bind
+        # the untrusted fields before they can determine the expected horizon.
+        for relative in (72 + 52, 72 + 54, 72 + 55, 72 + 56, 72 + 60,
+                         72 + 104 + 40, 8, 40):
+            changed = baseline.copy()
+            packet = smoke.bounded.decode_ip(changed[4][14:])
+            body = bytearray(smoke.tcp_parts(packet)[1]); body[96 + relative] ^= 1
+            changed[4] = outer(0, 1, packet.sequence, packet.flags, body,
+                               int.from_bytes(smoke.tcp_parts(packet)[0][8:12], 'big'), window=18560)
+            with self.subTest(relative=relative), self.assertRaises(ValueError): self.inspect(changed, 2)
+        changed = baseline.copy()
+        packet = smoke.bounded.decode_ip(changed[4][14:])
+        changed[4] = outer(0, 1, packet.sequence, packet.flags, smoke.tcp_parts(packet)[1],
+                           int.from_bytes(smoke.tcp_parts(packet)[0][8:12], 'big'), window=32768)
+        with self.assertRaises(ValueError): self.inspect(changed, 2)
+        # A self-consistent arbitrary first phase horizon is insufficient.
+        changed = baseline.copy()
+        for index, raw in enumerate(changed):
+            packet = smoke.bounded.decode_ip(raw[14:]); tcp, data = smoke.tcp_parts(packet)
+            item = smoke.phase_payload(data, 0 if packet.source_port in smoke.retained.PORTS[0] else 1,
+                                       1 if packet.source == '192.0.2.2' else 2) if data else None
+            if item is not None:
+                body = bytearray(data); body[84:92] = (item['retired'] + 32768).to_bytes(8, 'big')
+                lane = 0 if packet.source_port in smoke.retained.PORTS[0] else 1
+                changed[index] = outer(lane, 1 if packet.source == '192.0.2.2' else 2,
+                                       packet.sequence, packet.flags, body,
+                                       int.from_bytes(tcp[8:12], 'big'), window=32768)
+        with self.assertRaises(ValueError): self.inspect(changed, 2)
+
+    def test_duplicate_phase_packet_cannot_change_outer_advertised_window(self):
+        baseline = underlay(window=18560, scale=0)
+        packet = smoke.bounded.decode_ip(baseline[4][14:]); tcp, data = smoke.tcp_parts(packet)
+        self.inspect(baseline + [baseline[4]])
+        with self.assertRaises(ValueError):
+            self.inspect(baseline + [outer(0, 1, packet.sequence, packet.flags, data,
+                                          int.from_bytes(tcp[8:12], 'big'), window=18559)])
+
+    def test_missing_or_ambiguous_original_syn_options_fail_as_capture_errors(self):
+        baseline = underlay(window=18560, scale=0)
+        with self.assertRaises(ValueError): self.inspect(baseline[1:])
+        with self.assertRaises(ValueError):
+            self.inspect(baseline + [outer(0, 2, 1000, 18, acknowledgment=101,
+                                          options=b'\x02\x04\x04\x88')])
+        for options in (b'\x03\x03\x0f\x01', b'\x02\x04\x04\x88' * 2,
+                        b'\x08\x0a' + bytes(10)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                smoke.syn_profile(smoke.tcp_parts(smoke.bounded.decode_ip(
+                    outer(0, 1, 100, 2, options=options)[14:]))[0])
 
     def test_acknowledged_old_prefix_keepalive_is_not_new_tls_bytes(self):
         packets = underlay()
@@ -318,7 +406,7 @@ class RawPacketEvidenceTests(unittest.TestCase):
 
 class OwnedLifecycleTests(unittest.TestCase):
     """Fake clocks/processes test the supervisor, never assert native qualification."""
-    def exercise(self, layer='tun', duplex='half', natural=True, cleanup_error=False):
+    def exercise(self, layer='tun', duplex='half', natural=True, cleanup_error=False, stale_owner=False, missing_owner=False):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
             output = Path(directory)
             plan = smoke.case_plan('fixture', layer, duplex)
@@ -381,8 +469,11 @@ class OwnedLifecycleTests(unittest.TestCase):
                 if operation is smoke.netns_lab.cleanup:
                     events.append(('namespace_cleanup', clock[0]))
                     if cleanup_error: raise OSError('injected namespace cleanup failure')
+            observations = {}
             def observe(pid, lanes, previous=None):
-                return {'pid': pid, 'start': '42', 'raw_fds': {str(i): str(1000 + i) for i in range(lanes)}}
+                observations[pid] = observations.get(pid, 0) + 1
+                count = lanes - 1 if missing_owner or stale_owner and observations[pid] == 1 else lanes
+                return {'pid': pid, 'start': '42', 'raw_fds': {str(i): str(1000 + i) for i in range(count)}}
             def install(target, name, **kwargs): patches.enter_context(patch.object(target, name, **kwargs))
             install(smoke.time, 'monotonic', side_effect=lambda: clock[0])
             install(smoke.time, 'sleep', side_effect=advance)
@@ -405,7 +496,7 @@ class OwnedLifecycleTests(unittest.TestCase):
             install(smoke, 'audit_captured_peers', return_value={'fixture_parser_tested_separately': True})
             install(smoke, 'audit_native', return_value={'fixture_parser_tested_separately': True})
             install(smoke.netns_lab, 'NETNS_DIRECTORY', new=output / 'absent-netns')
-            if natural and not cleanup_error:
+            if natural and not cleanup_error and not missing_owner:
                 value = smoke.run_case(plan, output / 'binary', output / 'harness', output, output / 'secrets', output / 'state')
                 self.assertEqual(value['status'], 'passed')
                 self.assertEqual(value['cleanup'], 'passed')
@@ -421,8 +512,12 @@ class OwnedLifecycleTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     smoke.run_case(plan, output / 'binary', output / 'harness', output, output / 'secrets', output / 'state')
                 value = json.loads((output / plan['case'] / 'receipt.json').read_text())
-                self.assertEqual(value['status'], 'failed' if cleanup_error else 'bound_exhausted')
+                self.assertEqual(value['status'], 'failed' if cleanup_error or missing_owner else 'bound_exhausted')
                 self.assertEqual(value['cleanup'], 'failed' if cleanup_error else 'passed')
+                if missing_owner:
+                    self.assertEqual(value['stage'], 'original_authentication')
+                    self.assertIn('missing original native descriptor ownership', value['error'])
+                    self.assertNotIn('natural_terminal', value)
                 if not natural:
                     self.assertEqual(len([e for e in events if e == ('forced', 'daemon')]), 2)
                     self.assertNotIn('natural_terminal', value)
@@ -434,6 +529,10 @@ class OwnedLifecycleTests(unittest.TestCase):
         for layer in ('tap', 'tun'):
             for duplex in ('full', 'half'):
                 with self.subTest(layer=layer, duplex=duplex): self.exercise(layer, duplex)
+
+    def test_active_rpc_requires_fresh_complete_original_descriptor_observation(self):
+        self.exercise(stale_owner=True)
+        self.exercise(missing_owner=True)
 
     def test_silent_peers_hit_original_loss_deadline_and_forced_cleanup_cannot_pass(self):
         self.exercise(natural=False)

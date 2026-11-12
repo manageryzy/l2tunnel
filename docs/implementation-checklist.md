@@ -51,6 +51,9 @@ and the [shared raw client](modules/raw-packet-client.md), with the
 separate execution gates. The [rolling-frame runtime](modules/rolling-runtime.md)
 tracks common MUX, authenticated UDP/QUIC composition and exact shared budgets;
 its finite tests do not close the complete Python-family gates.
+The [rolling client](modules/rolling-client.md) records explicit API/CLI activation,
+while [pressure capture allocation](modules/proxy-pressure-capture.md) records the
+bounded native evidence collection required for the corrected proxy pressure run.
 
 ## Tested native vertical slice
 

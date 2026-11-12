@@ -73,6 +73,9 @@ pub struct Snapshot {
     /// Actual explicit raw packet selection and bounded logical runtime status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_packet: Option<crate::raw_packet::Snapshot>,
+    /// Present only for an explicitly authenticated rolling session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling: Option<crate::rolling::Snapshot>,
 }
 /// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

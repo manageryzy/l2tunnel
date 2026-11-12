@@ -19,6 +19,8 @@ pub(crate) use proxy_frontend::serve_measured as serve_measured_for_test;
 mod packed_frontend;
 #[path = "raw_packet/cli.rs"]
 mod raw_packet_frontend;
+#[path = "rolling/cli.rs"]
+mod rolling_frontend;
 #[cfg(all(test, unix))]
 pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
 #[path = "openvpn/cli.rs"]
@@ -577,6 +579,9 @@ impl DeviceSpec {
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
+    if let Some(path) = rolling_frontend::selection(options, config)? {
+        return rolling_frontend::execute(command, options, config, path).await;
+    }
     if let Some((path, mark)) = raw_packet_frontend::selection(options, config)? {
         return raw_packet_frontend::execute(command, options, config, path, mark).await;
     }
@@ -1094,6 +1099,7 @@ async fn active_local_action(
         proxy: None,
         openvpn_drain: None,
         raw_packet: None,
+        rolling: None,
     });
     Response {
         version: VERSION,
@@ -1106,6 +1112,12 @@ async fn active_local_action(
 #[cfg(not(target_os = "linux"))]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
+    if rolling_frontend::selection(options, config)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native rolling CLI is implemented on Linux only",
+        ));
+    }
     if raw_packet_frontend::selection(options, config)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1167,6 +1179,7 @@ async fn local_action(
         proxy: None,
         openvpn_drain: None,
         raw_packet: None,
+        rolling: None,
     });
     Response {
         version: VERSION,
@@ -1238,6 +1251,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", standalone::HELP);
         println!("\n{}", proxy_frontend::HELP);
         println!("\n{}", packed_frontend::HELP);
+        println!("\n{}", rolling_frontend::HELP);
         println!("\n{}", raw_packet_frontend::HELP);
         return ExitCode::SUCCESS;
     }
@@ -1303,6 +1317,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         allowed.extend_from_slice(ACTIVE_OPTIONS);
         allowed.extend_from_slice(standalone::OPTIONS);
         allowed.extend_from_slice(packed_frontend::OPTIONS);
+        allowed.extend_from_slice(rolling_frontend::OPTIONS);
         allowed.extend_from_slice(raw_packet_frontend::OPTIONS);
     }
     let result = options(&args[1..], &allowed).and_then(|options| {

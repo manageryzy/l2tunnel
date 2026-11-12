@@ -123,6 +123,7 @@ async fn bind(settings: Settings) -> io::Result<(UdpSocket, Option<UdpSocket>)> 
 #[derive(Clone, Copy)]
 pub(crate) enum Records<'a> {
     Frame,
+    Rolling(&'a l2tunnel_runtime::rolling::Config),
     Aligned(&'a l2tunnel_runtime::aligned::Config),
     Packed(&'a l2tunnel_runtime::packed::Config),
 }
@@ -163,6 +164,21 @@ impl Records<'_> {
                     peer,
                 )?,
                 l2tunnel_runtime::packed::udp_session_config(
+                    runtime_config,
+                    profile,
+                    *config,
+                    lane,
+                )?,
+            )),
+            Self::Rolling(config) => Ok((
+                l2tunnel_runtime::rolling::udp_carrier_config(
+                    runtime_config,
+                    profile,
+                    *config,
+                    lane,
+                    peer,
+                )?,
+                l2tunnel_runtime::rolling::udp_session_config(
                     runtime_config,
                     profile,
                     *config,

@@ -146,6 +146,7 @@ pub(crate) fn response(
             proxy: None,
             openvpn_drain: None,
             raw_packet: Some(raw),
+            rolling: None,
         }),
     }
 }

@@ -5,12 +5,15 @@ checklists remain authoritative for unfinished requirements and mode parity.
 
 ## Current parallel checkpoint
 
-The [wave16b frozen aggregate](../work/implementation-wave16b/validation.json)
-passed 949 Rust and 126 Python cases, formatting, strict workspace Clippy,
-warning-denied rustdoc, golden vectors and CLI checks. Its 593 source inputs
-were unchanged during the run. It includes the raw packet runtime, QUIC ownership
-cleanup, rolling structural wire codec and measured pressure/fixture corrections.
-Subsequent native raw opener/client and rolling scheduler edits are not covered.
+The [wave18 frozen aggregate](../work/implementation-wave18/validation.json)
+passed 987 Rust and 142 Python cases, formatting, strict workspace Clippy,
+warning-denied rustdoc, golden vectors and CLI checks. All 620 source inputs
+were unchanged during the run. The [exact native build](../work/native-build18/receipt.json)
+matches that complete input map. This includes the raw opener/client and native
+harness, rolling scheduler/runtime, causal raw fixture correction and directional
+proxy-pressure correction. Subsequent HTTPS, rolling-client and pressure-capture
+allocation work is excluded. The [wave16b aggregate](../work/implementation-wave16b/validation.json)
+remains the earlier 593-input, 949 Rust/126 Python checkpoint.
 The derived [wave17 aggregate](../work/implementation-wave17/validation.json)
 kept all 608 inputs stable but failed the raw paired-lane review test's pending
 message precondition (`pairing_review_tests.rs:299`), after 524 Rust and two
@@ -18,9 +21,8 @@ Python cases. Its original receipt is retained. It is not a passing aggregate.
 The [derived pairing fixture](../work/raw-pairing-precondition18/validation.json)
 now reproduces the early observation deterministically and waits for the original
 driver's actual blocked send, keeping all original authority/deadline assertions.
-Its 152 focused cases and strict lint pass. Wave18 composes that two-file fix,
-the raw native harness, rolling runtime and directional pressure correction;
-its aggregate/build/native gates remain separate from their focused results.
+Its 152 focused cases and strict lint pass. Wave18's aggregate and exact build
+now pass; native acceptance remains separately gated.
 The earlier [wave14b aggregate](../work/implementation-wave14b/validation.json)
 remains the 562-input, 858 Rust/107 Python checkpoint for its historical native
 builds; later results do not rewrite that evidence.
@@ -31,6 +33,16 @@ runtime integration in three independent source/build lanes. Aggregate/build/nat
 qualification uses a copied source checkpoint, releasing developers immediately
 after copy verification. Clean native profiles use disjoint owned namespaces;
 concurrent runs qualify finite connectivity/integrity, not performance.
+
+The subsequent [rolling client checkpoint](../work/rolling-client19/validation.json)
+passes 113 library and 19 example cases, including actual protected UDP and
+genuine QUIC with both device layers and duplex modes. Strict policy parsing,
+authentication binding, original setup expiry and cancellation are covered.
+The [pressure capture allocation](../work/proxy-pressure-capture19/validation.json)
+adds an explicit 32768-packet WAN allocation only for pressure profiles; native,
+fixed and clean captures retain 8192, with unchanged payload/growth/window gates
+and file/child/deadline limits. Both bundles await a new copied aggregate and
+exact native build; they are not part of wave18 or new native qualifications.
 
 The first copied wave14 failed because source identity collection excluded any
 directory named `target`, including the real Rust module
@@ -74,9 +86,19 @@ constructor. The [explicit shared raw client](modules/raw-packet-client.md)
 passes 101 client and 19 example cases, selecting the actual authenticated packet
 runtime with strict bounded settings, original setup deadlines and observable
 capabilities. Its native qualification, congestion controller, clean drain and
-hot reload are explicitly unavailable. These completed bundles entered wave17,
-whose aggregate failed as recorded above; no native result follows from their
+hot reload are explicitly unavailable. These completed bundles entered wave17
+and the passing derived wave18 aggregate; no native result follows from their
 focused compilation or tests.
+
+The [first four raw-packet native cases](../work/raw-native18-initial-audit.json)
+all retain failed original receipts and passed owned cleanup. TAP/full and
+TUN/full/half reached exact native transfer, confirmed fences and natural bounded
+carrier-loss termination, then failed the capture auditor's hardcoded requested
+horizon. Their actual effective horizon is 18560 bytes, bounded by the maintained
+TCP window; the configured 32768 is a ceiling. TAP/half instead stopped at the
+startup descriptor-count observation. Corrected independent audit and startup
+sampling regressions remain pending; none is yet counted as qualified native
+packet-phase evidence. Every owned namespace was independently confirmed absent.
 
 The source-stable wave15 aggregate failed in a paired OpenVPN-like UDP close;
 its unchanged isolated rerun passed, leaving the original cause unattributed.

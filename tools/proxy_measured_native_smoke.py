@@ -69,12 +69,21 @@ def policy() -> dict:
     }
 
 
+def capture_packet_limits(profile: str) -> dict[str, int]:
+    if profile not in ('clean', 'pressure'):
+        raise ValueError('explicit clean or pressure capture allocation required')
+    wan = 32768 if profile == 'pressure' else PACKET_LIMIT
+    return fixed.validated_capture_limits({'a_native': PACKET_LIMIT, 'b_native': PACKET_LIMIT,
+                                           'a_wan': wan, 'b_wan': wan})
+
+
 def case_plan(lab_id: str, duplex: str, profile: str = 'clean') -> dict:
     if profile not in ('clean', 'pressure'):
         raise ValueError('explicit clean or pressure acceptance profile required')
     plan = fixed.case_plan(lab_id, duplex)
     plan['case'] = f'tun-{duplex}-{profile}'
     plan['qualification'] = profile
+    plan['capture_packet_limits'] = capture_packet_limits(profile)
     plan['policy'] = policy()
     plan['profile'][1] = 'proxy-measured'
     plan['bounds_seconds'] = dict(BOUNDS)
@@ -447,9 +456,9 @@ def tcp_window(packet) -> dict:
             'ack': int.from_bytes(tcp[8:12], 'big'), 'scale_offer': scale, 'options': options}
 
 
-def timed_capture(path: Path) -> tuple[list, list[int], int]:
+def timed_capture(path: Path, packet_limit: int = PACKET_LIMIT) -> tuple[list, list[int], int]:
     """Retain classic-PCAP realtime timestamps after the unchanged full audit parser."""
-    packets = fixed.read_pcap(path)
+    packets = fixed.read_pcap(path, packet_limit)
     raw = path.read_bytes()
     magic = raw[:4]
     endian = '<' if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
@@ -531,10 +540,12 @@ def window_sequence(packets: list, flow: dict, side: str, pressure: bool,
 
 
 def audit_windows(paths: dict[str, Path], flows: list[dict], pressure: bool,
-                  transfers: list[dict] | None = None) -> list[dict]:
+                  transfers: list[dict] | None = None,
+                  packet_limits: dict[str, int] | None = None) -> list[dict]:
+    limits = fixed.validated_capture_limits(packet_limits)
     result = []
     for side in ('a', 'b'):
-        packets, timestamps, tick = timed_capture(paths[f'{side}_native'])
+        packets, timestamps, tick = timed_capture(paths[f'{side}_native'], limits[f'{side}_native'])
         for flow in flows:
             release = None
             if pressure:
@@ -577,6 +588,9 @@ def cleanup_owned_sockets(owners: dict[Path, tuple[int, int]], processes: list) 
 def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Path, state_dir: Path) -> dict:
     start = time.monotonic()
     end = start + BOUNDS['case']
+    packet_limits = capture_packet_limits(plan['qualification'])
+    if plan.get('capture_packet_limits') != packet_limits:
+        raise ValueError('capture allocation differs from explicit profile')
     spec = netns_lab.LabSpec(plan['lab_id'])
     ns = spec.namespaces
     case_dir = output / plan['case']
@@ -633,7 +647,7 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
             for label, interface in [('native', 'tun0'), ('wan', 'wan0')]:
                 key = f'{side}_{label}'
                 path, log = case_dir / f'{key}.pcap', case_dir / f'{key}-capture.log'
-                process = start_capture(nsrun(side, 'tcpdump', '-U', '-n', '-i', interface, '-s', '0', '-c', str(PACKET_LIMIT), '-w', str(path)), log, min(end, time.monotonic() + 5))
+                process = start_capture(nsrun(side, 'tcpdump', '-U', '-n', '-i', interface, '-s', '0', '-c', str(packet_limits[key]), '-w', str(path)), log, min(end, time.monotonic() + 5))
                 captures[key], capture_paths[key] = (process, log), path
                 processes.append(process)
         stage('authenticate')
@@ -751,14 +765,14 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
         stage('capture_audit', terminal=terminal, close_reports=reports)
         counts = {}
         for key, (process, log) in captures.items():
-            counts[key] = finish_capture(process, log)
-        audit = audit_native_captures(capture_paths, plan['flows'], plan['lanes'])
-        windows = audit_windows(capture_paths, [f for f in plan['flows'] if f['split']], plan['qualification'] == 'pressure', transfers)
+            counts[key] = finish_capture(process, log, packet_limits[key])
+        audit = audit_native_captures(capture_paths, plan['flows'], plan['lanes'], packet_limits)
+        windows = audit_windows(capture_paths, [f for f in plan['flows'] if f['split']], plan['qualification'] == 'pressure', transfers, packet_limits)
         stage('completed', capture_counts=counts, capture_audit=audit, native_windows=windows,
               capture_sha256={name: file_hash(path) for name, path in capture_paths.items()})
     except Exception as error:
         failure = error
-        status = ('bound_exhausted' if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else
+        status = ('bound_exhausted' if isinstance(error, (TimeoutError, subprocess.TimeoutExpired, fixed.CaptureBound)) else
                   'unsupported' if isinstance(error, Unsupported) else 'tool_failure' if isinstance(error, OSError) else 'failed')
         receipt.update(status=status, error=str(error)[:4096])
     finally:
@@ -768,10 +782,10 @@ def run_case(plan: dict, binary: Path, harness: Path, output: Path, secrets: Pat
                 stop(process)
             except Exception as error:
                 child_errors.append(str(error)[:256])
-        for process, log in captures.values():
+        for key, (process, log) in captures.items():
             if process.stderr is not None and not process.stderr.closed:
                 try:
-                    finish_capture(process, log)
+                    finish_capture(process, log, packet_limits[key])
                 except Exception:
                     pass  # Failed evidence remains in its log; the case cannot pass.
         try:

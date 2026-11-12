@@ -105,6 +105,39 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
                     self.assertEqual(plan['pressure_probe']['dscp_weights'], [1, 1])
                 self.assertEqual(h.fixed.case_plan('fixed', 'full')['profile'][1], 'proxy')
 
+    def test_capture_allocation_is_explicit_pressure_wan_only(self):
+        baseline = {'a_native': 8192, 'b_native': 8192, 'a_wan': 8192, 'b_wan': 8192}
+        for mode in ('full', 'half'):
+            clean = h.case_plan('unit', mode, 'clean')
+            pressure = h.case_plan('unit', mode, 'pressure')
+            self.assertEqual(clean['capture_packet_limits'], baseline)
+            self.assertEqual(pressure['capture_packet_limits'],
+                {**baseline, 'a_wan': 32768, 'b_wan': 32768})
+            self.assertEqual(clean['bounds_seconds'], pressure['bounds_seconds'])
+            self.assertEqual(h.fixed.validated_capture_limits(), baseline)
+        with self.assertRaises(ValueError): h.capture_packet_limits('unknown')
+        # Calling either plan never changes the fixed helper or measured native default.
+        self.assertEqual(h.PACKET_LIMIT, 8192)
+        self.assertEqual(h.fixed.PACKET_LIMIT, 8192)
+
+    def test_timestamp_and_window_audits_use_selected_native_capture_limits(self):
+        raw = fixtures.ip_packet('198.19.0.1', '198.19.0.2')
+        limits = h.capture_packet_limits('pressure')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'capture.pcap'
+            path.write_bytes(fixtures.pcap([raw] * 3))
+            with self.assertRaises(h.fixed.CaptureBound): h.timed_capture(path, 3)
+            packets, timestamps, tick = h.timed_capture(path, 4)
+            self.assertEqual((len(packets), len(timestamps), tick), (3, 3, 1000))
+            paths = {name: path for name in limits}
+            with patch.object(h, 'timed_capture', wraps=h.timed_capture) as read:
+                self.assertEqual(h.audit_windows(paths, [], False, packet_limits=limits), [])
+            self.assertEqual([call.args[1] for call in read.call_args_list], [8192, 8192])
+            with patch.object(h, 'timed_capture') as read:
+                with self.assertRaises(ValueError):
+                    h.audit_windows(paths, [], False, packet_limits={'a_native': 32768})
+                read.assert_not_called()
+
     def test_strict_plan_rejects_unsafe_names_and_conflicting_case_selection(self):
         for lab, mode, profile in [('../host', 'full', 'clean'), ('x' * 19, 'half', 'clean'),
                                     ('safe', 'bad', 'clean'), ('safe', 'full', 'unknown')]:
@@ -194,6 +227,43 @@ class MeasuredNativeHarnessTests(unittest.TestCase):
                     h.main(['--output', str(output), '--apply', '--build-receipt', '/nonexistent/receipt'])
                 run.assert_not_called()
             self.assertEqual(sentinel.read_text(), 'owned elsewhere')
+
+    def test_capture_commands_and_failed_case_cleanup_share_profile_allocation(self):
+        for profile in ('clean', 'pressure'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                secrets = root / 'secrets'; secrets.mkdir(mode=0o700)
+                plan = h.case_plan('unitlimits', 'half', profile)
+                def child(*_):
+                    process = unittest.mock.Mock(stderr=io.BytesIO())
+                    process.poll.return_value = 0
+                    return process
+                with patch.object(h, 'bounded_lab'), patch.object(h, 'command', return_value=''), \
+                        patch.object(h, 'offloads', return_value={}), \
+                        patch.object(h, 'disable_underlay_ipv6', return_value={}), \
+                        patch.object(h, 'start_capture', side_effect=child) as start, \
+                        patch.object(h, 'finish_capture', return_value={}) as finish, \
+                        patch.object(h, 'stop'), \
+                        patch.object(h, 'launch', side_effect=h.fixed.CaptureBound('finite capture bound')), \
+                        patch.object(h.netns_lab, 'NETNS_DIRECTORY', root / 'empty-netns'):
+                    with self.assertRaises(RuntimeError):
+                        h.run_case(plan, root / 'binary', root / 'harness', root, secrets, root / 'state')
+                self.assertEqual(len(start.call_args_list), 4)
+                limits = plan['capture_packet_limits']
+                for call in start.call_args_list:
+                    argv, log, _ = call.args
+                    key = log.name.removesuffix('-capture.log')
+                    self.assertEqual(int(argv[argv.index('-c') + 1]), limits[key])
+                self.assertEqual({call.args[1].name.removesuffix('-capture.log'): call.args[2]
+                                  for call in finish.call_args_list}, limits)
+                receipt = json.loads((root / plan['case'] / 'receipt.json').read_text())
+                self.assertEqual(receipt['status'], 'bound_exhausted')
+                self.assertEqual(receipt['cleanup'], 'passed')
+                self.assertEqual(receipt['plan']['capture_packet_limits'], limits)
+        plan['capture_packet_limits']['a_native'] = 32768
+        with patch.object(h, 'bounded_lab') as lab, self.assertRaisesRegex(ValueError, 'allocation differs'):
+            h.run_case(plan, root / 'binary', root / 'harness', root, secrets, root / 'state')
+        lab.assert_not_called()
 
     def test_partial_case_failure_cleans_only_the_same_owned_spec_and_preserves_failure(self):
         with tempfile.TemporaryDirectory() as directory:

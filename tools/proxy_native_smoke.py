@@ -31,11 +31,31 @@ ROOT = Path(__file__).resolve().parents[1]
 CAPTURE_LIMIT = 32 * 1024 * 1024
 LOG_LIMIT = RECEIPT_LIMIT = 4 * 1024 * 1024
 PACKET_LIMIT = 8192
+MAX_CAPTURE_PACKET_LIMIT = 32768
 REPLY_LIMIT = 8192
 PAYLOAD_LENGTHS = (65537, 32771)
 BOUNDS = {'case': 300, 'command': 15, 'startup': 40, 'transfer': 30, 'ping': 5,
           'rpc': 2, 'drain_observation': 127, 'runtime_drain': 120, 'local_grace': 5,
           'probe_inactivity': 5, 'namespace_cleanup': 30}
+
+
+class CaptureBound(ValueError):
+    """A finite capture allocation was reached; this cannot qualify evidence."""
+
+
+def validated_packet_limit(value: int) -> int:
+    if type(value) is not int or not 2 <= value <= MAX_CAPTURE_PACKET_LIMIT:
+        raise ValueError('capture packet limit must be integer 2..32768')
+    return value
+
+
+def validated_capture_limits(value: dict[str, int] | None = None) -> dict[str, int]:
+    surfaces = ('a_native', 'b_native', 'a_wan', 'b_wan')
+    if value is None:
+        return {key: PACKET_LIMIT for key in surfaces}
+    if type(value) is not dict or set(value) != set(surfaces):
+        raise ValueError('capture limit map requires exactly four surfaces')
+    return {key: validated_packet_limit(value[key]) for key in surfaces}
 
 
 class Unsupported(RuntimeError):
@@ -437,9 +457,10 @@ def decode_ip(raw: bytes) -> Packet:
                   protocol, sport, dport, seq, flags, raw[:size])
 
 
-def read_pcap(path: Path) -> list[Packet]:
+def read_pcap(path: Path, packet_limit: int = PACKET_LIMIT) -> list[Packet]:
+    packet_limit = validated_packet_limit(packet_limit)
     if path.stat().st_size > CAPTURE_LIMIT:
-        raise ValueError('capture file exceeds fixed bound')
+        raise CaptureBound('capture file exceeds fixed bound')
     data = path.read_bytes()
     magic = {b'\xd4\xc3\xb2\xa1': '<', b'\xa1\xb2\xc3\xd4': '>',
              b'\x4d\x3c\xb2\xa1': '<', b'\xa1\xb2\x3c\x4d': '>'}
@@ -460,8 +481,8 @@ def read_pcap(path: Path) -> list[Packet]:
         frame = data[cursor:cursor + captured]
         cursor += captured
         count += 1
-        if count >= PACKET_LIMIT:
-            raise ValueError('capture packet cap exhausted')
+        if count >= packet_limit:
+            raise CaptureBound('capture packet cap exhausted')
         offset, ether = 0, None
         if linktype == 1:
             offset = 14
@@ -491,10 +512,12 @@ def read_pcap(path: Path) -> list[Packet]:
     return packets
 
 
-def audit_native_captures(paths: dict[str, Path], flows: list[dict], lanes: int) -> dict:
+def audit_native_captures(paths: dict[str, Path], flows: list[dict], lanes: int,
+                          packet_limits: dict[str, int] | None = None) -> dict:
     if set(paths) != {'a_native', 'b_native', 'a_wan', 'b_wan'}:
         raise ValueError('four complete capture surfaces required')
-    captures = {name: read_pcap(path) for name, path in paths.items()}
+    limits = validated_capture_limits(packet_limits)
+    captures = {name: read_pcap(path, limits[name]) for name, path in paths.items()}
     evidence = []
     for flow in flows:
         def selected(p, reverse=False):
@@ -538,14 +561,17 @@ def audit_native_captures(paths: dict[str, Path], flows: list[dict], lanes: int)
             'maximum_whole_ip_bytes': {name: max(map(lambda p: len(p.raw), value)) for name, value in captures.items()}}
 
 
-def capture_counts(text: str) -> dict:
+def capture_counts(text: str, packet_limit: int = PACKET_LIMIT) -> dict:
+    packet_limit = validated_packet_limit(packet_limit)
     result = {}
     for field in ('captured', 'received by filter', 'dropped by kernel'):
         matches = re.findall(rf'^(\d+) packets {field}$', text, re.MULTILINE)
         if len(matches) != 1:
             raise ValueError('missing/duplicate complete capture counters')
         result[field] = int(matches[0])
-    if not 0 < result['captured'] < PACKET_LIMIT or result['dropped by kernel']:
+    if result['captured'] >= packet_limit:
+        raise CaptureBound('capture packet cap exhausted')
+    if result['captured'] <= 0 or result['dropped by kernel']:
         raise ValueError('empty/exhausted/lossy capture')
     return result
 
@@ -611,7 +637,9 @@ def start_capture(argv: list[str], path: Path, deadline: float):
         raise
 
 
-def finish_capture(process: subprocess.Popen, path: Path) -> dict:
+def finish_capture(process: subprocess.Popen, path: Path,
+                   packet_limit: int = PACKET_LIMIT) -> dict:
+    packet_limit = validated_packet_limit(packet_limit)
     stop(process, interrupt=True)
     if process.stderr is None:
         raise RuntimeError('capture diagnostics pipe missing')
@@ -621,7 +649,7 @@ def finish_capture(process: subprocess.Popen, path: Path) -> dict:
     if len(prior) + len(tail) > LOG_LIMIT:
         raise ValueError('capture diagnostic bound')
     path.write_bytes(prior + tail)
-    return capture_counts(read_log(path))
+    return capture_counts(read_log(path), packet_limit)
 
 
 def offloads(namespace: str, interface: str, deadline: float) -> dict:
