@@ -106,7 +106,12 @@ pub(crate) async fn run(
                 if !discarded {
                     match bytes.first() {
                         Some(32 | 40) => match control.receive(source, bytes, now) {
-                            Ok(ReceiveOutcome::Fresh) => { quiet.activity(); if let Some(gate) = &mut gate { gate.confirm_peer_control(now)?; } gate = None; }
+                            Ok(ReceiveOutcome::Fresh) => {
+                                #[cfg(test)]
+                                if let Some(close) = shared.modify(|s| Ok(s.close_started))? {
+                                    eprintln!("CLOSE_ACTIVITY lane={} server={server} reason=fresh_control opcode={} packet={:?} driver_at={now:?} close_elapsed={:?} quiet_since={:?}", config.profile.lane.0, bytes[0], bytes.get(20..28).and_then(|b| <[u8;8]>::try_from(b).ok()).map(u64::from_be_bytes), close.elapsed(),quiet.since);
+                                }
+                                quiet.activity(); if let Some(gate) = &mut gate { gate.confirm_peer_control(now)?; } gate = None; }
                             Ok(ReceiveOutcome::Replay) => discarded = true,
                             Err(l2tunnel_udp_control::Error::Malformed | l2tunnel_udp_control::Error::Authentication) => discarded = true,
                             Err(l2tunnel_udp_control::Error::Recovery(RecoveryError::Capacity(BufferSide::Receive) | RecoveryError::SequenceWindow)) => discarded = true,
@@ -324,6 +329,20 @@ pub(crate) async fn run(
                 });
                 match sent {
                     Ok(sent) => {
+                        #[cfg(test)]
+                        if let Some(close) = shared.modify(|s| Ok(s.close_started))? {
+                            eprintln!(
+                                "CLOSE_ACTIVITY lane={} server={server} reason=send opcode={:?} control_packet={:?} physical_count={sent} driver_at={now:?} close_elapsed={:?} quiet_since={:?}",
+                                config.profile.lane.0,
+                                bytes.first(),
+                                bytes
+                                    .get(20..28)
+                                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                                    .map(u64::from_be_bytes),
+                                close.elapsed(),
+                                quiet.since
+                            );
+                        }
                         quiet.activity();
                         *pending = None;
                         shared.modify(|s| {
@@ -349,6 +368,16 @@ pub(crate) async fn run(
             s.data_drained = data_drained;
             Ok((s.tls_finished, s.status.closing, s.close_started))
         })?;
+        #[cfg(test)]
+        test_path.observe_recovery_drain(
+            data_drained
+                && control.drained()
+                && control_output.is_none()
+                && data_output.is_none()
+                && from_start == from_end
+                && to_start == to_end
+                && test_path.drained(),
+        );
         if close_started.is_some_and(|at| at.elapsed() >= config.close_timeout) {
             #[cfg(test)]
             eprintln!(

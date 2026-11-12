@@ -551,28 +551,33 @@ async fn asymmetric_final_ack_loss_and_repeated_final_retries_keep_original_cont
 
 #[tokio::test]
 async fn endless_final_ack_loss_cannot_extend_absolute_close_deadline() -> TestResult {
-    let (a, b, cfg) = pair(Protection::ChaCha20Poly1305, |cfg| {
-        cfg.bootstrap.arq.initial_rto = Duration::from_millis(10);
-        cfg.bootstrap.arq.maximum_rto = Duration::from_millis(30);
-        cfg.bootstrap.arq.ack_delay = Duration::from_millis(8);
-        cfg.bootstrap.arq.max_retries = 100;
-        cfg.close_timeout = Duration::from_millis(160);
-        assert!(
-            test_wire::install(
-                cfg.bootstrap.path.server,
-                test_wire::Mode::DropCloseAcks(usize::MAX)
-            )
-            .is_ok()
-        );
-    })
-    .await?;
-    let (ac, _at, _ar) = a.split();
-    let (bc, _bt, _br) = b.split();
-    let started = tokio::time::Instant::now();
-    let (a, b) = tokio::join!(ac.close(), bc.close());
-    assert!(matches!(a, Err(Error::IncompleteClose)));
-    assert!(matches!(b, Err(Error::IncompleteClose)));
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(test_wire::dropped(cfg.bootstrap.path.server)? > 1);
+    for default_profile in [false, true] {
+        let (a, b, cfg) = pair(Protection::ChaCha20Poly1305, |cfg| {
+            if !default_profile {
+                cfg.bootstrap.arq.initial_rto = Duration::from_millis(10);
+                cfg.bootstrap.arq.maximum_rto = Duration::from_millis(30);
+                cfg.bootstrap.arq.ack_delay = Duration::from_millis(8);
+                cfg.bootstrap.arq.max_retries = 100;
+                cfg.close_timeout = Duration::from_millis(160);
+            }
+            assert!(
+                test_wire::install(
+                    cfg.bootstrap.path.server,
+                    test_wire::Mode::DropCloseAcks(usize::MAX)
+                )
+                .is_ok()
+            );
+        })
+        .await?;
+        let (ac, _at, _ar) = a.split();
+        let (bc, _bt, _br) = b.split();
+        let started = tokio::time::Instant::now();
+        let (a, b) = tokio::join!(ac.close(), bc.close());
+        assert!(matches!(a, Err(Error::IncompleteClose)));
+        assert!(matches!(b, Err(Error::IncompleteClose)));
+        assert!(started.elapsed() >= cfg.close_timeout);
+        assert!(started.elapsed() < Duration::from_secs(if default_profile { 6 } else { 1 }));
+        assert!(test_wire::dropped(cfg.bootstrap.path.server)? > 1);
+    }
     Ok(())
 }

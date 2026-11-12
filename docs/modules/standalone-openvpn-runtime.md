@@ -334,5 +334,19 @@ an already-Clean state or completed child could return success at/after the
 original deadline because the timeout wrapper polled the ready child first.
 Two deterministic regressions reject both an already-expired owner and a child
 made ready after an executor stall. This correction does not claim to fix the
-preserved snapshot15 `IncompleteClose` observation. The complete current crate
-passes 49 tests; strict validation details are recorded in the focused receipt.
+preserved snapshot15 `IncompleteClose` observation. That snapshot
+passed 49 tests; strict validation details are recorded in its focused receipt.
+
+The later [snapshot27d finite failure](../../work/implementation-wave27d/local-check.log)
+again reported `IncompleteClose` with drained ownership, while the whole quiet
+interval had not completed. Its trace does not identify a specific lost final ACK;
+driver-origin quiet times and close-relative ages must not be subtracted directly.
+The [current scoped follow-up](../../work/openvpn-close28/RECEIPT.md) preserves that
+failure and qualifies the positive paired test as impaired exact transfer followed
+by witnessed recovery/held-path drain and no-new-loss close. Only those four test
+paths are quiesced, within the original transfer budget; the five-second production
+close and complete quiet requirement are unchanged. A separate actual final-ACK
+loss table retains its 160ms profile and additionally requires explicit failure at
+the default five-second bound. Neither the positive fixture nor isolated passing
+runs explain away the historical failures or promise clean shutdown under arbitrary
+continuing loss.

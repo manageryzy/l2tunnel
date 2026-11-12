@@ -100,9 +100,13 @@ async fn actual_paired_udp_ipv4_loss_and_ipv6_integrity_transfer_both_bulk_direc
                 protection,
             )?,
         ];
+        let mut paths = Vec::new();
         if impaired {
             for socket in [&ca, &cb, &sa, &sb] {
-                crate::test_wire::install(socket.local_addr()?, crate::test_wire::Mode::Impaired)?;
+                paths.push(crate::test_wire::install_observed(
+                    socket.local_addr()?,
+                    crate::test_wire::Mode::Impaired,
+                )?);
             }
         }
         let cert = rcgen::generate_simple_self_signed(vec!["paired.test".to_owned()])?;
@@ -143,7 +147,8 @@ async fn actual_paired_udp_ipv4_loss_and_ipv6_integrity_transfer_both_bulk_direc
         );
         let (cc, ct, mut cr) = client.split();
         let (sc, st, mut sr) = server.split();
-        timeout(std::time::Duration::from_secs(8), async {
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        tokio::time::timeout_at(transfer_deadline, async {
             tokio::try_join!(
                 async {
                     for n in 0..40_u8 {
@@ -200,6 +205,54 @@ async fn actual_paired_udp_ipv4_loss_and_ipv6_integrity_transfer_both_bulk_direc
             sc.controls[0].shared.clone(),
             sc.controls[1].shared.clone(),
         ];
+        if impaired {
+            assert!(
+                paths
+                    .iter()
+                    .map(crate::test_wire::Observer::dropped)
+                    .sum::<usize>()
+                    > 0
+            );
+        }
+        if impaired {
+            // ca and sb are the configured half-lane USER source senders. Their
+            // reverse USER receive direction is disabled, so these are not ACKs.
+            assert!(paths[0].dropped_user() + paths[3].dropped_user() > 0);
+        }
+        // This positive case qualifies impaired transfer followed by clean close.
+        // Arrival-index faults do not promise a bounded final-ACK loss schedule.
+        // Quiesce only these paths, then prove prior USER/held ownership drained
+        // plus control ARQ/bridge/output ownership, within the original transfer
+        // deadline before starting the unchanged close.
+        for path in &paths {
+            path.quiesce();
+        }
+        tokio::time::timeout_at(transfer_deadline, async {
+            loop {
+                let mut drained = paths.iter().all(crate::test_wire::Observer::drained);
+                for lane in &lanes {
+                    drained &= lane.modify(|s| Ok(s.data_drained))?;
+                }
+                if drained {
+                    return Ok::<_, Error>(());
+                }
+                tokio::time::sleep(configs[0].poll_interval).await;
+            }
+        })
+        .await??;
+        eprintln!(
+            "PAIR_TRANSFER_QUIESCED host={host} dropped={} dropped_user_sources={} held_control_bridge_outputs_released={} recovery_drained=true",
+            paths
+                .iter()
+                .map(crate::test_wire::Observer::dropped)
+                .sum::<usize>(),
+            if impaired {
+                paths[0].dropped_user() + paths[3].dropped_user()
+            } else {
+                0
+            },
+            paths.iter().all(crate::test_wire::Observer::drained)
+        );
         eprintln!(
             "PAIR_CLOSE_START host={host} impaired={impaired} shared={:?} states={:?}",
             lanes.iter().map(std::sync::Arc::as_ptr).collect::<Vec<_>>(),
