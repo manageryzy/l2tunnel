@@ -14,10 +14,7 @@ struct Bank {
 impl Bank {
     fn new(c: Config, width: usize) -> Result<Self, Error> {
         Ok(Self {
-            data: bytes(add(
-                mul(2 * c.window, width)?,
-                mul(c.max_rows, add(c.window, width)?)?,
-            )?)?,
+            data: bytes(mul(c.max_rows, add(c.window, width)?)?)?,
             known: slots(2 * c.window, None)?,
             pivots: slots(c.max_rows, None)?,
             map: slots(c.window, None)?,
@@ -204,6 +201,9 @@ pub struct Decoder {
     width: usize,
     live: Bank,
     shadow: Bank,
+    // Immutable while referenced by committed identities. Candidate recovery may
+    // stage only into vacant slots; publication is the identity-bank commit.
+    known_data: Vec<u8>,
     input: Vec<u8>,
     candidate: Vec<u8>,
     history: Vec<u8>,
@@ -228,10 +228,7 @@ impl Decoder {
     pub fn memory_bound(c: Config) -> Result<usize, Error> {
         let width = c.width()?;
         let bank = add(
-            add(
-                mul(2 * c.window, width)?,
-                mul(c.max_rows, add(c.window, width)?)?,
-            )?,
+            mul(c.max_rows, add(c.window, width)?)?,
             add(
                 mul(
                     2 * c.window + c.max_rows,
@@ -248,7 +245,10 @@ impl Decoder {
                     add(width, std::mem::size_of::<Option<Descriptor>>())?,
                 )?,
             )?,
-            add(add(width, c.window + width)?, std::mem::size_of::<Self>())?,
+            add(
+                mul(2 * c.window, width)?,
+                add(add(width, c.window + width)?, std::mem::size_of::<Self>())?,
+            )?,
         )
     }
     /// Construct every bounded bank/scratch/history allocation before packet ingress.
@@ -266,6 +266,7 @@ impl Decoder {
             width,
             live: Bank::new(config, width)?,
             shadow: Bank::new(config, width)?,
+            known_data: bytes(mul(2 * config.window, width)?)?,
             input: bytes(width)?,
             candidate: bytes(config.window + width)?,
             history: bytes(mul(config.repair_history, width)?)?,
@@ -318,9 +319,14 @@ impl Decoder {
             }
             None => None,
         };
+        let vacant_source = matches!(input, Input::Source(_)) && self.live.rank == 0;
         self.job = Some(Job {
             input,
-            phase: Phase::CopyData(0),
+            phase: if vacant_source {
+                Phase::CopyMeta(0)
+            } else {
+                Phase::CopyData(0)
+            },
             deadline: job_end,
             debt,
             recovered: 0,
@@ -358,7 +364,7 @@ impl Decoder {
         }
         let slot = id.0 as usize % (2 * self.config.window);
         if self.live.known[slot] == Some(id.0) {
-            let data = &self.live.data[slot * self.width..(slot + 1) * self.width];
+            let data = &self.known_data[slot * self.width..(slot + 1) * self.width];
             let len = usize::from(u16::from_be_bytes([data[0], data[1]]));
             return if len == original.len() && data[2..2 + len] == *original {
                 Ok(Begin::Duplicate)
@@ -427,7 +433,7 @@ impl Decoder {
         self.stage(Input::Repair(descriptor), now)
     }
     fn row_start(&self, row: usize) -> usize {
-        2 * self.config.window * self.width + row * (self.config.window + self.width)
+        row * (self.config.window + self.width)
     }
     fn known(&self, id: u32) -> Option<usize> {
         let slot = id as usize % (2 * self.config.window);
@@ -541,7 +547,7 @@ impl Decoder {
                     }
                     let start = self.known(source).ok_or(Error::Identity)?;
                     self.candidate[w + column] ^=
-                        field::multiply(factor, self.shadow.data[start + column]);
+                        field::multiply(factor, self.known_data[start + column]);
                     job.phase = Phase::Known {
                         source,
                         factor,
@@ -863,6 +869,15 @@ impl Decoder {
                     {
                         return Err(Error::Identity);
                     }
+                    // Payload staging may touch only a slot unreachable through
+                    // committed metadata. The authenticated horizon guarantees this
+                    // for new identities even if candidate prefix advancement evicts
+                    // additional shadow identities before commit.
+                    if self.live.known[slot]
+                        .is_some_and(|old| old >= self.live.prefix.saturating_sub(w as u32))
+                    {
+                        return Err(Error::Identity);
+                    }
                     job.phase = Phase::Store { row, id, index: 0 };
                 } else {
                     if !spend(&mut budget.copies) {
@@ -908,7 +923,9 @@ impl Decoder {
                         return Ok(Action::Paused);
                     }
                     let value = self.payload_byte(row, index);
-                    self.shadow.data[slot * width + index] = value;
+                    // Both identity banks proved this slot unreferenced. Partial
+                    // payload writes are invisible until the identity bank commits.
+                    self.known_data[slot * width + index] = value;
                     job.phase = Phase::Store {
                         row,
                         id,
@@ -1052,7 +1069,7 @@ impl Decoder {
         if self.live.known[slot] != Some(self.handoff) {
             return None;
         }
-        let vector = &self.live.data[slot * self.width..(slot + 1) * self.width];
+        let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
         let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
         Some((SourceId(self.handoff), &vector[2..2 + length]))
     }
@@ -1109,3 +1126,6 @@ impl Decoder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

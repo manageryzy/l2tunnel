@@ -22,6 +22,9 @@ The initial primitive carries complete vectors; repair-padding trimming is absen
 The decoder keeps historical and future known columns across nearly 2W slots,
 plus bounded rows and duplicate history. It prepares a preallocated shadow bank
 using resumable copy/metadata/field work, and publishes accepted state atomically.
+Known payloads occupy one shared preallocated ring; only equation rows and
+identity metadata are transactional. Staging never overwrites an identity still
+referenced by the committed history. Rank-zero systematic input skips row copies.
 Every useful repair end is bounded by decoded-prefix+W before work. Repairs ending
 at/before the decoded prefix are stale. Recovered source handoff is separate from
 native delivery; only the upper owner can prove native delivery. The public `decoded_prefix` is the contiguous **published receipt** prefix,
@@ -132,6 +135,7 @@ is supplied. Gates 06/07 remain open after this finite subgate.
 - [ ] [MOD-LGR-06] Add causal repair-credit/tail/feedback scheduling, authenticated wire framing and large-window qualification as separate gates.
 - [x] [MOD-LGR-06A] Implement and test the additive bounded structural source/repair wire codec without granting authentication or replay authority. Evidence: [focused wire checks](../../work/rolling-wire15/validation.json), nine literal/parser/output-atomicity and independent received-wire recovery tests, strict FEC Clippy, warning-denied rustdoc and Cargo formatting. This is a structural contract, not authenticated transport integration.
 - [x] [MOD-LGR-06B] Implement causal bounded repair-credit/tail/identified cumulative feedback scheduling over actual rolling owners and wire; verify independent two-owner exact bytes under data/repair/feedback loss, reorder, output pressure, tiny work and original expiry. Evidence: [scoped exact-file receipt](../../work/rolling-scheduler16/validation.json), 49 FEC unit and 16 independent integration cases (13 scheduler / 3 existing stream), strict FEC lint/docs and formatting. New maintained-Python repair/feedback literals pin actual deficit/rank and full structural bytes; W8 budget1/17/65536 exchanges cross eight windows. This finite pure slice does not complete either parent gate.
+- [x] [MOD-LGR-06C] Remove complete known-payload bank copies while preserving bounded work, retained history and atomic recovery publication. Evidence: [focused optimization receipt](../../work/fix03-shared26/RECEIPT.md),69 FEC tests, strict Clippy and formatting; partial rank-positive recovery preserves exact committed payload/rows/identities through original expiry. At G8192/width1450 the reservation drops23,756,800 bytes. This is a pure-module checkpoint; FIX-03 still requires measured large-window service cost and runtime qualification.
 - [ ] [MOD-LGR-07] Integrate explicit aligned/packed selection, runtime/client/native qualification and complete Python family parity.
 
 The implementation checks the configured reservation before allocating two fixed
