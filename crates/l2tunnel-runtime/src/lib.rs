@@ -21,6 +21,8 @@ pub mod quic;
 pub mod raw_packet;
 /// Explicit rolling-frame recovery over retained authenticated UDP/QUIC owners.
 pub mod rolling;
+/// Same-socket cookie/Noise/member authentication with bounded final-flight custody.
+pub mod secure_udp;
 /// Lean paced packed-stream profile over protected UDP with readiness-driven I/O.
 #[cfg(unix)]
 pub mod swift;

@@ -67,6 +67,7 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-core` | Typed IDs, capabilities, policy and config validation | Initial mode types and structural validation |
 | `crates/l2tunnel-wire`, `crates/l2tunnel-session` | Versioned records, parsers, session contracts | Bounded wire/framing and local reload guard; distributed transactions live in management |
 | `crates/l2tunnel-auth` | Verified TLS and member authentication | Retained TCP/TLS and generic I/O TLS, exporter/member/config binding and negative tests |
+| `crates/l2tunnel-identity` | Reusable existing-member keys and possession proofs | Pure Ed25519 extraction and explicit Noise-bound member gate; same-carrier runtime integration has its own ledger |
 | `crates/l2tunnel-security` | Shared opaque protection and explicit Swift v2 compatibility | Pure AEAD/HMAC, domains, metadata, replay and adjacent ratchets; existing Swift runtime consumes byte-compatible owners |
 | `crates/l2tunnel-handshake` | Maintained fixed-pattern Noise adapter | Protocol-tested pinned-peer proof, caller entropy/time, public secret handoff and final-confirmation custody; no production credential migration or full lifecycle |
 | `crates/l2tunnel-cover` | Explicit QUIC-header/RTP-like appearance | Bounded pure codecs, without standard transport validity, identification or ISP classification claims |
@@ -92,6 +93,16 @@ outputs, source-bound receipts and independently useful existing transports.
 | `simulator/` | Existing reference algorithms, experiments and golden oracle generation | Preserved existing Python project |
 | `tools/` | Local checks, isolated topology and native qualification | Source-hashed checks, immutable binary snapshots, TAP/TUN/VXLAN/netem, payload/path/cleanup receipts |
 | `config/` | Mode requirement catalog; later versioned deployable profiles | Catalog is an inventory, not a daemon config |
+
+The [shared UDP client factory](modules/client-secure-udp.md) passed the
+[frozen-source local aggregate](../work/shared-session-client-20261113/validation.json),
+including actual same-socket cookie/Noise establishment, existing-member proof
+and protected Swift/control over both appearances. The
+[Swift record extraction](modules/swift-record-engine.md) removes duplicated
+packing/channel/header processing from the legacy runtime. Their ledgers record
+the actual checks. Neither source presence nor factory authentication completes
+the selected shared-service/native data path or remaining carrier/lifecycle
+requirements.
 
 Additional planned source boundaries (create at the first actual implementation):
 

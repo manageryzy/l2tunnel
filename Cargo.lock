@@ -542,6 +542,7 @@ dependencies = [
  "l2tunnel-fec",
  "l2tunnel-flow-control",
  "l2tunnel-handshake",
+ "l2tunnel-identity",
  "l2tunnel-management",
  "l2tunnel-mux",
  "l2tunnel-packet",
@@ -595,6 +596,7 @@ version = "0.1.0"
 dependencies = [
  "l2tunnel-core",
  "l2tunnel-device",
+ "l2tunnel-identity",
  "l2tunnel-udp-control",
  "rcgen",
  "ring",
@@ -608,13 +610,17 @@ dependencies = [
 name = "l2tunnel-client-core"
 version = "0.1.0"
 dependencies = [
+ "l2tunnel",
  "l2tunnel-auth",
  "l2tunnel-codec",
  "l2tunnel-core",
+ "l2tunnel-cover",
  "l2tunnel-datagram",
  "l2tunnel-device",
  "l2tunnel-fec",
  "l2tunnel-flow-control",
+ "l2tunnel-handshake",
+ "l2tunnel-identity",
  "l2tunnel-openvpn",
  "l2tunnel-packet",
  "l2tunnel-platform-linux",
@@ -625,6 +631,7 @@ dependencies = [
  "l2tunnel-recovery",
  "l2tunnel-reliable",
  "l2tunnel-runtime",
+ "l2tunnel-security",
  "l2tunnel-swift",
  "l2tunnel-tcp-proxy",
  "l2tunnel-udp",
@@ -703,6 +710,15 @@ dependencies = [
  "rustls",
  "tokio",
  "tokio-rustls",
+ "zeroize",
+]
+
+[[package]]
+name = "l2tunnel-identity"
+version = "0.1.0"
+dependencies = [
+ "l2tunnel-security",
+ "ring",
  "zeroize",
 ]
 
@@ -849,15 +865,19 @@ dependencies = [
 name = "l2tunnel-runtime"
 version = "0.1.0"
 dependencies = [
+ "l2tunnel",
  "l2tunnel-active",
  "l2tunnel-aligned",
  "l2tunnel-auth",
  "l2tunnel-codec",
  "l2tunnel-core",
+ "l2tunnel-cover",
  "l2tunnel-datagram",
  "l2tunnel-device",
  "l2tunnel-fec",
  "l2tunnel-flow-control",
+ "l2tunnel-handshake",
+ "l2tunnel-identity",
  "l2tunnel-management",
  "l2tunnel-openvpn",
  "l2tunnel-packet",

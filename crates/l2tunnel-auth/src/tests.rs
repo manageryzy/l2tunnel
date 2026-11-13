@@ -318,7 +318,7 @@ async fn captured_member_proof_cannot_replay_on_another_tls_connection() -> Test
     proof[32..64].copy_from_slice(&key.public_key().0);
     write_config(&mut proof[64..97], config(PacketLayer::Ip));
     let first_transcript = transcript(&first, &challenge, &proof[..PROOF_PREFIX_LEN])?;
-    proof[PROOF_PREFIX_LEN..].copy_from_slice(key.0.sign(&first_transcript).as_ref());
+    proof[PROOF_PREFIX_LEN..].copy_from_slice(&key.0.sign(&first_transcript)?);
     write_frame(&mut first, PROOF, &proof).await?;
     let accepted = read_frame::<48>(&mut first, ACCEPT).await?;
     write_frame(&mut first, FINISH, &accepted[16..]).await?;
@@ -340,9 +340,12 @@ async fn captured_member_proof_cannot_replay_on_another_tls_connection() -> Test
     let second_challenge = read_frame::<CHALLENGE_LEN>(&mut second, CHALLENGE).await?;
     let replay_transcript = transcript(&second, &challenge, &proof[..PROOF_PREFIX_LEN])?;
     assert!(
-        UnparsedPublicKey::new(&ED25519, key.public_key().0)
-            .verify(&replay_transcript, &proof[PROOF_PREFIX_LEN..])
-            .is_err()
+        l2tunnel_identity::verify_signature(
+            key.public_key(),
+            &replay_transcript,
+            &proof[PROOF_PREFIX_LEN..],
+        )
+        .is_err()
     );
     assert_ne!(second_challenge[..48], challenge[..48]);
     write_frame(&mut second, PROOF, &proof).await?;

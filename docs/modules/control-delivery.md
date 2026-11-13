@@ -98,11 +98,15 @@ calculation. No waiting operation resets a data-mode transaction.
 
 The first-source/first-feedback correction passed all eight delivery regressions
 in the parent-serialized local run (34 management tests total), including
-continuous duplicate-input feedback pressure and reserved-source RTO cases.
+continuous duplicate-input feedback pressure and reserved-source RTO cases. See
+the [reservation and wake implementation](../../crates/l2tunnel-management/src/delivery.rs),
+the [independent recovery source timer](../../crates/l2tunnel-recovery/src/arq.rs)
+and the [eight delivery regressions](../../crates/l2tunnel-management/src/delivery/tests.rs).
 The same focused run passed the two-socket Noise/Swift/control composition and
 strict workspace Clippy. These finite cases establish bounded source/feedback
 opportunities under the tested interval budgets; native scheduling fairness
-remains part of CDL-07.
+remains part of CDL-07. The complete source-stable aggregate check subsequently
+passed in the [recorded checkpoint](../../work/shared-session-primitives-20261113/validation.json).
 
 - [x] [CDL-01] Implement bounded construction, fixed context and exact source delivery using maintained selective repeat, without clocks or I/O. Evidence: [service](../../crates/l2tunnel-management/src/delivery.rs) and [bounded source tests](../../crates/l2tunnel-management/src/delivery/tests.rs).
 - [x] [CDL-02] Reject user-origin, wrong session/lane/role, malformed or conflicting input without consuming valid state. Evidence: [origin/context/conflict and preserved-delivery test](../../crates/l2tunnel-management/src/delivery/tests.rs).

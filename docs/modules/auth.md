@@ -17,6 +17,13 @@ HTTPS-like still requires its real outer TCP/TLS handshake. Existing credentials
 trust tests and historical receipts remain unchanged until a reviewed binding is
 specified; no dependency or credential migration is approved here.
 
+The [pure identity extraction](session-identity.md) now supplies one maintained
+Ed25519 key/parser, public member type, signature verifier and bounded allowlist.
+This adapter retains its public key-generation/loading/error APIs through
+delegating wrappers; OS randomness stays here. Existing TLS/member and HTTPS
+transcripts and wire bytes remain unchanged. The separately domain-separated
+Noise member proof does not turn a TLS exporter into a datagram trust assertion.
+
 ## Exact initial embedding interface
 
 - `ClientTls::from_der_roots(&[Vec<u8>])` creates a private TLS 1.3-only rustls

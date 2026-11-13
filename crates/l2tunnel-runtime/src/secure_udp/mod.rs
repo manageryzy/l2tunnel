@@ -1,0 +1,9 @@
+//! Runtime-owned same-socket bootstrap and existing-member authentication.
+//!
+//! These owners perform no device setup or implicit client/profile selection.
+//! A sole data/control reader retains the returned bounded final-flight tails.
+
+/// Original connected UDP admission, maintained Noise and bootstrap custody.
+pub mod establish;
+/// Actual existing-member proof and authenticated acceptance on that same socket.
+pub mod member;

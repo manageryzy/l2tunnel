@@ -56,6 +56,23 @@ The common-session implementation wave is tracked in
 [protected record composition](modules/secure-records.md) and
 [fixed reliable control delivery](modules/control-delivery.md), with
 [finite CPU measurement recording](modules/secure-record-performance.md).
+The subsequent same-carrier integration is tracked in
+[existing-member identity](modules/session-identity.md),
+[reusable Swift records](modules/swift-record-engine.md),
+[real UDP establishment](modules/secure-udp-establishment.md),
+[member admission and tail custody](modules/shared-udp-session.md),
+[shared client factory](modules/client-secure-udp.md) and its
+[real-factory composition tests](modules/common-session-client-tests.md).
+These child ledgers preserve FIX-13, full SW-11 and every mode/native/platform
+gate; an authenticated factory is not a running selected native client profile.
+The [same-socket client aggregate](../work/shared-session-client-20261113/validation.json)
+passed with stable inputs: 1437 Rust cases including doctests, 245 Python tooling
+cases and 1658 simulator cases. It covers actual Noise and
+Ed25519 admission, complete extracted Swift records and fixed control over the
+original UDP pair. The [evidence-only ledger reconciliation](../work/shared-session-client-20261113/postcheck-ledger-validation.json)
+verifies the final prose and unchanged non-document inputs. Whole-path
+independent runtimes, restarted-peer recovery and selected CLI/native integration
+remain open in the linked ledgers.
 Swift now consumes the common library's explicit legacy compatibility owners;
 the existing CLI still uses retained TLS plus a separate UDP data socket. A new
 same-UDP-pair integration fixture exercises Noise, both appearance codecs,

@@ -160,6 +160,17 @@ pub struct SessionRoot {
     owners: Vec<Domain>,
 }
 impl SessionRoot {
+    /// Public authenticated session/transcript context, never a secret MAC key.
+    /// This observation creates no owner and changes no key, replay or counter.
+    pub const fn binding(&self) -> SessionBinding {
+        self.binding
+    }
+
+    /// Authenticated local endpoint role, without exporting secret material.
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
     /// Consume global-direction split keys and bind a standard HKDF root to
     /// the authenticated session/transcript. The inputs are zeroized on drop.
     pub fn from_split_keys(

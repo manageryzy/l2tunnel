@@ -13,6 +13,7 @@
 //! This module performs no authentication, key derivation or device setup.
 pub use codec::control::Policy;
 use codec::control::{Message, Refusal};
+use codec::records::{self, RecordNumber};
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_security::{self as security, swift_v2 as protection};
 use l2tunnel_swift as codec;
@@ -59,10 +60,8 @@ pub struct Config {
 impl Config {
     /// Validate scalar bounds before any state is allocated.
     pub fn validate(self) -> io::Result<()> {
-        self.codec.validate().map_err(invalid)?;
-        if !(1..=codec::MAX_CHANNELS).contains(&self.channels)
-            || self.max_native + codec::header::MAX_EXPANSION != self.codec.max_packet
-            || !(8_000..=1_250_000_000).contains(&self.send_bytes_per_second)
+        self.records().validate().map_err(invalid)?;
+        if !(8_000..=1_250_000_000).contains(&self.send_bytes_per_second)
             || !(28..=128).contains(&self.network_overhead)
             || self
                 .report_interval
@@ -73,6 +72,17 @@ impl Config {
             ));
         }
         Ok(())
+    }
+    fn records(self) -> records::Config {
+        records::Config {
+            codec: self.codec,
+            channels: self.channels,
+            layer: match self.layer {
+                PacketLayer::Ethernet => records::Layer::Ethernet,
+                PacketLayer::Ip => records::Layer::Ip,
+            },
+            max_native: self.max_native,
+        }
     }
     fn datagram_cost(self, wire: usize) -> u64 {
         (wire + self.network_overhead) as u64
@@ -240,8 +250,14 @@ struct Change {
 fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
-fn protocol(error: codec::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
+fn protocol(error: impl Into<records::Error>) -> io::Error {
+    match error.into() {
+        records::Error::Codec(error) => io::Error::new(io::ErrorKind::InvalidData, error),
+        records::Error::Admission => {
+            io::Error::other("swift packing queue refused an admitted record")
+        }
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
 }
 
 /// Token bucket in millionths of an IP byte.
@@ -302,91 +318,40 @@ struct Engine {
     config: Config,
     /// Policy of the receiving engines.
     receive: Config,
-    /// Largest datagram body any policy of this session allowed.
-    limit: usize,
     coordinator: bool,
     change: Option<Change>,
     /// Control messages owed to the peer, a handful at most.
     outbox: VecDeque<Message>,
     /// Result of the locally requested change, once known.
     outcome: Option<Result<u64, SwitchError>>,
-    /// Peer sources and repairs numbered below this belong to a drained epoch.
-    source_floor: u64,
-    /// Peer feedback numbered below this describes a drained epoch.
-    feedback_floor: u64,
-    saved_base: u64,
-    senders: Vec<codec::Sender>,
-    receivers: Vec<codec::Receiver>,
-    compressors: Vec<codec::header::Compressor>,
-    decompressors: Vec<codec::header::Decompressor>,
+    records: records::Engine,
     seal: protection::Sender,
     open: protection::Receiver,
     pacer: Pacer,
-    /// Channel served after the last new source, for round-robin fairness.
-    turn: usize,
-    /// Earliest time of the next feedback datagram.
-    feedback_at: u64,
-    feedback_turn: usize,
-    /// One bit per channel whose receiver may hold complete packets.
-    ready: u64,
-    body: Vec<u8>,
-    block: Vec<u8>,
     wire: Vec<u8>,
     opened: Vec<u8>,
-    native: Vec<u8>,
-    record: Vec<u8>,
     snapshot: Snapshot,
-}
-
-fn tagged(kind: u8, channel: usize) -> u8 {
-    kind | ((channel as u8) << 2)
 }
 
 impl Engine {
     fn new(config: Config, keys: &Keys<'_>, now: u64) -> io::Result<Self> {
         config.validate()?;
         let largest = config.datagram_cost(config.codec.datagram_bytes + PROTECTION_BYTES);
-        let mut senders = Vec::with_capacity(config.channels);
-        let mut receivers = Vec::with_capacity(config.channels);
-        let ethernet = config.layer == PacketLayer::Ethernet;
-        let mut compressors = Vec::with_capacity(config.channels);
-        let mut decompressors = Vec::with_capacity(config.channels);
-        for _ in 0..config.channels {
-            senders.push(codec::Sender::new(config.codec).map_err(invalid)?);
-            receivers.push(codec::Receiver::new(config.codec).map_err(invalid)?);
-            compressors.push(codec::header::Compressor::new(ethernet));
-            decompressors.push(codec::header::Decompressor::new(ethernet));
-        }
         Ok(Self {
             config,
             receive: config,
-            limit: config.codec.datagram_bytes,
             coordinator: false,
             change: None,
             outbox: VecDeque::new(),
             outcome: None,
-            source_floor: 0,
-            feedback_floor: 0,
-            saved_base: 0,
-            senders,
-            receivers,
-            compressors,
-            decompressors,
+            records: records::Engine::new(config.records()).map_err(invalid)?,
             seal: protection::Sender::new(keys.send, security::MAX_BODY_BYTES, KEY_PACKETS)
                 .map_err(io::Error::other)?,
             open: protection::Receiver::new(keys.receive, security::MAX_BODY_BYTES, KEY_PACKETS)
                 .map_err(io::Error::other)?,
             pacer: Pacer::new(config.send_bytes_per_second, largest, now),
-            turn: 0,
-            feedback_at: 0,
-            feedback_turn: 0,
-            ready: 0,
-            body: Vec::with_capacity(config.codec.datagram_bytes),
-            block: Vec::with_capacity(codec::FEEDBACK_HEADER + 2 * codec::MAX_REQUESTS),
             wire: Vec::with_capacity(config.codec.datagram_bytes + PROTECTION_BYTES),
             opened: Vec::with_capacity(config.codec.datagram_bytes + PROTECTION_BYTES),
-            native: Vec::with_capacity(config.codec.max_packet),
-            record: Vec::with_capacity(config.codec.max_packet),
             snapshot: Snapshot::default(),
         })
     }
@@ -400,106 +365,41 @@ impl Engine {
         {
             return false;
         }
-        let queued: usize = self.senders.iter().map(codec::Sender::queued).sum();
-        queued + self.config.codec.max_packet + codec::FRAME_PREFIX <= self.config.codec.queue_bytes
+        self.records.has_room()
     }
     /// Queue one native packet read from the device.
     fn offer(&mut self, now: u64, packet: &[u8]) -> io::Result<()> {
-        // Refuse before compressing: a compressed record must be delivered,
-        // or the peer's header contexts would no longer match.
-        if packet.is_empty() || packet.len() > self.config.max_native || !self.has_room() {
+        // Policy drain stops admission before header contexts can advance.
+        if !self.has_room() {
             self.snapshot.native_dropped += 1;
             return Ok(());
         }
-        let channel = match self.config.layer {
-            PacketLayer::Ethernet => codec::flow::classify_ethernet(packet, self.config.channels),
-            PacketLayer::Ip => codec::flow::classify_ip(packet, self.config.channels),
-        };
-        self.compressors[channel].compress(packet, &mut self.record);
-        if !self.senders[channel]
-            .push_packet(now, &self.record)
-            .map_err(protocol)?
-        {
-            return Err(io::Error::other(
-                "swift packing queue refused an admitted record",
-            ));
-        }
-        self.snapshot.native_read += 1;
+        self.records.offer(now, packet).map_err(protocol)?;
         Ok(())
-    }
-    /// One feedback datagram body with a block for every channel that owes
-    /// one, as far as they fit. Returns whether anything was written.
-    fn feedback(&mut self, now: u64) -> bool {
-        if now < self.feedback_at {
-            return false;
-        }
-        self.body.clear();
-        let block = codec::FEEDBACK_HEADER + 2 * codec::MAX_REQUESTS;
-        let mut deferred = false;
-        for step in 0..self.receive.channels {
-            let channel = (self.feedback_turn + step) % self.receive.channels;
-            if self.body.len() + block > self.config.codec.datagram_bytes {
-                // Continue with this channel in the next datagram.
-                deferred = self.receivers[channel].deadline().is_some();
-                if deferred {
-                    self.feedback_turn = channel;
-                    break;
-                }
-                continue;
-            }
-            if self.receivers[channel].feedback(now, &mut self.block) {
-                self.block[0] = tagged(codec::KIND_FEEDBACK, channel);
-                self.body.extend_from_slice(&self.block);
-            }
-        }
-        if !deferred {
-            self.feedback_at = now.saturating_add(self.config.codec.feedback_micros);
-        }
-        !self.body.is_empty()
-    }
-    /// The next source, repair or retransmission the budget allows.
-    fn data(&mut self, now: u64) -> io::Result<bool> {
-        if !self.pacer.ready() {
-            return Ok(false);
-        }
-        let channels = self.config.channels;
-        // Requested retransmissions unblock delivery, so they go first.
-        let urgent = (0..channels)
-            .map(|step| (self.turn + step) % channels)
-            .find(|channel| self.senders[*channel].urgent());
-        let order = urgent
-            .into_iter()
-            .chain((0..channels).map(|step| (self.turn + step) % channels));
-        for channel in order {
-            if self.senders[channel]
-                .poll(now, self.seal.next_number().0, &mut self.body)
-                .map_err(protocol)?
-            {
-                self.body[0] = tagged(self.body[0], channel);
-                if urgent != Some(channel) {
-                    self.turn = (channel + 1) % channels;
-                }
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
     /// The next protected datagram due at `now`, if any. Feedback is never
     /// held back by pacing but is charged to the same budget.
     fn produce(&mut self, now: u64) -> io::Result<Option<&[u8]>> {
         self.pacer.refill(now);
-        if !self.feedback(now) && !self.data(now)? {
+        let Some(body) = self
+            .records
+            .poll(
+                now,
+                RecordNumber(self.seal.next_number().0),
+                self.pacer.ready(),
+            )
+            .map_err(protocol)?
+        else {
             return Ok(None);
-        }
-        let length = self
-            .body
+        };
+        let length = body
             .len()
             .checked_add(PROTECTION_BYTES)
             .ok_or_else(|| io::Error::other("swift protected packet size overflow"))?;
         self.wire.resize(length, 0);
         let sealed = self
             .seal
-            .seal(&self.body, &mut self.wire)
+            .seal(body, &mut self.wire)
             .map_err(io::Error::other)?;
         self.wire.truncate(sealed.bytes);
         self.snapshot.key_generation = sealed.generation.0;
@@ -511,19 +411,12 @@ impl Engine {
     }
     /// Earliest time [`Engine::produce`] can have something new without input.
     fn wake(&self, now: u64) -> Option<u64> {
-        let send = if self.senders.iter().any(|sender| sender.ready(now)) {
+        let send = if self.records.data_ready(now) {
             Some(self.pacer.available_at())
         } else {
-            self.senders
-                .iter()
-                .filter_map(codec::Sender::deadline)
-                .min()
+            self.records.data_deadline()
         };
-        let feedback = self
-            .receivers
-            .iter()
-            .any(|receiver| receiver.deadline().is_some())
-            .then_some(self.feedback_at);
+        let feedback = self.records.feedback_deadline();
         let activity = match (send, feedback) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -536,7 +429,7 @@ impl Engine {
     /// Authenticate and apply one received datagram. Unauthenticated input is
     /// counted and ignored; inconsistent authenticated input ends the session.
     fn accept(&mut self, now: u64, datagram: &[u8]) -> io::Result<()> {
-        let limit = self.limit + PROTECTION_BYTES;
+        let limit = self.records.body_limit() + PROTECTION_BYTES;
         if datagram.len() <= PROTECTION_BYTES || datagram.len() > limit {
             self.snapshot.datagrams_rejected += 1;
             return Ok(());
@@ -552,90 +445,34 @@ impl Engine {
                 return Ok(());
             }
         };
-        let number = opened.number.0;
-        let body = &mut self.opened[..opened.bytes];
         self.snapshot.datagrams_received += 1;
-        let malformed = || protocol(codec::Error::Malformed);
-        let lead = *body.first().ok_or_else(malformed)?;
-        let channel = usize::from(lead >> 2);
-        if lead & codec::KIND_MASK != codec::KIND_FEEDBACK {
-            if number < self.source_floor {
-                // A late copy from an epoch that was confirmed in full.
-                self.snapshot.receiver.duplicates += 1;
-                return Ok(());
-            }
-            if channel >= self.receive.channels {
-                return Err(malformed());
-            }
-            body[0] = lead & codec::KIND_MASK;
-            self.ready |= 1 << channel;
-            return self.receivers[channel]
-                .on_datagram(number, body)
-                .map_err(protocol);
-        }
-        if number < self.feedback_floor {
-            return Ok(());
-        }
-        let mut rest = body;
-        while !rest.is_empty() {
-            let lead = rest[0];
-            let channel = usize::from(lead >> 2);
-            let requests =
-                usize::from(*rest.get(codec::FEEDBACK_HEADER - 1).ok_or_else(malformed)?);
-            let length = codec::FEEDBACK_HEADER + 2 * requests;
-            if lead & codec::KIND_MASK != codec::KIND_FEEDBACK
-                || channel >= self.config.channels
-                || rest.len() < length
-            {
-                return Err(malformed());
-            }
-            let (block, tail) = rest.split_at_mut(length);
-            block[0] = codec::KIND_FEEDBACK;
-            self.senders[channel]
-                .on_feedback(now, block)
-                .map_err(protocol)?;
-            rest = tail;
-        }
-        Ok(())
+        self.records
+            .accept(
+                now,
+                RecordNumber(opened.number.0),
+                &mut self.opened[..opened.bytes],
+            )
+            .map_err(protocol)
     }
     /// Whether [`Engine::pop`] may still return a packet.
     fn deliverable(&self) -> bool {
-        self.ready != 0
+        self.records.deliverable()
     }
     /// The next recovered native packet of any channel, if one is complete.
     fn pop(&mut self) -> io::Result<Option<&[u8]>> {
-        while self.ready != 0 {
-            let channel = self.ready.trailing_zeros() as usize;
-            if self.receivers[channel]
-                .pop_packet(&mut self.record)
-                .map_err(protocol)?
-            {
-                self.decompressors[channel]
-                    .decompress(&self.record, self.config.max_native, &mut self.native)
-                    .map_err(protocol)?;
-                return Ok(Some(&self.native));
-            }
-            self.ready &= !(1 << channel);
-        }
-        Ok(None)
+        self.records.pop().map_err(protocol)
     }
     fn snapshot(&self, now: u64) -> Snapshot {
+        let stats = self.records.stats();
         let mut snapshot = Snapshot {
             elapsed_micros: now,
             ..self.snapshot
         };
-        for sender in &self.senders {
-            snapshot.sender.add(&sender.stats());
-        }
-        for receiver in &self.receivers {
-            snapshot.receiver.add(&receiver.stats());
-        }
-        snapshot.header_bytes_saved = self.saved_base
-            + self
-                .compressors
-                .iter()
-                .map(codec::header::Compressor::saved)
-                .sum::<u64>();
+        snapshot.sender.add(&stats.sender);
+        snapshot.receiver.add(&stats.receiver);
+        snapshot.native_read += stats.native_read;
+        snapshot.native_dropped += stats.native_dropped;
+        snapshot.header_bytes_saved += stats.header_bytes_saved;
         snapshot
     }
     /// Start a locally requested change. `resolved` is this endpoint's
@@ -785,55 +622,26 @@ impl Engine {
                 }
                 change.send = SendPhase::Done;
                 let config = change.resolved.send;
-                self.replace_senders(now, config)?;
-                self.feedback_floor = feedback_from;
+                self.replace_senders(now, config, feedback_from)?;
             }
         }
         Ok(())
     }
-    fn replace_senders(&mut self, now: u64, config: Config) -> io::Result<()> {
+    fn replace_senders(&mut self, now: u64, config: Config, feedback_from: u64) -> io::Result<()> {
         config.validate()?;
-        for sender in &self.senders {
-            self.snapshot.sender.add(&sender.stats());
-        }
-        self.saved_base += self
-            .compressors
-            .iter()
-            .map(codec::header::Compressor::saved)
-            .sum::<u64>();
-        let ethernet = config.layer == PacketLayer::Ethernet;
-        self.senders.clear();
-        self.compressors.clear();
-        for _ in 0..config.channels {
-            self.senders
-                .push(codec::Sender::new(config.codec).map_err(invalid)?);
-            self.compressors
-                .push(codec::header::Compressor::new(ethernet));
-        }
+        self.records
+            .replace_send(config.records(), RecordNumber(feedback_from))
+            .map_err(protocol)?;
         let largest = config.datagram_cost(config.codec.datagram_bytes + PROTECTION_BYTES);
         self.pacer = Pacer::new(config.send_bytes_per_second, largest, now);
-        self.limit = self.limit.max(config.codec.datagram_bytes);
-        self.turn = 0;
         self.config = config;
         Ok(())
     }
-    fn replace_receivers(&mut self, config: Config) -> io::Result<()> {
+    fn replace_receivers(&mut self, config: Config, source_from: u64) -> io::Result<()> {
         config.validate()?;
-        for receiver in &self.receivers {
-            self.snapshot.receiver.add(&receiver.stats());
-        }
-        let ethernet = config.layer == PacketLayer::Ethernet;
-        self.receivers.clear();
-        self.decompressors.clear();
-        for _ in 0..config.channels {
-            self.receivers
-                .push(codec::Receiver::new(config.codec).map_err(invalid)?);
-            self.decompressors
-                .push(codec::header::Decompressor::new(ethernet));
-        }
-        self.limit = self.limit.max(config.codec.datagram_bytes);
-        self.feedback_turn = 0;
-        self.ready = 0;
+        self.records
+            .replace_receive(config.records(), RecordNumber(source_from))
+            .map_err(protocol)?;
         self.receive = config;
         Ok(())
     }
@@ -845,12 +653,7 @@ impl Engine {
         let Some(change) = self.change.as_mut() else {
             return Ok(());
         };
-        if change.send == SendPhase::Draining
-            && self
-                .senders
-                .iter()
-                .all(|sender| sender.unconfirmed() == 0 && sender.queued() == 0)
-        {
+        if change.send == SendPhase::Draining && self.records.send_drained() {
             change.send = SendPhase::Barrier;
             self.outbox.push_back(Message::Barrier {
                 epoch: change.epoch,
@@ -858,13 +661,9 @@ impl Engine {
             });
         }
         if let ReceivePhase::Flushing { first_number } = change.receive
-            && self.ready == 0
+            && !self.records.deliverable()
         {
-            if self
-                .receivers
-                .iter()
-                .any(|receiver| receiver.pending() != 0)
-            {
+            if !self.records.receive_drained() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "swift barrier before the previous epoch was delivered",
@@ -872,8 +671,7 @@ impl Engine {
             }
             change.receive = ReceivePhase::Done;
             let (epoch, config) = (change.epoch, change.resolved.receive);
-            self.replace_receivers(config)?;
-            self.source_floor = first_number;
+            self.replace_receivers(config, first_number)?;
             self.outbox.push_back(Message::BarrierAck {
                 epoch,
                 feedback_from: self.seal.next_number().0,
@@ -1116,6 +914,10 @@ where
 mod tests {
     use super::*;
 
+    fn tagged(kind: u8, channel: usize) -> u8 {
+        kind | ((channel as u8) << 2)
+    }
+
     fn config(rate: u64, channels: usize) -> Config {
         Config {
             codec: codec::Config {
@@ -1265,7 +1067,7 @@ mod tests {
         let feedback = right.produce(10_000)?.map(<[u8]>::to_vec);
         let feedback = feedback.ok_or_else(|| io::Error::other("no feedback"))?;
         left.accept(10_000, &feedback)?;
-        assert_eq!(left.senders[0].unconfirmed(), 0);
+        assert_eq!(left.records.unconfirmed(), 0);
         Ok(())
     }
 
@@ -1557,7 +1359,7 @@ mod tests {
         // has moved on, so present them to engines that never saw them.
         let stale_source = stale_source.ok_or_else(|| io::Error::other("no stale source"))?;
         let stale_feedback = stale_feedback.ok_or_else(|| io::Error::other("no stale feedback"))?;
-        assert!(left.feedback_floor > 0 && right.source_floor > 0);
+        assert!(left.records.feedback_floor().0 > 0 && right.records.source_floor().0 > 0);
         // Fresh receiving fixtures authenticate these old generation-zero
         // bytes, isolating the epoch floors from ordinary replay rejection.
         right.open = protection::Receiver::new(&[1; 32], security::MAX_BODY_BYTES, KEY_PACKETS)

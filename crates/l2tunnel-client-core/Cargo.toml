@@ -9,6 +9,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+l2tunnel-cover = { path = "../l2tunnel-cover" }
+l2tunnel-handshake = { path = "../l2tunnel-handshake" }
+l2tunnel-identity = { path = "../l2tunnel-identity" }
+l2tunnel-security = { path = "../l2tunnel-security" }
 l2tunnel-fec = { path = "../l2tunnel-fec" }
 l2tunnel-swift = { path = "../l2tunnel-swift" }
 l2tunnel-raw-io = { path = "../l2tunnel-raw-io" }
@@ -40,6 +44,7 @@ l2tunnel-platform-linux = { path = "../l2tunnel-platform-linux" }
 rustix = { version = "=1.1.4", features = ["process", "fs", "net"] }
 
 [dev-dependencies]
+l2tunnel = { path = "../l2tunnel" }
 tokio = { version = "=1.53.1", features = ["test-util"] }
 l2tunnel-reliable = { path = "../l2tunnel-reliable" }
 l2tunnel-recovery = { path = "../l2tunnel-recovery" }

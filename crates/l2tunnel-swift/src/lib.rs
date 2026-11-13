@@ -23,6 +23,7 @@ pub mod flow;
 pub mod gf;
 pub mod header;
 mod receiver;
+pub mod records;
 mod sender;
 
 pub use receiver::Receiver;

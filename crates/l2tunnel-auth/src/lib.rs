@@ -16,7 +16,7 @@ use l2tunnel_core::ConfigDigest;
 use l2tunnel_device::PacketLayer;
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -171,9 +171,8 @@ pub async fn server_authenticate_channel<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| Error::TimedOut)?
 }
 
-/// Raw Ed25519 public member key; never contains private key material.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MemberPublicKey(pub [u8; 32]);
+/// Shared raw Ed25519 public member identity; contains no private key material.
+pub use l2tunnel_identity::MemberPublicKey;
 
 /// SHA-256 fingerprint of the exact server leaf DER certificate verified by TLS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,7 +203,7 @@ pub struct SessionInfo {
 }
 
 /// Ed25519 private membership identity; deliberately does not implement Debug.
-pub struct MemberKey(Ed25519KeyPair);
+pub struct MemberKey(l2tunnel_identity::IdentityKey);
 
 impl MemberKey {
     /// Generate a fresh PKCS#8 Ed25519 key for provisioning; output is secret and must not be logged.
@@ -216,42 +215,31 @@ impl MemberKey {
 
     /// Load a ring-validated PKCS#8 Ed25519 private key without logging its bytes.
     pub fn from_pkcs8(encoded: &[u8]) -> Result<Self, Error> {
-        if encoded.len() > 4_096 {
-            return Err(Error::InvalidKey);
-        }
-        Ed25519KeyPair::from_pkcs8(encoded)
+        l2tunnel_identity::IdentityKey::from_pkcs8(encoded)
             .map(Self)
             .map_err(|_| Error::InvalidKey)
     }
 
     /// Public member identity suitable for the server allowlist.
     pub fn public_key(&self) -> MemberPublicKey {
-        let mut bytes = [0; 32];
-        bytes.copy_from_slice(self.0.public_key().as_ref());
-        MemberPublicKey(bytes)
+        self.0.public_key()
     }
 }
 
 /// Immutable bounded allowlist of public Ed25519 member identities.
 #[derive(Clone)]
-pub struct MemberAllowlist(Vec<MemberPublicKey>);
+pub struct MemberAllowlist(l2tunnel_identity::Allowlist);
 
 impl MemberAllowlist {
     /// Validate and copy between 1 and 1,024 entries; duplicates are removed.
     pub fn new(keys: &[MemberPublicKey]) -> Result<Self, Error> {
-        if keys.is_empty() || keys.len() > 1_024 {
-            return Err(Error::Configuration(
-                "allowlist must contain 1..=1024 entries",
-            ));
-        }
-        let mut keys = keys.to_vec();
-        keys.sort_unstable();
-        keys.dedup();
-        Ok(Self(keys))
+        l2tunnel_identity::Allowlist::new(keys)
+            .map(Self)
+            .map_err(|_| Error::Configuration("allowlist must contain 1..=1024 entries"))
     }
 
     fn contains(&self, key: MemberPublicKey) -> bool {
-        self.0.binary_search(&key).is_ok()
+        self.0.contains(key)
     }
 }
 
@@ -644,7 +632,11 @@ async fn client_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     proof[32..64].copy_from_slice(&member.public_key().0);
     write_config(&mut proof[64..97], config);
     let transcript = bound_transcript(binding, &challenge, &proof[..PROOF_PREFIX_LEN])?;
-    proof[PROOF_PREFIX_LEN..].copy_from_slice(member.0.sign(&transcript).as_ref());
+    let signature = member
+        .0
+        .sign(&transcript)
+        .map_err(|_| Error::InvalidProof)?;
+    proof[PROOF_PREFIX_LEN..].copy_from_slice(&signature);
     write_frame(stream, PROOF, &proof).await?;
     let accepted = read_frame::<48>(stream, ACCEPT).await?;
     let transcript_hash = hash(&transcript);
@@ -683,8 +675,7 @@ async fn server_exchange<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(Error::MemberDenied);
     }
     let transcript = bound_transcript(binding, &challenge, &proof[..PROOF_PREFIX_LEN])?;
-    UnparsedPublicKey::new(&ED25519, member.0)
-        .verify(&transcript, &proof[PROOF_PREFIX_LEN..])
+    l2tunnel_identity::verify_signature(member, &transcript, &proof[PROOF_PREFIX_LEN..])
         .map_err(|_| Error::InvalidProof)?;
     let transcript_hash = hash(&transcript);
     let mut accepted = [0; 48];

@@ -115,8 +115,9 @@ pub fn sign(
         .map_err(|_| Error::Random)?;
     let signature = member
         .0
-        .sign(&transcript(binding, config, request, &value[..65]));
-    value[65..].copy_from_slice(signature.as_ref());
+        .sign(&transcript(binding, config, request, &value[..65]))
+        .map_err(|_| Error::InvalidProof)?;
+    value[65..].copy_from_slice(&signature);
     Ok(Proof(value))
 }
 
@@ -149,12 +150,12 @@ impl Attempt {
         if !members.contains(public) {
             return Err(Error::InvalidProof);
         }
-        UnparsedPublicKey::new(&ED25519, public.0)
-            .verify(
-                &transcript(binding, config, request, &proof[..65]),
-                &proof[65..],
-            )
-            .map_err(|_| Error::InvalidProof)?;
+        l2tunnel_identity::verify_signature(
+            public,
+            &transcript(binding, config, request, &proof[..65]),
+            &proof[65..],
+        )
+        .map_err(|_| Error::InvalidProof)?;
         Ok(public)
     }
 }

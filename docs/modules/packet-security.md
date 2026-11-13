@@ -16,6 +16,16 @@ The [common session contract](secure-session.md) retains those broader gates.
 
 ## Boundary and ownership
 
+The integration exposes `SessionRoot::binding(&self) -> SessionBinding`
+and `SessionRoot::role(&self) -> Role`.
+It copies only the already authenticated public session ID and final handshake
+hash, enabling existing-member signatures after the supported root handoff.
+It returns no key, nonce owner or provider-private state. Callers must never use
+this public value as a secret authentication key. The getter neither creates
+packet domains nor mutates counters, replay, roles or secret ownership.
+The role observation lets consuming membership gates reject a root for the
+wrong endpoint role before releasing user-data ownership.
+
 The crate owns ring-based ChaCha20-Poly1305/HMAC-SHA256, standard HKDF, a bounded
 replay window and adjacent key generations. It accepts opaque record bytes and
 authenticated context, writes into caller-owned buffers and returns explicit
@@ -150,6 +160,7 @@ native-device forwarding, full shared-session lifecycle or ISP/QoS behavior.
 - [x] [PKS-06] Run focused parser, metadata/domain/suite mismatch, wrong key, replay, reordering, truncation, buffer, counter/use exhaustion and ratchet failure tests plus runtime Swift transfer/switch regressions; record exact source-bound local checks and remaining platform/native limits. Evidence: 11 security and 16 Swift runtime tests passed, including in the parent's [source-stable aggregate run](../../work/shared-session-primitives-20261113/validation.json); see [security tests](../../crates/l2tunnel-security/src/tests.rs), [record boundary tests](../../crates/l2tunnel-security/src/record.rs) and [runtime tests](../../crates/l2tunnel-runtime/src/swift.rs). This is local Linux evidence, not a privileged, cross-platform or real-device pass.
 - [x] [PKS-07] Integrate supported maintained handshake split-key ownership through `SessionRoot`; qualify wrong role/session/transcript binding and duplicate-owner refusal before any shared-session data release. An isolated packet test does not complete SEC-02 or SEC-03. Evidence: [consuming maintained split-key handoff](../../crates/l2tunnel-handshake/src/lib.rs), 13 passing [handshake regressions](../../crates/l2tunnel-handshake/src/tests.rs), and passing wrong-role/session/transcript and duplicate-owner tests in [security regressions](../../crates/l2tunnel-security/src/tests.rs). The adapter tests exercise both IK/IKpsk2, both packet protections, reverse management and bounded final-confirmation custody; dependency audit/secret-erasure and broader session/runtime gates remain separate in [the handshake module](noise-handshake.md).
 - [ ] [PKS-08] Qualify complete shared-session/carrier lifecycle, time expiry, authenticated fresh exchange, management and SW-11/profile switching separately under SEC-05/SEC-06 and the parent ledgers. Packet extraction alone cannot check those gates.
+- [x] [PKS-09] Expose only the public authenticated binding after supported handshake root transfer and exercise it in the real same-carrier existing-member proof, with no secret export, private-state extraction or owner/counter reset. Evidence: the public [root observations](../../crates/l2tunnel-security/src/context.rs), actual [member custody](../../crates/l2tunnel-runtime/src/secure_udp/member.rs) and [real factory fixture](../../crates/l2tunnel-client-core/src/secure_udp_tests.rs) passed in the [source-stable full aggregate](../../work/shared-session-client-20261113/validation.json) and [focused commands](../../work/shared-session-client-focused-20261113/attempt-5/validation.json). No private key material is exposed; Info also retains the exact public authenticated Noise prologue.
 
 These are new subordinate deliverables. All original mode, AEAD-or-MAC, carrier,
 platform, bounded recovery and SW-11 requirements remain in scope.

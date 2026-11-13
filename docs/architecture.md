@@ -49,6 +49,17 @@ finite protocol/loopback evidence in their
 The same-socket library fixture is distinct from integrating these components
 into the real shared client/service and native device runtime. Those target
 gates remain open; no new carrier/default or automatic recovery is silently enabled.
+Existing Ed25519 identity and multi-channel Swift records now live in pure
+libraries. Shared client-core factories compose admission, Noise and member
+proof on the original connected UDP socket. The
+[frozen-source aggregate](../work/shared-session-client-20261113/validation.json)
+passed local Linux checks, including actual factory authentication followed by
+protected Swift and fixed control over both appearances on the original UDP pair.
+The
+[runtime/client ledgers](modules/client-secure-udp.md) separate authenticated
+factory completion and finite transport tests from selected CLI/service/native
+readiness. Actual authenticated prologue values, final-flight custody and the
+original operation deadline remain owned through each handoff.
 
 ## Library boundary and layering
 

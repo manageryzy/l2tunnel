@@ -9,6 +9,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+l2tunnel = { path = "../l2tunnel" }
+l2tunnel-identity = { path = "../l2tunnel-identity" }
+l2tunnel-handshake = { path = "../l2tunnel-handshake" }
+l2tunnel-cover = { path = "../l2tunnel-cover" }
+l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
 l2tunnel-raw-io = { path = "../l2tunnel-raw-io" }
 l2tunnel-openvpn = { path = "../l2tunnel-openvpn" }
 l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
@@ -39,5 +44,4 @@ tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi
 [dev-dependencies]
 tokio = { version = "=1.53.1", features = ["test-util"] }
 l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
-l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

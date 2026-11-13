@@ -38,6 +38,8 @@ pub mod proxy_measured;
 pub mod quic;
 /// Explicit original-owner raw packet runtime; native qualification remains separate.
 pub mod raw_packet;
+/// Explicit same-carrier authentication factory; native/service integration is separate.
+pub mod secure_udp;
 /// Retained managed-TCP connect, cancel, abort, reconnect and apply lifecycle.
 pub mod service;
 /// Shared existing-session command dispatch for authorized local frontends.

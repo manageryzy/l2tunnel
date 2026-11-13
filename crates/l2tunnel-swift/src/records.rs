@@ -1,0 +1,463 @@
+//! Complete Swift packing and ordered channels over authenticated numbered bodies.
+//!
+//! Callers own authentication, replay, packet numbers, pacing, I/O and negotiated
+//! control. Numbered bodies preserve the legacy channel tags and repair seeds.
+
+use crate::{Receiver, ReceiverStats, Sender, SenderStats, flow, header};
+
+/// Native packet grammar, independent of a platform device handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Layer {
+    /// Complete Ethernet frames.
+    Ethernet,
+    /// Complete raw IPv4/IPv6 packets.
+    Ip,
+}
+
+/// One direction's packing/recovery policy and fixed native format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Config {
+    /// Existing bounded single-channel recovery configuration.
+    pub codec: crate::Config,
+    /// Number of connection-affinity ordering channels, in 1..=64.
+    pub channels: usize,
+    /// Fixed native packet grammar.
+    pub layer: Layer,
+    /// Largest complete native packet, before the header record tag.
+    pub max_native: usize,
+}
+impl Config {
+    /// Check all scalar bounds before allocating channel state.
+    pub fn validate(self) -> Result<(), Error> {
+        self.codec.validate().map_err(Error::Codec)?;
+        if !(1..=crate::MAX_CHANNELS).contains(&self.channels)
+            || self.max_native.checked_add(header::MAX_EXPANSION) != Some(self.codec.max_packet)
+        {
+            return Err(Error::Configuration);
+        }
+        Ok(())
+    }
+}
+
+/// Full authenticated security-record number, also the GF repair seed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordNumber(pub u64);
+
+/// Native admission result, decided before changing header contexts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Admission {
+    /// The packet was retained exactly once.
+    Accepted,
+    /// The common packing-byte budget cannot admit another maximum record.
+    Full,
+    /// Empty or larger than the fixed native packet bound.
+    PacketSize,
+}
+
+/// Explicit configuration, protocol, drain or invariant failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Invalid channels, native bound or changed physical packet format.
+    Configuration,
+    /// Existing Swift grammar or recovery failure.
+    Codec(crate::Error),
+    /// Directional replacement requires completed delivery/confirmation.
+    NotDrained,
+    /// A packing queue rejected a pre-admitted compressed record.
+    Admission,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration => output.write_str("invalid Swift record configuration"),
+            Self::Codec(error) => std::fmt::Display::fmt(error, output),
+            Self::NotDrained => output.write_str("Swift record direction has not drained"),
+            Self::Admission => output.write_str("Swift packing queue refused an admitted record"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<crate::Error> for Error {
+    fn from(error: crate::Error) -> Self {
+        Self::Codec(error)
+    }
+}
+
+/// Cumulative algorithm observations, including retired directional engines.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Stats {
+    /// All current and retired sending engines.
+    pub sender: SenderStats,
+    /// All current and retired receiving engines.
+    pub receiver: ReceiverStats,
+    /// Native packets accepted for packing.
+    pub native_read: u64,
+    /// Native packets refused for size or common queue pressure.
+    pub native_dropped: u64,
+    /// Native bytes removed by exact header records, net of record tags.
+    pub header_bytes_saved: u64,
+}
+
+/// Bounded pure data path; never a connection, crypto or management owner.
+pub struct Engine {
+    send: Config,
+    receive: Config,
+    limit: usize,
+    source_floor: RecordNumber,
+    feedback_floor: RecordNumber,
+    senders: Vec<Sender>,
+    receivers: Vec<Receiver>,
+    compressors: Vec<header::Compressor>,
+    decompressors: Vec<header::Decompressor>,
+    turn: usize,
+    feedback_at: u64,
+    feedback_turn: usize,
+    ready: u64,
+    body: Vec<u8>,
+    block: Vec<u8>,
+    native: Vec<u8>,
+    record: Vec<u8>,
+    base: Stats,
+}
+
+fn tagged(kind: u8, channel: usize) -> u8 {
+    kind | ((channel as u8) << 2)
+}
+
+impl Engine {
+    /// Construct identical initial directional policies without keys or clocks.
+    pub fn new(config: Config) -> Result<Self, Error> {
+        config.validate()?;
+        let mut senders = Vec::with_capacity(config.channels);
+        let mut receivers = Vec::with_capacity(config.channels);
+        let ethernet = config.layer == Layer::Ethernet;
+        let mut compressors = Vec::with_capacity(config.channels);
+        let mut decompressors = Vec::with_capacity(config.channels);
+        for _ in 0..config.channels {
+            senders.push(Sender::new(config.codec)?);
+            receivers.push(Receiver::new(config.codec)?);
+            compressors.push(header::Compressor::new(ethernet));
+            decompressors.push(header::Decompressor::new(ethernet));
+        }
+        Ok(Self {
+            send: config,
+            receive: config,
+            limit: config.codec.datagram_bytes,
+            source_floor: RecordNumber(0),
+            feedback_floor: RecordNumber(0),
+            senders,
+            receivers,
+            compressors,
+            decompressors,
+            turn: 0,
+            feedback_at: 0,
+            feedback_turn: 0,
+            ready: 0,
+            body: Vec::with_capacity(config.codec.datagram_bytes),
+            block: Vec::with_capacity(crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS),
+            native: Vec::with_capacity(config.codec.max_packet),
+            record: Vec::with_capacity(config.codec.max_packet),
+            base: Stats::default(),
+        })
+    }
+
+    /// Current sending policy.
+    pub fn send_config(&self) -> Config {
+        self.send
+    }
+    /// Current receiving policy.
+    pub fn receive_config(&self) -> Config {
+        self.receive
+    }
+    /// Largest body permitted by any installed directional policy.
+    pub fn body_limit(&self) -> usize {
+        self.limit
+    }
+    /// Whether the shared packing queue can admit a maximum native record.
+    pub fn has_room(&self) -> bool {
+        let queued: usize = self.senders.iter().map(Sender::queued).sum();
+        queued + self.send.codec.max_packet + crate::FRAME_PREFIX <= self.send.codec.queue_bytes
+    }
+    /// Admit before compression so rejected packets cannot desynchronize contexts.
+    pub fn offer(&mut self, now: u64, packet: &[u8]) -> Result<Admission, Error> {
+        let rejected = if packet.is_empty() || packet.len() > self.send.max_native {
+            Some(Admission::PacketSize)
+        } else if !self.has_room() {
+            Some(Admission::Full)
+        } else {
+            None
+        };
+        if let Some(rejected) = rejected {
+            self.base.native_dropped += 1;
+            return Ok(rejected);
+        }
+        let channel = match self.send.layer {
+            Layer::Ethernet => flow::classify_ethernet(packet, self.send.channels),
+            Layer::Ip => flow::classify_ip(packet, self.send.channels),
+        };
+        self.compressors[channel].compress(packet, &mut self.record);
+        if !self.senders[channel].push_packet(now, &self.record)? {
+            return Err(Error::Admission);
+        }
+        self.base.native_read += 1;
+        Ok(Admission::Accepted)
+    }
+
+    fn feedback(&mut self, now: u64) -> bool {
+        if now < self.feedback_at {
+            return false;
+        }
+        self.body.clear();
+        let block = crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS;
+        let mut deferred = false;
+        for step in 0..self.receive.channels {
+            let channel = (self.feedback_turn + step) % self.receive.channels;
+            if self.body.len() + block > self.send.codec.datagram_bytes {
+                deferred = self.receivers[channel].deadline().is_some();
+                if deferred {
+                    self.feedback_turn = channel;
+                    break;
+                }
+                continue;
+            }
+            if self.receivers[channel].feedback(now, &mut self.block) {
+                self.block[0] = tagged(crate::KIND_FEEDBACK, channel);
+                self.body.extend_from_slice(&self.block);
+            }
+        }
+        if !deferred {
+            self.feedback_at = now.saturating_add(self.send.codec.feedback_micros);
+        }
+        !self.body.is_empty()
+    }
+
+    fn data(&mut self, now: u64, number: RecordNumber) -> Result<bool, Error> {
+        let channels = self.send.channels;
+        let urgent = (0..channels)
+            .map(|step| (self.turn + step) % channels)
+            .find(|channel| self.senders[*channel].urgent());
+        let order = urgent
+            .into_iter()
+            .chain((0..channels).map(|step| (self.turn + step) % channels));
+        for channel in order {
+            if self.senders[channel].poll(now, number.0, &mut self.body)? {
+                self.body[0] = tagged(self.body[0], channel);
+                if urgent != Some(channel) {
+                    self.turn = (channel + 1) % channels;
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Produce the exact next body for the caller's unchanged security number.
+    /// Feedback bypasses `allow_data`, but the caller must charge its wire cost.
+    pub fn poll(
+        &mut self,
+        now: u64,
+        number: RecordNumber,
+        allow_data: bool,
+    ) -> Result<Option<&[u8]>, Error> {
+        if self.feedback(now) || (allow_data && self.data(now, number)?) {
+            Ok(Some(&self.body))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Apply an already authenticated, replay-checked User record in workspace.
+    /// A malformed authenticated body is terminal; partial updates do not roll back.
+    pub fn accept(&mut self, now: u64, number: RecordNumber, body: &mut [u8]) -> Result<(), Error> {
+        if body.is_empty() || body.len() > self.limit {
+            return Err(crate::Error::Malformed.into());
+        }
+        let lead = body[0];
+        let channel = usize::from(lead >> 2);
+        if lead & crate::KIND_MASK != crate::KIND_FEEDBACK {
+            if number.0 < self.source_floor.0 {
+                self.base.receiver.duplicates += 1;
+                return Ok(());
+            }
+            if channel >= self.receive.channels {
+                return Err(crate::Error::Malformed.into());
+            }
+            body[0] = lead & crate::KIND_MASK;
+            self.ready |= 1 << channel;
+            return self.receivers[channel]
+                .on_datagram(number.0, body)
+                .map_err(Error::Codec);
+        }
+        if number.0 < self.feedback_floor.0 {
+            return Ok(());
+        }
+        let mut rest = body;
+        while !rest.is_empty() {
+            let lead = rest[0];
+            let channel = usize::from(lead >> 2);
+            let requests = usize::from(
+                *rest
+                    .get(crate::FEEDBACK_HEADER - 1)
+                    .ok_or(crate::Error::Malformed)?,
+            );
+            let length = crate::FEEDBACK_HEADER + 2 * requests;
+            if lead & crate::KIND_MASK != crate::KIND_FEEDBACK
+                || channel >= self.send.channels
+                || rest.len() < length
+            {
+                return Err(crate::Error::Malformed.into());
+            }
+            let (block, tail) = rest.split_at_mut(length);
+            block[0] = crate::KIND_FEEDBACK;
+            self.senders[channel].on_feedback(now, block)?;
+            rest = tail;
+        }
+        Ok(())
+    }
+
+    /// Whether a source, repair or retransmission is ready for the outer pacer.
+    pub fn data_ready(&self, now: u64) -> bool {
+        self.senders.iter().any(|sender| sender.ready(now))
+    }
+    /// Earliest sender deadline, without pacing or transaction deadlines.
+    pub fn data_deadline(&self) -> Option<u64> {
+        self.senders.iter().filter_map(Sender::deadline).min()
+    }
+    /// Earliest channel-feedback scheduling turn under the legacy packing rule.
+    pub fn feedback_deadline(&self) -> Option<u64> {
+        self.receivers
+            .iter()
+            .any(|receiver| receiver.deadline().is_some())
+            .then_some(self.feedback_at)
+    }
+    /// Whether native delivery may return another complete packet.
+    pub fn deliverable(&self) -> bool {
+        self.ready != 0
+    }
+    /// Return one exact recovered native packet from the next ready channel.
+    pub fn pop(&mut self) -> Result<Option<&[u8]>, Error> {
+        while self.ready != 0 {
+            let channel = self.ready.trailing_zeros() as usize;
+            if self.receivers[channel].pop_packet(&mut self.record)? {
+                self.decompressors[channel].decompress(
+                    &self.record,
+                    self.send.max_native,
+                    &mut self.native,
+                )?;
+                return Ok(Some(&self.native));
+            }
+            self.ready &= !(1 << channel);
+        }
+        Ok(None)
+    }
+    /// Total retained sources across all sending channels.
+    pub fn unconfirmed(&self) -> usize {
+        self.senders.iter().map(Sender::unconfirmed).sum()
+    }
+    /// All queued bytes sent and every retained source confirmed.
+    pub fn send_drained(&self) -> bool {
+        self.senders
+            .iter()
+            .all(|sender| sender.unconfirmed() == 0 && sender.queued() == 0)
+    }
+    /// No deliverable or pending receive state remains before a reset.
+    pub fn receive_drained(&self) -> bool {
+        self.ready == 0
+            && self
+                .receivers
+                .iter()
+                .all(|receiver| receiver.pending() == 0)
+    }
+    /// First source/repair number allowed in the current receive epoch.
+    pub fn source_floor(&self) -> RecordNumber {
+        self.source_floor
+    }
+    /// First feedback number allowed to affect the current sending epoch.
+    pub fn feedback_floor(&self) -> RecordNumber {
+        self.feedback_floor
+    }
+    fn check_format(&self, config: Config) -> Result<(), Error> {
+        config.validate()?;
+        if config.layer != self.send.layer || config.max_native != self.send.max_native {
+            return Err(Error::Configuration);
+        }
+        Ok(())
+    }
+    /// Replace a confirmed send direction after caller-authenticated barriers.
+    pub fn replace_send(
+        &mut self,
+        config: Config,
+        feedback_from: RecordNumber,
+    ) -> Result<(), Error> {
+        self.check_format(config)?;
+        if !self.send_drained() {
+            return Err(Error::NotDrained);
+        }
+        for sender in &self.senders {
+            self.base.sender.add(&sender.stats());
+        }
+        self.base.header_bytes_saved += self
+            .compressors
+            .iter()
+            .map(header::Compressor::saved)
+            .sum::<u64>();
+        self.senders.clear();
+        self.compressors.clear();
+        for _ in 0..config.channels {
+            self.senders.push(Sender::new(config.codec)?);
+            self.compressors
+                .push(header::Compressor::new(config.layer == Layer::Ethernet));
+        }
+        self.limit = self.limit.max(config.codec.datagram_bytes);
+        self.turn = 0;
+        self.send = config;
+        self.feedback_floor = feedback_from;
+        Ok(())
+    }
+    /// Replace a delivered receive direction after caller-authenticated barriers.
+    pub fn replace_receive(
+        &mut self,
+        config: Config,
+        source_from: RecordNumber,
+    ) -> Result<(), Error> {
+        self.check_format(config)?;
+        if !self.receive_drained() {
+            return Err(Error::NotDrained);
+        }
+        for receiver in &self.receivers {
+            self.base.receiver.add(&receiver.stats());
+        }
+        self.receivers.clear();
+        self.decompressors.clear();
+        for _ in 0..config.channels {
+            self.receivers.push(Receiver::new(config.codec)?);
+            self.decompressors
+                .push(header::Decompressor::new(config.layer == Layer::Ethernet));
+        }
+        self.limit = self.limit.max(config.codec.datagram_bytes);
+        self.feedback_turn = 0;
+        self.ready = 0;
+        self.receive = config;
+        self.source_floor = source_from;
+        Ok(())
+    }
+    /// Cumulative retired plus current algorithm statistics.
+    pub fn stats(&self) -> Stats {
+        let mut stats = self.base;
+        for sender in &self.senders {
+            stats.sender.add(&sender.stats());
+        }
+        for receiver in &self.receivers {
+            stats.receiver.add(&receiver.stats());
+        }
+        stats.header_bytes_saved += self
+            .compressors
+            .iter()
+            .map(header::Compressor::saved)
+            .sum::<u64>();
+        stats
+    }
+}
+
+#[cfg(test)]
+mod tests;

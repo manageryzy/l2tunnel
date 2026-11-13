@@ -13,6 +13,8 @@ pub use l2tunnel_cover as cover;
 pub use l2tunnel_device as device;
 /// Bounded maintained Noise adapter with caller entropy/time and explicit own-peer trust.
 pub use l2tunnel_handshake as handshake;
+/// Pure existing-member identities and explicit authenticated Noise-session proofs.
+pub use l2tunnel_identity as identity;
 /// Bounded common traffic arbiter.
 pub use l2tunnel_mux as mux;
 /// Recovery-engine boundary.
