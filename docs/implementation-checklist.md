@@ -132,6 +132,19 @@ The subsequent [evidence-only ledger reconciliation](../work/shared-session-prim
 checks updated prose and verifies that all non-document inputs still match that
 aggregate snapshot. Historical receipts remain unchanged.
 
+The subsequent [bounded capture-tail correction](modules/native-capture-drain.md)
+has74 passing focused cases and four source-pinned current Linux observations.
+Both clean cases pass all native checks; both impaired cases still fail80Mbit/s.
+The separate [current PID-scoped kernel diagnostic](../work/secure-udp-performance-analysis-20261113/current-kernel-summary-attempt-2/analysis.md)
+retains validated samples, switch records and paired I/O observations. It does not
+close SBC-04, SNL-08/SNL-09/SNL-11 or any parent mode/lifecycle/platform gate.
+
+The capture correction's [required aggregate](../work/native-capture-drain-20261113/aggregate-attempt-2/validation.json)
+subsequently passes with stable inputs:1619 Rust cases including doctests,319
+Python tooling cases and1658 simulator cases, plus formatting, strict Clippy,
+rustdoc and CLI checks. The interrupted first check and native performance
+failures retain their original outcomes; final reconciliation/checkpoint are separate.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |
@@ -142,6 +155,7 @@ aggregate snapshot. Historical receipts remain unchanged.
 | Independent common control streams | SCS-01..SCS-08 | [Control streams](modules/control-streams.md) | explicit negotiated binding, independent liveness and shared wire allowance |
 | Streamed Swift runtime control | SUC-01..SUC-08 | [Selected runtime custody](modules/streamed-swift-control.md) | authenticated explicit backend, original caps and semantic custody; generic switching remains open |
 | Swift byte-transfer correction | SBC-01..SBC-06 | [Bounded bulk transfer](modules/swift-bulk-copy.md) | source-bound perf evidence, exact ownership/bytes and immutable pre/post measurements |
+| Native capture tail | NCD-01..NCD-06 | [Bounded capture witness](modules/native-capture-drain.md) | exact final probe fingerprints before capture stop; original final audits and performance gates retained |
 | VXLAN | VX-01..VX-09 | [Overlay design](overlay-and-carriers.md) | L2 frame validation, tenancy and MTU accounting |
 | UDP covers | UDP-01..UDP-16 | [Carrier design](overlay-and-carriers.md) | selected authenticated bootstrap; UDP-only is its own gate |
 | CLI/GUI/native clients | CL-01..CL-39 | [Client plan](client-design.md) | shared client-core/local API; native adapters independently qualified |

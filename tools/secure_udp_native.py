@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -504,6 +505,285 @@ def protected_shape(payload: bytes, complete_bytes: int, phase: str, direction: 
         raise ValueError('cover phase/routing mismatch')
 
 
+def _pcap_header(header: bytes) -> tuple[str, int, int]:
+    magic = {b'\xd4\xc3\xb2\xa1': ('<', 1000), b'\xa1\xb2\xc3\xd4': ('>', 1000),
+             b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1)}
+    if len(header) != 24 or header[:4] not in magic:
+        raise ObservationError('unsupported/truncated pcap header')
+    endian, precision = magic[header[:4]]
+    major, minor, zone, accuracy, snaplen, link = struct.unpack(endian + 'HHIIII', header[4:])
+    if (major, minor, zone, accuracy, snaplen, link) != (2, 4, 0, 0, BOUNDS['capture_snaplen'], 1):
+        raise ObservationError('unexpected pcap link/snapshot/version')
+    return endian, precision, snaplen
+
+
+def _pcap_record(header: bytes, endian: str, precision: int, snaplen: int) -> tuple[int, int, int, int]:
+    if len(header) != 16:
+        raise ValueError('truncated pcap record header')
+    seconds, fraction, captured, original = struct.unpack(endian + 'IIII', header)
+    if (fraction >= 1_000_000_000 // precision or not 14 <= captured <= snaplen
+            or captured != min(original, snaplen) or original > 65_535 + 14):
+        raise ValueError('invalid declared capture snapshot/extent')
+    return seconds, fraction, captured, original
+
+
+def _captured_ipv4(frame: bytes, original: int) -> tuple[bytes, int]:
+    ip = frame[14:]
+    if len(ip) < 20 or ip[0] != 0x45:
+        raise ValueError('unsupported IPv4 options/truncated header')
+    total = int.from_bytes(ip[2:4], 'big')
+    if total < 20 or original not in (max(14 + total, 60), 14 + total) or bounded.checksum(ip[:20]):
+        raise ValueError('invalid captured original IP extent/checksum')
+    return ip, total
+
+
+def _native_icmp_sample(ip: bytes, total: int) -> dict | None:
+    if ip[9] != 1:
+        return None
+    source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+    fragment = int.from_bytes(ip[6:8], 'big')
+    if (total != 1500 or len(ip) < 44 or {source, destination} != set(HOST.values())
+            or fragment & 0x3fff or ip[20] not in (0, 8) or ip[21] != 0
+            or ip[20] == 8 and not fragment & 0x4000 or not 1 <= int.from_bytes(ip[26:28], 'big') <= 3):
+        raise ValueError('native ICMP full-MTU/DF/type/sequence mismatch')
+    return {'source': source, 'address': destination, 'type': ip[20],
+        'identifier': int.from_bytes(ip[24:26], 'big'), 'sequence': int.from_bytes(ip[26:28], 'big'),
+        'ip_bytes': total, 'df': bool(fragment & 0x4000), 'payload_prefix': ip[28:44].hex()}
+
+
+class _NativeCaptureCursor:
+    """Observe one owned growing pcap without rescanning accepted records."""
+    def __init__(self, path: Path):
+        self._path, self._stream, self._identity = Path(path), None, None
+        self._offset = self._packets = self._bytes_read = self._size = 0
+        self._format, self._closed = None, False
+        self._icmp = {'requests': 0, 'replies': 0, 'samples': []}
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @property
+    def packets(self):
+        return self._packets
+
+    @property
+    def bytes_read(self):
+        return self._bytes_read
+
+    @property
+    def native_icmp(self):
+        return {**self._icmp, 'samples': [dict(sample) for sample in self._icmp['samples']]}
+
+    def close(self):
+        self._closed = True
+        if self._stream is not None:
+            stream, self._stream = self._stream, None
+            stream.close()
+
+    def _check_file(self, terminal):
+        try:
+            visible = self._path.lstat()
+        except FileNotFoundError:
+            if self._stream is not None or terminal:
+                raise ObservationError('native capture file disappeared or was never created') from None
+            return False
+        if not stat.S_ISREG(visible.st_mode):
+            raise ObservationError('native capture must be a regular non-symlink file')
+        identity = (visible.st_dev, visible.st_ino)
+        if self._stream is None:
+            self._stream = self._path.open('rb', buffering=0)
+            self._identity = identity
+        opened = os.fstat(self._stream.fileno())
+        current = self._path.lstat()
+        if (not stat.S_ISREG(current.st_mode) or identity != self._identity
+                or (opened.st_dev, opened.st_ino) != self._identity
+                or (current.st_dev, current.st_ino) != self._identity):
+            raise ObservationError('native capture path/file identity changed')
+        if (opened.st_size < self._size or current.st_size < self._size or opened.st_size < self._offset
+                or opened.st_size < visible.st_size or current.st_size < opened.st_size):
+            raise ObservationError('native capture file shrank')
+        self._size = max(opened.st_size, current.st_size)
+        if self._size >= BOUNDS['capture_bytes']:
+            raise BoundExhausted('capture byte ceiling exhausted')
+        return True
+
+    def _read(self, length):
+        value = self._stream.read(length)
+        self._bytes_read += len(value)
+        return value
+
+    def poll(self, terminal=False, max_records=4096):
+        if self._closed:
+            raise ValueError('native capture cursor is closed')
+        if type(max_records) is not int or not 1 <= max_records <= 4096:
+            raise ValueError('native capture scan work must be1..4096 records')
+        result = {'records_read': 0, 'at_end': False, 'incomplete': False}
+        if not self._check_file(terminal):
+            return {**result, 'at_end': True, 'incomplete': True}
+        self._stream.seek(self._offset)
+        if self._format is None:
+            header = self._read(24)
+            if len(header) != 24:
+                if terminal:
+                    raise ObservationError('unsupported/truncated pcap header')
+                return {**result, 'at_end': True, 'incomplete': True}
+            self._format = _pcap_header(header)
+            self._offset = 24
+        endian, precision, snaplen = self._format
+        for _ in range(max_records):
+            header = self._read(16)
+            if not header:
+                result['at_end'] = True
+                break
+            if len(header) != 16:
+                if terminal:
+                    raise ValueError('truncated pcap record header')
+                result.update(at_end=True, incomplete=True)
+                break
+            _, _, captured, original = _pcap_record(header, endian, precision, snaplen)
+            frame = self._read(captured)
+            if len(frame) != captured:
+                if terminal:
+                    raise ValueError('truncated pcap record body')
+                result.update(at_end=True, incomplete=True)
+                break
+            if self._packets + 1 >= BOUNDS['capture_packets']:
+                raise BoundExhausted('capture packet ceiling exhausted')
+            sample = None
+            if frame[12:14] != b'\x08\x06':
+                if frame[12:14] != b'\x08\x00':
+                    raise ValueError('unexpected IP family/underlay Ethernet type')
+                ip, total = _captured_ipv4(frame, original)
+                sample = _native_icmp_sample(ip, total)
+                if sample is not None and len(self._icmp['samples']) >= 128:
+                    raise BoundExhausted('native ICMP observation ceiling exhausted')
+            # An incomplete or malformed record cannot adopt a cursor or key.
+            self._offset += 16 + captured
+            self._packets += 1
+            result['records_read'] += 1
+            if sample is not None:
+                self._icmp['requests' if sample['type'] == 8 else 'replies'] += 1
+                self._icmp['samples'].append(sample)
+        self._check_file(terminal)
+        if not result['incomplete'] and self._size > self._offset:
+            result['at_end'] = False
+        return result
+
+
+def _native_icmp_key(sample: dict) -> tuple:
+    return tuple(sample[name] for name in ('source', 'address', 'type', 'identifier',
+        'sequence', 'payload_prefix', 'ip_bytes')) + (sample['df'] if sample['type'] == 8 else None,)
+
+
+def _expected_native_icmp(phases: dict) -> list[dict]:
+    expected, distinct = [], set()
+    if not isinstance(phases, dict):
+        raise ObservationError('native capture drain requires completed probe outcomes')
+    for phase in ('functional', 'after_reconnect'):
+        outcome = phases.get(phase)
+        if not isinstance(outcome, dict) or set(outcome) != {'a', 'b'}:
+            raise ObservationError('native capture drain requires all four completed ICMP probes')
+        for side in ('a', 'b'):
+            if not isinstance(outcome[side], dict) or not isinstance(outcome[side].get('icmp'), dict):
+                raise ObservationError('native capture drain requires all four completed ICMP probes')
+            result = outcome[side]['icmp']
+            other = 'b' if side == 'a' else 'a'
+            rows = result.get('rows', [])
+            if (result.get('status') != 'passed' or result.get('sent') != 3
+                    or result.get('received_unique') != 3 or result.get('request_count') != 3
+                    or result.get('payload_bytes') != 1472 or result.get('ip_bytes') != 1500
+                    or result.get('df') is not True or result.get('source') != HOST[side]
+                    or result.get('address') != HOST[other]
+                    or type(result.get('identifier')) is not int or not 1 <= result['identifier'] <= 65535
+                    or type(result.get('original_deadline_ns')) is not int
+                    or not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+                    or [row.get('sequence') for row in rows] != [1, 2, 3]):
+                raise ObservationError('native capture drain requires exact validated three-request outcomes')
+            for row in rows:
+                prefix = row.get('payload_prefix')
+                if (not isinstance(prefix, str) or re.fullmatch('[0-9a-f]{32}', prefix) is None
+                        or type(row.get('sent_ns')) is not int or type(row.get('received_ns')) is not int
+                        or not row['sent_ns'] <= row['received_ns'] < result['original_deadline_ns']):
+                    raise ObservationError('native capture drain probe identity/timing is incomplete')
+                for kind, source, address in [(8, HOST[side], HOST[other]), (0, HOST[other], HOST[side])]:
+                    sample = {'phase': phase, 'side': side, 'source': source, 'address': address,
+                        'type': kind, 'identifier': result['identifier'], 'sequence': row['sequence'],
+                        'payload_prefix': prefix, 'ip_bytes': 1500, 'df': kind == 8}
+                    key = _native_icmp_key(sample)
+                    if key in distinct:
+                        raise ObservationError('native capture drain probe fingerprints are not distinct')
+                    distinct.add(key)
+                    expected.append(sample)
+    return expected
+
+
+def drain_native_capture(process, path, phases, deadline, *, clock=time.monotonic, sleeper=time.sleep) -> dict:
+    """Witness all persisted probe keys before interrupting the owned capture."""
+    report = {'status': 'pending', 'deadline': deadline, 'original_deadline': deadline,
+        'clock_unit': 'monotonic_seconds', 'started_monotonic_seconds': clock(),
+        'finished_monotonic_seconds': None, 'expected_keys': 24,
+        'matched_keys': 0, 'missing': [], 'offset': 0, 'packets': 0, 'bytes_read': 0,
+        'process_returncode': None, 'scope': 'persisted exact ICMP keys; final capture audit still required'}
+    cursor, failure, expected = None, None, None
+    try:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError('finite original capture drain deadline required')
+        expected = _expected_native_icmp(phases)
+        report['missing'] = expected
+        cursor = _NativeCaptureCursor(path)
+        while True:
+            if clock() >= deadline:
+                raise BoundExhausted('original case deadline exhausted before capture drain')
+            code = process.poll()
+            report['process_returncode'] = code
+            polled = cursor.poll(terminal=code is not None)
+            seen = {_native_icmp_key(sample) for sample in cursor.native_icmp['samples']}
+            missing = [sample for sample in expected if _native_icmp_key(sample) not in seen]
+            report.update(matched_keys=24 - len(missing), missing=missing, offset=cursor.offset,
+                packets=cursor.packets, bytes_read=cursor.bytes_read, process_returncode=code)
+            now = clock()
+            if now >= deadline:
+                raise BoundExhausted('original case deadline exhausted during capture drain')
+            if not missing and polled['at_end'] and not polled['incomplete']:
+                report['status'] = 'passed'
+                return report
+            if not polled['at_end']:
+                continue
+            if code is not None:
+                raise ObservationError('native capture producer exited before all exact ICMP keys were saved')
+            sleeper(min(.02, deadline - now))
+    except Exception as error:
+        failure = error
+        if cursor is not None:
+            report.update(offset=cursor.offset, packets=cursor.packets, bytes_read=cursor.bytes_read)
+            if expected is not None:
+                seen = {_native_icmp_key(sample) for sample in cursor.native_icmp['samples']}
+                missing = [sample for sample in expected if _native_icmp_key(sample) not in seen]
+                report.update(matched_keys=24 - len(missing), missing=missing)
+        report.update(status=failure_status(error), error=f'{type(error).__name__}: {error}'[:4096])
+        error.capture_drain = report
+        raise
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception as error:
+                if failure is not None:
+                    report['close_error'] = f'{type(error).__name__}: {error}'[:4096]
+                else:
+                    report.update(status=failure_status(error), error=f'{type(error).__name__}: {error}'[:4096])
+                    report['finished_monotonic_seconds'] = clock()
+                    error.capture_drain = report
+                    raise
+        report['finished_monotonic_seconds'] = clock()
+        if failure is None and report['status'] == 'passed' and report['finished_monotonic_seconds'] >= deadline:
+            error = BoundExhausted('original case deadline exhausted before capture drain completion')
+            report.update(status='bound_exhausted', error=f'{type(error).__name__}: {error}')
+            error.capture_drain = report
+            raise error
+
+
 def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[dict], clock: dict | None = None) -> dict:
     if path.stat().st_size >= BOUNDS['capture_bytes']:
         raise BoundExhausted('capture byte ceiling exhausted')
@@ -528,23 +808,11 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
             if high >= begin and low < end:
                 row['measurement_max_ip_bytes'] += total
 
-    magic = {b'\xd4\xc3\xb2\xa1': ('<', 1000), b'\xa1\xb2\xc3\xd4': ('>', 1000),
-             b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1)}
     with path.open('rb') as stream:
         header = stream.read(24)
-        if len(header) != 24 or header[:4] not in magic:
-            raise ObservationError('unsupported/truncated pcap header')
-        endian, precision = magic[header[:4]]
-        major, minor, zone, accuracy, snaplen, link = struct.unpack(endian + 'HHIIII', header[4:])
-        if (major, minor, zone, accuracy, snaplen, link) != (2, 4, 0, 0, BOUNDS['capture_snaplen'], 1):
-            raise ObservationError('unexpected pcap link/snapshot/version')
+        endian, precision, snaplen = _pcap_header(header)
         while record_header := stream.read(16):
-            if len(record_header) != 16:
-                raise ValueError('truncated pcap record header')
-            seconds, fraction, captured, original = struct.unpack(endian + 'IIII', record_header)
-            if (fraction >= 1_000_000_000 // precision or not 14 <= captured <= snaplen
-                    or captured != min(original, snaplen) or original > 65_535 + 14):
-                raise ValueError('invalid declared capture snapshot/extent')
+            seconds, fraction, captured, original = _pcap_record(record_header, endian, precision, snaplen)
             frame = stream.read(captured)
             if len(frame) != captured:
                 raise ValueError('truncated pcap record body')
@@ -557,27 +825,15 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
                 continue
             if ether != b'\x08\x00':
                 raise ValueError('unexpected IP family/underlay Ethernet type')
-            ip = frame[14:]
-            if len(ip) < 20 or ip[0] != 0x45:
-                raise ValueError('unsupported IPv4 options/truncated header')
-            total = int.from_bytes(ip[2:4], 'big')
-            if total < 20 or original not in (max(14 + total, 60), 14 + total) or bounded.checksum(ip[:20]):
-                raise ValueError('invalid captured original IP extent/checksum')
+            ip, total = _captured_ipv4(frame, original)
             if local_side is None:
-                if ip[9] == 1:
-                    source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
-                    fragment = int.from_bytes(ip[6:8], 'big')
-                    if (total != 1500 or len(ip) < 44 or {source, destination} != set(HOST.values())
-                            or fragment & 0x3fff or ip[20] not in (0, 8) or ip[21] != 0
-                            or ip[20] == 8 and not fragment & 0x4000 or not 1 <= int.from_bytes(ip[26:28], 'big') <= 3):
-                        raise ValueError('native ICMP full-MTU/DF/type/sequence mismatch')
+                sample = _native_icmp_sample(ip, total)
+                if sample is not None:
                     observed = result['native_icmp']
                     if len(observed['samples']) >= 128:
                         raise BoundExhausted('native ICMP observation ceiling exhausted')
-                    observed['requests' if ip[20] == 8 else 'replies'] += 1
-                    observed['samples'].append({'source': source, 'address': destination, 'type': ip[20],
-                        'identifier': int.from_bytes(ip[24:26], 'big'), 'sequence': int.from_bytes(ip[26:28], 'big'),
-                        'ip_bytes': total, 'df': bool(fragment & 0x4000), 'payload_prefix': ip[28:44].hex()})
+                    observed['requests' if sample['type'] == 8 else 'replies'] += 1
+                    observed['samples'].append(sample)
                 continue
             if total > case['path_mtu'] or int.from_bytes(ip[6:8], 'big') & 0x3fff:
                 raise ValueError('outer MTU breach or fragmentation')
@@ -1032,17 +1288,37 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 bounded.stop(child)
             except Exception as error:
                 errors.append({'status': 'failed', 'cleanup': f'{type(error).__name__}: {error}'})
-        for name, (child, log, capture) in captures.items():
-            try:
-                counts = capture_counts(log, child)
-                capture_counters[name] = counts
-                receipt.update(**{name + '_capture_counters': counts})
-            except Exception as error:
-                errors.append({'status': failure_status(error), 'capture': name, 'error': f'{type(error).__name__}: {error}'})
+        # Persist every exact probe fingerprint before any capture is
+        # interrupted. This witness never replaces the final stopped audit.
+        try:
+            native = captures.get('native-a')
+            if native is not None:
                 try:
-                    bounded.stop(child)
-                except Exception:
-                    pass
+                    observation = drain_native_capture(native[0], native[2], receipt.value, deadline)
+                except Exception as error:
+                    observation = getattr(error, 'capture_drain', {
+                        'status': failure_status(error), 'original_deadline': deadline,
+                        'error': f'{type(error).__name__}: {error}'[:4096]})
+                    errors.append({'status': failure_status(error), 'capture': 'native-a',
+                        'phase': 'capture_drain', 'error': f'{type(error).__name__}: {error}'[:4096]})
+                try:
+                    receipt.update(native_capture_drain=observation)
+                except Exception as error:
+                    errors.append({'status': failure_status(error), 'capture': 'native-a',
+                        'phase': 'capture_drain_receipt', 'error': f'{type(error).__name__}: {error}'[:4096]})
+        finally:
+            # Drain or publication failure must not bypass any owned stop.
+            for name, (child, log, capture) in captures.items():
+                try:
+                    counts = capture_counts(log, child)
+                    capture_counters[name] = counts
+                    receipt.update(**{name + '_capture_counters': counts})
+                except Exception as error:
+                    errors.append({'status': failure_status(error), 'capture': name, 'error': f'{type(error).__name__}: {error}'})
+                    try:
+                        bounded.stop(child)
+                    except Exception:
+                        pass
         anchors.append(clock_anchor())
         if captures and public:
             try:

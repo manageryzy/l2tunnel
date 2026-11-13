@@ -634,3 +634,42 @@ shared-host PSI use their own contained intervals, separately from 20s goodput.
 The [required frozen-source aggregate](../../work/swift-bulk-copy-20261113/aggregate-attempt-2/validation.json)
 passes local Rust/tooling/simulator checks. It does not reverse the native capture
 or impaired-performance failures; all original receipts remain unchanged.
+
+## Current PID-scoped kernel observation and capture-tail correction
+
+The [current kernel summary](../../work/secure-udp-performance-analysis-20261113/current-kernel-summary-attempt-2/analysis.md)
+links a new immutable build, raw parser and independent perf symbol reconciliation.
+It observes only the two owned daemon processes under the original35ms each-way
+latency/15% each-way loss,16 forward flows and20s measurement. The planned middle
+16s recording intentionally stops on time; its actual event span is14.9078s,
+with1542 CPU samples,475848 per-task switch records and zero lost markers.
+Kernel mode accounts for72.7155% of all sampled cycle-period weight. Inclusive
+schedule21.95%, epoll syscall15.94%, TAP write15.60% and UDP send8.23% contexts
+overlap; none measures blocked duration or proves a unique throughput cause.
+
+Separate sequential CPU/I/O read brackets cover approximately16.9s within the
+20s window. The endpoints use2.04/6.90s and2.92/7.41s user/system CPU, respectively;
+each reports zero storage-read bytes and192512/188416 storage-write bytes.
+Host IO PSI and disk activity remain shared-host observations. Delay accounting
+and scheduler statistics remain disabled; sparse wait states and closed switch
+pairs cannot assign exact disk wait or wakeup/runqueue latency. Existing PMU/BPF
+instrumentation may add overhead. The profiled77.6672Mbit/s fails80 and is not an
+uninstrumented acceptance result. No host sysctl or existing network state changes.
+
+The [capture-tail ledger](native-capture-drain.md) separately records74 focused
+cases and two separately pinned four-case uninstrumented clean/impaired matrices
+for both appearances. All full capture/control/cleanup checks pass. The final
+observed-growth follow-up measures90.6326/90.0291Mbit/s clean and76.9351/78.4729Mbit/s
+impaired; both impaired cases still fail80. The profiled diagnostic retains its
+own helper revision and the same compiled Rust/binary bytes. The fix waits for24 exact saved ICMP keys and a
+complete saved-record boundary under the original case deadline before capture
+SIGINT. It adds no probe traffic or relaxed final assertions. Historical capped
+perf, clean A/B capture failures, SBC-04 and all parent gates retain their status.
+A controlled explicitly selected runtime-threading comparison is the next kernel
+hypothesis to measure; it is not an implemented default or an owner decision.
+
+The capture-only correction's [required frozen-source check](../../work/native-capture-drain-20261113/aggregate-attempt-2/validation.json)
+passes1619 Rust cases including doctests,319 Python tooling cases and1658 simulator
+cases, with formatting, strict Clippy, rustdoc, CLI and stable input maps. Its
+interrupted first aggregate remains separate. These local checks do not close
+SNL-08/SNL-09/SNL-11, SBC-04 or any parent carrier/mode/lifecycle/platform gate.
