@@ -20,6 +20,12 @@ pub mod session_control;
 /// Fixed bounded reliable control service, independent of data-profile epochs.
 pub mod delivery;
 
+/// Whole-message custody composed from existing reliable delivery and fragmentation.
+pub mod messages;
+
+/// Explicitly negotiated independent streams inside one authenticated control class.
+pub mod control_streams;
+
 /// Fixed header size of the internal draft format, excluding protection outside this crate.
 pub const HEADER_LEN: usize = 112;
 /// Current draft format version; not a final network interoperability commitment.

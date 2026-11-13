@@ -122,3 +122,10 @@ and packet-security APIs must be frozen before consumers use them. Verification
 records commands and source identities in the [focused receipt](../../work/shared-session-primitives-20261113/focused-validation.json)
 and [required local check result](../../work/shared-session-primitives-20261113/validation.json).
 Component tests and loopback fixtures do not qualify CDL-07 or its parent gates.
+
+The additive [whole-message owner](control-messages.md) now composes this unchanged
+service with existing LX fragmentation and explicit complete-message acceptance.
+The [stream wrapper and gate](control-streams.md) keep liveness independent of an
+incomplete management transfer while sharing common security and wire accounting.
+Those protocol/original-socket fixtures leave CDL-07 and full SW-11 open; the
+selected runtime does not yet dispatch this new negotiated contract.

@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+l2tunnel-codec = { path = "../l2tunnel-codec", default-features = false }
 l2tunnel-core = { path = "../l2tunnel-core" }
 l2tunnel-session = { path = "../l2tunnel-session" }
 l2tunnel-recovery = { path = "../l2tunnel-recovery" }

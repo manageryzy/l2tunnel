@@ -367,6 +367,27 @@ fn exact_deadline_expiry_tombstones_and_time_validation() -> TestResult {
 }
 
 #[test]
+fn next_expiry_tracks_pending_custody_without_renewing_on_duplicates() -> TestResult {
+    let first = fragments(1, 320)?;
+    let second = fragments(2, 320)?;
+    let mut receiver = Reassembler::new(context(), receiver_config())?;
+    let mut output = [0; 320];
+    assert_eq!(receiver.deadline(), None);
+    receiver.accept(&first.fragments[0], 3, &mut output)?;
+    receiver.accept(&second.fragments[0], 7, &mut output)?;
+    assert_eq!(receiver.deadline(), Some(13));
+    receiver.accept(&first.fragments[0], 9, &mut output)?;
+    assert_eq!(receiver.deadline(), Some(13));
+    receiver.accept(&first.fragments[1], 12, &mut output)?;
+    assert_eq!(receiver.deadline(), Some(17));
+    assert!(receiver.expire(16)?.is_empty());
+    assert_eq!(receiver.deadline(), Some(17));
+    assert_eq!(receiver.expire(17)?, vec![MessageId(2)]);
+    assert_eq!(receiver.deadline(), None);
+    Ok(())
+}
+
+#[test]
 fn valid_input_cleans_expired_state_without_explicit_timer_poll() -> TestResult {
     let first = fragments(1, 320)?;
     let second = fragments(2, 320)?;

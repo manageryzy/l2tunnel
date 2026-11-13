@@ -9,6 +9,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[path = "common_session_udp/streams.rs"]
+mod streams;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const ESTABLISHED_AT: u64 = 12_000;
 

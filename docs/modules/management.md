@@ -17,10 +17,15 @@ encrypted packet alone does not implement those operations.
 ## Public API and dependency boundary
 
 `l2tunnel-management` depends on the local `l2tunnel-core`,
-`l2tunnel-session` and `l2tunnel-recovery` crates, Rust's standard library, and maintained ring for canonical
-configuration SHA-256. The [fixed reliable control service](control-delivery.md)
+`l2tunnel-session`, `l2tunnel-recovery` and compression-disabled `l2tunnel-codec`
+crates, Rust's standard library, and maintained ring for canonical configuration
+and exact-message SHA-256. The [fixed reliable control service](control-delivery.md)
 reuses selective repeat with independent retention, expiry and charged service
 bounds; it is separate from transaction semantics and physical carrier I/O.
+The additive [whole-message](control-messages.md) and
+[control-stream](control-streams.md) work composes existing bounded fragmentation
+and reliable delivery for complete generic transactions and independent liveness.
+Their implementation and integration gates remain separate from full SW-11.
 The crate has no socket, clock, runtime or random source; it does
 not authenticate records or implement cryptographic primitives. It reuses `Epoch`,
 `ConfigDigest` and `Ticket`; a ticket's target epoch, attempt and digest do not

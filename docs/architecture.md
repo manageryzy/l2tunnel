@@ -108,6 +108,19 @@ The scheduler checkpoint has a separate [source-stable required pass](../work/se
 with 1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases. Its conditional framing-capacity calculation
 is an engineering assumption check, not a waiver of the80Mbit/s target.
 
+The next reusable dependency now has a [whole-message custody ledger](modules/control-messages.md)
+and an [explicit control-stream ledger](modules/control-streams.md). Existing LX
+fragmentation and SelectiveRepeat carry genuine 354/2762-byte PREPARE envelopes
+through smaller windows with separate complete-message acceptance. Independent
+Transaction/Liveness/DataFeedback contexts remain inside one common Control
+security owner and shared wire allowance. Both-cover original-socket fixtures
+complete 130 Ping/Pong rounds during a blocked transaction, then recover PREPARE
+without applying it. The selected runtime still uses its existing control
+contract; generic dispatch, retired-retry permits and full SW-11 remain open.
+Its [source-stable required aggregate](../work/common-control-messages-20261113/aggregate-attempt-3/validation.json)
+passes 1555 Rust cases including doctests, 295 Python tooling cases and 1658
+simulator cases. No new native or platform result is inferred from that pass.
+
 ## Library boundary and layering
 
 ```mermaid

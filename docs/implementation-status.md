@@ -42,6 +42,18 @@ uses the same immutable profile, deferred attachment, service owner and version2
 local API as an embedding frontend. It does not supply dummy TLS credentials or
 implicitly choose a carrier.
 
+The additive [whole-message custody](modules/control-messages.md) and
+[explicit control streams](modules/control-streams.md) are separately implemented
+and protocol-tested. Genuine generic PREPARE envelopes survive bounded
+fragmentation/recovery; both-cover original-socket fixtures preserve liveness
+through a blocked transaction using one common security owner. This does not
+enable a new selected runtime contract, complete a mode switch or qualify
+retired-retry permits, lifecycle, other platforms or native performance.
+The [required source-stable aggregate](../work/common-control-messages-20261113/aggregate-attempt-3/validation.json)
+passes 1555 Rust cases including doctests, 295 Python tooling cases and 1658
+simulator cases; preserved checklist-format failures are described in the module
+ledgers. These are local Linux checks, not new native or non-Linux qualification.
+
 The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API
 tests, strict Clippy and rustdoc. Actual paired UDP/service fixtures exercise

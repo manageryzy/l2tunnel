@@ -394,6 +394,11 @@ impl Reassembler {
         Ok(expired)
     }
 
+    /// Earliest original incomplete-message expiry, without advancing time or state.
+    pub fn deadline(&self) -> Option<u64> {
+        self.pending.values().map(|entry| entry.deadline).min()
+    }
+
     /// Bytes reserved for entire incomplete records, including missing fragments.
     pub fn reserved_bytes(&self) -> usize {
         self.reserved_bytes
