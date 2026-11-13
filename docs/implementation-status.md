@@ -7,6 +7,18 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The current [Swift bulk-prefix checkpoint](modules/swift-bulk-copy.md) implements
+checked at-most-two-slice deque extraction at the existing sender/receiver sites.
+Exact bytes/recovery tests and immutable CPU ABBA give baseline/candidate elapsed
+ratios of 4.34–4.55 in the finite library workloads. Native impaired QUIC/media-like remain
+77.30/78.30 Mbit/s after the change, below 80; both clean A/B cases fail existing
+ICMP capture completeness despite 92.06/92.40 Mbit/s, successful endpoint probes
+and owned cleanup. These are preserved failures, not native qualification or a
+statistically established throughput regression/gain. The
+[source-stable required aggregate](../work/swift-bulk-copy-20261113/aggregate-attempt-2/validation.json)
+passes 1619 Rust cases including doctests, 295 tooling cases and 1658 simulator
+cases. This local Linux validation preserves all parent/native/platform gates.
+
 ## Architecture target and current Swift composition
 
 The target separates pure data algorithms, a [common inner secure session](modules/secure-session.md),

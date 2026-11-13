@@ -1,5 +1,10 @@
 # Swift algorithm and current protected-UDP composition
 
+The pure engine's subsequent [bounded bulk-prefix correction](swift-bulk-copy.md)
+preserves bytes and ownership at its two deque extraction sites. CPU improvement
+is measured separately from the still-open impaired native performance and clean
+ICMP capture qualification; no carrier or recovery requirement is removed.
+
 Status: the pure Swift packing/recovery engine is implemented and protocol-tested.
 The current explicit `--record-profile swift --carrier udp` composition is
 implemented, with historical integration receipts from Linux TAP in owned

@@ -618,3 +618,19 @@ not qualify native performance. Only the parent integrator executes --apply afte
 its immutable build and source checks.
 
 - [ ] [SNL-11] Diagnose the secure-UDP native performance regression using source-pinned runtime/channel performance reports, matched clean and impaired workloads and explicitly limited simulator overhead/timing sensitivity. Use measured counters to justify each correction, retain before/after failures, and rerun integrity, original-deadline/liveness and the unchanged80Mbit/s impaired target. Instrumentation alone cannot complete this gate.
+
+## Perf-guided Swift byte-transfer observations
+
+The subsequent [bulk-prefix checkpoint](swift-bulk-copy.md) replaces only the two
+Swift deque append loops identified in the preserved build9 profile. Immutable
+production-engine CPU ABBA preserves all functional fields with baseline/candidate elapsed
+ratios of 4.34–4.55. The six native observations retain the original lab and
+all failures: post-copy QUIC/media impaired 77.3023/78.2980 Mbit/s fail 80, and both
+clean A/B cases fail full-MTU ICMP capture completeness despite passing 80 and
+endpoint probes. All owned cleanups pass. No throughput improvement, full SNL-11
+or parent gate is claimed; SBC-04 remains open. Process CPU/storage counters and
+shared-host PSI use their own contained intervals, separately from 20s goodput.
+
+The [required frozen-source aggregate](../../work/swift-bulk-copy-20261113/aggregate-attempt-2/validation.json)
+passes local Rust/tooling/simulator checks. It does not reverse the native capture
+or impaired-performance failures; all original receipts remain unchanged.

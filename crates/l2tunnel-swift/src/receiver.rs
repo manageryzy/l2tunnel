@@ -438,7 +438,7 @@ impl Receiver {
             return Ok(false);
         }
         self.stream.drain(..FRAME_PREFIX);
-        output.extend(self.stream.drain(..length));
+        crate::byte_queue::append_prefix(&mut self.stream, length, output)?;
         self.stats.packets += 1;
         Ok(true)
     }
@@ -531,3 +531,7 @@ impl Receiver {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "receiver_byte_queue_tests.rs"]
+mod byte_queue_tests;

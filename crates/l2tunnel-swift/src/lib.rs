@@ -18,6 +18,7 @@
 //! native side is one ordered byte stream per direction, so a packet is never
 //! duplicated or reordered relative to others in the same direction.
 
+mod byte_queue;
 pub mod control;
 pub mod flow;
 pub mod gf;

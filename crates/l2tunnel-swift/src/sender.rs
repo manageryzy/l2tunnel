@@ -240,7 +240,7 @@ impl Sender {
             let length = self.queue.len().min(self.config.symbol_bytes());
             let mut payload = self.spare.pop().unwrap_or_default();
             payload.clear();
-            payload.extend(self.queue.drain(..length));
+            crate::byte_queue::append_prefix(&mut self.queue, length, &mut payload)?;
             // Whatever is left starts a new partial symbol.
             self.queue_since = now;
             output.push(KIND_SOURCE);
@@ -407,3 +407,7 @@ impl Sender {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sender_byte_queue_tests.rs"]
+mod byte_queue_tests;
