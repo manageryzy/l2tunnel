@@ -3,7 +3,10 @@
 Status: implemented and protocol-tested pure composition, with both-cover
 original-socket fixtures. Required aggregate checks are recorded below separately.
 This is an integrator proposal for SEC-07, FIX-11 and full SW-11, not an
-additional owner decision, enabled runtime mode or completion of those gates.
+additional owner decision or completion of those gates. The explicit
+[Swift runtime integration](streamed-swift-control.md) now owns semantic custody
+for SwiftPolicyV1 and independent Ping/Pong; generic Management dispatch and
+complete shared API/native qualification remain open under SCM-07.
 
 The existing reliable control service accepts one bounded source. A complete
 generic PREPARE can require 2762 bytes including L2SC, while the selected Swift
@@ -90,7 +93,7 @@ liveness through its independent control stream and report recovery status.
 - [x] [SCM-04] Fault-test lost first/middle/final fragments, reordering, duplicates and lost complete-message/source receipts using the existing ARQ. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
 - [x] [SCM-05] Test independent queue/byte/fragment/work limits, atomic refusal, original deadlines, backwards/overflow time and sticky terminal failure without owner reset. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
 - [x] [SCM-06] Compose authenticated Control and the explicit stream wrapper on both original UDP cover pairs, including transaction blockage with independent liveness. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
-- [ ] [SCM-07] Integrate actual selected-carrier runtime dispatch, semantic receipt custody, original operation caps and shared service/API status during complete profile switches.
+- [ ] [SCM-07] Integrate actual selected-carrier runtime dispatch, semantic receipt custody, original operation caps and shared service/API status during complete profile switches. Progress: [explicit streamed Swift runtime custody](streamed-swift-control.md) passes finite original-socket tests; generic/cross-profile dispatch, shared frontend status and saturated native qualification remain open.
 - [x] [SCM-08] Pass focused and required aggregate checks with exact source identities and preserve all failed attempts and legacy receipts. Evidence: [required pass](../../work/leased-control-20261113/aggregate-attempt-1/validation.json).
 
 These child gates preserve CDL-07, MG-01/04..08, SEC-07/08/10, SW-11/SW-15 and

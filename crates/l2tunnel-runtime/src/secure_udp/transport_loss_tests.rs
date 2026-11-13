@@ -422,14 +422,18 @@ async fn out_of_order_pong_custody_cannot_pass_the_missing_ping_or_clear_livenes
         );
         assert!(
             !fixture
-                .driver(Side::A)
+                .driver_mut(Side::A)
                 .control
+                .legacy_mut()
+                .ok_or("missing legacy control")?
                 .source_confirmed(0, duration(start + 5_000))?
         );
         assert!(
             fixture
-                .driver(Side::A)
+                .driver_mut(Side::A)
                 .control
+                .legacy_mut()
+                .ok_or("missing legacy control")?
                 .source_confirmed(1, duration(start + 5_000))?
         );
         assert!(fixture.driver(Side::B).challenge.is_some());
@@ -568,13 +572,16 @@ async fn lost_ack_retries_preserve_exact_control_and_never_repeat_ping_effects()
         fixture.pump(start, &mut fault).await?;
         fixture.pump(start + 5_000, &mut fault).await?;
         let receive_number = fixture.driver(Side::B).envelope_rx;
-        let send_number = fixture.driver(Side::B).envelope_tx;
+        let send_number = fixture.driver(Side::B).control.legacy_next_sequence();
         let pong = fixture.driver(Side::B).live.last_pong_micros;
         assert!(fixture.driver(Side::A).challenge.is_none());
         assert_eq!(fixture.driver(Side::A).control.retained().send_records, 2);
         fixture.pump(start + 200_000, &mut fault).await?;
         assert_eq!(fixture.driver(Side::B).envelope_rx, receive_number);
-        assert_eq!(fixture.driver(Side::B).envelope_tx, send_number);
+        assert_eq!(
+            fixture.driver(Side::B).control.legacy_next_sequence(),
+            send_number
+        );
         assert_eq!(fixture.driver(Side::B).remote_ping, 1);
         assert!(fixture.driver(Side::B).pong.is_none());
         assert_eq!(fixture.driver(Side::B).live.last_pong_micros, pong);

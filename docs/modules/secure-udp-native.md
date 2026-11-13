@@ -520,6 +520,61 @@ as documented in SUR-11; the complete successful rerun retains all cases and
 original assertions/deadlines. Local checks remain distinct from the failed
 forward performance target and outstanding carrier/mode/platform qualification.
 
+### Impaired build9 kernel diagnostic
+
+The owner requested kernel perf on the impaired path. A fresh
+[owned-namespace diagnostic](../../work/secure-udp-native-20261113/quic-build9-kernel-impaired-attempt-1/receipt.json)
+uses the same preserved build9 binary and archived helpers: QUIC-like, forward16,
+100/10Mbit/s, 70ms RTT and independent15% loss each way. Measured20s goodput is
+77.4992768Mbit/s with perf attached; exact bytes/EOF, functional/control checks,
+captures and cleanup pass, while the unchanged80Mbit/s gate fails. It is a
+separate instrumented observation, not a replacement uninstrumented baseline or
+qualification of the later streamed-control source.
+
+The [raw recorder](../../work/secure-udp-performance-analysis-20261113/build9-quic-impaired-kernel-attempt-1/profile.json)
+remains failed because perf reached its requested16MiB event-stream threshold
+before the planned stop. Metadata makes the actual file19,444,472bytes; its
+separate enforced whole-file ceiling was32MiB. Independent
+[partial-data validation](../../work/secure-udp-performance-analysis-20261113/build9-quic-impaired-kernel-analysis-attempt-2/validation.json)
+checks raw record boundaries against `perf script`, hashes and timestamps. The
+retained13.704321962s span lies wholly inside the20s measurement, with1,047 cycles
+samples,515,065 switch records and zero recorded loss markers. One byte-identical
+SWITCH-IN duplicate remains in raw counts and is excluded only from interval
+pairing. Neither this validation nor the recorder exit code changes the failed
+raw-wrapper or native target status.
+
+The PERIOD-weighted kernel share is63.7058% of sampled on-CPU cycles, not wall
+time. Independently timestamped process observations contained in that span
+cover12.4845s: sideA uses1.18s user plus3.41s system CPU (0.3677core average),
+sideB1.71s plus4.31s (0.4822core). These averages do not prove absence of per-thread
+delays. All switch records belong to four active main/worker TIDs. Closed switch
+pairs measure off-CPU intervals, with censored recording boundaries; nonpreempted
+switch-outs do not uniquely identify disk sleep or separate blocked from runnable
+delay. Sparse wait-channel observations include futex and epoll.
+
+The cap path did not retain the final host-PSI/disk/process-I/O snapshot, so this
+run cannot establish those interval deltas or rule out other host I/O activity.
+Hardware PMU bookkeeping also appears in the flat sample report and must not be
+attributed wholly to tunnel work. Inclusive kernel chains overlap, finite CPU
+samples are estimates, and profiling can perturb scheduling. No single causal
+throughput bottleneck or target waiver follows from these observations. The
+earlier clean build7 kernel percentages remain a different experiment.
+
+The same-data [self/inclusive reports](../../work/secure-udp-performance-analysis-20261113/build9-quic-impaired-kernel-reports-attempt-1/validation-3.json)
+separate leaf costs from caller contexts. Inclusive kernel frames include
+schedule16.42%, epoll syscall13.01%, futex syscall12.17%, TAP write11.29% and
+UDP send8.63% of all sampled PERIOD weight. These overlap and cannot be added or
+interpreted as off-CPU durations. Flat userspace `Vec::extend` accounts for9.90%
+of that denominator. [Exact sample-IP/disassembly attribution](../../work/secure-udp-performance-analysis-20261113/build9-quic-impaired-kernel-reports-attempt-1/vec-attribution.json)
+places all86 matching samples in the byte-at-a-time deque-to-vector append loop,
+with none in its reserve-call branch. The two compiled direct callers match
+Swift sender packing and receiver packet extraction; both source hashes equal
+build9. Optimized frame-pointer chains cannot divide the cost between callers,
+and zero allocation-branch samples do not measure allocation frequency. Compare
+bounded two-slice bulk copying under unchanged byte/order/recovery semantics as
+a controlled hypothesis; this does not establish a unique bottleneck or a change
+that meets80Mbit/s.
+
 ## Results and acceptance
 
 Each fresh output preserves its source/binary/helper identity, exact command

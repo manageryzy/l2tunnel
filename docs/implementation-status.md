@@ -60,6 +60,15 @@ transaction with lost final output and forced backpressure, while preserving
 independent liveness. This is not an actual Records User-scope/profile or selected
 service switch; those integration and performance gates remain open.
 
+The [explicit streamed Swift backend](modules/streamed-swift-control.md) now
+integrates those message owners into the actual UDP driver and authenticated
+shared-client Profile, with finite local Unix integration tests and a passing required source-stable aggregate. It preserves
+original operation caps and whole-message custody, independent runtime Ping/Pong,
+one Control security owner and one shared allowance. Embedding selection is
+explicit; the CLI still chooses legacy control. Generic Management/DataFeedback,
+shared API/frontend selection, full SW-11 and native/platform qualification remain
+open. Runtime Snapshot custody observations do not change strict local API bytes.
+
 The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API
 tests, strict Clippy and rustdoc. Actual paired UDP/service fixtures exercise

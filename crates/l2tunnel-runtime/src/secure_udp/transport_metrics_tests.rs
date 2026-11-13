@@ -119,6 +119,8 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
             resumed,
             driver.records.control_scope(),
             control::Body::Ping { nonce: 991 },
+            driver.lease,
+            true,
         )?;
         driver.send(&fixture.socket, resumed, driver.origin + duration(resumed))?;
         let control = driver.snapshot(resumed, true);

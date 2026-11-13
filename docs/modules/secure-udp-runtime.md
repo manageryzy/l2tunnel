@@ -9,6 +9,14 @@ the existing [member handoff](shared-udp-session.md). It does not replace the
 OpenVPN wire-handshake, original HTTPS raw-packet, full SW-11, 47-mode parity,
 native performance, lifecycle recovery or platform acceptance gates.
 
+An additive [streamed Swift-control backend](streamed-swift-control.md) is now
+explicitly selectable in authenticated runtime/client profiles. It retains whole
+messages and original operation caps through Swift policy completion while
+independent Ping/Pong uses the same Control security owner and shared budget.
+Finite local Unix focused and required aggregate checks pass. CLI defaults and strict local API bytes
+remain legacy; generic Management/DataFeedback dispatch, full SW-11, native
+saturation and platform qualification are separate open gates.
+
 The [source-stable focused receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 transport tests, 21 shared-client secure-UDP tests, retained service/local
 API tests, strict Clippy and rustdoc. Transport fixtures use two independent Tokio
@@ -165,7 +173,7 @@ application digest. Passing a second unchecked digest is not proof that arbitrar
 later settings were authenticated. The parent retains that explicit construction
 contract; the runtime checks the actual full authenticated digest at attachment.
 
-## Proposed public interface
+## Public interface outline
 
 All types below are in `l2tunnel_runtime::secure_udp::transport`. Public protocol
 libraries remain free of Tokio, native handles, clocks and privileges.
@@ -179,6 +187,7 @@ Config {
     security: security::Limits,
     control: management::delivery::Settings,
     control_epoch: security::Epoch,
+    streams: Option<secure_udp::control::Settings>,
     data_epoch: security::Epoch,
     wire: WireBudget,
     work: WorkBudget,
@@ -215,6 +224,8 @@ where D: PacketDevice<Error = io::Error> + AsRawFd + Send;
 Snapshot {
     running: bool, elapsed_micros: u64,
     info: member::Info, configuration: security::ConfigDigest,
+    control_streams: bool, policy_deadline_micros: Option<u64>,
+    policy_receipt_pending: bool,
     send: swift::policy::Direction, receive: swift::policy::Direction,
     committed: swift::policy::Committed, pending: Option<swift::policy::Pending>,
     swift: swift::records::Stats, swift_unconfirmed: usize,

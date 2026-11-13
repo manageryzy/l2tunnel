@@ -325,3 +325,393 @@ impl Profile {
         }
     }
 }
+
+fn enable_streams(runtime: &mut transport::Config) -> io::Result<()> {
+    let mut delivery = runtime.control;
+    delivery.wire_overhead = delivery
+        .wire_overhead
+        .checked_add(l2tunnel_management::control_streams::HEADER_BYTES)
+        .ok_or_else(|| invalid("stream overhead overflow"))?;
+    let transaction = l2tunnel_management::messages::Settings {
+        delivery,
+        path_mtu: runtime.path_mtu,
+        max_message_bytes: 2762,
+        max_outbound_messages: 32,
+        max_outbound_bytes: 1 << 20,
+        max_fragments: 13,
+        max_reassembly_bytes: 65_536,
+        max_incomplete_messages: 1,
+        message_lifetime: Duration::from_secs(30),
+        work_per_call: 64,
+    };
+    let small = l2tunnel_management::messages::Settings {
+        max_message_bytes: 192,
+        max_fragments: 1,
+        ..transaction
+    };
+    runtime.streams = Some(l2tunnel_runtime::secure_udp::control::Settings {
+        streams: [transaction, small, small],
+    });
+    runtime.wire.burst_bytes = runtime
+        .wire
+        .burst_bytes
+        .checked_add(2 * l2tunnel_management::control_streams::HEADER_BYTES)
+        .ok_or_else(|| invalid("stream reserve overflow"))?;
+    Ok(())
+}
+
+fn streamed_sample(
+    appearance: l2tunnel_cover::Appearance,
+) -> io::Result<(Profile, establish::Peers)> {
+    let (base, peers) = sample(appearance)?;
+    let mut initiator = base.initiator;
+    let mut responder = base.responder;
+    enable_streams(&mut initiator)?;
+    enable_streams(&mut responder)?;
+    Ok((
+        Profile::new(
+            base.connection,
+            base.session_with_seed(),
+            initiator,
+            responder,
+        )?,
+        peers,
+    ))
+}
+
+#[test]
+fn legacy_none_keeps_pre_stream_runtime_digest_vectors() -> io::Result<()> {
+    // These vectors freeze the pre-stream native-contract/v1 fixture, including
+    // the original role-specific burst capacities. Selection must remain explicit.
+    for (appearance, expected) in [
+        (
+            l2tunnel_cover::Appearance::QuicLike,
+            [
+                "5200a0f6a179b29423cdee4bae1d9fc73296ad48f5c6a2e5a29df95a45710faa",
+                "df152296cd247c5fe30796a2280c88718c3e3aeb53f05a530ec0fea3b90fd701",
+            ],
+        ),
+        (
+            l2tunnel_cover::Appearance::MediaLike,
+            [
+                "2e18a5b7edd370bfb943941fe890f9873b3727e3767f1e2243e8951459c0ace4",
+                "f46a6365072f4fb68b10c8892f5cb3626b263f4345c84cd1185f46ee4747c4d4",
+            ],
+        ),
+    ] {
+        let (base, _) = sample(appearance)?;
+        for (runtime, expected) in [base.initiator, base.responder].into_iter().zip(expected) {
+            assert!(runtime.streams.is_none());
+            let actual: String = runtime
+                .canonical_digest()?
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_stream_contract_is_bound_by_both_role_profiles_without_fallback() -> io::Result<()> {
+    for appearance in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let (selected, peers) = streamed_sample(appearance)?;
+        let mut legacy_a = selected.initiator;
+        let mut legacy_b = selected.responder;
+        legacy_a.streams = None;
+        legacy_b.streams = None;
+        let legacy = Profile::new(
+            selected.connection,
+            selected.session_with_seed(),
+            legacy_a,
+            legacy_b,
+        )?;
+        assert_ne!(selected.configuration(peers)?, legacy.configuration(peers)?);
+        assert_ne!(
+            selected.settings().application,
+            legacy.settings().application
+        );
+        assert_eq!(selected.initial_policy()?, legacy.initial_policy()?);
+        assert!(
+            Profile::new(
+                selected.connection,
+                selected.session_with_seed(),
+                selected.initiator,
+                legacy_b,
+            )
+            .is_err(),
+            "one selected role must not fall back to the legacy control contract"
+        );
+        let initial = selected.initial_policy()?;
+        let unchanged = selected.with_policy(&initial)?;
+        assert_eq!(
+            selected.configuration(peers)?,
+            unchanged.configuration(peers)?
+        );
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            assert!(selected.runtime(role).streams.is_some());
+            let resolved = selected
+                .resolve(&initial, role, peers)
+                .ok_or_else(|| invalid("selected initial policy resolution"))?;
+            assert_eq!(resolved.digest.0, selected.configuration(peers)?.0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_stream_whole_message_bound_changes_authenticated_profile() -> io::Result<()> {
+    let (base, peers) = streamed_sample(l2tunnel_cover::Appearance::QuicLike)?;
+    for stream in 0..3 {
+        for field in 0..8 {
+            let mut initiator = base.initiator;
+            let mut responder = base.responder;
+            for runtime in [&mut initiator, &mut responder] {
+                let settings = &mut runtime
+                    .streams
+                    .as_mut()
+                    .ok_or_else(|| invalid("missing selected streams"))?
+                    .streams[stream];
+                match field {
+                    0 => settings.max_message_bytes += 1,
+                    1 => settings.max_outbound_messages += 1,
+                    2 => settings.max_outbound_bytes += 1,
+                    3 => settings.max_fragments += 1,
+                    4 => settings.max_reassembly_bytes += 1,
+                    5 => settings.max_incomplete_messages += 1,
+                    6 => settings.message_lifetime += Duration::from_nanos(1),
+                    _ => settings.work_per_call += 1,
+                }
+            }
+            let changed = Profile::new(
+                base.connection,
+                base.session_with_seed(),
+                initiator,
+                responder,
+            )?;
+            assert_ne!(
+                changed.configuration(peers)?,
+                base.configuration(peers)?,
+                "stream {stream} field {field} was omitted from authentication"
+            );
+            assert_eq!(changed.initial_policy()?, base.initial_policy()?);
+            assert!(
+                Profile::new(
+                    base.connection,
+                    base.session_with_seed(),
+                    initiator,
+                    base.responder,
+                )
+                .is_err(),
+                "role mismatch in stream {stream} field {field} was accepted"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_stream_resources_and_contexts_refuse_profile_construction() -> io::Result<()> {
+    let (base, _) = streamed_sample(l2tunnel_cover::Appearance::MediaLike)?;
+    for field in 0..15 {
+        let mut initiator = base.initiator;
+        let mut responder = base.responder;
+        for runtime in [&mut initiator, &mut responder] {
+            let settings = &mut runtime
+                .streams
+                .as_mut()
+                .ok_or_else(|| invalid("missing selected streams"))?
+                .streams[0];
+            match field {
+                0 => settings.max_message_bytes = 0,
+                1 => settings.max_message_bytes = 65_537,
+                2 => settings.max_outbound_messages = 0,
+                3 => settings.max_outbound_messages = 65,
+                4 => settings.max_outbound_bytes = 0,
+                5 => settings.max_outbound_bytes = 16 * 1024 * 1024 + 1,
+                6 => settings.max_fragments = 0,
+                7 => settings.max_reassembly_bytes = 2 * settings.max_message_bytes - 1,
+                8 => settings.max_incomplete_messages = 0,
+                9 => settings.max_incomplete_messages = 65,
+                10 => settings.message_lifetime = Duration::ZERO,
+                11 => settings.work_per_call = 0,
+                12 => settings.work_per_call = 4097,
+                13 => settings.delivery.wire_overhead -= 1,
+                _ => settings.path_mtu -= 1,
+            }
+        }
+        assert!(
+            Profile::new(
+                base.connection,
+                base.session_with_seed(),
+                initiator,
+                responder,
+            )
+            .is_err(),
+            "invalid selected stream field {field} reached a prepared profile"
+        );
+    }
+    let mut initiator = base.initiator;
+    let mut responder = base.responder;
+    initiator.control_epoch = security::Epoch(u64::MAX);
+    responder.control_epoch = security::Epoch(u64::MAX);
+    assert!(
+        Profile::new(
+            base.connection,
+            base.session_with_seed(),
+            initiator,
+            responder,
+        )
+        .is_err(),
+        "stream recovery context arithmetic must reject overflow before device work"
+    );
+    Ok(())
+}
+
+#[test]
+fn streamed_control_requires_exact_additional_wrapper_reserve_and_path_mtu() -> io::Result<()> {
+    for appearance in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let (base, _) = sample(appearance)?;
+        let mut initiator = base.initiator;
+        let mut responder = base.responder;
+        let legacy_reserve = initiator.control.recovery.max_source_bytes
+            + l2tunnel_recovery::DATA_HEADER_BYTES
+            + l2tunnel_recovery::ACK_PACKET_BYTES
+            + 2 * initiator.control.wire_overhead;
+        for runtime in [&mut initiator, &mut responder] {
+            runtime.wire.burst_bytes = runtime.path_mtu + legacy_reserve;
+        }
+        Profile::new(
+            base.connection,
+            base.session_with_seed(),
+            initiator,
+            responder,
+        )?;
+        enable_streams(&mut initiator)?;
+        enable_streams(&mut responder)?;
+        let exact = initiator.path_mtu + legacy_reserve + 16;
+        assert_eq!(initiator.wire.burst_bytes, exact);
+        Profile::new(
+            base.connection,
+            base.session_with_seed(),
+            initiator,
+            responder,
+        )?;
+        for role in 0..2 {
+            let mut too_small_a = initiator;
+            let mut too_small_b = responder;
+            if role == 0 {
+                too_small_a.wire.burst_bytes -= 1;
+            } else {
+                too_small_b.wire.burst_bytes -= 1;
+            }
+            assert!(
+                Profile::new(
+                    base.connection,
+                    base.session_with_seed(),
+                    too_small_a,
+                    too_small_b,
+                )
+                .is_err()
+            );
+        }
+
+        // A control source that fits the original bare recovery contract exactly
+        // must not acquire eight extra protected bytes by silently reducing data.
+        let mut wide_a = base.initiator;
+        let mut wide_b = base.responder;
+        for runtime in [&mut wide_a, &mut wide_b] {
+            runtime.control.recovery.max_source_bytes = runtime.path_mtu
+                - runtime.control.wire_overhead
+                - l2tunnel_recovery::DATA_HEADER_BYTES;
+            let reserve = runtime.control.recovery.max_source_bytes
+                + l2tunnel_recovery::DATA_HEADER_BYTES
+                + l2tunnel_recovery::ACK_PACKET_BYTES
+                + 2 * runtime.control.wire_overhead;
+            runtime.control.bytes_per_interval = 2 * reserve;
+            runtime.wire.burst_bytes = runtime.path_mtu + reserve;
+        }
+        Profile::new(base.connection, base.session_with_seed(), wide_a, wide_b)?;
+        enable_streams(&mut wide_a)?;
+        enable_streams(&mut wide_b)?;
+        assert!(
+            Profile::new(base.connection, base.session_with_seed(), wide_a, wide_b,).is_err(),
+            "selected wrapper must fit the original explicit active MTU"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn streamed_policy_preserves_numeric_range_and_all_fixed_owner_bounds() -> io::Result<()> {
+    for appearance in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let (base, peers) = streamed_sample(appearance)?;
+        let mut policy = base.initial_policy()?;
+        policy.channels = 64;
+        policy.forward_kbit = 10_000_000;
+        policy.reverse_kbit = 64;
+        policy.window = 255;
+        policy.repair_permille = 1000;
+        policy.path_mtu = 1800;
+        let changed = base.with_policy(&policy)?;
+        assert_eq!(changed.initial_policy()?, policy);
+        assert_ne!(changed.configuration(peers)?, base.configuration(peers)?);
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            let original = base
+                .runtime(role)
+                .streams
+                .ok_or_else(|| invalid("missing original streams"))?;
+            let mut expected = original.streams;
+            for settings in &mut expected {
+                settings.path_mtu = usize::from(policy.path_mtu);
+            }
+            let runtime = changed.runtime(role);
+            let actual = runtime
+                .streams
+                .ok_or_else(|| invalid("policy silently removed stream selection"))?;
+            assert_eq!(actual.streams, expected);
+            assert_eq!(runtime.control, base.runtime(role).control);
+            assert_eq!(runtime.wire, base.runtime(role).wire);
+            assert_eq!(
+                runtime.send.records.codec.datagram_bytes,
+                usize::from(policy.path_mtu) - runtime.control.wire_overhead
+            );
+            let resolved = base
+                .resolve(&policy, role, peers)
+                .ok_or_else(|| invalid("numeric selected policy resolution"))?;
+            assert_eq!(resolved.digest.0, changed.configuration(peers)?.0);
+        }
+        let unchanged = changed.with_policy(&policy)?;
+        assert_eq!(
+            unchanged.configuration(peers)?,
+            changed.configuration(peers)?
+        );
+        for field in 0..6 {
+            let mut unsupported = policy;
+            match field {
+                0 => unsupported.channels = 65,
+                1 => unsupported.forward_kbit = 63,
+                2 => unsupported.reverse_kbit = 10_000_001,
+                3 => unsupported.window = 0,
+                4 => unsupported.repair_permille = 1001,
+                _ => unsupported.path_mtu = 2100,
+            }
+            assert!(base.with_policy(&unsupported).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[path = "profile_stream_tests.rs"]
+mod streamed_factories;

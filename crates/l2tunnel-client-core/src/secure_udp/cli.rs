@@ -360,6 +360,7 @@ impl Selection {
                 wire_overhead: overhead,
             },
             control_epoch: security::Epoch(1),
+            streams: None,
             data_epoch: security::Epoch(1),
             wire: burst(send.bytes_per_second)?,
             work: transport::WorkBudget {

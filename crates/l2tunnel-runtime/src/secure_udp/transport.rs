@@ -3,12 +3,14 @@
 //! Device creation and privilege belong to the caller. This Unix driver owns no
 //! side channel and never turns a local configuration edit into a peer switch.
 
-use super::{establish, member};
+use super::{control as control_owner, establish, member};
 use l2tunnel::secure_record::{self as record, Class, Scope};
 use l2tunnel_core as core;
 use l2tunnel_cover as cover;
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
-use l2tunnel_management::{self as mg, delivery, session_control as control};
+use l2tunnel_management::{
+    self as mg, control_streams as streams, delivery, session_control as control,
+};
 use l2tunnel_recovery as recovery;
 use l2tunnel_security as security;
 use l2tunnel_swift::{self as swift, policy, records};
@@ -120,6 +122,7 @@ where
             driver.collect_native(now)?;
             driver.progress(now)?;
             if let Some(reason)=driver.terminal {break Ok(reason);}
+            driver.service_control(now,&resolve)?;
             driver.submit_control(now)?;
             driver.send(&socket,now,instant)?;
             let native_before=driver.performance.counters.native_write_batch_packets;
@@ -337,6 +340,9 @@ pub struct Config {
     pub security: security::Limits,
     /// Fixed reliable control retention, retry and wire service bounds.
     pub control: delivery::Settings,
+    /// Explicit authenticated independent-stream selection; None preserves the
+    /// legacy control bytes and global envelope sequence without fallback.
+    pub streams: Option<control_owner::Settings>,
     /// Immutable nonzero common control scope epoch.
     pub control_epoch: security::Epoch,
     /// Nonzero base common data epoch; logical policy epochs are added to it.
@@ -411,7 +417,7 @@ impl Config {
             .control
             .recovery
             .max_source_bytes
-            .checked_add(recovery::DATA_HEADER_BYTES)
+            .checked_add(recovery::DATA_HEADER_BYTES + self.control_wrapper_bytes())
             .ok_or_else(|| invalid("control source size overflow"))?;
         if maximum > self.security.max_body_bytes {
             return Err(invalid("control exceeds declared common body ceiling"));
@@ -452,6 +458,21 @@ impl Config {
             self.lifetime.lease,
         )
         .map_err(invalid)?;
+        if let Some(settings) = self.streams {
+            settings.validate(self.control, self.path_mtu, self.lifetime.lease)?;
+            for stream in streams::Stream::ALL {
+                streams::delivery_binding(
+                    delivery::Binding {
+                        session: mg::SessionId([1; 16]),
+                        lane: mg::LaneId(LANE),
+                        local_role: mg::Role::Client,
+                        control_epoch: self.control_epoch.0,
+                    },
+                    stream,
+                )
+                .map_err(invalid)?;
+            }
+        }
         Ok(())
     }
     /// Validate actual selected cover and family against full admitted wire limits.
@@ -486,7 +507,11 @@ impl Config {
             .codec
             .datagram_bytes
             .max(self.receive.records.codec.datagram_bytes)
-            .max(self.control.recovery.max_source_bytes + recovery::DATA_HEADER_BYTES);
+            .max(
+                self.control.recovery.max_source_bytes
+                    + recovery::DATA_HEADER_BYTES
+                    + self.control_wrapper_bytes(),
+            );
         if current
             .checked_add(fixed)
             .is_none_or(|bytes| bytes > self.path_mtu)
@@ -498,7 +523,7 @@ impl Config {
             .recovery
             .max_source_bytes
             .checked_add(recovery::DATA_HEADER_BYTES + recovery::ACK_PACKET_BYTES)
-            .and_then(|bytes| bytes.checked_add(2 * fixed))
+            .and_then(|bytes| bytes.checked_add(2 * (fixed + self.control_wrapper_bytes())))
             .ok_or_else(|| invalid("control reserve overflow"))?;
         if self.control.wire_overhead != fixed
             || self
@@ -516,7 +541,11 @@ impl Config {
     pub fn canonical_digest(&self) -> io::Result<core::ConfigDigest> {
         self.validate()?;
         let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(b"l2tunnel/secure-udp-native-contract/v1\0");
+        hash.update(if self.streams.is_some() {
+            b"l2tunnel/secure-udp-native-contract/streamed-v1\0"
+        } else {
+            b"l2tunnel/secure-udp-native-contract/v1\0"
+        });
         let mut number = |value: u64| hash.update(&value.to_be_bytes());
         for direction in [self.send, self.receive] {
             let r = direction.records;
@@ -589,9 +618,51 @@ impl Config {
             number(duration.as_secs());
             number(u64::from(duration.subsec_nanos()));
         }
+        if let Some(settings) = self.streams {
+            number(u64::from(streams::VERSION));
+            number(streams::HEADER_BYTES as u64);
+            for (stream, entry) in streams::Stream::ALL.into_iter().zip(settings.streams) {
+                number(stream as u64);
+                let binding = streams::delivery_binding(
+                    delivery::Binding {
+                        session: mg::SessionId([1; 16]),
+                        lane: mg::LaneId(LANE),
+                        local_role: mg::Role::Client,
+                        control_epoch: self.control_epoch.0,
+                    },
+                    stream,
+                )
+                .map_err(invalid)?;
+                number(binding.control_epoch);
+                // Delivery fields equal the already hashed global base except
+                // this exact wrapper charge; validate rejects any divergence.
+                for value in [
+                    entry.delivery.wire_overhead as u64,
+                    entry.path_mtu as u64,
+                    entry.max_message_bytes as u64,
+                    entry.max_outbound_messages as u64,
+                    entry.max_outbound_bytes as u64,
+                    u64::from(entry.max_fragments),
+                    entry.max_reassembly_bytes as u64,
+                    entry.max_incomplete_messages as u64,
+                    entry.work_per_call as u64,
+                    entry.message_lifetime.as_secs(),
+                    u64::from(entry.message_lifetime.subsec_nanos()),
+                ] {
+                    number(value);
+                }
+            }
+        }
         let mut bytes = [0; 32];
         bytes.copy_from_slice(hash.finish().as_ref());
         Ok(core::ConfigDigest(bytes))
+    }
+    fn control_wrapper_bytes(&self) -> usize {
+        if self.streams.is_some() {
+            streams::HEADER_BYTES
+        } else {
+            0
+        }
     }
 }
 
@@ -680,6 +751,14 @@ pub struct Snapshot {
     pub info: member::Info,
     /// Actual full authenticated configuration digest.
     pub configuration: security::ConfigDigest,
+    /// Selected independent Liveness/SwiftPolicyV1 framing. Generic Management
+    /// and DataFeedback remain unsupported by this Swift runtime. This runtime
+    /// observation does not upgrade the legacy local API schema.
+    pub control_streams: bool,
+    /// Original policy deadline retained through final message custody.
+    pub policy_deadline_micros: Option<u64>,
+    /// A policy source or applied incoming command still awaits custody release.
+    pub policy_receipt_pending: bool,
     /// Current outgoing records/rate.
     pub send: policy::Direction,
     /// Current incoming records/rate.
@@ -747,6 +826,18 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 }
 fn protocol(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+fn envelope_scope(scope: Scope) -> control::Scope {
+    control::Scope {
+        epoch: core::Epoch(scope.epoch.0),
+        digest: core::ConfigDigest(scope.configuration.0),
+    }
+}
+fn policy_reply(outcome: policy::Outcome) -> Result<u64, SwitchError> {
+    match outcome {
+        policy::Outcome::Applied(epoch) => Ok(epoch.0),
+        policy::Outcome::Rejected => Err(SwitchError::Rejected),
+    }
 }
 #[derive(Debug)]
 struct Exhausted;
@@ -853,7 +944,7 @@ struct Native {
 }
 struct PendingPolicy {
     id: policy::OutboundId,
-    source: u64,
+    source: control_owner::Token,
 }
 struct Challenge {
     nonce: u64,
@@ -878,8 +969,11 @@ struct Driver {
     target: Option<Scope>,
     transaction_origin: Option<Scope>,
     resolved: Option<policy::Resolved>,
-    control: delivery::Service,
+    control: control_owner::Owner,
     policy_source: Option<PendingPolicy>,
+    policy_cap: Option<u64>,
+    pending_outcome: Option<policy::Outcome>,
+    control_work: bool,
     waiting: Option<Reply>,
     wire: Vec<u8>,
     seal: Vec<u8>,
@@ -887,9 +981,7 @@ struct Driver {
     plain: Vec<u8>,
     control_wire: Vec<u8>,
     control_input: Vec<u8>,
-    envelope: Vec<u8>,
     frame: Vec<u8>,
-    envelope_tx: u64,
     envelope_rx: u64,
     native: VecDeque<Native>,
     native_bytes: usize,
@@ -902,6 +994,7 @@ struct Driver {
     live: Liveness,
     challenge: Option<Challenge>,
     pong: Option<u64>,
+    pong_deadline: Option<u64>,
     remote_ping: u64,
     next_nonce: u64,
     next_ping: u64,
@@ -1034,14 +1127,17 @@ impl Driver {
         } else {
             mg::Role::Server
         };
-        let control = delivery::Service::new(
+        let control = control_owner::Owner::new(
             config.control,
+            config.streams,
             delivery::Binding {
                 session: mg::SessionId(parts.info.binding.session.0),
                 lane: mg::LaneId(LANE),
                 local_role: role,
                 control_epoch: config.control_epoch.0,
             },
+            envelope_scope(control_scope),
+            envelope_scope(data_scope),
             Duration::ZERO,
             config.lifetime.lease,
         )
@@ -1052,7 +1148,19 @@ impl Driver {
         let reserve = config.control.recovery.max_source_bytes
             + recovery::DATA_HEADER_BYTES
             + recovery::ACK_PACKET_BYTES
-            + 2 * config.control.wire_overhead;
+            + 2 * (config.control.wire_overhead + config.control_wrapper_bytes());
+        let control_packet = control.max_packet_bytes();
+        let control_message =
+            config
+                .streams
+                .map_or(config.control.recovery.max_source_bytes, |settings| {
+                    settings
+                        .streams
+                        .iter()
+                        .map(|entry| entry.max_message_bytes)
+                        .max()
+                        .unwrap_or(0)
+                });
         let lease = add(0, config.lifetime.lease)?;
         origin
             .checked_add(config.lifetime.lease)
@@ -1083,20 +1191,17 @@ impl Driver {
                 resolved: None,
                 control,
                 policy_source: None,
+                policy_cap: None,
+                pending_outcome: None,
+                control_work: false,
                 waiting: None,
                 wire: vec![0; parts.cover.limits().max_packet_bytes],
                 seal: vec![0; capacity.seal_workspace_bytes],
                 open: vec![0; capacity.open_workspace_bytes],
                 plain: vec![0; config.security.max_body_bytes],
-                control_wire: vec![
-                    0;
-                    config.control.recovery.max_source_bytes
-                        + recovery::DATA_HEADER_BYTES
-                ],
-                control_input: vec![0; config.control.recovery.max_source_bytes],
-                envelope: vec![0; config.control.recovery.max_source_bytes],
+                control_wire: vec![0; control_packet],
+                control_input: vec![0; control_message],
                 frame: Vec::with_capacity(swift::control::MAX_FRAME),
-                envelope_tx: 1,
                 envelope_rx: 1,
                 native: VecDeque::with_capacity(config.native.pending_packets),
                 native_bytes: 0,
@@ -1112,6 +1217,7 @@ impl Driver {
                 live: Liveness::default(),
                 challenge: None,
                 pong: None,
+                pong_deadline: None,
                 remote_ping: 0,
                 next_nonce: 1,
                 next_ping: add(0, config.lifetime.ping_interval)?,
@@ -1144,6 +1250,11 @@ impl Driver {
             elapsed_micros: now,
             info: self.info,
             configuration: security::ConfigDigest(self.info.authenticated.configuration),
+            control_streams: self.config.streams.is_some(),
+            policy_deadline_micros: self
+                .policy_cap
+                .or_else(|| self.coordinator.deadline().map(|deadline| deadline.0)),
+            policy_receipt_pending: self.policy_source.is_some() || self.control.has_dispatched(),
             send: self.send,
             receive: self.receive,
             committed: self.coordinator.committed(),
@@ -1197,7 +1308,8 @@ impl Driver {
         }
         let control = self.config.control.recovery.max_source_bytes
             + recovery::DATA_HEADER_BYTES
-            + self.config.control.wire_overhead;
+            + self.config.control.wire_overhead
+            + self.config.control_wrapper_bytes();
         if control > usize::from(requested.path_mtu) {
             return Err(invalid(
                 "policy cannot retain stable control packet service",
@@ -1232,12 +1344,19 @@ impl Driver {
         if self.coordinator.pending().is_some()
             || self.coordinator.outbound().is_some()
             || self.policy_source.is_some()
+            || self.control.has_dispatched()
         {
             return Ok(());
         }
         if let Some(target) = self.target {
             if self.source_scope == target && self.feedback_scope == target {
                 let old = self.records.active_data();
+                self.control.advance_scope(envelope_scope(target))?;
+                match self.control.retire_draining(envelope_scope(old)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                }
                 self.records.activate_data(target).map_err(protocol)?;
                 self.records.retire_data(old).map_err(protocol)?;
             } else if self.source_scope == self.records.active_data()
@@ -1253,6 +1372,7 @@ impl Driver {
         }
         self.transaction_origin = None;
         self.resolved = None;
+        self.policy_cap = None;
         Ok(())
     }
     // This guard has no delivery, policy-completion or refill side effects.
@@ -1285,6 +1405,13 @@ impl Driver {
                 "original native output stall deadline",
             ));
         }
+        if self.policy_cap.is_some_and(|deadline| now >= deadline) {
+            self.terminal = Some(StopReason::PolicyTimeout);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original streamed policy custody deadline",
+            ));
+        }
         if self
             .coordinator
             .deadline()
@@ -1302,14 +1429,12 @@ impl Driver {
             return Ok(());
         }
         if let Some(pending) = &self.policy_source
-            && self
-                .control
-                .source_confirmed(pending.source, duration(now))
-                .map_err(protocol)?
+            && self.control.confirmed(pending.source, duration(now))?
         {
             self.coordinator
                 .complete_outbound(policy::Time(now), pending.id)
                 .map_err(protocol)?;
+            self.control.retire(pending.source, duration(now))?;
             self.policy_source = None;
         }
         let target = self.target;
@@ -1329,15 +1454,23 @@ impl Driver {
         self.coordinator
             .progress(policy::Time(now), &mut hooks)
             .map_err(protocol)?;
-        if let Some(outcome) = self.coordinator.take_outcome()
-            && let Some(reply) = self.waiting.take()
-        {
-            let _ = reply.send(match outcome {
-                policy::Outcome::Applied(epoch) => Ok(epoch.0),
-                policy::Outcome::Rejected => Err(SwitchError::Rejected),
-            });
+        if let Some(outcome) = self.coordinator.take_outcome() {
+            if self.config.streams.is_some() {
+                if self.pending_outcome.replace(outcome).is_some() {
+                    return Err(protocol("another policy outcome still owns custody"));
+                }
+            } else if let Some(reply) = self.waiting.take() {
+                let _ = reply.send(policy_reply(outcome));
+            }
         }
         self.settle_scope()?;
+        if self.config.streams.is_some()
+            && self.policy_cap.is_none()
+            && let Some(outcome) = self.pending_outcome.take()
+            && let Some(reply) = self.waiting.take()
+        {
+            let _ = reply.send(policy_reply(outcome));
+        }
         self.bucket.refill(now)?;
         if now >= self.ingress.refill {
             self.ingress.left = self.config.work.receive_packets;
@@ -1375,6 +1508,7 @@ impl Driver {
         {
             Ok(()) => {
                 self.waiting = Some(reply);
+                self.retain_policy_cap();
                 if self.coordinator.pending().is_some() {
                     self.resolved = resolved;
                     self.transaction_origin = Some(self.source_scope);
@@ -1393,7 +1527,7 @@ impl Driver {
     }
     fn envelope_limits(&self) -> control::Limits {
         control::Limits {
-            max_frame_bytes: self.config.control.recovery.max_source_bytes,
+            max_frame_bytes: self.control_input.len(),
             max_management_bytes: mg::HEADER_LEN,
             max_feedback_bytes: 1,
         }
@@ -1410,38 +1544,26 @@ impl Driver {
         now: u64,
         scope: Scope,
         body: control::Body<'_>,
-    ) -> io::Result<Option<u64>> {
-        let next = self.envelope_tx.checked_add(1).ok_or_else(exhausted)?;
-        let envelope = control::Envelope {
-            binding: control::Binding {
-                session: mg::SessionId(self.info.binding.session.0),
-                lane: mg::LaneId(LANE),
-                sender: self.role(),
-                packet: mg::PacketNumber(self.envelope_tx),
-                scope: control::Scope {
-                    epoch: core::Epoch(scope.epoch.0),
-                    digest: core::ConfigDigest(scope.configuration.0),
-                },
-            },
+        deadline: u64,
+        auto_retire: bool,
+    ) -> io::Result<Option<control_owner::Token>> {
+        self.control.submit(
+            envelope_scope(scope),
             body,
-        };
-        let limits = self.envelope_limits();
-        let length = envelope
-            .encode(&mut self.envelope, limits)
-            .map_err(protocol)?;
-        match self.control.submit(&self.envelope[..length], duration(now)) {
-            Ok(source) => {
-                self.envelope_tx = next;
-                Ok(Some(source))
-            }
-            Err(delivery::Error::Recovery(recovery::RecoveryError::Capacity(
-                recovery::BufferSide::Send,
-            ))) => Ok(None),
-            Err(error) => Err(protocol(error)),
+            duration(now),
+            duration(deadline),
+            auto_retire,
+        )
+    }
+    fn retain_policy_cap(&mut self) {
+        if self.config.streams.is_some() {
+            let deadline = self.coordinator.deadline().map(|deadline| deadline.0);
+            self.policy_cap = self.policy_cap.into_iter().chain(deadline).min();
         }
     }
     fn submit_control(&mut self, now: u64) -> io::Result<()> {
-        // One retained ARQ source owns each policy token until a verified receipt.
+        // Retain each policy token until the selected backend proves its exact
+        // custody: legacy source ACK or streamed complete-message confirmation.
         if self.policy_source.is_none()
             && let Some(outbound) = self.coordinator.outbound()
         {
@@ -1460,11 +1582,16 @@ impl Driver {
                     tag: control::ProfileTag::SwiftPolicyV1,
                     bytes: &bytes[..length],
                 },
+                self.policy_cap
+                    .or_else(|| self.coordinator.deadline().map(|deadline| deadline.0))
+                    .unwrap_or(self.lease),
+                false,
             )? {
                 self.policy_source = Some(PendingPolicy {
                     id: outbound.id,
                     source,
                 });
+                self.retain_policy_cap();
             }
         }
         if let Some(nonce) = self.pong
@@ -1473,10 +1600,13 @@ impl Driver {
                     now,
                     self.records.control_scope(),
                     control::Body::Pong { nonce },
+                    self.pong_deadline.unwrap_or(self.lease),
+                    true,
                 )?
                 .is_some()
         {
             self.pong = None;
+            self.pong_deadline = None;
         }
         if self.challenge.is_none() && now >= self.next_ping {
             let nonce = self.next_nonce;
@@ -1490,16 +1620,18 @@ impl Driver {
             self.live.outstanding = Some(nonce);
             self.live.deadline_micros = Some(deadline);
         }
-        if let Some(nonce) = self
+        if let Some((nonce, deadline)) = self
             .challenge
             .as_ref()
             .filter(|challenge| !challenge.submitted)
-            .map(|challenge| challenge.nonce)
+            .map(|challenge| (challenge.nonce, challenge.deadline))
             && self
                 .submit(
                     now,
                     self.records.control_scope(),
                     control::Body::Ping { nonce },
+                    deadline,
+                    true,
                 )?
                 .is_some()
             && let Some(challenge) = &mut self.challenge
@@ -1522,6 +1654,13 @@ impl Driver {
         {
             return Err(protocol("profile command has another data-policy origin"));
         }
+        if self.config.streams.is_some() && self.policy_cap.is_none() {
+            self.policy_cap = Some(
+                now.checked_add(self.config.policy.transaction_micros)
+                    .ok_or_else(exhausted)?
+                    .min(self.lease),
+            );
+        }
         let was_pending = self.coordinator.pending().is_some();
         let candidate = if let swift::control::Message::Propose { policy, .. } = message {
             resolve(&policy).filter(|value| self.validate_resolution(&policy, *value).is_ok())
@@ -1542,6 +1681,7 @@ impl Driver {
         self.coordinator
             .receive(policy::Time(now), message, |_| candidate, &mut hooks)
             .map_err(protocol)?;
+        self.retain_policy_cap();
         if self.transaction_origin.is_none() {
             self.transaction_origin = Some(scope);
         }
@@ -1551,17 +1691,42 @@ impl Driver {
         }
         Ok(())
     }
+    fn service_control(&mut self, now: u64, resolve: &Resolver) -> io::Result<()> {
+        if self.config.streams.is_some()
+            && (self.control_work
+                || self
+                    .control
+                    .ready_for_dispatch(self.target.map(envelope_scope))?)
+        {
+            self.delivered_control(now, resolve)?;
+        }
+        Ok(())
+    }
     fn delivered_control(&mut self, now: u64, resolve: &Resolver) -> io::Result<()> {
+        self.control_work = false;
         // ARQ receive retention bounds this whole loop. All delivered commands are
         // validated/applied before any poll is allowed to encode their receipts.
         for _ in 0..self.config.control.recovery.receive_records {
-            let Some((_, length)) = self
-                .control
-                .deliver(&mut self.control_input, duration(now))
-                .map_err(protocol)?
+            if self.config.streams.is_some() {
+                self.progress(now)?;
+            }
+            let deferred = self.target.map(envelope_scope);
+            let Some(incoming) = self.control.next_with_deferred_scope(
+                duration(now),
+                &mut self.control_input,
+                deferred,
+            )?
             else {
+                if self.config.streams.is_some() {
+                    let before = self.target;
+                    self.progress(now)?;
+                    if before.is_some() && self.target.is_none() {
+                        continue;
+                    }
+                }
                 return Ok(());
             };
+            let length = incoming.bytes;
             let envelope =
                 control::Envelope::decode(&self.control_input[..length], self.envelope_limits())
                     .map_err(protocol)?;
@@ -1569,7 +1734,7 @@ impl Driver {
             if binding.session != mg::SessionId(self.info.binding.session.0)
                 || binding.lane != mg::LaneId(LANE)
                 || binding.sender != self.remote()
-                || binding.packet.0 != self.envelope_rx
+                || (incoming.stream.is_none() && binding.packet.0 != self.envelope_rx)
             {
                 return Err(protocol("ordered authenticated control binding"));
             }
@@ -1609,12 +1774,16 @@ impl Driver {
                     ));
                 }
             };
-            self.envelope_rx = self.envelope_rx.checked_add(1).ok_or_else(exhausted)?;
+            if incoming.stream.is_none() {
+                self.envelope_rx = self.envelope_rx.checked_add(1).ok_or_else(exhausted)?;
+            }
             match command {
                 Command::Ping(nonce) => {
                     if nonce > self.remote_ping {
                         self.remote_ping = nonce;
                         self.pong = Some(nonce);
+                        self.pong_deadline =
+                            Some(add(now, self.config.lifetime.pong_timeout)?.min(self.lease));
                     }
                 }
                 Command::Pong(nonce) => {
@@ -1630,7 +1799,10 @@ impl Driver {
                 }
                 Command::Profile(message) => self.profile(now, scope, message, resolve)?,
             }
+            self.control.accepted(incoming, duration(now))?;
+            self.retain_policy_cap();
         }
+        self.control_work = self.config.streams.is_some();
         Ok(())
     }
     fn receive(
@@ -2118,9 +2290,23 @@ impl Driver {
     }
     fn wake(&self, now: u64) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if self.config.streams.is_some()
+            && (self.control_work
+                || self
+                    .control
+                    .ready_for_dispatch(self.target.map(envelope_scope))?)
+        {
+            wake = wake.min(now);
+        }
         for at in [
             self.challenge.as_ref().map(|value| value.deadline),
             self.coordinator.deadline().map(|value| value.0),
+            self.policy_cap,
+            Some(u64::try_from(self.control.expiry().as_micros()).map_err(invalid)?),
+            self.control
+                .pending_deadline()
+                .map(|deadline| u64::try_from(deadline.as_micros()).map_err(invalid))
+                .transpose()?,
             self.native
                 .front()
                 .map(|packet| add(packet.since, self.config.native.stall_timeout))

@@ -224,6 +224,13 @@ impl Profile {
         let mut responder = self.responder;
         initiator.path_mtu = usize::from(selected.path_mtu);
         responder.path_mtu = usize::from(selected.path_mtu);
+        for runtime in [&mut initiator, &mut responder] {
+            if let Some(streams) = &mut runtime.streams {
+                for settings in &mut streams.streams {
+                    settings.path_mtu = runtime.path_mtu;
+                }
+            }
+        }
         initiator.send = update(initiator.send, true)?;
         initiator.receive = update(initiator.receive, false)?;
         responder.send = update(responder.send, false)?;

@@ -20,13 +20,17 @@ All deployable Python mode families are requirements, including unfavorable mode
 
 The target [common secure session](modules/secure-session.md) and explicitly
 selected carrier are composition boundaries around these algorithms, not a
-replacement inventory. Swift remains a reusable packing/recovery algorithm;
-its current separate TCP/TLS-bootstrap and protected-UDP client path does not
-qualify selected-carrier continuity, common security or another mode family.
+replacement inventory. Swift remains a reusable packing/recovery algorithm.
+Its historical separate TCP/TLS-bootstrap path is distinct from the newer
+same-socket common-UDP integration; neither qualifies another mode family.
 RLNC, parity, rolling, packed, proxy and every catalog entry remain in scope.
 Negotiated switching between Swift and the other record profiles retains the
 full SW-11 gate; changing Swift's own policy under SW-13 is only an internal
 policy operation and does not satisfy cross-profile parity or switching.
+The explicit [streamed-control runtime checkpoint](modules/streamed-swift-control.md)
+retains that same boundary: SwiftPolicyV1 and independent Liveness are actual
+adapter functions; generic Management/DataFeedback and other record engines remain
+open requirements. It changes none of the 47 catalog acceptance definitions.
 
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s

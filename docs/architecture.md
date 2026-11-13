@@ -130,6 +130,14 @@ committing its envelope sequence; borrowed message proofs distinguish queued
 acceptance from peer-confirmed whole messages. This does not switch a native data
 profile, enable the contract in the selected service or qualify full SCS-05/SW-11.
 
+The subsequent [explicit Swift runtime backend](modules/streamed-swift-control.md)
+composes independent control streams in the actual original-socket driver and
+authenticated client Profile. Whole-message custody and original operation caps
+remain after a Swift policy outcome; target-scope commands wait for actual reader
+settlement while Liveness continues. The focused and required frozen-source workspace checks pass. This is
+explicit embedding selection, with unchanged CLI defaults and local API schemas;
+generic Management/DataFeedback, full SW-11 and native saturation remain open.
+
 ## Library boundary and layering
 
 ```mermaid

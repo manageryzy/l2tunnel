@@ -1,7 +1,9 @@
 # Explicit authenticated control streams
 
 Status: additive pure implementation with protocol and both-cover original-socket
-tests; no current runtime selects it. This refines FIX-11 and SEC-07 without changing legacy L2SC/L2MC bytes,
+tests. An explicitly selected [Swift runtime backend](streamed-swift-control.md)
+now composes these owners; focused qualification is in progress and CLI defaults
+remain legacy. This refines FIX-11 and SEC-07 without changing legacy L2SC/L2MC bytes,
 default carrier, common security owners or full SW-11 scope. It is not an owner
 decision about the final public wire protocol.
 
@@ -118,7 +120,7 @@ delayed copies of the original ARQ sources remain below semantic dispatch.
 - [x] [SCS-04] Compose independently bounded existing fragmentation/ARQ owners with one shared allowance; prove liveness progress while a transaction remains incomplete beyond 128 liveness envelopes. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
 - [ ] [SCS-05] Integrate exact cached-retry permits, staged/retired origin authority, absolute expiry and final-reply custody with the existing generic transaction owner. Progress: [leased generic core and actual message custody](#leased-transaction-checkpoint) are protocol-tested; selected-profile staged authority and complete adapter lifecycle remain unqualified.
 - [x] [SCS-06] Fault-test loss, duplication, reorder, binding/replay/exhaustion, capacity and stale-scope failures without modifying legacy vectors. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
-- [ ] [SCS-07] Integrate and qualify actual selected-carrier scheduling, both covers, saturated user/native traffic, complete mode switches, liveness and shared API reporting.
+- [ ] [SCS-07] Integrate and qualify actual selected-carrier scheduling, both covers, saturated user/native traffic, complete mode switches, liveness and shared API reporting. Progress: [explicit streamed Swift runtime custody](streamed-swift-control.md) passes finite original-socket tests; generic/cross-profile dispatch, shared frontend status and saturated native qualification remain open.
 - [x] [SCS-08] Pass focused and required aggregate checks with frozen sources and preserved failures; distinguish protocol fixtures from native/platform/ISP qualification. Evidence: [required pass](../../work/leased-control-20261113/aggregate-attempt-1/validation.json).
 
 The [whole-message ledger](control-messages.md) tracks payload custody. These

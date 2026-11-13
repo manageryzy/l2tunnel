@@ -589,6 +589,16 @@ impl Owner {
         if self.idle_actions < self.idle_limit() {
             return self.last_now;
         }
+        self.expiry().min(self.service.deadline())
+    }
+
+    /// Earliest immutable session/message/assembly expiry, independent of work
+    /// readiness and ARQ retries. A shared scheduler must not delay this bound
+    /// merely because its emission quota cannot refill yet.
+    pub fn expiry(&self) -> Duration {
+        if self.failed.is_some() {
+            return self.last_now;
+        }
         let partial = self
             .reassembler
             .deadline()
@@ -599,9 +609,19 @@ impl Owner {
             .map(|entry| entry.deadline)
             .chain(self.held.iter().map(|held| held.deadline))
             .chain(partial)
-            .chain([self.service.deadline(), self.expires])
+            .chain([self.expires])
             .min()
             .unwrap_or(self.expires)
+    }
+
+    /// Earliest internal-work, expiry or ARQ wake fitting an unchanged outer
+    /// byte allowance. Its refill is a separate trigger owned by the scheduler.
+    pub fn deadline_with_allowance(&self, allowance: usize) -> Duration {
+        if self.failed.is_some() || self.idle_actions < self.idle_limit() {
+            return self.last_now;
+        }
+        self.expiry()
+            .min(self.service.deadline_with_allowance(allowance))
     }
 
     /// Current bounded payload retention, including the reserved completion slot.

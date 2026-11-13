@@ -1,0 +1,950 @@
+//! Explicit control-backend ownership without a socket or cryptographic owner.
+//!
+//! The caller authenticates Control records before ingress and dispatches exact
+//! presented envelopes before accepting them. Streamed completion means whole
+//! message custody, never an applied policy or a generic mode transaction.
+
+use l2tunnel_management::{
+    self as mg, control_streams as streams, delivery, messages, session_control as sc,
+};
+use l2tunnel_recovery as recovery;
+use std::{io, time::Duration};
+
+/// Explicit per-stream storage/recovery bounds under one shared service budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Settings {
+    /// Transaction, Liveness and DataFeedback settings in that fixed order.
+    pub streams: [messages::Settings; 3],
+}
+
+impl Settings {
+    /// Validate actual owners, exact wrapper overhead and complete path geometry.
+    /// Message lifetimes may exceed the session; each owner clamps its expiry.
+    pub fn validate(
+        self,
+        base: delivery::Settings,
+        path_mtu: usize,
+        lifetime: Duration,
+    ) -> io::Result<()> {
+        streams::Limits {
+            max_packet_bytes: base
+                .recovery
+                .max_source_bytes
+                .checked_add(recovery::DATA_HEADER_BYTES)
+                .ok_or_else(|| invalid("control packet size overflow"))?,
+        }
+        .validate()
+        .map_err(invalid)?;
+        let expected = delivery::Settings {
+            wire_overhead: base
+                .wire_overhead
+                .checked_add(streams::HEADER_BYTES)
+                .ok_or_else(|| invalid("stream wrapper overhead overflow"))?,
+            ..base
+        };
+        let binding = delivery::Binding {
+            session: mg::SessionId([1; 16]),
+            lane: mg::LaneId(0),
+            local_role: mg::Role::Client,
+            control_epoch: 1,
+        };
+        for (stream, settings) in streams::Stream::ALL.into_iter().zip(self.streams) {
+            if settings.delivery != expected || settings.path_mtu != path_mtu {
+                return Err(invalid(
+                    "stream settings must preserve base service bounds and exact wrapper geometry",
+                ));
+            }
+            envelope_limits(settings.max_message_bytes)?;
+            let chunk = base
+                .recovery
+                .max_source_bytes
+                .checked_sub(1 + l2tunnel_codec::FRAGMENT_HEADER_BYTES)
+                .filter(|chunk| *chunk > 0)
+                .ok_or_else(|| invalid("control fragment has no payload capacity"))?;
+            if settings.max_message_bytes.div_ceil(chunk) > usize::from(settings.max_fragments) {
+                return Err(invalid(
+                    "fragment bound cannot carry the declared whole-message ceiling",
+                ));
+            }
+            messages::Owner::new(
+                settings,
+                streams::delivery_binding(binding, stream).map_err(invalid)?,
+                Duration::ZERO,
+                lifetime,
+            )
+            .map_err(invalid)?;
+        }
+        Ok(())
+    }
+}
+
+/// Opaque ownership of an admitted original source or complete message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Token {
+    binding: delivery::Binding,
+    kind: TokenKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenKind {
+    Legacy(u64),
+    Streamed {
+        stream: streams::Stream,
+        ticket: messages::Ticket,
+    },
+}
+
+/// One exact envelope presented once for the caller's semantic dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Incoming {
+    pub token: Token,
+    pub bytes: usize,
+    pub stream: Option<streams::Stream>,
+}
+
+struct Legacy {
+    service: delivery::Service,
+    next: u64,
+    envelope: Vec<u8>,
+    limits: sc::Limits,
+}
+
+struct Outgoing {
+    token: Token,
+    scope: sc::Scope,
+    deadline: Duration,
+    auto_retire: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Held {
+    incoming: Incoming,
+    scope: sc::Scope,
+    deadline: Duration,
+    dispatched: bool,
+}
+
+struct Streamed {
+    owners: [messages::Owner; 3],
+    gate: streams::gate::Gate,
+    settings: Settings,
+    next: [u64; 3],
+    outgoing: [Vec<Outgoing>; 3],
+    held: [Option<Held>; 3],
+    control_scope: sc::Scope,
+    active: sc::Scope,
+    draining: Option<sc::Scope>,
+    envelope: Vec<u8>,
+    raw: Vec<u8>,
+    poll_cursor: usize,
+    receive_cursor: usize,
+    auto_cursor: usize,
+    quota: delivery::Settings,
+    refill: Duration,
+    packets_left: u32,
+    bytes_left: usize,
+}
+
+enum Backend {
+    Legacy(Box<Legacy>),
+    Streamed(Box<Streamed>),
+}
+
+/// Selected bounded control transport; all actual I/O remains with its caller.
+pub(crate) struct Owner {
+    backend: Backend,
+    binding: delivery::Binding,
+    expires: Duration,
+    now: Duration,
+    max_packet: usize,
+}
+
+impl Owner {
+    #[allow(clippy::too_many_arguments)] // The frozen boundary names each independent context.
+    pub(crate) fn new(
+        base: delivery::Settings,
+        selected: Option<Settings>,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+    ) -> io::Result<Self> {
+        let raw = base
+            .recovery
+            .max_source_bytes
+            .checked_add(recovery::DATA_HEADER_BYTES)
+            .ok_or_else(|| invalid("control packet size overflow"))?;
+        let (backend, max_packet) = if let Some(settings) = selected {
+            let lifetime = expires
+                .checked_sub(now)
+                .ok_or_else(|| invalid("control already expired"))?;
+            settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
+            let owners = streams::Stream::ALL
+                .into_iter()
+                .zip(settings.streams)
+                .map(|(stream, settings)| {
+                    messages::Owner::new(
+                        settings,
+                        streams::delivery_binding(binding, stream).map_err(invalid)?,
+                        now,
+                        expires,
+                    )
+                    .map_err(invalid)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let owners: [messages::Owner; 3] = owners
+                .try_into()
+                .map_err(|_| invalid("control stream count"))?;
+            let maximum = settings
+                .streams
+                .iter()
+                .map(|settings| settings.max_message_bytes)
+                .max()
+                .ok_or_else(|| invalid("missing control streams"))?;
+            let gate = streams::gate::Gate::new(streams::gate::GateSettings {
+                binding: sc::PeerBinding {
+                    session: binding.session,
+                    remote_role: opposite(binding.local_role),
+                    control_lane: binding.lane,
+                    data_lanes: [Some(binding.lane), None],
+                },
+                control: control_scope,
+                active: policy(data_scope),
+                limits: envelope_limits(maximum)?,
+            })
+            .map_err(invalid)?;
+            let size = raw
+                .checked_add(streams::HEADER_BYTES)
+                .ok_or_else(|| invalid("wrapper size overflow"))?;
+            (
+                Backend::Streamed(Box::new(Streamed {
+                    owners,
+                    gate,
+                    settings,
+                    next: [1; 3],
+                    outgoing: std::array::from_fn(|i| {
+                        Vec::with_capacity(settings.streams[i].max_outbound_messages)
+                    }),
+                    held: [None; 3],
+                    control_scope,
+                    active: data_scope,
+                    draining: None,
+                    envelope: vec![0; maximum],
+                    raw: vec![0; raw],
+                    poll_cursor: 0,
+                    receive_cursor: 0,
+                    auto_cursor: 0,
+                    quota: base,
+                    refill: now,
+                    packets_left: 0,
+                    bytes_left: 0,
+                })),
+                size,
+            )
+        } else {
+            let limits = sc::Limits {
+                max_frame_bytes: base.recovery.max_source_bytes,
+                max_management_bytes: mg::HEADER_LEN,
+                max_feedback_bytes: 1,
+            };
+            limits.validate().map_err(invalid)?;
+            (
+                Backend::Legacy(Box::new(Legacy {
+                    service: delivery::Service::new(base, binding, now, expires)
+                        .map_err(invalid)?,
+                    next: 1,
+                    envelope: vec![0; base.recovery.max_source_bytes],
+                    limits,
+                })),
+                raw,
+            )
+        };
+        Ok(Self {
+            backend,
+            binding,
+            expires,
+            now,
+            max_packet,
+        })
+    }
+
+    pub(crate) fn max_packet_bytes(&self) -> usize {
+        self.max_packet
+    }
+
+    /// Reserve one immutable envelope only when the actual source/message owner accepts it.
+    /// A refused admission consumes no envelope or submission identity.
+    /// Streamed custody receives its own immutable expiry bounded by the caller's
+    /// original operation cap; this does not replace that operation's deadline.
+    pub(crate) fn submit(
+        &mut self,
+        scope: sc::Scope,
+        body: sc::Body<'_>,
+        now: Duration,
+        original_deadline: Duration,
+        auto_retire: bool,
+    ) -> io::Result<Option<Token>> {
+        self.observe(now)?;
+        match &mut self.backend {
+            Backend::Legacy(legacy) => {
+                let next = legacy.next.checked_add(1).ok_or_else(exhausted)?;
+                let envelope = sc::Envelope {
+                    binding: envelope_binding(self.binding, legacy.next, scope),
+                    body,
+                };
+                let length = envelope
+                    .encode(&mut legacy.envelope, legacy.limits)
+                    .map_err(protocol)?;
+                match legacy.service.submit(&legacy.envelope[..length], now) {
+                    Ok(source) => {
+                        legacy.next = next;
+                        Ok(Some(Token {
+                            binding: self.binding,
+                            kind: TokenKind::Legacy(source),
+                        }))
+                    }
+                    Err(delivery::Error::Recovery(recovery::RecoveryError::Capacity(
+                        recovery::BufferSide::Send,
+                    ))) => Ok(None),
+                    Err(error) => Err(protocol(error)),
+                }
+            }
+            Backend::Streamed(streamed) => {
+                let stream = outgoing_stream(body)?;
+                let i = index(stream);
+                if auto_retire && stream != streams::Stream::Liveness {
+                    return Err(invalid("profile tokens require explicit completion"));
+                }
+                if (stream == streams::Stream::Liveness && scope != streamed.control_scope)
+                    || (stream == streams::Stream::Transaction
+                        && scope != streamed.active
+                        && Some(scope) != streamed.draining)
+                {
+                    return Err(invalid("outgoing control origin is not registered"));
+                }
+                let next = streamed.next[i].checked_add(1).ok_or_else(exhausted)?;
+                let deadline = now
+                    .checked_add(streamed.settings.streams[i].message_lifetime)
+                    .ok_or_else(exhausted)?
+                    .min(original_deadline)
+                    .min(self.expires);
+                let envelope = sc::Envelope {
+                    binding: envelope_binding(self.binding, streamed.next[i], scope),
+                    body,
+                };
+                let length = envelope
+                    .encode(
+                        &mut streamed.envelope,
+                        envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                    )
+                    .map_err(protocol)?;
+                match streamed.owners[i].submit(
+                    messages::SubmissionId(streamed.next[i]),
+                    &streamed.envelope[..length],
+                    now,
+                    deadline,
+                ) {
+                    Ok(ticket) => {
+                        let token = Token {
+                            binding: self.binding,
+                            kind: TokenKind::Streamed { stream, ticket },
+                        };
+                        streamed.outgoing[i].push(Outgoing {
+                            token,
+                            scope,
+                            deadline,
+                            auto_retire,
+                        });
+                        streamed.next[i] = next;
+                        Ok(Some(token))
+                    }
+                    Err(messages::Error::Backpressure) => Ok(None),
+                    Err(error) => Err(protocol(error)),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn confirmed(&mut self, token: Token, now: Duration) -> io::Result<bool> {
+        self.check_token(token)?;
+        self.observe(now)?;
+        match (&mut self.backend, token.kind) {
+            (Backend::Legacy(legacy), TokenKind::Legacy(source)) => legacy
+                .service
+                .source_confirmed(source, now)
+                .map_err(protocol),
+            (Backend::Streamed(streamed), TokenKind::Streamed { stream, ticket }) => streamed
+                .owners[index(stream)]
+            .confirmed(ticket, now)
+            .map_err(protocol),
+            _ => Err(invalid("control token belongs to another backend")),
+        }
+    }
+
+    pub(crate) fn retire(&mut self, token: Token, now: Duration) -> io::Result<()> {
+        self.check_token(token)?;
+        self.observe(now)?;
+        match (&mut self.backend, token.kind) {
+            (Backend::Legacy(_), TokenKind::Legacy(_)) => Ok(()),
+            (Backend::Streamed(streamed), TokenKind::Streamed { stream, ticket }) => {
+                let i = index(stream);
+                streamed.owners[i].retire(ticket, now).map_err(protocol)?;
+                streamed.outgoing[i].retain(|entry| entry.token != token);
+                Ok(())
+            }
+            _ => Err(invalid("control token belongs to another backend")),
+        }
+    }
+
+    pub(crate) fn receive(
+        &mut self,
+        verified: mg::Ingress,
+        bytes: &[u8],
+        now: Duration,
+    ) -> io::Result<()> {
+        verify(self.binding, verified)?;
+        self.observe(now)?;
+        match &mut self.backend {
+            Backend::Legacy(legacy) => legacy
+                .service
+                .receive(verified, bytes, now)
+                .map_err(protocol),
+            Backend::Streamed(streamed) => {
+                let frame = streams::Frame::decode(
+                    bytes,
+                    streams::Limits {
+                        max_packet_bytes: self.max_packet - streams::HEADER_BYTES,
+                    },
+                )
+                .map_err(protocol)?;
+                streamed.owners[index(frame.stream)]
+                    .receive(verified, frame.packet, now)
+                    .map_err(protocol)
+            }
+        }
+    }
+
+    /// Copy and present a held envelope once; semantic dispatch remains external.
+    #[cfg(test)]
+    pub(crate) fn next(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+    ) -> io::Result<Option<Incoming>> {
+        self.next_with_deferred_scope(now, output, None)
+    }
+
+    /// Retain a pending command for the actual staged target until its reader
+    /// activates. Deferral grants no scope authority and does not block Liveness.
+    pub(crate) fn next_with_deferred_scope(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        deferred: Option<sc::Scope>,
+    ) -> io::Result<Option<Incoming>> {
+        self.observe(now)?;
+        match &mut self.backend {
+            Backend::Legacy(legacy) => Ok(legacy
+                .service
+                .deliver(output, now)
+                .map_err(protocol)?
+                .map(|(source, bytes)| Incoming {
+                    token: Token {
+                        binding: self.binding,
+                        kind: TokenKind::Legacy(source),
+                    },
+                    bytes,
+                    stream: None,
+                })),
+            Backend::Streamed(streamed) => {
+                for offset in 0..3 {
+                    let i = (streamed.receive_cursor + offset) % 3;
+                    if streamed.held[i].is_some() {
+                        continue;
+                    }
+                    let Some(delivery) = streamed.owners[i].pending() else {
+                        continue;
+                    };
+                    let stream = streams::Stream::ALL[i];
+                    let envelope = sc::Envelope::decode(
+                        delivery.bytes(),
+                        envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                    )
+                    .map_err(protocol)?;
+                    if outgoing_stream(envelope.body)? != stream {
+                        return Err(protocol("control body was substituted across streams"));
+                    }
+                    let scope = envelope.binding.scope;
+                    if stream == streams::Stream::Transaction && deferred == Some(scope) {
+                        continue;
+                    }
+                    let bytes = delivery.bytes().len();
+                    let ticket = delivery.ticket();
+                    let deadline = delivery.deadline();
+                    let target = output
+                        .get_mut(..bytes)
+                        .ok_or_else(|| invalid("control completion output is too small"))?;
+                    target.copy_from_slice(delivery.bytes());
+                    streamed
+                        .gate
+                        .admit(
+                            mg::Ingress::AuthenticatedManagement {
+                                session: self.binding.session,
+                                lane: self.binding.lane,
+                                sender: opposite(self.binding.local_role),
+                            },
+                            stream,
+                            target,
+                        )
+                        .map_err(protocol)?;
+                    let incoming = Incoming {
+                        token: Token {
+                            binding: self.binding,
+                            kind: TokenKind::Streamed { stream, ticket },
+                        },
+                        bytes,
+                        stream: Some(stream),
+                    };
+                    streamed.held[i] = Some(Held {
+                        incoming,
+                        scope,
+                        deadline,
+                        dispatched: false,
+                    });
+                    streamed.receive_cursor = (i + 1) % 3;
+                    return Ok(Some(incoming));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Observe complete unpresented messages without advancing work or the gate.
+    /// A staged-origin command remains ineligible; this is a scheduling hint,
+    /// never authentication, semantic acceptance or a reason to extend expiry.
+    pub(crate) fn ready_for_dispatch(&self, deferred: Option<sc::Scope>) -> io::Result<bool> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return Ok(false);
+        };
+        for (i, stream) in streams::Stream::ALL.into_iter().enumerate() {
+            if streamed.held[i].is_some() {
+                continue;
+            }
+            let Some(delivery) = streamed.owners[i].pending() else {
+                continue;
+            };
+            let envelope = sc::Envelope::decode(
+                delivery.bytes(),
+                envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+            )
+            .map_err(protocol)?;
+            if outgoing_stream(envelope.body)? != stream {
+                return Err(protocol("control body was substituted across streams"));
+            }
+            if stream != streams::Stream::Transaction || deferred != Some(envelope.binding.scope) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mark successful semantic dispatch and retain receipt admission across pressure.
+    pub(crate) fn accepted(&mut self, incoming: Incoming, now: Duration) -> io::Result<()> {
+        self.check_token(incoming.token)?;
+        self.observe(now)?;
+        match (&mut self.backend, incoming.token.kind) {
+            (Backend::Legacy(_), TokenKind::Legacy(_)) => Ok(()),
+            (Backend::Streamed(streamed), TokenKind::Streamed { stream, ticket }) => {
+                let i = index(stream);
+                let held = streamed.held[i]
+                    .as_mut()
+                    .filter(|held| held.incoming == incoming)
+                    .ok_or_else(|| invalid("unknown presented control message"))?;
+                held.dispatched = true;
+                match streamed.owners[i].accept(ticket, now) {
+                    Ok(()) => {
+                        streamed.held[i] = None;
+                        Ok(())
+                    }
+                    Err(messages::Error::Backpressure) => Ok(()),
+                    Err(error) => Err(protocol(error)),
+                }
+            }
+            _ => Err(invalid("control token belongs to another backend")),
+        }
+    }
+
+    /// Emit one attempt inside the original shared control interval and wire allowance.
+    pub(crate) fn poll(
+        &mut self,
+        now: Duration,
+        allowance: usize,
+        output: &mut [u8],
+    ) -> io::Result<Option<delivery::Emission>> {
+        self.observe(now)?;
+        if output.len() < self.max_packet {
+            return Err(invalid("control packet output is too small"));
+        }
+        match &mut self.backend {
+            Backend::Legacy(legacy) => legacy
+                .service
+                .poll(now, allowance, output)
+                .map_err(protocol),
+            Backend::Streamed(streamed) => {
+                if now >= streamed.refill {
+                    streamed.refill = now
+                        .checked_add(streamed.quota.interval)
+                        .ok_or_else(exhausted)?
+                        .min(self.expires);
+                    streamed.packets_left = streamed.quota.packets_per_interval;
+                    streamed.bytes_left = streamed.quota.bytes_per_interval;
+                }
+                let available = allowance.min(streamed.bytes_left);
+                if streamed.packets_left == 0 {
+                    return Ok(None);
+                }
+                for offset in 0..3 {
+                    let i = (streamed.poll_cursor + offset) % 3;
+                    if let Some(emission) = streamed.owners[i]
+                        .poll(now, available, &mut streamed.raw)
+                        .map_err(protocol)?
+                    {
+                        let stream = streams::Stream::ALL[i];
+                        let bytes = streams::Frame {
+                            stream,
+                            packet: &streamed.raw[..emission.bytes],
+                        }
+                        .encode(
+                            output,
+                            streams::Limits {
+                                max_packet_bytes: streamed.raw.len(),
+                            },
+                        )
+                        .map_err(protocol)?;
+                        streamed.packets_left -= 1;
+                        streamed.bytes_left -= emission.wire_bytes;
+                        streamed.poll_cursor = (i + 1) % 3;
+                        return Ok(Some(delivery::Emission {
+                            bytes,
+                            wire_bytes: emission.wire_bytes,
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Duration {
+        match &self.backend {
+            Backend::Legacy(legacy) => legacy.service.deadline(),
+            Backend::Streamed(streamed) => {
+                let absolute = streamed
+                    .owners
+                    .iter()
+                    .map(messages::Owner::expiry)
+                    .min()
+                    .unwrap_or(self.expires);
+                if streamed.packets_left == 0 {
+                    let due = streamed
+                        .owners
+                        .iter()
+                        .map(messages::Owner::deadline)
+                        .min()
+                        .unwrap_or(self.expires);
+                    return absolute.min(due.max(streamed.refill));
+                }
+                // A small ACK may fit even when the maximum source reservation
+                // does not. Filter each owner's actual reservation separately;
+                // increasing this outer allowance remains a separate trigger.
+                let due = streamed
+                    .owners
+                    .iter()
+                    .map(|owner| owner.deadline_with_allowance(streamed.bytes_left))
+                    .min()
+                    .unwrap_or(self.expires);
+                let refill = if streamed.bytes_left < streamed.quota.bytes_per_interval {
+                    streamed.refill
+                } else {
+                    self.expires
+                };
+                absolute.min(due).min(refill)
+            }
+        }
+    }
+
+    /// Earliest immutable session/message/assembly expiry, independent of any
+    /// emission eligibility or outer allowance refill.
+    pub(crate) fn expiry(&self) -> Duration {
+        match &self.backend {
+            Backend::Legacy(_) => self.expires,
+            Backend::Streamed(streamed) => streamed
+                .owners
+                .iter()
+                .map(messages::Owner::expiry)
+                .chain([self.expires])
+                .min()
+                .unwrap_or(self.expires),
+        }
+    }
+
+    pub(crate) fn retained(&self) -> recovery::Retained {
+        match &self.backend {
+            Backend::Legacy(legacy) => legacy.service.retained(),
+            Backend::Streamed(streamed) => {
+                streamed
+                    .owners
+                    .iter()
+                    .fold(recovery::Retained::default(), |mut sum, owner| {
+                        let retained = owner.retained().recovery;
+                        sum.send_records = sum.send_records.saturating_add(retained.send_records);
+                        sum.send_bytes = sum.send_bytes.saturating_add(retained.send_bytes);
+                        sum.receive_records =
+                            sum.receive_records.saturating_add(retained.receive_records);
+                        sum.receive_bytes =
+                            sum.receive_bytes.saturating_add(retained.receive_bytes);
+                        sum
+                    })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drained(&self) -> bool {
+        match &self.backend {
+            Backend::Legacy(legacy) => legacy.service.drained(),
+            Backend::Streamed(streamed) => {
+                streamed.held.iter().all(Option::is_none)
+                    && streamed.owners.iter().all(|owner| {
+                        let retained = owner.retained();
+                        retained.outbound_messages == 0
+                            && retained.held_bytes == 0
+                            && retained.incomplete_messages == 0
+                            && retained.recovery == recovery::Retained::default()
+                    })
+            }
+        }
+    }
+
+    /// Transaction presentation/receipt custody only; unrelated liveness is separate.
+    pub(crate) fn has_dispatched(&self) -> bool {
+        match &self.backend {
+            Backend::Legacy(_) => false,
+            Backend::Streamed(streamed) => {
+                streamed.held[index(streams::Stream::Transaction)].is_some()
+            }
+        }
+    }
+
+    pub(crate) fn pending_deadline(&self) -> Option<Duration> {
+        match &self.backend {
+            Backend::Legacy(_) => None,
+            Backend::Streamed(streamed) => {
+                let i = index(streams::Stream::Transaction);
+                streamed.outgoing[i]
+                    .iter()
+                    .map(|entry| entry.deadline)
+                    .chain(streamed.held[i].map(|held| held.deadline))
+                    .min()
+            }
+        }
+    }
+
+    pub(crate) fn advance_scope(&mut self, scope: sc::Scope) -> io::Result<()> {
+        if let Backend::Streamed(streamed) = &mut self.backend {
+            if scope == streamed.active {
+                return Ok(());
+            }
+            streamed
+                .gate
+                .advance_scope(policy(scope))
+                .map_err(protocol)?;
+            streamed.draining = Some(streamed.active);
+            streamed.active = scope;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_draining(&mut self, scope: sc::Scope) -> io::Result<()> {
+        if let Backend::Streamed(streamed) = &mut self.backend {
+            let i = index(streams::Stream::Transaction);
+            let pending_old = if let Some(delivery) = streamed.owners[i].pending() {
+                sc::Envelope::decode(
+                    delivery.bytes(),
+                    envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                )
+                .map_err(protocol)?
+                .binding
+                .scope
+                    == scope
+            } else {
+                false
+            };
+            if streamed.outgoing[i]
+                .iter()
+                .any(|entry| entry.scope == scope)
+                || streamed.held[i].is_some_and(|held| held.scope == scope)
+                || pending_old
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "old control scope still owns custody",
+                ));
+            }
+            streamed.gate.retire_draining(scope).map_err(protocol)?;
+            streamed.draining = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_next_sequence(&self) -> Option<u64> {
+        match &self.backend {
+            Backend::Legacy(legacy) => Some(legacy.next),
+            Backend::Streamed(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_mut(&mut self) -> Option<&mut delivery::Service> {
+        match &mut self.backend {
+            Backend::Legacy(legacy) => Some(&mut legacy.service),
+            Backend::Streamed(_) => None,
+        }
+    }
+
+    fn check_token(&self, token: Token) -> io::Result<()> {
+        if token.binding != self.binding {
+            return Err(invalid("control token belongs to another session"));
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, now: Duration) -> io::Result<()> {
+        if now < self.now {
+            return Err(protocol("control time moved backwards"));
+        }
+        if now >= self.expires {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original control session expiry",
+            ));
+        }
+        if let Backend::Streamed(streamed) = &mut self.backend {
+            for i in 0..3 {
+                streamed.owners[i].tick(now).map_err(protocol)?;
+                if let Some(held) = streamed.held[i].filter(|held| held.dispatched)
+                    && let TokenKind::Streamed { ticket, .. } = held.incoming.token.kind
+                {
+                    match streamed.owners[i].accept(ticket, now) {
+                        Ok(()) => streamed.held[i] = None,
+                        Err(messages::Error::Backpressure) => {}
+                        Err(error) => return Err(protocol(error)),
+                    }
+                }
+            }
+            // Only Liveness permits automatic retirement. Inspect one rotating
+            // entry, so confirmed() cannot multiply work_per_call by the entire
+            // bounded retry ledger. Manual entries do not starve later entries.
+            let i = index(streams::Stream::Liveness);
+            if !streamed.outgoing[i].is_empty() {
+                let position = streamed.auto_cursor % streamed.outgoing[i].len();
+                let entry = &streamed.outgoing[i][position];
+                let TokenKind::Streamed { ticket, .. } = entry.token.kind else {
+                    return Err(protocol("streamed custody contains a legacy token"));
+                };
+                if entry.auto_retire
+                    && streamed.owners[i]
+                        .confirmed(ticket, now)
+                        .map_err(protocol)?
+                {
+                    streamed.owners[i].retire(ticket, now).map_err(protocol)?;
+                    streamed.outgoing[i].remove(position);
+                    streamed.auto_cursor = position;
+                } else {
+                    streamed.auto_cursor = position + 1;
+                }
+            }
+        }
+        self.now = now;
+        Ok(())
+    }
+}
+
+fn policy(scope: sc::Scope) -> streams::gate::DataPolicy {
+    streams::gate::DataPolicy {
+        scope,
+        recovery: None,
+        receipts: sc::ReceiptPolicy::Cumulative,
+    }
+}
+fn index(stream: streams::Stream) -> usize {
+    stream as usize - 1
+}
+fn opposite(role: mg::Role) -> mg::Role {
+    match role {
+        mg::Role::Client => mg::Role::Server,
+        mg::Role::Server => mg::Role::Client,
+    }
+}
+fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
+    match body {
+        sc::Body::Ping { .. } | sc::Body::Pong { .. } => Ok(streams::Stream::Liveness),
+        sc::Body::ProfileControl {
+            tag: sc::ProfileTag::SwiftPolicyV1,
+            ..
+        } => Ok(streams::Stream::Transaction),
+        _ => Err(protocol(
+            "selected Swift control backend does not dispatch this body",
+        )),
+    }
+}
+fn envelope_binding(binding: delivery::Binding, packet: u64, scope: sc::Scope) -> sc::Binding {
+    sc::Binding {
+        session: binding.session,
+        lane: binding.lane,
+        sender: binding.local_role,
+        packet: mg::PacketNumber(packet),
+        scope,
+    }
+}
+fn envelope_limits(maximum: usize) -> io::Result<sc::Limits> {
+    let limits = sc::Limits {
+        max_frame_bytes: maximum,
+        max_management_bytes: maximum
+            .checked_sub(sc::HEADER_BYTES)
+            .ok_or_else(|| invalid("control envelope ceiling"))?,
+        max_feedback_bytes: 1,
+    };
+    limits.validate().map_err(invalid)?;
+    Ok(limits)
+}
+fn verify(binding: delivery::Binding, verified: mg::Ingress) -> io::Result<()> {
+    match verified {
+        mg::Ingress::AuthenticatedManagement {
+            session,
+            lane,
+            sender,
+        } if session == binding.session
+            && lane == binding.lane
+            && sender == opposite(binding.local_role) =>
+        {
+            Ok(())
+        }
+        _ => Err(protocol("control ingress lacks full authenticated binding")),
+    }
+}
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+fn protocol(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+fn exhausted() -> io::Error {
+    invalid("control sequence or time arithmetic exhausted")
+}
+
+#[cfg(test)]
+#[path = "control_tests.rs"]
+mod tests;

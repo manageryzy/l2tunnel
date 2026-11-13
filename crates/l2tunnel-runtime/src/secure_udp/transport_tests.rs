@@ -8,6 +8,8 @@ mod fairness;
 mod loss;
 #[path = "transport_metrics_tests.rs"]
 mod metrics;
+#[path = "transport_stream_tests.rs"]
+mod streamed;
 
 use super::*;
 use l2tunnel_handshake as hs;
@@ -127,6 +129,7 @@ fn config(kind: cover::Appearance) -> Config {
             wire_overhead: overhead,
         },
         control_epoch: security::Epoch(1),
+        streams: None,
         data_epoch: security::Epoch(1),
         wire: WireBudget { burst_bytes: 4096 },
         work: WorkBudget {
@@ -1027,7 +1030,9 @@ fn authenticated_pong(driver: &mut Driver, now: u64, nonce: u64) -> Result<Vec<u
             .submit(
                 now,
                 driver.records.control_scope(),
-                control::Body::Pong { nonce }
+                control::Body::Pong { nonce },
+                driver.lease,
+                true,
             )?
             .is_some()
     );
@@ -1096,7 +1101,10 @@ async fn original_established_lease_expires_despite_fresh_authenticated_pong_and
         b.progress(lease)?;
         assert_eq!(b.terminal, Some(StopReason::LeaseExpired));
         assert_eq!(
-            b.control.submit(b"expired", duration(lease)),
+            b.control
+                .legacy_mut()
+                .ok_or("missing legacy control")?
+                .submit(b"expired", duration(lease)),
             Err(delivery::Error::Expired)
         );
         let stopped = b.snapshot(lease, false);
@@ -1271,7 +1279,10 @@ async fn authenticated_malformed_control_is_not_receipted_or_reclassified_as_use
     let instant = Instant::now();
     let (_, mut a) = Driver::new(a, security::ConfigDigest([3; 32]), config, instant)?;
     let (_, mut b) = Driver::new(b, security::ConfigDigest([3; 32]), config, instant)?;
-    a.control.submit(b"not an L2SC envelope", Duration::ZERO)?;
+    a.control
+        .legacy_mut()
+        .ok_or("missing legacy control")?
+        .submit(b"not an L2SC envelope", Duration::ZERO)?;
     let emitted = a
         .control
         .poll(Duration::ZERO, 4096, &mut a.control_wire)?
@@ -1366,7 +1377,9 @@ async fn full_native_queue_still_rejects_empty_unknown_user_and_services_control
             a.submit(
                 4,
                 a.records.control_scope(),
-                control::Body::Ping { nonce: 1 }
+                control::Body::Ping { nonce: 1 },
+                a.lease,
+                true,
             )?
             .is_some()
         );

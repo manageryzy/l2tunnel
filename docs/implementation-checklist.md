@@ -140,6 +140,7 @@ aggregate snapshot. Historical receipts remain unchanged.
 | Internal L2 management/reload | MG-01..MG-08 | [Management protocol](overlay-and-carriers.md) | authenticated session; stable control framing before hot data modes |
 | Whole-message control custody | SCM-01..SCM-08 | [Control messages](modules/control-messages.md) | existing ARQ/fragmentation, explicit completion custody and original deadlines |
 | Independent common control streams | SCS-01..SCS-08 | [Control streams](modules/control-streams.md) | explicit negotiated binding, independent liveness and shared wire allowance |
+| Streamed Swift runtime control | SUC-01..SUC-08 | [Selected runtime custody](modules/streamed-swift-control.md) | authenticated explicit backend, original caps and semantic custody; generic switching remains open |
 | VXLAN | VX-01..VX-09 | [Overlay design](overlay-and-carriers.md) | L2 frame validation, tenancy and MTU accounting |
 | UDP covers | UDP-01..UDP-16 | [Carrier design](overlay-and-carriers.md) | selected authenticated bootstrap; UDP-only is its own gate |
 | CLI/GUI/native clients | CL-01..CL-39 | [Client plan](client-design.md) | shared client-core/local API; native adapters independently qualified |

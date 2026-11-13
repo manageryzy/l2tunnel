@@ -301,30 +301,64 @@ impl Service {
             .min(self.expires)
     }
 
+    /// Earliest service wake whose exact source/feedback reservation fits the
+    /// unchanged caller allowance. The caller separately schedules any increase
+    /// of that allowance; local quota refills and original expiry still apply.
+    /// Unlike `deadline`, this omits work that needs more shared bytes.
+    pub fn deadline_with_allowance(&self, allowance: usize) -> Duration {
+        let source = self
+            .recovery
+            .source_deadline()
+            .filter(|_| allowance >= self.source_charge())
+            .map(|at| self.admitted_deadline(at, self.can_source_with(allowance)));
+        let feedback = self
+            .recovery
+            .feedback_deadline()
+            .filter(|_| allowance >= self.feedback_charge())
+            .map(|at| self.admitted_deadline(at, self.can_feedback_with(allowance)));
+        source
+            .into_iter()
+            .chain(feedback)
+            .min()
+            .unwrap_or(self.expires)
+            .min(self.expires)
+    }
+
     fn admitted_deadline(&self, at: Duration, admitted: bool) -> Duration {
         let at = at.max(self.last_now);
         if admitted { at } else { at.max(self.refill_at) }
     }
 
     fn can_source(&self) -> bool {
-        let reserve_feedback = u32::from(!self.feedback_emitted);
-        let charge = self.max_charge
+        self.can_source_with(self.shared_allowance)
+    }
+    fn source_charge(&self) -> usize {
+        self.max_charge
             + if self.feedback_emitted {
                 0
             } else {
                 self.ack_charge
-            };
-        self.packets_left > reserve_feedback
-            && self.bytes_left >= charge
-            && self.shared_allowance >= charge
+            }
+    }
+    fn can_source_with(&self, allowance: usize) -> bool {
+        let reserve_feedback = u32::from(!self.feedback_emitted);
+        let charge = self.source_charge();
+        self.packets_left > reserve_feedback && self.bytes_left >= charge && allowance >= charge
     }
 
     fn can_feedback(&self) -> bool {
+        self.can_feedback_with(self.shared_allowance)
+    }
+    fn feedback_charge(&self) -> usize {
         let reserve_source = !self.source_emitted && self.recovery.source_deadline().is_some();
-        let charge = self.ack_charge + if reserve_source { self.max_charge } else { 0 };
+        self.ack_charge + if reserve_source { self.max_charge } else { 0 }
+    }
+    fn can_feedback_with(&self, allowance: usize) -> bool {
+        let reserve_source = !self.source_emitted && self.recovery.source_deadline().is_some();
+        let charge = self.feedback_charge();
         self.packets_left > u32::from(reserve_source)
             && self.bytes_left >= charge
-            && self.shared_allowance >= charge
+            && allowance >= charge
     }
 
     /// Local retention and pending receipts have all been discharged.

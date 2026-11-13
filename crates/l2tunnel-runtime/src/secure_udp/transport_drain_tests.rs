@@ -293,7 +293,9 @@ async fn pending_and_wouldblock_predrain_retain_output_and_allow_input_and_contr
                 .submit(
                     now + 2,
                     fixture.driver.records.control_scope(),
-                    control::Body::Ping { nonce: 1 }
+                    control::Body::Ping { nonce: 1 },
+                    fixture.driver.lease,
+                    true,
                 )?
                 .is_some()
         );

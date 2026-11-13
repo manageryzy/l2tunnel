@@ -238,6 +238,8 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
     assert!(
         remote
             .control
+            .legacy_mut()
+            .ok_or("missing legacy control")?
             .source_confirmed(0, duration(REMOTE_TIME + 200_000))?
     );
     remote.collect_native(REMOTE_TIME + 200_000)?;

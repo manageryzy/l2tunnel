@@ -3,6 +3,9 @@
 //! These owners perform no device setup or implicit client/profile selection.
 //! A sole data/control reader retains the returned bounded final-flight tails.
 
+/// Explicit bounded control backends under the existing common secure session.
+#[cfg(unix)]
+pub mod control;
 /// Original connected UDP admission, maintained Noise and bootstrap custody.
 pub mod establish;
 /// Actual existing-member proof and authenticated acceptance on that same socket.

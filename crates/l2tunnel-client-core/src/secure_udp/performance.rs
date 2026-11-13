@@ -466,6 +466,9 @@ mod tests {
                 elapsed_micros: 1234,
                 info,
                 configuration: profile.configuration(peers)?,
+                control_streams: config.streams.is_some(),
+                policy_deadline_micros: None,
+                policy_receipt_pending: false,
                 send: config.send,
                 receive: config.receive,
                 committed: policy::Committed {
