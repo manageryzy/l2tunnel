@@ -75,7 +75,16 @@ Engine::replace_send(&mut self, config: Config, feedback_from: RecordNumber)
 Engine::replace_receive(&mut self, config: Config, source_from: RecordNumber)
     -> Result<(), Error>
 Engine::stats(&self) -> Stats
+Engine::channel_stats(&self, index: usize) -> Option<ChannelStats>
 ```
+
+`channel_stats` observes only current directional engines without allocation,
+polling, time sampling or wire mutation. Indices cover0..<max(send,receive), at
+most64; a missing asymmetric direction is `None`, and an index beyond both is
+absent rather than silently truncated. Current RTT/RTO, queued packing bytes,
+unconfirmed sources and pending retransmission/repair debt exclude retired
+engines. Aggregate `stats` retains retired totals and its existing maximum RTT
+semantics; it is not a current-channel or average RTT.
 
 Configuration validates checked native/header expansion, existing codec bounds
 and 1..=64 channels before allocation. Layer and native packet bound are fixed
@@ -167,5 +176,6 @@ classification and performance qualification.
 - [x] [SWR-05] Consume the record engine from the legacy runtime and remove its duplicate data algorithm while preserving public runtime APIs, v2 wire, pacing/charged feedback, native accounting, policy barriers and terminal-report behavior. Evidence: the [consumer delegates packing/recovery/header work](../../crates/l2tunnel-runtime/src/swift.rs); all 16 legacy runtime tests passed, including actual two-runtime loopback traffic and paused-clock deadline/terminal reporting. This does not qualify a native device or the target common carrier runtime.
 - [x] [SWR-06] Compose the complete extracted engine through common protected records on the original selected UDP socket, with authenticated User/Control dispatch, exact bytes, loss/reorder, bounded control and separate common-session lifecycle gates. Evidence: the [real factory composition](../../crates/l2tunnel-client-core/src/secure_udp_tests.rs) uses the full extracted Engine, actual Noise/member roots, common AEAD, fixed reliable control and original UDP pair for both covers/profiles; exact bidirectional bytes, charged loss/duplicates/reordering and key generations passed in the [source-stable full aggregate](../../work/shared-session-client-20261113/validation.json) and [focused commands](../../work/shared-session-client-focused-20261113/attempt-5/validation.json). Local data-scope staging is not negotiated SW-11.
 - [x] [SWR-07] Record source-stable focused tests, formatting, warning-denied workspace checks and the required aggregate result; distinguish finite library/runtime fixtures from native and platform validation. Evidence: the earlier [pure/runtime focus](../../work/swift-record-engine-20261113/focused-validation.json) and [source-stable full aggregate](../../work/shared-session-client-20261113/validation.json) and [focused commands](../../work/shared-session-client-focused-20261113/attempt-5/validation.json) passed with explicit source identities. Native devices, network performance and Windows/Android execution remain separate.
+- [x] [SWR-08] Expose bounded, nonmutating per-channel packing/recovery observations, including current RTT/RTO, retransmission and retained-source debt; preserve exact wire bytes, directional replacement and separate retired aggregate statistics. Validate asymmetric channel counts and all64 channel indices before reporting this child complete. Evidence: [Sender observations](../../crates/l2tunnel-swift/src/sender.rs), [current-channel API](../../crates/l2tunnel-swift/src/records.rs) and12 passing [record tests](../../crates/l2tunnel-swift/src/records/tests.rs) in the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json). Tests prove observed/unobserved exact wire equivalence, asymmetric1/64 directions, out-of-range rejection, replacement/current-versus-retired statistics and retained retransmission custody.
 
 The parent acceptance gates are not completed by these scoped results.

@@ -470,6 +470,38 @@ async fn secure_udp_service_forwards_switches_reports_and_reconnects_same_owner(
             server.wait_stopped(b).await.map_err(submit)?,
             Terminal::Aborted
         );
+        for handle in [&client, &server] {
+            let stopped = handle.snapshot();
+            let frame = stopped
+                .runtime
+                .as_ref()
+                .and_then(Observation::secure_udp)
+                .ok_or("missing stopped shared frame")?;
+            let runtime = frame.runtime.as_ref().ok_or("missing retained runtime")?;
+            assert!(
+                runtime.running,
+                "fixture must exercise an inline drop without a final runtime report"
+            );
+            assert_eq!(frame.service_terminal, Some(Terminal::Aborted));
+            assert!(!frame.status()?.running);
+            let report = frame.performance()?.ok_or("missing stopped performance")?;
+            assert!(!report.status.running);
+            assert_eq!(report.service_terminal.as_deref(), Some("Aborted"));
+            assert_eq!(report.status.elapsed_micros, runtime.elapsed_micros);
+            assert_eq!(
+                report.status.terminal,
+                runtime.terminal.map(|reason| format!("{reason:?}"))
+            );
+            assert_eq!(report.status.wire_packets, runtime.counters.wire_packets);
+            assert_eq!(
+                report.status.native_written,
+                runtime.counters.native_written
+            );
+            assert_eq!(
+                report.performance,
+                crate::secure_udp::performance::Driver::from(runtime.performance)
+            );
+        }
         let rebound = [
             std::net::UdpSocket::bind(addresses[0])?,
             std::net::UdpSocket::bind(addresses[1])?,
@@ -491,6 +523,19 @@ async fn secure_udp_service_forwards_switches_reports_and_reconnects_same_owner(
             .ok_or("missing fresh status")?;
         assert_ne!(fresh.session, old_session);
         assert!(fresh.generation > a.value());
+        for handle in [&client, &server] {
+            let snapshot = handle.snapshot();
+            let frame = snapshot
+                .runtime
+                .as_ref()
+                .and_then(Observation::secure_udp)
+                .ok_or("missing fresh shared frame")?;
+            let report = frame.performance()?.ok_or("missing fresh performance")?;
+            assert!(report.status.running);
+            assert!(report.service_terminal.is_none());
+            assert!(frame.service_terminal.is_none());
+            assert_ne!(report.status.session, old_session);
+        }
         assert_eq!(
             fresh.policy_epoch, 0,
             "fresh session is not retained-state recovery"
@@ -505,6 +550,29 @@ async fn secure_udp_service_forwards_switches_reports_and_reconnects_same_owner(
         client_task.abort();
         server_task.abort();
         let _ = tokio::join!(client_task, server_task);
+        for handle in [&client, &server] {
+            let snapshot = handle.snapshot();
+            let frame = snapshot
+                .runtime
+                .as_ref()
+                .and_then(Observation::secure_udp)
+                .ok_or("missing closed shared frame")?;
+            let runtime = frame.runtime.as_ref().ok_or("missing last runtime")?;
+            let report = frame
+                .performance()?
+                .ok_or("missing actor-drop performance")?;
+            assert!(!report.status.running);
+            assert_eq!(frame.service_terminal, snapshot.terminal);
+            assert_eq!(report.status.elapsed_micros, runtime.elapsed_micros);
+            assert_eq!(
+                report.status.terminal,
+                runtime.terminal.map(|reason| format!("{reason:?}"))
+            );
+            assert_eq!(
+                report.status.socket_accepted_packets,
+                runtime.counters.socket_accepted_packets
+            );
+        }
         assert!(
             hosts
                 .iter()

@@ -70,6 +70,30 @@ attempts then failed a ping phase and a bulk-time runtime timeout, respectively;
 neither supplies qualified throughput. The latest harness retains bounded live
 failure observations. The required aggregate for these corrections passed as recorded below; native requalification remains open.
 
+The owner-requested [counter-guided checkpoint](modules/secure-udp-native.md#counter-guided-performance-correction)
+now observes scheduling, credit/refill discard, charged classes, native pressure
+and current-channel Swift recovery through the shared client/service API.
+The independently tested burst and bounded output-order corrections improve
+impaired QUIC-like goodput from40.0928 to64.5727 to70.6236Mbit/s. Build7's
+matched clean case is72.0171 and its media-like impaired case is78.2192. These
+pass exact native integrity, control changes, manual reconnect, captures and
+cleanup but fail80Mbit/s. Reported native-pressure
+drops/output-full/write-WouldBlock are zero; remaining pacing/CPU causes are
+unresolved and saturated native-read fairness is SUR-11. The exact preserved old
+binary now measures71.4825 clean, so its historical83.0069 is not a current
+environment baseline. A fresh overhead/timing sensitivity study gives78.75/78.60
+for QUIC/media-like simulation; it is not kernel performance or full parity.
+
+The requested [kernel profile](modules/secure-udp-native.md#requested-kernel-profiling)
+identifies TAP/network execution and epoll/futex/scheduler call chains, with zero
+lost samples. Simultaneous tunnel physical reads are zero and writes about172KB
+per endpoint over16.6s despite substantial host I/O PSI; off-CPU wait causality
+remains unproved. A separate reviewed correction removes CPU-count-sized worker
+pools from one-shot local API helpers. Actual old/new CLI tests observe255-to-1
+threads with byte-identical replies and one request; the daemon scheduler and
+original65s private timeout remain unchanged. Build8 then measures77.3464Mbit/s
+QUIC-like impaired and still fails80 with functional/capture/cleanup passed.
+
 Historical `tools/selftest.py` runs (Linux TAP, unprivileged
 namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
 RTT, 15% loss each way) measured 79.74, 80.50 and 79.91 Mbit/s forward
@@ -102,7 +126,26 @@ does not narrow SW-11 or close any Python mode gate.
 
 ## Verification evidence
 
-The [latest correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+The [latest required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+passed with unchanged source maps:1526 Rust cases including doctests,295 Python
+tooling cases and1658 simulator cases, plus formatting, strict workspace Clippy,
+rustdoc and CLI checks. `RUST_TEST_THREADS=1` serializes the complete Rust suite;
+no cases, assertions, original deadlines or performance thresholds were relaxed.
+Native labs, kernel profiling, remote CI and Windows/Android execution retain
+their separate scopes. Subsequent changes reconcile documentation evidence only.
+
+The performance correction has an [expanded source-stable focused pass](../work/secure-udp-performance-focused-20261113/attempt-5/validation.json)
+and50 passing [native-tooling tests](../work/secure-udp-native-tooling-focused-20261113/attempt-9/validation.json).
+The [first aggregate attempt](../work/secure-udp-performance-progress-20261113/attempt-1/validation.json)
+failed two existing elapsed-time assertions; both passed [unchanged isolated checks](../work/secure-udp-performance-focused-20261113/deadline-recheck-1/validation.json).
+The [serial aggregate attempt](../work/secure-udp-performance-progress-20261113/attempt-2/validation.json)
+then passed1526 Rust cases including doctests and executed295 Python tests, but
+failed one existing100ms kernel-loopback measurement with zero received bytes,
+before the simulator suite. Its [unchanged isolated recheck](../work/secure-udp-performance-progress-20261113/kernel-loopback-recheck-1.log)
+passed all three kernel-loopback tests. Neither failed aggregate is relabeled;
+no deadlines, test assertions or performance thresholds were relaxed.
+
+The [preceding correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
 passed 1498 Rust cases including doctests, 285 Python tooling cases and 1658 simulator
 cases, with unchanged source maps, formatting, strict Clippy, rustdoc and CLI
 checks. It executes the new-profile attachment rejection, 28 transport regressions

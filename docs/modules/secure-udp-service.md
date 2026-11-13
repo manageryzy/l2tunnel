@@ -165,6 +165,50 @@ bytes afterward. This does not close or narrow SW-11/15/16.
 
 ## Local API and CLI compatibility
 
+The owner-requested performance instrumentation uses a separate schema1 report
+from `SecureUdpFrame::performance()`. CLI `secure_udp_performance` JSON events
+sample that shared observation at the existing report cadence and include the
+actual generation/session/driver time, policy epoch, current rate/burst geometry,
+runtime counters, aggregate Swift counters and at most64 current channels.
+This report is not a new local version2 status field. Keys and packet bodies are
+absent; current per-channel RTT/RTO is distinct from retired aggregate maximum
+RTT. Sampled report intervals are not automatically the native20s goodput window.
+
+`service_terminal` records the service owner's bounded outcome separately from
+the last runtime observation. After original owners are dropped, explicit abort
+or service destruction publishes `running = false` without inventing a runtime
+StopReason, advancing its timestamp or changing its counters. Fresh reconnect
+uses a new generation/session and clears that overlay. CLI deduplication includes
+the owner outcome so cancellation does not hide the final report.
+
+Ready, performance and terminal logs use a128KiB line bound, four-line/512KiB
+queue, and at most four writes/64KiB per flush turn, with a5ms retry only while
+pending. A partial front line retains its exact remaining bytes. Pipe WouldBlock
+is nonfatal; BrokenPipe/other write errors disable the sink and discard only its
+bounded pending queue. Saturating `log_health` and projection-error counters
+make loss observable on later usable records. Health describes the state before
+that emission; a permanently failed sink can prevent a final health record.
+There is no blocking queue drain
+or logging thread. Pipes/TTYs use a separate nonblocking open-file description;
+regular-file stdout safely duplicates the original description and shares its
+offset with aliased stderr without changing inherited flags. Regular-file writes
+remain subject to filesystem latency, not a promised disk-latency bound.
+
+- [x] [SUS-10] Expose and validate the bounded performance report through the shared service and CLI, preserving strict local version1/version2 status bytes and explicit identity/epoch/timestamp/geometry semantics. Retain actual native report evidence separately from DTO and component tests. Evidence: [shared report](../../crates/l2tunnel-client-core/src/secure_udp/performance.rs), [service lifecycle fixtures](../../crates/l2tunnel-client-core/src/service/tests/secure_udp.rs), and [CLI real-pipe/shared-file regressions](../../crates/l2tunnel-client-core/src/secure_udp/cli.rs) passed in the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json), including all64 channels, mapping/geometry, disconnect/reconnect/destruction, full/BrokenPipe behavior and shared stdout/stderr offsets. [Build7 native reports](../../work/secure-udp-native-20261113/quic-impaired-perf-attempt-3/receipt.json) retain their separate finite Linux CLI/TAP scope; throughput acceptance still fails.
+
+The user-requested kernel profile also exposes a separate measurement boundary:
+the CLI previously constructed its default multi-worker runtime even for one private local
+API request. Native sampling launches two such status helpers per sample, in
+addition to the persistent tunnel processes. This source fact is not proof of
+the measured throughput cause. The reviewed narrow correction uses an
+I/O/timer-enabled current-thread runtime only for the existing eight local API
+commands; connect/serve keep their existing scheduler and key generation keeps
+its synchronous path. The private protocol, exact version handling, single
+submission and original65s unknown-outcome bound remain unchanged. This is an
+integrator correction, not an owner decision about daemon worker count.
+
+- [x] [SUS-11] Execute one-shot local API commands without creating a CPU-count-sized worker pool. Verify the actual immutable CLI on a held private-socket response, observed helper thread count, exact version1/version2 status and one mutating submission, while preserving original timeout/no-retry behavior. Retain matched native sampling outcomes separately; no daemon scheduler or parent acceptance gate is reduced. Evidence: [actual immutable old/new CLI comparison](../../work/secure-udp-ipc-runtime-proof-20261113/comparison.json) and its [preserved proof script](../../work/secure-udp-performance-analysis-20261113/executed-tools/l2tunnel-cli-ipc-proof-20261113.py) pass all eight commands/nine cases, with three live observations per held response:255 threads before, one afterward, identical request/reply bytes, exact successful exit and one submission. The original private transport/65s timeout implementation is unchanged from the preceding checkpoint; the proof does not execute a full65s timeout. The [expanded focused suite](../../work/secure-udp-performance-focused-20261113/attempt-5/validation.json) passes runtime/service/CLI/local tests, strict Clippy and rustdoc. The subsequent [build8 impaired run](../../work/secure-udp-native-20261113/quic-ipcfix-impaired-attempt-1/receipt.json) passes functional/capture/cleanup at77.346368Mbit/s and still fails80; one run does not isolate throughput causality.
+
 Keep local `VERSION = 1` and its legacy response bytes. Add explicit version 2
 handling for the new observation/actions. A version1 request to a new-profile
 service returns `requires_version_2` with no state before any action is submitted.

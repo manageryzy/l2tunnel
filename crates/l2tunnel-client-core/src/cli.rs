@@ -1325,7 +1325,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         allowed.extend_from_slice(secure_udp_frontend::OPTIONS);
         allowed.extend_from_slice(raw_packet_frontend::OPTIONS);
     }
-    if matches!(
+    let local_api = matches!(
         command.as_str(),
         "status"
             | "disconnect"
@@ -1335,7 +1335,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             | "set-active-policy"
             | "drain-proxy"
             | "drain-openvpn"
-    ) {
+    );
+    if local_api {
         allowed.push("--api-version");
     }
     let result = options(&args[1..], &allowed).and_then(|options| {
@@ -1345,26 +1346,17 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         if command == "openvpn-keygen" {
             return standalone::generate(&options);
         }
+        if local_api {
+            // One private IPC exchange needs I/O and timers, not a worker pool.
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(execute_api(command, &options));
+        }
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(async {
-                if matches!(
-                    command.as_str(),
-                    "status"
-                        | "disconnect"
-                        | "reconnect"
-                        | "set-swift"
-                        | "set-compression"
-                        | "set-active-policy"
-                        | "drain-proxy"
-                        | "drain-openvpn"
-                ) {
-                    execute_api(command, &options).await
-                } else {
-                    execute(command, &options).await
-                }
-            })
+            .block_on(execute(command, &options))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

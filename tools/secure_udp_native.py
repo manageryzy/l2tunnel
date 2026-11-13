@@ -233,15 +233,45 @@ def functional(label, output, deadline, launch, command, receipt):
                 if child.poll() is not None or time.monotonic() >= until:
                     raise BoundExhausted('native UDP echo readiness bound')
                 time.sleep(.02)
-            # Each independent40s echo owner covers its own readiness<=5s,
-            # ping<=12s and UDP<=17s; the opposite direction starts anew.
-            ping = command('host_' + side, 'ping', '-n', '-c', '3', '-i', '.2', '-W', '3',
-                           '-M', 'do', '-s', '1472', HOST[other], cap=12)
+            # Keep one original12s ICMP bound including subprocess startup.
+            # The echo owner still covers readiness<=5s + ICMP<=12s + UDP<=17s.
+            ping_end = min(int(deadline * 1e9), time.monotonic_ns() + 12_000_000_000)
+            ping_child, ping_log = launch('host_' + side,
+                [sys.executable, output / 'secure_udp_native_probe.py', 'icmp-probe', '--source', HOST[side],
+                 '--address', HOST[other], '--deadline-ns', str(ping_end)], f'{label}-icmp-{side}', cap=64 * 1024)
+            wait_error, stop_error = None, None
+            try:
+                ping_child.wait(timeout=bounded.remaining(ping_end / 1e9, 12))
+            except Exception as error:
+                wait_error = error
+                try:
+                    bounded.stop(ping_child)
+                except Exception as cleanup_error:
+                    stop_error = f'{type(cleanup_error).__name__}: {cleanup_error}'[:4096]
+            ping = bounded.read_log(ping_log)
             if len(ping.encode()) > 64 * 1024:
                 raise ObservationError('native ping output exceeds64KiB bound')
             result[side] = {'full_mtu_df_ping': ping}
+            if stop_error:
+                result[side]['icmp_cleanup_error'] = stop_error
             receipt.update(**{label + '_functional_progress': result})
-            if ' 0% packet loss' not in ping:
+            if wait_error:
+                raise wait_error
+            icmp = last_json(ping_log)
+            result[side]['icmp'] = icmp
+            receipt.update(**{label + '_functional_progress': result})
+            if icmp.get('status') == 'bound_exhausted':
+                raise BoundExhausted('exact full-MTU ICMP probe exhausted its original bound')
+            if icmp.get('status') == 'tool_failure':
+                raise ObservationError('exact full-MTU ICMP tool failure: ' + str(icmp.get('error', 'unknown'))[:4096])
+            if (ping_child.returncode or icmp.get('status') != 'passed' or icmp.get('sent') != 3
+                    or icmp.get('received_unique') != 3 or icmp.get('request_count') != 3
+                    or icmp.get('payload_bytes') != 1472 or icmp.get('ip_bytes') != 1500 or icmp.get('df') is not True
+                    or icmp.get('source') != HOST[side] or icmp.get('address') != HOST[other]
+                    or icmp.get('original_deadline_ns') != ping_end
+                    or [row.get('sequence') for row in icmp.get('rows', [])] != [1, 2, 3]
+                    or any(type(row.get('sent_ns')) is not int or type(row.get('received_ns')) is not int
+                        or not row['sent_ns'] <= row['received_ns'] < ping_end for row in icmp['rows'])):
                 raise ValueError('full-MTU DF native ping did not return exactly')
             raw = command('host_' + side, sys.executable, str(output / 'secure_udp_native_probe.py'),
                 'udp-probe', '--address', HOST[other], '--port', '24461', cap=17)
@@ -481,6 +511,7 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
     if not offsets or max(offsets) - min(offsets) > 5_000_000:
         raise ObservationError('capture realtime/monotonic clock offset unstable')
     result = {'packets': 0, 'arp': 0, 'udp': 0, 'tcp': 0, 'handshake': 0, 'established': 0, 'icmp_path_errors': 0,
+        'native_icmp': {'requests': 0, 'replies': 0, 'samples': []},
         'directions': {side: {'packets': 0, 'ip_bytes': 0, 'measurement_min_ip_bytes': 0, 'measurement_max_ip_bytes': 0} for side in ('a', 'b')},
         'user_epochs': {}, 'snapshot_bytes': BOUNDS['capture_snaplen'], 'payload_integrity': 'endpoint exact probes, not truncated capture'}
     def account_ip(direction, total, seconds, fraction, precision):
@@ -533,6 +564,20 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
             if total < 20 or original not in (max(14 + total, 60), 14 + total) or bounded.checksum(ip[:20]):
                 raise ValueError('invalid captured original IP extent/checksum')
             if local_side is None:
+                if ip[9] == 1:
+                    source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+                    fragment = int.from_bytes(ip[6:8], 'big')
+                    if (total != 1500 or len(ip) < 44 or {source, destination} != set(HOST.values())
+                            or fragment & 0x3fff or ip[20] not in (0, 8) or ip[21] != 0
+                            or ip[20] == 8 and not fragment & 0x4000 or not 1 <= int.from_bytes(ip[26:28], 'big') <= 3):
+                        raise ValueError('native ICMP full-MTU/DF/type/sequence mismatch')
+                    observed = result['native_icmp']
+                    if len(observed['samples']) >= 128:
+                        raise BoundExhausted('native ICMP observation ceiling exhausted')
+                    observed['requests' if ip[20] == 8 else 'replies'] += 1
+                    observed['samples'].append({'source': source, 'address': destination, 'type': ip[20],
+                        'identifier': int.from_bytes(ip[24:26], 'big'), 'sequence': int.from_bytes(ip[26:28], 'big'),
+                        'ip_bytes': total, 'df': bool(fragment & 0x4000), 'payload_prefix': ip[28:44].hex()})
                 continue
             if total > case['path_mtu'] or int.from_bytes(ip[6:8], 'big') & 0x3fff:
                 raise ValueError('outer MTU breach or fragmentation')
@@ -602,6 +647,27 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
     if local_side is not None and case.get('require_policy_epochs') and not {'1', '2', '3'} <= set(result['user_epochs']):
         raise ValueError('capture lacks actual User traffic in each loaded policy epoch')
     return result
+
+
+def icmp_capture_complete(audit: dict, phases: dict) -> dict:
+    """Bind truncated native headers to independently validated endpoint payloads."""
+    observed, checked = audit['native_icmp']['samples'], []
+    for phase in ('functional', 'after_reconnect'):
+        for side, value in phases.get(phase, {}).items():
+            result = value.get('icmp', {})
+            if (result.get('status') != 'passed' or result.get('sent') != 3 or result.get('received_unique') != 3
+                    or [row.get('sequence') for row in result.get('rows', [])] != [1, 2, 3]):
+                raise ValueError('native ICMP result lacks exact validated three-request scope')
+            other = 'b' if side == 'a' else 'a'
+            for row in result['rows']:
+                for kind, source, address in [(8, HOST[side], HOST[other]), (0, HOST[other], HOST[side])]:
+                    if not any(sample['type'] == kind and sample['source'] == source and sample['address'] == address
+                            and sample['identifier'] == result['identifier'] and sample['sequence'] == row['sequence']
+                            and sample['payload_prefix'] == row['payload_prefix'] and sample['ip_bytes'] == 1500
+                            and (kind != 8 or sample['df']) for sample in observed):
+                        raise ValueError('native capture missing exact full-MTU ICMP request/reply')
+            checked.append({'phase': phase, 'side': side, 'identifier': result['identifier'], 'requests': 3, 'replies': 3})
+    return {'probes': checked, 'scope': 'captured complete IP extent, DF requests and fresh payload prefix; complete ICMP checksum/payload validated by endpoint'}
 
 
 def capture_counts(log: Path, process: subprocess.Popen) -> dict:
@@ -872,7 +938,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         return result
 
     try:
-        for tool in ('ip', 'tc', 'ss', 'ethtool', 'sysctl', 'ping', 'tcpdump'):
+        for tool in ('ip', 'tc', 'ss', 'ethtool', 'sysctl', 'tcpdump'):
             if shutil.which(tool) is None:
                 raise FileNotFoundError(tool)
         receipt.update(kernel=command(None, 'uname', '-a'), resources=resource_context(),
@@ -991,6 +1057,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 if not audits['native-a']['arp']:
                     raise ValueError('no actual native ARP witnessed')
                 receipt.update(capture_audits=audits)
+                receipt.update(native_icmp_capture=icmp_capture_complete(audits['native-a'], receipt.value))
                 if reference_result:
                     receipt.update(reference_wire_window=wire_window_evidence(reference_result, audits))
             except Exception as error:

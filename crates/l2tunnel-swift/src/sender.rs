@@ -13,6 +13,23 @@ struct Source {
     queued: bool,
 }
 
+/// Read-only current sender occupancy and recovery observations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Observation {
+    /// Counters for this current directional engine only.
+    pub stats: SenderStats,
+    /// Packed native bytes, including prefixes, not yet cut into sources.
+    pub queued_bytes: usize,
+    /// Retained sources not yet confirmed by the peer.
+    pub unconfirmed: usize,
+    /// Current retransmission estimate, without changing any timer.
+    pub rto_micros: u64,
+    /// Explicit retransmission queue entries awaiting polling.
+    pub retransmit_pending: usize,
+    /// Proportional repairs earned but not yet polled.
+    pub repairs_due: u32,
+}
+
 /// One direction's sending engine.
 pub struct Sender {
     config: Config,
@@ -88,6 +105,17 @@ impl Sender {
     /// Current counters.
     pub fn stats(&self) -> SenderStats {
         self.stats
+    }
+    /// Observe current occupancy without polling, allocating or advancing time.
+    pub fn observation(&self) -> Observation {
+        Observation {
+            stats: self.stats,
+            queued_bytes: self.queue.len(),
+            unconfirmed: self.sources.len(),
+            rto_micros: self.rto(),
+            retransmit_pending: self.retransmit.len(),
+            repairs_due: self.repairs_due,
+        }
     }
     /// Whether one more maximum-size native packet fits in the packing queue.
     pub fn has_room(&self) -> bool {

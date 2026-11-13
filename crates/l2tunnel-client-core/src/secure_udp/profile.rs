@@ -82,6 +82,9 @@ impl Profile {
         let mut fixed = responder;
         fixed.send = initiator.send;
         fixed.receive = initiator.receive;
+        // Each role owns its own fixed byte-credit capacity. Both original
+        // values are validated and hashed below; other fixed resources match.
+        fixed.wire.burst_bytes = initiator.wire.burst_bytes;
         if fixed.canonical_digest()? != initiator.canonical_digest()? {
             return Err(invalid(
                 "role contracts differ in immutable control/security/resource policy",

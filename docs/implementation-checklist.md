@@ -89,6 +89,25 @@ passed exact bytes, policy/lifecycle checks and clean/delay QUIC-like performanc
 both impaired appearances failed the unchanged throughput target. The complete
 native matrix and restarted-peer recovery remain open. The later deadline/wakeup
 correction passed its [source-stable required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json): 1498 Rust cases including doctests, 285 Python tooling cases and 1658 simulator cases. Its native attempts remain failed, with full evidence retained.
+The later [counter-guided checkpoint](modules/secure-udp-native.md#counter-guided-performance-correction)
+adds SUR-10/SUS-10/SWR-08 observations and separately tested burst/output-order
+corrections, while preserving original retry/deadline behavior. Its
+[focused check](../work/secure-udp-performance-focused-20261113/attempt-4/validation.json)
+passed. Build7 impaired QUIC-like goodput is70.6236Mbit/s with reported native
+pressure removed; SNL-09/SNL-11 and FIX-04 remain open. SUR-11 separately tracks
+native-read fairness under saturated UDP ingress. Complete SW-11,47-mode parity,
+OpenVPN/raw HTTPS, retained recovery and Windows/Android are unchanged gates.
+SUS-11 subsequently corrects one-shot IPC helper scheduling with an
+[expanded focused pass](../work/secure-udp-performance-focused-20261113/attempt-5/validation.json)
+and [actual byte/thread-count comparison](../work/secure-udp-ipc-runtime-proof-20261113/comparison.json).
+Build8 impaired QUIC-like is77.3464Mbit/s and still fails80; the daemon's scheduler,
+wire rates, retry limits and original deadlines are preserved.
+The [latest required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+passed with stable source maps:1526 Rust cases including doctests,295 Python
+tooling cases and1658 simulator cases, plus formatting, strict Clippy, rustdoc
+and CLI checks. Complete serialized Rust execution preserves all assertions and
+deadlines. Both earlier aggregate failures and all native target failures remain
+unchanged; these local results do not close any parent mode/platform/lifecycle gate.
 Swift now consumes the common library's explicit legacy compatibility owners;
 the legacy CLI profile uses retained TLS plus a separate UDP data socket. A new
 same-UDP-pair integration fixture exercises Noise, both appearance codecs,

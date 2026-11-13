@@ -5,6 +5,9 @@
 
 /// Explicit runtime credential owners and bounded manual key-file readers.
 pub mod credentials;
+/// Bounded performance telemetry shared by CLI and embedding frontends.
+#[cfg(unix)]
+pub mod performance;
 /// Immutable shared native-runtime profile and authenticated policy resolution.
 #[cfg(unix)]
 pub mod profile;

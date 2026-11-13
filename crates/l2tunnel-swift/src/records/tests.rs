@@ -68,6 +68,149 @@ fn body(engine: &mut Engine, now: u64, number: u64, allow: bool) -> Result<Vec<u
 }
 
 #[test]
+fn bounded_channel_observations_preserve_asymmetric_direction_counts() -> Result<(), Error> {
+    let mut engine = Engine::new(config(crate::MAX_CHANNELS))?;
+    engine.replace_receive(config(1), RecordNumber(0))?;
+    assert!(
+        engine
+            .channel_stats(0)
+            .is_some_and(|c| c.send.is_some() && c.receive.is_some())
+    );
+    let last = engine
+        .channel_stats(crate::MAX_CHANNELS - 1)
+        .ok_or(Error::Admission)?;
+    assert!(last.send.is_some());
+    assert!(last.receive.is_none());
+    assert_eq!(last.receive_pending, 0);
+    assert!(engine.channel_stats(crate::MAX_CHANNELS).is_none());
+    assert!(engine.channel_stats(usize::MAX).is_none());
+    engine.replace_send(config(1), RecordNumber(0))?;
+    engine.replace_receive(config(crate::MAX_CHANNELS), RecordNumber(0))?;
+    let last = engine
+        .channel_stats(crate::MAX_CHANNELS - 1)
+        .ok_or(Error::Admission)?;
+    assert!(last.send.is_none());
+    assert!(last.receive.is_some());
+    Ok(())
+}
+
+#[test]
+fn channel_observation_does_not_consume_queued_sources_repairs_or_feedback() -> Result<(), Error> {
+    let mut c = config(1);
+    c.codec.repair_numerator = 1;
+    let mut observed = Engine::new(c)?;
+    let mut untouched = Engine::new(c)?;
+    let mut receiver = Engine::new(c)?;
+    let native = packet(40_000, 0, 360);
+    observed.offer(7, &native)?;
+    untouched.offer(7, &native)?;
+    let queued = observed
+        .channel_stats(0)
+        .ok_or(Error::Admission)?
+        .send
+        .ok_or(Error::Admission)?;
+    assert!(queued.queued_bytes > 0);
+    assert_eq!(queued.unconfirmed, 0);
+    assert_eq!(queued.rto_micros, c.codec.max_rto_micros);
+    for number in 0..12 {
+        let before = observed.channel_stats(0);
+        assert_eq!(before, observed.channel_stats(0));
+        let left = observed
+            .poll(10 + number, RecordNumber(number), true)?
+            .map(<[u8]>::to_vec);
+        let right = untouched
+            .poll(10 + number, RecordNumber(number), true)?
+            .map(<[u8]>::to_vec);
+        assert_eq!(left, right);
+        if let Some(mut wire) = left {
+            receiver.accept(100 + number, RecordNumber(number), &mut wire)?;
+        }
+        if number == 0 {
+            let sent = observed
+                .channel_stats(0)
+                .ok_or(Error::Admission)?
+                .send
+                .ok_or(Error::Admission)?;
+            assert_eq!(sent.unconfirmed, 1);
+            assert_eq!(sent.repairs_due, 1);
+            assert_eq!(sent.stats.sources, 1);
+        }
+    }
+    let before = receiver.channel_stats(0).ok_or(Error::Admission)?;
+    assert!(before.receive.is_some_and(|c| c.sources > 0));
+    assert_eq!(before, receiver.channel_stats(0).ok_or(Error::Admission)?);
+    assert_eq!(receiver.pop()?, Some(native.as_slice()));
+    Ok(())
+}
+
+#[test]
+fn sender_observation_preserves_requested_retransmission_custody() -> Result<(), Error> {
+    let mut sender = Sender::new(config(1).codec)?;
+    let mut wire = Vec::new();
+    for number in 0..4 {
+        assert!(sender.push_packet(number, &[0xaa; 128])?);
+        assert!(sender.poll(number, number, &mut wire)?);
+    }
+    let mut feedback = vec![crate::KIND_FEEDBACK];
+    feedback.extend_from_slice(&0_u32.to_be_bytes());
+    feedback.extend_from_slice(&4_u32.to_be_bytes());
+    feedback.extend_from_slice(&1_u16.to_be_bytes());
+    feedback.push(1);
+    feedback.extend_from_slice(&0_u16.to_be_bytes());
+    sender.on_feedback(100, &feedback)?;
+    let before = sender.observation();
+    assert_eq!(before.retransmit_pending, 1);
+    assert_eq!(before.unconfirmed, 4);
+    assert_eq!(before.stats.retransmits, 0);
+    assert_eq!(before, sender.observation());
+    assert!(sender.poll(100, 4, &mut wire)?);
+    assert_eq!(&wire[..5], &[crate::KIND_SOURCE, 0, 0, 0, 0]);
+    let after = sender.observation();
+    assert_eq!(after.retransmit_pending, 0);
+    assert_eq!(after.unconfirmed, 4);
+    assert_eq!(after.stats.retransmits, 1);
+    Ok(())
+}
+
+#[test]
+fn retired_sender_totals_stay_out_of_current_channel_observations() -> Result<(), Error> {
+    let c = config(1);
+    let mut sender = Engine::new(c)?;
+    let mut receiver = Engine::new(c)?;
+    sender.offer(0, &[0xaa, 0, 0xbb])?;
+    let mut wire = body(&mut sender, 0, 1, true)?;
+    receiver.accept(1, RecordNumber(1), &mut wire)?;
+    assert_eq!(receiver.pop()?, Some([0xaa, 0, 0xbb].as_slice()));
+    assert_eq!(receiver.pop()?, None);
+    let mut feedback = body(&mut receiver, 100, 2, false)?;
+    sender.accept(101, RecordNumber(2), &mut feedback)?;
+    assert!(sender.send_drained());
+    assert_eq!(sender.stats().sender.sources, 1);
+    sender.replace_send(c, RecordNumber(3))?;
+    assert_eq!(sender.stats().sender.sources, 1);
+    let current = sender
+        .channel_stats(0)
+        .ok_or(Error::Admission)?
+        .send
+        .ok_or(Error::Admission)?;
+    assert_eq!(current.stats.sources, 0);
+    assert_eq!(current.unconfirmed, 0);
+    assert_eq!(current.queued_bytes, 0);
+    receiver.replace_receive(c, RecordNumber(3))?;
+    assert_eq!(receiver.stats().receiver.sources, 1);
+    assert_eq!(
+        receiver
+            .channel_stats(0)
+            .ok_or(Error::Admission)?
+            .receive
+            .ok_or(Error::Admission)?
+            .sources,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn frozen_source_feedback_and_full_number_repair_match_legacy_bodies() -> Result<(), Error> {
     let mut c = config(1);
     c.codec.repair_numerator = 1;
@@ -345,6 +488,8 @@ fn feedback_is_available_when_outer_data_pacer_is_blocked() -> Result<(), Error>
     let mut source = body(&mut left, 0, 0, true)?;
     right.accept(0, RecordNumber(0), &mut source)?;
     assert_eq!(right.feedback_deadline(), Some(0));
+    assert!(!right.feedback_ready(99));
+    assert!(right.feedback_ready(100));
     assert_eq!(body(&mut right, 100, 1, false)?[0], crate::KIND_FEEDBACK);
     Ok(())
 }
@@ -375,6 +520,7 @@ fn scalar_bounds_and_legacy_small_feedback_limit_are_explicit() -> Result<(), Er
     let mut source = body(&mut left, 0, 0, true)?;
     right.accept(0, RecordNumber(0), &mut source)?;
     assert!(right.poll(100, RecordNumber(1), false)?.is_none());
+    assert!(!right.feedback_ready(100));
     assert!(right.feedback_deadline().is_some());
     Ok(())
 }

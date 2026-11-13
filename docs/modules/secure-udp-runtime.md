@@ -17,6 +17,110 @@ and nonblocking AF_UNIX `PacketDevice` adapters. The driver matrix currently use
 IK and Ethernet with both covers; it does not qualify the complete IK/IKpsk2,
 IP/Ethernet, impairment and final-handoff matrix or privileged TAP/TUN performance.
 
+## Performance-counter correction
+
+The owner requested counters to locate the native regression before tuning it.
+The counter hooks observe the runtime without selecting work or changing
+configured rates, deadlines or crypto. The separately reviewed burst and native
+output scheduling corrections below are explicit behavior changes.
+Counters saturate and never decide protocol progress. Report cumulative values
+with the actual service generation, cryptographic session and driver timestamp;
+compare differences only inside the same identity and policy epoch.
+
+Instrument actual loop wake causes, UDP/native/send batch occupancy and limit
+hits, native WouldBlock/output pressure, emitted packet classes and exact charged
+IP bytes. The wire bucket separately reports generated refill credit and credit
+discarded at its burst cap. Neither is wire delivery or bandwidth utilization.
+Credit-blocked observations require eligible Swift work, avoiding idle-time
+inflation. Elapsed time between a blocked observation and the next send check
+includes scheduler delay; lateness is measured against the saved credit-ready
+timestamp. Open intervals are included in snapshots without mutating state.
+Per-channel pure observations expose actual source/retransmit/repair counts,
+feedback, RTT/RTO, pending recovery and packing debt, rather than inferring Swift
+RTT from inner TCP RTT. Retired aggregate RTT retains its existing maximum
+semantics and is not an average or current-channel RTT.
+
+The shared service supplies a separate versioned performance report to embedding
+frontends. CLI logs sample that same observation at the existing report cadence;
+the strict local version2 status bytes are preserved. Native receipts must retain
+raw reports, distinguish sampled intervals from the common20s goodput window and
+avoid claiming a bottleneck from counters alone. Native retests and matched
+simulator sensitivity runs retain their own exact inputs and failed outcomes.
+
+- [x] [SUR-10] Implement and validate observational scheduling, batch, class-cost, wire-credit and native-pressure counters with nonmutating bounded per-channel snapshots. Reconcile actual protected socket attempts and exact credit waits against production driver fixtures; preserve original protocol, deadline and scheduling behavior. Evidence: [performance state](../../crates/l2tunnel-runtime/src/secure_udp/transport_performance.rs), [actual production-driver metrics fixtures](../../crates/l2tunnel-runtime/src/secure_udp/transport_metrics_tests.rs), and the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json). Counter hooks remain observational; the burst and output-order changes have their own explicit tests and native outcomes below. Saturation, fractional refill, nonmutating open waits, idle/not-yet-due feedback exclusion, class charges, actual WouldBlock and irreversible terminal I/O accounting passed.
+
+The [first immutable instrumented impaired run](../../work/secure-udp-native-20261113/quic-impaired-perf-attempt-1/receipt.json) retains40.0928032Mbit/s and passes
+exact bytes/EOF, policy changes, manual reconnect, captures and owned cleanup;
+only the unchanged80Mbit/s target fails. In a sampled8.003s interval of the
+original session/epoch0, forward packing debt remains approximately240KiB,
+while roughly49MB of refill credit is discarded at the9500B cap and the
+credit-ready check accumulates about7.06s of lateness. These are sampled runtime
+observations, not the exact20s goodput window or proof of exclusive CPU cost.
+They justify testing the small burst capacity as a causal contributor.
+
+The reviewed candidate changes only CLI profile construction: size each role's
+fixed burst to `max(maximum_path_mtu, initial_send_bytes_per_second / 250)` plus
+the existing control reserve. This retains four milliseconds of initial-rate
+credit, as the legacy pacer did, with checked arithmetic and the existing finite
+runtime bound. At99/9.9Mbit/s the forward/reverse bursts become50000/9500B for
+QUIC-header appearance. Rates, complete-wire charging, control reservation,
+workload, deadlines and cipher remain unchanged. The burst remains part of the
+authenticated immutable contract. A live policy change keeps the capacity and
+credit owner: ordinary elapsed credit accrues at the previous rate before the
+rate changes, without granting a fresh burst or resetting tokens.
+This is an integrator candidate, not an owner decision or accepted performance
+claim. A new immutable build, focused admission/charge regressions and matched
+native before/after measurements must establish its actual effect.
+
+The second instrumented impaired run improves to64.5726912Mbit/s but still fails
+the same80Mbit/s target. Its receiving peer records substantial native admission
+pressure without a native write WouldBlock. Source review identifies a scheduling
+boundary: the loop fills its local native FIFO, then a biased UDP-readable branch
+can consume a receive batch before processing already-available native writable
+readiness. New user sources are refused at the full local FIFO even though the
+device could accept the queued output. Enlarging that FIFO would not correct
+the ownership/scheduling error.
+
+The next reviewed correction polls existing native writable readiness once,
+without waiting, after collection and before receiving another UDP batch. It
+writes at most the existing per-turn native budget with all existing fresh
+deadline/completion checks. The later readiness branch consumes only the unused
+part of that same budget. If output remains because the budget was exhausted,
+another bounded loop turn must still service shutdown/commands/UDP rather than
+performing an unbounded drain. Pending readiness or WouldBlock immediately
+returns to the combined event loop, preserving opposite-direction native input
+and fixed authenticated control. An actual pre-drain attempt schedules one
+immediate bounded turn so the policy coordinator observes native completion;
+an unavailable writable guard does not create a repeated immediate wake.
+Validate a writable full FIFO with queued UDP,
+real device pressure, partial/batch limits and exact/original expiry before
+claiming the correction or a native performance result.
+
+The [same focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json)
+passed all five new [output-drain regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_drain_tests.rs)
+for both appearances: a writable full FIFO with queued original-socket UDP,
+actual paired-runtime FIFO1 bursts, Pending/WouldBlock with opposite input and
+authenticated control, shared attempt quotas/FIFO remainder, and original expiry
+with irreversible completion accounting. Five separate [control-loss fixtures](../../crates/l2tunnel-runtime/src/secure_udp/transport_loss_tests.rs)
+discard actual protected socket emissions. Initial Ping/Pong loss, lost receipts,
+out-of-order custody and shared-credit pressure recover within the existing
+bounds; five lost copies still reach the original five-second challenge expiry.
+Fresh authenticated user traffic cannot renew it. Retry policy is unchanged.
+
+The [immutable build7](../../work/secure-udp-native-build-20261113/attempt-7/build-receipt.json)
+then measured [70.6235936Mbit/s impaired](../../work/secure-udp-native-20261113/quic-impaired-perf-attempt-3/receipt.json)
+and [72.0171488Mbit/s clean](../../work/secure-udp-native-20261113/quic-clean-perf-attempt-2/receipt.json).
+Both cases pass exact native bytes/EOF, policy, manual reconnect, captures and
+cleanup, and both fail80Mbit/s. Both peers' reported native-pressure drops,
+output-full polls and native write WouldBlock remain zero. The [sampled comparison](../../work/secure-udp-performance-analysis-20261113/build7-clean-impaired-sampled-focus.json)
+still observes backlogged packing endpoints, discarded refill credit and late
+credit checks. These sampled intervals and reference-window process CPU are
+separate observations; they do not isolate scheduler, syscall or CPU causality.
+`native_ready_events` now includes processed pre-drain readiness as well as
+selected readiness, so it is not the older selected-branch denominator.
+
+- [ ] [SUR-11] Prove and, where necessary, correct opposite-direction native-read progress under continuously ready UDP ingress whose receive work spans quota refill intervals. Use a deterministic production-loop regression, preserve authenticated admission, both native work quotas, original deadlines and control/shutdown progress, then measure both directions. The existing biased UDP-before-native selection can refill ingress before each turn; write pre-drain alone does not prove read fairness. This source-review risk is not attributed as the measured remaining bottleneck.
+
 ## Ownership and admission boundary
 
 The Unix runtime receives a nonblocking `PacketDevice + AsRawFd`, the exact

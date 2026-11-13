@@ -220,6 +220,103 @@ fn partial_policy_api_rejects_unrepresentable_startup_without_rounding() -> io::
     Ok(())
 }
 
+#[test]
+fn cli_burst_credit_is_role_specific_fixed_and_bound_by_both_authenticated_contracts()
+-> io::Result<()> {
+    for appearance in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let (base, peers) = sample(appearance)?;
+        let path = base.session.gate.path;
+        let selected = Selection {
+            appearance,
+            role: security::Role::Initiator,
+            local: path.client,
+            peer: path.server,
+            policy: Policy {
+                forward_kbit: 99_000,
+                reverse_kbit: 9_900,
+                channels: 16,
+                window: 64,
+                path_mtu: 1500,
+                repair_permille: 0,
+            },
+            maximum_mtu: 9000,
+            profile: hs::Profile::Ik,
+            report: None,
+        };
+        let profile = selected.build(base.connection, peers, base.session.member)?;
+        let a = profile.runtime(security::Role::Initiator);
+        let b = profile.runtime(security::Role::Responder);
+        let reserve = a.control.recovery.max_source_bytes
+            + l2tunnel_recovery::DATA_HEADER_BYTES
+            + l2tunnel_recovery::ACK_PACKET_BYTES
+            + 2 * a.control.wire_overhead;
+        // This positive assertion rejects the previous max-MTU-only forward cap.
+        assert_eq!(a.wire.burst_bytes, 49_500 + reserve);
+        assert!(a.wire.burst_bytes > 9000 + reserve);
+        assert_eq!(b.wire.burst_bytes, 9000 + reserve);
+        assert_eq!(a.send.bytes_per_second, 12_375_000);
+        assert_eq!(b.send.bytes_per_second, 1_237_500);
+        assert_eq!(a.send, b.receive);
+        assert_eq!(a.receive, b.send);
+        let opposite = Selection {
+            role: security::Role::Responder,
+            local: path.server,
+            peer: path.client,
+            ..selected
+        }
+        .build(base.connection, peers, base.session.member)?;
+        assert_eq!(
+            opposite.configuration(peers)?,
+            profile.configuration(peers)?
+        );
+        for initiator in [false, true] {
+            let mut a = a;
+            let mut b = b;
+            if initiator {
+                a.wire.burst_bytes += 1;
+            } else {
+                b.wire.burst_bytes += 1;
+            }
+            let changed = Profile::new(profile.connection, profile.session_with_seed(), a, b)?;
+            assert_ne!(changed.configuration(peers)?, profile.configuration(peers)?);
+            assert_eq!(changed.initial_policy()?, profile.initial_policy()?);
+        }
+        let mut next = profile.initial_policy()?;
+        next.forward_kbit = 50_000;
+        let changed = profile.with_policy(&next)?;
+        assert_eq!(changed.initiator.wire.burst_bytes, a.wire.burst_bytes);
+        assert_eq!(changed.responder.wire.burst_bytes, b.wire.burst_bytes);
+        for invalid in [1500 + reserve - 1, 16 * 1024 * 1024 + 1] {
+            let mut invalid_a = a;
+            invalid_a.wire.burst_bytes = invalid;
+            assert!(
+                Profile::new(
+                    profile.connection,
+                    profile.session_with_seed(),
+                    invalid_a,
+                    b
+                )
+                .is_err()
+            );
+            let mut invalid_b = b;
+            invalid_b.wire.burst_bytes = invalid;
+            assert!(
+                Profile::new(
+                    profile.connection,
+                    profile.session_with_seed(),
+                    a,
+                    invalid_b
+                )
+                .is_err()
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Profile {
     fn session_with_seed(self) -> Settings {
         Settings {

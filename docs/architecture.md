@@ -73,13 +73,31 @@ actual TAP/TUN performance, default state-retaining recovery, fresh-DH rekey,
 generic management dispatch or full SW-11. The
 [native lab](modules/secure-udp-native.md) tracks those finite CLI/TAP measurements
 separately from all remaining carrier, platform and ISP requirements.
-The [latest required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+The [preceding deadline-correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
 also passed with unchanged inputs. Subsequent [immutable native baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
 passed clean/delay QUIC-like cases and functional policy/reconnect/integrity checks
 for both appearances; both 15%-loss cases failed the unchanged performance target.
 Later deadline and ready-work corrections have separate focused evidence and
 require their own build/native qualification. No baseline result is promoted to
 full lifecycle, carrier or platform completion.
+
+The owner-requested [performance-counter correction](modules/secure-udp-native.md#counter-guided-performance-correction)
+adds bounded runtime/channel observations through the shared service API. It
+separately corrects the CLI's too-small forward burst and drains already-writable
+native output before the next UDP batch using the original per-turn quota.
+Finite QUIC-like impaired measurements improve from40.0928 to64.5727 and then
+70.6236Mbit/s; the80Mbit/s gate remains open. Reported native-pressure rejection
+is removed in build7, while remaining pacer/CPU and saturated-read fairness need
+their own evidence. The same preserved old binary now measures71.4825 clean,
+so its historical83.0069 is not promoted to a current environment baseline.
+Requested kernel profiling then locates network and epoll/futex execution; the
+separately verified one-shot IPC helper correction measures77.3464Mbit/s
+impaired in build8, still below80, without changing daemon scheduling.
+Pure observations and focused protocol/runtime tests remain separate from
+source-pinned native measurements, complete mode/lifecycle acceptance and ISP QoS.
+The [latest required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+passes with unchanged source inputs; this local check does not complete the
+remaining native performance, recovery, carrier, mode or platform gates.
 
 ## Library boundary and layering
 

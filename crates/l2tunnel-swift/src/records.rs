@@ -5,6 +5,9 @@
 
 use crate::{Receiver, ReceiverStats, Sender, SenderStats, flow, header};
 
+/// Read-only sender occupancy, recovery estimate and current-engine counters.
+pub use crate::sender::Observation as SenderObservation;
+
 /// Native packet grammar, independent of a platform device handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Layer {
@@ -98,6 +101,17 @@ pub struct Stats {
     pub header_bytes_saved: u64,
 }
 
+/// One indexed channel's current directional observations, without retired totals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelStats {
+    /// Absent when this index is outside the current sending channel count.
+    pub send: Option<SenderObservation>,
+    /// Absent when this index is outside the current receiving channel count.
+    pub receive: Option<ReceiverStats>,
+    /// Known sources awaiting ordered delivery; zero without a receive channel.
+    pub receive_pending: u32,
+}
+
 /// Bounded pure data path; never a connection, crypto or management owner.
 pub struct Engine {
     send: Config,
@@ -168,6 +182,20 @@ impl Engine {
     /// Current receiving policy.
     pub fn receive_config(&self) -> Config {
         self.receive
+    }
+    /// Observe one channel without polling, allocating or changing protocol state.
+    /// Indices beyond both current directions return None; at most 64 exist.
+    pub fn channel_stats(&self, index: usize) -> Option<ChannelStats> {
+        let send = self.senders.get(index).map(Sender::observation);
+        let receive = self.receivers.get(index);
+        if send.is_none() && receive.is_none() {
+            return None;
+        }
+        Some(ChannelStats {
+            send,
+            receive: receive.map(Receiver::stats),
+            receive_pending: receive.map_or(0, Receiver::pending),
+        })
     }
     /// Largest body permitted by any installed directional policy.
     pub fn body_limit(&self) -> usize {
@@ -322,6 +350,16 @@ impl Engine {
     /// Earliest sender deadline, without pacing or transaction deadlines.
     pub fn data_deadline(&self) -> Option<u64> {
         self.senders.iter().filter_map(Sender::deadline).min()
+    }
+    /// Whether due feedback can actually fit under the legacy packing rule.
+    /// This observation changes no receiver counters, timers or output bytes.
+    pub fn feedback_ready(&self, now: u64) -> bool {
+        now >= self.feedback_at
+            && self.send.codec.datagram_bytes >= crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS
+            && self
+                .receivers
+                .iter()
+                .any(|receiver| receiver.deadline().is_some_and(|at| at <= now))
     }
     /// Earliest channel-feedback scheduling turn under the legacy packing rule.
     pub fn feedback_deadline(&self) -> Option<u64> {

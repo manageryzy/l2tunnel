@@ -1,5 +1,12 @@
 //! Finite native/device and same-original-UDP transport fixtures, without privileges.
 
+#[path = "transport_drain_tests.rs"]
+mod drain;
+#[path = "transport_loss_tests.rs"]
+mod loss;
+#[path = "transport_metrics_tests.rs"]
+mod metrics;
+
 use super::*;
 use l2tunnel_handshake as hs;
 use l2tunnel_identity as identity;
@@ -542,6 +549,30 @@ fn native_bidirectional_policy_liveness_and_ratchets_use_both_original_socket_pa
                 .all(|done| done.reason == StopReason::Cancelled && !done.snapshot.running)
         );
         for done in &stopped {
+            let metrics = done.snapshot.performance;
+            assert!(
+                metrics.loop_turns > 0
+                    && metrics.native_ready_events > 0
+                    && metrics.udp_ready_events > 0
+            );
+            assert_eq!(
+                metrics.native_write_batch_packets,
+                done.snapshot.counters.native_written
+            );
+            assert_eq!(
+                metrics.bootstrap_packets
+                    + metrics.control_packets
+                    + metrics.user_packets
+                    + metrics.feedback_packets,
+                done.snapshot.counters.wire_packets
+            );
+            assert_eq!(
+                metrics.bootstrap_ip_bytes
+                    + metrics.control_ip_bytes
+                    + metrics.user_ip_bytes
+                    + metrics.feedback_ip_bytes,
+                done.snapshot.counters.wire_bytes
+            );
             assert_eq!(done.snapshot.committed.epoch, policy::Epoch(1));
             assert_eq!(done.snapshot.send.records.channels, 3);
             assert_eq!(done.snapshot.receive.records.channels, 3);
@@ -635,6 +666,8 @@ fn real_native_socket_backpressure_keeps_exact_fifo_and_bounded_pending_storage(
         .find(|done| done.snapshot.info.role == security::Role::Responder)
         .ok_or("missing responder observation")?;
     assert_eq!(server.snapshot.counters.native_written, 64);
+    assert!(server.snapshot.performance.native_write_would_block > 0);
+    assert_eq!(server.snapshot.performance.native_write_batch_packets, 64);
     Ok(())
 }
 
@@ -1547,6 +1580,7 @@ async fn native_write_crossing_expiry_is_counted_once_without_retained_duplicate
             Some(io::ErrorKind::WouldBlock)
         );
         let stopped = fixture.driver.snapshot(deadline, false);
+        assert_eq!(stopped.performance.native_write_batch_packets, 1);
         assert_eq!(stopped.counters.native_pending_packets, 0);
         assert_eq!(stopped.counters.native_written, 1);
         assert_eq!(stopped.terminal, Some(StopReason::NativeStall));
@@ -1587,6 +1621,14 @@ async fn native_success_is_accounted_when_completion_clock_or_check_fails() -> R
         );
         assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.driver.counters.native_written, 1);
+        assert_eq!(
+            fixture
+                .driver
+                .performance
+                .counters
+                .native_write_batch_packets,
+            1
+        );
         assert!(fixture.driver.native.is_empty());
         assert_eq!(fixture.driver.native_bytes, 0);
         let mut packet = [0; 512];
@@ -1684,6 +1726,14 @@ async fn native_read_crossing_lease_expiry_is_not_admitted_to_swift() -> Result 
             .read_native(&mut ready, &mut input, || Ok(time.load(Ordering::SeqCst)))?
     );
     assert_eq!(fixture.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .driver
+            .performance
+            .counters
+            .native_read_batch_packets,
+        1
+    );
     assert_eq!(fixture.driver.counters.native_read, 0);
     assert_eq!(fixture.driver.swift.unconfirmed(), 0);
     assert_eq!(fixture.driver.swift.stats().native_read, 0);

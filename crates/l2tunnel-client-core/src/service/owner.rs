@@ -50,6 +50,10 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     let mut state = shared.lock();
     state.backend = None;
     state.snapshot.runtime = backend.and_then(|backend| backend.observe());
+    #[cfg(unix)]
+    if let Some(observation) = &mut state.snapshot.runtime {
+        observation.record_service_terminal(terminal);
+    }
     state.snapshot.listening = None;
     if let Some(generation) = generation {
         if state.terminals.len() == RETAINED {

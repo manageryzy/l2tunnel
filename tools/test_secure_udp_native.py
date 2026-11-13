@@ -181,18 +181,31 @@ class HarnessContracts(unittest.TestCase):
             with self.subTest(phase=label), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
                 receipt = h.bounded.Receipt(output / 'receipt.json', {'status': 'running', **prior})
-                failed_ping = '3 packets transmitted, 2 received, 33.3333% packet loss\n'
+                failed_ping = json.dumps({'status': 'failed', 'sent': 3, 'received_unique': 2,
+                    'request_count': 3, 'payload_bytes': 1472, 'ip_bytes': 1500, 'df': True}) + '\n'
                 launched, stopped, observed = [], [], []
-                def launch(role, argv, name):
-                    Path(argv[argv.index('--ready') + 1]).write_text('ready')
-                    child = Mock(); child.poll.return_value = None
-                    launched.append(child)
-                    return child, output / (name + '.log')
+                def launch(role, argv, name, cap=None):
+                    child = Mock(); child.poll.return_value = None; child.returncode = 0
+                    log = output / (name + '.log')
+                    if '--ready' in argv:
+                        Path(argv[argv.index('--ready') + 1]).write_text('ready')
+                        launched.append(child)
+                    else:
+                        self.assertEqual(cap, 64 * 1024)
+                        self.assertEqual(argv[2], 'icmp-probe')
+                        side = role[-1]
+                        self.assertEqual(argv[argv.index('--source') + 1], h.HOST[side])
+                        self.assertEqual(argv[argv.index('--address') + 1], h.HOST['b' if side == 'a' else 'a'])
+                        end = int(argv[argv.index('--deadline-ns') + 1])
+                        self.assertLessEqual(end, int(deadline * 1e9))
+                        log.write_text(json.dumps({'status': 'passed', 'sent': 3, 'received_unique': 3,
+                            'request_count': 3, 'payload_bytes': 1472, 'ip_bytes': 1500, 'df': True,
+                            'source': h.HOST[side], 'address': h.HOST['b' if side == 'a' else 'a'],
+                            'original_deadline_ns': end,
+                            'rows': [{'sequence': n, 'sent_ns': end - 2, 'received_ns': end - 1} for n in (1, 2, 3)]}) + '\n'
+                            if role == 'host_a' else failed_ping)
+                    return child, log
                 def command(role, *argv, cap):
-                    if argv[0] == 'ping':
-                        self.assertEqual(cap, 12)
-                        self.assertEqual(argv[1:-1], ('-n', '-c', '3', '-i', '.2', '-W', '3', '-M', 'do', '-s', '1472'))
-                        return '3 packets transmitted, 3 received, 0% packet loss\n' if role == 'host_a' else failed_ping
                     self.assertEqual(cap, 17)
                     return json.dumps({'status': 'passed', 'rows': [{'answered': True}] * 14})
                 def observe(side):
@@ -236,6 +249,33 @@ class HarnessContracts(unittest.TestCase):
                 self.assertEqual(peers['a']['status'], 'tool_failure')
                 self.assertIn('control socket unavailable', peers['a']['error'])
                 self.assertEqual(peers['b']['status'], 'observed' if len(expected_calls) == 2 else 'bound_exhausted')
+
+    def test_icmp_process_bound_retains_partial_log_before_live_failure_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            receipt = h.bounded.Receipt(output / 'receipt.json', {'status': 'running', 'initial_sockets': {'sole_udp': True}})
+            primary = subprocess.TimeoutExpired('icmp-probe', 12)
+            progress = json.dumps({'event': 'icmp_reply', 'status': 'running', 'sent': 3, 'received_unique': 2}) + '\n'
+            def launch(role, argv, name, cap=None):
+                child, log = Mock(), output / (name + '.log')
+                if '--ready' in argv:
+                    Path(argv[argv.index('--ready') + 1]).write_text('ready')
+                else:
+                    log.write_text(progress)
+                    child.wait.side_effect = primary
+                return child, log
+            def observe(side):
+                saved = json.loads(receipt.path.read_text())
+                self.assertEqual(saved['initial_functional_progress']['a']['full_mtu_df_ping'], progress)
+                self.assertTrue(saved['initial_sockets']['sole_udp'])
+                return status(side)
+            deadline = time.monotonic() + 20
+            with patch.object(h.bounded, 'stop') as stop, self.assertRaises(subprocess.TimeoutExpired) as caught:
+                h.record_functional(receipt, 'functional',
+                    lambda: h.functional('initial', output, deadline, launch, Mock(), receipt), observe, deadline)
+            self.assertIs(caught.exception, primary); self.assertEqual(stop.call_count, 2)
+            peers = json.loads(receipt.path.read_text())['functional_failure']['peers']
+            self.assertTrue(all(row['status'] == 'observed' for row in peers.values()))
 
     def test_failure_diagnostic_bounds_and_publication_cannot_replace_primary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -718,6 +758,202 @@ class OwnedShapingContracts(unittest.TestCase):
             self.assertEqual(value['reference'], {'exact_bytes': 123})
             self.assertEqual(value['tc_before']['phase'], 'before'); self.assertEqual(value['tc_final']['phase'], 'final')
             self.assertNotIn('tc_post_reference', value)
+
+
+def icmp_echo_reply(request):
+    packet = bytearray(request)
+    packet[12:16], packet[16:20] = request[16:20], request[12:16]
+    packet[20] = 0
+    packet[22:24] = bytes(2)
+    packet[22:24] = h.bounded.checksum(packet[20:]).to_bytes(2, 'big')
+    packet[10:12] = bytes(2)
+    packet[10:12] = h.bounded.checksum(packet[:20]).to_bytes(2, 'big')
+    return bytes(packet)
+
+
+class IcmpSocket:
+    """Deterministic raw socket boundary; no privileges or real ICMP traffic."""
+    def __init__(self, clock, on_send):
+        self.clock, self.on_send = clock, on_send
+        self.sent, self.events, self.options, self.send_advance = [], [], [], {}
+        self.closed, self.close_at = False, None
+    def setsockopt(self, *option): self.options.append(option)
+    def bind(self, address): self.local = address
+    def connect(self, address): self.peer = address
+    def settimeout(self, timeout):
+        if timeout <= 0: raise AssertionError('nonpositive socket bound')
+        self.timeout = timeout
+    def send(self, packet):
+        sequence = int.from_bytes(packet[26:28], 'big')
+        self.sent.append((self.clock[0], packet))
+        self.on_send(self, sequence, packet)
+        self.clock[0] += self.send_advance.get(sequence, 0)
+        return len(packet)
+    def enqueue(self, at, packet, peer='198.18.0.2'):
+        self.events.append((at, packet, (peer, 0)))
+        self.events.sort(key=lambda row: row[0])
+    def recvfrom(self, maximum):
+        if maximum != 1501: raise AssertionError('unbounded ICMP receive')
+        until = self.clock[0] + round(self.timeout * 1e9)
+        if self.events and self.events[0][0] <= until:
+            at, packet, peer = self.events.pop(0)
+            self.clock[0] = max(at, self.clock[0])
+            return packet[:maximum], peer
+        self.clock[0] = until
+        raise socket.timeout()
+    def close(self):
+        self.closed = True
+        if self.close_at is not None: self.clock[0] = self.close_at
+
+
+class IcmpContracts(unittest.TestCase):
+    def probe(self, on_send, *, deadline=None, setup=None):
+        clock = [1_000_000_000]
+        stream = IcmpSocket(clock, on_send)
+        if setup: setup(stream)
+        factory, events = Mock(return_value=stream), []
+        value = p.icmp_probe('198.18.0.1', '198.18.0.2', deadline,
+            clock=lambda: clock[0], socket_factory=factory, random_bytes=lambda count: b'\x12\x34' + b'n' * 16,
+            progress=events.append)
+        factory.assert_called_once_with(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        self.assertTrue(stream.closed)
+        self.assertLess(len(json.dumps(value)) + sum(len(json.dumps(row)) for row in events), 64 * 1024)
+        return value, stream, events
+
+    def test_exact_three_full_mtu_df_requests_wait_for_delayed_third_reply(self):
+        def sent(stream, sequence, packet):
+            stream.enqueue(stream.clock[0] + (2_000_000_000 if sequence == 3 else 10_000_000), icmp_echo_reply(packet))
+        result, stream, events = self.probe(sent)
+        self.assertEqual(result['status'], 'passed')
+        self.assertEqual((result['sent'], result['received_unique']), (3, 3))
+        self.assertEqual([at for at, packet in stream.sent], [1_000_000_000, 1_200_000_000, 1_400_000_000])
+        self.assertGreater(result['completed_ns'], 3_000_000_000)
+        self.assertEqual(stream.local, ('198.18.0.1', 0)); self.assertEqual(stream.peer, ('198.18.0.2', 0))
+        self.assertIn((socket.IPPROTO_IP, socket.IP_HDRINCL, 1), stream.options)
+        self.assertIn((socket.IPPROTO_IP, 10, 2), stream.options)
+        for sequence, (_, packet) in enumerate(stream.sent, 1):
+            self.assertEqual(len(packet), 1500); self.assertEqual(int.from_bytes(packet[2:4], 'big'), 1500)
+            self.assertEqual(int.from_bytes(packet[6:8], 'big'), 0x4000)
+            self.assertEqual(h.bounded.checksum(packet[:20]), 0); self.assertEqual(h.bounded.checksum(packet[20:]), 0)
+            self.assertEqual(packet[20:22], b'\x08\0'); self.assertEqual(packet[24:26], b'\x12\x34')
+            self.assertEqual(int.from_bytes(packet[26:28], 'big'), sequence)
+            self.assertEqual(len(packet[28:]), 1472)
+        self.assertEqual(len([row for row in events if row['event'] == 'icmp_sent']), 3)
+
+    def test_unique_exact_replies_tolerate_duplicates_and_reordering(self):
+        def sent(stream, sequence, packet):
+            at = {1: 1_500_000_000, 2: 1_300_000_000, 3: 1_800_000_000}[sequence]
+            stream.enqueue(at, icmp_echo_reply(packet))
+            if sequence == 2: stream.enqueue(at + 10_000_000, icmp_echo_reply(packet))
+        result, stream, _ = self.probe(sent)
+        self.assertEqual(result['status'], 'passed'); self.assertEqual(len(stream.sent), 3)
+        self.assertEqual(result['received_unique'], 3)
+        self.assertEqual(result['duplicates'], 1); self.assertEqual(result['reordered'], 1)
+
+    def test_loss_and_at_or_after_original_deadline_cannot_pass_or_retransmit(self):
+        for third_at in (None, 13_000_000_000, 13_000_000_001):
+            def sent(stream, sequence, packet):
+                if sequence < 3: stream.enqueue(stream.clock[0] + 10_000_000, icmp_echo_reply(packet))
+                elif third_at is not None: stream.enqueue(third_at, icmp_echo_reply(packet))
+            with self.subTest(third_at=third_at):
+                result, stream, _ = self.probe(sent)
+                self.assertEqual(result['status'], 'bound_exhausted')
+                self.assertEqual((result['sent'], result['received_unique']), (3, 2))
+                self.assertEqual(len(stream.sent), 3); self.assertEqual(result['original_deadline_ns'], 13_000_000_000)
+                self.assertEqual(result['late'], int(third_at == 13_000_000_000))
+
+    def test_successful_send_and_finalization_crossing_expiry_keep_honest_counts(self):
+        def sent(stream, sequence, packet): stream.enqueue(stream.clock[0] + 10_000_000, icmp_echo_reply(packet))
+        result, stream, _ = self.probe(sent, setup=lambda stream: stream.send_advance.update({3: 11_600_000_000}))
+        self.assertEqual(result['status'], 'bound_exhausted')
+        self.assertEqual((result['sent'], result['received_unique']), (3, 2))
+        self.assertEqual(len(stream.sent), 3); self.assertEqual(result['rows'][2]['sent_ns'], 13_000_000_000)
+        result, _, _ = self.probe(sent, setup=lambda stream: setattr(stream, 'close_at', 13_000_000_000))
+        self.assertEqual(result['status'], 'bound_exhausted'); self.assertEqual(result['received_unique'], 3)
+        result, stream, _ = self.probe(sent, deadline=1_300_000_000)
+        self.assertEqual(result['original_deadline_ns'], 1_300_000_000)
+        self.assertEqual(result['status'], 'bound_exhausted'); self.assertEqual(len(stream.sent), 2)
+
+    def test_checksums_identity_sequence_extent_and_payload_are_required(self):
+        request = p.icmp_request('198.18.0.1', '198.18.0.2', 0x1234, 1, b'x' * 1472)
+        exact = icmp_echo_reply(request)
+        payloads = {1: b'x' * 1472}
+        self.assertEqual(p.icmp_reply(exact, '198.18.0.2', '198.18.0.1', '198.18.0.2', 0x1234, payloads), ('exact', 1))
+        for mutation in ('ip_checksum', 'icmp_checksum', 'identifier', 'sequence', 'extent', 'payload', 'fragment', 'peer', 'code'):
+            packet, peer = bytearray(exact), '198.18.0.2'
+            if mutation == 'ip_checksum': packet[10] ^= 1
+            if mutation == 'icmp_checksum': packet[22] ^= 1
+            if mutation == 'identifier': packet[25] ^= 1
+            if mutation == 'sequence': packet[27] = 4
+            if mutation == 'extent': packet.pop()
+            if mutation == 'payload': packet[-1] ^= 1
+            if mutation == 'fragment': packet[6:8] = b'\x20\0'
+            if mutation == 'peer': peer = '198.18.0.9'
+            if mutation == 'code': packet[21] = 1
+            if mutation in ('sequence', 'payload', 'code'):
+                packet[22:24] = bytes(2); packet[22:24] = h.bounded.checksum(packet[20:]).to_bytes(2, 'big')
+            if mutation == 'fragment':
+                packet[10:12] = bytes(2); packet[10:12] = h.bounded.checksum(packet[:20]).to_bytes(2, 'big')
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(p.icmp_reply(bytes(packet), peer, '198.18.0.1', '198.18.0.2', 0x1234, payloads)[0], 'exact')
+        def sent(stream, sequence, packet):
+            if sequence == 1:
+                bad = bytearray(icmp_echo_reply(packet)); bad[-1] ^= 1
+                stream.enqueue(stream.clock[0] + 1, bytes(bad))
+            stream.enqueue(stream.clock[0] + 10_000_000, icmp_echo_reply(packet))
+        result, _, _ = self.probe(sent)
+        self.assertEqual(result['status'], 'failed'); self.assertEqual(result['invalid'], 1)
+        self.assertEqual(result['received_unique'], 3)
+
+    def test_ingress_and_diagnostic_bounds_preserve_partial_result(self):
+        def sent(stream, sequence, packet):
+            wrong = bytearray(icmp_echo_reply(packet)); wrong[25] ^= 1
+            for offset in range(257): stream.enqueue(stream.clock[0] + offset + 1, bytes(wrong))
+        result, stream, events = self.probe(sent)
+        self.assertEqual(result['status'], 'bound_exhausted')
+        self.assertEqual(result['ingress_packets'], 257); self.assertEqual(len(result['diagnostics']), 16)
+        self.assertEqual(result['unrelated'], 256); self.assertEqual(result['received_unique'], 0)
+        self.assertEqual(len(stream.sent), 1)
+
+    def test_subcommand_failure_keeps_structured_result_and_original_deadline(self):
+        failure = {'status': 'bound_exhausted', 'sent': 3, 'received_unique': 2, 'rows': [{'sequence': 3}]}
+        with patch.object(p, 'icmp_probe', return_value=failure) as invoke, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(p.main(['icmp-probe', '--source', '198.18.0.1', '--address', '198.18.0.2',
+                                     '--deadline-ns', '1234']), 1)
+        self.assertEqual(invoke.call_args.args, ('198.18.0.1', '198.18.0.2', 1234))
+        self.assertEqual(json.loads(output.getvalue()), failure)
+
+    def test_expired_original_bound_and_socket_privilege_failure_remain_explicit(self):
+        factory = Mock(side_effect=PermissionError('raw ICMP capability unavailable'))
+        result = p.icmp_probe('198.18.0.1', '198.18.0.2', 1, clock=lambda: 2, socket_factory=factory)
+        factory.assert_not_called()
+        self.assertEqual(result['status'], 'bound_exhausted'); self.assertEqual(result['sent'], 0)
+        result = p.icmp_probe('198.18.0.1', '198.18.0.2', clock=lambda: 2, socket_factory=factory)
+        self.assertEqual(result['status'], 'tool_failure'); self.assertEqual(result['sent'], 0)
+        self.assertIn('capability unavailable', result['error'])
+
+    def test_native_capture_binds_full_mtu_df_request_and_reply_to_fresh_probe(self):
+        def sent(stream, sequence, packet): stream.enqueue(stream.clock[0] + 10_000_000, icmp_echo_reply(packet))
+        result, stream, _ = self.probe(sent)
+        frames = [bytes(12) + b'\x08\0' + packet for _, request in stream.sent for packet in (request, icmp_echo_reply(request))]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native.pcap'; path.write_bytes(pcap(frames))
+            audit = h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
+            matched = h.icmp_capture_complete(audit, {'functional': {'a': {'icmp': result}}})
+            self.assertEqual((audit['native_icmp']['requests'], audit['native_icmp']['replies']), (3, 3))
+            self.assertEqual(len(matched['probes']), 1)
+            for mutation in ('missing', 'wrong_prefix', 'no_df'):
+                changed = copy.deepcopy(audit)
+                if mutation == 'missing': changed['native_icmp']['samples'].pop()
+                if mutation == 'wrong_prefix': changed['native_icmp']['samples'][0]['payload_prefix'] = '00' * 16
+                if mutation == 'no_df': changed['native_icmp']['samples'][0]['df'] = False
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    h.icmp_capture_complete(changed, {'functional': {'a': {'icmp': result}}})
+            changed = bytearray(frames[0]); changed[20:22] = bytes(2)
+            changed[24:26] = bytes(2); changed[24:26] = h.bounded.checksum(changed[14:34]).to_bytes(2, 'big')
+            path.write_bytes(pcap([bytes(changed)]))
+            with self.assertRaisesRegex(ValueError, 'DF'):
+                h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
 
 
 class ProbeContracts(unittest.TestCase):

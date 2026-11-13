@@ -113,13 +113,30 @@ reconnect. This follows the factory checkpoint; it does not qualify actual
 CLI/TAP throughput. The [separate native lab](modules/secure-udp-native.md) retains
 clean, delay, 1%/15% loss, sixteen-flow ACK-return, reverse-bulk stress, payload,
 policy/lifecycle and capture acceptance without reducing parent gates.
-The [latest required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+The [preceding deadline-correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
 passed with stable source inputs. The subsequent [immutable CLI/TAP baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
 exercise exact bytes, real policy commits and manual reconnect for both appearances.
 Clean/delay QUIC-like cases passed; both impaired cases failed the unchanged
 80 Mbit/s target. Source-backed deadline/wakeup corrections and the remaining
 matched matrix require new recorded qualification; these finite observations do
 not close FIX-04, FIX-13 or full SW-11.
+
+The [counter-guided correction](modules/secure-udp-native.md#counter-guided-performance-correction)
+now has [source-stable focused evidence](../work/secure-udp-performance-focused-20261113/attempt-4/validation.json)
+for production class/credit/native observations, shared bounded reports/logging,
+original control-loss bounds and output-drain scheduling. The initial-rate burst
+and write pre-drain improve finite impaired QUIC-like goodput to70.6236Mbit/s,
+with reported native-pressure rejection removed;80Mbit/s remains unqualified.
+The later [expanded focus](../work/secure-udp-performance-focused-20261113/attempt-5/validation.json)
+and actual immutable CLI proofs validate the IPC-only helper scheduler correction;
+build8 reaches77.3464Mbit/s impaired and still fails80. Kernel perf and simultaneous
+process I/O observations do not establish disk I/O as the primary cause.
+SUR-11 retains the independent saturated native-read fairness risk. Simulator
+overhead sensitivity, sampled CPU/credit and historical-binary replay remain
+separate evidence, not a reduction of any mode, lifecycle or performance gate.
+The [latest source-stable aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+passed the complete ordinary workspace checks. Both earlier failed aggregate
+attempts remain preserved; actual native80Mbit/s acceptance remains open.
 
 Additional unfinished source and integration boundaries:
 

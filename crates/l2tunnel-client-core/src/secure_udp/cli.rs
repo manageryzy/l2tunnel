@@ -325,10 +325,24 @@ impl Selection {
             + l2tunnel_recovery::DATA_HEADER_BYTES
             + l2tunnel_recovery::ACK_PACKET_BYTES
             + 2 * overhead;
+        // Fixed per-role credit headroom absorbs timer granularity. This is
+        // authenticated geometry, not a change to either wire-rate budget.
+        let burst = |rate: u64| -> io::Result<transport::WireBudget> {
+            let credit = usize::try_from(rate / 250).map_err(io::Error::other)?;
+            Ok(transport::WireBudget {
+                burst_bytes: self
+                    .maximum_mtu
+                    .max(credit)
+                    .checked_add(pair_cost)
+                    .ok_or_else(|| input("wire burst geometry overflow"))?,
+            })
+        };
+        let send = direction(true);
+        let receive = direction(false);
         let initiator = transport::Config {
             path_mtu: usize::from(self.policy.path_mtu),
-            send: direction(true),
-            receive: direction(false),
+            send,
+            receive,
             policy: policy::Settings {
                 transaction_micros: 10_000_000,
                 max_outbound: 32,
@@ -347,9 +361,7 @@ impl Selection {
             },
             control_epoch: security::Epoch(1),
             data_epoch: security::Epoch(1),
-            wire: transport::WireBudget {
-                burst_bytes: self.maximum_mtu + pair_cost,
-            },
+            wire: burst(send.bytes_per_second)?,
             work: transport::WorkBudget {
                 receive_interval: Duration::from_millis(1),
                 receive_packets: 256,
@@ -372,6 +384,7 @@ impl Selection {
         let responder = transport::Config {
             send: initiator.receive,
             receive: initiator.send,
+            wire: burst(receive.bytes_per_second)?,
             ..initiator
         };
         Profile::new(connection, selected, initiator, responder)
@@ -387,6 +400,7 @@ pub(super) async fn execute(
 ) -> io::Result<()> {
     use crate::service::{self, Completed, Terminal};
     use std::path::Path;
+    let report_interval = selected.report.unwrap_or(Duration::from_secs(1));
     let noise = credentials::NoiseIdentity::new(
         credentials::read_secret(Path::new(required(options, "--noise-private-key-file")?))?,
         hs::PeerKey(credentials::read_public(Path::new(required(
@@ -448,6 +462,12 @@ pub(super) async fn execute(
     let lifecycle = async move {
         let mut cursor = accepted.operation.value().saturating_sub(1);
         let mut live = None;
+        let mut last_performance = secure_udp::performance::Cursor::default();
+        let mut report_tick = tokio::time::interval(report_interval);
+        report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut output = output::Sink::stdout();
+        let mut output_tick = tokio::time::interval(Duration::from_millis(5));
+        output_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let stopped = async {
                 match live {
@@ -459,8 +479,10 @@ pub(super) async fn execute(
                 terminal = stopped => {
                     live = None;
                     let terminal = terminal.map_err(submit)?;
-                    println!("{}", serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
+                    emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
+                    output.emit(serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
                     if let Terminal::Failed(failure) = terminal {
+                        output.flush_turn();
                         return Err(io::Error::new(failure.kind, "secure UDP runtime failed"));
                     }
                 }
@@ -471,9 +493,12 @@ pub(super) async fn execute(
                         Completed::Connected { generation } => {
                             live = Some(generation);
                             let snapshot = life.snapshot();
-                            let status = snapshot.runtime.as_ref().and_then(service::Observation::secure_udp)
-                                .ok_or_else(|| io::Error::other("selected secure UDP observation absent"))?.status()?;
-                            println!("{}", serde_json::json!({"event":"secure_udp_ready","status":status}));
+                            let frame = snapshot.runtime.as_ref().and_then(service::Observation::secure_udp);
+                            match frame.map(service::SecureUdpFrame::status).transpose() {
+                                Ok(Some(status)) => output.emit(serde_json::json!({"event":"secure_udp_ready","status":status})),
+                                _ => output.projection_error(),
+                            }
+                            emit_performance(frame, &mut last_performance, &mut output);
                         }
                         Completed::Failed(failure) => return Err(io::Error::new(failure.kind, "secure UDP setup failed")),
                         Completed::Cancelled => return Err(io::Error::new(io::ErrorKind::Interrupted, "secure UDP setup cancelled")),
@@ -481,7 +506,12 @@ pub(super) async fn execute(
                         Completed::Applied(_) | Completed::Rejected(_) | Completed::OutcomeUnknown => {}
                     }
                 }
+                _ = report_tick.tick() => {
+                    emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
+                }
+                _ = output_tick.tick(), if output.has_pending() => {},
             }
+            output.flush_turn();
         }
     };
     let local = async {
@@ -497,6 +527,442 @@ pub(super) async fn execute(
         }
     };
     tokio::select! { result = run => result, result = lifecycle => result, result = local => result }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_performance(
+    frame: Option<&crate::service::SecureUdpFrame>,
+    last: &mut secure_udp::performance::Cursor,
+    output: &mut output::Sink,
+) {
+    let report = match frame
+        .map(crate::service::SecureUdpFrame::performance)
+        .transpose()
+    {
+        Ok(Some(Some(report))) => report,
+        Ok(_) => return,
+        Err(_) => {
+            output.projection_error();
+            return;
+        }
+    };
+    if last.accept(&report) {
+        output.emit(serde_json::json!({"event":"secure_udp_performance","report":report}));
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod output {
+    use std::{
+        collections::VecDeque,
+        fs::{File, OpenOptions},
+        io::{self, Write},
+        os::fd::{AsFd, AsRawFd, BorrowedFd},
+        os::unix::fs::OpenOptionsExt,
+        path::Path,
+    };
+    pub(super) const MAX_LINE: usize = 128 * 1024;
+    pub(super) const MAX_LINES: usize = 4;
+    const MAX_BYTES: usize = MAX_LINE * MAX_LINES;
+    pub(super) const WRITE_BYTES: usize = 64 * 1024;
+    const WRITE_CALLS: usize = 4;
+    /// Local logger health; observations never become protocol inputs.
+    #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+    pub(super) struct Health {
+        pub disabled: bool,
+        pub write_errors: u64,
+        pub broken_pipe: u64,
+        pub would_block: u64,
+        pub projection_errors: u64,
+        pub dropped_lines: u64,
+        pub dropped_bytes: u64,
+        pub written_bytes: u64,
+        pub queue_bytes_high: u64,
+    }
+    pub(super) struct Sink {
+        file: Option<File>,
+        pending: VecDeque<Vec<u8>>,
+        offset: usize,
+        bytes: usize,
+        pub(super) health: Health,
+    }
+    impl Sink {
+        pub(super) fn stdout() -> Self {
+            Self::from_stdio(std::io::stdout().as_fd()).unwrap_or_else(|_| Self {
+                file: None,
+                pending: VecDeque::new(),
+                offset: 0,
+                bytes: 0,
+                health: Health {
+                    disabled: true,
+                    write_errors: 1,
+                    ..Health::default()
+                },
+            })
+        }
+        fn from_stdio(original: BorrowedFd<'_>) -> io::Result<Self> {
+            let duplicate = File::from(original.try_clone_to_owned()?);
+            if duplicate.metadata()?.is_file() {
+                // Stdout and stderr may alias this same open-file description.
+                // Preserve their shared offset: a separate APPEND description
+                // would leave stderr's old offset able to overwrite telemetry.
+                // Regular-file writes have byte/call bounds, not a nonblocking
+                // disk-latency guarantee; never alter the inherited flags.
+                return Ok(Self::with_file(duplicate));
+            }
+            // Pipes/terminals need their own nonblocking description; changing
+            // the duplicate's status flags would also change inherited stdio.
+            Self::reopen(Path::new(&format!(
+                "/proc/self/fd/{}",
+                original.as_raw_fd()
+            )))
+        }
+        fn with_file(file: File) -> Self {
+            Self {
+                file: Some(file),
+                pending: VecDeque::with_capacity(MAX_LINES),
+                offset: 0,
+                bytes: 0,
+                health: Health::default(),
+            }
+        }
+        pub(super) fn reopen(path: &Path) -> io::Result<Self> {
+            // Opening procfs creates a distinct open-file description. Never set
+            // O_NONBLOCK/O_APPEND on the inherited stdout description. APPEND is
+            // required because this new description has an independent offset.
+            let flags = rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+            let file = OpenOptions::new()
+                .append(true)
+                .custom_flags(i32::try_from(flags.bits()).map_err(io::Error::other)?)
+                .open(path)?;
+            Ok(Self::with_file(file))
+        }
+        pub(super) fn has_pending(&self) -> bool {
+            !self.pending.is_empty()
+        }
+        pub(super) fn projection_error(&mut self) {
+            self.health.projection_errors = self.health.projection_errors.saturating_add(1);
+        }
+        pub(super) fn emit(&mut self, mut value: serde_json::Value) {
+            if self.file.is_none() {
+                self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
+                return;
+            }
+            if let Some(object) = value.as_object_mut() {
+                match serde_json::to_value(self.health) {
+                    Ok(health) => {
+                        object.insert("log_health".into(), health);
+                    }
+                    Err(_) => {
+                        self.projection_error();
+                        return;
+                    }
+                }
+            }
+            let mut encoded = Limited(Vec::new());
+            if serde_json::to_writer(&mut encoded, &value).is_err() {
+                self.projection_error();
+                self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
+                return;
+            }
+            encoded.0.push(b'\n');
+            if self.pending.len() == MAX_LINES
+                || self.bytes.saturating_add(encoded.0.len()) > MAX_BYTES
+            {
+                self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
+                self.health.dropped_bytes = self
+                    .health
+                    .dropped_bytes
+                    .saturating_add(encoded.0.len() as u64);
+                return;
+            }
+            self.bytes += encoded.0.len();
+            self.health.queue_bytes_high = self.health.queue_bytes_high.max(self.bytes as u64);
+            self.pending.push_back(encoded.0);
+        }
+        pub(super) fn flush_turn(&mut self) {
+            let mut budget = WRITE_BYTES;
+            for _ in 0..WRITE_CALLS {
+                let (Some(file), Some(line)) = (&mut self.file, self.pending.front()) else {
+                    break;
+                };
+                if budget == 0 {
+                    break;
+                }
+                let end = line.len().min(self.offset.saturating_add(budget));
+                match file.write(&line[self.offset..end]) {
+                    Ok(0) => {
+                        self.fail(io::ErrorKind::WriteZero);
+                        break;
+                    }
+                    Ok(written) => {
+                        self.offset += written;
+                        self.bytes -= written;
+                        budget -= written;
+                        self.health.written_bytes =
+                            self.health.written_bytes.saturating_add(written as u64);
+                        if self.offset == line.len() {
+                            self.pending.pop_front();
+                            self.offset = 0;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        self.health.would_block = self.health.would_block.saturating_add(1);
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        self.fail(error.kind());
+                        break;
+                    }
+                }
+            }
+        }
+        fn fail(&mut self, kind: io::ErrorKind) {
+            self.health.disabled = true;
+            self.health.write_errors = self.health.write_errors.saturating_add(1);
+            if kind == io::ErrorKind::BrokenPipe {
+                self.health.broken_pipe = self.health.broken_pipe.saturating_add(1);
+            }
+            self.health.dropped_lines = self
+                .health
+                .dropped_lines
+                .saturating_add(self.pending.len() as u64);
+            self.health.dropped_bytes = self.health.dropped_bytes.saturating_add(self.bytes as u64);
+            self.pending.clear();
+            self.bytes = 0;
+            self.offset = 0;
+            self.file = None;
+        }
+    }
+    struct Limited(Vec<u8>);
+    impl Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > (MAX_LINE - 1).saturating_sub(self.0.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "bounded JSON line",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{
+            io::{Read, Seek},
+            os::fd::AsRawFd,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        fn pipe() -> io::Result<(std::io::PipeReader, std::io::PipeWriter, Sink)> {
+            let (reader, writer) = std::io::pipe()?;
+            let before = rustix::fs::fcntl_getfl(&writer)?;
+            let sink = Sink::from_stdio(writer.as_fd())?;
+            assert_eq!(
+                rustix::fs::fcntl_getfl(&writer)?,
+                before,
+                "inherited pipe flags changed"
+            );
+            let flags = rustix::fs::fcntl_getfl(
+                sink.file
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("sink file"))?,
+            )?;
+            assert!(flags.contains(rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::APPEND));
+            Ok((reader, writer, sink))
+        }
+        #[test]
+        fn real_full_pipe_retains_exact_partial_lines_with_bounded_queue_and_turns()
+        -> io::Result<()> {
+            let (mut reader, _writer, mut sink) = pipe()?;
+            // Fill this actual pipe nonblockingly, then expose only a bounded
+            // free prefix. This does not assume a kernel pipe capacity/page size.
+            let mut filled = 0;
+            let mut blocked = false;
+            for _ in 0..4096 {
+                match sink
+                    .file
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("sink file"))?
+                    .write(&[b'P'; 4096])
+                {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "pipe prefill")),
+                    Ok(bytes) => filled += bytes,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        blocked = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            assert!(
+                blocked && filled > 0,
+                "actual pipe did not fill within the finite fixture bound"
+            );
+            let free = filled.min(8192);
+            reader.read_exact(&mut vec![0; free])?;
+            for index in 0..MAX_LINES {
+                sink.emit(serde_json::json!({"index":index,"body":"x".repeat(MAX_LINE / 2)}));
+            }
+            assert_eq!(sink.pending.len(), MAX_LINES);
+            sink.flush_turn();
+            assert!(sink.health.would_block > 0);
+            assert!(sink.health.written_bytes <= WRITE_BYTES as u64);
+            assert!(sink.offset > 0 && sink.has_pending());
+            let bytes = sink.bytes;
+            sink.emit(serde_json::json!({"discarded":"bounded"}));
+            assert_eq!(sink.pending.len(), MAX_LINES);
+            assert_eq!(sink.bytes, bytes);
+            assert_eq!(sink.health.dropped_lines, 1);
+            reader.read_exact(&mut vec![0; filled - free])?;
+            let mut received = Vec::new();
+            let mut read = 0;
+            for _ in 0..128 {
+                let produced = sink.health.written_bytes as usize - read;
+                if produced > 0 {
+                    let mut chunk = vec![0; produced];
+                    reader.read_exact(&mut chunk)?;
+                    received.extend_from_slice(&chunk);
+                    read += produced;
+                }
+                if !sink.has_pending() {
+                    break;
+                }
+                let before = sink.health.written_bytes;
+                sink.flush_turn();
+                assert!(sink.health.written_bytes - before <= WRITE_BYTES as u64);
+            }
+            assert!(!sink.has_pending());
+            assert_eq!(sink.bytes, 0);
+            let lines = received
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), MAX_LINES);
+            for (index, line) in lines.iter().enumerate() {
+                let value: serde_json::Value = serde_json::from_slice(line)?;
+                assert_eq!(value["index"], index);
+                assert_eq!(value["body"].as_str().map(str::len), Some(MAX_LINE / 2));
+            }
+            Ok(())
+        }
+        #[test]
+        fn broken_pipe_and_projection_failures_are_nonfatal_and_bounded() -> io::Result<()> {
+            let (reader, _writer, mut sink) = pipe()?;
+            sink.projection_error();
+            sink.emit(serde_json::json!({"too_large":"x".repeat(MAX_LINE * 2)}));
+            assert!(sink.pending.is_empty());
+            assert_eq!(sink.health.projection_errors, 2);
+            drop(reader);
+            sink.emit(serde_json::json!({"event":"terminal"}));
+            sink.flush_turn();
+            assert!(sink.health.disabled);
+            assert_eq!(sink.health.broken_pipe, 1);
+            assert_eq!(sink.health.write_errors, 1);
+            assert!(!sink.has_pending());
+            assert_eq!(sink.bytes, 0);
+            assert!(sink.file.is_none());
+            let dropped = sink.health.dropped_lines;
+            sink.emit(serde_json::json!({"event":"still_nonfatal"}));
+            sink.flush_turn();
+            assert_eq!(sink.health.dropped_lines, dropped + 1);
+            Ok(())
+        }
+        #[test]
+        fn regular_file_sink_appends_without_changing_inherited_offset_or_flags() -> io::Result<()>
+        {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "l2tunnel-log-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut original = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            std::fs::remove_file(&path)?;
+            original.write_all(b"original\n")?;
+            original.rewind()?;
+            let flags = rustix::fs::fcntl_getfl(&original)?;
+            let mut sink = Sink::reopen(Path::new(&format!(
+                "/proc/self/fd/{}",
+                original.as_raw_fd()
+            )))?;
+            sink.emit(serde_json::json!({"event":"appended"}));
+            sink.flush_turn();
+            assert_eq!(rustix::fs::fcntl_getfl(&original)?, flags);
+            assert_eq!(original.stream_position()?, 0);
+            let mut bytes = String::new();
+            original.read_to_string(&mut bytes)?;
+            assert!(bytes.starts_with("original\n"));
+            let value: serde_json::Value = serde_json::from_str(
+                bytes
+                    .strip_prefix("original\n")
+                    .ok_or_else(|| io::Error::other("prefix"))?
+                    .trim(),
+            )?;
+            assert_eq!(value["event"], "appended");
+            assert!(value["log_health"].is_object());
+            assert!(!sink.has_pending());
+            Ok(())
+        }
+        #[test]
+        fn stdio_regular_file_and_aliased_stderr_preserve_each_others_lines() -> io::Result<()> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "l2tunnel-shared-log-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut original = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            std::fs::remove_file(&path)?;
+            let mut stderr = original.try_clone()?;
+            original.write_all(b"original prefix\n")?;
+            let flags = rustix::fs::fcntl_getfl(&original)?;
+            assert!(!flags.intersects(rustix::fs::OFlags::APPEND | rustix::fs::OFlags::NONBLOCK));
+            let mut sink = Sink::from_stdio(original.as_fd())?;
+            sink.emit(serde_json::json!({"event":"first telemetry"}));
+            sink.flush_turn();
+            assert_eq!(
+                original.stream_position()?,
+                b"original prefix\n".len() as u64 + sink.health.written_bytes
+            );
+            stderr.write_all(b"final error\n")?;
+            sink.emit(serde_json::json!({"event":"second telemetry"}));
+            sink.flush_turn();
+            assert_eq!(rustix::fs::fcntl_getfl(&original)?, flags);
+            assert_eq!(rustix::fs::fcntl_getfl(&stderr)?, flags);
+            assert!(!sink.has_pending());
+            original.rewind()?;
+            let mut bytes = String::new();
+            original.read_to_string(&mut bytes)?;
+            let lines = bytes.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[0], "original prefix");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[1])?["event"],
+                "first telemetry"
+            );
+            assert_eq!(lines[2], "final error");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[3])?["event"],
+                "second telemetry"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

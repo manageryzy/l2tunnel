@@ -162,17 +162,42 @@ pub struct SecureUdpFrame {
     pub runtime: Option<l2tunnel_runtime::secure_udp::transport::Snapshot>,
     /// Exact service generation.
     pub generation: u64,
+    /// Service-owner termination, separate from the last runtime observation.
+    /// Dropping an inline runtime does not fabricate a runtime StopReason/time.
+    pub service_terminal: Option<Terminal>,
 }
 #[cfg(unix)]
 impl SecureUdpFrame {
-    /// Bounded version2 public observation without credentials or user payloads.
-    pub fn status(&self) -> io::Result<crate::secure_udp::status::Status> {
-        crate::secure_udp::status::Status::observe(
+    /// Performance telemetry from an actual runtime snapshot, never setup defaults.
+    pub fn performance(&self) -> io::Result<Option<crate::secure_udp::performance::Report>> {
+        let mut report = crate::secure_udp::performance::Report::observe(
             self.requested,
             self.info,
             self.generation,
             self.runtime.as_ref(),
-        )
+        )?;
+        if let Some(report) = &mut report {
+            report.service_terminal = self
+                .service_terminal
+                .map(|terminal| format!("{terminal:?}"));
+            if self.service_terminal.is_some() {
+                report.status.running = false;
+            }
+        }
+        Ok(report)
+    }
+    /// Bounded version2 public observation without credentials or user payloads.
+    pub fn status(&self) -> io::Result<crate::secure_udp::status::Status> {
+        let mut status = crate::secure_udp::status::Status::observe(
+            self.requested,
+            self.info,
+            self.generation,
+            self.runtime.as_ref(),
+        )?;
+        if self.service_terminal.is_some() {
+            status.running = false;
+        }
+        Ok(status)
     }
 }
 #[cfg(unix)]
@@ -214,6 +239,12 @@ pub enum Observation {
     SecureUdp(Box<SecureUdpFrame>),
 }
 impl Observation {
+    #[cfg(unix)]
+    fn record_service_terminal(&mut self, terminal: Terminal) {
+        if let Self::SecureUdp(frame) = self {
+            frame.service_terminal = Some(terminal);
+        }
+    }
     /// Managed status, absent for every other backend.
     pub fn managed(&self) -> Option<&managed::Status> {
         match self {
@@ -333,6 +364,7 @@ impl ObservedBackend {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
                 generation: secure.generation,
+                service_terminal: None,
             }))),
         }
     }
@@ -1041,6 +1073,12 @@ impl Drop for Completion {
             && let Some((_, terminal)) = state.terminals.iter().find(|(id, _)| *id == generation)
         {
             state.snapshot.terminal = Some(*terminal);
+        }
+        #[cfg(unix)]
+        if let Some(terminal) = state.snapshot.terminal
+            && let Some(observation) = &mut state.snapshot.runtime
+        {
+            observation.record_service_terminal(terminal);
         }
         let queued = state.queued.take();
         drop(state);

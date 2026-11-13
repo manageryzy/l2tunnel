@@ -24,6 +24,10 @@ const SCALE: u128 = 1_000_000;
 const MAX_QUEUE: usize = 16 * 1024 * 1024;
 const LANE: u32 = 0;
 
+#[path = "transport_performance.rs"]
+mod performance;
+pub use performance::Performance;
+
 /// Immutable authenticated full-wire bucket, including control and feedback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WireBudget {
@@ -81,33 +85,47 @@ where
     let result:io::Result<StopReason>=async {
         loop {
             let instant=Instant::now();let now=clock(origin,instant)?;
+            driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.collect_native(now)?;
             driver.progress(now)?;
             if let Some(reason)=driver.terminal {break Ok(reason);}
             driver.submit_control(now)?;
             driver.send(&socket,now,instant)?;
+            let native_before=driver.performance.counters.native_write_batch_packets;
+            let native_spent=driver.flush_native_ready(&mut device,||clock(origin,Instant::now())).await?;
+            let native_write_remaining=driver.config.work.native_write_batch.saturating_sub(native_spent);
+            if let Some(reason)=driver.terminal {break Ok(reason);}
             if driver.next_report.is_some_and(|at|now>=at) {
-                observe(&driver.snapshot(now,true));
-                driver.next_report=driver.config.report_interval.map(|interval|add(now,interval)).transpose()?;
+                let reported=clock(origin,Instant::now())?;
+                observe(&driver.snapshot(reported,true));
+                driver.next_report=driver.config.report_interval.map(|interval|add(reported,interval)).transpose()?;
             }
             let read_native=driver.coordinator.admission_allowed() && driver.swift.has_room();
             let write_native=!driver.native.is_empty();
             let interest=if read_native && write_native {Interest::READABLE.add(Interest::WRITABLE)}else if write_native {Interest::WRITABLE}else{Interest::READABLE};
-            let wake=driver.wake(now)?;
+            let mut wake=driver.wake(now)?;
+            if native_spent>0 || (driver.swift.deliverable() && driver.native_room()) {wake=wake.min(Instant::now());}
             tokio::select! {
                 biased;
                 ()=&mut shutdown=>break Ok(StopReason::Cancelled),
                 request=next_request(&mut requests),if requests.is_some()=>{
+                    driver.performance.counters.request_events=driver.performance.counters.request_events.saturating_add(1);
                     match request {Some((requested,reply))=>driver.request(clock(origin,Instant::now())?,requested,reply,&resolve)?,None=>requests=None}
                 },
                 readable=socket.readable(),if driver.ingress.left>0=>{
                     readable?;
-                    for _ in 0..driver.config.work.receive_packets.min(driver.ingress.left) {
+                    driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);
+                    let maximum=driver.config.work.receive_packets.min(driver.ingress.left);
+                    let mut batch=0u64;
+                    for _ in 0..maximum {
                         if !driver.check_expiry(clock(origin,Instant::now())?)? {break;}
                         driver.ingress.left-=1;
                         match socket.try_recv(&mut datagram) {
                             Ok(length)=>{
+                                batch+=1;
+                                driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
+                                if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
                                 let at=Instant::now();let time=clock(origin,at)?;
                                 if !driver.check_expiry(time)? {break;}
                                 if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive(&datagram[..length],time,at,&resolve)?;}
@@ -120,18 +138,26 @@ where
                 },
                 ready=device.ready_mut(interest),if read_native || write_native=>{
                     let mut ready=ready?;
-                    if ready.ready().is_writable() && write_native {
-                        for _ in 0..driver.config.work.native_write_batch {
-                            if !driver.write_native(&mut ready,||clock(origin,Instant::now()))? {break;}
+                    driver.performance.counters.native_ready_events=driver.performance.counters.native_ready_events.saturating_add(1);
+                    if ready.ready().is_writable() && write_native && native_write_remaining>0 {
+                        for _ in 0..native_write_remaining {
+                            let step=driver.write_native(&mut ready,||clock(origin,Instant::now()));
+                            if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
+                            if !step? {break;}
                         }
                     }
                     if ready.ready().is_readable() && read_native {
+                        let mut batch=0u64;
                         for _ in 0..driver.config.work.native_read_batch {
-                            if !driver.read_native(&mut ready,&mut native,||clock(origin,Instant::now()))? {break;}
+                            let before=driver.performance.counters.native_read_batch_packets;
+                            let step=driver.read_native(&mut ready,&mut native,||clock(origin,Instant::now()));
+                            batch+=driver.performance.counters.native_read_batch_packets.saturating_sub(before);
+                            if batch==driver.config.work.native_read_batch as u64 {driver.performance.counters.native_read_batch_limit_hits=driver.performance.counters.native_read_batch_limit_hits.saturating_add(1);}
+                            if !step? {break;}
                         }
                     }
                 },
-                ()=sleep_until(wake)=>{},
+                ()=sleep_until(wake)=>{driver.performance.counters.timer_events=driver.performance.counters.timer_events.saturating_add(1);},
             }
         }
     }.await;
@@ -600,6 +626,10 @@ pub struct Snapshot {
     pub swift: records::Stats,
     /// Current unconfirmed recovery source count.
     pub swift_unconfirmed: usize,
+    /// Bounded per-channel observations, without changing protocol state.
+    pub channels: Vec<records::ChannelStats>,
+    /// Actual scheduling, wire-credit and native-pressure observations.
+    pub performance: Performance,
     /// Fixed reliable control retention.
     pub control: recovery::Retained,
     /// Wire, security and native counters.
@@ -699,6 +729,8 @@ struct Bucket {
     burst: usize,
     tokens: u128,
     last: u64,
+    generated: u128,
+    discarded: u128,
 }
 impl Bucket {
     fn new(rate: u64, burst: usize) -> Self {
@@ -707,16 +739,20 @@ impl Bucket {
             burst,
             tokens: burst as u128 * SCALE,
             last: 0,
+            generated: 0,
+            discarded: 0,
         }
     }
     fn refill(&mut self, now: u64) -> io::Result<()> {
         let elapsed = now
             .checked_sub(self.last)
             .ok_or_else(|| protocol("wire clock regression"))?;
-        self.tokens = self
-            .tokens
-            .saturating_add(u128::from(self.rate) * u128::from(elapsed))
-            .min(self.burst as u128 * SCALE);
+        let generated = u128::from(self.rate) * u128::from(elapsed);
+        let available = self.tokens.saturating_add(generated);
+        let cap = self.burst as u128 * SCALE;
+        self.generated = self.generated.saturating_add(generated);
+        self.discarded = self.discarded.saturating_add(available.saturating_sub(cap));
+        self.tokens = available.min(cap);
         self.last = now;
         Ok(())
     }
@@ -796,6 +832,7 @@ struct Driver {
     ip: usize,
     ingress: IngressBudget,
     counters: Counters,
+    performance: performance::State,
     live: Liveness,
     challenge: Option<Challenge>,
     pong: Option<u64>,
@@ -1005,6 +1042,7 @@ impl Driver {
                     refill: add(0, config.work.receive_interval)?,
                 },
                 counters: Counters::default(),
+                performance: performance::State::default(),
                 live: Liveness::default(),
                 challenge: None,
                 pong: None,
@@ -1046,6 +1084,14 @@ impl Driver {
             pending: self.coordinator.pending(),
             swift: self.swift.stats(),
             swift_unconfirmed: self.swift.unconfirmed(),
+            channels: (0..self
+                .send
+                .records
+                .channels
+                .max(self.receive.records.channels))
+                .filter_map(|index| self.swift.channel_stats(index))
+                .collect(),
+            performance: self.performance.snapshot(now, &self.bucket),
             control: self.control.retained(),
             counters,
             liveness: self.live,
@@ -1626,6 +1672,11 @@ impl Driver {
     fn collect_native(&mut self, now: u64) -> io::Result<()> {
         for _ in 0..self.config.work.native_write_batch {
             if !self.native_room() {
+                self.performance.counters.native_output_full_polls = self
+                    .performance
+                    .counters
+                    .native_output_full_polls
+                    .saturating_add(1);
                 break;
             }
             let Some(packet) = self.swift.pop().map_err(protocol)? else {
@@ -1639,6 +1690,16 @@ impl Driver {
                 bytes: packet.to_vec(),
                 since: now,
             });
+            self.performance.counters.native_pending_packets_high = self
+                .performance
+                .counters
+                .native_pending_packets_high
+                .max(self.native.len() as u64);
+            self.performance.counters.native_pending_bytes_high = self
+                .performance
+                .counters
+                .native_pending_bytes_high
+                .max(self.native_bytes as u64);
         }
         Ok(())
     }
@@ -1655,6 +1716,23 @@ impl Driver {
             return Ok(false);
         }
         let received = try_native_read(ready, output);
+        match &received {
+            Ok(Some(_)) => {
+                self.performance.counters.native_read_batch_packets = self
+                    .performance
+                    .counters
+                    .native_read_batch_packets
+                    .saturating_add(1)
+            }
+            Ok(None) => {
+                self.performance.counters.native_read_would_block = self
+                    .performance
+                    .counters
+                    .native_read_would_block
+                    .saturating_add(1)
+            }
+            Err(_) => {}
+        }
         let now = now()?;
         if !self.check_expiry(now)? {
             return Ok(false);
@@ -1679,6 +1757,60 @@ impl Driver {
         }
         Ok(true)
     }
+    async fn flush_native_ready<D: PacketDevice<Error = io::Error> + AsRawFd>(
+        &mut self,
+        device: &mut AsyncFd<D>,
+        mut now: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<usize> {
+        if self.native.is_empty() {
+            return Ok(0);
+        }
+        // Observe cached writable readiness once without awaiting the device.
+        // The guard never escapes this closure and Pending returns immediately,
+        // so blocked output cannot hold opposite-direction input or control.
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            let mut ready = match device.poll_write_ready_mut(cx) {
+                Poll::Pending => return Poll::Ready(Ok(0)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(ready)) => ready,
+            };
+            self.performance.counters.native_ready_events = self
+                .performance
+                .counters
+                .native_ready_events
+                .saturating_add(1);
+            let before = self.performance.counters.native_write_batch_packets;
+            let mut attempts = 0;
+            for _ in 0..self.config.work.native_write_batch {
+                if self.native.is_empty() {
+                    break;
+                }
+                attempts += 1;
+                let step = self.write_native(&mut ready, &mut now);
+                if self
+                    .performance
+                    .counters
+                    .native_write_batch_packets
+                    .saturating_sub(before)
+                    == self.config.work.native_write_batch as u64
+                {
+                    self.performance.counters.native_write_batch_limit_hits = self
+                        .performance
+                        .counters
+                        .native_write_batch_limit_hits
+                        .saturating_add(1);
+                }
+                match step {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
+            Poll::Ready(Ok(attempts))
+        })
+        .await
+    }
     fn write_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
         &mut self,
         ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
@@ -1691,6 +1823,20 @@ impl Driver {
             return Ok(false);
         };
         let result = try_native_write(ready, &packet.bytes);
+        if matches!(&result, Ok(true)) {
+            self.performance.counters.native_write_batch_packets = self
+                .performance
+                .counters
+                .native_write_batch_packets
+                .saturating_add(1);
+        }
+        if matches!(&result, Ok(false)) {
+            self.performance.counters.native_write_would_block = self
+                .performance
+                .counters
+                .native_write_would_block
+                .saturating_add(1);
+        }
         // Keep the front packet and its original deadline through the fresh
         // completion check. A successful physical handoff cannot be rolled back,
         // including when sampling/checking time itself fails after that handoff.
@@ -1708,11 +1854,17 @@ impl Driver {
         }
         result
     }
-    fn handed(&mut self, socket: &tokio::net::UdpSocket, bytes: usize) -> io::Result<()> {
+    fn handed(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        bytes: usize,
+        kind: performance::WireKind,
+    ) -> io::Result<()> {
         let cost = bytes
             .checked_add(self.ip)
             .ok_or_else(|| protocol("wire charge overflow"))?;
         self.bucket.charge(cost)?;
+        self.performance.sent(kind, cost);
         self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
         self.counters.wire_packets = self.counters.wire_packets.saturating_add(1);
         self.counters.wire_bytes = self.counters.wire_bytes.saturating_add(cost as u64);
@@ -1780,9 +1932,14 @@ impl Driver {
         now: u64,
         instant: Instant,
     ) -> io::Result<()> {
+        self.performance.counters.send_calls =
+            self.performance.counters.send_calls.saturating_add(1);
+        self.performance.checked(now);
+        let mut emitted = 0;
         for _ in 0..self.config.work.send_batch {
             if let Some(bytes) = self.tail(instant)? {
-                self.handed(socket, bytes)?;
+                self.handed(socket, bytes, performance::WireKind::Bootstrap)?;
+                emitted += 1;
                 continue;
             }
             if self.outer == u32::MAX {
@@ -1812,7 +1969,8 @@ impl Driver {
                 }
                 self.counters.control_number = Some(sealed.number);
                 self.counters.control_generation = Some(sealed.generation);
-                self.handed(socket, sealed.bytes)?;
+                self.handed(socket, sealed.bytes, performance::WireKind::Control)?;
+                emitted += 1;
                 continue;
             }
             let maximum = self
@@ -1828,6 +1986,10 @@ impl Driver {
                 .packet_bytes
                 + self.ip;
             if self.bucket.allowance() < required + self.reserve {
+                if self.swift.data_ready(now) || self.swift.feedback_ready(now) {
+                    self.performance
+                        .blocked(now, self.bucket.ready_at(required + self.reserve)?);
+                }
                 break;
             }
             let number = self.records.next_number(Class::User);
@@ -1836,6 +1998,11 @@ impl Driver {
                 .poll(now, records::RecordNumber(number.0), true)
                 .map_err(protocol)?
             else {
+                self.performance.counters.user_not_ready_polls = self
+                    .performance
+                    .counters
+                    .user_not_ready_polls
+                    .saturating_add(1);
                 break;
             };
             let feedback = body
@@ -1863,7 +2030,23 @@ impl Driver {
             }
             self.counters.user_number = Some(sealed.number);
             self.counters.user_generation = Some(sealed.generation);
-            self.handed(socket, sealed.bytes)?;
+            self.handed(
+                socket,
+                sealed.bytes,
+                if feedback {
+                    performance::WireKind::Feedback
+                } else {
+                    performance::WireKind::Data
+                },
+            )?;
+            emitted += 1;
+        }
+        if emitted == self.config.work.send_batch {
+            self.performance.counters.send_batch_limit_hits = self
+                .performance
+                .counters
+                .send_batch_limit_hits
+                .saturating_add(1);
         }
         Ok(())
     }
