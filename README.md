@@ -61,6 +61,8 @@ python3 tools/selftest.py                      # 16 flows, 100/10 Mbit/s, 70 ms,
 python3 tools/selftest.py --path clean --flows 4 --duration 10
 python3 tools/selftest.py --require-reference  # fail unless within 2.5% of the simulator
 l2tunneld status --control-socket /private/dir/swift.sock   # live counters, with --control-socket on the endpoint
+l2tunneld disconnect --control-socket /private/dir/swift.sock
+l2tunneld reconnect --control-socket /private/dir/swift.sock
 ```
 
 The default `swift` profile is selected on the CLI with:

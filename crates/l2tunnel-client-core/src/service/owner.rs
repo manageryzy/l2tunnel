@@ -97,6 +97,15 @@ pub(super) async fn establish(
             check(deadline)?;
             return result;
         }
+        #[cfg(unix)]
+        Transport::Swift(settings) => {
+            let setup = establish_swift(&shared, &plan, accepted, deadline, settings);
+            let result = tokio::time::timeout_at(deadline, setup)
+                .await
+                .map_err(|_| expired())?;
+            check(deadline)?;
+            return result;
+        }
     };
     let setup = async {
         let (link, role) = match &plan.data.endpoint {
@@ -292,6 +301,76 @@ async fn establish_udp(
             effective,
             delivery,
         })),
+        generation: accepted.operation,
+    })
+}
+/// Existing swift factories. The acceptor's operation deadline covers its
+/// listening period; each TCP connection keeps the original handshake bound.
+/// The runtime owns the retained TLS stream, UDP socket and device inline.
+#[cfg(unix)]
+async fn establish_swift(
+    shared: &Shared,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    settings: crate::swift::Settings,
+) -> io::Result<Active> {
+    let config = plan.data.connection;
+    let session = match &plan.data.endpoint {
+        Endpoint::Client(c) => {
+            crate::swift::connect(
+                c.remote,
+                &c.tls,
+                &c.server_name,
+                &c.member,
+                config,
+                settings,
+            )
+            .await?
+        }
+        Endpoint::Server(s) => {
+            check(deadline)?;
+            let listener = TcpListener::bind(s.listen).await?;
+            shared.lock().snapshot.listening = Some(Listening {
+                operation: accepted.operation,
+                address: listener.local_addr()?,
+            });
+            shared.changed();
+            crate::swift::accept(&listener, &s.tls, &s.members, config, settings).await?
+        }
+    };
+    check(deadline)?;
+    let device = plan.open_readable()?;
+    // Observe at least once a second so status stays fresh without printing.
+    let session = session.observe_every(std::time::Duration::from_secs(1));
+    let backend = Arc::new(SwiftBackend {
+        requested: settings,
+        effective: session.config(),
+        receive_buffer: session.receive_buffer()?,
+        counters: Mutex::new(l2tunnel_runtime::swift::Snapshot::default()),
+    });
+    let sink = backend.clone();
+    let mut runtime: RunFuture = Box::pin(session.run(device, move |snapshot| {
+        *sink
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = *snapshot;
+    }));
+    // Authentication alone is insufficient: the runtime must have registered
+    // its socket and device and still be running after its first poll.
+    std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "swift runtime ended during readiness",
+        ))),
+        Poll::Pending => Poll::Ready(Ok(())),
+    })
+    .await?;
+    check(deadline)?;
+    Ok(Active {
+        runtime,
+        backend: ObservedBackend::Swift(backend),
         generation: accepted.operation,
     })
 }

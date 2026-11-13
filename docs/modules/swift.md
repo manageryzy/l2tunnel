@@ -7,7 +7,8 @@ real per-datagram overhead, on all four self-test paths: 79.7–80.5 Mbit/s
 against 80.72 on the 100/10 Mbit/s, 70 ms, 15% loss reference path. These are
 finite runs in one environment. Real devices, privileged host namespaces, IPv6
 underlay runs, Windows/Android, remote CI and long-duration soak are not
-covered.
+covered. The session is owned by the shared lifecycle service, with
+`disconnect` and `reconnect` on the local control socket.
 
 - [x] [SW-01] Pure bounded engine: pack native packets across fixed-capacity source symbols, send each once, recover by receiver-requested retransmission with optional sliding-window GF(256) repairs, and deliver one exact ordered stream. Evidence: [engine](../../crates/l2tunnel-swift/src/lib.rs) with [loss, reordering, tail, flush, back-pressure and malformed-input tests](../../crates/l2tunnel-swift/src/tests.rs).
 - [x] [SW-02] Stateless connection classification into ordering channels for Ethernet (one VLAN tag) and raw IPv4/IPv6, with fragments kept together and unknown input on channel zero. Evidence: [classifier and tests](../../crates/l2tunnel-swift/src/flow.rs).
@@ -17,7 +18,7 @@ covered.
 - [x] [SW-06] Unprivileged Linux TAP self-test under HTB and netem with verified payload, clean close, same-window wire accounting and layer-2 checks in both directions (ARP, full-MTU unfragmented ping, UDP from 1 to 1472 bytes). Evidence: [tool](../../tools/selftest.py), [helper tests](../../tools/test_selftest.py), [clean](../../work/swift-selftest41/clean.json), [delay](../../work/swift-selftest41/delay.json) and [1% loss](../../work/swift-selftest41/loss1.json) receipts.
 - [x] [SW-07] Match the simulator at equal byte overhead within 2.5% on every self-test path. Evidence: [three reference runs](../../work/swift-selftest41/impaired-1.json), [kernel-default RTO run](../../work/swift-selftest41/impaired-kernel-rto.json), [simulator on the reference path](../../work/swift-simulator-reference38/output.log) and [on the control paths](../../work/swift-simulator-reference40/output.log).
 - [x] [SW-12] Read-only `status` over the private local control socket, reporting phase and counters of the live session. Evidence: [response and tests](../../crates/l2tunnel-client-core/src/swift/cli.rs); every [self-test receipt](../../work/swift-selftest41/impaired-1.json) queries both endpoints with the real `status` command.
-- [ ] [SW-08] Route swift through the shared service API with disconnect and reconnect; today the CLI owns the session directly and its control socket answers status only.
+- [x] [SW-08] Route swift through the shared service API with disconnect and reconnect: the service owns the authenticated session, sockets and device as one backend; the CLI only parses and prints. Evidence: [service backend](../../crates/l2tunnel-client-core/src/service/owner.rs), [two-service lifecycle test over real loopback TLS and UDP](../../crates/l2tunnel-client-core/src/service/tests/swift.rs), [CLI adapter](../../crates/l2tunnel-client-core/src/swift/cli.rs), and the `lifecycle` block of the [self-test receipts](../../work/swift-selftest43/impaired.json), which disconnects and reconnects the live tunnel with the real commands.
 - [ ] [SW-09] Qualify on real devices and privileged host namespaces, IPv6 underlay, TUN, long soak, CPU and memory.
 - [ ] [SW-10] Rekeying and packet-number or source-sequence rollover without reconnecting; a session ends when its 32-bit per-channel source sequence is exhausted.
 - [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles; the profile is startup-only.
@@ -64,6 +65,33 @@ only the changed fields (identification, sequence, acknowledgement, control
 word, timestamp value and echo) as modular varints. With a 1500-byte path MTU
 the datagram body is 1448 bytes and a source symbol carries 1440.
 
+## Lifecycle
+
+The shared lifecycle service owns a swift session exactly as it owns the
+managed TCP and base UDP backends: one accepted operation at a time, typed
+completion, and release of the TLS stream, UDP socket and device before any
+replacement work. A swift plan needs an attachment whose devices expose a
+readiness descriptor. An acceptor's setup operation keeps its listener open
+for up to 24 hours; each accepted TCP connection keeps the original handshake
+timeout.
+
+The private control socket serves three commands through that service:
+
+- `status` reports the lifecycle phase (`forwarding`, `disconnected`,
+  `connecting`, `failed`), the generation as `epoch`, and the latest counters.
+- `disconnect` aborts the live session and leaves the daemon idle. It is a
+  local abort, not a peer-confirmed drain; the peer sees its liveness stream
+  close.
+- `reconnect` replaces the live session, or connects again when idle, using
+  the plan the daemon started with. The reply is sent once the new session is
+  actually forwarding, or reports `failed`.
+
+Every session derives fresh keys from its own TLS handshake and starts with
+empty ordering state; packets in flight when a session ends are lost, as on
+any link flap. `--swift-restart on` sets a session up again one second after
+it ends or a setup attempt fails. Without it a daemon exits when its session
+fails or its peer leaves, and after a failed `reconnect`.
+
 ## Bounds and failure behavior
 
 Per channel: at most 4096 unconfirmed sources, at most `2 * window` pending
@@ -98,6 +126,15 @@ endpoints answered `status`. The simulator numbers are the mean of three
 replications. An earlier set of the same runs is kept in
 `work/swift-selftest39/`. The tunnel paces at 99% of the shaped rate while the
 simulator uses all of it, which accounts for most of the remaining difference.
+
+After the session moved into the shared lifecycle service, the reference path
+measured 79.20 Mbit/s (98.1%) and the clean path 93.80 Mbit/s (99.2%), each
+followed by a successful disconnect and reconnect of the live tunnel
+(`work/swift-selftest43/`). Two runs taken while the test machine was heavily
+loaded by unrelated work measured about 49 Mbit/s (`work/swift-selftest42/`);
+the previous build measured 62–69 Mbit/s under the same load and both builds
+reached 80.0 Mbit/s when it eased, so those runs show the harness's
+sensitivity to scheduling, not a difference between builds.
 
 Retransmissions were 17.5–17.7% of sources on the 15% path. The simulator's
 published candidate uses a 36-byte outer header and no authentication bytes and

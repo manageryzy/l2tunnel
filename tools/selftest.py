@@ -180,6 +180,9 @@ def endpoint_command(args: argparse.Namespace, side: str, work: Path) -> list[st
             '--swift-window', str(args.swift_window),
             '--swift-repair-permille', str(args.swift_repair_permille),
             '--swift-report-ms', '1000',
+            # The acceptor listens again after its peer leaves, so the
+            # initiator's local reconnect command has something to reach.
+            '--swift-restart', 'on' if side == 'b' else 'off',
             '--control-socket', str(work / f'control-{side}.sock')] + args.extra
     command += ['--carrier', 'udp', '--path-mtu', '1500', '--udp-cover', 'quic-like',
                 '--udp-protection', args.protection,
@@ -333,6 +336,43 @@ def udp_probe(address: str, port: int) -> None:
     print(json.dumps({'sizes': len(sizes), 'answered': good}))
 
 
+def control(work: Path, binary: str, side: str, command: str) -> dict:
+    """Run one local control command against a live endpoint."""
+    space = 'ea' if side == 'a' else 'eb'
+    out = ns(space, binary, command, '--control-socket',
+             str(work / f'control-{side}.sock'), check=False)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {'ok': False, 'raw': out[-200:]}
+
+
+def reachable() -> bool:
+    out = ns('ha', 'ping', '-c', '3', '-i', '0.2', '-W', '2', HOST_B, check=False)
+    return ' 0% packet loss' in out or ' 33% packet loss' in out
+
+
+def lifecycle(work: Path, binary: str) -> dict:
+    """Disconnect and reconnect through the shared service's local commands:
+    the tunnel must actually stop carrying traffic and actually resume."""
+    phase = lambda reply: (reply.get('state') or {}).get('phase')
+    checks = {}
+    reply = control(work, binary, 'a', 'disconnect')
+    checks['disconnect_reported'] = bool(reply.get('ok')) and phase(reply) == 'disconnected'
+    checks['traffic_stopped'] = not reachable()
+    resumed = {}
+    for _ in range(20):   # the acceptor needs a moment to listen again
+        resumed = control(work, binary, 'a', 'reconnect')
+        if resumed.get('ok'):
+            break
+        time.sleep(0.5)
+    checks['reconnect_reported'] = bool(resumed.get('ok')) and phase(resumed) == 'forwarding'
+    checks['new_generation'] = ((resumed.get('state') or {}).get('epoch') or 0) > 1
+    checks['traffic_resumed'] = reachable()
+    checks['acceptor_forwarding'] = phase(control(work, binary, 'b', 'status')) == 'forwarding'
+    return checks
+
+
 def functional(script: str) -> dict:
     """Layer-2 behaviour visible to the hosts, in both directions."""
     checks = {}
@@ -439,6 +479,9 @@ def run(args: argparse.Namespace) -> int:
                                           'native_written': swift.get('native_written')}
                 if not reply.get('ok') or not swift.get('native_written'):
                     passed = False
+            result['lifecycle'] = lifecycle(work, args.binary)
+            if not all(result['lifecycle'].values()):
+                passed = False
         for name, _, _, _, endpoint in directions:
             state = json.loads((work / f'{name}.json').read_text())
             goodput = rate_mbit(state['samples'], args.warmup, total)

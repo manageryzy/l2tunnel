@@ -1133,6 +1133,8 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
     use super::local::{self, Action, Compression as ApiCompression, Request, VERSION};
     let action = match command {
         "status" => Action::Status {},
+        "disconnect" => Action::Disconnect {},
+        "reconnect" => Action::Reconnect {},
         "drain-proxy" => Action::DrainProxy {},
         "drain-openvpn" => Action::DrainOpenVpn {},
         "set-compression" => Action::SwitchCompression {
@@ -1215,7 +1217,9 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     let mut allowed = match command.as_str() {
         "keygen" => vec!["--private", "--public"],
         "openvpn-keygen" => vec!["--admission", "--cookie"],
-        "status" | "drain-proxy" | "drain-openvpn" => vec!["--control-socket"],
+        "status" | "disconnect" | "reconnect" | "drain-proxy" | "drain-openvpn" => {
+            vec!["--control-socket"]
+        }
         "set-compression" => vec!["--control-socket", "--compression"],
         "set-active-policy" => vec!["--control-socket", "--mux-channels", "--qos-dscp"],
         "connect" => vec![
@@ -1284,6 +1288,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
                 if matches!(
                     command.as_str(),
                     "status"
+                        | "disconnect"
+                        | "reconnect"
                         | "set-compression"
                         | "set-active-policy"
                         | "drain-proxy"

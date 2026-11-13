@@ -32,6 +32,10 @@ class SelfTestHelpers(unittest.TestCase):
             self.assertEqual(option(command, '--swift-reverse-kbit'), '9900')
             self.assertEqual(option(command, '--swift-channels'), '16')
             self.assertEqual(option(command, '--swift-repair-permille'), '0')
+        # Only the acceptor restarts by itself; the initiator is driven by
+        # the local reconnect command.
+        self.assertEqual(option(client, '--swift-restart'), 'off')
+        self.assertEqual(option(server, '--swift-restart'), 'on')
         self.assertEqual(option(client, '--control-socket'), '/work/control-a.sock')
         self.assertEqual(option(server, '--control-socket'), '/work/control-b.sock')
         self.assertEqual(option(client, '--udp-bind'), option(server, '--udp-peer'))
@@ -40,6 +44,28 @@ class SelfTestHelpers(unittest.TestCase):
         self.assertNotIn('--udp-cover', client)
         extra = selftest.endpoint_command(arguments(extra=['--swift-report-ms', '500']), 'a', work)
         self.assertEqual(extra[-2:], ['--swift-report-ms', '500'])
+
+    def test_lifecycle_requires_actual_stop_and_resume(self):
+        from unittest import mock
+        replies = {'disconnect': {'ok': True, 'state': {'phase': 'disconnected', 'epoch': 1}},
+                   'reconnect': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 3}},
+                   'status': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 2}}}
+        calls = []
+
+        def control(work, binary, side, command):
+            calls.append((side, command))
+            return replies[command]
+        with mock.patch.object(selftest, 'control', control), \
+                mock.patch.object(selftest, 'reachable', side_effect=[False, True]):
+            checks = selftest.lifecycle(Path('/work'), '/bin/l2tunneld')
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(calls, [('a', 'disconnect'), ('a', 'reconnect'), ('b', 'status')])
+        # A tunnel that kept forwarding after disconnect is a failure even
+        # when every command reported success.
+        with mock.patch.object(selftest, 'control', control), \
+                mock.patch.object(selftest, 'reachable', side_effect=[True, True]):
+            checks = selftest.lifecycle(Path('/work'), '/bin/l2tunneld')
+        self.assertFalse(checks['traffic_stopped'])
 
     def test_udp_echo_answers_with_the_digest_of_each_datagram(self):
         import hashlib, json, io, socket, threading

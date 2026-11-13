@@ -18,6 +18,12 @@ pub enum Compression {
 pub enum Action {
     /// Query current committed state and pending phase.
     Status {},
+    /// Abort the live session and leave the service idle; the reply reports
+    /// the actual release, never a peer-confirmed clean close.
+    Disconnect {},
+    /// Replace the live session, or connect again when idle, with the
+    /// service's latest accepted plan; the reply reports actual readiness.
+    Reconnect {},
     /// Begin proxy drain; acceptance and terminal outcome are separate.
     DrainProxy {},
     /// Submit a standalone native drain; acceptance is not actual completion.

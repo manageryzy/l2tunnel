@@ -10,11 +10,48 @@ pub(super) type Device = Box<dyn PacketDevice<Error = io::Error> + Send>;
 #[derive(Clone)]
 pub struct Attachment {
     layer: PacketLayer,
-    open: Arc<dyn Fn() -> io::Result<Device> + Send + Sync>,
+    open: Open,
+}
+#[derive(Clone)]
+enum Open {
+    Packet(Arc<dyn Fn() -> io::Result<Device> + Send + Sync>),
+    #[cfg(unix)]
+    Readable(Arc<dyn Fn() -> io::Result<crate::swift::Native> + Send + Sync>),
 }
 impl Attachment {
     pub(super) fn open(&self) -> io::Result<Device> {
-        (self.open)()
+        match &self.open {
+            Open::Packet(open) => open(),
+            #[cfg(unix)]
+            Open::Readable(open) => Ok(Box::new(open()?)),
+        }
+    }
+    /// Fresh readiness-capable owner; absent for a plain packet provider.
+    #[cfg(unix)]
+    pub(super) fn open_readable(&self) -> io::Result<crate::swift::Native> {
+        match &self.open {
+            Open::Readable(open) => open(),
+            Open::Packet(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment has no readiness descriptor",
+            )),
+        }
+    }
+    #[cfg(unix)]
+    fn readable_kind(&self) -> bool {
+        matches!(self.open, Open::Readable(_))
+    }
+    /// Bind a layer and a factory of devices that expose a readiness
+    /// descriptor. Every backend accepts it; the swift backend requires it.
+    #[cfg(unix)]
+    pub fn readable(
+        layer: PacketLayer,
+        open: impl Fn() -> io::Result<crate::swift::Native> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            layer,
+            open: Open::Readable(Arc::new(open)),
+        }
     }
     /// Bind an advertised layer and a fresh-owner factory; does not invoke it.
     pub fn new(
@@ -23,7 +60,7 @@ impl Attachment {
     ) -> Self {
         Self {
             layer,
-            open: Arc::new(open),
+            open: Open::Packet(Arc::new(open)),
         }
     }
 }
@@ -68,7 +105,13 @@ pub(super) enum Transport {
         settings: crate::udp::Settings,
         delivery: managed::DeliveryConfig,
     },
+    #[cfg(unix)]
+    Swift(crate::swift::Settings),
 }
+/// Longest time a swift acceptor keeps its listener open for a peer. Each
+/// accepted TCP connection is still bound by the original handshake timeout.
+#[cfg(unix)]
+pub const SWIFT_LISTEN: Duration = Duration::from_secs(24 * 60 * 60);
 pub(super) struct Data {
     pub connection: ConnectionConfig,
     pub endpoint: Endpoint,
@@ -133,6 +176,50 @@ impl Prepared {
             Transport::UdpFrame { settings, delivery },
         )
     }
+    /// Swift initiator: TLS-bootstrapped authentication, then paced protected
+    /// UDP. The attachment must come from [`Attachment::readable`]. Pure
+    /// validation of the complete policy precedes any socket or device work.
+    #[cfg(unix)]
+    pub fn swift_client(
+        connection: ConnectionConfig,
+        credentials: Client,
+        settings: crate::swift::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&credentials)?;
+        Self::new(
+            connection,
+            Endpoint::Client(credentials),
+            attachment,
+            Transport::Swift(settings),
+        )
+    }
+    /// Swift acceptor; same validation as [`Self::swift_client`]. Its setup
+    /// operation may wait up to [`SWIFT_LISTEN`] for a peer.
+    #[cfg(unix)]
+    pub fn swift_server(
+        connection: ConnectionConfig,
+        credentials: Server,
+        settings: crate::swift::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            connection,
+            Endpoint::Server(credentials),
+            attachment,
+            Transport::Swift(settings),
+        )
+    }
+    /// Bound of one accepted setup operation, started at acceptance.
+    pub(super) fn setup_timeout(&self) -> Duration {
+        match (&self.data.transport, &self.data.endpoint) {
+            #[cfg(unix)]
+            (Transport::Swift(_), Endpoint::Server(_)) => {
+                SWIFT_LISTEN + self.data.connection.handshake_timeout
+            }
+            _ => self.data.connection.handshake_timeout,
+        }
+    }
     fn client_endpoint(credentials: &Client) -> io::Result<()> {
         if credentials.remote.port() == 0
             || credentials.remote.ip().is_unspecified()
@@ -188,6 +275,17 @@ impl Prepared {
                 )?;
                 None
             }
+            #[cfg(unix)]
+            Transport::Swift(settings) => {
+                settings.session(connection)?;
+                if !attachment.readable_kind() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "swift requires a readiness-capable attachment",
+                    ));
+                }
+                None
+            }
         };
         if attachment.layer != connection.layer
             || profile_interval
@@ -207,6 +305,17 @@ impl Prepared {
                 transport,
             }),
         })
+    }
+    #[cfg(unix)]
+    pub(super) fn open_readable(&self) -> io::Result<crate::swift::Native> {
+        let device = self.data.attachment.open_readable()?;
+        if PacketDevice::layer(&device) != self.data.connection.layer {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened attachment changed layer",
+            ));
+        }
+        Ok(device)
     }
     pub(super) fn open(&self) -> io::Result<Device> {
         let device = self.data.attachment.open()?;

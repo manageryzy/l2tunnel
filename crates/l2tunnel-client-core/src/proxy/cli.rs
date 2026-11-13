@@ -224,6 +224,8 @@ mod service {
                 },
                 Action::SwitchCompression { .. }
                 | Action::SwitchActivePolicy { .. }
+                | Action::Disconnect {}
+                | Action::Reconnect {}
                 | Action::DrainOpenVpn {} => Err("unsupported"),
             };
             Response {

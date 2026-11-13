@@ -6,8 +6,13 @@ Windows named-pipe/service authorization is a separate implementation gate.
 
 The version-1 API uses a 4-byte big-endian byte length and one bounded JSON object.
 Requests are limited to 4096 bytes and replies to 8192. Unknown fields, versions,
-commands and compression names are rejected. Actions are status and compression
-switch; no arbitrary code, path, shell or raw control-frame submission is exposed.
+commands and compression names are rejected. Actions are status, the profile
+drains, compression and active-policy switches, and the lifecycle commands
+`disconnect` and `reconnect`; no arbitrary code, path, shell or raw
+control-frame submission is exposed. The lifecycle commands were added without
+a version change: an endpoint that predates them rejects the unknown command,
+and only a frontend that keeps its daemon alive across generations (today the
+swift profile) serves them; every other frontend answers `unsupported`.
 `Request`, `Action`, `Response` and `Snapshot` are shared typed interfaces.
 
 `Server::bind(path)` requires an existing private directory owned by the effective

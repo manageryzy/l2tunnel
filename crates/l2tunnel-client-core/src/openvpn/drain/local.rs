@@ -16,6 +16,8 @@ pub(super) fn action(
             Err(_) => Err("closed"),
         },
         local::Action::DrainProxy {}
+        | local::Action::Disconnect {}
+        | local::Action::Reconnect {}
         | local::Action::SwitchCompression { .. }
         | local::Action::SwitchActivePolicy { .. } => Err("unsupported"),
     };

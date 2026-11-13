@@ -31,6 +31,18 @@ qualification. Exact commands, negative observations and limits are in the
 These checks use actual loopback TLS and injected packet devices; they do not
 qualify new native TAP/TUN lifecycle behavior, Windows or Android.
 
+## Swift in the same owner
+
+The [swift profile](swift.md) is a third backend variant, used by the CLI
+itself. `Prepared::swift_client`/`swift_server` validate the complete policy
+and require an attachment built with `Attachment::readable`, whose devices
+expose a readiness descriptor. The service keeps the latest accepted plan so
+`Handle::lifecycle_request` can serve local `disconnect` and `reconnect`
+without re-parsing credentials, and `Handle::wait_next` lets a frontend follow
+operations another local client submitted. `apply` is rejected as Unsupported
+for swift exactly as for UDP. Evidence: the [two-service lifecycle
+test](../../crates/l2tunnel-client-core/src/service/tests/swift.rs).
+
 ## Base UDP in the same owner (embedding API only)
 
 `Prepared::udp_client` and `Prepared::udp_server` take the existing parsed TLS/member

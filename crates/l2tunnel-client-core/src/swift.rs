@@ -202,6 +202,41 @@ impl Status {
     }
 }
 
+/// A native device the swift runtime can wait on for readiness.
+pub trait Device:
+    l2tunnel_device::PacketDevice<Error = io::Error> + std::os::fd::AsRawFd + Send + Sync
+{
+}
+impl<T> Device for T where
+    T: l2tunnel_device::PacketDevice<Error = io::Error> + std::os::fd::AsRawFd + Send + Sync
+{
+}
+/// Owned dynamic readiness-capable device, as a service attachment returns it.
+pub struct Native(Box<dyn Device>);
+impl Native {
+    /// Take ownership of a concrete device.
+    pub fn new(device: impl Device + 'static) -> Self {
+        Self(Box::new(device))
+    }
+}
+impl l2tunnel_device::PacketDevice for Native {
+    type Error = io::Error;
+    fn layer(&self) -> PacketLayer {
+        self.0.layer()
+    }
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        self.0.receive(buffer)
+    }
+    fn transmit(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.0.transmit(packet)
+    }
+}
+impl std::os::fd::AsRawFd for Native {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 /// One authenticated endpoint ready to forward.
 pub struct Session {
     control: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,

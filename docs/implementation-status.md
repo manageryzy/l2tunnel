@@ -19,8 +19,11 @@ minimum RTO. The 1% loss, delay-only and clean paths measured 93.41, 93.69 and
 and the simulator runs ([reference path](../work/swift-simulator-reference38/output.log),
 [control paths](../work/swift-simulator-reference40/output.log)) are saved.
 This is integration-tested in one local environment only: real devices,
-privileged host namespaces, soak, the shared service API and the other profiles'
-blocking corrections remain open, and no Python mode gate is closed by it.
+privileged host namespaces, soak and the other profiles' blocking corrections
+remain open. The session is owned by the shared lifecycle service; the
+self-test [disconnects and reconnects](../work/swift-selftest43/impaired.json)
+the live tunnel through the local commands. Rekeying, negotiated profile
+switching and a clean peer-confirmed drain are not implemented, and no Python mode gate is closed by it.
 
 ## Current verification
 

@@ -20,6 +20,8 @@ use tokio::{
     time::Instant,
 };
 mod prepared;
+#[cfg(unix)]
+pub use prepared::SWIFT_LISTEN;
 pub use prepared::{Attachment, Client, Options, Prepared, Server};
 mod owner;
 #[cfg(test)]
@@ -133,6 +135,26 @@ pub struct UdpFrame {
     /// Local queue, native delivery flight and recovery retention stay separate.
     pub lanes: l2tunnel_runtime::udp::Snapshot,
 }
+/// Requested and effective swift profile with the latest runtime counters.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwiftFrame {
+    /// Settings the caller prepared.
+    pub requested: crate::swift::Settings,
+    /// Runtime policy of this endpoint, derived by the authenticated factory.
+    pub effective: l2tunnel_runtime::swift::Config,
+    /// Effective kernel receive buffer of the data socket in bytes.
+    pub receive_buffer: usize,
+    /// Latest counters the runtime reported; zero before its first report.
+    pub counters: l2tunnel_runtime::swift::Snapshot,
+}
+#[cfg(unix)]
+impl SwiftFrame {
+    /// Flat non-secret status for the local API.
+    pub fn status(&self) -> crate::swift::Status {
+        crate::swift::Status::new(self.effective, &self.counters)
+    }
+}
 /// Actual observation of the one live or last backend; variants are never merged.
 #[derive(Clone, Debug)]
 pub enum Observation {
@@ -140,20 +162,31 @@ pub enum Observation {
     Managed(managed::Status),
     /// Base system/frame UDP runtime status, boxed because it carries two lanes.
     UdpFrame(Box<UdpFrame>),
+    /// Swift runtime status.
+    #[cfg(unix)]
+    Swift(Box<SwiftFrame>),
 }
 impl Observation {
     /// Managed status, absent for every other backend.
     pub fn managed(&self) -> Option<&managed::Status> {
         match self {
             Self::Managed(status) => Some(status),
-            Self::UdpFrame(_) => None,
+            _ => None,
         }
     }
     /// Base UDP observation, absent for every other backend.
     pub fn udp_frame(&self) -> Option<&UdpFrame> {
         match self {
             Self::UdpFrame(frame) => Some(frame),
-            Self::Managed(_) => None,
+            _ => None,
+        }
+    }
+    /// Swift observation, absent for every other backend.
+    #[cfg(unix)]
+    pub fn swift(&self) -> Option<&SwiftFrame> {
+        match self {
+            Self::Swift(frame) => Some(frame),
+            _ => None,
         }
     }
 }
@@ -166,6 +199,15 @@ enum ObservedBackend {
         profile: Option<managed::ProfileHandle>,
     },
     UdpFrame(Arc<UdpBackend>),
+    #[cfg(unix)]
+    Swift(Arc<SwiftBackend>),
+}
+#[cfg(unix)]
+struct SwiftBackend {
+    requested: crate::swift::Settings,
+    effective: l2tunnel_runtime::swift::Config,
+    receive_buffer: usize,
+    counters: Mutex<l2tunnel_runtime::swift::Snapshot>,
 }
 struct UdpBackend {
     observer: l2tunnel_runtime::udp::Observer,
@@ -183,12 +225,22 @@ impl ObservedBackend {
                 delivery: udp.delivery,
                 lanes: udp.observer.status(),
             }))),
+            #[cfg(unix)]
+            Self::Swift(swift) => Some(Observation::Swift(Box::new(SwiftFrame {
+                requested: swift.requested,
+                effective: swift.effective,
+                receive_buffer: swift.receive_buffer,
+                counters: *swift
+                    .counters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            }))),
         }
     }
     fn managed(&self) -> Option<&managed::ControlHandle> {
         match self {
             Self::Managed { control, .. } => Some(control),
-            Self::UdpFrame(_) => None,
+            _ => None,
         }
     }
 }
@@ -266,6 +318,9 @@ struct State {
     backend: Option<ObservedBackend>,
     queued: Option<Job>,
     entries: VecDeque<Entry>,
+    /// Latest accepted setup plan, kept so a local lifecycle request can
+    /// connect again without re-parsing credentials.
+    plan: Option<Prepared>,
     terminals: VecDeque<(OperationId, Terminal)>,
     last_key: u64,
     retired_through: u64,
@@ -421,7 +476,10 @@ impl Handle {
         }
         let connected = state.backend.is_some();
         if matches!(command, Command::Apply(_))
-            && matches!(state.backend, Some(ObservedBackend::UdpFrame(_)))
+            && state
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.managed().is_none())
         {
             return Err(SubmitError::Unsupported);
         }
@@ -437,11 +495,14 @@ impl Handle {
         let deadline = match &command {
             Command::Connect(p) | Command::Reconnect(p) => Some(
                 Instant::now()
-                    .checked_add(p.data.connection.handshake_timeout)
+                    .checked_add(p.setup_timeout())
                     .ok_or(SubmitError::Closed)?,
             ),
             _ => None,
         };
+        if let Command::Connect(p) | Command::Reconnect(p) = &command {
+            state.plan = Some(p.clone());
+        }
         let accepted = Accepted {
             operation: OperationId(key.0),
             deadline,
@@ -517,6 +578,32 @@ impl Handle {
             changed.changed().await.map_err(|_| SubmitError::Closed)?;
         }
     }
+    /// Wait for the first completed operation after `after` (zero for the
+    /// first ever) and return its ordinal with its actual completion. A
+    /// frontend follows operations other local clients submitted this way.
+    pub async fn wait_next(&self, after: u64) -> Result<(OperationId, Completed), SubmitError> {
+        let mut changed = self.subscribe();
+        loop {
+            {
+                let state = self.0.lock();
+                if after < state.retired_through {
+                    return Err(SubmitError::Expired);
+                }
+                if let Some(entry) = state
+                    .entries
+                    .iter()
+                    .find(|entry| entry.accepted.operation.0 > after)
+                    && let Some(result) = &entry.result
+                {
+                    return Ok((entry.accepted.operation, result.clone()));
+                }
+                if state.snapshot.phase == Phase::Closed {
+                    return Err(SubmitError::Closed);
+                }
+            }
+            changed.changed().await.map_err(|_| SubmitError::Closed)?;
+        }
+    }
     /// Wait for an actual retained generation to stop, independently of operation acceptance.
     pub async fn wait_stopped(&self, generation: OperationId) -> Result<Terminal, SubmitError> {
         let mut changed = self.subscribe();
@@ -564,6 +651,8 @@ impl Handle {
                 // The local v1 status schema describes managed sessions only.
                 // Typed in-process status is Handle::snapshot, not a new IPC wire.
                 Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
+                #[cfg(unix)]
+                Some(ObservedBackend::Swift(_)) => self.swift_status(true, "ok"),
                 None => response("closed"),
             };
         }
@@ -579,6 +668,99 @@ impl Handle {
             Err(SubmitError::Unsupported) => response("unsupported"),
             Err(SubmitError::Busy | SubmitError::Conflict) => response("busy"),
             Err(_) => response("closed"),
+        }
+    }
+}
+impl Handle {
+    /// Local API including lifecycle commands: `disconnect` aborts the live
+    /// generation and leaves the service idle; `reconnect` replaces it, or
+    /// connects again when idle, using the latest accepted plan. Each reply
+    /// reports the actual completion, not mere acceptance. Every other
+    /// request is answered exactly as [`Self::request`] does. A frontend that
+    /// exits when its generation stops should keep using `request`.
+    pub async fn lifecycle_request(&self, request: local::Request) -> local::Response {
+        if request.version != local::VERSION {
+            return response("unsupported_version");
+        }
+        let accepted = match request.action {
+            local::Action::Disconnect {} => self.next_key().and_then(|key| self.disconnect(key)),
+            local::Action::Reconnect {} => {
+                let (plan, connected) = {
+                    let state = self.0.lock();
+                    (state.plan.clone(), state.backend.is_some())
+                };
+                let Some(plan) = plan else {
+                    return self.lifecycle_reply(false, "closed");
+                };
+                self.next_key().and_then(|key| {
+                    if connected {
+                        self.reconnect(plan, key)
+                    } else {
+                        self.connect(plan, key)
+                    }
+                })
+            }
+            local::Action::Status {} if self.0.lock().backend.is_none() => {
+                return self.lifecycle_reply(true, "ok");
+            }
+            _ => return self.request(request).await,
+        };
+        match accepted {
+            Ok(accepted) => match self.wait(accepted.operation).await {
+                Ok(Completed::Connected { .. } | Completed::Aborted) => {
+                    self.lifecycle_reply(true, "ok")
+                }
+                Ok(Completed::Cancelled) => self.lifecycle_reply(false, "cancelled"),
+                Ok(Completed::Failed(_)) => self.lifecycle_reply(false, "failed"),
+                _ => self.lifecycle_reply(false, "closed"),
+            },
+            Err(SubmitError::Busy | SubmitError::Conflict) => self.lifecycle_reply(false, "busy"),
+            Err(SubmitError::State) => self.lifecycle_reply(false, "state"),
+            Err(_) => self.lifecycle_reply(false, "closed"),
+        }
+    }
+    fn lifecycle_reply(&self, ok: bool, code: &str) -> local::Response {
+        #[cfg(unix)]
+        if matches!(self.snapshot().runtime, Some(Observation::Swift(_)) | None) {
+            return self.swift_status(ok, code);
+        }
+        local::Response {
+            ok,
+            ..response(code)
+        }
+    }
+    /// Lifecycle phase and, when a swift generation exists, its last counters.
+    #[cfg(unix)]
+    fn swift_status(&self, ok: bool, code: &str) -> local::Response {
+        let snapshot = self.snapshot();
+        let phase = match snapshot.phase {
+            Phase::Connected => "forwarding",
+            Phase::Disconnected => "disconnected",
+            Phase::Preparing | Phase::Authenticating => "connecting",
+            Phase::Applying => "applying",
+            Phase::Stopping => "stopping",
+            Phase::Failed => "failed",
+            Phase::Closed => "closed",
+        };
+        local::Response {
+            version: local::VERSION,
+            ok,
+            code: code.into(),
+            state: Some(local::Snapshot {
+                epoch: snapshot.generation.map_or(0, OperationId::value),
+                phase: phase.into(),
+                compression: local::Compression::Off,
+                active: None,
+                proxy: None,
+                openvpn_drain: None,
+                raw_packet: None,
+                rolling: None,
+                swift: snapshot
+                    .runtime
+                    .as_ref()
+                    .and_then(Observation::swift)
+                    .map(SwiftFrame::status),
+            }),
         }
     }
 }
@@ -663,6 +845,7 @@ pub fn channel() -> (Handle, Run) {
             backend: None,
             queued: None,
             entries: VecDeque::with_capacity(RETAINED),
+            plan: None,
             terminals: VecDeque::with_capacity(RETAINED),
             last_key: 0,
             retired_through: 0,

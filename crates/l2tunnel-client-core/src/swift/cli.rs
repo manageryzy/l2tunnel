@@ -8,8 +8,9 @@ pub(super) const OPTIONS: &[&str] = &[
     "--swift-window",
     "--swift-repair-permille",
     "--swift-report-ms",
+    "--swift-restart",
 ];
-pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. Optional --control-socket supports status only. No compression, VXLAN, lanes or hot switching.";
+pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. --swift-restart on|off (default off) sets the session up again one second after it ends or fails; a server otherwise exits when its peer leaves. Optional --control-socket serves status, disconnect and reconnect through the shared lifecycle service. No compression, VXLAN, lanes or hot switching.";
 pub(super) fn selection(
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
@@ -109,6 +110,21 @@ fn line(event: &str, snapshot: &client::Snapshot) -> String {
     })
     .to_string()
 }
+fn service_error(error: crate::service::SubmitError) -> io::Error {
+    io::Error::other(format!("service request: {error:?}"))
+}
+/// Pause before an automatic new setup attempt after a failure.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
+/// Whether a stopped or failed session is set up again automatically.
+pub(super) fn restart(options: &BTreeMap<String, String>) -> io::Result<bool> {
+    match options.get("--swift-restart").map(String::as_str) {
+        None | Some("off") => Ok(false),
+        Some("on") => Ok(true),
+        _ => Err(input("--swift-restart must be on or off")),
+    }
+}
+/// Present the shared lifecycle service for a swift plan. This adapter parses
+/// credentials and prints; the service owns the connection, device and state.
 #[cfg(target_os = "linux")]
 pub(super) async fn execute(
     command: &str,
@@ -116,27 +132,33 @@ pub(super) async fn execute(
     config: ConnectionConfig,
     settings: client::Settings,
 ) -> io::Result<()> {
-    let name = required(options, "--device")?;
-    // Bound before authentication so an unusable path fails early.
-    let api = options
-        .get("--control-socket")
-        .map(crate::local::Server::bind)
-        .transpose()?;
-    let session = match command {
+    use crate::service::{self, Completed, Observation, Terminal};
+    let restart = restart(options)?;
+    let name = required(options, "--device")?.to_owned();
+    let attachment = service::Attachment::readable(config.layer, move || {
+        Ok(client::Native::new(
+            l2tunnel_platform_linux::TunTap::attach(&name, config.layer)?,
+        ))
+    });
+    let plan = match command {
         "connect" => {
-            let address = required(options, "--remote")?
+            let remote = required(options, "--remote")?
                 .parse()
                 .map_err(|_| input("remote requires IP:PORT"))?;
             let roots = vec![bounded_file(required(options, "--ca")?, 65536)?];
             let member =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;
-            let tls = ClientTls::from_der_roots(&roots).map_err(auth_error)?;
-            let server = required(options, "--server-name")?;
-            client::connect(address, &tls, server, &member, config, settings).await?
+            let credentials = service::Client {
+                remote,
+                tls: ClientTls::from_der_roots(&roots).map_err(auth_error)?,
+                server_name: required(options, "--server-name")?.into(),
+                member: std::sync::Arc::new(member),
+            };
+            service::Prepared::swift_client(config, credentials, settings, attachment)?
         }
         "serve" => {
-            let address: SocketAddr = required(options, "--listen")?
+            let listen: SocketAddr = required(options, "--listen")?
                 .parse()
                 .map_err(|_| input("listen requires IP:PORT"))?;
             let chain = vec![bounded_file(required(options, "--cert")?, 65536)?];
@@ -144,97 +166,198 @@ pub(super) async fn execute(
             let public: [u8; 32] = bounded_file(required(options, "--allow-key")?, 32)?
                 .try_into()
                 .map_err(|_| input("allow-key requires exactly32 bytes"))?;
-            let allow = MemberAllowlist::new(&[MemberPublicKey(public)]).map_err(auth_error)?;
-            let tls = ServerTls::from_der(&chain, &key).map_err(auth_error)?;
-            let listener = TcpListener::bind(address).await?;
-            client::accept(&listener, &tls, &allow, config, settings).await?
+            let credentials = service::Server {
+                listen,
+                tls: ServerTls::from_der(&chain, &key).map_err(auth_error)?,
+                members: MemberAllowlist::new(&[MemberPublicKey(public)]).map_err(auth_error)?,
+            };
+            service::Prepared::swift_server(config, credentials, settings, attachment)?
         }
         _ => return Err(input("unsupported swift command")),
     };
-    let device = l2tunnel_platform_linux::TunTap::attach(name, config.layer)?;
-    let effective = session.config();
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "swift_authenticated",
-            "datagram_bytes": effective.codec.datagram_bytes,
-            "symbol_bytes": effective.codec.symbol_bytes(),
-            "channels": effective.channels,
-            "window": effective.codec.window,
-            "repair_permille": effective.codec.repair_numerator,
-            "send_bytes_per_second": effective.send_bytes_per_second,
-            "receive_buffer_bytes": session.receive_buffer()?,
-        })
-    );
-    let session = if api.is_some() {
-        session.observe_every(Duration::from_secs(1))
-    } else {
-        session
-    };
-    let status = std::sync::Arc::new(std::sync::Mutex::new(client::Status::new(
-        effective,
-        &client::Snapshot::default(),
-    )));
-    let observed = status.clone();
-    let mut printed: Option<Duration> = None;
-    let run = session.run(device, |snapshot| {
-        // Counters are observed at the shorter of the print and status
-        // intervals; lines are printed only as often as the user asked.
-        let now = Duration::from_micros(snapshot.elapsed_micros);
-        if let Some(interval) = settings.report
-            && printed
-                .is_none_or(|at| now.saturating_sub(at) + Duration::from_millis(50) >= interval)
-        {
-            printed = Some(now);
-            println!("{}", line("swift_report", snapshot));
-        }
-        if let Ok(mut slot) = observed.lock() {
-            *slot = client::Status::new(effective, snapshot);
-        }
-    });
-    let result = match api {
-        Some(api) => {
-            let service = api.serve(move |request| std::future::ready(response(&status, request)));
-            tokio::pin!(service);
+    // Bound before authentication so an unusable path fails early.
+    let api = options
+        .get("--control-socket")
+        .map(crate::local::Server::bind)
+        .transpose()?;
+    let (handle, run) = service::channel();
+    handle
+        .connect(plan.clone(), handle.next_key().map_err(service_error)?)
+        .map_err(service_error)?;
+    let life = handle.clone();
+    let lifecycle = async move {
+        // Follows every operation, including those other local clients submit.
+        let mut cursor = 0;
+        let mut live = None;
+        let mut retry: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut ticker = settings.report.map(|interval| {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker
+        });
+        let frame = |life: &service::Handle| match life.snapshot().runtime {
+            Some(Observation::Swift(frame)) => Some(*frame),
+            _ => None,
+        };
+        let ended = |life: &service::Handle, reason: &str, ok: bool| {
+            if let Some(frame) = frame(life) {
+                println!("{}", line("swift_report", &frame.counters));
+            }
+            println!(
+                "{}",
+                serde_json::json!({"event": "swift_terminal", "ok": ok, "reason": reason})
+            );
+        };
+        loop {
+            let stopped = async {
+                match live {
+                    Some(generation) => life.wait_stopped(generation).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let again = async {
+                match retry.as_mut() {
+                    Some(sleep) => sleep.await,
+                    None => std::future::pending().await,
+                }
+            };
+            let tick = async {
+                match ticker.as_mut() {
+                    Some(ticker) => ticker.tick().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
-                result = run => result,
-                result = &mut service => Err(result
-                    .err()
-                    .unwrap_or_else(|| io::Error::other("swift status service stopped"))),
+                biased;
+                terminal = stopped => {
+                    live = None;
+                    match terminal.map_err(service_error)? {
+                        // An explicit local command; its own result follows.
+                        Terminal::Aborted => ended(&life, "aborted", true),
+                        Terminal::Failed(failure) => {
+                            // The peer closing the retained control stream is
+                            // the ordinary end of a session.
+                            let closed = failure.kind == io::ErrorKind::UnexpectedEof;
+                            ended(&life, if closed { "peer_closed" } else { "failed" }, closed);
+                            if restart {
+                                retry = Some(Box::pin(tokio::time::sleep(RESTART_DELAY)));
+                            } else if closed {
+                                return Ok(());
+                            } else {
+                                return Err(io::Error::new(failure.kind, "swift runtime stopped"));
+                            }
+                        }
+                    }
+                }
+                next = life.wait_next(cursor) => {
+                    let (operation, completed) = next.map_err(service_error)?;
+                    cursor = operation.value();
+                    match completed {
+                        Completed::Connected { generation } => {
+                            retry = None;
+                            live = Some(generation);
+                            let frame = frame(&life)
+                                .ok_or_else(|| io::Error::other("swift observation absent"))?;
+                            let effective = frame.effective;
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "swift_authenticated",
+                                    "generation": generation.value(),
+                                    "datagram_bytes": effective.codec.datagram_bytes,
+                                    "symbol_bytes": effective.codec.symbol_bytes(),
+                                    "channels": effective.channels,
+                                    "window": effective.codec.window,
+                                    "repair_permille": effective.codec.repair_numerator,
+                                    "send_bytes_per_second": effective.send_bytes_per_second,
+                                    "receive_buffer_bytes": frame.receive_buffer,
+                                })
+                            );
+                        }
+                        Completed::Aborted => {}
+                        Completed::Failed(failure) if restart => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "swift_setup_failed",
+                                    "kind": format!("{:?}", failure.kind),
+                                })
+                            );
+                            retry = Some(Box::pin(tokio::time::sleep(RESTART_DELAY)));
+                        }
+                        Completed::Failed(failure) => {
+                            return Err(io::Error::new(failure.kind, "swift setup failed"));
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "swift setup cancelled",
+                            ));
+                        }
+                    }
+                }
+                () = again => {
+                    retry = None;
+                    // A local client may have acted meanwhile; its operation
+                    // then takes precedence and this attempt is not needed.
+                    if let Ok(key) = life.next_key() {
+                        let _ = life.connect(plan.clone(), key);
+                    }
+                }
+                _ = tick => {
+                    if live.is_some() && let Some(frame) = frame(&life) {
+                        println!("{}", line("swift_report", &frame.counters));
+                    }
+                }
             }
         }
-        None => run.await,
     };
-    println!(
-        "{}",
-        serde_json::json!({"event": "swift_terminal", "ok": result.is_ok()})
-    );
-    result
-}
-/// Answer one local request. Only `status` is supported; the profile has no
-/// negotiated runtime changes.
-pub(crate) fn response(
-    status: &std::sync::Mutex<client::Status>,
-    request: crate::local::Request,
-) -> crate::local::Response {
-    use crate::local::{self, Action, Response, Snapshot};
-    let ok = matches!(request.action, Action::Status {});
-    let state = status.lock().map(|value| value.clone()).ok();
-    Response {
-        version: local::VERSION,
-        ok: ok && state.is_some(),
-        code: if ok { "ok" } else { "unsupported" }.into(),
-        state: state.map(|swift| Snapshot {
-            epoch: 0,
-            phase: "forwarding".into(),
-            compression: local::Compression::Off,
-            active: None,
-            proxy: None,
-            openvpn_drain: None,
-            raw_packet: None,
-            rolling: None,
-            swift: Some(swift),
-        }),
+    let local_handle = handle.clone();
+    let ipc = async {
+        match &api {
+            Some(api) => {
+                api.serve(move |request| {
+                    let handle = local_handle.clone();
+                    async move { handle.lifecycle_request(request).await }
+                })
+                .await
+            }
+            None => std::future::pending::<io::Result<()>>().await,
+        }
+    };
+    let mut changes = handle.subscribe();
+    let mut listening = None;
+    let mut serving = api.is_some();
+    tokio::pin!(run, lifecycle, ipc);
+    loop {
+        tokio::select! {
+            result = &mut run => return result,
+            result = &mut lifecycle => return result,
+            result = &mut ipc, if serving => {
+                // Loss of local IPC cannot cancel the accepted tunnel owner.
+                if result.is_err() {
+                    eprintln!("Local service API stopped; swift tunnel remains owned");
+                }
+                serving = false;
+            },
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "swift lifecycle stopped"));
+                }
+                if let Some(current) = handle.snapshot().listening
+                    && listening != Some(current.operation)
+                {
+                    listening = Some(current.operation);
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "swift_listening",
+                            "address": current.address.to_string(),
+                        })
+                    );
+                }
+            },
+        }
     }
 }
 
@@ -282,13 +405,17 @@ mod tests {
             ("--swift-channels", "65"),
             ("--swift-repair-permille", "1001"),
             ("--swift-report-ms", "5"),
+            ("--swift-restart", "maybe"),
             ("--path-mtu", "100"),
             ("--udp-peer", "[::1]:9"),
         ] {
             let mut bad = valid.clone();
             bad.insert(key.into(), value.into());
             let config = configuration(&bad)?;
-            assert!(selection(&bad, config).is_err(), "{key} {value}");
+            assert!(
+                selection(&bad, config).and_then(|_| restart(&bad)).is_err(),
+                "{key} {value}"
+            );
         }
         for key in [
             "--udp-bind",
@@ -308,52 +435,6 @@ mod tests {
             other.remove(*key);
         }
         assert_eq!(selection(&other, config)?, None);
-        Ok(())
-    }
-    #[test]
-    fn status_reports_counters_and_other_commands_are_unsupported() -> io::Result<()> {
-        use crate::local::{Action, Request, VERSION};
-        let mut valid = options();
-        valid.insert("--control-socket".into(), "/unused/private.sock".into());
-        let config = configuration(&valid)?;
-        let settings = selection(&valid, config)?.ok_or_else(|| input("not selected"))?;
-        let runtime = settings.runtime(config, true)?;
-        let mut snapshot = client::Snapshot {
-            native_written: 7,
-            ..client::Snapshot::default()
-        };
-        snapshot.sender.sources = 9;
-        snapshot.sender.repairs = 1;
-        snapshot.sender.tail_repairs = 2;
-        let status = std::sync::Mutex::new(client::Status::new(runtime, &snapshot));
-        let ask = |action| {
-            response(
-                &status,
-                Request {
-                    version: VERSION,
-                    action,
-                },
-            )
-        };
-        let reply = ask(Action::Status {});
-        assert!(reply.ok);
-        let state = reply.state.ok_or_else(|| input("no state"))?;
-        assert_eq!(state.phase, "forwarding");
-        let swift = state.swift.ok_or_else(|| input("no swift state"))?;
-        assert_eq!(
-            (swift.native_written, swift.sources, swift.repairs),
-            (7, 9, 3)
-        );
-        assert_eq!(
-            (swift.channels, swift.send_bytes_per_second),
-            (16, 12_500_000)
-        );
-        let text = serde_json::to_string(&swift).map_err(io::Error::other)?;
-        let parsed: client::Status = serde_json::from_str(&text).map_err(io::Error::other)?;
-        assert_eq!(parsed, swift);
-        let refused = ask(Action::DrainProxy {});
-        assert!(!refused.ok);
-        assert_eq!(refused.code, "unsupported");
         Ok(())
     }
     #[test]

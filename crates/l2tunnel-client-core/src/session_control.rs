@@ -70,9 +70,11 @@ async fn local_action(
                 ControlError::Aborted => "aborted",
                 ControlError::Closed => "closed",
             }),
-        Action::SwitchActivePolicy { .. } | Action::DrainProxy {} | Action::DrainOpenVpn {} => {
-            Err("unsupported")
-        }
+        Action::SwitchActivePolicy { .. }
+        | Action::DrainProxy {}
+        | Action::DrainOpenVpn {}
+        | Action::Disconnect {}
+        | Action::Reconnect {} => Err("unsupported"),
     };
     let code = result.err().unwrap_or("ok");
     let state = handle.status().map(|status| Snapshot {
@@ -108,9 +110,11 @@ async fn active_local_action(
     use l2tunnel_runtime::active_management::ControlError;
     let result = match request.action {
         Action::Status {} => Ok(()),
-        Action::SwitchCompression { .. } | Action::DrainProxy {} | Action::DrainOpenVpn {} => {
-            Err("unsupported")
-        }
+        Action::SwitchCompression { .. }
+        | Action::DrainProxy {}
+        | Action::DrainOpenVpn {}
+        | Action::Disconnect {}
+        | Action::Reconnect {} => Err("unsupported"),
         Action::SwitchActivePolicy { policy } => match policy.mode() {
             Err(_) => Err("invalid_policy"),
             Ok(mode) => handle
