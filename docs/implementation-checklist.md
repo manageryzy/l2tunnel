@@ -63,6 +63,14 @@ The subsequent same-carrier integration is tracked in
 [member admission and tail custody](modules/shared-udp-session.md),
 [shared client factory](modules/client-secure-udp.md) and its
 [real-factory composition tests](modules/common-session-client-tests.md).
+The actual runtime/service integration additionally tracks
+[directional scopes and typed control](modules/directional-control.md),
+[one reusable Swift policy coordinator](modules/swift-policy-coordinator.md) and
+[shared secure-UDP service integration](modules/secure-udp-service.md).
+The [original-socket native driver](modules/secure-udp-runtime.md) has its own
+bounded transport and runtime validation gates. The
+[source-pinned native lab](modules/secure-udp-native.md) separately tracks actual
+CLI/TAP payloads, policy/lifecycle, capture and matched performance acceptance.
 These child ledgers preserve FIX-13, full SW-11 and every mode/native/platform
 gate; an authenticated factory is not a running selected native client profile.
 The [same-socket client aggregate](../work/shared-session-client-20261113/validation.json)
@@ -70,15 +78,22 @@ passed with stable inputs: 1437 Rust cases including doctests, 245 Python toolin
 cases and 1658 simulator cases. It covers actual Noise and
 Ed25519 admission, complete extracted Swift records and fixed control over the
 original UDP pair. The [evidence-only ledger reconciliation](../work/shared-session-client-20261113/postcheck-ledger-validation.json)
-verifies the final prose and unchanged non-document inputs. Whole-path
-independent runtimes, restarted-peer recovery and selected CLI/native integration
-remain open in the linked ledgers.
+verifies the final prose and unchanged non-document inputs. The subsequent
+[runtime/service focused receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
+passed real socket/device and paired-service checks, credential/profile/CLI
+validation, versioned local API, policy and manual reconnect cases, strict Clippy
+and rustdoc. The subsequent [required aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
+passed with stable inputs: 1487 Rust cases including doctests, 271 Python tooling
+cases and 1658 simulator cases. Actual CLI/TAP performance, the full independent-runtime
+impairment matrix and restarted-peer recovery remain open.
 Swift now consumes the common library's explicit legacy compatibility owners;
-the existing CLI still uses retained TLS plus a separate UDP data socket. A new
+the legacy CLI profile uses retained TLS plus a separate UDP data socket. A new
 same-UDP-pair integration fixture exercises Noise, both appearance codecs,
 Swift recovery and fixed control with scripted loss and key generations. That
 fixture does not close FIX-13, native performance, credential migration, default
-recovery, OpenVPN/HTTPS composition or full SW-11. The [local wave receipt](../work/shared-session-primitives-20261113/validation.json)
+recovery, OpenVPN/HTTPS composition or full SW-11. Explicit QUIC-header/media-like
+Swift selection is now wired through the shared service; actual native/impairment
+acceptance is separate. The [local wave receipt](../work/shared-session-primitives-20261113/validation.json)
 records its exact tested inputs and result: 1392 Rust cases including doctests,
 245 Python tooling cases and 1658 simulator cases passed with stable inputs.
 The subsequent [evidence-only ledger reconciliation](../work/shared-session-primitives-20261113/postcheck-ledger-validation.json)

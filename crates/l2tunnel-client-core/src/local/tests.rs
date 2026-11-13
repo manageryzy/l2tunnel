@@ -39,6 +39,8 @@ fn response() -> Response {
             rolling: None,
             #[cfg(unix)]
             swift: None,
+            #[cfg(unix)]
+            secure_udp: None,
         }),
     }
 }
@@ -65,6 +67,79 @@ async fn private_real_socket_requests_and_ownership_cleanup() -> io::Result<()> 
     task.abort();
     let _cancelled = task.await;
     assert!(!path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_version_two_is_not_retried_or_downgraded() -> io::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    // A v1-only backend explicitly refuses v2; transport must not resend a write.
+    let task = tokio::spawn(async move {
+        server
+            .serve(move |request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Response {
+                        version: request.version,
+                        ok: false,
+                        code: "unsupported_version".into(),
+                        state: None,
+                    }
+                }
+            })
+            .await
+    });
+    let result = request(
+        &path,
+        &Request {
+            version: SECURE_UDP_VERSION,
+            action: Action::Reconnect {},
+        },
+    )
+    .await?;
+    assert_eq!(result.version, SECURE_UDP_VERSION);
+    assert_eq!(result.code, "unsupported_version");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+    let _cancelled = task.await;
+    assert!(
+        request(
+            &path,
+            &Request {
+                version: 3,
+                action: Action::Reconnect {}
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reply_version_must_match_the_explicit_request() -> io::Result<()> {
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let task = tokio::spawn(async move { server.serve(|_request| async { response() }).await });
+    let result = request(
+        &path,
+        &Request {
+            version: SECURE_UDP_VERSION,
+            action: Action::Status {},
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidData));
+    task.abort();
+    let _cancelled = task.await;
     Ok(())
 }
 #[tokio::test]

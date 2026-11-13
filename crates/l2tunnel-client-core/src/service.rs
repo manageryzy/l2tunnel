@@ -1,8 +1,8 @@
 //! One retained lifecycle owner for authorized local frontends.
 //!
-//! Supported backends are the existing managed TCP/frame profile and base
-//! system/frame UDP with TLS-bootstrapped authentication. Genuine QUIC and every
-//! other profile factory remain independent; there is no implicit fallback.
+//! Existing managed TCP, TLS-bootstrapped UDP/Swift and explicitly selected
+//! same-socket secure UDP/Swift share this owner. Other profile factories remain
+//! independent; there is no implicit carrier fallback or credential migration.
 //! Handles and waiters do not own or cancel the actor. The caller retains and
 //! polls Run.
 use crate::{ConnectionConfig, local};
@@ -150,6 +150,31 @@ pub struct SwiftFrame {
     /// Service generation that owns this session.
     pub generation: u64,
 }
+/// Same-socket authenticated carrier with its actual native transport observation.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct SecureUdpFrame {
+    /// Immutable globally authenticated startup/profile construction contract.
+    pub requested: crate::secure_udp::profile::Profile,
+    /// Actual member and exact public Noise binding, with original endpoints.
+    pub info: l2tunnel_runtime::secure_udp::member::Info,
+    /// Absent until the real transport publishes its first readiness observation.
+    pub runtime: Option<l2tunnel_runtime::secure_udp::transport::Snapshot>,
+    /// Exact service generation.
+    pub generation: u64,
+}
+#[cfg(unix)]
+impl SecureUdpFrame {
+    /// Bounded version2 public observation without credentials or user payloads.
+    pub fn status(&self) -> io::Result<crate::secure_udp::status::Status> {
+        crate::secure_udp::status::Status::observe(
+            self.requested,
+            self.info,
+            self.generation,
+            self.runtime.as_ref(),
+        )
+    }
+}
 #[cfg(unix)]
 impl SwiftFrame {
     /// Flat non-secret status for the local API.
@@ -184,6 +209,9 @@ pub enum Observation {
     /// Swift runtime status.
     #[cfg(unix)]
     Swift(Box<SwiftFrame>),
+    /// Explicit same-connected-UDP common-session transport.
+    #[cfg(unix)]
+    SecureUdp(Box<SecureUdpFrame>),
 }
 impl Observation {
     /// Managed status, absent for every other backend.
@@ -208,6 +236,14 @@ impl Observation {
             _ => None,
         }
     }
+    /// Distinct new carrier observation, absent for legacy TLS Swift.
+    #[cfg(unix)]
+    pub fn secure_udp(&self) -> Option<&SecureUdpFrame> {
+        match self {
+            Self::SecureUdp(frame) => Some(frame),
+            _ => None,
+        }
+    }
 }
 /// Authoritative handles of the live backend. Its presence is the live-session
 /// predicate; it is not a capability flag or a second lifecycle state machine.
@@ -220,6 +256,16 @@ enum ObservedBackend {
     UdpFrame(Arc<UdpBackend>),
     #[cfg(unix)]
     Swift(Arc<SwiftBackend>),
+    #[cfg(unix)]
+    SecureUdp(Arc<SecureUdpBackend>),
+}
+#[cfg(unix)]
+struct SecureUdpBackend {
+    requested: crate::secure_udp::profile::Profile,
+    info: l2tunnel_runtime::secure_udp::member::Info,
+    counters: Mutex<Option<l2tunnel_runtime::secure_udp::transport::Snapshot>>,
+    switcher: l2tunnel_runtime::secure_udp::transport::ControlHandle,
+    generation: u64,
 }
 #[cfg(unix)]
 struct SwiftBackend {
@@ -277,6 +323,17 @@ impl ObservedBackend {
                     generation: swift.generation,
                 })))
             }
+            #[cfg(unix)]
+            Self::SecureUdp(secure) => Some(Observation::SecureUdp(Box::new(SecureUdpFrame {
+                requested: secure.requested,
+                info: secure.info,
+                runtime: secure
+                    .counters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                generation: secure.generation,
+            }))),
         }
     }
     fn managed(&self) -> Option<&managed::ControlHandle> {
@@ -474,7 +531,7 @@ impl Handle {
     /// Unsupported without consuming it, queueing a command or sending anything.
     /// Retained keys still replay their original acceptance.
     pub fn apply(&self, request: local::Request, key: RequestKey) -> Result<Accepted, SubmitError> {
-        if request.version != local::VERSION
+        if !local::supported_version(request.version)
             || !matches!(
                 request.action,
                 local::Action::SwitchCompression { .. } | local::Action::SetSwiftPolicy { .. }
@@ -526,10 +583,15 @@ impl Handle {
             && let Some(backend) = &state.backend
         {
             let fits = match request.action {
-                local::Action::SwitchCompression { .. } => backend.managed().is_some(),
+                local::Action::SwitchCompression { .. } => {
+                    request.version == local::VERSION && backend.managed().is_some()
+                }
                 #[cfg(unix)]
                 local::Action::SetSwiftPolicy { .. } => {
-                    matches!(backend, ObservedBackend::Swift(_))
+                    (request.version == local::VERSION
+                        && matches!(backend, ObservedBackend::Swift(_)))
+                        || (request.version == local::SECURE_UDP_VERSION
+                            && matches!(backend, ObservedBackend::SecureUdp(_)))
                 }
                 _ => false,
             };
@@ -691,9 +753,15 @@ impl Handle {
     }
     /// Adapt the existing authorized local API without creating a new local wire.
     pub async fn request(&self, request: local::Request) -> local::Response {
-        if request.version != local::VERSION {
-            return response("unsupported_version");
+        if let Some(response) = self.api_version(&request) {
+            return response;
         }
+        let version = request.version;
+        let refusal = |code| {
+            let mut response = response(code);
+            response.version = version;
+            response
+        };
         if matches!(request.action, local::Action::Status {}) {
             let backend = self.0.lock().backend.clone();
             return match backend {
@@ -707,7 +775,13 @@ impl Handle {
                 Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
                 #[cfg(unix)]
                 Some(ObservedBackend::Swift(_)) => self.swift_status(true, "ok"),
-                None => response("closed"),
+                #[cfg(unix)]
+                Some(ObservedBackend::SecureUdp(_)) => self.secure_udp_status(true, "ok"),
+                #[cfg(unix)]
+                None if version == local::SECURE_UDP_VERSION => {
+                    self.secure_udp_status(false, "closed")
+                }
+                None => refusal("closed"),
             };
         }
         // Local-v1 has no idempotency field. Serialize key allocation+submission
@@ -716,16 +790,45 @@ impl Handle {
         match accepted {
             Ok(accepted) => match self.wait(accepted.operation).await {
                 Ok(Completed::Applied(result) | Completed::Rejected(result)) => result,
-                Ok(Completed::OutcomeUnknown) => response("outcome_unknown"),
-                _ => response("closed"),
+                Ok(Completed::OutcomeUnknown) => refusal("outcome_unknown"),
+                _ => refusal("closed"),
             },
-            Err(SubmitError::Unsupported) => response("unsupported"),
-            Err(SubmitError::Busy | SubmitError::Conflict) => response("busy"),
-            Err(_) => response("closed"),
+            Err(SubmitError::Unsupported) => refusal("unsupported"),
+            Err(SubmitError::Busy | SubmitError::Conflict) => refusal("busy"),
+            Err(_) => refusal("closed"),
         }
     }
 }
 impl Handle {
+    fn api_version(&self, request: &local::Request) -> Option<local::Response> {
+        #[cfg(unix)]
+        let secure = {
+            let state = self.0.lock();
+            state.plan.as_ref().is_some_and(Prepared::secure_udp)
+                || matches!(&state.backend, Some(ObservedBackend::SecureUdp(_)))
+        };
+        #[cfg(not(unix))]
+        let secure = false;
+        let code = if secure && request.version == local::VERSION {
+            Some("requires_version_2")
+        } else if request.version
+            != if secure {
+                local::SECURE_UDP_VERSION
+            } else {
+                local::VERSION
+            }
+        {
+            Some("unsupported_version")
+        } else {
+            None
+        };
+        code.map(|code| local::Response {
+            version: request.version,
+            ok: false,
+            code: code.into(),
+            state: None,
+        })
+    }
     /// Local API including lifecycle commands: `disconnect` aborts the live
     /// generation and leaves the service idle; `reconnect` replaces it, or
     /// connects again when idle, using the latest accepted plan. Each reply
@@ -733,8 +836,8 @@ impl Handle {
     /// request is answered exactly as [`Self::request`] does. A frontend that
     /// exits when its generation stops should keep using `request`.
     pub async fn lifecycle_request(&self, request: local::Request) -> local::Response {
-        if request.version != local::VERSION {
-            return response("unsupported_version");
+        if let Some(response) = self.api_version(&request) {
+            return response;
         }
         let accepted = match request.action {
             local::Action::Disconnect {} => self.next_key().and_then(|key| self.disconnect(key)),
@@ -774,6 +877,16 @@ impl Handle {
         }
     }
     fn lifecycle_reply(&self, ok: bool, code: &str) -> local::Response {
+        #[cfg(unix)]
+        if self
+            .0
+            .lock()
+            .plan
+            .as_ref()
+            .is_some_and(Prepared::secure_udp)
+        {
+            return self.secure_udp_status(ok, code);
+        }
         #[cfg(unix)]
         if matches!(self.snapshot().runtime, Some(Observation::Swift(_)) | None) {
             return self.swift_status(ok, code);
@@ -818,6 +931,55 @@ impl Handle {
                     .as_ref()
                     .and_then(Observation::swift)
                     .map(SwiftFrame::status),
+                secure_udp: None,
+            }),
+        }
+    }
+    #[cfg(unix)]
+    fn secure_udp_status(&self, ok: bool, code: &str) -> local::Response {
+        let snapshot = self.snapshot();
+        let frame = snapshot.runtime.as_ref().and_then(Observation::secure_udp);
+        let mut status = match frame.map(SecureUdpFrame::status).transpose() {
+            Ok(status) => status,
+            Err(_) => {
+                return local::Response {
+                    version: local::SECURE_UDP_VERSION,
+                    ok: false,
+                    code: "status_unavailable".into(),
+                    state: None,
+                };
+            }
+        };
+        if let Some(status) = &mut status
+            && self.0.lock().backend.is_none()
+        {
+            status.running = false;
+            status.terminal = snapshot.terminal.map(|terminal| format!("{terminal:?}"));
+        }
+        let phase = match snapshot.phase {
+            Phase::Connected => "forwarding",
+            Phase::Disconnected => "disconnected",
+            Phase::Preparing | Phase::Authenticating => "connecting",
+            Phase::Applying => "applying",
+            Phase::Stopping => "stopping",
+            Phase::Failed => "failed",
+            Phase::Closed => "closed",
+        };
+        local::Response {
+            version: local::SECURE_UDP_VERSION,
+            ok,
+            code: code.into(),
+            state: Some(local::Snapshot {
+                epoch: status.as_ref().map_or(0, |status| status.policy_epoch),
+                phase: phase.into(),
+                compression: local::Compression::Off,
+                active: None,
+                proxy: None,
+                openvpn_drain: None,
+                raw_packet: None,
+                rolling: None,
+                swift: None,
+                secure_udp: status,
             }),
         }
     }

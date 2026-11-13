@@ -149,6 +149,8 @@ pub(crate) fn response(
             rolling: None,
             #[cfg(unix)]
             swift: None,
+            #[cfg(unix)]
+            secure_udp: None,
         }),
     }
 }

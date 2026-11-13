@@ -199,6 +199,8 @@ mod service {
                 rolling: None,
                 #[cfg(unix)]
                 swift: None,
+                #[cfg(unix)]
+                secure_udp: None,
                 proxy: Some(ProxySnapshot {
                     digest: self.digest.clone(),
                     drain_accepted: self.accepted,

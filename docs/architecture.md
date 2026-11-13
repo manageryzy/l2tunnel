@@ -21,13 +21,13 @@ bootstrap is the integration boundary being replaced; data security is retained.
 
 The [secure-session contract](modules/secure-session.md) separates those confirmed
 requirements from unselected dependencies, wire formats, key/provisioning APIs,
-timeout values and migration policies. Its SEC-* tasks are all planned. The
+timeout values and migration policies. Its SEC-* parent gates remain open. The
 following are evidence boundaries, not a declaration that the target is running:
 
 | Area | Current evidence | Target gap |
 | --- | --- | --- |
 | Pure protocol libraries | Typed, bounded engines with caller-supplied time/I/O boundaries. | Preserve them through common security and carrier composition. |
-| Swift | TLS/member authentication plus separate AEAD UDP data, private TLS policy control and finite Linux TAP receipts. It is explicitly selected, not the CLI default. | Shared carrier-independent authentication/protection/control; original-flow continuity and full SW-11. |
+| Swift | Historical TLS/separate-UDP composition has finite Linux TAP receipts. A new explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures passed locally. | Actual CLI/TAP performance for the new path, complete session lifecycle, every other carrier and full SW-11. |
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
 | OpenVPN-like UDP | Real TLS over custom reliable UDP control; standalone native slices exist. | The custom 144-byte gate is not the requested OpenVPN wire-format handshake. |
 | HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
@@ -46,9 +46,9 @@ a reusable pure library while preserving its v2 wire bytes. New pure Noise,
 appearance, protected User/Control records and reliable control components have
 finite protocol/loopback evidence in their
 [module ledgers](implementation-checklist.md#reading-order-and-detailed-task-lists).
-The same-socket library fixture is distinct from integrating these components
-into the real shared client/service and native device runtime. Those target
-gates remain open; no new carrier/default or automatic recovery is silently enabled.
+The same-socket library fixture is distinct from selected shared-service,
+native-device and performance acceptance. Those target gates have separate
+evidence; no default carrier or automatic retained-state recovery is silently enabled.
 Existing Ed25519 identity and multi-channel Swift records now live in pure
 libraries. Shared client-core factories compose admission, Noise and member
 proof on the original connected UDP socket. The
@@ -60,6 +60,21 @@ The
 factory completion and finite transport tests from selected CLI/service/native
 readiness. Actual authenticated prologue values, final-flight custody and the
 original operation deadline remain owned through each handoff.
+
+The [original-socket driver](modules/secure-udp-runtime.md) and
+[shared service/CLI integration](modules/secure-udp-service.md) now have a
+[source-stable focused receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json).
+It covers actual connected UDP, independently owned runtime fixtures, readiness-capable
+Unix datagram packet devices, common AEAD/control, authenticated Swift policy
+changes, liveness, cancellation and fresh manual reconnect. The CLI selects
+`quic-like` or `media-like` separately from `--record-profile swift`, uses explicit
+manual credentials, and exposes the shared version2 service API. This is not
+actual TAP/TUN performance, default state-retaining recovery, fresh-DH rekey,
+generic management dispatch or full SW-11. The
+[native lab](modules/secure-udp-native.md) tracks those finite CLI/TAP measurements
+separately from all remaining carrier, platform and ISP requirements.
+The [required new aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
+also passed with unchanged inputs; actual native execution remains separate.
 
 ## Library boundary and layering
 

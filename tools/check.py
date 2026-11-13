@@ -57,6 +57,7 @@ def main() -> None:
         run('cargo', 'build', '--quiet', '--locked', '-p', 'l2tunneld')
         run(sys.executable, 'tools/udp_cli_loopback.py', 'target/debug/l2tunneld')
     if sys.platform == 'linux':
+        run(sys.executable, '-m', 'unittest', 'tools.test_secure_udp_native', '-v')
         run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_check_simulator', 'tools.test_selftest', '-v')
     else:
         print('Linux namespace harness tests skipped on this host.', flush=True)

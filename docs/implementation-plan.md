@@ -71,6 +71,7 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-security` | Shared opaque protection and explicit Swift v2 compatibility | Pure AEAD/HMAC, domains, metadata, replay and adjacent ratchets; existing Swift runtime consumes byte-compatible owners |
 | `crates/l2tunnel-handshake` | Maintained fixed-pattern Noise adapter | Protocol-tested pinned-peer proof, caller entropy/time, public secret handoff and final-confirmation custody; no production credential migration or full lifecycle |
 | `crates/l2tunnel-cover` | Explicit QUIC-header/RTP-like appearance | Bounded pure codecs, without standard transport validity, identification or ISP classification claims |
+| `crates/l2tunnel-swift` | Reusable packing/recovery, numbered records and policy negotiation | Pure full-record and directional policy engines; legacy TLS and new common-UDP adapters share the coordinator |
 | `crates/l2tunnel-transport` | Carrier selection semantics | Capability-aware explicit fallback contract; actual adapters below |
 | `crates/l2tunnel-mux`, `crates/l2tunnel-packet`, `crates/l2tunnel-pipeline` | Classification, connection affinity, common admission | Real parsed frames, bounded affinity/channel scheduling and DRR composition |
 | `crates/l2tunnel-codec` | L2/L3 fragmentation and compression | None/LZ4 frame bytes, bounded reassembly, Python timestamp/delta and aligned body primitives; complete mode integration pending |
@@ -83,9 +84,9 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-raw-tcp`, `crates/l2tunnel-raw-io` | Single-owner userspace TCP and native adapter | Retained TLS-to-protected-packet transition, runtime and explicit shared client are implemented; original native packet captures and startup sampling are under separate qualification; congestion control, clean drain and broader path behavior remain open |
 | `crates/l2tunnel-tcp-proxy` | Explicit TCP ownership and reliable relay | Maintained-TCP legs and ACK-based fixed credit; clean Linux TUN full/half native split, exact-byte/FIN and lane-close tests passed; adaptive proxy windows pending |
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
-| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC with optional real FEC |
+| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; new same-socket secure-UDP Swift/control driver has finite Unix socket/device tests |
 | `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift CLI paths use the shared service; profile-specific status/apply support differs; other profile lifecycles, default state-retaining recovery and GUI remain open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; new explicit QUIC-header/media-like Swift selection has version2 status/control and paired-service fixtures; native qualification, other profile lifecycles, default state-retaining recovery and GUI remain open |
 | `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
 | `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Status/help CLI; runtime returns nonzero |
 | `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |
@@ -104,18 +105,30 @@ the actual checks. Neither source presence nor factory authentication completes
 the selected shared-service/native data path or remaining carrier/lifecycle
 requirements.
 
-Additional planned source boundaries (create at the first actual implementation):
+The [new common-UDP runtime/service focused checks](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
+passed with unchanged compiled-source inputs, including actual original-socket
+transport, native readiness/backpressure fixtures, authenticated Swift policy
+changes, explicit credential/CLI validation, versioned local API and manual fresh
+reconnect. This follows the factory checkpoint; it does not qualify actual
+CLI/TAP throughput. The [separate native lab](modules/secure-udp-native.md) retains
+clean, delay, 1%/15% loss, sixteen-flow ACK-return, reverse-bulk stress, payload,
+policy/lifecycle and capture acceptance without reducing parent gates.
+The [required runtime/service aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
+passed with stable source inputs; this is local validation rather than native performance.
 
-| Planned project | Responsibility |
+Additional unfinished source and integration boundaries:
+
+| Unfinished boundary | Responsibility |
 | --- | --- |
 | Native Windows/Android adapter crates | Reviewed driver/FD/JNI boundaries and native device lifecycle |
 | `clients/desktop`, `clients/android` | Future desktop GUI and Kotlin Android GUI/VpnService shell |
-| Common secure-session implementation boundary | Reusable inner authentication, key exchange, protection, replay/rekey and management for every carrier; exact maintained dependency and crate boundary remain undecided |
-| QUIC-header and minimal RTP cover adapters | Explicit outer layouts over the selected UDP socket, independent of the inner secure session and data recovery; no native QUIC controller or full WebRTC implied |
+| Cross-carrier secure-session lifecycle | Complete the existing pure security/Noise/control implementation draft across every carrier, including fresh-DH exchange and default retained-state recovery; parent SEC-* gates remain open |
+| Additional carrier and appearance composition | Preserve implemented QUIC-header/RTP codecs and the selected UDP driver while qualifying native use and other carriers; no native QUIC controller or full WebRTC is implied |
 
 [Client design](client-design.md) assigns service/runtime/platform responsibilities;
 [flow control](flow-control.md) and [overlays](overlay-and-carriers.md) define protocol
-contracts. The second table contains remaining projects, not empty built packages.
+contracts. The second table identifies unfinished boundaries; it does not imply
+that another empty package or duplicated secure protocol is needed.
 
 Split actual OS implementations into dedicated adapter crates when native FFI
 appears, keeping `unsafe` exceptions outside protocol crates. The runtime crate

@@ -92,6 +92,8 @@ async fn local_action(
         rolling: None,
         #[cfg(unix)]
         swift: None,
+        #[cfg(unix)]
+        secure_udp: None,
     });
     Response {
         version: VERSION,
@@ -156,6 +158,8 @@ async fn active_local_action(
         rolling: None,
         #[cfg(unix)]
         swift: None,
+        #[cfg(unix)]
+        secure_udp: None,
     });
     Response {
         version: VERSION,

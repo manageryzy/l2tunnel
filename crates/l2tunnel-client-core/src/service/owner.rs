@@ -87,10 +87,10 @@ pub(super) async fn establish(
     let config = plan.data.connection;
     shared.lock().snapshot.phase = Phase::Authenticating;
     shared.changed();
-    let options = match plan.data.transport {
-        Transport::Managed(options) => options,
+    let options = match &plan.data.transport {
+        Transport::Managed(options) => *options,
         Transport::UdpFrame { settings, delivery } => {
-            let setup = establish_udp(&shared, &plan, accepted, deadline, settings, delivery);
+            let setup = establish_udp(&shared, &plan, accepted, deadline, *settings, *delivery);
             let result = tokio::time::timeout_at(deadline, setup)
                 .await
                 .map_err(|_| expired())?;
@@ -99,10 +99,21 @@ pub(super) async fn establish(
         }
         #[cfg(unix)]
         Transport::Swift(settings) => {
-            let setup = establish_swift(&shared, &plan, accepted, deadline, settings);
+            let setup = establish_swift(&shared, &plan, accepted, deadline, *settings);
             let result = tokio::time::timeout_at(deadline, setup)
                 .await
                 .map_err(|_| expired())?;
+            check(deadline)?;
+            return result;
+        }
+        #[cfg(unix)]
+        Transport::SecureUdpSwift(profile) => {
+            let result = tokio::time::timeout_at(
+                deadline,
+                establish_secure_udp(&shared, &plan, accepted, deadline, **profile),
+            )
+            .await
+            .map_err(|_| expired())?;
             check(deadline)?;
             return result;
         }
@@ -145,6 +156,13 @@ pub(super) async fn establish(
                     None => crate::accept(&listener, &s.tls, &s.members, config).await?,
                 };
                 (link, managed::Role::Server)
+            }
+            #[cfg(unix)]
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "prepared endpoint/backend mismatch",
+                ));
             }
         };
         check(deadline)?;
@@ -267,6 +285,13 @@ async fn establish_udp(
             shared.changed();
             crate::udp::accept(&listener, &s.tls, &s.members, config, settings, delivery).await?
         }
+        #[cfg(unix)]
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared endpoint/backend mismatch",
+            ));
+        }
     };
     check(deadline)?;
     let device = plan.open()?;
@@ -338,6 +363,12 @@ async fn establish_swift(
             shared.changed();
             crate::swift::accept(&listener, &s.tls, &s.members, config, settings).await?
         }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared endpoint/backend mismatch",
+            ));
+        }
     };
     check(deadline)?;
     let device = plan.open_readable()?;
@@ -376,6 +407,161 @@ async fn establish_swift(
     Ok(Active {
         runtime,
         backend: ObservedBackend::Swift(backend),
+        generation: accepted.operation,
+    })
+}
+/// Same accepted setup operation, with one fixed original UDP owner and gate.
+#[cfg(unix)]
+async fn establish_secure_udp(
+    shared: &Arc<Shared>,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    profile: crate::secure_udp::profile::Profile,
+) -> io::Result<Active> {
+    use l2tunnel_runtime::secure_udp::{establish, transport};
+    use l2tunnel_security::Role;
+    let selected = profile.settings();
+    let role = match &plan.data.endpoint {
+        Endpoint::SecureClient(_) => Role::Initiator,
+        Endpoint::SecureServer(_) => Role::Responder,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing explicit Noise credentials",
+            ));
+        }
+    };
+    let (local, peer) = match role {
+        Role::Initiator => (selected.gate.path.client, selected.gate.path.server),
+        Role::Responder => (selected.gate.path.server, selected.gate.path.client),
+    };
+    check(deadline)?;
+    let socket = tokio::net::UdpSocket::bind(local).await?;
+    socket.connect(peer).await?;
+    check(deadline)?;
+    if role == Role::Responder {
+        shared.lock().snapshot.listening = Some(Listening {
+            operation: accepted.operation,
+            address: socket.local_addr()?,
+        });
+        shared.changed();
+    }
+    let mut entropy = establish::RuntimeEntropy::new();
+    let session = match &plan.data.endpoint {
+        Endpoint::SecureClient(credentials) => {
+            crate::secure_udp::connect(
+                socket,
+                selected,
+                credentials.noise().attempt(),
+                credentials.member(),
+                credentials.admission(),
+                deadline,
+                &mut entropy,
+            )
+            .await?
+        }
+        Endpoint::SecureServer(server) => {
+            // This owner survives cancellation and every reconnect of this plan.
+            let mut admission = server.admission.lock().await;
+            check(deadline)?;
+            if admission.is_none() {
+                *admission = Some(crate::secure_udp::Server::new(
+                    selected,
+                    server.credentials.noise().peers(role),
+                    server.credentials.admission(),
+                    server.credentials.cookie(),
+                    Instant::now(),
+                )?);
+            }
+            admission
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing retained admission owner"))?
+                .accept(
+                    socket,
+                    server.credentials.noise().attempt(),
+                    deadline,
+                    &mut entropy,
+                )
+                .await?
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared endpoint/backend mismatch",
+            ));
+        }
+    };
+    check(deadline)?;
+    let info = session.info();
+    let configuration = profile.configuration(info.peers)?;
+    let parts = session.into_parts();
+    let device = plan.open_readable()?;
+    check(deadline)?;
+    let (switcher, requests) = transport::channel();
+    let backend = Arc::new(SecureUdpBackend {
+        requested: profile,
+        info,
+        counters: Mutex::new(None),
+        switcher,
+        generation: accepted.operation.value(),
+    });
+    let sink = backend.clone();
+    let changed = shared.clone();
+    let resolver: transport::Resolver =
+        Box::new(move |policy| profile.resolve(policy, role, info.peers));
+    let mut runtime: RunFuture = Box::pin(async move {
+        let stopped = transport::run(
+            device,
+            parts,
+            configuration,
+            profile.runtime(role),
+            Some(requests),
+            resolver,
+            std::future::pending::<()>(),
+            move |snapshot| {
+                *sink
+                    .counters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+                changed.changed();
+            },
+        )
+        .await?;
+        let kind = match stopped.reason {
+            transport::StopReason::Cancelled => io::ErrorKind::Interrupted,
+            transport::StopReason::LeaseExpired
+            | transport::StopReason::PeerTimeout
+            | transport::StopReason::NativeStall
+            | transport::StopReason::PolicyTimeout => io::ErrorKind::TimedOut,
+            transport::StopReason::Io(kind) => kind,
+            _ => io::ErrorKind::InvalidData,
+        };
+        Err(io::Error::new(kind, "secure UDP runtime terminated"))
+    });
+    std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "secure UDP runtime ended during readiness",
+        ))),
+        Poll::Pending
+            if backend
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.running) =>
+        {
+            Poll::Ready(Ok(()))
+        }
+        Poll::Pending => Poll::Pending,
+    })
+    .await?;
+    check(deadline)?;
+    Ok(Active {
+        runtime,
+        backend: ObservedBackend::SecureUdp(backend),
         generation: accepted.operation,
     })
 }
@@ -450,6 +636,94 @@ async fn apply_swift(
         Err(SwitchError::Rejected) => Completed::Rejected(handle.swift_status(false, "rejected")),
         Err(SwitchError::Invalid) => {
             Completed::Rejected(handle.swift_status(false, "invalid_policy"))
+        }
+        Err(SwitchError::Closed) => Completed::OutcomeUnknown,
+    }
+}
+#[cfg(unix)]
+async fn apply_secure_udp(
+    shared: &Arc<Shared>,
+    backend: &SecureUdpBackend,
+    request: &local::Request,
+) -> Completed {
+    use l2tunnel_runtime::secure_udp::transport::SwitchError;
+    let handle = Handle(shared.clone());
+    let local::Action::SetSwiftPolicy { policy: change } = &request.action else {
+        return Completed::Rejected(handle.secure_udp_status(false, "unsupported"));
+    };
+    let mut next = match backend.requested.initial_policy() {
+        Ok(initial) => backend
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|snapshot| snapshot.committed.policy)
+            .unwrap_or(initial),
+        Err(_) => return Completed::Rejected(handle.secure_udp_status(false, "invalid_policy")),
+    };
+    let convert = |value: Option<u64>, current: u64| value.unwrap_or(current);
+    let converted = (
+        u16::try_from(convert(change.path_mtu, u64::from(next.path_mtu))),
+        u32::try_from(convert(change.forward_kbit, u64::from(next.forward_kbit))),
+        u32::try_from(convert(change.reverse_kbit, u64::from(next.reverse_kbit))),
+        u8::try_from(convert(change.channels, u64::from(next.channels))),
+        u8::try_from(convert(change.window, u64::from(next.window))),
+        u16::try_from(convert(
+            change.repair_permille,
+            u64::from(next.repair_permille),
+        )),
+    );
+    let (
+        Ok(path_mtu),
+        Ok(forward_kbit),
+        Ok(reverse_kbit),
+        Ok(channels),
+        Ok(window),
+        Ok(repair_permille),
+    ) = converted
+    else {
+        return Completed::Rejected(handle.secure_udp_status(false, "invalid_policy"));
+    };
+    (
+        next.path_mtu,
+        next.forward_kbit,
+        next.reverse_kbit,
+        next.channels,
+        next.window,
+        next.repair_permille,
+    ) = (
+        path_mtu,
+        forward_kbit,
+        reverse_kbit,
+        channels,
+        window,
+        repair_permille,
+    );
+    if backend.requested.with_policy(&next).is_err() {
+        return Completed::Rejected(handle.secure_udp_status(false, "invalid_policy"));
+    }
+    match backend.switcher.switch(next).await {
+        Ok(epoch) => {
+            if let Some(snapshot) = backend
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                snapshot.committed.epoch = l2tunnel_swift::policy::Epoch(epoch);
+                snapshot.committed.policy = Some(next);
+            }
+            Completed::Applied(handle.secure_udp_status(true, "ok"))
+        }
+        Err(SwitchError::Busy) => Completed::Rejected(handle.secure_udp_status(false, "busy")),
+        Err(SwitchError::NotCoordinator) => {
+            Completed::Rejected(handle.secure_udp_status(false, "not_coordinator"))
+        }
+        Err(SwitchError::Rejected) => {
+            Completed::Rejected(handle.secure_udp_status(false, "rejected"))
+        }
+        Err(SwitchError::Invalid) => {
+            Completed::Rejected(handle.secure_udp_status(false, "invalid_policy"))
         }
         Err(SwitchError::Closed) => Completed::OutcomeUnknown,
     }
@@ -598,6 +872,22 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                                 let failure = Failure {
                                     kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |e| e.kind()),
                                 };
+                                stopped(&shared, &mut active, Terminal::Failed(failure));
+                                Completed::OutcomeUnknown
+                            }
+                        };
+                        finish(&shared, accepted.operation, result);
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    if let ObservedBackend::SecureUdp(secure) = &session.backend {
+                        let secure = secure.clone();
+                        let change = apply_secure_udp(&shared, &secure, &request);
+                        tokio::pin!(change);
+                        let result = tokio::select! {
+                            result = &mut change => result,
+                            result = &mut session.runtime => {
+                                let failure = Failure { kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()) };
                                 stopped(&shared, &mut active, Terminal::Failed(failure));
                                 Completed::OutcomeUnknown
                             }

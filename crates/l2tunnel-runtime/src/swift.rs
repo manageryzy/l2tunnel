@@ -11,13 +11,14 @@
 //! the tunnel fills, and does not overrun, a configured path budget.
 //!
 //! This module performs no authentication, key derivation or device setup.
+use codec::control::Message;
 pub use codec::control::Policy;
-use codec::control::{Message, Refusal};
+use codec::policy::{self, Time};
 use codec::records::{self, RecordNumber};
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_security::{self as security, swift_v2 as protection};
 use l2tunnel_swift as codec;
-use std::collections::VecDeque;
+use std::cell::Cell;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -219,34 +220,6 @@ impl Switching {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SendPhase {
-    /// Proposed, not agreed: still forwarding under the old policy.
-    Proposed,
-    /// Agreed: admission stopped, waiting for every source to be confirmed.
-    Draining,
-    /// Barrier sent, waiting for the peer to replace its receiving state.
-    Barrier,
-    Done,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReceivePhase {
-    Open,
-    /// Peer's barrier received: delivering what is held before replacing.
-    Flushing {
-        first_number: u64,
-    },
-    Done,
-}
-struct Change {
-    epoch: u64,
-    deadline: u64,
-    policy: Policy,
-    resolved: Resolved,
-    send: SendPhase,
-    receive: ReceivePhase,
-}
-
 fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
@@ -318,12 +291,9 @@ struct Engine {
     config: Config,
     /// Policy of the receiving engines.
     receive: Config,
-    coordinator: bool,
-    change: Option<Change>,
-    /// Control messages owed to the peer, a handful at most.
-    outbox: VecDeque<Message>,
-    /// Result of the locally requested change, once known.
-    outcome: Option<Result<u64, SwitchError>>,
+    policy: policy::Coordinator,
+    /// Exact adapter fields for one resolution; phases live only in policy.
+    resolution: Cell<Option<Resolved>>,
     records: records::Engine,
     seal: protection::Sender,
     open: protection::Receiver,
@@ -340,10 +310,8 @@ impl Engine {
         Ok(Self {
             config,
             receive: config,
-            coordinator: false,
-            change: None,
-            outbox: VecDeque::new(),
-            outcome: None,
+            policy: policy_coordinator(false, now)?,
+            resolution: Cell::new(None),
             records: records::Engine::new(config.records()).map_err(invalid)?,
             seal: protection::Sender::new(keys.send, security::MAX_BODY_BYTES, KEY_PACKETS)
                 .map_err(io::Error::other)?,
@@ -357,12 +325,7 @@ impl Engine {
     }
     /// The packing queues share one byte budget, like one bottleneck queue.
     fn has_room(&self) -> bool {
-        // Nothing is admitted between agreement and this direction's switch.
-        if self
-            .change
-            .as_ref()
-            .is_some_and(|change| !matches!(change.send, SendPhase::Proposed | SendPhase::Done))
-        {
+        if !self.policy.admission_allowed() {
             return false;
         }
         self.records.has_room()
@@ -421,7 +384,7 @@ impl Engine {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        match (activity, self.change.as_ref().map(|change| change.deadline)) {
+        match (activity, self.policy.deadline().map(|deadline| deadline.0)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -475,220 +438,241 @@ impl Engine {
         snapshot.header_bytes_saved += stats.header_bytes_saved;
         snapshot
     }
-    /// Start a locally requested change. `resolved` is this endpoint's
-    /// derivation of the policy.
+    fn set_coordinator(&mut self, coordinator: bool, now: u64) -> io::Result<()> {
+        if self.policy.pending().is_some()
+            || self.policy.outbound().is_some()
+            || self.policy.committed().epoch != policy::Epoch(0)
+        {
+            return Err(io::Error::other("policy authority already in use"));
+        }
+        self.policy = policy_coordinator(coordinator, now)?;
+        Ok(())
+    }
+    /// Preserve the public resolver and cache its exact local adapter fields.
     fn request(
         &mut self,
         now: u64,
-        policy: Policy,
+        requested: Policy,
         resolved: io::Result<Resolved>,
     ) -> Result<(), SwitchError> {
-        if !self.coordinator {
-            return Err(SwitchError::NotCoordinator);
-        }
-        if self.change.is_some() || self.outcome.is_some() {
-            return Err(SwitchError::Busy);
-        }
-        let resolved = resolved.map_err(|_| SwitchError::Invalid)?;
-        if self.snapshot.policy == Some(policy) {
-            // Already in force: a retry of a completed request.
-            self.outcome = Some(Ok(self.snapshot.policy_epoch));
-            return Ok(());
-        }
-        let epoch = self
-            .snapshot
-            .policy_epoch
-            .checked_add(1)
-            .ok_or(SwitchError::Invalid)?;
-        let deadline = now
-            .checked_add(DRAIN_TIMEOUT.as_micros() as u64)
-            .ok_or(SwitchError::Invalid)?;
-        self.change = Some(Change {
-            epoch,
-            deadline,
-            policy,
-            resolved,
-            send: SendPhase::Proposed,
-            receive: ReceivePhase::Open,
+        let resolved = resolved.ok().filter(|resolved| {
+            resolved.send.validate().is_ok() && resolved.receive.validate().is_ok()
         });
-        self.outbox.push_back(Message::Propose { epoch, policy });
-        Ok(())
-    }
-    /// Every phase shares the original deadline. Check before a received
-    /// message can change state or a progress turn can report completion.
-    fn check_change_deadline(&self, now: u64) -> io::Result<()> {
-        if self
-            .change
-            .as_ref()
-            .is_some_and(|change| now >= change.deadline)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "swift policy change exceeded its original deadline",
-            ));
+        self.policy
+            .request(Time(now), requested, resolved.map(logical))
+            .map_err(|error| match error {
+                policy::RequestError::Busy => SwitchError::Busy,
+                policy::RequestError::NotCoordinator => SwitchError::NotCoordinator,
+                policy::RequestError::Invalid => SwitchError::Invalid,
+            })?;
+        if self.policy.pending().is_some() {
+            self.resolution.set(resolved);
         }
         Ok(())
     }
-    /// Apply one control message from the authenticated stream. A message
-    /// that does not fit the current state is a protocol violation.
+    fn check_change_deadline(&mut self, now: u64) -> io::Result<()> {
+        self.policy.check(Time(now)).map_err(policy_fault)
+    }
     fn on_control(
         &mut self,
         now: u64,
         message: Message,
         resolve: &dyn Fn(&Policy) -> io::Result<Resolved>,
     ) -> io::Result<()> {
-        self.check_change_deadline(now)?;
-        let violation = || io::Error::new(io::ErrorKind::InvalidData, "swift control out of state");
-        match message {
-            Message::Propose { epoch, policy } => {
-                if self.coordinator {
-                    return Err(violation());
-                }
-                let refuse = |reason| Message::Reject { epoch, reason };
-                let reply = if let Some(change) = &self.change {
-                    if change.epoch == epoch && change.policy == policy {
-                        // A repeated proposal gets the same answer.
-                        Message::Accept {
-                            epoch,
-                            digest: change.resolved.digest,
-                        }
-                    } else {
-                        refuse(Refusal::Busy)
-                    }
-                } else if self.snapshot.policy_epoch.checked_add(1) != Some(epoch) {
-                    refuse(Refusal::Epoch)
-                } else if let Ok(resolved) = resolve(&policy) {
-                    let deadline = now
-                        .checked_add(DRAIN_TIMEOUT.as_micros() as u64)
-                        .ok_or_else(|| io::Error::other("swift policy deadline exhausted"))?;
-                    self.change = Some(Change {
-                        epoch,
-                        deadline,
-                        policy,
-                        resolved,
-                        send: SendPhase::Draining,
-                        receive: ReceivePhase::Open,
-                    });
-                    Message::Accept {
-                        epoch,
-                        digest: resolved.digest,
-                    }
-                } else {
-                    refuse(Refusal::Invalid)
-                };
-                self.outbox.push_back(reply);
-            }
-            Message::Accept { epoch, digest } => {
-                let change = self.change.as_mut().ok_or_else(violation)?;
-                if change.epoch != epoch || change.send != SendPhase::Proposed {
-                    return Err(violation());
-                }
-                if change.resolved.digest != digest {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "swift peers derived different configurations",
-                    ));
-                }
-                change.send = SendPhase::Draining;
-            }
-            Message::Reject { epoch, .. } => {
-                let change = self.change.as_ref().ok_or_else(violation)?;
-                if change.epoch != epoch || change.send != SendPhase::Proposed {
-                    return Err(violation());
-                }
-                self.change = None;
-                self.outcome = Some(Err(SwitchError::Rejected));
-            }
-            Message::Barrier {
-                epoch,
-                first_number,
-            } => {
-                let change = self.change.as_mut().ok_or_else(violation)?;
-                if change.epoch != epoch
-                    || change.send == SendPhase::Proposed
-                    || change.receive != ReceivePhase::Open
-                {
-                    return Err(violation());
-                }
-                change.receive = ReceivePhase::Flushing { first_number };
-            }
-            Message::BarrierAck {
-                epoch,
-                feedback_from,
-            } => {
-                let change = self.change.as_mut().ok_or_else(violation)?;
-                if change.epoch != epoch || change.send != SendPhase::Barrier {
-                    return Err(violation());
-                }
-                change.send = SendPhase::Done;
-                let config = change.resolved.send;
-                self.replace_senders(now, config, feedback_from)?;
-            }
+        let Self {
+            policy,
+            resolution,
+            config,
+            receive,
+            records,
+            pacer,
+            seal,
+            ..
+        } = self;
+        let mut hooks = PolicyHooks {
+            resolution,
+            config,
+            receive,
+            records,
+            pacer,
+            next: RecordNumber(seal.next_number().0),
+        };
+        let result = policy
+            .receive(
+                Time(now),
+                message,
+                |requested| {
+                    let resolved = resolve(requested).ok()?;
+                    resolved.send.validate().ok()?;
+                    resolved.receive.validate().ok()?;
+                    resolution.set(Some(resolved));
+                    Some(logical(resolved))
+                },
+                &mut hooks,
+            )
+            .map_err(policy_error);
+        if policy.pending().is_none() {
+            resolution.set(None);
+        }
+        result
+    }
+    fn progress(&mut self, now: u64) -> io::Result<()> {
+        let Self {
+            policy,
+            resolution,
+            config,
+            receive,
+            records,
+            pacer,
+            seal,
+            snapshot,
+            ..
+        } = self;
+        let mut hooks = PolicyHooks {
+            resolution,
+            config,
+            receive,
+            records,
+            pacer,
+            next: RecordNumber(seal.next_number().0),
+        };
+        policy
+            .progress(Time(now), &mut hooks)
+            .map_err(policy_error)?;
+        let committed = policy.committed();
+        snapshot.policy_epoch = committed.epoch.0;
+        snapshot.policy = committed.policy;
+        if policy.pending().is_none() {
+            resolution.set(None);
         }
         Ok(())
     }
-    fn replace_senders(&mut self, now: u64, config: Config, feedback_from: u64) -> io::Result<()> {
+    fn take_outcome(&mut self) -> Option<Result<u64, SwitchError>> {
+        self.policy.take_outcome().map(|outcome| match outcome {
+            policy::Outcome::Applied(epoch) => Ok(epoch.0),
+            policy::Outcome::Rejected => Err(SwitchError::Rejected),
+        })
+    }
+    #[cfg(test)]
+    fn take_control(&mut self, now: u64) -> io::Result<Option<Message>> {
+        let Some(output) = self.policy.outbound() else {
+            return Ok(None);
+        };
+        self.policy
+            .complete_outbound(Time(now), output.id)
+            .map_err(policy_fault)?;
+        Ok(Some(output.message))
+    }
+}
+
+fn policy_coordinator(coordinator: bool, now: u64) -> io::Result<policy::Coordinator> {
+    policy::Coordinator::new(
+        if coordinator {
+            policy::Authority::Coordinator
+        } else {
+            policy::Authority::Participant
+        },
+        policy::Committed {
+            epoch: policy::Epoch(0),
+            policy: None,
+        },
+        policy::Settings {
+            transaction_micros: DRAIN_TIMEOUT.as_micros() as u64,
+            max_outbound: 32,
+        },
+        Time(now),
+    )
+    .map_err(policy_fault)
+}
+fn direction(config: Config) -> policy::Direction {
+    policy::Direction {
+        records: config.records(),
+        bytes_per_second: config.send_bytes_per_second,
+    }
+}
+fn logical(resolved: Resolved) -> policy::Resolved {
+    policy::Resolved {
+        send: direction(resolved.send),
+        receive: direction(resolved.receive),
+        digest: policy::Digest(resolved.digest),
+    }
+}
+fn policy_fault(error: policy::Fault) -> io::Error {
+    let kind = match error {
+        policy::Fault::Deadline => io::ErrorKind::TimedOut,
+        policy::Fault::Configuration | policy::Fault::NonMonotonicTime => {
+            io::ErrorKind::InvalidInput
+        }
+        policy::Fault::Capacity | policy::Fault::CounterExhausted => io::ErrorKind::Other,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
+}
+fn policy_error(error: policy::Error<io::Error>) -> io::Error {
+    match error {
+        policy::Error::Fault(error) => policy_fault(error),
+        policy::Error::Apply(error) => error,
+    }
+}
+struct PolicyHooks<'a> {
+    resolution: &'a Cell<Option<Resolved>>,
+    config: &'a mut Config,
+    receive: &'a mut Config,
+    records: &'a mut records::Engine,
+    pacer: &'a mut Pacer,
+    next: RecordNumber,
+}
+impl policy::Hooks for PolicyHooks<'_> {
+    type Error = io::Error;
+    fn status(&self) -> policy::Status {
+        policy::Status {
+            send_drained: self.records.send_drained(),
+            receive_deliverable: self.records.deliverable(),
+            receive_drained: self.records.receive_drained(),
+            next_number: self.next,
+        }
+    }
+    fn replace_send(
+        &mut self,
+        now: Time,
+        requested: policy::Direction,
+        feedback_from: RecordNumber,
+    ) -> io::Result<()> {
+        let config = self
+            .resolution
+            .get()
+            .ok_or_else(|| io::Error::other("missing Swift policy resolution"))?
+            .send;
+        if direction(config) != requested {
+            return Err(io::Error::other("Swift policy resolution changed"));
+        }
         config.validate()?;
         self.records
-            .replace_send(config.records(), RecordNumber(feedback_from))
+            .replace_send(config.records(), feedback_from)
             .map_err(protocol)?;
         let largest = config.datagram_cost(config.codec.datagram_bytes + PROTECTION_BYTES);
-        self.pacer = Pacer::new(config.send_bytes_per_second, largest, now);
-        self.config = config;
+        *self.pacer = Pacer::new(config.send_bytes_per_second, largest, now.0);
+        *self.config = config;
         Ok(())
     }
-    fn replace_receivers(&mut self, config: Config, source_from: u64) -> io::Result<()> {
+    fn replace_receive(
+        &mut self,
+        requested: policy::Direction,
+        source_from: RecordNumber,
+    ) -> io::Result<()> {
+        let config = self
+            .resolution
+            .get()
+            .ok_or_else(|| io::Error::other("missing Swift policy resolution"))?
+            .receive;
+        if direction(config) != requested {
+            return Err(io::Error::other("Swift policy resolution changed"));
+        }
         config.validate()?;
         self.records
-            .replace_receive(config.records(), RecordNumber(source_from))
+            .replace_receive(config.records(), source_from)
             .map_err(protocol)?;
-        self.receive = config;
-        Ok(())
-    }
-    /// Advance a change in progress: send this direction's barrier once it
-    /// has drained, replace receiving state once the peer's barrier arrived
-    /// and everything held was delivered, and commit when both are done.
-    fn progress(&mut self, now: u64) -> io::Result<()> {
-        self.check_change_deadline(now)?;
-        let Some(change) = self.change.as_mut() else {
-            return Ok(());
-        };
-        if change.send == SendPhase::Draining && self.records.send_drained() {
-            change.send = SendPhase::Barrier;
-            self.outbox.push_back(Message::Barrier {
-                epoch: change.epoch,
-                first_number: self.seal.next_number().0,
-            });
-        }
-        if let ReceivePhase::Flushing { first_number } = change.receive
-            && !self.records.deliverable()
-        {
-            if !self.records.receive_drained() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "swift barrier before the previous epoch was delivered",
-                ));
-            }
-            change.receive = ReceivePhase::Done;
-            let (epoch, config) = (change.epoch, change.resolved.receive);
-            self.replace_receivers(config, first_number)?;
-            self.outbox.push_back(Message::BarrierAck {
-                epoch,
-                feedback_from: self.seal.next_number().0,
-            });
-        }
-        if let Some(change) = &self.change
-            && change.send == SendPhase::Done
-            && change.receive == ReceivePhase::Done
-            && self.outbox.is_empty()
-        {
-            self.snapshot.policy_epoch = change.epoch;
-            self.snapshot.policy = Some(change.policy);
-            if self.coordinator {
-                self.outcome = Some(Ok(change.epoch));
-            }
-            self.change = None;
-        }
+        *self.receive = config;
         Ok(())
     }
 }
@@ -753,7 +737,7 @@ where
 {
     let start = Instant::now();
     let mut engine = Engine::new(config, &keys, 0)?;
-    engine.coordinator = switching.coordinator;
+    engine.set_coordinator(switching.coordinator, 0)?;
     let Switching {
         mut requests,
         resolve,
@@ -772,13 +756,13 @@ where
         loop {
         let now = micros(start);
         engine.progress(now)?;
-        while let Some(message) = engine.outbox.pop_front() {
+        while let Some(output) = engine.policy.outbound() {
             frame.clear();
-            message.encode(&mut frame);
+            output.message.encode(&mut frame);
             let write_started = micros(start);
             engine.check_change_deadline(write_started)?;
-            let write_limit = engine.change.as_ref().map_or(CONTROL_WRITE, |change| {
-                CONTROL_WRITE.min(Duration::from_micros(change.deadline - write_started))
+            let write_limit = engine.policy.deadline().map_or(CONTROL_WRITE, |deadline| {
+                CONTROL_WRITE.min(Duration::from_micros(deadline.0 - write_started))
             });
             tokio::time::timeout(write_limit, async {
                 writer.write_all(&frame).await?;
@@ -788,13 +772,14 @@ where
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "swift control write stalled")
             })??;
+            engine.policy.complete_outbound(Time(micros(start)), output.id).map_err(policy_fault)?;
         }
         // A terminal BarrierAck may have been queued by the first progress
         // turn. Commit only after that write actually completed and a fresh
         // time sample still satisfies the original transaction deadline.
         let now = micros(start);
         engine.progress(now)?;
-        if let Some(outcome) = engine.outcome.take()
+        if let Some(outcome) = engine.take_outcome()
             && let Some(reply) = waiting.take()
         {
             // The requester may have stopped waiting; the change stands.
@@ -830,7 +815,7 @@ where
         } else {
             // `wake` includes the original policy-change deadline, even
             // when no datagram or control message arrives.
-            let idle = if engine.change.is_some() {
+            let idle = if engine.policy.pending().is_some() {
                 Duration::from_millis(100)
             } else {
                 Duration::from_secs(3600)
@@ -839,8 +824,8 @@ where
                 Duration::from_micros(at.saturating_sub(now).max(200)).min(idle)
             })
         };
-        let wait = engine.change.as_ref().map_or(wait, |change| {
-            wait.min(Duration::from_micros(change.deadline - now))
+        let wait = engine.policy.deadline().map_or(wait, |deadline| {
+            wait.min(Duration::from_micros(deadline.0 - now))
         });
         tokio::select! {
             biased;
@@ -913,6 +898,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codec::control::Refusal;
+    use policy::{ReceivePhase, SendPhase};
+    use std::collections::VecDeque;
 
     fn tagged(kind: u8, channel: usize) -> u8 {
         kind | ((channel as u8) << 2)
@@ -1256,10 +1244,10 @@ mod tests {
         let (client, server) = (resolver(true), resolver(false));
         left.progress(*now)?;
         right.progress(*now)?;
-        while let Some(message) = left.outbox.pop_front() {
+        while let Some(message) = left.take_control(*now)? {
             right.on_control(*now, message, &*server)?;
         }
-        while let Some(message) = right.outbox.pop_front() {
+        while let Some(message) = right.take_control(*now)? {
             left.on_control(*now, message, &*client)?;
         }
         let mut delivered = (Vec::new(), Vec::new());
@@ -1295,7 +1283,7 @@ mod tests {
     #[test]
     fn policy_change_drains_each_direction_then_switches_without_losing_order() -> io::Result<()> {
         let (mut left, mut right) = pair(2_500_000, 4)?;
-        left.coordinator = true;
+        left.set_coordinator(true, 0)?;
         let policy = test_policy(2, 200, 1400, 16_000);
         let (mut now, mut sent) = (0, 0);
         let (mut offered, mut got) = ((0u32, 0u32), (Vec::new(), Vec::new()));
@@ -1327,7 +1315,7 @@ mod tests {
             let delivered = step(&mut left, &mut right, &mut now, 7, &mut sent)?;
             got.0.extend(delivered.0);
             got.1.extend(delivered.1);
-            if let Some(change) = &left.change
+            if let Some(change) = left.policy.pending()
                 && change.send != SendPhase::Proposed
                 && change.send != SendPhase::Done
             {
@@ -1337,8 +1325,8 @@ mod tests {
             }
         }
         assert!(paused, "the sending direction never paused");
-        assert_eq!(left.outcome, Some(Ok(1)));
-        assert!(left.change.is_none() && right.change.is_none());
+        assert_eq!(left.take_outcome(), Some(Ok(1)));
+        assert!(left.policy.pending().is_none() && right.policy.pending().is_none());
         for engine in [&left, &right] {
             let snapshot = engine.snapshot(now);
             assert_eq!(snapshot.policy_epoch, 1);
@@ -1384,7 +1372,7 @@ mod tests {
         let server = resolver(false);
         let fresh = || -> io::Result<(Engine, Engine)> {
             let (mut left, right) = pair(2_500_000, 4)?;
-            left.coordinator = true;
+            left.set_coordinator(true, 0)?;
             Ok((left, right))
         };
         // Only the coordinator proposes, and only valid policies.
@@ -1398,19 +1386,18 @@ mod tests {
             left.request(0, invalid, client(&invalid)),
             Err(SwitchError::Invalid)
         );
-        assert!(left.outbox.is_empty() && left.change.is_none());
+        assert!(left.policy.outbound().is_none() && left.policy.pending().is_none());
         // The peer refuses what it cannot derive; nothing changes and
         // forwarding continues.
         assert_eq!(left.request(0, policy, client(&policy)), Ok(()));
         let propose = left
-            .outbox
-            .pop_front()
+            .take_control(0)?
             .ok_or_else(|| io::Error::other("no proposal"))?;
         let refuse =
             |_: &Policy| -> io::Result<Resolved> { Err(io::ErrorKind::Unsupported.into()) };
         right.on_control(0, propose, &refuse)?;
         assert_eq!(
-            right.outbox.pop_front(),
+            right.take_control(0)?,
             Some(Message::Reject {
                 epoch: 1,
                 reason: Refusal::Invalid
@@ -1424,23 +1411,25 @@ mod tests {
             },
             &*client,
         )?;
-        assert_eq!(left.outcome.take(), Some(Err(SwitchError::Rejected)));
-        assert!(left.change.is_none() && right.change.is_none() && left.has_room());
+        assert_eq!(left.take_outcome(), Some(Err(SwitchError::Rejected)));
+        assert!(
+            left.policy.pending().is_none() && right.policy.pending().is_none() && left.has_room()
+        );
         // A wrong epoch is refused; a repeated proposal gets the same answer;
         // a different one while busy is refused.
         right.on_control(0, Message::Propose { epoch: 5, policy }, &*server)?;
         assert_eq!(
-            right.outbox.pop_front(),
+            right.take_control(0)?,
             Some(Message::Reject {
                 epoch: 5,
                 reason: Refusal::Epoch
             })
         );
         right.on_control(0, propose, &*server)?;
-        let accept = right.outbox.pop_front();
+        let accept = right.take_control(0)?;
         assert!(matches!(accept, Some(Message::Accept { epoch: 1, .. })));
         right.on_control(0, propose, &*server)?;
-        assert_eq!(right.outbox.pop_front(), accept);
+        assert_eq!(right.take_control(0)?, accept);
         let other = test_policy(3, 0, 1400, 16_000);
         right.on_control(
             0,
@@ -1451,7 +1440,7 @@ mod tests {
             &*server,
         )?;
         assert_eq!(
-            right.outbox.pop_front(),
+            right.take_control(0)?,
             Some(Message::Reject {
                 epoch: 1,
                 reason: Refusal::Busy
@@ -1519,8 +1508,9 @@ mod tests {
         left.on_control(1_000, Message::Accept { epoch: 1, digest }, &*client)?;
         left.progress(2_000)?;
         assert!(
-            left.outbox
-                .iter()
+            left.policy
+                .outstanding()
+                .map(|output| output.message)
                 .all(|message| !matches!(message, Message::Barrier { .. }))
         );
         let deadline = 1_000 + DRAIN_TIMEOUT.as_micros() as u64;
@@ -1563,7 +1553,7 @@ mod tests {
     fn policy_change_silent_proposal_preserves_old_data_until_original_deadline() -> io::Result<()>
     {
         let (mut left, mut right) = pair(2_500_000, 4)?;
-        left.coordinator = true;
+        left.set_coordinator(true, 0)?;
         let original = left.config;
         let policy = test_policy(2, 0, 1400, 16_000);
         let client = resolver(true);
@@ -1581,7 +1571,7 @@ mod tests {
         left.progress(deadline - 1)?;
         assert_eq!(left.config, original);
         assert_eq!(
-            left.change.as_ref().map(|change| change.send),
+            left.policy.pending().map(|change| change.send),
             Some(SendPhase::Proposed)
         );
         assert_eq!(
@@ -1596,8 +1586,49 @@ mod tests {
             Some(io::ErrorKind::TimedOut)
         );
         assert_eq!(left.snapshot.policy_epoch, 0);
-        assert!(left.snapshot.policy.is_none() && left.outcome.is_none());
+        assert!(left.snapshot.policy.is_none() && left.take_outcome().is_none());
         assert_eq!(left.config, original);
+        Ok(())
+    }
+
+    /// The pure coordinator carries logical records/rates, while the adapter
+    /// must apply every exact field supplied by the existing public resolver.
+    #[test]
+    fn policy_adapter_preserves_exact_custom_runtime_resolution() -> io::Result<()> {
+        let custom = |client: bool| -> Resolver {
+            let base = resolver(client);
+            Box::new(move |policy| {
+                let mut resolved = base(policy)?;
+                resolved.send.network_overhead = if client { 80 } else { 96 };
+                resolved.receive.network_overhead = if client { 96 } else { 80 };
+                resolved.send.report_interval = Some(Duration::from_millis(300));
+                resolved.receive.report_interval = Some(Duration::from_millis(700));
+                Ok(resolved)
+            })
+        };
+        let (client, server) = (custom(true), custom(false));
+        let (mut left, mut right) = pair(2_500_000, 4)?;
+        left.set_coordinator(true, 0)?;
+        let requested = test_policy(2, 100, 1400, 16_000);
+        let expected_left = client(&requested)?;
+        let expected_right = server(&requested)?;
+        assert_eq!(left.request(0, requested, Ok(expected_left)), Ok(()));
+        for now in 1..16 {
+            left.progress(now)?;
+            right.progress(now)?;
+            while let Some(message) = left.take_control(now)? {
+                right.on_control(now, message, &*server)?;
+            }
+            while let Some(message) = right.take_control(now)? {
+                left.on_control(now, message, &*client)?;
+            }
+        }
+        assert_eq!(left.config, expected_left.send);
+        assert_eq!(left.receive, expected_left.receive);
+        assert_eq!(right.config, expected_right.send);
+        assert_eq!(right.receive, expected_right.receive);
+        assert_eq!(left.take_outcome(), Some(Ok(1)));
+        assert!(left.resolution.get().is_none() && right.resolution.get().is_none());
         Ok(())
     }
 
@@ -1606,7 +1637,7 @@ mod tests {
     #[test]
     fn policy_change_silent_barrier_expires_at_original_proposal_deadline() -> io::Result<()> {
         let (mut left, _) = pair(2_500_000, 4)?;
-        left.coordinator = true;
+        left.set_coordinator(true, 0)?;
         let original = left.config;
         let policy = test_policy(2, 0, 1400, 16_000);
         let client = resolver(true);
@@ -1617,12 +1648,13 @@ mod tests {
         left.on_control(deadline - 2, Message::Accept { epoch: 1, digest }, &*client)?;
         left.progress(deadline - 1)?;
         assert_eq!(
-            left.change.as_ref().map(|change| change.send),
+            left.policy.pending().map(|change| change.send),
             Some(SendPhase::Barrier)
         );
         assert!(
-            left.outbox
-                .iter()
+            left.policy
+                .outstanding()
+                .map(|output| output.message)
                 .any(|message| matches!(message, Message::Barrier { epoch: 1, .. }))
         );
         assert_eq!(left.wake(deadline - 1), Some(deadline));
@@ -1646,7 +1678,7 @@ mod tests {
         );
         assert_eq!(left.config, original);
         assert_eq!(left.snapshot.policy_epoch, 0);
-        assert!(left.snapshot.policy.is_none() && left.outcome.is_none());
+        assert!(left.snapshot.policy.is_none() && left.take_outcome().is_none());
         Ok(())
     }
 
@@ -1669,7 +1701,7 @@ mod tests {
         let proposal = Message::Propose { epoch: 1, policy };
         let deadline = 1_000 + DRAIN_TIMEOUT.as_micros() as u64;
         right.on_control(1_000, proposal, &*server)?;
-        let accepted = right.outbox.pop_front();
+        let accepted = right.take_control(1_000)?;
         right.on_control(
             1_000,
             Message::Barrier {
@@ -1680,14 +1712,14 @@ mod tests {
         )?;
         right.progress(deadline - 1)?;
         assert!(matches!(
-            right.change.as_ref().map(|change| change.receive),
+            right.policy.pending().map(|change| change.receive),
             Some(ReceivePhase::Flushing { .. })
         ));
-        right.outbox.clear();
+        while right.take_control(deadline - 1)?.is_some() {}
         right.on_control(deadline - 1, proposal, &*server)?;
-        assert_eq!(right.outbox.pop_front(), accepted);
+        assert_eq!(right.take_control(deadline - 1)?, accepted);
         assert_eq!(
-            right.change.as_ref().map(|change| change.deadline),
+            right.policy.deadline().map(|deadline| deadline.0),
             Some(deadline)
         );
         assert_eq!(
@@ -1696,7 +1728,7 @@ mod tests {
         );
         assert_eq!(right.receive, original);
         assert_eq!(right.snapshot.policy_epoch, 0);
-        assert!(right.snapshot.policy.is_none() && right.outcome.is_none());
+        assert!(right.snapshot.policy.is_none() && right.take_outcome().is_none());
         assert_eq!(right.pop()?, Some(packet.as_slice()));
         Ok(())
     }

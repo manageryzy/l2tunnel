@@ -95,10 +95,19 @@ pub struct Server {
 pub(super) enum Endpoint {
     Client(Client),
     Server(Server),
+    #[cfg(unix)]
+    SecureClient(crate::secure_udp::credentials::Client),
+    #[cfg(unix)]
+    SecureServer(Box<SecureServer>),
+}
+#[cfg(unix)]
+pub(super) struct SecureServer {
+    pub credentials: crate::secure_udp::credentials::Server,
+    pub admission: tokio::sync::Mutex<Option<crate::secure_udp::Server>>,
 }
 /// Selected setup backend. Each variant names one existing authenticated factory;
 /// this is not a carrier preference list and never falls back to another variant.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum Transport {
     Managed(Options),
     UdpFrame {
@@ -107,6 +116,8 @@ pub(super) enum Transport {
     },
     #[cfg(unix)]
     Swift(crate::swift::Settings),
+    #[cfg(unix)]
+    SecureUdpSwift(Arc<crate::secure_udp::profile::Profile>),
 }
 /// Longest time a swift acceptor keeps its listener open for a peer. Each
 /// accepted TCP connection is still bound by the original handshake timeout.
@@ -126,6 +137,41 @@ pub struct Prepared {
     pub(super) data: Arc<Data>,
 }
 impl Prepared {
+    /// Explicit same-socket Noise/member/Swift client, with deferred device work.
+    #[cfg(unix)]
+    pub fn secure_udp_client(
+        profile: crate::secure_udp::profile::Profile,
+        credentials: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureClient(credentials),
+            attachment,
+            Transport::SecureUdpSwift(Arc::new(profile)),
+        )
+    }
+    /// Fixed-peer acceptor retaining one admission quarantine across attempts.
+    #[cfg(unix)]
+    pub fn secure_udp_server(
+        profile: crate::secure_udp::profile::Profile,
+        credentials: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureServer(Box::new(SecureServer {
+                credentials,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::SecureUdpSwift(Arc::new(profile)),
+        )
+    }
+    #[cfg(unix)]
+    pub(super) fn secure_udp(&self) -> bool {
+        matches!(&self.data.transport, Transport::SecureUdpSwift(_))
+    }
     /// Pure validation; credentials are already parsed and no provider is invoked.
     pub fn client(
         connection: ConnectionConfig,
@@ -253,7 +299,7 @@ impl Prepared {
         attachment: Attachment,
         transport: Transport,
     ) -> io::Result<Self> {
-        let profile_interval = match transport {
+        let profile_interval = match &transport {
             Transport::Managed(options) => {
                 match options.delivery {
                     Some(delivery) => {
@@ -267,11 +313,11 @@ impl Prepared {
             }
             Transport::UdpFrame { settings, delivery } => {
                 // Same exact checks the authenticated factory repeats before I/O.
-                let profile = crate::udp::runtime_config(connection, settings)?;
+                let profile = crate::udp::runtime_config(connection, *settings)?;
                 l2tunnel_runtime::udp::base_session_config(
                     connection.runtime(),
                     profile,
-                    delivery,
+                    *delivery,
                 )?;
                 None
             }
@@ -284,6 +330,39 @@ impl Prepared {
                         "swift requires a readiness-capable attachment",
                     ));
                 }
+                None
+            }
+            #[cfg(unix)]
+            Transport::SecureUdpSwift(profile) => {
+                let session = profile.settings();
+                let (noise, role) = match &endpoint {
+                    Endpoint::SecureClient(credentials) => {
+                        if credentials.member_key() != session.member {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "configured member differs from actual credential",
+                            ));
+                        }
+                        (credentials.noise(), l2tunnel_security::Role::Initiator)
+                    }
+                    Endpoint::SecureServer(server) => (
+                        server.credentials.noise(),
+                        l2tunnel_security::Role::Responder,
+                    ),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "secure UDP requires distinct Noise credentials",
+                        ));
+                    }
+                };
+                if noise.profile() != session.profile || !attachment.readable_kind() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "secure UDP profile/credentials or readable attachment differ",
+                    ));
+                }
+                profile.configuration(noise.peers(role))?;
                 None
             }
         };

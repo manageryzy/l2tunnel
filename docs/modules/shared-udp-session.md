@@ -69,6 +69,7 @@ JoiningTail::receive(&mut self, cover::Decoded<'_>, Instant) -> io::Result<bool>
 JoiningTail::poll(&mut self, Instant, cover::PacketMeta, &mut [u8])
     -> io::Result<Option<usize>>
 JoiningTail::deadline(&self) -> Option<Instant>
+JoiningTail::max_packet_bytes(&self) -> usize
 ```
 
 `Info` exposes only member identity, public session/transcript and exact Noise
@@ -94,6 +95,15 @@ After server root release, its tail remembers only the previously authenticated
 proof ciphertext and cached encrypted acceptance. An exact duplicate may schedule
 the same acceptance at the configured bounded retry interval; other joining
 input receives no reply. No secret Joining owner is needed after that handoff.
+The tail reports its exact complete covered acceptance size, excluding IP/UDP,
+for output storage and shared-wire preflight. This requirement is independent
+of a larger admitted cover-storage ceiling; reserving the entire ceiling for a
+small cached acceptance would unnecessarily stall valid control service.
+The [new runtime/service aggregate](../../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
+also executes the exact tail-size/output-preflight and expired-empty-buffer
+regressions for both covers; the larger admitted storage ceiling does not block
+a small retained acceptance.
+
 The client releases its root only after authenticating the acceptance and checking
 its own member identity. All cache sends consume the unchanged operation deadline
 and finite attempt allowance. No cache retry resets the appearance counter or

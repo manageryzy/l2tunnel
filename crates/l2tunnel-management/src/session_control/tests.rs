@@ -312,3 +312,82 @@ const PING_HEX: &str = "4c32534301040100000000580000000b111111111111111111111111
 const FEEDBACK_HEX: &str = "4c325343010201000000005b0000000b111111111111111111111111111111110000000000000001000000000000000722222222222222222222222222222222222222222222222222222222222222220000000c00030000aabbcc";
 
 const NATIVE_HEX: &str = "4c32534301030100000000600000000b111111111111111111111111111111110000000000000001000000000000000722222222222222222222222222222222222222222222222222222222222222220000000c020000030000000000000009";
+
+#[test]
+fn profile_control_has_exact_additive_wire_and_borrowed_payload() -> R {
+    // Existing Swift Reject(epoch=1, Invalid), including its length prefix.
+    let command = [0, 10, 3, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+    let frame = Envelope {
+        binding: binding(1, 7),
+        body: Body::ProfileControl {
+            tag: ProfileTag::SwiftPolicyV1,
+            bytes: &command,
+        },
+    };
+    let packet = encoded(frame)?;
+    let golden = concat!(
+        "4c32534301060100000000600000000b",
+        "11111111111111111111111111111111",
+        "00000000000000010000000000000007",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "00010000000a03000000000000000101"
+    );
+    assert_eq!(packet, from_hex(golden)?);
+    let decoded = Envelope::decode(&packet, limits())?;
+    assert_eq!(decoded, frame);
+    let Body::ProfileControl { bytes, .. } = decoded.body else {
+        return Err("wrong decoded profile body".into());
+    };
+    assert_eq!(bytes.as_ptr(), packet[HEADER_BYTES + 4..].as_ptr());
+    let mut output = [0xa5; 128];
+    let written = frame.encode(&mut output, limits())?;
+    assert_eq!(&output[..written], packet);
+    assert!(output[written..].iter().all(|byte| *byte == 0xa5));
+    Ok(())
+}
+
+#[test]
+fn profile_control_refusals_preserve_output_and_admission_replay() -> R {
+    let command = [0, 10, 3, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+    let frame = Envelope {
+        binding: binding(1, 7),
+        body: Body::ProfileControl {
+            tag: ProfileTag::SwiftPolicyV1,
+            bytes: &command,
+        },
+    };
+    let packet = encoded(frame)?;
+    let mut admission = gate()?;
+    for end in 0..packet.len() {
+        assert!(Envelope::decode(&packet[..end], limits()).is_err());
+    }
+    for (at, byte) in [(80, 1), (81, 2), (82, 1), (83, 1), (5, 7)] {
+        let mut bad = packet.clone();
+        bad[at] = byte;
+        assert!(admission.admit(ingress(11), &bad).is_err());
+        assert_eq!(admission.highest_packet(), None);
+    }
+    for bytes in [Vec::new(), vec![0x42; MAX_PROFILE_CONTROL_BYTES + 1]] {
+        let bad = Envelope {
+            body: Body::ProfileControl {
+                tag: ProfileTag::SwiftPolicyV1,
+                bytes: &bytes,
+            },
+            ..frame
+        };
+        let mut output = [0xa5; 256];
+        assert_eq!(bad.encode(&mut output, limits()), Err(Error::Length));
+        assert_eq!(output, [0xa5; 256]);
+    }
+    let mut short = vec![0xa5; packet.len() - 1];
+    assert_eq!(frame.encode(&mut short, limits()), Err(Error::Output));
+    assert!(short.iter().all(|byte| *byte == 0xa5));
+    assert!(admission.admit(Ingress::UserTraffic, &packet).is_err());
+    assert_eq!(admission.highest_packet(), None);
+    let accepted = admission.admit(ingress(11), &packet)?;
+    assert_eq!(accepted.envelope.body, frame.body);
+    assert_eq!(admission.highest_packet(), Some(PacketNumber(1)));
+    assert!(admission.admit(ingress(11), &packet).is_err());
+    assert_eq!(admission.highest_packet(), Some(PacketNumber(1)));
+    Ok(())
+}

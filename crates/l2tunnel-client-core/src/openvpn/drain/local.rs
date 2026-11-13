@@ -45,6 +45,8 @@ pub(super) fn action(
                 rolling: None,
                 #[cfg(unix)]
                 swift: None,
+                #[cfg(unix)]
+                secure_udp: None,
                 active: None,
                 proxy: None,
                 openvpn_drain: Some(state),

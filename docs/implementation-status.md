@@ -11,9 +11,10 @@ percentage. All 47 complete Python mode gates remain open.
 
 The target separates pure data algorithms, a [common inner secure session](modules/secure-session.md),
 and the explicitly selected appearance carrier. The common fixed-peer security
-model is WireGuard-like, with AEAD data on every carrier including HTTPS;
-the library, common wire contract and runtime integration are not yet selected
-or implemented. The selected carrier must retain the same socket and five-tuple
+model is WireGuard-like, with AEAD data on every carrier including HTTPS.
+Maintained Noise, common protection, numbered Swift records and selected UDP
+runtime/service components now have finite implementation evidence; the complete
+cross-carrier contract and lifecycle remain unfinished. The selected carrier must retain the same socket and five-tuple
 through its handshake, user data and authenticated management. Swift is a data
 packing/recovery algorithm, not an independent connection mode or implicit default.
 Bounded automatic recovery is required by default in the target design.
@@ -22,14 +23,38 @@ of the 47 Python mode gates. Retaining Swift's AEAD on every carrier does not
 delete independently selected authenticated-cleartext requirements of other
 profiles; their common protection contract remains an explicit design gate.
 
-The current explicit [Swift composition](modules/swift.md) still authenticates
+The historical explicit [Swift composition](modules/swift.md) authenticates
 over TCP/TLS and sends data over a separate UDP socket. It reuses TLS/member
-authentication, exporter secrets and the shared lifecycle service, but defines
-its own AEAD datagram/replay/key-chain envelope and Swift-specific TLS policy
-control. Data is always ChaCha20-Poly1305, with a 4096-packet replay window and
+authentication, exporter secrets and the shared lifecycle service, preserving
+its v2 AEAD/replay/key-chain wire through the common security library's explicit
+compatibility owners. Its TLS policy wire remains profile-specific, while the
+policy coordinator is now shared with the common UDP adapter. Data is always
+ChaCha20-Poly1305, with a 4096-packet replay window and
 automatic per-direction HKDF key generations every 2^28 datagrams. The pure
-engine has no socket, real clock, key or device dependency. Convergence on the
-common secure session and selected carrier remains planned under SW-14..SW-16.
+engine has no socket, real clock, key or device dependency. The retained
+compatibility path and all saved receipts remain available.
+
+The new explicit `quic-like` and `media-like` carriers select Swift separately
+as a record profile. They share the original UDP socket through admission,
+Noise, existing Ed25519 member proof, common ChaCha20-Poly1305 User/Control records,
+full Swift packing/recovery and fixed authenticated control. CLI construction
+uses the same immutable profile, deferred attachment, service owner and version2
+local API as an embedding frontend. It does not supply dummy TLS credentials or
+implicitly choose a carrier.
+
+The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
+passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API
+tests, strict Clippy and rustdoc. Actual paired UDP/service fixtures exercise
+native Unix datagram packet devices, both appearances, IPv4/native bytes,
+authenticated policy changes, requested/effective status, negative trust,
+cancellation, late readiness and manual fresh-session reconnect. Driver fixtures
+also cover independent Tokio runtimes, exact FIFO recovery after a measured
+OS `WouldBlock`, permanent native stalls, replay/tamper, immutable challenge
+deadlines and key generations. They do not qualify actual Linux TAP/TUN throughput,
+full default retained-state recovery, fresh-DH rekey, generic management,
+OpenVPN/HTTPS migration or full SW-11. The
+[runtime](modules/secure-udp-runtime.md), [service](modules/secure-udp-service.md)
+and [native lab](modules/secure-udp-native.md) ledgers preserve those boundaries.
 
 Historical `tools/selftest.py` runs (Linux TAP, unprivileged
 namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
@@ -63,14 +88,28 @@ does not narrow SW-11 or close any Python mode gate.
 
 ## Verification evidence
 
-The [latest saved aggregate check](../work/udp-framing-wording-20261113-final/validation.json)
+The [new runtime/service aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
+passed 1487 Rust cases including doctests, 271 Python tooling cases and 1658 simulator
+cases, with unchanged source maps, formatting, strict Clippy, rustdoc and CLI
+checks. It also executes the new-profile attachment rejection and26 native-tooling
+tests. Native labs, remote CI and platform qualification remain separate.
+
+The prior committed factory checkpoint, `e689674`, has a
+[source-stable aggregate receipt](../work/shared-session-client-20261113/validation.json):
+1437 Rust cases including doctests, 245 Python tooling cases and 1658 simulator
+cases passed. Its [evidence reconciliation](../work/shared-session-client-20261113/postcheck-ledger-validation.json)
+verified the final documentation and unchanged non-document inputs. The newer
+runtime/service focused receipt above applies only to its recorded compiled
+graph; the complete new aggregate above validates its later recorded inputs.
+Actual native measurements remain separate.
+
+The historical [UDP wording aggregate check](../work/udp-framing-wording-20261113-final/validation.json)
 failed strict Clippy in a Swift runtime test (`manual_is_multiple_of`). Its
 [focused follow-up](../work/udp-framing-wording-20261113-final/focused-validation.json)
 records 467 passing Rust test executions including doctests and passing rustdoc,
-but retains a failed required aggregate check. This documentation review does
-not rerun those checks or change that result. Saved source maps apply to their
-recorded inputs; these edits do not turn the current working tree into a full
-passing checkpoint.
+but retains a failed required aggregate check. This review does not change that
+failed result. Saved source maps apply to their recorded inputs; later passing
+checkpoints do not rewrite historical failures.
 
 The earlier [source30 aggregate check](../work/implementation-wave30/validation.json)
 passed on code commit `10d4a0b`, including decoder commit `1c98510`:

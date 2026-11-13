@@ -815,3 +815,104 @@ fn protected_user_and_control_use_the_same_two_real_udp_sockets() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn explicit_directional_scopes_share_user_numbers_replay_and_generations() -> Result<()> {
+    for appearance in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for protection in [
+            security::Protection::ChaCha20Poly1305,
+            security::Protection::HmacSha256,
+        ] {
+            let (mut left, mut right) = peers(appearance, protection)?;
+            let next = scope(11, 0xe1);
+            left.stage_data(next)?;
+            right.stage_data(next)?;
+            let mut old_packet = None;
+            let mut new_packet = None;
+            for index in 0..20_u64 {
+                // Old-policy sources coexist with new receiver-policy feedback.
+                let selected = if index % 2 == 0 { data() } else { next };
+                let body = [index as u8, 0x81, 0xff, 0, 0];
+                let capacity = left.capacity(body.len())?;
+                let mut workspace = vec![0; capacity.seal_workspace_bytes];
+                let mut packet = vec![0; capacity.packet_bytes];
+                let sealed = left.seal_user_in(
+                    selected,
+                    outer(index as u32),
+                    &body,
+                    &mut workspace,
+                    &mut packet,
+                )?;
+                assert_eq!(sealed.number.0, index);
+                assert_eq!(sealed.generation.0, index / 8);
+                if index == 0 {
+                    old_packet = Some(packet.clone());
+                }
+                if index == 1 {
+                    new_packet = Some(packet.clone());
+                }
+                let (opened, actual) = open(&mut right, &packet)?;
+                assert_eq!(opened.scope, selected);
+                assert_eq!(opened.number, sealed.number);
+                assert_eq!(opened.generation, sealed.generation);
+                assert_eq!(actual, body);
+                if index == 7 {
+                    left.activate_data(next)?;
+                    right.activate_data(next)?;
+                    let (_, management) = seal(&mut left, Class::Control, b"fixed control\0")?;
+                    assert_eq!(open(&mut right, &management)?.0.scope, control());
+                    for replay in [&old_packet, &new_packet] {
+                        let replay = replay.as_ref().ok_or("missing replay fixture")?;
+                        assert!(open(&mut right, replay).is_err());
+                    }
+                }
+            }
+            assert_eq!(left.next_number(Class::User).0, 20);
+            left.retire_data(data())?;
+            right.retire_data(data())?;
+            let mut workspace = [0xa5; 64];
+            let mut packet = [0xa5; 128];
+            assert_eq!(
+                left.seal_user_in(data(), outer(22), b"old", &mut workspace, &mut packet),
+                Err(Error::Scope)
+            );
+            assert_eq!(left.next_number(Class::User).0, 20);
+            assert_eq!(workspace, [0xa5; 64]);
+            assert_eq!(packet, [0xa5; 128]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_scope_preflight_cannot_substitute_digest_or_burn_a_number() -> Result<()> {
+    let (mut left, _) = peers(
+        cover::Appearance::MediaLike,
+        security::Protection::ChaCha20Poly1305,
+    )?;
+    let staged = scope(11, 0xe1);
+    left.stage_data(staged)?;
+    let mut workspace = [0xa5; 128];
+    let mut packet = [0xa5; 256];
+    for rejected in [scope(11, 0xe2), scope(12, 0xe1), scope(1, 0xc0)] {
+        assert_eq!(
+            left.seal_user_in(rejected, outer(1), b"x", &mut workspace, &mut packet),
+            Err(Error::Scope)
+        );
+        assert_eq!(left.next_number(Class::User).0, 0);
+        assert_eq!(workspace, [0xa5; 128]);
+        assert_eq!(packet, [0xa5; 256]);
+    }
+    assert_eq!(
+        left.seal_user_in(staged, outer(1), b"x", &mut [], &mut packet),
+        Err(Error::OutputTooSmall)
+    );
+    assert_eq!(left.next_number(Class::User).0, 0);
+    left.cancel_staged_data(staged)?;
+    assert_eq!(
+        left.seal_user_in(staged, outer(1), b"x", &mut workspace, &mut packet),
+        Err(Error::Scope)
+    );
+    assert_eq!(left.next_number(Class::User).0, 0);
+    Ok(())
+}

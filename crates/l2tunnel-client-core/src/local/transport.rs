@@ -94,7 +94,7 @@ impl Server {
             )
             .await
             {
-                Ok(Ok(request)) if request.version == VERSION => request,
+                Ok(Ok(request)) if supported_version(request.version) => request,
                 _ => continue,
             };
             let response = handler(request).await;
@@ -121,7 +121,7 @@ impl Drop for Server {
 /// Submit a local operation. A timeout has unknown remote outcome; query status
 /// before retrying a mode change, because an accepted transaction is not rolled back.
 pub async fn request(path: impl AsRef<Path>, request: &Request) -> io::Result<Response> {
-    if request.version != VERSION {
+    if !supported_version(request.version) {
         return Err(invalid("unsupported local API version"));
     }
     tokio::time::timeout(Duration::from_secs(65), async {
@@ -134,7 +134,7 @@ pub async fn request(path: impl AsRef<Path>, request: &Request) -> io::Result<Re
         }
         write_json(&mut stream, request, REQUEST_LIMIT).await?;
         let response: Response = read_json(&mut stream, RESPONSE_LIMIT).await?;
-        if response.version != VERSION {
+        if response.version != request.version {
             return Err(invalid("unsupported local API response version"));
         }
         Ok(response)

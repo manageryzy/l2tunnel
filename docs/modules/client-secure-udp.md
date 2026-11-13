@@ -5,6 +5,9 @@ integration composes the real establishment and member-admission runtimes.
 The existing CLI and service data drivers are not changed into this profile by
 an enum, constructor or compile. Native forwarding, automatic retained-state
 recovery and complete mode switching remain required under the parent ledgers.
+The subsequent [real service integration](secure-udp-service.md) consumes these
+factories and passed its [required local aggregate](../../work/secure-udp-runtime-service-20261113/attempt-1/validation.json).
+Actual CLI/TAP performance and complete lifecycle qualification remain separate.
 
 ## Frozen implementation-draft API
 
@@ -53,8 +56,14 @@ views are validated before network work.
 IP/UDP plus the one-byte bootstrap tag and handshake-phase cover. The supplied
 gate must already select that cost and compatible ARQ/MTU bounds. The factory
 rejects an incompatible legacy default instead of silently shrinking its source
-geometry. Complete covered packet limits count UDP payload bytes, so only the
-actual IP/UDP headers are added when comparing that limit with the path MTU.
+geometry. Complete covered packet limits count UDP payload bytes and are bounded
+storage/admitted ceilings. The bootstrap path MTU check uses the largest actual
+gate/ARQ packet plus its selected handshake cover and actual IP/UDP headers;
+it does not equate that path MTU with the entire provisioned capacity ceiling.
+The selected active data MTU is checked by the transport composition separately.
+This distinction permits negotiated upward data-MTU changes within the admitted
+cover/security ceilings without changing the initial bootstrap MTU or silently
+claiming the path supports the full capacity ceiling.
 
 The versioned configuration digest binds the caller's complete data-application
 digest, existing complete gate profile digest, cover digest, Noise profile,

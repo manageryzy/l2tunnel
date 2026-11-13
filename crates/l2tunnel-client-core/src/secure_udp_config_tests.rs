@@ -176,3 +176,28 @@ fn invalid_limits_and_legacy_overhead_fail_before_socket_work() -> io::Result<()
     assert_eq!(media.bootstrap_overhead(true)?, 63);
     Ok(())
 }
+
+#[test]
+fn admitted_capacity_is_distinct_from_actual_bootstrap_path_mtu() -> io::Result<()> {
+    let (mut selected, peers) = settings()?;
+    selected.cover.max_packet_bytes = 8972;
+    selected.cover.max_protected_bytes = 8942;
+    assert!(selected.configuration(peers).is_ok());
+    for appearance in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        selected.cover.appearance = appearance;
+        selected.gate.outer_overhead = selected.cover.bootstrap_overhead(false)?;
+        // Valid bootstrap control records exceed QUIC's one-byte length threshold.
+        let header = selected.cover.bootstrap_overhead(false)? - 28 - 1;
+        let source = selected.gate.path_mtu
+            - 28
+            - header
+            - 1
+            - gate::CONTROL_OVERHEAD
+            - l2tunnel_recovery::DATA_HEADER_BYTES;
+        selected.gate.arq.max_source_bytes = source;
+        assert!(selected.configuration(peers).is_ok());
+        selected.gate.arq.max_source_bytes = source + 1;
+        assert!(selected.configuration(peers).is_err());
+    }
+    Ok(())
+}

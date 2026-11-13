@@ -310,6 +310,14 @@ pub fn inspect_packet(
 }
 
 impl SelectiveRepeat {
+    /// Whether an allocated source was removed by a validated peer receipt.
+    /// Unallocated and retained sources return false; polling is not receipt.
+    /// Sticky recovery failure remains an error rather than proving completion.
+    pub fn source_confirmed(&self, source: SourceId) -> Result<bool, RecoveryError> {
+        self.0.running()?;
+        Ok(source.0 < self.0.next_source && !self.0.sent.contains_key(&source))
+    }
+
     /// Earliest first-source or retry deadline, independent of pending receipts.
     /// A bounded service can preserve a source opportunity without waking for
     /// feedback that cannot fit its remaining reservation.

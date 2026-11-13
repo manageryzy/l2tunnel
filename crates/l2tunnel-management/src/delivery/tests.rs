@@ -479,3 +479,45 @@ fn silent_peer_and_invalid_resource_bounds_fail_explicitly() -> Result<(), Error
     ));
     Ok(())
 }
+
+#[test]
+fn exact_source_receipt_custody_checks_verified_ack_and_original_time() -> Result<(), Error> {
+    let [mut left, mut right] = pair(settings(), Duration::from_secs(1))?;
+    assert!(!left.source_confirmed(0, Duration::ZERO)?);
+    let source = left.submit(b"last directional barrier\0", Duration::ZERO)?;
+    let mut packet = [0; 256];
+    let data = left
+        .poll(Duration::ZERO, usize::MAX, &mut packet)?
+        .ok_or(Error::Settings)?;
+    assert!(!left.source_confirmed(source, Duration::ZERO)?);
+    right.receive(ingress(Role::Client), &packet[..data.bytes], Duration::ZERO)?;
+    assert!(!left.source_confirmed(source, Duration::ZERO)?);
+    let receipt = right
+        .poll(Duration::ZERO, usize::MAX, &mut packet)?
+        .ok_or(Error::Settings)?;
+    assert_eq!(
+        left.receive(
+            Ingress::UserTraffic,
+            &packet[..receipt.bytes],
+            Duration::ZERO
+        ),
+        Err(Error::Origin)
+    );
+    assert!(!left.source_confirmed(source, Duration::ZERO)?);
+    let now = Duration::from_millis(1);
+    left.receive(ingress(Role::Server), &packet[..receipt.bytes], now)?;
+    left.submit(b"unrelated later command", now)?;
+    assert!(!left.drained());
+    assert!(left.source_confirmed(source, now)?);
+    assert!(!left.source_confirmed(source + 1, now)?);
+    assert!(!left.source_confirmed(u64::MAX, now)?);
+    assert_eq!(
+        left.source_confirmed(source, Duration::ZERO),
+        Err(Error::NonMonotonicTime)
+    );
+    assert_eq!(
+        left.source_confirmed(source, Duration::from_secs(1)),
+        Err(Error::Expired)
+    );
+    Ok(())
+}

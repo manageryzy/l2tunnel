@@ -331,6 +331,15 @@ impl Service {
     pub fn drained(&self) -> bool {
         self.recovery.drained()
     }
+    /// Exact submitted source receipt, independent of unrelated queued controls.
+    /// Submission, encoding and native handoff do not establish receipt.
+    /// Unknown sources return false; original expiry/time/failure still apply.
+    pub fn source_confirmed(&self, source: u64, now: Duration) -> Result<bool, Error> {
+        self.check(now)?;
+        self.recovery
+            .source_confirmed(l2tunnel_recovery::SourceId(source))
+            .map_err(Error::Recovery)
+    }
     /// Exact current payload retention, excluding bounded allocator metadata.
     pub fn retained(&self) -> Retained {
         self.recovery.retained()

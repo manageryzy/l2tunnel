@@ -33,7 +33,8 @@ pub struct Scope {
 pub enum ReaderState {
     /// Receive is prepared, but outgoing data still uses the active scope.
     Staged,
-    /// Outgoing data changed; the previous scope remains receive-only.
+    /// Default outgoing data changed; the prior scope remains registered.
+    /// Explicit directional feedback can still use it through `seal_user_in`.
     Draining,
 }
 
@@ -64,6 +65,8 @@ pub struct Capacity {
 pub struct Sealed {
     /// Unique identity owned by this class's security sender.
     pub number: security::PacketNumber,
+    /// Actual sender key generation used for this protected record.
+    pub generation: security::KeyGeneration,
     /// Complete covered packet bytes in caller output.
     pub bytes: usize,
 }
@@ -278,6 +281,40 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
+        let scope = match class {
+            Class::User => self.data,
+            Class::Control => self.control,
+        };
+        self.seal_scoped(class, scope, outer, plaintext, workspace, output)
+    }
+
+    /// Seal User bytes in their exact registered directional policy scope.
+    /// The trusted negotiated owner selects source versus feedback provenance.
+    /// This creates no scope or owner and shares the existing User counter.
+    /// Refused scope, phase or capacity leaves nonces and output unchanged.
+    pub fn seal_user_in(
+        &mut self,
+        scope: Scope,
+        outer: cover::PacketMeta,
+        plaintext: &[u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<Sealed, Error> {
+        if self.registered_scope(Class::User, scope.epoch)? != scope {
+            return Err(Error::Scope);
+        }
+        self.seal_scoped(Class::User, scope, outer, plaintext, workspace, output)
+    }
+
+    fn seal_scoped(
+        &mut self,
+        class: Class,
+        scope: Scope,
+        outer: cover::PacketMeta,
+        plaintext: &[u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<Sealed, Error> {
         if outer.phase != cover::Phase::Established {
             return Err(Error::Phase);
         }
@@ -285,10 +322,6 @@ impl Records {
         if workspace.len() < capacity.seal_workspace_bytes || output.len() < capacity.packet_bytes {
             return Err(Error::OutputTooSmall);
         }
-        let scope = match class {
-            Class::User => self.data,
-            Class::Control => self.control,
-        };
         let route = route_for(class, scope);
         let metadata = security::Metadata {
             epoch: scope.epoch,
@@ -306,6 +339,7 @@ impl Records {
                 .encode(outer, &workspace[..capacity.seal_workspace_bytes], output)?;
         Ok(Sealed {
             number: sealed.number,
+            generation: sealed.generation,
             bytes,
         })
     }

@@ -739,6 +739,41 @@ fn tail_retries_are_exact_interval_bounded_and_do_not_renew_or_keep_keys() -> Re
             .is_none()
     );
     assert!(expired.cache.is_none());
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let cover = appearance(kind, 2, 1)?;
+        let peer_cover = appearance(kind, 1, 2)?;
+        let mut exact = JoiningTail::server(cover, policy, end, now, proof, accepted);
+        let required = exact.max_packet_bytes();
+        assert_eq!(
+            required,
+            ACCEPT_WIRE + cover.overhead(cover::Phase::Established, ACCEPT_WIRE)?
+        );
+        assert!(required < cover.limits().max_packet_bytes);
+        exact.receive(decoded(&proof), now)?;
+        let mut output = vec![0x55; required];
+        assert!(
+            exact
+                .poll(
+                    due,
+                    metadata(25, cover::Phase::Established),
+                    &mut output[..required - 1]
+                )
+                .is_err()
+        );
+        assert_eq!(output, vec![0x55; required]);
+        assert_eq!(exact.attempts, 1);
+        assert_eq!(
+            exact.poll(due, metadata(25, cover::Phase::Established), &mut output)?,
+            Some(required)
+        );
+        assert_eq!(peer_cover.decode(&output)?.protected, accepted);
+        exact.receive(decoded(&proof), end - Duration::from_millis(1))?;
+        assert_eq!(
+            exact.poll(end, metadata(26, cover::Phase::Established), &mut [])?,
+            None
+        );
+        assert_eq!(exact.deadline(), None, "expiry needs no output capacity");
+    }
     let mut number = u32::MAX;
     assert_eq!(
         advance(&mut number).err().map(|error| error.kind()),

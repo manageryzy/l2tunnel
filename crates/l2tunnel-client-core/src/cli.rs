@@ -22,6 +22,9 @@ mod raw_packet_frontend;
 #[path = "rolling/cli.rs"]
 mod rolling_frontend;
 #[cfg(unix)]
+#[path = "secure_udp/cli.rs"]
+pub(crate) mod secure_udp_frontend;
+#[cfg(unix)]
 #[path = "swift/cli.rs"]
 mod swift_frontend;
 #[cfg(all(test, unix))]
@@ -596,6 +599,9 @@ impl DeviceSpec {
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
+    if let Some(selected) = secure_udp_frontend::selection(command, options, config)? {
+        return secure_udp_frontend::execute(command, options, config, selected).await;
+    }
     let profile_interval = profiling::interval(options)?;
     let delivery = delivery_frontend::settings(options, config)?;
     if let Some(settings) = swift_frontend::selection(options, config)? {
@@ -1094,6 +1100,13 @@ async fn run_active_managed<D: l2tunnel_device::PacketDevice<Error = io::Error>>
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     let config = configuration(options)?;
     #[cfg(unix)]
+    if secure_udp_frontend::selection(command, options, config)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure UDP native CLI is implemented on Linux only",
+        ));
+    }
+    #[cfg(unix)]
     if swift_frontend::selection(options, config)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1180,12 +1193,13 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
         }
         _ => return Err(input("unsupported local API command")),
     };
+    let version = number(options, "--api-version", VERSION)?;
+    if !local::supported_version(version) {
+        return Err(input("api-version must be explicitly 1 or 2"));
+    }
     let response = local::request(
         required(options, "--control-socket")?,
-        &Request {
-            version: VERSION,
-            action,
-        },
+        &Request { version, action },
     )
     .await?;
     println!(
@@ -1220,6 +1234,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", rolling_frontend::HELP);
         #[cfg(unix)]
         println!("\n{}", swift_frontend::HELP);
+        #[cfg(unix)]
+        println!("\n{}", secure_udp_frontend::HELP);
         println!("\n{}", raw_packet_frontend::HELP);
         println!("\n{}", delivery_frontend::HELP);
         println!(
@@ -1305,7 +1321,22 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         allowed.extend_from_slice(rolling_frontend::OPTIONS);
         #[cfg(unix)]
         allowed.extend_from_slice(swift_frontend::OPTIONS);
+        #[cfg(unix)]
+        allowed.extend_from_slice(secure_udp_frontend::OPTIONS);
         allowed.extend_from_slice(raw_packet_frontend::OPTIONS);
+    }
+    if matches!(
+        command.as_str(),
+        "status"
+            | "disconnect"
+            | "reconnect"
+            | "set-swift"
+            | "set-compression"
+            | "set-active-policy"
+            | "drain-proxy"
+            | "drain-openvpn"
+    ) {
+        allowed.push("--api-version");
     }
     let result = options(&args[1..], &allowed).and_then(|options| {
         if command == "keygen" {

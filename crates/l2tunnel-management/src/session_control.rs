@@ -8,6 +8,23 @@ use std::fmt;
 pub const HEADER_BYTES: usize = 80;
 /// Version of L2SC, independently negotiated from legacy control formats.
 pub const VERSION: u8 = 1;
+/// Largest supported exact framed profile-control body, excluding its tag.
+pub const MAX_PROFILE_CONTROL_BYTES: usize = 43;
+/// Explicit profile-specific command grammar, independent of recovery feedback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum ProfileTag {
+    /// Existing framed Swift proposal and directional-barrier grammar version 1.
+    SwiftPolicyV1 = 1,
+}
+impl ProfileTag {
+    fn decode(value: u16) -> Result<Self, Error> {
+        match value {
+            1 => Ok(Self::SwiftPolicyV1),
+            _ => Err(Error::ProfileTag),
+        }
+    }
+}
 /// Current or explicitly draining authenticated data policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Scope {
@@ -145,6 +162,13 @@ pub enum Body<'a> {
         /// Exact request nonce being answered.
         nonce: u64,
     },
+    /// Exact selected profile command; the adapter validates its full grammar.
+    ProfileControl {
+        /// Explicit negotiated grammar, never authority inferred from payload.
+        tag: ProfileTag,
+        /// One complete bounded frame, borrowed without interpretation here.
+        bytes: &'a [u8],
+    },
 }
 /// Complete borrowed envelope after strict syntactic validation only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,6 +277,18 @@ impl<'a> Envelope<'a> {
                     Body::Pong { nonce }
                 }
             }
+            6 => {
+                if bytes.len() <= 4 || bytes.len() > 4 + MAX_PROFILE_CONTROL_BYTES {
+                    return Err(Error::Length);
+                }
+                if bytes[2..4] != [0; 2] {
+                    return Err(Error::Reserved);
+                }
+                Body::ProfileControl {
+                    tag: ProfileTag::decode(u16::from_be_bytes(read(bytes, 0)?))?,
+                    bytes: &bytes[4..],
+                }
+            }
             _ => return Err(Error::Kind),
         };
         Ok(Self { binding, body })
@@ -267,6 +303,9 @@ impl<'a> Envelope<'a> {
             }
             Body::NativeReceipt { .. } => 16,
             Body::Ping { .. } | Body::Pong { .. } => 8,
+            Body::ProfileControl { bytes, .. } => {
+                bytes.len().checked_add(4).ok_or(Error::Length)?
+            }
         };
         let length = HEADER_BYTES.checked_add(body).ok_or(Error::Length)?;
         if length > limits.max_frame_bytes {
@@ -278,6 +317,11 @@ impl<'a> Envelope<'a> {
             }
             Body::RecoveryFeedback { bytes, .. }
                 if bytes.is_empty() || bytes.len() > limits.max_feedback_bytes =>
+            {
+                return Err(Error::Length);
+            }
+            Body::ProfileControl { bytes, .. }
+                if bytes.is_empty() || bytes.len() > MAX_PROFILE_CONTROL_BYTES =>
             {
                 return Err(Error::Length);
             }
@@ -320,6 +364,7 @@ impl<'a> Envelope<'a> {
             Body::NativeReceipt { .. } => 3,
             Body::Ping { .. } => 4,
             Body::Pong { .. } => 5,
+            Body::ProfileControl { .. } => 6,
         };
         output[6] = b.sender as u8;
         output[7] = 0;
@@ -356,6 +401,11 @@ impl<'a> Envelope<'a> {
             }
             Body::Ping { nonce } | Body::Pong { nonce } => {
                 body.copy_from_slice(&nonce.to_be_bytes())
+            }
+            Body::ProfileControl { tag, bytes } => {
+                body[..2].copy_from_slice(&(tag as u16).to_be_bytes());
+                body[2..4].fill(0);
+                body[4..].copy_from_slice(bytes);
             }
         }
         Ok(length)
@@ -566,6 +616,8 @@ pub enum Error {
     Kind,
     /// Feedback tag, target lane or scoped payload limit mismatch.
     FeedbackTag,
+    /// Unknown profile-specific command grammar.
+    ProfileTag,
     /// Native receipt grammar/channel/target lane mismatch.
     Receipt,
     /// Unknown, retired or nonmonotonic data scope.

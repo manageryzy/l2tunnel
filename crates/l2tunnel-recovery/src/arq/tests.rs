@@ -557,3 +557,71 @@ fn independent_engines_recover_bidirectional_bytes_over_loss_reorder_and_duplica
     assert_eq!(right.retained(), Retained::default());
     Ok(())
 }
+
+#[test]
+fn source_confirmation_requires_the_exact_allocated_peer_receipt() -> Result<(), RecoveryError> {
+    let (mut left, mut right) = pair()?;
+    assert!(!left.source_confirmed(SourceId(0))?);
+    left.submit(b"first\0\0", ms(0))?;
+    left.submit(b"second\0", ms(0))?;
+    assert!(!left.source_confirmed(SourceId(0))?);
+    assert_eq!(
+        left.receive(&ack(1, 0), ms(0)),
+        Err(RecoveryError::UnsentAcknowledgement)
+    );
+    let mut packet = [0; 256];
+    let first = left
+        .poll_source(ms(0), &mut packet)?
+        .ok_or(RecoveryError::MalformedPacket)?;
+    let first = packet[..first].to_vec();
+    let second = left
+        .poll_source(ms(0), &mut packet)?
+        .ok_or(RecoveryError::MalformedPacket)?;
+    right.receive(&packet[..second], ms(0))?;
+    assert!(!left.source_confirmed(SourceId(0))?);
+    assert!(!left.source_confirmed(SourceId(1))?);
+    let receipt = right
+        .poll_feedback(ms(1), &mut packet)?
+        .ok_or(RecoveryError::MalformedPacket)?;
+    left.receive(&packet[..receipt], ms(1))?;
+    assert!(!left.source_confirmed(SourceId(0))?);
+    assert!(left.source_confirmed(SourceId(1))?);
+    assert!(!left.source_confirmed(SourceId(2))?);
+    assert!(!left.source_confirmed(SourceId(u64::MAX))?);
+    let retained = left.retained();
+    assert_eq!(
+        left.receive(&ack(3, 0), ms(1)),
+        Err(RecoveryError::UnsentAcknowledgement)
+    );
+    assert_eq!(left.retained(), retained);
+    assert!(!left.source_confirmed(SourceId(0))?);
+    right.receive(&first, ms(1))?;
+    let receipt = right
+        .poll_feedback(ms(2), &mut packet)?
+        .ok_or(RecoveryError::MalformedPacket)?;
+    left.receive(&packet[..receipt], ms(2))?;
+    let stats = left.statistics();
+    assert!(left.source_confirmed(SourceId(0))?);
+    assert!(left.source_confirmed(SourceId(1))?);
+    assert_eq!(left.statistics(), stats);
+    Ok(())
+}
+
+#[test]
+fn retry_failure_cannot_be_observed_as_confirmed_custody() -> Result<(), RecoveryError> {
+    let mut policy = config();
+    policy.max_retries = 0;
+    let mut sender = SelectiveRepeat::new(policy, context(EndpointRole::Initiator))?;
+    sender.submit(b"lost final command", ms(0))?;
+    let mut packet = [0; 256];
+    assert!(sender.poll_source(ms(0), &mut packet)?.is_some());
+    assert!(!sender.source_confirmed(SourceId(0))?);
+    let error = sender
+        .poll_source(ms(10), &mut packet)
+        .err()
+        .ok_or(RecoveryError::MalformedPacket)?;
+    assert!(matches!(error, RecoveryError::RetryExhausted { .. }));
+    assert_eq!(sender.source_confirmed(SourceId(0)), Err(error));
+    assert_eq!(sender.source_confirmed(SourceId(1)), Err(error));
+    Ok(())
+}

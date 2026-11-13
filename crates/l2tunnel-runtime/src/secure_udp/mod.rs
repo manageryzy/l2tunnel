@@ -7,3 +7,6 @@
 pub mod establish;
 /// Actual existing-member proof and authenticated acceptance on that same socket.
 pub mod member;
+/// Unix native forwarding and fixed authenticated control on the original socket.
+#[cfg(unix)]
+pub mod transport;

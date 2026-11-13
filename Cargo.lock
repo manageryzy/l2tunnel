@@ -621,6 +621,7 @@ dependencies = [
  "l2tunnel-flow-control",
  "l2tunnel-handshake",
  "l2tunnel-identity",
+ "l2tunnel-management",
  "l2tunnel-openvpn",
  "l2tunnel-packet",
  "l2tunnel-platform-linux",
@@ -896,6 +897,7 @@ dependencies = [
  "l2tunnel-wire",
  "rcgen",
  "ring",
+ "socket2",
  "tokio",
  "zeroize",
 ]

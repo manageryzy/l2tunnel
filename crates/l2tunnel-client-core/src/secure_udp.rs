@@ -3,6 +3,15 @@
 //! Authentication readiness is distinct from native runtime readiness. The caller
 //! transfers every returned tail to the one selected-carrier data/control reader.
 
+/// Explicit runtime credential owners and bounded manual key-file readers.
+pub mod credentials;
+/// Immutable shared native-runtime profile and authenticated policy resolution.
+#[cfg(unix)]
+pub mod profile;
+/// Non-secret versioned observations for the selected shared UDP profile.
+#[cfg(unix)]
+pub mod status;
+
 use l2tunnel_core::ConfigDigest;
 use l2tunnel_cover as cover;
 use l2tunnel_handshake as hs;
@@ -183,14 +192,28 @@ impl Settings {
                 "gate overhead does not include the selected bootstrap cover",
             ));
         }
-        if self
+        let protected_bootstrap = self
+            .gate
+            .arq
+            .max_source_bytes
+            .checked_add(gate::CONTROL_OVERHEAD + l2tunnel_recovery::DATA_HEADER_BYTES + 1)
+            .ok_or_else(|| invalid("bootstrap source geometry overflow"))?
+            .max(gate::GATE_BYTES + 1);
+        let bootstrap_header = self
             .cover
-            .max_packet_bytes
-            .checked_add(ip_bytes)
-            .is_none_or(|bytes| bytes > self.gate.path_mtu)
+            .config(security::Role::Initiator)?
+            .overhead(cover::Phase::Handshake, protected_bootstrap)
+            .map_err(invalid)?;
+        let bootstrap_packet = protected_bootstrap
+            .checked_add(bootstrap_header)
+            .ok_or_else(|| invalid("bootstrap packet geometry overflow"))?;
+        if bootstrap_packet > self.cover.max_packet_bytes
+            || bootstrap_packet
+                .checked_add(ip_bytes)
+                .is_none_or(|bytes| bytes > self.gate.path_mtu)
         {
             return Err(invalid(
-                "cover packet bound exceeds the configured path MTU",
+                "actual bootstrap packet exceeds the configured path MTU",
             ));
         }
         let mut hash = digest::Context::new(&digest::SHA256);

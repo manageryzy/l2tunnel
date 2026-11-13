@@ -112,6 +112,15 @@ pub struct JoiningTail {
     maximum: u32,
 }
 impl JoiningTail {
+    /// Exact complete covered acceptance size, excluding IP/UDP.
+    /// This bounds retry storage without reserving the larger cover ceiling.
+    pub const fn max_packet_bytes(&self) -> usize {
+        ACCEPT_WIRE
+            + match self.cover.appearance() {
+                cover::Appearance::QuicLike => cover::QUIC_ESTABLISHED_OVERHEAD,
+                cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+            }
+    }
     fn empty(cover: cover::Config, settings: Settings, end: Instant, now: Instant) -> Self {
         Self {
             cover,
