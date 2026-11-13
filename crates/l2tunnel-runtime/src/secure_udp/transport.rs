@@ -50,10 +50,39 @@ pub async fn run<D>(
     parts: member::Parts,
     expected_configuration: security::ConfigDigest,
     config: Config,
+    requests: Option<ControlRequests>,
+    resolve: Resolver,
+    shutdown: impl Future<Output = ()> + Send,
+    observe: impl FnMut(&Snapshot) + Send,
+) -> io::Result<Stopped>
+where
+    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+{
+    run_clock(
+        device,
+        parts,
+        expected_configuration,
+        config,
+        requests,
+        resolve,
+        shutdown,
+        observe,
+        Instant::now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Private clock seam exercises the production loop.
+async fn run_clock<D>(
+    device: D,
+    parts: member::Parts,
+    expected_configuration: security::ConfigDigest,
+    config: Config,
     mut requests: Option<ControlRequests>,
     resolve: Resolver,
     shutdown: impl Future<Output = ()> + Send,
     mut observe: impl FnMut(&Snapshot) + Send,
+    mut sample: impl FnMut() -> Instant + Send,
 ) -> io::Result<Stopped>
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
@@ -68,10 +97,10 @@ where
         ));
     }
     let setup_deadline = parts.deadline;
-    let origin = Instant::now();
+    let origin = sample();
     let (socket, mut driver) = Driver::new(parts, expected_configuration, config, origin)?;
     let mut device = AsyncFd::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
-    let ready = Instant::now();
+    let ready = sample();
     if ready >= setup_deadline {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -82,9 +111,10 @@ where
     let mut datagram = vec![0; driver.cover.limits().max_packet_bytes + 1];
     tokio::pin!(shutdown);
     observe(&driver.snapshot(clock(origin, ready)?, true));
+    let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
-            let instant=Instant::now();let now=clock(origin,instant)?;
+            let instant=sample();let now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.collect_native(now)?;
@@ -93,11 +123,11 @@ where
             driver.submit_control(now)?;
             driver.send(&socket,now,instant)?;
             let native_before=driver.performance.counters.native_write_batch_packets;
-            let native_spent=driver.flush_native_ready(&mut device,||clock(origin,Instant::now())).await?;
+            let native_spent=driver.flush_native_ready(&mut device,||clock(origin,sample())).await?;
             let native_write_remaining=driver.config.work.native_write_batch.saturating_sub(native_spent);
             if let Some(reason)=driver.terminal {break Ok(reason);}
             if driver.next_report.is_some_and(|at|now>=at) {
-                let reported=clock(origin,Instant::now())?;
+                let reported=clock(origin,sample())?;
                 observe(&driver.snapshot(reported,true));
                 driver.next_report=driver.config.report_interval.map(|interval|add(reported,interval)).transpose()?;
             }
@@ -105,28 +135,29 @@ where
             let write_native=!driver.native.is_empty();
             let interest=if read_native && write_native {Interest::READABLE.add(Interest::WRITABLE)}else if write_native {Interest::WRITABLE}else{Interest::READABLE};
             let mut wake=driver.wake(now)?;
-            if native_spent>0 || (driver.swift.deliverable() && driver.native_room()) {wake=wake.min(Instant::now());}
+            if native_spent>0 || (driver.swift.deliverable() && driver.native_room()) {wake=wake.min(sample());}
             tokio::select! {
                 biased;
                 ()=&mut shutdown=>break Ok(StopReason::Cancelled),
                 request=next_request(&mut requests),if requests.is_some()=>{
                     driver.performance.counters.request_events=driver.performance.counters.request_events.saturating_add(1);
-                    match request {Some((requested,reply))=>driver.request(clock(origin,Instant::now())?,requested,reply,&resolve)?,None=>requests=None}
+                    match request {Some((requested,reply))=>driver.request(clock(origin,sample())?,requested,reply,&resolve)?,None=>requests=None}
                 },
-                readable=socket.readable(),if driver.ingress.left>0=>{
-                    readable?;
+                event=next_io(&socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
+                IoEvent::Udp=>{
+                    native_first=true;
                     driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);
                     let maximum=driver.config.work.receive_packets.min(driver.ingress.left);
                     let mut batch=0u64;
                     for _ in 0..maximum {
-                        if !driver.check_expiry(clock(origin,Instant::now())?)? {break;}
+                        if !driver.check_expiry(clock(origin,sample())?)? {break;}
                         driver.ingress.left-=1;
                         match socket.try_recv(&mut datagram) {
                             Ok(length)=>{
                                 batch+=1;
                                 driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
                                 if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
-                                let at=Instant::now();let time=clock(origin,at)?;
+                                let at=sample();let time=clock(origin,at)?;
                                 if !driver.check_expiry(time)? {break;}
                                 if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive(&datagram[..length],time,at,&resolve)?;}
                             },
@@ -136,12 +167,12 @@ where
                         }
                     }
                 },
-                ready=device.ready_mut(interest),if read_native || write_native=>{
-                    let mut ready=ready?;
+                IoEvent::Native(mut ready)=>{
+                    native_first=false;
                     driver.performance.counters.native_ready_events=driver.performance.counters.native_ready_events.saturating_add(1);
                     if ready.ready().is_writable() && write_native && native_write_remaining>0 {
                         for _ in 0..native_write_remaining {
-                            let step=driver.write_native(&mut ready,||clock(origin,Instant::now()));
+                            let step=driver.write_native(&mut ready,||clock(origin,sample()));
                             if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
                             if !step? {break;}
                         }
@@ -150,18 +181,19 @@ where
                         let mut batch=0u64;
                         for _ in 0..driver.config.work.native_read_batch {
                             let before=driver.performance.counters.native_read_batch_packets;
-                            let step=driver.read_native(&mut ready,&mut native,||clock(origin,Instant::now()));
+                            let step=driver.read_native(&mut ready,&mut native,||clock(origin,sample()));
                             batch+=driver.performance.counters.native_read_batch_packets.saturating_sub(before);
                             if batch==driver.config.work.native_read_batch as u64 {driver.performance.counters.native_read_batch_limit_hits=driver.performance.counters.native_read_batch_limit_hits.saturating_add(1);}
                             if !step? {break;}
                         }
                     }
                 },
-                ()=sleep_until(wake)=>{driver.performance.counters.timer_events=driver.performance.counters.timer_events.saturating_add(1);},
+                IoEvent::Timer=>{driver.performance.counters.timer_events=driver.performance.counters.timer_events.saturating_add(1);},
+                },
             }
         }
     }.await;
-    let now = clock(origin, Instant::now()).unwrap_or(u64::MAX);
+    let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {
         Ok(reason) => *reason,
         Err(error) => driver.terminal.unwrap_or(
@@ -181,6 +213,40 @@ where
     let snapshot = driver.snapshot(now, false);
     observe(&snapshot);
     result.map(|reason| Stopped { reason, snapshot })
+}
+
+enum IoEvent<'a, D: AsRawFd> {
+    Udp,
+    Native(tokio::io::unix::AsyncFdReadyMutGuard<'a, D>),
+    Timer,
+}
+
+// The caller polls shutdown and control first. Alternate ready I/O priorities so
+// elapsed receive work cannot renew UDP's quota ahead of every native read.
+async fn next_io<'a, D: AsRawFd>(
+    socket: &tokio::net::UdpSocket,
+    device: &'a mut AsyncFd<D>,
+    interest: Interest,
+    native: bool,
+    udp: bool,
+    wake: Instant,
+    native_first: bool,
+) -> io::Result<IoEvent<'a, D>> {
+    if native_first {
+        tokio::select! {
+            biased;
+            ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
+            ready = socket.readable(), if udp => ready.map(|()| IoEvent::Udp),
+            () = sleep_until(wake) => Ok(IoEvent::Timer),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            ready = socket.readable(), if udp => ready.map(|()| IoEvent::Udp),
+            ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
+            () = sleep_until(wake) => Ok(IoEvent::Timer),
+        }
+    }
 }
 
 async fn next_request(

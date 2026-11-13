@@ -102,12 +102,22 @@ SUS-11 subsequently corrects one-shot IPC helper scheduling with an
 and [actual byte/thread-count comparison](../work/secure-udp-ipc-runtime-proof-20261113/comparison.json).
 Build8 impaired QUIC-like is77.3464Mbit/s and still fails80; the daemon's scheduler,
 wire rates, retry limits and original deadlines are preserved.
-The [latest required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+SUR-11 then proves and corrects UDP/native-read starvation without changing those
+budgets or deadlines. Its [focused check](../work/secure-udp-performance-focused-20261113/attempt-8/validation.json)
+passes, and [build9 forward/reverse measurements](modules/secure-udp-native.md#saturated-ingress-fairness)
+cover both appearances. Forward16 measures78.6206/78.2435Mbit/s and fails80;
+separate reverse stress passes functional checks. SNL-10 is scoped to those
+bidirectional observations; SNL-08/SNL-09/SNL-11 and all parent gates remain open.
+The [preceding required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
 passed with stable source maps:1526 Rust cases including doctests,295 Python
 tooling cases and1658 simulator cases, plus formatting, strict Clippy, rustdoc
 and CLI checks. Complete serialized Rust execution preserves all assertions and
 deadlines. Both earlier aggregate failures and all native target failures remain
 unchanged; these local results do not close any parent mode/platform/lifecycle gate.
+The fairness checkpoint's [required aggregate](../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json) subsequently passes
+1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases; all input maps remain stable. Its earlier
+aggregate Deadline failure and unchanged isolated recheck remain separate
+receipts. No test, original deadline, performance target or mode scope is reduced.
 Swift now consumes the common library's explicit legacy compatibility owners;
 the legacy CLI profile uses retained TLS plus a separate UDP data socket. A new
 same-UDP-pair integration fixture exercises Noise, both appearance codecs,

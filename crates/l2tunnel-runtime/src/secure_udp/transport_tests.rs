@@ -2,6 +2,8 @@
 
 #[path = "transport_drain_tests.rs"]
 mod drain;
+#[path = "transport_fairness_tests.rs"]
+mod fairness;
 #[path = "transport_loss_tests.rs"]
 mod loss;
 #[path = "transport_metrics_tests.rs"]

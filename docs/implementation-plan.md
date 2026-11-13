@@ -131,12 +131,20 @@ The later [expanded focus](../work/secure-udp-performance-focused-20261113/attem
 and actual immutable CLI proofs validate the IPC-only helper scheduler correction;
 build8 reaches77.3464Mbit/s impaired and still fails80. Kernel perf and simultaneous
 process I/O observations do not establish disk I/O as the primary cause.
-SUR-11 retains the independent saturated native-read fairness risk. Simulator
+SUR-11 now reproduces and corrects the independent saturated native-read fairness
+defect, with a [passing focus](../work/secure-udp-performance-focused-20261113/attempt-8/validation.json)
+and both-cover forward/reverse native observations. Build9 forward16 measures
+78.6206/78.2435Mbit/s, still failing80; the separate reverse-stress receipts pass
+their functional gates. Simulator
 overhead sensitivity, sampled CPU/credit and historical-binary replay remain
 separate evidence, not a reduction of any mode, lifecycle or performance gate.
-The [latest source-stable aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+The [preceding source-stable aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
 passed the complete ordinary workspace checks. Both earlier failed aggregate
 attempts remain preserved; actual native80Mbit/s acceptance remains open.
+The scheduler checkpoint's [required aggregate](../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json) also passes
+1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases, without changing assertions or deadlines. The
+conditional wire-capacity estimate in the native ledger preserves the target
+and requires separate validation of any future framing/rate proposal.
 
 Additional unfinished source and integration boundaries:
 

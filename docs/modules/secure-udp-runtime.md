@@ -119,7 +119,26 @@ separate observations; they do not isolate scheduler, syscall or CPU causality.
 `native_ready_events` now includes processed pre-drain readiness as well as
 selected readiness, so it is not the older selected-branch denominator.
 
-- [ ] [SUR-11] Prove and, where necessary, correct opposite-direction native-read progress under continuously ready UDP ingress whose receive work spans quota refill intervals. Use a deterministic production-loop regression, preserve authenticated admission, both native work quotas, original deadlines and control/shutdown progress, then measure both directions. The existing biased UDP-before-native selection can refill ingress before each turn; write pre-drain alone does not prove read fairness. This source-review risk is not attributed as the measured remaining bottleneck.
+- [x] [SUR-11] Prove and, where necessary, correct opposite-direction native-read progress under continuously ready UDP ingress whose receive work spans quota refill intervals. Use a deterministic production-loop regression, preserve authenticated admission, both native work quotas, original deadlines and control/shutdown progress, then measure both directions. Evidence: the [old production loop fails](../../work/secure-udp-fairness-regression-20261113/old-order-attempt-2/validation.json) with zero native reads at the fixed ingress prefix, while the [corrected runtime/client focus passes](../../work/secure-udp-performance-focused-20261113/attempt-8/validation.json). Both covers, blocked native output and authenticated Pong/ACK checks use the actual loop. The [four native observations](../../work/secure-udp-performance-analysis-20261113/fairness-native-matrix-attempt-2/validation.json) include forward16 and reverse stress for both covers; all functional/cleanup checks pass, while both forward runs still fail80. This correction does not identify the remaining throughput bottleneck or complete a parent performance/mode gate.
+
+The correction alternates priority between ready UDP and native I/O
+after each selected I/O event. Shutdown and local control requests retain higher
+priority, and an unavailable descriptor cannot hold up the other descriptor.
+Existing per-turn quotas, authentication and deadline checks remain authoritative.
+A private injected clock exercises the actual runtime loop with elapsed receive
+work; the public runtime API continues to use Tokio's monotonic clock. At the
+fixed observation prefix, five protected datagrams remain queued. Test response
+reception consumes exactly the runtime's socket-accepted packet count under one
+absolute I/O deadline, preserving exact control and native-byte assertions.
+The first draft compile failure, the initial peer-readiness failure and the
+subsequent test guard-scope lint failure remain in their original receipts.
+The [required source-stable aggregate](../../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json) passes 1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases,
+formatting, strict workspace Clippy, rustdoc and CLI checks. The
+[first aggregate](../../work/secure-udp-fairness-progress-20261113/attempt-1/validation.json)
+retains an existing predrain test's Deadline failure. Its
+[unchanged isolated recheck](../../work/secure-udp-fairness-progress-20261113/deadline-recheck-attempt-1/validation.json)
+passes; the complete rerun skips no cases and changes no deadlines, retries
+or assertions. These local checks do not qualify other modes or platforms.
 
 ## Ownership and admission boundary
 

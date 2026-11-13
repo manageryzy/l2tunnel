@@ -449,6 +449,77 @@ still failed. This removes unnecessary helper pools, without proving that they
 explain all prior throughput differences. The kernel diagnostic and all earlier
 failures retain their original source identities and outcomes.
 
+### Saturated ingress fairness
+
+SUR-11 now has a deterministic failing old-loop regression and a
+[passing runtime/client focus](../../work/secure-udp-performance-focused-20261113/attempt-8/validation.json).
+The production loop alternates ready UDP/native priority while shutdown and local
+control requests stay first. Existing quotas, authentication, wire rates and
+original deadlines are preserved. This proves a scheduling defect and its finite
+correction; it does not establish that the defect caused the prior throughput gap.
+
+[Immutable build9](../../work/secure-udp-native-build-20261113/attempt-9/build-receipt.json)
+has four fresh owned Linux namespace observations, all with70ms RTT and15% loss
+each way. The forward16 workload retains sixteen forward TCP flows and only
+reverse ACKs; reverse stress separately adds sixteen reverse bulk flows.
+
+| Case | Forward Mbit/s | Reverse Mbit/s | Result |
+| --- | ---: | ---: | --- |
+| [QUIC-like forward16](../../work/secure-udp-native-20261113/quic-fairness-impaired-attempt-1/receipt.json) | 78.620608 | 0 | Failed80; functional/cleanup passed |
+| [Media-like forward16](../../work/secure-udp-native-20261113/media-fairness-impaired-attempt-1/receipt.json) | 78.2435488 | 0 | Failed80; functional/cleanup passed |
+| [QUIC-like reverse stress](../../work/secure-udp-native-20261113/quic-fairness-reverse-impaired-attempt-1/receipt.json) | 52.054832 | 7.62484 | Functional/cleanup passed; forward80 target not applicable |
+| [Media-like reverse stress](../../work/secure-udp-native-20261113/media-fairness-reverse-impaired-attempt-1/receipt.json) | 51.2209824 | 7.5413232 | Functional/cleanup passed; forward80 target not applicable |
+
+The [matrix](../../work/secure-udp-performance-analysis-20261113/fairness-native-matrix-attempt-2/validation.json)
+therefore retains an overall failed result. All four cases pass exact TCP
+counts/hashes/EOF, the original three full-MTU ICMP probes, UDP/ARP, loaded policy
+changes/restoration, fresh manual reconnect and capture/owned-cleanup checks.
+[Counter reconciliation](../../work/secure-udp-performance-analysis-20261113/fairness-native-matrix-attempt-2/counter-binding.json)
+matches every class packet/IP-byte total to charged output. Reported native
+backpressure drops, full-output polls and write WouldBlock maxima are zero in
+both endpoints of every case. Sampled counters do not prove continuous occupancy
+or causality. The first orchestration attempt's post-run permission failure is
+preserved separately; its completed QUIC case was hash-verified and reused rather
+than overwritten or rerun as though the first result had not occurred.
+
+The [source-bound workload audit](../../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
+also prevents treating78.7502Mbit/s simulator sensitivity as exact Rust parity.
+That study owns an independent recovery transport per TCP connection and sends
+reverse inner ACKs without compact recovery. Rust uses directional flow hashing
+and per-channel ordering. In the archived build8 tuple set, sixteen connections
+occupy nine forward and ten reverse ACK channels; only one uses the same index
+both ways. These are calculated mappings corroborated by channel activity, not
+decryption of the capture or a measurement of collision cost. P-unified-duplex-mux,
+full SW-11, the80Mbit/s target and every existing mode/platform gate stay open.
+
+### Conditional framing capacity estimate
+
+The [source-bound calculation](../../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/conditional-ceiling.json)
+uses the actual99Mbit/s full-IP allowance,1500B IPv4 path,76/77B fixed
+QUIC-like/media-like overhead and1416/1415B maximum packed source payload.
+Maximum SOURCE packets cost1497IP bytes; REPAIR packets cost1500, because repairs
+also code the source-length word. The per-native two-byte record length is a
+separate cost. Assuming independent15% packet loss, full useful symbols, steady
+allowance and no other costs, optimistic packed-stream rates are79.5968/79.5406Mbit/s.
+For1448B TCP payloads with an optimistic two-byte compressed header and two-byte
+record length, those estimates become79.3775/79.3215Mbit/s.
+
+This is a conditional asymptotic estimate, not a strict finite20s bound or a
+measurement of an actual codec's average compression. Burst/warmup boundaries,
+variable packets, realized loss and record geometry require separate treatment.
+It explains why CPU/scheduler improvements alone cannot guarantee expected80
+under these fixed assumptions. Changing rate accounting or wire efficiency needs
+its own explicit configuration/negotiation and controlled comparison; no rate,
+security, MTU, mode default, target or owner decision changes here. The simulator
+variants also change flush timing, so they do not isolate overhead alone.
+
+The scheduler checkpoint's [required aggregate](../../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json) passes
+1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases. Its
+first aggregate failure and unchanged isolated deadline recheck remain preserved
+as documented in SUR-11; the complete successful rerun retains all cases and
+original assertions/deadlines. Local checks remain distinct from the failed
+forward performance target and outstanding carrier/mode/platform qualification.
+
 ## Results and acceptance
 
 Each fresh output preserves its source/binary/helper identity, exact command
@@ -463,10 +534,10 @@ tooling results never overwrite historical receipts or become skipped success.
 - [x] [SNL-04] Verify sixteen-flow forward-only and distinct duplex stress probes with exact bytes/hash/EOF, common-window accounting and meaningful bound/error tests. Evidence: [probe](../../tools/secure_udp_native_probe.py), [ordinary sixteen-flow TCP and exact UDP loopback, accounting, original-deadline and byte-ceiling boundary regressions](../../tools/test_secure_udp_native.py), and the [40-test focused passing receipt](../../work/secure-udp-native-tooling-focused-20261113/attempt-7/validation.json). This is tooling/ordinary-loopback evidence, not a TAP throughput result.
 - [x] [SNL-05] Implement and test complete-MTU/ARP/zero-payload checks, real under-load policy changes and fresh manual reconnect observations without claiming SW-11 or automatic recovery. Evidence: current immutable build7 [QUIC-like](../../work/secure-udp-native-20261113/quic-impaired-perf-attempt-3/receipt.json) and [media-like](../../work/secure-udp-native-20261113/media-impaired-perf-attempt-1/receipt.json) TAP receipts pass exact three-request1500B/DF ICMP with the original12s bound, arbitrary/zero/trailing-zero UDP, captured ARP, TCP hashes/EOF, changed/restored policy epochs and new authenticated sessions on the configured UDP tuple. [Fifty focused tooling cases](../../work/secure-udp-native-tooling-focused-20261113/attempt-9/validation.json), the [delayed-third ICMP preflight](../../work/secure-udp-native-preflight-20261113/exact-three-icmp-attempt-2.json), and five production-owner control-loss tests in the [runtime focus](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json) retain original timeout/retry semantics. Deterministic control loss is fixture evidence, distinct from stochastic native impairment. Overall throughput targets still fail; full SW-11 and automatic recovery remain open.
 - [x] [SNL-06] Verify bounded all-IP capture parsing, original tuple/phase/MTU/fragment checks, same-window IP cost and nonzero capture-loss rejection. Evidence: [streaming capture/parser and final counters](../../tools/secure_udp_native.py), [both-cover, policy-epoch, role/extent, ICMP, truncation, exact-counter, checksum, fragment, resource and common-window fixtures](../../tools/test_secure_udp_native.py), and the [source-stable 40-test focused result](../../work/secure-udp-native-tooling-focused-20261113/attempt-7/validation.json). The new coverage gate rejects positive measured payload with no conservative same-window WAN denominator, including missing ACK-return observations. Capture of actual native traffic remains SNL-08.
-- [x] [SNL-07] Pass focused tooling checks and the source-stable required aggregate, retaining failed attempts and exact provenance. Evidence: [50 focused tooling tests](../../work/secure-udp-native-tooling-focused-20261113/attempt-9/validation.json), the [expanded runtime/client focus](../../work/secure-udp-performance-focused-20261113/attempt-5/validation.json), and the [latest source-stable required aggregate](../../work/secure-udp-performance-progress-20261113/attempt-3/validation.json) passed. The aggregate records1526 Rust cases including doctests,295 Python tooling cases and1658 simulator cases; formatting, strict workspace Clippy, rustdoc, CLI checks and input stability passed. Rust tests were serialized without skipping cases or changing assertions/deadlines. Earlier40-test/1498-Rust checkpoints and both failed performance-correction aggregates retain their original results. Native qualification remains separate under SNL-05 and SNL-08..SNL-11.
+- [x] [SNL-07] Pass focused tooling checks and the source-stable required aggregate, retaining failed attempts and exact provenance. Evidence: [50 focused tooling tests](../../work/secure-udp-native-tooling-focused-20261113/attempt-9/validation.json), the [expanded runtime/client focus](../../work/secure-udp-performance-focused-20261113/attempt-5/validation.json), and the [preceding source-stable required aggregate](../../work/secure-udp-performance-progress-20261113/attempt-3/validation.json) passed. The aggregate records1526 Rust cases including doctests,295 Python tooling cases and1658 simulator cases; formatting, strict workspace Clippy, rustdoc, CLI checks and input stability passed. Rust tests were serialized without skipping cases or changing assertions/deadlines. Earlier40-test/1498-Rust checkpoints and both failed performance-correction aggregates retain their original results. Native qualification remains separate under SNL-05 and SNL-08..SNL-11.
 - [ ] [SNL-08] Execute both appearances on clean/delay/1%/15% matched sixteen-flow ACK-return paths with immutable binary/helpers; retain exact integrity, policy/lifecycle and capture outcomes.
 - [ ] [SNL-09] Meet the existing 80 Mbit/s forward lab target on the matched impaired composition; retain honest timing, overhead, CPU/resource and negative results.
-- [ ] [SNL-10] Execute separate reverse-bulk stress and document its limits independently from matched reference, native-device scope and all remaining platform/ISP gates.
+- [x] [SNL-10] Execute separate reverse-bulk stress and document its limits independently from matched reference, native-device scope and all remaining platform/ISP gates. Evidence: the build9 [QUIC-like](../../work/secure-udp-native-20261113/quic-fairness-reverse-impaired-attempt-1/receipt.json) and [media-like](../../work/secure-udp-native-20261113/media-fairness-reverse-impaired-attempt-1/receipt.json) impaired Linux TAP cases pass integrity/control/capture/cleanup, with separately recorded directional goodput above. These finite bidirectional cases do not substitute for the forward16 target, other native devices, full path matrix or platform/ISP evidence.
 
 The parent-owned [29-test focused receipt](../../work/secure-udp-native-tooling-focused-20261113/attempt-4/validation.json)
 records the owned-qdisc correction with stable tooling inputs. The earlier

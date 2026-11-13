@@ -93,11 +93,20 @@ so its historical83.0069 is not promoted to a current environment baseline.
 Requested kernel profiling then locates network and epoll/futex execution; the
 separately verified one-shot IPC helper correction measures77.3464Mbit/s
 impaired in build8, still below80, without changing daemon scheduling.
+SUR-11 subsequently reproduces saturated UDP starving queued native input in the
+actual loop, then corrects ready-I/O priority with unchanged work quotas and
+deadlines. Build9 records78.6206/78.2435Mbit/s for QUIC-like/media-like forward16
+and separate bidirectional stress; all four pass functional/cleanup checks, but
+both forward results fail80. The [native ledger](modules/secure-udp-native.md#saturated-ingress-fairness)
+keeps these outcomes distinct from the source-bound simulator workload audit.
 Pure observations and focused protocol/runtime tests remain separate from
 source-pinned native measurements, complete mode/lifecycle acceptance and ISP QoS.
-The [latest required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
+The [preceding required aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
 passes with unchanged source inputs; this local check does not complete the
 remaining native performance, recovery, carrier, mode or platform gates.
+The scheduler checkpoint has a separate [source-stable required pass](../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json)
+with 1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases. Its conditional framing-capacity calculation
+is an engineering assumption check, not a waiver of the80Mbit/s target.
 
 ## Library boundary and layering
 

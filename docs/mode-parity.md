@@ -28,6 +28,15 @@ Negotiated switching between Swift and the other record profiles retains the
 full SW-11 gate; changing Swift's own policy under SW-13 is only an internal
 policy operation and does not satisfy cross-profile parity or switching.
 
+The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
+distinguishes the independent per-connection recovery used by the78.7502Mbit/s
+compact simulator sensitivity from current Rust directional hash/channel ordering.
+In that archived build8 test, sixteen TCP connections occupy nine forward and
+ten reverse ACK channels; the simulator's reverse ACKs bypass compact recovery.
+Neither that study nor the later SUR-11 runtime fairness correction qualifies
+P-unified-duplex-mux, full mode parity, reverse affinity or connection-round-robin
+admission. All47 complete catalog gates retain their stated scope and status.
+
 ## Recovery and scheduling
 
 | Catalog ID | Existing Python implementation | Knobs and behavior that must survive the port | Rust milestone |
