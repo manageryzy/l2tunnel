@@ -31,7 +31,7 @@ current CLI and wire formats below describe observed behavior.
 - [ ] [SW-09] Qualify on real devices and privileged host namespaces, IPv6 underlay, TUN, long soak, CPU and memory.
 - [x] [SW-10] Rekeying and sequence rollover without reconnecting: each direction's datagram key changes every 2^28 datagrams through an HKDF-SHA256 chain with no message, and source sequences are 64-bit inside the engine with their low 32 bits on the wire. Evidence: [key chain and ratchet test](../../crates/l2tunnel-runtime/src/swift.rs) covering many generations in both directions, a reordered straggler, forged and skipped generations and retirement; [boundary-crossing engine test](../../crates/l2tunnel-swift/src/tests.rs) under 15% loss with and without repairs. A production-cadence rekey (2^28 datagrams, hours at the reference rate) has not been observed in a live run.
 - [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles, retaining authenticated management, matching digests, drain barriers, bounded retries and old-epoch rejection. Cross-profile selection is currently startup-only. SW-13 does not narrow or complete this gate.
-- [ ] [SW-13] Negotiated in-place change of the swift policy (budgets, channels, repair window and proportion, path MTU) on a live session: proposal and digest agreement on the retained authenticated stream, then a per-direction drain barrier, with datagram numbers and keys never reset. Implemented with focused tests ([control messages](../../crates/l2tunnel-swift/src/control.rs), [engine state machine, refusal and violation tests, two-runtime loopback test with two changes under traffic](../../crates/l2tunnel-runtime/src/swift.rs), [service and local `set-swift`](../../crates/l2tunnel-client-core/src/service/tests/swift.rs)); the [saved focused check](../../work/udp-framing-wording-20261113-final/focused-validation.json) passed, but the required aggregate check failed and [native receipts are mixed](#policy-change-receipts). Complete the failure/deadline and native qualification gates before checking this item. Its Swift-specific policy change is not a substitute for SW-11.
+- [ ] [SW-13] Negotiated in-place change of the swift policy (budgets, channels, repair window and proportion, path MTU) on a live session: proposal and digest agreement on the retained authenticated stream, then a per-direction drain barrier, with datagram numbers and keys never reset. Implemented with focused tests ([control messages](../../crates/l2tunnel-swift/src/control.rs), [engine state machine, refusal and violation tests, two-runtime loopback test with two changes under traffic](../../crates/l2tunnel-runtime/src/swift.rs), [service and local `set-swift`](../../crates/l2tunnel-client-core/src/service/tests/swift.rs)); the original total deadline now covers silent proposal/barrier waits, receive flushing and terminal control writes, with injected-time and paused-runtime regressions. See the [checkpoint validation result and source identity](../../work/swift-policy-deadline-20261113/validation.json). The earlier [focused check](../../work/udp-framing-wording-20261113-final/focused-validation.json) passed, but its required aggregate check failed and [native receipts are mixed](#policy-change-receipts). Complete the remaining failure and native qualification gates before checking this item. Its Swift-specific policy change is not a substitute for SW-11.
 - [ ] [SW-14] Compose the pure Swift algorithm over the explicitly selected carrier and common secure session, without an independent Swift connection/default or mandatory separate TCP/TLS bootstrap. Preserve packing, exact header records, channels, retransmission and optional repairs; prove handshake/data/control socket and five-tuple continuity, exact bytes, replay rejection, carrier overhead and unsupported-combination reporting. Implementation depends on the [common secure-session gates](secure-session.md).
 - [ ] [SW-15] Move Swift policy changes and full SW-11 switching onto the common authenticated session-control service, independent of data profile and carrier. Retain digest agreement, per-direction drain, idempotent retries, original deadlines, delayed old feedback rejection and bounded control progress under saturated traffic. Preserve all other record profiles and Python parity requirements.
 - [ ] [SW-16] Qualify fixed-peer bounded automatic recovery through the shared client/service API, enabled by default in the target design. Retain eligible logical-session delivery and mode-transaction state through temporary path loss and security-key refresh; distinguish peer state loss or explicit replacement sessions requiring authenticated reconciliation or reported loss. Bound liveness, proposal, barrier and retry waits and expose requested/effective recovery state and terminal failure. Test short loss, silent blackholes, restored paths, explicit disconnect and failed reauthentication without changing the host's network state.
@@ -175,20 +175,27 @@ and ordered:
    numbered below `first_number`, and feedback numbered below
    `feedback_from`, belong to the drained epoch and are ignored.
 
-The two directions cross their barriers independently; the epoch is committed
-when both have. Focused tests exercise exact ordered delivery across this change;
+The two directions cross their barriers independently; the local epoch is committed
+when both have and the terminal control frames have finished writing. This does
+not prove the peer observed the last acknowledgement. Focused tests exercise exact ordered delivery across this change;
 that does not prove loss-free switching under every device or outage condition.
-A direction that cannot drain within ten seconds ends the session with an error
-rather than switching unilaterally. A message that does not fit the current state
+One original ten-second deadline covers the proposal, drain, receive flushing and
+barrier phases, including pending terminal control writes. It begins when the
+runtime proposes or first accepts the change; identical repeated proposals keep
+their idempotent reply without extending the deadline. A message that does not fit the current state
 ends the session. Only the coordinator proposes; the peer accepts any policy that
 is valid for the session, so the connecting side controls both budgets. A new
 session (reconnect or restart) starts again from the configured policy.
 
-This control protocol assumes a retained reliable TLS stream. The current
-five-second write bound only limits writing a control frame into that stream;
-there is no general Swift heartbeat/dead-peer deadline, and proposal-response
-and barrier-acknowledgement waits have no complete transaction deadline.
-A silent connection can therefore leave a change pending. General common-control
+This control protocol assumes a retained reliable TLS stream. Each control write
+is bounded by the earlier of its five-second write limit and the original
+transaction deadline. A timeout ends the runtime with `TimedOut` and emits a
+terminal snapshot; the pending requester receives `Closed`, exposed by the shared
+service as `OutcomeUnknown`, never successful application or rollback. A direction
+may already have changed behind its barrier, so the session ends rather than
+unilaterally restoring the old state. These current-profile bounds do not select
+the future common session's timer values. There is still no general Swift
+heartbeat/dead-peer deadline outside a policy change. General common-control
 retry, reconciliation and cross-profile switching remain required by SW-11,
 SW-15 and SW-16; a successful local `set-swift` is not evidence for those gates.
 
@@ -273,4 +280,7 @@ failed Clippy in `l2tunnel-runtime::swift` (`manual_is_multiple_of` in a test).
 The [separate focused receipt](../../work/udp-framing-wording-20261113-final/focused-validation.json)
 records 467 passing Rust test executions including doctests and passing rustdoc,
 with the required aggregate check still failed. Neither is a fresh check of
-these documentation edits, a native lab run, remote CI or platform qualification.
+the policy-deadline correction, a native lab run, remote CI or platform qualification.
+The [policy-deadline checkpoint](../../work/swift-policy-deadline-20261113/validation.json)
+records its local validation result and source identity; the historical receipts
+above remain unchanged.

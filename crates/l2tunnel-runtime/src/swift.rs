@@ -19,11 +19,12 @@ use ring::{aead, hkdf};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 /// Packet number and authentication tag added to every engine datagram body.
 pub const PROTECTION_BYTES: usize = 24;
@@ -125,8 +126,9 @@ pub struct Snapshot {
     pub policy: Option<Policy>,
 }
 
-/// Longest a direction may take to confirm everything it sent before its
-/// barrier; a session that cannot drain in this time ends with an error.
+/// Original total bound for the current profile's policy change, including
+/// proposal, drain and both barriers. The retained name preserves the public
+/// API; a duplicate message never extends this bound.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Both directions of one endpoint's configuration for a proposed policy,
@@ -141,7 +143,9 @@ pub struct Resolved {
     pub digest: [u8; 32],
 }
 
-/// Why a locally requested policy change did not happen. Nothing changed.
+/// Why a locally requested policy change did not report completion. A refusal
+/// preserves the current policy; an ended session can have a partial or unknown
+/// peer outcome and never implies rollback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SwitchError {
     /// Another change is in progress.
@@ -212,9 +216,7 @@ enum SendPhase {
     /// Proposed, not agreed: still forwarding under the old policy.
     Proposed,
     /// Agreed: admission stopped, waiting for every source to be confirmed.
-    Draining {
-        since: u64,
-    },
+    Draining,
     /// Barrier sent, waiting for the peer to replace its receiving state.
     Barrier,
     Done,
@@ -230,6 +232,7 @@ enum ReceivePhase {
 }
 struct Change {
     epoch: u64,
+    deadline: u64,
     policy: Policy,
     resolved: Resolved,
     send: SendPhase,
@@ -709,7 +712,11 @@ impl Engine {
             .iter()
             .any(|receiver| receiver.deadline().is_some())
             .then_some(self.feedback_at);
-        match (send, feedback) {
+        let activity = match (send, feedback) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match (activity, self.change.as_ref().map(|change| change.deadline)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -833,6 +840,7 @@ impl Engine {
     /// derivation of the policy.
     fn request(
         &mut self,
+        now: u64,
         policy: Policy,
         resolved: io::Result<Resolved>,
     ) -> Result<(), SwitchError> {
@@ -853,14 +861,33 @@ impl Engine {
             .policy_epoch
             .checked_add(1)
             .ok_or(SwitchError::Invalid)?;
+        let deadline = now
+            .checked_add(DRAIN_TIMEOUT.as_micros() as u64)
+            .ok_or(SwitchError::Invalid)?;
         self.change = Some(Change {
             epoch,
+            deadline,
             policy,
             resolved,
             send: SendPhase::Proposed,
             receive: ReceivePhase::Open,
         });
         self.outbox.push_back(Message::Propose { epoch, policy });
+        Ok(())
+    }
+    /// Every phase shares the original deadline. Check before a received
+    /// message can change state or a progress turn can report completion.
+    fn check_change_deadline(&self, now: u64) -> io::Result<()> {
+        if self
+            .change
+            .as_ref()
+            .is_some_and(|change| now >= change.deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "swift policy change exceeded its original deadline",
+            ));
+        }
         Ok(())
     }
     /// Apply one control message from the authenticated stream. A message
@@ -871,6 +898,7 @@ impl Engine {
         message: Message,
         resolve: &dyn Fn(&Policy) -> io::Result<Resolved>,
     ) -> io::Result<()> {
+        self.check_change_deadline(now)?;
         let violation = || io::Error::new(io::ErrorKind::InvalidData, "swift control out of state");
         match message {
             Message::Propose { epoch, policy } => {
@@ -891,11 +919,15 @@ impl Engine {
                 } else if self.snapshot.policy_epoch.checked_add(1) != Some(epoch) {
                     refuse(Refusal::Epoch)
                 } else if let Ok(resolved) = resolve(&policy) {
+                    let deadline = now
+                        .checked_add(DRAIN_TIMEOUT.as_micros() as u64)
+                        .ok_or_else(|| io::Error::other("swift policy deadline exhausted"))?;
                     self.change = Some(Change {
                         epoch,
+                        deadline,
                         policy,
                         resolved,
-                        send: SendPhase::Draining { since: now },
+                        send: SendPhase::Draining,
                         receive: ReceivePhase::Open,
                     });
                     Message::Accept {
@@ -918,7 +950,7 @@ impl Engine {
                         "swift peers derived different configurations",
                     ));
                 }
-                change.send = SendPhase::Draining { since: now };
+                change.send = SendPhase::Draining;
             }
             Message::Reject { epoch, .. } => {
                 let change = self.change.as_ref().ok_or_else(violation)?;
@@ -1007,26 +1039,21 @@ impl Engine {
     /// has drained, replace receiving state once the peer's barrier arrived
     /// and everything held was delivered, and commit when both are done.
     fn progress(&mut self, now: u64) -> io::Result<()> {
+        self.check_change_deadline(now)?;
         let Some(change) = self.change.as_mut() else {
             return Ok(());
         };
-        if let SendPhase::Draining { since } = change.send {
-            if self
+        if change.send == SendPhase::Draining
+            && self
                 .senders
                 .iter()
                 .all(|sender| sender.unconfirmed() == 0 && sender.queued() == 0)
-            {
-                change.send = SendPhase::Barrier;
-                self.outbox.push_back(Message::Barrier {
-                    epoch: change.epoch,
-                    first_number: self.number,
-                });
-            } else if now.saturating_sub(since) > DRAIN_TIMEOUT.as_micros() as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "swift policy change could not drain in time",
-                ));
-            }
+        {
+            change.send = SendPhase::Barrier;
+            self.outbox.push_back(Message::Barrier {
+                epoch: change.epoch,
+                first_number: self.number,
+            });
         }
         if let ReceivePhase::Flushing { first_number } = change.receive
             && self.ready == 0
@@ -1053,6 +1080,7 @@ impl Engine {
         if let Some(change) = &self.change
             && change.send == SendPhase::Done
             && change.receive == ReceivePhase::Done
+            && self.outbox.is_empty()
         {
             self.snapshot.policy_epoch = change.epoch;
             self.snapshot.policy = Some(change.policy);
@@ -1140,13 +1168,19 @@ where
     let mut interval = config.report_interval.map(tokio::time::interval);
     let mut read = vec![0; READ_BUFFER_BYTES];
     let mut datagram = vec![0; 65_536];
-    let result = loop {
+    let result = async {
+        loop {
         let now = micros(start);
         engine.progress(now)?;
         while let Some(message) = engine.outbox.pop_front() {
             frame.clear();
             message.encode(&mut frame);
-            tokio::time::timeout(CONTROL_WRITE, async {
+            let write_started = micros(start);
+            engine.check_change_deadline(write_started)?;
+            let write_limit = engine.change.as_ref().map_or(CONTROL_WRITE, |change| {
+                CONTROL_WRITE.min(Duration::from_micros(change.deadline - write_started))
+            });
+            tokio::time::timeout(write_limit, async {
                 writer.write_all(&frame).await?;
                 writer.flush().await
             })
@@ -1155,6 +1189,11 @@ where
                 io::Error::new(io::ErrorKind::TimedOut, "swift control write stalled")
             })??;
         }
+        // A terminal BarrierAck may have been queued by the first progress
+        // turn. Commit only after that write actually completed and a fresh
+        // time sample still satisfies the original transaction deadline.
+        let now = micros(start);
+        engine.progress(now)?;
         if let Some(outcome) = engine.outcome.take()
             && let Some(reply) = waiting.take()
         {
@@ -1189,8 +1228,8 @@ where
         let wait = if engine.deliverable() {
             Duration::ZERO
         } else {
-            // A change in progress is re-examined at least this often, so
-            // its drain deadline is noticed on an otherwise silent path.
+            // `wake` includes the original policy-change deadline, even
+            // when no datagram or control message arrives.
             let idle = if engine.change.is_some() {
                 Duration::from_millis(100)
             } else {
@@ -1200,6 +1239,9 @@ where
                 Duration::from_micros(at.saturating_sub(now).max(200)).min(idle)
             })
         };
+        let wait = engine.change.as_ref().map_or(wait, |change| {
+            wait.min(Duration::from_micros(change.deadline - now))
+        });
         tokio::select! {
             biased;
             read = reader.read(&mut chunk) => {
@@ -1219,7 +1261,7 @@ where
             }
             request = next_request(&mut requests), if waiting.is_none() => {
                 match request {
-                    Some((policy, reply)) => match engine.request(policy, resolve(&policy)) {
+                    Some((policy, reply)) => match engine.request(micros(start), policy, resolve(&policy)) {
                         Ok(()) => waiting = Some(reply),
                         Err(error) => {
                             let _ = reply.send(Err(error));
@@ -1261,7 +1303,9 @@ where
             _ = tokio::time::sleep(wait) => {}
             _ = tick(&mut interval) => report(&engine.snapshot(micros(start))),
         }
-    };
+        }
+    }
+    .await;
     report(&engine.snapshot(micros(start)));
     result
 }
@@ -1672,9 +1716,9 @@ mod tests {
                     right.accept(now + 1, wire)?;
                 }
                 stale_feedback = right.produce(now + 10_000)?.map(<[u8]>::to_vec);
-                assert_eq!(left.request(policy, resolver(true)(&policy)), Ok(()));
+                assert_eq!(left.request(now, policy, resolver(true)(&policy)), Ok(()));
                 assert_eq!(
-                    left.request(policy, resolver(true)(&policy)),
+                    left.request(now, policy, resolver(true)(&policy)),
                     Err(SwitchError::Busy)
                 );
             }
@@ -1740,18 +1784,18 @@ mod tests {
         // Only the coordinator proposes, and only valid policies.
         let (mut left, mut right) = fresh()?;
         assert_eq!(
-            right.request(policy, server(&policy)),
+            right.request(0, policy, server(&policy)),
             Err(SwitchError::NotCoordinator)
         );
         let invalid = test_policy(0, 0, 1400, 16_000);
         assert_eq!(
-            left.request(invalid, client(&invalid)),
+            left.request(0, invalid, client(&invalid)),
             Err(SwitchError::Invalid)
         );
         assert!(left.outbox.is_empty() && left.change.is_none());
         // The peer refuses what it cannot derive; nothing changes and
         // forwarding continues.
-        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        assert_eq!(left.request(0, policy, client(&policy)), Ok(()));
         let propose = left
             .outbox
             .pop_front()
@@ -1836,7 +1880,7 @@ mod tests {
         assert!(left.on_control(0, propose, &*client).is_err());
         // Agreement on a different configuration ends the session.
         let (mut left, _) = fresh()?;
-        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        assert_eq!(left.request(0, policy, client(&policy)), Ok(()));
         let mismatch = Message::Accept {
             epoch: 1,
             digest: [0xEE; 32],
@@ -1845,14 +1889,14 @@ mod tests {
         // A barrier may not precede agreement, and an acknowledgement may
         // not precede the barrier.
         let (mut left, _) = fresh()?;
-        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        assert_eq!(left.request(0, policy, client(&policy)), Ok(()));
         let early = Message::Barrier {
             epoch: 1,
             first_number: 0,
         };
         assert!(left.on_control(0, early, &*client).is_err());
         let (mut left, _) = fresh()?;
-        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        assert_eq!(left.request(0, policy, client(&policy)), Ok(()));
         let digest = client(&policy)?.digest;
         left.on_control(0, Message::Accept { epoch: 1, digest }, &*client)?;
         let early = Message::BarrierAck {
@@ -1865,7 +1909,7 @@ mod tests {
         let (mut left, _) = fresh()?;
         left.offer(0, &segment(9, 0, 700))?;
         assert!(left.produce(1_000)?.is_some());
-        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        assert_eq!(left.request(1_000, policy, client(&policy)), Ok(()));
         left.on_control(1_000, Message::Accept { epoch: 1, digest }, &*client)?;
         left.progress(2_000)?;
         assert!(
@@ -1874,8 +1918,8 @@ mod tests {
                 .all(|message| !matches!(message, Message::Barrier { .. }))
         );
         let deadline = 1_000 + DRAIN_TIMEOUT.as_micros() as u64;
-        left.progress(deadline)?;
-        let error = left.progress(deadline + 1).err();
+        left.progress(deadline - 1)?;
+        let error = left.progress(deadline).err();
         assert_eq!(
             error.map(|error| error.kind()),
             Some(io::ErrorKind::TimedOut)
@@ -1903,6 +1947,151 @@ mod tests {
         // Nothing is deliverable: the first source never arrived.
         assert!(right.pop()?.is_none());
         assert!(right.progress(2_000).is_err());
+        Ok(())
+    }
+
+    /// A peer that never answers the proposal cannot leave an operation
+    /// pending indefinitely. User packets still cross under the old policy
+    /// before the original deadline, and a late acceptance cannot commit it.
+    #[test]
+    fn policy_change_silent_proposal_preserves_old_data_until_original_deadline() -> io::Result<()>
+    {
+        let (mut left, mut right) = pair(2_500_000, 4)?;
+        left.coordinator = true;
+        let original = left.config;
+        let policy = test_policy(2, 0, 1400, 16_000);
+        let client = resolver(true);
+        let started = 1_000;
+        let deadline = started + DRAIN_TIMEOUT.as_micros() as u64;
+        assert_eq!(left.request(started, policy, client(&policy)), Ok(()));
+        assert!(left.has_room());
+        let packet = segment(9, 0, 700);
+        left.offer(started, &packet)?;
+        let wire = left
+            .produce(started + 1_000)?
+            .ok_or_else(|| io::Error::other("no old-policy datagram"))?;
+        right.accept(started + 1_000, wire)?;
+        assert_eq!(right.pop()?, Some(packet.as_slice()));
+        left.progress(deadline - 1)?;
+        assert_eq!(left.config, original);
+        assert_eq!(
+            left.change.as_ref().map(|change| change.send),
+            Some(SendPhase::Proposed)
+        );
+        assert_eq!(
+            left.progress(deadline).err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        let digest = client(&policy)?.digest;
+        assert_eq!(
+            left.on_control(deadline, Message::Accept { epoch: 1, digest }, &*client)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(left.snapshot.policy_epoch, 0);
+        assert!(left.snapshot.policy.is_none() && left.outcome.is_none());
+        assert_eq!(left.config, original);
+        Ok(())
+    }
+
+    /// Time waiting for acceptance belongs to the same transaction as the
+    /// barrier wait. Silence after a barrier cannot gain another full bound.
+    #[test]
+    fn policy_change_silent_barrier_expires_at_original_proposal_deadline() -> io::Result<()> {
+        let (mut left, _) = pair(2_500_000, 4)?;
+        left.coordinator = true;
+        let original = left.config;
+        let policy = test_policy(2, 0, 1400, 16_000);
+        let client = resolver(true);
+        let started = 1_000;
+        let deadline = started + DRAIN_TIMEOUT.as_micros() as u64;
+        assert_eq!(left.request(started, policy, client(&policy)), Ok(()));
+        let digest = client(&policy)?.digest;
+        left.on_control(deadline - 2, Message::Accept { epoch: 1, digest }, &*client)?;
+        left.progress(deadline - 1)?;
+        assert_eq!(
+            left.change.as_ref().map(|change| change.send),
+            Some(SendPhase::Barrier)
+        );
+        assert!(
+            left.outbox
+                .iter()
+                .any(|message| matches!(message, Message::Barrier { epoch: 1, .. }))
+        );
+        assert_eq!(left.wake(deadline - 1), Some(deadline));
+        assert!(!left.has_room());
+        assert_eq!(
+            left.progress(deadline).err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(
+            left.on_control(
+                deadline,
+                Message::BarrierAck {
+                    epoch: 1,
+                    feedback_from: 0,
+                },
+                &*client,
+            )
+            .err()
+            .map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(left.config, original);
+        assert_eq!(left.snapshot.policy_epoch, 0);
+        assert!(left.snapshot.policy.is_none() && left.outcome.is_none());
+        Ok(())
+    }
+
+    /// An acceptor holding actual deliverable old data must finish flushing
+    /// under its original proposal deadline. Identical proposals keep their
+    /// idempotent reply but cannot renew the deadline or report a commit.
+    #[test]
+    fn policy_change_duplicate_proposal_cannot_renew_receive_flush_deadline() -> io::Result<()> {
+        let (mut left, mut right) = pair(2_500_000, 4)?;
+        let original = right.receive;
+        let packet = segment(9, 0, 700);
+        left.offer(0, &packet)?;
+        let wire = left
+            .produce(1_000)?
+            .ok_or_else(|| io::Error::other("no datagram before the proposal"))?;
+        right.accept(1_000, wire)?;
+        assert!(right.deliverable());
+        let policy = test_policy(2, 0, 1400, 16_000);
+        let server = resolver(false);
+        let proposal = Message::Propose { epoch: 1, policy };
+        let deadline = 1_000 + DRAIN_TIMEOUT.as_micros() as u64;
+        right.on_control(1_000, proposal, &*server)?;
+        let accepted = right.outbox.pop_front();
+        right.on_control(
+            1_000,
+            Message::Barrier {
+                epoch: 1,
+                first_number: left.number,
+            },
+            &*server,
+        )?;
+        right.progress(deadline - 1)?;
+        assert!(matches!(
+            right.change.as_ref().map(|change| change.receive),
+            Some(ReceivePhase::Flushing { .. })
+        ));
+        right.outbox.clear();
+        right.on_control(deadline - 1, proposal, &*server)?;
+        assert_eq!(right.outbox.pop_front(), accepted);
+        assert_eq!(
+            right.change.as_ref().map(|change| change.deadline),
+            Some(deadline)
+        );
+        assert_eq!(
+            right.progress(deadline).err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(right.receive, original);
+        assert_eq!(right.snapshot.policy_epoch, 0);
+        assert!(right.snapshot.policy.is_none() && right.outcome.is_none());
+        assert_eq!(right.pop()?, Some(packet.as_slice()));
         Ok(())
     }
 
@@ -1948,7 +2137,7 @@ mod tests {
         let mut now = 0u64;
         while now < u64::from(frames) * 200_000 + 5_000_000 {
             now += 500;
-            if now % 200_000 == 0 && sent_at[0].len() < frames as usize {
+            if now.is_multiple_of(200_000) && sent_at[0].len() < frames as usize {
                 for (side, engine) in [&mut left, &mut right].into_iter().enumerate() {
                     engine.offer(now, &segment(0, sent_at[side].len() as u32, 1500))?;
                     sent_at[side].push(now);
@@ -2103,6 +2292,217 @@ mod tests {
         fn transmit(&mut self, packet: &[u8]) -> io::Result<()> {
             self.0.send(packet).map(drop)
         }
+    }
+
+    struct DeadlineRuntime {
+        task: tokio::task::JoinHandle<io::Result<()>>,
+        switch: Switcher,
+        peer: tokio::io::DuplexStream,
+        reports: std::sync::Arc<std::sync::Mutex<Vec<Snapshot>>>,
+        _application: std::os::unix::net::UnixDatagram,
+        _udp_peer: UdpSocket,
+    }
+
+    async fn deadline_runtime(control_capacity: usize) -> io::Result<DeadlineRuntime> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_peer = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(udp_peer.local_addr()?).await?;
+        udp_peer.connect(socket.local_addr()?).await?;
+        let (device, application) = std::os::unix::net::UnixDatagram::pair()?;
+        device.set_nonblocking(true)?;
+        let (control, peer) = tokio::io::duplex(control_capacity);
+        let (switch, requests) = switcher();
+        let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = reports.clone();
+        let task = tokio::spawn(async move {
+            run(
+                Pipe(device),
+                socket,
+                Keys {
+                    send: &[5; 32],
+                    receive: &[6; 32],
+                },
+                config(2_500_000, 4),
+                control,
+                Switching {
+                    coordinator: true,
+                    requests: Some(requests),
+                    resolve: resolver(true),
+                },
+                move |snapshot| {
+                    sink.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(*snapshot);
+                },
+            )
+            .await
+        });
+        Ok(DeadlineRuntime {
+            task,
+            switch,
+            peer,
+            reports,
+            _application: application,
+            _udp_peer: udp_peer,
+        })
+    }
+
+    async fn read_control(peer: &mut tokio::io::DuplexStream) -> io::Result<Message> {
+        let mut prefix = [0; 2];
+        peer.read_exact(&mut prefix).await?;
+        let length = usize::from(u16::from_be_bytes(prefix));
+        if length + prefix.len() > codec::control::MAX_FRAME {
+            return Err(io::Error::other("oversized test control message"));
+        }
+        let mut frame = vec![0; length + prefix.len()];
+        frame[..prefix.len()].copy_from_slice(&prefix);
+        peer.read_exact(&mut frame[prefix.len()..]).await?;
+        Message::decode(&frame)
+            .map_err(protocol)?
+            .map(|(message, _)| message)
+            .ok_or_else(|| io::Error::other("incomplete test control message"))
+    }
+
+    async fn write_control(peer: &mut tokio::io::DuplexStream, message: Message) -> io::Result<()> {
+        let mut frame = Vec::new();
+        message.encode(&mut frame);
+        peer.write_all(&frame).await
+    }
+
+    /// An otherwise silent real runtime must wake at the original policy
+    /// deadline in both proposal and barrier waits, emit its terminal report
+    /// and close the requester without reporting an applied epoch.
+    #[tokio::test(start_paused = true)]
+    async fn runtime_policy_change_silence_expires_and_reports_at_original_deadline()
+    -> io::Result<()> {
+        for barrier in [false, true] {
+            let mut runtime = deadline_runtime(128).await?;
+            let started = Instant::now();
+            let policy = test_policy(2, 0, 1400, 16_000);
+            let switch = runtime.switch.clone();
+            let change = tokio::spawn(async move { switch.switch(policy).await });
+            assert!(matches!(
+                read_control(&mut runtime.peer).await?,
+                Message::Propose { epoch: 1, .. }
+            ));
+            tokio::time::advance(DRAIN_TIMEOUT - Duration::from_millis(1)).await;
+            if barrier {
+                write_control(
+                    &mut runtime.peer,
+                    Message::Accept {
+                        epoch: 1,
+                        digest: resolver(true)(&policy)?.digest,
+                    },
+                )
+                .await?;
+                assert!(matches!(
+                    read_control(&mut runtime.peer).await?,
+                    Message::Barrier { epoch: 1, .. }
+                ));
+            }
+            assert!(!runtime.task.is_finished() && !change.is_finished());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let result = tokio::time::timeout(Duration::from_millis(1), runtime.task)
+                .await
+                .map_err(io::Error::other)?
+                .map_err(io::Error::other)?;
+            assert_eq!(
+                result.err().map(|error| error.kind()),
+                Some(io::ErrorKind::TimedOut)
+            );
+            assert_eq!(Instant::now().duration_since(started), DRAIN_TIMEOUT);
+            assert_eq!(
+                change.await.map_err(io::Error::other)?,
+                Err(SwitchError::Closed)
+            );
+            let reports = runtime
+                .reports
+                .lock()
+                .map_err(|_| io::Error::other("reports poisoned"))?;
+            assert_eq!(reports.len(), 1, "timeout skipped the terminal report");
+            assert_eq!(reports[0].elapsed_micros, DRAIN_TIMEOUT.as_micros() as u64);
+            assert_eq!(reports[0].policy_epoch, 0);
+            assert!(reports[0].policy.is_none());
+        }
+        Ok(())
+    }
+
+    /// Both directions can change locally before the terminal acknowledgement
+    /// finishes writing. A blocked final write still shares the original
+    /// deadline and cannot publish a successful committed epoch or roll back.
+    #[tokio::test(start_paused = true)]
+    async fn runtime_policy_change_blocked_terminal_ack_keeps_original_deadline() -> io::Result<()>
+    {
+        let mut runtime = deadline_runtime(1).await?;
+        let started = Instant::now();
+        let policy = test_policy(2, 0, 1400, 16_000);
+        let switch = runtime.switch.clone();
+        let change = tokio::spawn(async move { switch.switch(policy).await });
+        assert!(matches!(
+            read_control(&mut runtime.peer).await?,
+            Message::Propose { epoch: 1, .. }
+        ));
+        write_control(
+            &mut runtime.peer,
+            Message::Accept {
+                epoch: 1,
+                digest: resolver(true)(&policy)?.digest,
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_control(&mut runtime.peer).await?,
+            Message::Barrier { epoch: 1, .. }
+        ));
+        tokio::time::advance(DRAIN_TIMEOUT - Duration::from_millis(1)).await;
+        write_control(
+            &mut runtime.peer,
+            Message::BarrierAck {
+                epoch: 1,
+                feedback_from: 0,
+            },
+        )
+        .await?;
+        write_control(
+            &mut runtime.peer,
+            Message::Barrier {
+                epoch: 1,
+                first_number: 0,
+            },
+        )
+        .await?;
+        // Observe the start of the terminal BarrierAck, then stop reading.
+        // The one-byte control buffer cannot hold its remaining frame.
+        let mut first = [0; 1];
+        runtime.peer.read_exact(&mut first).await?;
+        assert_eq!(first, [0]);
+        assert!(!runtime.task.is_finished() && !change.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let result = tokio::time::timeout(Duration::from_millis(1), runtime.task)
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(Instant::now().duration_since(started), DRAIN_TIMEOUT);
+        assert_eq!(
+            change.await.map_err(io::Error::other)?,
+            Err(SwitchError::Closed)
+        );
+        let reports = runtime
+            .reports
+            .lock()
+            .map_err(|_| io::Error::other("reports poisoned"))?;
+        assert_eq!(
+            reports.len(),
+            1,
+            "write timeout skipped the terminal report"
+        );
+        assert_eq!(reports[0].policy_epoch, 0);
+        assert!(reports[0].policy.is_none());
+        Ok(())
     }
 
     /// Two complete runtimes over real loopback UDP sockets and readiness-
