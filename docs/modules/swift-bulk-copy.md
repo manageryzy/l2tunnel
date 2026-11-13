@@ -207,8 +207,12 @@ aggregate count. The [first aggregate attempt](../../work/swift-bulk-copy-202611
 failed before Cargo at the checklist formatting gate because newly checked SBC
 rows lacked inline evidence links. Adding those links preserved every task
 ID/definition and all tests, deadlines and thresholds. That failure remains
-preserved. SBC-06 stays unchecked until evidence-only reconciliation and an
-exact-byte coherent local checkpoint have both actually completed.
+preserved. The [evidence-only reconciliation](../../work/swift-bulk-copy-20261113/aggregate-attempt-2/postcheck/ledger-1/validation.json)
+passed with all non-document inputs equal to the required aggregate, 409 local
+links checked and no link errors. The [completed source checkpoint](../../work/swift-bulk-copy-20261113/commit-binding-attempt-1/validation.json)
+is commit 677b23b; all 13 committed files match the verified ledger bytes and its
+worktree was clean. SBC-06 now records these actually completed scoped checks
+and checkpoint, while SBC-04 and every parent performance/mode gate remain open.
 These are local Linux checks, not Windows/Android builds/devices, remote CI,
 ISP QoS classification or the complete platform/native matrix.
 
@@ -219,7 +223,7 @@ ISP QoS classification or the complete platform/native matrix.
 - [x] [SBC-03] Execute source-stable paired CPU-only measurements with identical real-engine workloads/example bytes and immutable pre/post executables; preserve raw results and distinguish copied bytes, capacity growth and unmeasured allocations. Evidence: [immutable ABBA measurements](../../work/swift-bulk-copy-20261113/cpu-abba-attempt-1/validation.json).
 - [ ] [SBC-04] Run finite matched native pre/post observations for both impaired appearances and a clean control; retain complete integrity/control/cleanup, source/binary identity, pressure/CPU scope and the unchanged80Mbit/s acceptance result. Evidence: [six terminal observations](../../work/swift-bulk-copy-20261113/native-analysis-attempt-1/analysis.json). The finite matrix is recorded, but both clean capture completeness checks failed, so this gate remains open.
 - [x] [SBC-05] Evaluate whether observed CPU/native differences support the correction, identify remaining wire/queue/scheduling limits and preserve failures without claiming a unique bottleneck or closing parent performance/mode gates. Evidence: [CPU comparison](../../work/swift-bulk-copy-20261113/cpu-comparison-attempt-1/validation.json) and [native/resource analysis](../../work/swift-bulk-copy-20261113/native-analysis-attempt-1/analysis.json).
-- [ ] [SBC-06] Pass focused tests, strict Clippy/rustdoc, the required frozen-source workspace check and evidence-only ledger reconciliation; commit a coherent local checkpoint with exact validated bytes.
+- [x] [SBC-06] Pass focused tests, strict Clippy/rustdoc, the required frozen-source workspace check and evidence-only ledger reconciliation; commit a coherent local checkpoint with exact validated bytes. Evidence: [required aggregate](../../work/swift-bulk-copy-20261113/aggregate-attempt-2/validation.json), [passed ledger reconciliation](../../work/swift-bulk-copy-20261113/aggregate-attempt-2/postcheck/ledger-1/validation.json) and [completed exact-byte local source checkpoint](../../work/swift-bulk-copy-20261113/commit-binding-attempt-1/validation.json).
 
 The full SNL-08/SNL-09/SNL-11, FIX-02/FIX-04/FIX-09, SW-11, carrier/lifecycle/platform
 and all 47 P-* requirements remain required at their existing scope. Historical
