@@ -81,6 +81,7 @@ where
     let result:io::Result<StopReason>=async {
         loop {
             let instant=Instant::now();let now=clock(origin,instant)?;
+            if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.collect_native(now)?;
             driver.progress(now)?;
             if let Some(reason)=driver.terminal {break Ok(reason);}
@@ -103,10 +104,12 @@ where
                 readable=socket.readable(),if driver.ingress.left>0=>{
                     readable?;
                     for _ in 0..driver.config.work.receive_packets.min(driver.ingress.left) {
+                        if !driver.check_expiry(clock(origin,Instant::now())?)? {break;}
                         driver.ingress.left-=1;
                         match socket.try_recv(&mut datagram) {
                             Ok(length)=>{
                                 let at=Instant::now();let time=clock(origin,at)?;
+                                if !driver.check_expiry(time)? {break;}
                                 if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive(&datagram[..length],time,at,&resolve)?;}
                             },
                             Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
@@ -119,23 +122,12 @@ where
                     let mut ready=ready?;
                     if ready.ready().is_writable() && write_native {
                         for _ in 0..driver.config.work.native_write_batch {
-                            let Some(packet)=driver.native.front() else{break;};
-                            match try_native_write(&mut ready,&packet.bytes)? {
-                                true=>{let packet=driver.native.pop_front().ok_or_else(||protocol("native output ownership disappeared"))?;driver.native_bytes-=packet.bytes.len();driver.counters.native_written=driver.counters.native_written.saturating_add(1);},
-                                false=>break,
-                            }
+                            if !driver.write_native(&mut ready,||clock(origin,Instant::now()))? {break;}
                         }
                     }
                     if ready.ready().is_readable() && read_native {
                         for _ in 0..driver.config.work.native_read_batch {
-                            if !driver.coordinator.admission_allowed() || !driver.swift.has_room(){break;}
-                            let Some(length)=try_native_read(&mut ready,&mut native)? else{break;};
-                            if length==0 || length>driver.config.send.records.max_native || length>native.len() {driver.counters.native_oversize=driver.counters.native_oversize.saturating_add(1);continue;}
-                            match driver.swift.offer(clock(origin,Instant::now())?,&native[..length]).map_err(protocol)? {
-                                records::Admission::Accepted=>driver.counters.native_read=driver.counters.native_read.saturating_add(1),
-                                records::Admission::PacketSize=>driver.counters.native_oversize=driver.counters.native_oversize.saturating_add(1),
-                                records::Admission::Full=>return Err(protocol("Swift admission changed without another producer")),
-                            }
+                            if !driver.read_native(&mut ready,&mut native,||clock(origin,Instant::now()))? {break;}
                         }
                     }
                 },
@@ -1151,10 +1143,15 @@ impl Driver {
         self.resolved = None;
         Ok(())
     }
-    fn progress(&mut self, now: u64) -> io::Result<()> {
+    // This guard has no delivery, policy-completion or refill side effects.
+    // Event branches must check fresh time before removing any original expiry.
+    fn check_expiry(&mut self, now: u64) -> io::Result<bool> {
+        if self.terminal.is_some() {
+            return Ok(false);
+        }
         if now >= self.lease {
             self.terminal = Some(StopReason::LeaseExpired);
-            return Ok(());
+            return Ok(false);
         }
         if self
             .challenge
@@ -1186,6 +1183,12 @@ impl Driver {
         self.coordinator
             .check(policy::Time(now))
             .map_err(protocol)?;
+        Ok(true)
+    }
+    fn progress(&mut self, now: u64) -> io::Result<()> {
+        if !self.check_expiry(now)? {
+            return Ok(());
+        }
         if let Some(pending) = &self.policy_source
             && self
                 .control
@@ -1237,6 +1240,17 @@ impl Driver {
         reply: Reply,
         resolve: &Resolver,
     ) -> io::Result<()> {
+        match self.check_expiry(now) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = reply.send(Err(SwitchError::Closed));
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = reply.send(Err(SwitchError::Closed));
+                return Err(error);
+            }
+        }
         if self.waiting.is_some() {
             let _ = reply.send(Err(SwitchError::Busy));
             return Ok(());
@@ -1492,11 +1506,9 @@ impl Driver {
                     }
                 }
                 Command::Pong(nonce) => {
-                    if self
-                        .challenge
-                        .as_ref()
-                        .is_some_and(|challenge| challenge.submitted && challenge.nonce == nonce)
-                    {
+                    if self.challenge.as_ref().is_some_and(|challenge| {
+                        challenge.submitted && challenge.nonce == nonce && now < challenge.deadline
+                    }) {
                         self.challenge = None;
                         self.live.outstanding = None;
                         self.live.deadline_micros = None;
@@ -1629,6 +1641,72 @@ impl Driver {
             });
         }
         Ok(())
+    }
+    fn read_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+        &mut self,
+        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        output: &mut [u8],
+        mut now: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<bool> {
+        if !self.check_expiry(now()?)?
+            || !self.coordinator.admission_allowed()
+            || !self.swift.has_room()
+        {
+            return Ok(false);
+        }
+        let received = try_native_read(ready, output);
+        let now = now()?;
+        if !self.check_expiry(now)? {
+            return Ok(false);
+        }
+        let Some(length) = received? else {
+            return Ok(false);
+        };
+        if length == 0 || length > self.config.send.records.max_native || length > output.len() {
+            self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
+            return Ok(true);
+        }
+        match self.swift.offer(now, &output[..length]).map_err(protocol)? {
+            records::Admission::Accepted => {
+                self.counters.native_read = self.counters.native_read.saturating_add(1);
+            }
+            records::Admission::PacketSize => {
+                self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
+            }
+            records::Admission::Full => {
+                return Err(protocol("Swift admission changed without another producer"));
+            }
+        }
+        Ok(true)
+    }
+    fn write_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+        &mut self,
+        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        mut now: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<bool> {
+        if !self.check_expiry(now()?)? {
+            return Ok(false);
+        }
+        let Some(packet) = self.native.front() else {
+            return Ok(false);
+        };
+        let result = try_native_write(ready, &packet.bytes);
+        // Keep the front packet and its original deadline through the fresh
+        // completion check. A successful physical handoff cannot be rolled back,
+        // including when sampling/checking time itself fails after that handoff.
+        let expiry = now().and_then(|now| self.check_expiry(now));
+        if matches!(&result, Ok(true)) {
+            let packet = self
+                .native
+                .pop_front()
+                .ok_or_else(|| protocol("native output ownership disappeared"))?;
+            self.native_bytes -= packet.bytes.len();
+            self.counters.native_written = self.counters.native_written.saturating_add(1);
+        }
+        if !expiry? {
+            return Ok(false);
+        }
+        result
     }
     fn handed(&mut self, socket: &tokio::net::UdpSocket, bytes: usize) -> io::Result<()> {
         let cost = bytes
@@ -1830,7 +1908,11 @@ impl Driver {
             + self.ip
             + self.reserve;
         let user_ready = self.bucket.ready_at(user_max)?;
-        if let Some(at) = self.swift.data_deadline() {
+        // Queued retransmissions and earned repairs are ready work even when
+        // the next idle-probe deadline is later than available wire credit.
+        if self.swift.data_ready(now) {
+            wake = wake.min(user_ready);
+        } else if let Some(at) = self.swift.data_deadline() {
             wake = wake.min(at.max(user_ready));
         }
         if let Some(at) = self.swift.feedback_deadline() {

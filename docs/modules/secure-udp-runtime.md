@@ -334,16 +334,55 @@ from a key interval, enum or successful compile. Unsupported requests remain
 observable and fail explicitly; no implicit recovery/default/carrier fallback
 is added by this scoped change.
 
+## Deadline and ready-work corrections
+
+The [first deadline-focused run](../../work/secure-udp-deadline-focused-20261113/attempt-1/validation.json)
+reproduced a matching authenticated Pong clearing its original challenge exactly
+at expiry. It also preserved a fixture assertion that assumed the wrong initial
+envelope number. The correction requires arrival strictly before the existing
+challenge deadline; exact or later arrivals retain the challenge and terminate
+with `PeerTimeout` on progress. The fixture now checks relative envelope progress.
+The [second focused run](../../work/secure-udp-deadline-focused-20261113/attempt-2/validation.json)
+passed all 20 transport tests and strict runtime Clippy with unchanged inputs.
+Its new tests use actual Noise/member roots and protected L2SC/control-ARQ
+dispatch for both covers with injected driver time. They verify immutable lease
+expiry, fresh stale/mismatched Pongs and exact/late matching Pongs without sleeps.
+
+The same source review found a separate native boundary: a writable
+device event can win after the original front-packet stall deadline, transmit
+and remove that obligation before the next expiry check. The reviewed correction
+extracts an expiry-only guard, checks fresh time before event effects and retains
+the original native obligation through completion checking. A late physical write
+cannot be rolled back or counted as unwritten: it is popped and counted exactly
+once, then the original expiry/error is reported. Six deterministic real-root,
+real-descriptor tests cover before/exact/after expiry, a call crossing the bound,
+completion-clock/check errors, lease admission and original terminal precedence.
+All six passed in the [28-test regression run](../../work/secure-udp-deadline-focused-20261113/attempt-3/validation.json),
+whose overall result remains failed because of the separate wakeup defects below.
+
+That run reproduced ready retransmissions and earned repairs sleeping until a
+later idle probe after the wire bucket was exhausted. The previous runtime
+checked data readiness before its idle deadline; the new driver had omitted that
+branch. Its correction wakes ready work at the existing full-packet credit time,
+while preserving the control reserve, future-data/feedback deadlines and100us
+re-observation floor. Wake calculation never emits, consumes credit or advances
+nonces/counters. The two regressions construct actual authenticated loss/request
+feedback or earned repairs with an empty packing queue and independently prove
+that other timers cannot mask the result. The [fourth focused run](../../work/secure-udp-deadline-focused-20261113/attempt-4/validation.json)
+passed all 28 transport tests and strict runtime Clippy with unchanged inputs.
+The source-stable failed runs remain preserved. Native validation of this final
+source remains separate from the earlier baseline performance receipts.
+
 ## Acceptance ledger
 
 - [x] [SUR-01] Freeze the exact runtime, immutable canonical binding, control/observer, typed wire, lifecycle, scope and bounded-native ownership APIs before implementation. Evidence: the design/API above was frozen before the [runtime implementation](../../crates/l2tunnel-runtime/src/secure_udp/transport.rs); [canonical-contract/resource regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs) passed in the [focused receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json).
 - [x] [SUR-02] Implement real native PacketDevice transport with the original member-authenticated socket, one reader, both retained tails, complete pure Swift records and common AEAD User/Control owners. Evidence: [runtime](../../crates/l2tunnel-runtime/src/secure_udp/transport.rs), [both-cover independent-runtime native fixture](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs), [focused passing receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json). Scope is actual AF_UNIX packet-device and loopback UDP I/O, without TAP/TUN or platform/performance qualification.
-- [ ] [SUR-03] Verify full-wire budgeting, fixed control reservation, every receive/work/native bound, parser/output/nonce preflight and original deadline behavior without busy loops or uncharged feedback. Partial evidence: [17 passing transport regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs) cover exact token credit, checked geometry/timers, parser-before-pressure, replay/tamper, preauthentication usage-guard rejection and expired tails with no allowance. The complete runtime hostile-ingress/quota and charged transient-loss matrix remains required.
-- [x] [SUR-04] Verify retained complete native output through WouldBlock and eventual exact device acceptance; bound permanent stalls and distinguish native storage, device completion and recovery retention. Evidence: [real AF_UNIX pressure, permanent-stall and opposite-readiness tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs), [focused receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json). The pressure fixture uses safe `socket2::SockRef` to request a small send buffer, requires a counter from an actual socket `WouldBlock` and retained bounded ownership, then checks all 64 exact FIFO packets and native-write completions. The permanent-stall case is a separately identified deterministic blocked adapter on a real descriptor.
+- [ ] [SUR-03] Verify full-wire budgeting, fixed control reservation, every receive/work/native bound, parser/output/nonce preflight and original deadline behavior without busy loops or uncharged feedback. Partial evidence: [28 passing transport regressions](../../work/secure-udp-deadline-focused-20261113/attempt-4/validation.json) cover exact token credit, checked geometry/timers, parser-before-pressure, replay/tamper, preauthentication usage-guard rejection, expired tails with no allowance, event-expiry precedence and ready-retransmission/repair credit wakeups. The complete runtime hostile-ingress/quota and charged transient-loss matrix remains required.
+- [x] [SUR-04] Verify retained complete native output through WouldBlock and eventual exact device acceptance; bound permanent stalls and distinguish native storage, device completion and recovery retention. Evidence: [real AF_UNIX pressure, permanent-stall and opposite-readiness tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs), [initial focused receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json), and the [28-test deadline/wake result](../../work/secure-udp-deadline-focused-20261113/attempt-4/validation.json). The pressure fixture requires actual socket `WouldBlock`, bounded retained ownership and all 64 exact FIFO completions. New real-descriptor event steps prove before/exact/after stall boundaries, a successful call crossing expiry and correct irreversible completion accounting when clock/check errors occur. The expiry-only guard preserves the original terminal precedence and prevents a late writable event from erasing the deadline.
 - [ ] [SUR-05] Integrate actual authenticated typed profile control with pure coordinator drain barriers, full digests, scoped source/feedback and confirmed reliable-source custody; no local-only switch or premature Applied result. Partial evidence: the [driver](../../crates/l2tunnel-runtime/src/secure_udp/transport.rs) retains each outbound token until `source_confirmed`; the [both-cover clean negotiated switch](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs) passed. A dropped terminal acknowledgment, delayed crossing feedback and explicit no-premature-`Applied` runtime regression remain required.
-- [ ] [SUR-06] Implement and test fixed-control authenticated Ping/Pong, finite lease and explicit cancellation/failure/status behavior across data changes without renewing unrelated deadlines. Partial evidence: [passing native/policy/liveness, matching-Pong-deadline and cancellation tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs) include control progress with blocked native output and prove fresh User traffic does not renew a challenge. Explicit established-lease expiry and stale/mismatched-Pong runtime cases remain required.
+- [x] [SUR-06] Implement and test fixed-control authenticated Ping/Pong, finite lease and explicit cancellation/failure/status behavior across data changes without renewing unrelated deadlines. Evidence: [native/policy/liveness, matching-Pong-deadline and cancellation tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_tests.rs) include control progress with blocked native output and prove fresh User traffic does not renew a challenge. The [20-test focused deadline result](../../work/secure-udp-deadline-focused-20261113/attempt-2/validation.json) adds original established-lease expiry, fresh stale/mismatched Pongs and exact/late matching-Pong rejection for both covers through actual protected control dispatch. Native event/completion expiry is independently verified under SUR-04; this scoped liveness gate does not complete recovery or the hostile-input matrix.
 - [ ] [SUR-07] Exercise real shared factories, connected sockets and nonblocking PacketDevice adapters in independent runtimes for both covers/profiles, IP/Ethernet bytes, loss/reorder/replay, bounded hostile input, final handoff and policy/liveness cases.
-- [x] [SUR-08] Pass focused tests, formatting, warning-denied Clippy/rustdoc and required frozen-source aggregate; preserve failed receipts and distinguish loopback runtime from privileged native/network/device performance. Evidence: [focused validation](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json) and the [required source-stable aggregate](../../work/secure-udp-runtime-service-20261113/attempt-1/validation.json) passed all local workspace checks with 1487 Rust cases including doctests, 271 Python tooling cases and 1658 simulator cases; formatting, strict workspace Clippy and rustdoc passed, and before/after input hashes match. The focused real socket/device tests and preserved failed attempts are linked above. Full fault/lifecycle/native/GUI/platform qualification stays open.
+- [x] [SUR-08] Pass focused tests, formatting, warning-denied Clippy/rustdoc and required frozen-source aggregate; preserve failed receipts and distinguish loopback runtime from privileged native/network/device performance. Evidence: the [28-test focused driver check](../../work/secure-udp-deadline-focused-20261113/attempt-4/validation.json) and [required source-stable aggregate](../../work/secure-udp-native-progress-20261113/attempt-1/validation.json) passed. The aggregate records 1498 Rust cases including doctests, 285 Python tooling cases and 1658 simulator cases, with formatting, strict workspace Clippy, rustdoc and unchanged input maps. Failed Pong/wake regression attempts and failed native attempts remain preserved. Full fault/lifecycle/native/GUI/platform qualification stays open.
 - [ ] [SUR-09] Qualify shared service/CLI/GUI selection and owned-namespace TAP/TUN transport/performance while retaining all lifecycle, full SW-11, OpenVPN/HTTPS, platform and 47-mode requirements.
 
 The checked tasks above include their scoped implementation/test evidence;

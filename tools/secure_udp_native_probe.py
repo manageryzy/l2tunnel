@@ -81,7 +81,7 @@ def transfer(streams: list[socket.socket], start: int, measured: int, end: int,
                 next_sample = now + 500_000_000
             for index, (stream, row) in enumerate(zip(streams, state)):
                 if not row['write_closed'] and (now >= end or row['sent'] == maximum):
-                    row['bound_exhausted'] = row['sent'] == maximum and now < end
+                    row['bound_exhausted'] = row['bound_exhausted'] or row['sent'] == maximum and now < end
                     stream.shutdown(socket.SHUT_WR)
                     row['write_closed'] = True
                     if row['eof']:
@@ -118,6 +118,10 @@ def transfer(streams: list[socket.socket], start: int, measured: int, end: int,
                         sent = 0
                     row['send_hash'].update(chunk[:sent])
                     row['sent'] += sent
+                    if row['sent'] == maximum:
+                        # Preserve the exhaustion event even if the next turn
+                        # observes shutdown after the measurement boundary.
+                        row['bound_exhausted'] = True
     if time.monotonic_ns() >= deadline:
         raise TimeoutError('original TCP deadline reached during final I/O')
     rows = [{**{key: value for key, value in row.items() if not key.endswith('_hash')},

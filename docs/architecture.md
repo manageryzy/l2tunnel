@@ -27,7 +27,7 @@ following are evidence boundaries, not a declaration that the target is running:
 | Area | Current evidence | Target gap |
 | --- | --- | --- |
 | Pure protocol libraries | Typed, bounded engines with caller-supplied time/I/O boundaries. | Preserve them through common security and carrier composition. |
-| Swift | Historical TLS/separate-UDP composition has finite Linux TAP receipts. A new explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures passed locally. | Actual CLI/TAP performance for the new path, complete session lifecycle, every other carrier and full SW-11. |
+| Swift | Historical TLS/separate-UDP receipts remain preserved. The explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures and finite Linux CLI/TAP baselines now exist. | The full native matrix and impaired 80 Mbit/s target, complete session lifecycle, every other carrier and full SW-11. |
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
 | OpenVPN-like UDP | Real TLS over custom reliable UDP control; standalone native slices exist. | The custom 144-byte gate is not the requested OpenVPN wire-format handshake. |
 | HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
@@ -73,8 +73,13 @@ actual TAP/TUN performance, default state-retaining recovery, fresh-DH rekey,
 generic management dispatch or full SW-11. The
 [native lab](modules/secure-udp-native.md) tracks those finite CLI/TAP measurements
 separately from all remaining carrier, platform and ISP requirements.
-The [required new aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
-also passed with unchanged inputs; actual native execution remains separate.
+The [latest required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+also passed with unchanged inputs. Subsequent [immutable native baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
+passed clean/delay QUIC-like cases and functional policy/reconnect/integrity checks
+for both appearances; both 15%-loss cases failed the unchanged performance target.
+Later deadline and ready-work corrections have separate focused evidence and
+require their own build/native qualification. No baseline result is promoted to
+full lifecycle, carrier or platform completion.
 
 ## Library boundary and layering
 

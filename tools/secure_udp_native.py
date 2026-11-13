@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -183,6 +184,75 @@ def last_json(path: Path) -> dict:
             if isinstance(value, dict):
                 return value
     raise ObservationError('no bounded JSON result: ' + str(path))
+
+
+def ready_event(path: Path) -> dict:
+    for line in bounded.read_log(path).splitlines():
+        if line.startswith('{'):
+            value = bounded.strict_json(line)
+            if isinstance(value, dict) and value.get('event') == 'secure_udp_ready':
+                return value
+    raise ObservationError('no bounded secure UDP ready event: ' + str(path))
+
+
+def record_functional(receipt, field, operation, observe_status, deadline):
+    """Retain live-owner diagnostics without replacing the original probe error."""
+    try:
+        receipt.update(**{field: operation()})
+    except Exception:
+        observations = {}
+        for side in ('a', 'b'):
+            row = {'at_monotonic_ns': time.monotonic_ns()}
+            try:
+                if time.monotonic() >= deadline:
+                    raise BoundExhausted('original case deadline exhausted before failure status')
+                response = observe_status(side)
+                if len(json.dumps(response).encode()) > 64 * 1024:
+                    raise ObservationError('failure status response exceeds64KiB bound')
+                row.update(status='observed', response=response)
+            except Exception as error:
+                row.update(status=failure_status(error), error=f'{type(error).__name__}: {error}'[:4096])
+            observations[side] = row
+        try:
+            receipt.update(functional_failure={'phase': field, 'peers': observations})
+        except Exception as error:
+            print(('functional failure evidence publication failed: ' + f'{type(error).__name__}: {error}')[:4096],
+                  file=sys.stderr)
+        raise
+
+
+def functional(label, output, deadline, launch, command, receipt):
+    result = {}
+    for side, other in [('a', 'b'), ('b', 'a')]:
+        ready = output / f'{label}-udp-{other}.ready'
+        child, log = launch('host_' + other, [sys.executable, output / 'secure_udp_native_probe.py',
+            'udp-echo', '--address', HOST[other], '--port', '24461', '--ready', ready], f'{label}-echo-{other}')
+        try:
+            until = min(deadline, time.monotonic() + 5)
+            while not ready.exists():
+                if child.poll() is not None or time.monotonic() >= until:
+                    raise BoundExhausted('native UDP echo readiness bound')
+                time.sleep(.02)
+            # Each independent40s echo owner covers its own readiness<=5s,
+            # ping<=12s and UDP<=17s; the opposite direction starts anew.
+            ping = command('host_' + side, 'ping', '-n', '-c', '3', '-i', '.2', '-W', '3',
+                           '-M', 'do', '-s', '1472', HOST[other], cap=12)
+            if len(ping.encode()) > 64 * 1024:
+                raise ObservationError('native ping output exceeds64KiB bound')
+            result[side] = {'full_mtu_df_ping': ping}
+            receipt.update(**{label + '_functional_progress': result})
+            if ' 0% packet loss' not in ping:
+                raise ValueError('full-MTU DF native ping did not return exactly')
+            raw = command('host_' + side, sys.executable, str(output / 'secure_udp_native_probe.py'),
+                'udp-probe', '--address', HOST[other], '--port', '24461', cap=17)
+            udp = bounded.strict_json(raw.strip().splitlines()[-1])
+            result[side]['udp'] = udp
+            receipt.update(**{label + '_functional_progress': result})
+            if udp.get('status') != 'passed' or len(udp.get('rows', [])) != 14 or not all(row['answered'] for row in udp['rows']):
+                raise ValueError('exact native UDP zero/trailing-zero probe failed')
+        finally:
+            bounded.stop(child)
+    return result
 
 
 def validate_status(response: dict, case: dict, side: str, public: dict, expected_policy: dict | None = None) -> dict:
@@ -565,6 +635,100 @@ def capture_complete(audit: dict, counters: dict) -> None:
         raise ValueError('parsed capture records differ from tcpdump captured count')
 
 
+def owned_wan_qdiscs(raw: str) -> list[dict]:
+    value = bounded.strict_json(raw)
+    if not isinstance(value, list) or len(value) != 2 or any(not isinstance(row, dict) for row in value):
+        raise ValueError('expected only owned wan0 HTB/netem qdiscs')
+    root = [row for row in value if row.get('root') is True]
+    leaf = [row for row in value if row.get('parent') == '1:10']
+    if (len(root) != 1 or root[0].get('kind') != 'htb' or root[0].get('handle') != '1:'
+            or len(leaf) != 1 or leaf[0].get('kind') != 'netem' or leaf[0].get('handle') != '10:'):
+        raise ValueError('owned wan0 qdisc identity changed')
+    return value
+
+
+def recreate_owned_wan(case: dict, spec: lab.LabSpec, state_dir: Path, side: str, command) -> dict:
+    if side not in ('a', 'b') or case['namespaces'] != spec.namespaces or case['lab_id'] != spec.lab_id:
+        raise ValueError('exact owned endpoint specification required')
+    role = 'endpoint_' + side
+    namespace = spec.namespaces[role]
+    rate = 100 if side == 'a' else 10
+    with lab.locked_state(state_dir, spec) as journal:
+        manifest = lab.load_manifest(journal, spec)
+        if set(manifest['owned_namespaces']) != set(spec.namespaces.values()):
+            raise ValueError('complete created topology ownership required before shaping')
+        for name, identity in manifest['owned_namespaces'].items():
+            if lab.namespace_identity(name) != identity:
+                raise ValueError('refusing shaping in replaced namespace: ' + name)
+        if command(None, 'ip', 'netns', 'pids', namespace).strip():
+            raise ValueError('refusing shaping while owned endpoint processes exist')
+        before = owned_wan_qdiscs(command(role, 'tc', '-j', 'qdisc', 'show', 'dev', 'wan0'))
+        identity = manifest['owned_namespaces'][namespace]
+        if lab.namespace_identity(namespace) != identity:
+            raise ValueError('namespace ownership changed before qdisc deletion')
+        # The topology's existing HTB cannot acquire a different size table via
+        # change/replace. Recreate only this verified root, before all daemons.
+        command(role, 'tc', 'qdisc', 'del', 'dev', 'wan0', 'root', 'handle', '1:')
+        command(role, 'tc', 'qdisc', 'add', 'dev', 'wan0', 'root', 'handle', '1:', 'stab',
+            'overhead', '-14', 'linklayer', 'ethernet', 'htb', 'default', '10')
+        command(role, 'tc', 'class', 'add', 'dev', 'wan0', 'parent', '1:', 'classid', '1:10',
+            'htb', 'rate', f'{rate}mbit', 'ceil', f'{rate}mbit')
+        command(role, 'tc', 'qdisc', 'add', 'dev', 'wan0', 'parent', '1:10', 'handle', '10:',
+            'netem', 'limit', '1000', 'delay', str(case['one_way_delay_ms']) + 'ms',
+            'loss', 'random', str(case['loss_percent_per_direction']) + '%')
+        after = owned_wan_qdiscs(command(role, 'tc', '-j', 'qdisc', 'show', 'dev', 'wan0'))
+        if lab.namespace_identity(namespace) != identity:
+            raise ValueError('namespace ownership changed during qdisc recreation')
+        return {'namespace': namespace, 'identity': identity, 'before': before, 'after': after,
+            'accounting': 'explicit fresh HTB STAB overhead-14; no change/replace fallback'}
+
+
+def owned_tc_snapshot(spec: lab.LabSpec, state_dir: Path, command, label: str) -> dict:
+    started = time.monotonic_ns()
+    observations = {}
+    with lab.locked_state(state_dir, spec) as journal:
+        manifest = lab.load_manifest(journal, spec)
+        if set(manifest['owned_namespaces']) != set(spec.namespaces.values()):
+            raise ObservationError('complete owned topology required for tc observation')
+        for side in ('a', 'b'):
+            role, namespace = 'endpoint_' + side, spec.namespaces['endpoint_' + side]
+            identity = manifest['owned_namespaces'][namespace]
+            if lab.namespace_identity(namespace) != identity:
+                raise ObservationError('replaced endpoint refused for tc observation')
+            raw = {kind: command(role, 'tc', '-s', kind, 'show', 'dev', 'wan0') for kind in ('class', 'qdisc')}
+            if not all(value.strip() for value in raw.values()) or lab.namespace_identity(namespace) != identity:
+                raise ObservationError('missing/replaced owned tc observation')
+            observations[side] = {'namespace': namespace, 'identity': identity, 'raw': raw}
+    return {'phase': label, 'started_monotonic_ns': started, 'finished_monotonic_ns': time.monotonic_ns(),
+        'endpoints': observations, 'scope': 'cumulative kernel counters; observation bounds are not the exact throughput window'}
+
+
+def record_tc_snapshot(receipt, spec: lab.LabSpec, state_dir: Path, command, label: str) -> None:
+    snapshot = owned_tc_snapshot(spec, state_dir, command, label)
+    receipt.update(**{label: snapshot})
+
+
+def wire_window_evidence(reference: dict, audits: dict) -> dict:
+    result = {}
+    for side, direction in [('a', 'a_to_b'), ('b', 'b_to_a')]:
+        values = audits['wan-' + side]['directions'][side]
+        low, high = values['measurement_min_ip_bytes'], values['measurement_max_ip_bytes']
+        if type(low) is not int or type(high) is not int or not 0 < low <= high:
+            raise ObservationError('no positive conservative same-window WAN denominator: ' + direction)
+        result[direction] = {'receiver_unique_bytes': reference['directions'][direction]['receiver_unique_bytes'],
+            'minimum_ip_bytes': low, 'maximum_ip_bytes': high,
+            'scope': 'same time window; endpoint WAN emitted IP bytes after egress qdisc, excluding qdisc drops; delivered bytes may be a different propagation cohort'}
+    return result
+
+
+def capture_command(name: str, destination: Path) -> list[str]:
+    if name not in ('wan-a', 'wan-b', 'native-a'):
+        raise ValueError('explicit owned capture surface required')
+    return ['tcpdump', '-n', '-U', '-B', '8192', '-s', str(BOUNDS['capture_snaplen']),
+        '-c', str(BOUNDS['capture_packets']), '-Z', 'root', '-i', 'tap0' if name == 'native-a' else 'wan0',
+        '-w', str(destination), 'ip or arp' if name == 'native-a' else 'ip or ip6 or arp']
+
+
 def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> dict:
     spec = lab.LabSpec(case['lab_id'])
     spaces, deadline = spec.namespaces, time.monotonic() + BOUNDS['case']
@@ -593,9 +757,9 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         processes.append(child)
         return child, path
 
-    def rpc(side, action, *flags):
+    def rpc(side, action, *flags, cap=BOUNDS['command']):
         raw = command('endpoint_' + side, str(binary), action, '--control-socket',
-                      str(secrets / f'control-{side}.sock'), '--api-version', '2', *flags)
+                      str(secrets / f'control-{side}.sock'), '--api-version', '2', *flags, cap=cap)
         if len(raw) > BOUNDS['log_bytes']:
             raise ObservationError('local response exceeds bound')
         try:
@@ -639,34 +803,6 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
             'daemon_resources': {side: daemon_resources(daemons[side][0], daemon_starttimes[side]) for side in ('a', 'b')},
             'host_loadavg': list(os.getloadavg()),
             'wan': {side: json.loads(command('endpoint_' + side, 'ip', '-j', '-s', 'link', 'show', 'dev', 'wan0')) for side in ('a', 'b')}})
-
-    def functional(label):
-        result = {}
-        for side, other in [('a', 'b'), ('b', 'a')]:
-            ready = output / f'{label}-udp-{other}.ready'
-            child, log = launch('host_' + other, [sys.executable, output / 'secure_udp_native_probe.py',
-                'udp-echo', '--address', HOST[other], '--port', '24461', '--ready', ready], f'{label}-echo-{other}')
-            try:
-                until = min(deadline, time.monotonic() + 5)
-                while not ready.exists():
-                    if child.poll() is not None or time.monotonic() >= until:
-                        raise BoundExhausted('native UDP echo readiness bound')
-                    time.sleep(.02)
-                # Each independent40s echo owner covers its own readiness<=5s,
-                # ping<=12s and UDP<=17s; the opposite direction starts anew.
-                ping = command('host_' + side, 'ping', '-n', '-c', '3', '-i', '.2', '-W', '3',
-                               '-M', 'do', '-s', '1472', HOST[other], cap=12)
-                if ' 0% packet loss' not in ping:
-                    raise ValueError('full-MTU DF native ping did not return exactly')
-                raw = command('host_' + side, sys.executable, str(output / 'secure_udp_native_probe.py'),
-                    'udp-probe', '--address', HOST[other], '--port', '24461', cap=17)
-                udp = bounded.strict_json(raw.strip().splitlines()[-1])
-                if udp.get('status') != 'passed' or len(udp.get('rows', [])) != 14 or not all(row['answered'] for row in udp['rows']):
-                    raise ValueError('exact native UDP zero/trailing-zero probe failed')
-                result[side] = {'full_mtu_df_ping': ping, 'udp': udp}
-            finally:
-                bounded.stop(child)
-        return result
 
     def bulk(label, workload, warmup, seconds, policy_action=False):
         path = output / (label + '-clock.json')
@@ -746,16 +882,11 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         journal = state_dir / (spec.lab_id + '.json')
         receipt.update(namespace_journal=json.loads(journal.read_text()))
         bounded.disable_underlay_ipv6(spaces, deadline)
-        offloads = {}
-        for side, rate in [('a', 100), ('b', 10)]:
+        offloads, shaping = {}, {}
+        for side in ('a', 'b'):
             role = 'endpoint_' + side
-            command(role, 'tc', 'qdisc', 'replace', 'dev', 'wan0', 'root', 'handle', '1:', 'stab',
-                'overhead', '-14', 'linklayer', 'ethernet', 'htb', 'default', '10')
-            command(role, 'tc', 'class', 'replace', 'dev', 'wan0', 'parent', '1:', 'classid', '1:10',
-                'htb', 'rate', f'{rate}mbit', 'ceil', f'{rate}mbit')
-            command(role, 'tc', 'qdisc', 'replace', 'dev', 'wan0', 'parent', '1:10', 'handle', '10:',
-                'netem', 'limit', '1000', 'delay', str(case['one_way_delay_ms']) + 'ms',
-                'loss', 'random', str(case['loss_percent_per_direction']) + '%')
+            shaping[side] = recreate_owned_wan(case, spec, state_dir, side, command)
+            receipt.update(shaping_recreation=shaping)
             command('host_' + side, 'ip', 'route', 'replace', '198.18.0.0/24', 'dev', 'eth0', 'rto_min', '1000ms')
             command('host_' + side, 'sysctl', '-q', '-w', 'net.ipv4.tcp_congestion_control=cubic')
             for owner, interface in [(role, 'wan0'), (role, 'tap0'), (role, 'lan0'), ('host_' + side, 'eth0')]:
@@ -764,14 +895,11 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
             offloads['router/' + interface] = bounded.offloads(spaces['router'], interface, deadline)
         receipt.update(offloads=offloads,
             tcp_defaults={side: command('host_' + side, 'sysctl', 'net.ipv4.tcp_congestion_control',
-                'net.ipv4.tcp_rmem', 'net.ipv4.tcp_wmem', 'net.ipv4.tcp_ecn') for side in ('a', 'b')},
-            tc_before={side: {kind: command('endpoint_' + side, 'tc', '-s', kind, 'show', 'dev', 'wan0')
-                for kind in ('class', 'qdisc')} for side in ('a', 'b')})
-        for name, role, interface in [('wan-a', 'endpoint_a', 'wan0'), ('wan-b', 'endpoint_b', 'wan0'), ('native-a', 'endpoint_a', 'tap0')]:
+                'net.ipv4.tcp_rmem', 'net.ipv4.tcp_wmem', 'net.ipv4.tcp_ecn') for side in ('a', 'b')})
+        record_tc_snapshot(receipt, spec, state_dir, command, 'tc_before')
+        for name, role in [('wan-a', 'endpoint_a'), ('wan-b', 'endpoint_b'), ('native-a', 'endpoint_a')]:
             capture = output / (name + '.pcap')
-            child, log = launch(role, ['tcpdump', '-n', '-U', '-B', '8192', '-s', str(BOUNDS['capture_snaplen']),
-                '-c', str(BOUNDS['capture_packets']), '-i', interface, '-w', capture,
-                'ip or arp' if name == 'native-a' else 'ip or ip6 or arp'], name + '-capture', BOUNDS['capture_bytes'])
+            child, log = launch(role, capture_command(name, capture), name + '-capture', BOUNDS['capture_bytes'])
             captures[name] = (child, log, capture)
             bounded.wait_log(child, log, 'listening on', min(deadline, time.monotonic() + 5))
         with tempfile.TemporaryDirectory(prefix='l2t-secure-native-') as directory:
@@ -785,13 +913,18 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 daemons[side] = (child, log)
             for child, log in daemons.values():
                 bounded.wait_log(child, log, '"event":"secure_udp_ready"', min(deadline, time.monotonic() + BOUNDS['startup']))
+            receipt.update(initial_ready={side: ready_event(value[1]) for side, value in daemons.items()})
             initial_resources = {side: daemon_resources(value[0]) for side, value in daemons.items()}
             daemon_starttimes = {side: value['starttime_ticks'] for side, value in initial_resources.items()}
             initial = statuses(INITIAL)
-            receipt.update(initial_status=initial, initial_daemon_resources=initial_resources,
-                initial_sockets=socket_observation(), functional=functional('initial'))
+            receipt.update(initial_status=initial, initial_daemon_resources=initial_resources)
+            receipt.update(initial_sockets=socket_observation())
+            record_functional(receipt, 'functional',
+                lambda: functional('initial', output, deadline, launch, command, receipt),
+                lambda side: rpc(side, 'status', cap=2), deadline)
             reference_result = bulk('reference', case['workload'], 5, 20)
             receipt.update(reference=reference_result)
+            record_tc_snapshot(receipt, spec, state_dir, command, 'tc_post_reference')
             policy_result = bulk('policy-load', 'forward16', 1, 12, policy_action=True)
             receipt.update(policy_under_load=policy_result)
             before = statuses(INITIAL)
@@ -817,8 +950,11 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 if after[side]['session'] == before[side]['session'] or after[side]['generation'] <= before[side]['generation']:
                     raise ValueError('reconnect did not establish fresh session and generation')
             receipt.update(lifecycle={'disconnect': disconnect, 'reconnect': replies, 'before': before, 'after': after,
-                'scope': 'manual fresh authentication; no retained-state or graceful-drain claim'},
-                final_sockets=socket_observation(), after_reconnect=functional('reconnected'))
+                'scope': 'manual fresh authentication; no retained-state or graceful-drain claim'})
+            receipt.update(final_sockets=socket_observation())
+            record_functional(receipt, 'after_reconnect',
+                lambda: functional('reconnected', output, deadline, launch, command, receipt),
+                lambda side: rpc(side, 'status', cap=2), deadline)
             sample('after-reconnect')
     except Exception as error:
         errors.append({'status': failure_status(error), 'error': f'{type(error).__name__}: {error}'})
@@ -855,8 +991,15 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 if not audits['native-a']['arp']:
                     raise ValueError('no actual native ARP witnessed')
                 receipt.update(capture_audits=audits)
+                if reference_result:
+                    receipt.update(reference_wire_window=wire_window_evidence(reference_result, audits))
             except Exception as error:
                 errors.append({'status': failure_status(error), 'error': f'{type(error).__name__}: {error}'})
+        try:
+            if (state_dir / (spec.lab_id + '.json')).exists():
+                record_tc_snapshot(receipt, spec, state_dir, command, 'tc_final')
+        except Exception as error:
+            errors.append({'status': failure_status(error), 'tc_final': f'{type(error).__name__}: {error}'})
         try:
             journal = state_dir / (spec.lab_id + '.json')
             if journal.exists():
@@ -941,6 +1084,22 @@ def finalize_launch_failure(output: Path, status: str, error: str) -> None:
             'scope': 'launcher before completed native case', 'cleanup': 'not_started_or_unverified'})
 
 
+def worker_file_limits():
+    """Bound the worker log while permitting explicitly capped capture children."""
+    soft, hard = BOUNDS['log_bytes'], BOUNDS['capture_bytes']
+    if type(soft) is not int or type(hard) is not int or not 0 < soft <= hard:
+        raise ObservationError('invalid worker/capture file-size bounds')
+    inherited = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    if inherited != resource.RLIM_INFINITY and inherited < hard:
+        raise ObservationError('inherited RLIMIT_FSIZE hard limit cannot permit explicit capture cap')
+    def apply():
+        inherited = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+        if inherited != resource.RLIM_INFINITY and inherited < hard:
+            raise ValueError('inherited worker file-size ceiling changed before exec')
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+    return apply
+
+
 def launch_isolated(case: dict, output: Path, binary: Path, receipt_path: Path) -> int:
     # Never adopt an existing output. Once this exclusive directory exists,
     # preflight/copy/namespace/worker failures all receive a terminal receipt.
@@ -976,9 +1135,12 @@ def launch_isolated(case: dict, output: Path, binary: Path, receipt_path: Path) 
             ','.join(f'{name}:{value}' for name, value in descriptors.items()), '--apply']
         environment = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME')}
         environment.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1')
+        limits = worker_file_limits()
+        launch.update(worker_file_size_limits={'unit': 'bytes', 'soft': BOUNDS['log_bytes'],
+            'hard': BOUNDS['capture_bytes'], 'inherited': list(resource.getrlimit(resource.RLIMIT_FSIZE))})
         with (output / 'worker.log').open('xb') as log:
             child = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, pass_fds=tuple(descriptors.values()),
-                env=environment, start_new_session=True, preexec_fn=bounded.limited_child(BOUNDS['log_bytes']))
+                env=environment, start_new_session=True, preexec_fn=limits)
             launch.update(status='running', worker_argv=argv, worker_pid=child.pid)
             code = child.wait(timeout=BOUNDS['launcher'])
         terminate_owned_group(child)

@@ -56,6 +56,20 @@ OpenVPN/HTTPS migration or full SW-11. The
 [runtime](modules/secure-udp-runtime.md), [service](modules/secure-udp-service.md)
 and [native lab](modules/secure-udp-native.md) ledgers preserve those boundaries.
 
+Subsequent [immutable native baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
+now execute the actual CLI on Linux TAP in fresh owned user/network/mount
+namespaces. QUIC-like clean and70ms/no-loss cases passed at83.01/83.48Mbit/s.
+At70ms/15% loss each way, QUIC-like38.91 and media-like39.76Mbit/s failed the
+unchanged80Mbit/s target, while exact hashes/EOF, native probes, live policy
+commits, fresh manual reconnect, complete captures and cleanup passed. These
+four runs use their own immutable baseline binary; they do not qualify later
+source changes or the complete matrix. The later [28-test runtime check](../work/secure-udp-deadline-focused-20261113/attempt-4/validation.json)
+and strict Clippy cover authenticated Pong expiry, native event/completion
+deadlines and ready retransmission/repair wakeups. Corrected-runtime native
+attempts then failed a ping phase and a bulk-time runtime timeout, respectively;
+neither supplies qualified throughput. The latest harness retains bounded live
+failure observations. The required aggregate for these corrections passed as recorded below; native requalification remains open.
+
 Historical `tools/selftest.py` runs (Linux TAP, unprivileged
 namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
 RTT, 15% loss each way) measured 79.74, 80.50 and 79.91 Mbit/s forward
@@ -88,11 +102,12 @@ does not narrow SW-11 or close any Python mode gate.
 
 ## Verification evidence
 
-The [new runtime/service aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
-passed 1487 Rust cases including doctests, 271 Python tooling cases and 1658 simulator
+The [latest correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+passed 1498 Rust cases including doctests, 285 Python tooling cases and 1658 simulator
 cases, with unchanged source maps, formatting, strict Clippy, rustdoc and CLI
-checks. It also executes the new-profile attachment rejection and26 native-tooling
-tests. Native labs, remote CI and platform qualification remain separate.
+checks. It executes the new-profile attachment rejection, 28 transport regressions
+and 40 native-tooling tests. Native labs, remote CI and platform qualification
+remain separate. The [prior runtime/service aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json) retains its original 1487/271/1658 result and source identity.
 
 The prior committed factory checkpoint, `e689674`, has a
 [source-stable aggregate receipt](../work/shared-session-client-20261113/validation.json):

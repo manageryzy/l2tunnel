@@ -166,6 +166,94 @@ class HarnessContracts(unittest.TestCase):
         peers['b']['session'][0] = 9
         with self.assertRaises(ValueError): h.aligned_peers(peers, False)
 
+    def test_ready_event_is_retained_even_after_later_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daemon.log'
+            ready = {'event': 'secure_udp_ready', 'status': status()['state']['secure_udp']}
+            path.write_text('startup\n' + json.dumps(ready) + '\n' + json.dumps({'event': 'secure_udp_terminal'}) + '\n')
+            self.assertEqual(h.ready_event(path), ready)
+
+    def test_functional_failure_keeps_prior_evidence_raw_ping_and_live_status(self):
+        for label, field, prior in [('initial', 'functional', {
+                'initial_ready': {'a': 'ready', 'b': 'ready'}, 'initial_status': {'generation': 1},
+                'initial_daemon_resources': {'cpu_ticks': 7}, 'initial_sockets': {'sole_udp': True}}),
+                ('reconnected', 'after_reconnect', {'lifecycle': {'generation': 2}, 'final_sockets': {'sole_udp': True}})]:
+            with self.subTest(phase=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                receipt = h.bounded.Receipt(output / 'receipt.json', {'status': 'running', **prior})
+                failed_ping = '3 packets transmitted, 2 received, 33.3333% packet loss\n'
+                launched, stopped, observed = [], [], []
+                def launch(role, argv, name):
+                    Path(argv[argv.index('--ready') + 1]).write_text('ready')
+                    child = Mock(); child.poll.return_value = None
+                    launched.append(child)
+                    return child, output / (name + '.log')
+                def command(role, *argv, cap):
+                    if argv[0] == 'ping':
+                        self.assertEqual(cap, 12)
+                        self.assertEqual(argv[1:-1], ('-n', '-c', '3', '-i', '.2', '-W', '3', '-M', 'do', '-s', '1472'))
+                        return '3 packets transmitted, 3 received, 0% packet loss\n' if role == 'host_a' else failed_ping
+                    self.assertEqual(cap, 17)
+                    return json.dumps({'status': 'passed', 'rows': [{'answered': True}] * 14})
+                def observe(side):
+                    saved = json.loads(receipt.path.read_text())
+                    self.assertEqual(saved[label + '_functional_progress']['b']['full_mtu_df_ping'], failed_ping)
+                    self.assertEqual(stopped, launched)
+                    for key, value in prior.items(): self.assertEqual(saved[key], value)
+                    observed.append(side)
+                    reply = status(side)
+                    reply['state']['secure_udp']['running'] = side == 'a'
+                    return reply
+                deadline = time.monotonic() + 20
+                with patch.object(h.bounded, 'stop', side_effect=stopped.append):
+                    with self.assertRaisesRegex(ValueError, 'full-MTU DF native ping did not return exactly'):
+                        h.record_functional(receipt, field,
+                            lambda: h.functional(label, output, deadline, launch, command, receipt), observe, deadline)
+                saved = json.loads(receipt.path.read_text())
+                self.assertEqual(observed, ['a', 'b'])
+                self.assertNotIn(field, saved)
+                self.assertEqual(len(saved[label + '_functional_progress']['a']['udp']['rows']), 14)
+                self.assertFalse(saved['functional_failure']['peers']['b']['response']['state']['secure_udp']['running'])
+                self.assertEqual(saved['functional_failure']['phase'], field)
+
+    def test_failure_status_errors_and_original_deadline_preserve_primary_error(self):
+        for clock, expected_calls in [([1, 1], ['a', 'b']), ([1, 5], ['a'])]:
+            with self.subTest(clock=clock), tempfile.TemporaryDirectory() as directory:
+                receipt = h.bounded.Receipt(Path(directory) / 'receipt.json', {'status': 'running'})
+                primary = ValueError('original full-MTU failure')
+                def fail(): raise primary
+                def observe(side):
+                    if side == 'a': raise OSError('control socket unavailable')
+                    return status(side)
+                with patch.object(h.time, 'monotonic', side_effect=clock), patch('builtins.print') as output:
+                    observer = Mock(side_effect=observe)
+                    with self.assertRaises(ValueError) as caught:
+                        h.record_functional(receipt, 'functional', fail, observer, 5)
+                self.assertIs(caught.exception, primary)
+                self.assertEqual([call.args[0] for call in observer.call_args_list], expected_calls)
+                output.assert_not_called()
+                peers = json.loads(receipt.path.read_text())['functional_failure']['peers']
+                self.assertEqual(peers['a']['status'], 'tool_failure')
+                self.assertIn('control socket unavailable', peers['a']['error'])
+                self.assertEqual(peers['b']['status'], 'observed' if len(expected_calls) == 2 else 'bound_exhausted')
+
+    def test_failure_diagnostic_bounds_and_publication_cannot_replace_primary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = h.bounded.Receipt(Path(directory) / 'receipt.json', {'status': 'running'})
+            primary = ValueError('original full-MTU failure')
+            def fail(): raise primary
+            with self.assertRaises(ValueError) as caught:
+                h.record_functional(receipt, 'functional', fail, lambda side: {'oversized': 'x' * (64 * 1024)},
+                                    time.monotonic() + 20)
+            self.assertIs(caught.exception, primary)
+            peers = json.loads(receipt.path.read_text())['functional_failure']['peers']
+            self.assertTrue(all(row['status'] == 'tool_failure' and '64KiB' in row['error'] for row in peers.values()))
+            with patch.object(receipt, 'update', side_effect=OSError('receipt publication unavailable')), \
+                    patch('builtins.print') as output, self.assertRaises(ValueError) as caught:
+                h.record_functional(receipt, 'functional', fail, lambda side: status(side), time.monotonic() + 20)
+            self.assertIs(caught.exception, primary)
+            self.assertIn('receipt publication unavailable', output.call_args.args[0])
+
     def test_probe_accounting_matches_socket_identity_not_accept_order(self):
         client, server = probes()
         result = h.compare_probes(client, server, 'forward16')
@@ -315,6 +403,60 @@ class HarnessContracts(unittest.TestCase):
             path.write_text(process_status()); self.assertEqual(h.bounded_proc_text(path), process_status())
         with patch.object(h.os, 'sysconf', side_effect=[0, 4096]), self.assertRaises(h.ObservationError): h.resource_context()
 
+    def test_real_worker_and_nested_capture_select_explicit_limits_without_raising_hard_ceiling(self):
+        parent = h.resource.getrlimit(h.resource.RLIMIT_FSIZE)
+        script = '''import json,resource,subprocess,sys
+from tools import secure_udp_native as h
+before=list(resource.getrlimit(resource.RLIMIT_FSIZE))
+code="import json,resource; print(json.dumps(list(resource.getrlimit(resource.RLIMIT_FSIZE))))"
+result=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,check=True,timeout=5,
+    preexec_fn=h.bounded.limited_child(h.BOUNDS['capture_bytes']))
+print(json.dumps({'worker':before,'capture':json.loads(result.stdout),
+    'worker_after':list(resource.getrlimit(resource.RLIMIT_FSIZE))}))
+'''
+        result = subprocess.run([h.sys.executable, '-B', '-c', script], cwd=h.ROOT, capture_output=True,
+            text=True, check=True, timeout=10, preexec_fn=h.worker_file_limits())
+        value = json.loads(result.stdout)
+        self.assertEqual(value['worker'], [h.BOUNDS['log_bytes'], h.BOUNDS['capture_bytes']])
+        self.assertEqual(value['worker_after'], value['worker'])
+        self.assertEqual(value['capture'], [h.BOUNDS['capture_bytes']] * 2)
+        self.assertEqual(h.resource.getrlimit(h.resource.RLIMIT_FSIZE), parent)
+
+    def test_real_insufficient_inherited_hard_limit_refuses_before_worker_spawn(self):
+        parent = h.resource.getrlimit(h.resource.RLIMIT_FSIZE)
+        script = '''import json,resource
+from tools import secure_udp_native as h
+cap=h.BOUNDS['log_bytes']; resource.setrlimit(resource.RLIMIT_FSIZE,(cap,cap))
+try:
+    h.worker_file_limits()
+except h.ObservationError as error:
+    print(json.dumps({'refused':True,'error':str(error),
+        'limits':list(resource.getrlimit(resource.RLIMIT_FSIZE))}))
+else:
+    raise SystemExit('insufficient inherited hard limit was accepted')
+'''
+        result = subprocess.run([h.sys.executable, '-B', '-c', script], cwd=h.ROOT,
+            capture_output=True, text=True, check=True, timeout=5)
+        value = json.loads(result.stdout)
+        self.assertTrue(value['refused']); self.assertIn('inherited RLIMIT_FSIZE', value['error'])
+        self.assertEqual(value['limits'], [h.BOUNDS['log_bytes']] * 2)
+        self.assertEqual(h.resource.getrlimit(h.resource.RLIMIT_FSIZE), parent)
+        with patch.object(h.resource, 'getrlimit', side_effect=[(0, h.resource.RLIM_INFINITY), (0, 1)]), \
+                patch.object(h.resource, 'setrlimit') as apply:
+            configure = h.worker_file_limits()
+            with self.assertRaises(ValueError): configure()
+        apply.assert_not_called()
+
+    def test_capture_stays_in_mapped_root_and_preserves_explicit_bounds(self):
+        for name in ('wan-a', 'wan-b', 'native-a'):
+            argv = h.capture_command(name, Path('/owned/capture.pcap'))
+            self.assertEqual(argv[argv.index('-Z') + 1], 'root')
+            self.assertEqual(int(argv[argv.index('-c') + 1]), h.BOUNDS['capture_packets'])
+            self.assertEqual(int(argv[argv.index('-s') + 1]), h.BOUNDS['capture_snaplen'])
+            self.assertEqual(argv[argv.index('-w') + 1], '/owned/capture.pcap')
+            self.assertEqual(argv[argv.index('-i') + 1], 'tap0' if name == 'native-a' else 'wan0')
+        with self.assertRaises(ValueError): h.capture_command('host-interface', Path('/owned/capture.pcap'))
+
 
 class CaptureContracts(unittest.TestCase):
     anchors = [{'offset_ns': 0, 'uncertainty_ns': 0}, {'offset_ns': 0, 'uncertainty_ns': 0}]
@@ -449,6 +591,134 @@ class CaptureContracts(unittest.TestCase):
             with patch.dict(h.BOUNDS, capture_packets=1):
                 with self.assertRaises(h.BoundExhausted): h.audit_capture(path, case(), None, self.anchors)
 
+    def test_positive_measured_payload_cannot_use_outside_window_or_boundary_only_wire_cost(self):
+        frames = [frame(cover_body('quic-like', 'handshake'))]
+        frames += [frame(cover_body('quic-like', epoch=epoch)) for epoch in (1, 2, 3)]
+        outside = self.audit(frames, timestamps=[500_000_000] * len(frames),
+            clock={'measure_start_ns': 1_000_000_000, 'end_ns': 2_000_000_000},
+            case_extra={'require_policy_epochs': True})
+        self.assertEqual(outside['directions']['a']['measurement_max_ip_bytes'], 0)
+        reference = h.compare_probes(*probes(), 'forward16')
+        audits = {'wan-a': copy.deepcopy(outside), 'wan-b': copy.deepcopy(outside)}
+        with self.assertRaises(h.ObservationError): h.wire_window_evidence(reference, audits)
+        audits['wan-a']['directions']['a'].update(measurement_min_ip_bytes=100, measurement_max_ip_bytes=200)
+        # Reverse application bytes are zero, but actual ACK-return wire cost
+        # must still have an observed conservative positive denominator.
+        with self.assertRaises(h.ObservationError): h.wire_window_evidence(reference, audits)
+        audits['wan-b']['directions']['b'].update(measurement_min_ip_bytes=0, measurement_max_ip_bytes=1)
+        with self.assertRaises(h.ObservationError): h.wire_window_evidence(reference, audits)
+        audits['wan-b']['directions']['b'].update(measurement_min_ip_bytes=50, measurement_max_ip_bytes=100)
+        value = h.wire_window_evidence(reference, audits)
+        self.assertEqual(value['a_to_b']['receiver_unique_bytes'], 160)
+        self.assertEqual(value['b_to_a']['receiver_unique_bytes'], 0)
+
+
+class OwnedShapingContracts(unittest.TestCase):
+    def fixture(self):
+        spec = h.lab.LabSpec('unit')
+        owned = {name: {'device': 1, 'inode': index + 10} for index, name in enumerate(spec.namespaces.values())}
+        manifest = {'version': h.lab.STATE_VERSION, 'lab_id': 'unit', 'uid': 0, 'owned_namespaces': owned}
+        qdiscs = [{'kind': 'htb', 'handle': '1:', 'root': True},
+                  {'kind': 'netem', 'handle': '10:', 'parent': '1:10'}]
+        return spec, manifest, qdiscs
+
+    def test_recreation_verifies_ownership_then_deletes_and_adds_exact_requested_geometry(self):
+        for side in ('a', 'b'):
+            for path in h.PATHS:
+                spec, manifest, qdiscs = self.fixture()
+                calls = []
+                def command(role, *argv):
+                    calls.append((role, *argv))
+                    return json.dumps(qdiscs) if '-j' in argv else ''
+                with patch.object(h.lab, 'locked_state', return_value=contextlib.nullcontext(Path('journal'))), \
+                        patch.object(h.lab, 'load_manifest', return_value=manifest) as load, \
+                        patch.object(h.lab, 'namespace_identity', side_effect=manifest['owned_namespaces'].__getitem__):
+                    result = h.recreate_owned_wan(case(path=path), spec, Path('/owned'), side, command)
+                load.assert_called_once_with(Path('journal'), spec)
+                self.assertEqual(calls[0], (None, 'ip', 'netns', 'pids', spec.namespaces['endpoint_' + side]))
+                self.assertEqual(calls[1][1:], ('tc', '-j', 'qdisc', 'show', 'dev', 'wan0'))
+                self.assertEqual(calls[2][1:], ('tc', 'qdisc', 'del', 'dev', 'wan0', 'root', 'handle', '1:'))
+                self.assertEqual(calls[3][1:], ('tc', 'qdisc', 'add', 'dev', 'wan0', 'root', 'handle', '1:',
+                    'stab', 'overhead', '-14', 'linklayer', 'ethernet', 'htb', 'default', '10'))
+                rate = '100mbit' if side == 'a' else '10mbit'
+                self.assertEqual(calls[4][-4:], ('rate', rate, 'ceil', rate))
+                self.assertEqual(calls[5][-5:], ('delay', str(h.PATHS[path][0]) + 'ms', 'loss', 'random', str(h.PATHS[path][1]) + '%'))
+                self.assertTrue(all(row[0] == 'endpoint_' + side for row in calls[1:]))
+                self.assertFalse(any('replace' in row or 'change' in row for row in calls))
+                self.assertEqual(result['before'], qdiscs); self.assertEqual(result['after'], qdiscs)
+
+    def test_unexpected_qdisc_replaced_namespace_or_active_process_refuses_before_mutation(self):
+        for failure in ('root', 'leaf', 'extra', 'missing_namespace', 'replaced_namespace', 'active', 'race'):
+            spec, manifest, qdiscs = self.fixture(); calls, target_checks = [], [0]
+            if failure == 'root': qdiscs[0]['handle'] = '2:'
+            if failure == 'leaf': qdiscs[1]['parent'] = '2:10'
+            if failure == 'extra': qdiscs.append({'kind': 'clsact', 'handle': 'ffff:'})
+            if failure == 'missing_namespace': manifest['owned_namespaces'].pop(spec.namespaces['router'])
+            def identity(name):
+                if failure == 'replaced_namespace': return {'device': 9, 'inode': 9}
+                if name == spec.namespaces['endpoint_a']:
+                    target_checks[0] += 1
+                    if failure == 'race' and target_checks[0] == 2: return {'device': 9, 'inode': 9}
+                return manifest['owned_namespaces'][name]
+            def command(role, *argv):
+                calls.append((role, *argv))
+                return json.dumps(qdiscs) if '-j' in argv else '999\n' if failure == 'active' else ''
+            with patch.object(h.lab, 'locked_state', return_value=contextlib.nullcontext(Path('journal'))), \
+                    patch.object(h.lab, 'load_manifest', return_value=manifest), \
+                    patch.object(h.lab, 'namespace_identity', side_effect=identity), \
+                    self.subTest(failure=failure), self.assertRaises(ValueError):
+                h.recreate_owned_wan(case(), spec, Path('/owned'), 'a', command)
+            self.assertFalse(any('del' in row or 'add' in row or 'replace' in row for row in calls))
+
+    def test_tool_rejection_after_owned_delete_is_preserved_without_accounting_fallback(self):
+        spec, manifest, qdiscs = self.fixture(); calls = []
+        def command(role, *argv):
+            calls.append((role, *argv))
+            if 'add' in argv: raise RuntimeError('real tool rejection')
+            return json.dumps(qdiscs) if '-j' in argv else ''
+        with patch.object(h.lab, 'locked_state', return_value=contextlib.nullcontext(Path('journal'))), \
+                patch.object(h.lab, 'load_manifest', return_value=manifest), \
+                patch.object(h.lab, 'namespace_identity', side_effect=manifest['owned_namespaces'].__getitem__), \
+                self.assertRaisesRegex(RuntimeError, 'real tool rejection'):
+            h.recreate_owned_wan(case(), spec, Path('/owned'), 'a', command)
+        self.assertEqual([row[3] for row in calls if len(row) > 3 and row[2] == 'qdisc'], ['del', 'add'])
+        self.assertFalse(any('replace' in row or 'change' in row for row in calls))
+
+    def test_tc_observations_use_only_verified_endpoint_namespaces_and_bounded_timestamps(self):
+        spec, manifest, _ = self.fixture(); calls = []
+        def command(role, *argv):
+            calls.append((role, *argv)); return 'actual raw tc statistics\n'
+        with patch.object(h.lab, 'locked_state', return_value=contextlib.nullcontext(Path('journal'))), \
+                patch.object(h.lab, 'load_manifest', return_value=manifest), \
+                patch.object(h.lab, 'namespace_identity', side_effect=manifest['owned_namespaces'].__getitem__), \
+                patch.object(h.time, 'monotonic_ns', side_effect=[100, 200]):
+            value = h.owned_tc_snapshot(spec, Path('/owned'), command, 'tc_post_reference')
+        self.assertEqual(value['started_monotonic_ns'], 100); self.assertEqual(value['finished_monotonic_ns'], 200)
+        self.assertEqual([row[0] for row in calls], ['endpoint_a', 'endpoint_a', 'endpoint_b', 'endpoint_b'])
+        self.assertTrue(all(row[1:3] == ('tc', '-s') and row[-3:] == ('show', 'dev', 'wan0') for row in calls))
+        self.assertIn('not the exact throughput window', value['scope'])
+        with patch.object(h.lab, 'locked_state', return_value=contextlib.nullcontext(Path('journal'))), \
+                patch.object(h.lab, 'load_manifest', return_value=manifest), \
+                patch.object(h.lab, 'namespace_identity', return_value={'device': 99, 'inode': 99}), \
+                self.assertRaises(h.ObservationError):
+            h.owned_tc_snapshot(spec, Path('/owned'), Mock(side_effect=AssertionError('must not run tc')), 'tc_final')
+
+    def test_tc_partial_phase_failure_keeps_prior_reference_and_allows_final_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'receipt.json'
+            receipt = h.bounded.Receipt(path, {'status': 'running', 'reference': {'exact_bytes': 123}})
+            spec = h.lab.LabSpec('unit')
+            with patch.object(h, 'owned_tc_snapshot', side_effect=[{'phase': 'before'},
+                    RuntimeError('actual tc observation failed'), {'phase': 'final'}]):
+                h.record_tc_snapshot(receipt, spec, Path('/owned'), Mock(), 'tc_before')
+                with self.assertRaisesRegex(RuntimeError, 'actual tc observation failed'):
+                    h.record_tc_snapshot(receipt, spec, Path('/owned'), Mock(), 'tc_post_reference')
+                h.record_tc_snapshot(receipt, spec, Path('/owned'), Mock(), 'tc_final')
+            value = json.loads(path.read_text())
+            self.assertEqual(value['reference'], {'exact_bytes': 123})
+            self.assertEqual(value['tc_before']['phase'], 'before'); self.assertEqual(value['tc_final']['phase'], 'final')
+            self.assertNotIn('tc_post_reference', value)
+
 
 class ProbeContracts(unittest.TestCase):
     def test_explicit_flow_window_and_original_clock_limits(self):
@@ -542,6 +812,28 @@ class ProbeContracts(unittest.TestCase):
         # result merely because there was no remaining stream in the loop.
         with patch.object(p.time, 'monotonic_ns', return_value=5):
             with self.assertRaisesRegex(TimeoutError, 'final I/O'): p.transfer([], 1, 2, 3, 4, 65536, False)
+
+    def test_byte_ceiling_reached_before_end_stays_exhausted_after_next_turn_crosses_end(self):
+        stream = Mock()
+        stream.getsockname.return_value = ('198.18.0.1', 30000)
+        stream.getpeername.return_value = ('198.18.0.2', 24451)
+        stream.recv.return_value = b''; stream.send.side_effect = len
+        poll = Mock(); poll.__enter__ = Mock(return_value=poll); poll.__exit__ = Mock(return_value=False)
+        key = SimpleNamespace(fileobj=stream, data=0)
+        poll.select.side_effect = [[(key, p.selectors.EVENT_READ | p.selectors.EVENT_WRITE)], []]
+        maximum = len(p.reference.BLOCK)
+        with patch.object(p.selectors, 'DefaultSelector', return_value=poll), \
+                patch.object(p.reference, 'tcp_info', return_value={}), \
+                patch.object(p.time, 'monotonic_ns', side_effect=[20, 90, 99, 101, 102, 103]):
+            result = p.transfer([stream], 1, 2, 100, 1000, maximum, True)
+        row = result['flows'][0]
+        self.assertEqual(row['sent'], maximum); self.assertTrue(row['write_closed']); self.assertTrue(row['bound_exhausted'])
+        server = {'clock': result['clock'], 'send_enabled': False, 'flows': [{
+            'local': row['peer'], 'peer': row['local'], 'sent': 0, 'received': maximum,
+            'warmup': 0, 'measured': maximum, 'postwindow': 0, 'write_closed': True, 'eof': True,
+            'bound_exhausted': False, 'sent_sha256': hashlib.sha256(b'').hexdigest(),
+            'received_sha256': row['sent_sha256']}]}
+        self.assertEqual(h.compare_probes(result, server, 'forward16', 1)['status'], 'bound_exhausted')
 
 
 if __name__ == '__main__':

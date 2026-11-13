@@ -9,7 +9,7 @@ use std::{
     os::unix::net::UnixDatagram,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc as sync_mpsc,
     },
     thread,
@@ -986,6 +986,191 @@ async fn fresh_user_traffic_cannot_renew_the_original_matching_pong_deadline() -
     Ok(())
 }
 
+fn authenticated_pong(driver: &mut Driver, now: u64, nonce: u64) -> Result<Vec<u8>> {
+    assert!(
+        driver
+            .submit(
+                now,
+                driver.records.control_scope(),
+                control::Body::Pong { nonce }
+            )?
+            .is_some()
+    );
+    let emitted = driver
+        .control
+        .poll(duration(now), 4096, &mut driver.control_wire)?
+        .ok_or_else(|| protocol("fixture Pong source missing"))?;
+    let sealed = driver.records.seal(
+        Class::Control,
+        meta(driver.outer, cover::Phase::Established),
+        &driver.control_wire[..emitted.bytes],
+        &mut driver.seal,
+        &mut driver.wire,
+    )?;
+    driver.outer += 1;
+    Ok(driver.wire[..sealed.bytes].to_vec())
+}
+
+#[tokio::test]
+async fn original_established_lease_expires_despite_fresh_authenticated_pong_and_user_data()
+-> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let mut config = config(kind);
+        config.lifetime.lease = Duration::from_millis(10);
+        config.lifetime.ping_interval = Duration::from_millis(1);
+        let (a, b) = parts_pair(kind).await?;
+        let origin = Instant::now();
+        let (_a_socket, mut a) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
+        let (_b_socket, mut b) = Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+        let lease = b.lease;
+        assert_eq!(lease, 10_000);
+
+        // Real Noise/member roots and protected control dispatch are used;
+        // established lease/challenge time is injected, without wall-clock waits.
+        b.submit_control(1000)?;
+        assert_eq!(b.live.outstanding, Some(1));
+        let pong = authenticated_pong(&mut a, 1001, 1)?;
+        b.receive(&pong, 1001, origin + duration(1001), &resolve(config))?;
+        assert_eq!(b.live.last_pong_micros, Some(1001));
+        assert!(b.challenge.is_none());
+
+        b.submit_control(lease - 2)?;
+        assert_eq!(b.live.outstanding, Some(2));
+        let pong = authenticated_pong(&mut a, lease - 1, 2)?;
+        b.receive(
+            &pong,
+            lease - 1,
+            origin + duration(lease - 1),
+            &resolve(config),
+        )?;
+        let user = source(&mut a, lease - 1, 9)?;
+        b.receive(
+            &user,
+            lease - 1,
+            origin + duration(lease - 1),
+            &resolve(config),
+        )?;
+        assert!(b.challenge.is_none());
+        assert_eq!(b.live.last_pong_micros, Some(lease - 1));
+        assert_eq!(b.live.last_verified_micros, Some(lease - 1));
+        assert!(b.next_ping > lease);
+        assert_eq!(b.lease, lease);
+        b.progress(lease - 1)?;
+        assert!(b.terminal.is_none());
+
+        b.progress(lease)?;
+        assert_eq!(b.terminal, Some(StopReason::LeaseExpired));
+        assert_eq!(
+            b.control.submit(b"expired", duration(lease)),
+            Err(delivery::Error::Expired)
+        );
+        let stopped = b.snapshot(lease, false);
+        assert!(!stopped.running);
+        assert_eq!(stopped.terminal, Some(StopReason::LeaseExpired));
+        assert_eq!(stopped.liveness.last_pong_micros, Some(lease - 1));
+        assert_eq!(stopped.committed.epoch, policy::Epoch(0));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_and_mismatched_authenticated_pongs_cannot_renew_the_original_challenge() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let mut config = config(kind);
+        config.lifetime.ping_interval = Duration::from_millis(1);
+        config.lifetime.pong_timeout = Duration::from_millis(5);
+        let (a, b) = parts_pair(kind).await?;
+        let origin = Instant::now();
+        let (_a_socket, mut a) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
+        let (_b_socket, mut b) = Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+        let first_envelope = b.envelope_rx;
+        b.submit_control(1000)?;
+        let completed = authenticated_pong(&mut a, 1001, 1)?;
+        b.receive(&completed, 1001, origin + duration(1001), &resolve(config))?;
+        assert!(b.challenge.is_none());
+        assert_eq!(b.live.last_pong_micros, Some(1001));
+
+        b.submit_control(2001)?;
+        let deadline = b
+            .live
+            .deadline_micros
+            .ok_or_else(|| protocol("new challenge missing"))?;
+        let next_ping = b.next_ping;
+        assert_eq!((b.live.outstanding, deadline), (Some(2), 7001));
+        // The old completed nonce and an unrelated future nonce each arrive in
+        // a fresh ordered ARQ source and fresh AEAD packet, not as replay noise.
+        for (now, nonce) in [(2002, 1), (2003, 3)] {
+            let pong = authenticated_pong(&mut a, now, nonce)?;
+            b.receive(&pong, now, origin + duration(now), &resolve(config))?;
+            assert_eq!(b.live.last_verified_micros, Some(now));
+            assert_eq!(b.live.last_pong_micros, Some(1001));
+            assert_eq!(b.live.outstanding, Some(2));
+            assert_eq!(b.live.deadline_micros, Some(deadline));
+            assert_eq!(b.next_ping, next_ping);
+            assert!(b.terminal.is_none());
+        }
+        assert_eq!(b.envelope_rx, first_envelope + 3);
+        assert_eq!(b.counters.replay_rejections, 0);
+        b.progress(deadline - 1)?;
+        assert!(b.terminal.is_none());
+        assert_eq!(
+            b.progress(deadline).err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        let stopped = b.snapshot(deadline, false);
+        assert!(!stopped.running);
+        assert_eq!(stopped.terminal, Some(StopReason::PeerTimeout));
+        assert_eq!(stopped.liveness.outstanding, Some(2));
+        assert_eq!(stopped.liveness.deadline_micros, Some(deadline));
+        assert_eq!(stopped.liveness.last_pong_micros, Some(1001));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_or_late_matching_authenticated_pong_cannot_clear_an_expired_challenge() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for late in [0, 1] {
+            let mut config = config(kind);
+            config.lifetime.ping_interval = Duration::from_millis(1);
+            config.lifetime.pong_timeout = Duration::from_millis(5);
+            let (a, b) = parts_pair(kind).await?;
+            let origin = Instant::now();
+            let (_a_socket, mut a) =
+                Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
+            let (_b_socket, mut b) =
+                Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+            b.submit_control(1000)?;
+            let deadline = b
+                .live
+                .deadline_micros
+                .ok_or_else(|| protocol("challenge missing"))?;
+            assert_eq!((b.live.outstanding, deadline), (Some(1), 6000));
+            let arrival = deadline + late;
+            let pong = authenticated_pong(&mut a, arrival, 1)?;
+            // Simulate a readable socket winning select at the deadline. The
+            // receive dispatch must not erase expiry before the next progress.
+            b.receive(&pong, arrival, origin + duration(arrival), &resolve(config))?;
+            assert_eq!(b.live.last_verified_micros, Some(arrival));
+            assert!(
+                b.challenge.is_some(),
+                "matching Pong at {arrival} cleared original deadline {deadline}"
+            );
+            assert_eq!(b.live.outstanding, Some(1));
+            assert_eq!(b.live.deadline_micros, Some(deadline));
+            assert_eq!(b.live.last_pong_micros, None);
+            assert_eq!(
+                b.progress(arrival).err().map(|error| error.kind()),
+                Some(io::ErrorKind::TimedOut)
+            );
+            let stopped = b.snapshot(arrival, false);
+            assert_eq!(stopped.terminal, Some(StopReason::PeerTimeout));
+            assert_eq!(stopped.liveness.deadline_micros, Some(deadline));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn no_allowance_cannot_keep_expired_bootstrap_or_joining_custody_alive() -> Result {
     let kind = cover::Appearance::QuicLike;
@@ -1168,6 +1353,598 @@ async fn full_native_queue_still_rejects_empty_unknown_user_and_services_control
         assert_eq!(b.pong, None);
         assert_eq!(b.control.retained().send_records, 1);
         assert_eq!(b.native.len(), 1);
+    }
+    Ok(())
+}
+
+struct EventDevice {
+    inner: Device,
+    time: Arc<AtomicU64>,
+    writes: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
+    written_at: Option<u64>,
+    read_at: Option<u64>,
+}
+impl AsRawFd for EventDevice {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+impl PacketDevice for EventDevice {
+    type Error = io::Error;
+    fn layer(&self) -> PacketLayer {
+        self.inner.layer()
+    }
+    fn receive(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.receive(output);
+        if let Some(now) = self.read_at {
+            self.time.store(now, Ordering::SeqCst);
+        }
+        result
+    }
+    fn transmit(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.transmit(packet)?;
+        if let Some(now) = self.written_at {
+            self.time.store(now, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+struct NativeEventFixture {
+    driver: Driver,
+    device: AsyncFd<EventDevice>,
+    peer: UnixDatagram,
+    time: Arc<AtomicU64>,
+    writes: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
+}
+impl NativeEventFixture {
+    async fn new(kind: cover::Appearance, config: Config) -> Result<Self> {
+        let (a, b) = parts_pair(kind).await?;
+        let instant = Instant::now();
+        let (_, mut driver) = Driver::new(a, security::ConfigDigest([3; 32]), config, instant)?;
+        let (_, mut remote) = Driver::new(b, security::ConfigDigest([3; 32]), config, instant)?;
+        // Populate actual native ownership through the authenticated remote
+        // record/Swift path, rather than fabricating roots or queue contents.
+        let wire = source(&mut remote, 0, 1)?;
+        driver.receive(&wire, 1, instant, &resolve(config))?;
+        driver.collect_native(1)?;
+        assert_eq!(driver.native.len(), 1);
+        let (socket, peer) = UnixDatagram::pair()?;
+        socket.set_nonblocking(true)?;
+        peer.set_nonblocking(true)?;
+        let time = Arc::new(AtomicU64::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let device = AsyncFd::with_interest(
+            EventDevice {
+                inner: Device {
+                    socket,
+                    blocked: false,
+                    wouldblock: None,
+                },
+                time: time.clone(),
+                writes: writes.clone(),
+                reads: reads.clone(),
+                written_at: None,
+                read_at: None,
+            },
+            Interest::READABLE.add(Interest::WRITABLE),
+        )?;
+        Ok(Self {
+            driver,
+            device,
+            peer,
+            time,
+            writes,
+            reads,
+        })
+    }
+}
+
+#[tokio::test]
+async fn native_writable_event_observes_the_original_stall_boundary_before_io() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for offset in [-1_i64, 0, 1] {
+            let mut config = config(kind);
+            config.native.stall_timeout = Duration::from_millis(50);
+            let mut fixture = NativeEventFixture::new(kind, config).await?;
+            let deadline = add(1, config.native.stall_timeout)?;
+            let now = u64::try_from(i64::try_from(deadline)? + offset)?;
+            fixture.time.store(now, Ordering::SeqCst);
+            let mut ready = tokio::time::timeout(
+                Duration::from_secs(1),
+                fixture.device.ready_mut(Interest::WRITABLE),
+            )
+            .await??;
+            assert!(ready.ready().is_writable());
+            let time = fixture.time.clone();
+            let result = fixture
+                .driver
+                .write_native(&mut ready, || Ok(time.load(Ordering::SeqCst)));
+            let mut packet = [0; 512];
+            if offset < 0 {
+                assert!(result?);
+                assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.driver.counters.native_written, 1);
+                assert!(fixture.driver.native.is_empty());
+                assert_eq!(fixture.driver.native_bytes, 0);
+                let length = fixture.peer.recv(&mut packet)?;
+                assert_eq!(&packet[..length], ethernet(1));
+                assert!(fixture.driver.terminal.is_none());
+            } else {
+                assert_eq!(
+                    result.err().map(|error| error.kind()),
+                    Some(io::ErrorKind::TimedOut)
+                );
+                assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.driver.counters.native_written, 0);
+                assert_eq!(fixture.driver.native.len(), 1);
+                assert_eq!(
+                    fixture.driver.native.front().map(|packet| packet.since),
+                    Some(1)
+                );
+                assert_eq!(fixture.driver.native_bytes, ethernet(1).len());
+                assert_eq!(fixture.driver.terminal, Some(StopReason::NativeStall));
+                assert_eq!(
+                    fixture
+                        .peer
+                        .recv(&mut packet)
+                        .err()
+                        .map(|error| error.kind()),
+                    Some(io::ErrorKind::WouldBlock)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_write_crossing_expiry_is_counted_once_without_retained_duplicate() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let mut config = config(kind);
+        config.native.stall_timeout = Duration::from_millis(50);
+        let mut fixture = NativeEventFixture::new(kind, config).await?;
+        let deadline = add(1, config.native.stall_timeout)?;
+        fixture.time.store(deadline - 1, Ordering::SeqCst);
+        fixture.device.get_mut().written_at = Some(deadline);
+        let mut ready = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.device.ready_mut(Interest::WRITABLE),
+        )
+        .await??;
+        let time = fixture.time.clone();
+        assert_eq!(
+            fixture
+                .driver
+                .write_native(&mut ready, || Ok(time.load(Ordering::SeqCst)))
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert_eq!(fixture.driver.terminal, Some(StopReason::NativeStall));
+        assert_eq!(fixture.driver.counters.native_written, 1);
+        assert!(fixture.driver.native.is_empty());
+        assert_eq!(fixture.driver.native_bytes, 0);
+        assert!(
+            !fixture
+                .driver
+                .write_native(&mut ready, || Ok(time.load(Ordering::SeqCst)))?
+        );
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+        let mut packet = [0; 512];
+        let length = fixture.peer.recv(&mut packet)?;
+        assert_eq!(&packet[..length], ethernet(1));
+        assert_eq!(
+            fixture
+                .peer
+                .recv(&mut packet)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        let stopped = fixture.driver.snapshot(deadline, false);
+        assert_eq!(stopped.counters.native_pending_packets, 0);
+        assert_eq!(stopped.counters.native_written, 1);
+        assert_eq!(stopped.terminal, Some(StopReason::NativeStall));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_success_is_accounted_when_completion_clock_or_check_fails() -> Result {
+    for clock_failure in [false, true] {
+        let kind = cover::Appearance::QuicLike;
+        let config = config(kind);
+        let mut fixture = NativeEventFixture::new(kind, config).await?;
+        let mut ready = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.device.ready_mut(Interest::WRITABLE),
+        )
+        .await??;
+        let mut calls = 0;
+        let result = fixture.driver.write_native(&mut ready, || {
+            calls += 1;
+            if calls == 1 {
+                return Ok(10);
+            }
+            if clock_failure {
+                Err(io::Error::other("completion clock unavailable"))
+            } else {
+                Ok(9)
+            }
+        });
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(if clock_failure {
+                io::ErrorKind::Other
+            } else {
+                io::ErrorKind::InvalidData
+            })
+        );
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.driver.counters.native_written, 1);
+        assert!(fixture.driver.native.is_empty());
+        assert_eq!(fixture.driver.native_bytes, 0);
+        let mut packet = [0; 512];
+        let length = fixture.peer.recv(&mut packet)?;
+        assert_eq!(&packet[..length], ethernet(1));
+        assert_eq!(
+            fixture
+                .peer
+                .recv(&mut packet)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_lease_has_no_native_or_new_policy_request_effects() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for late in [0, 1] {
+            let mut config = config(kind);
+            config.lifetime.lease = Duration::from_millis(10);
+            config.lifetime.ping_interval = Duration::from_millis(1);
+            config.lifetime.pong_timeout = Duration::from_millis(5);
+            let mut fixture = NativeEventFixture::new(kind, config).await?;
+            let now = fixture.driver.lease + late;
+            fixture.time.store(now, Ordering::SeqCst);
+            fixture.peer.send(&ethernet(2))?;
+            let mut ready = tokio::time::timeout(
+                Duration::from_secs(1),
+                fixture
+                    .device
+                    .ready_mut(Interest::READABLE.add(Interest::WRITABLE)),
+            )
+            .await??;
+            let time = fixture.time.clone();
+            assert!(
+                !fixture
+                    .driver
+                    .write_native(&mut ready, || Ok(time.load(Ordering::SeqCst)))?
+            );
+            let mut input = vec![0; READ_BUFFER_BYTES];
+            assert!(
+                !fixture
+                    .driver
+                    .read_native(&mut ready, &mut input, || Ok(time.load(Ordering::SeqCst)))?
+            );
+            let (reply, result) = oneshot::channel();
+            fixture
+                .driver
+                .request(now, policy_value(), reply, &resolve(config))?;
+            assert_eq!(result.await?, Err(SwitchError::Closed));
+            assert_eq!(fixture.driver.terminal, Some(StopReason::LeaseExpired));
+            assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.driver.counters.native_written, 0);
+            assert_eq!(fixture.driver.counters.native_read, 0);
+            assert_eq!(fixture.driver.native.len(), 1);
+            assert!(fixture.driver.coordinator.pending().is_none());
+            assert!(fixture.driver.coordinator.outbound().is_none());
+            assert!(fixture.driver.coordinator.take_outcome().is_none());
+            assert_eq!(
+                fixture.driver.coordinator.committed().epoch,
+                policy::Epoch(0)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_read_crossing_lease_expiry_is_not_admitted_to_swift() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let mut config = config(kind);
+    config.lifetime.lease = Duration::from_millis(10);
+    config.lifetime.ping_interval = Duration::from_millis(1);
+    config.lifetime.pong_timeout = Duration::from_millis(5);
+    let mut fixture = NativeEventFixture::new(kind, config).await?;
+    fixture
+        .time
+        .store(fixture.driver.lease - 1, Ordering::SeqCst);
+    fixture.device.get_mut().read_at = Some(fixture.driver.lease);
+    fixture.peer.send(&ethernet(2))?;
+    let mut ready = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.device.ready_mut(Interest::READABLE),
+    )
+    .await??;
+    let time = fixture.time.clone();
+    let mut input = vec![0; READ_BUFFER_BYTES];
+    assert!(
+        !fixture
+            .driver
+            .read_native(&mut ready, &mut input, || Ok(time.load(Ordering::SeqCst)))?
+    );
+    assert_eq!(fixture.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.driver.counters.native_read, 0);
+    assert_eq!(fixture.driver.swift.unconfirmed(), 0);
+    assert_eq!(fixture.driver.swift.stats().native_read, 0);
+    assert_eq!(fixture.driver.terminal, Some(StopReason::LeaseExpired));
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_expiry_preserves_lease_challenge_native_and_policy_priority() -> Result {
+    for reason in [
+        StopReason::LeaseExpired,
+        StopReason::PeerTimeout,
+        StopReason::NativeStall,
+        StopReason::PolicyTimeout,
+    ] {
+        let kind = cover::Appearance::QuicLike;
+        let mut config = config(kind);
+        config.native.stall_timeout =
+            Duration::from_micros(if reason == StopReason::PolicyTimeout {
+                100
+            } else {
+                49
+            });
+        config.policy.transaction_micros = 48;
+        config.lifetime.ping_interval = Duration::from_micros(10);
+        config.lifetime.pong_timeout = Duration::from_micros(40);
+        if reason == StopReason::LeaseExpired {
+            config.lifetime.lease = Duration::from_micros(50);
+        }
+        let mut fixture = NativeEventFixture::new(kind, config).await?;
+        let (reply, mut result) = oneshot::channel();
+        fixture
+            .driver
+            .request(2, policy_value(), reply, &resolve(config))?;
+        assert_eq!(
+            fixture.driver.coordinator.deadline(),
+            Some(policy::Time(50))
+        );
+        if matches!(reason, StopReason::LeaseExpired | StopReason::PeerTimeout) {
+            fixture.driver.submit_control(10)?;
+            assert_eq!(
+                fixture
+                    .driver
+                    .challenge
+                    .as_ref()
+                    .map(|challenge| challenge.deadline),
+                Some(50)
+            );
+        }
+        fixture.time.store(50, Ordering::SeqCst);
+        let mut ready = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.device.ready_mut(Interest::WRITABLE),
+        )
+        .await??;
+        let time = fixture.time.clone();
+        let outcome = fixture
+            .driver
+            .write_native(&mut ready, || Ok(time.load(Ordering::SeqCst)));
+        match reason {
+            StopReason::LeaseExpired => assert!(!outcome?),
+            StopReason::PolicyTimeout => assert_eq!(
+                outcome.err().map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidData)
+            ),
+            _ => assert_eq!(
+                outcome.err().map(|error| error.kind()),
+                Some(io::ErrorKind::TimedOut)
+            ),
+        }
+        assert_eq!(fixture.driver.terminal, Some(reason));
+        assert_eq!(fixture.driver.native.len(), 1);
+        assert_eq!(
+            fixture.driver.native.front().map(|packet| packet.since),
+            Some(1)
+        );
+        assert_eq!(fixture.driver.counters.native_written, 0);
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.driver.coordinator.committed().epoch,
+            policy::Epoch(0)
+        );
+        assert!(fixture.driver.coordinator.take_outcome().is_none());
+        assert_eq!(result.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        drop(ready);
+        drop(fixture);
+        assert!(result.await.is_err());
+    }
+    Ok(())
+}
+
+struct ReadyWakeFixture {
+    socket: tokio::net::UdpSocket,
+    driver: Driver,
+    _remote_socket: tokio::net::UdpSocket,
+    remote: Driver,
+    now: u64,
+}
+impl ReadyWakeFixture {
+    async fn new(kind: cover::Appearance, proportional_repairs: bool) -> Result<Self> {
+        let mut config = config(kind);
+        config.send.records.channels = 1;
+        config.receive.records.channels = 1;
+        config.send.records.codec.repair_numerator = u32::from(proportional_repairs);
+        config.send.records.codec.repair_denominator = 1;
+        config.receive.records.codec = config.send.records.codec;
+        config.lifetime.lease = Duration::from_secs(60);
+        config.lifetime.ping_interval = Duration::from_secs(10);
+        config.report_interval = None;
+        let (a, b) = parts_pair(kind).await?;
+        let setup_end = a.deadline.max(b.deadline);
+        let origin = Instant::now();
+        let (socket, mut driver) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
+        let (remote_socket, mut remote) =
+            Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+        // Retire actual bootstrap/joining custody at its original deadline,
+        // without allowing an unrelated tail wake to mask ready Swift work.
+        driver.bucket.tokens = 0;
+        remote.bucket.tokens = 0;
+        assert!(driver.tail(setup_end)?.is_none());
+        assert!(remote.tail(setup_end)?.is_none());
+        assert!(driver.bootstrap.deadline().is_none());
+        assert!(driver.joining.deadline().is_none());
+        let now = clock(origin, setup_end)? + 20_000;
+        Ok(Self {
+            socket,
+            driver,
+            _remote_socket: remote_socket,
+            remote,
+            now,
+        })
+    }
+
+    fn ready_at(&mut self) -> Result<(u64, Instant)> {
+        let driver = &mut self.driver;
+        assert!(driver.swift.data_ready(self.now));
+        // With flush=0, free source retention and no queued native bytes, only
+        // an idle probe remains in data_deadline despite the already-ready work.
+        assert_eq!(driver.send.records.codec.flush_micros, 0);
+        assert!(driver.swift.unconfirmed() < driver.send.records.codec.flow_sources);
+        assert!(driver.swift.data_deadline().is_some_and(|at| at > self.now));
+        assert!(driver.swift.feedback_deadline().is_none());
+        assert!(driver.native.is_empty());
+        assert!(driver.challenge.is_none());
+        assert!(driver.coordinator.deadline().is_none());
+        assert!(driver.next_report.is_none());
+        assert!(driver.ingress.left > 0);
+        assert!(driver.control.drained());
+        driver.bucket.tokens = 0;
+        driver.bucket.last = self.now;
+        let maximum = driver
+            .send
+            .records
+            .codec
+            .datagram_bytes
+            .max(driver.receive.records.codec.datagram_bytes);
+        let required = driver.records.capacity(maximum)?.packet_bytes + driver.ip + driver.reserve;
+        let ready = driver.bucket.ready_at(required)?;
+        assert!(ready > self.now + 100);
+        assert!(driver.swift.data_deadline().is_some_and(|at| at > ready));
+        assert!(driver.next_ping > ready);
+        assert!(driver.lease > ready);
+        assert!(driver.control.deadline() > duration(ready));
+        let number = driver.records.next_number(Class::User);
+        let statistics = driver.swift.stats();
+        let wake = driver.wake(self.now)?;
+        assert_eq!(driver.records.next_number(Class::User), number);
+        let after = driver.swift.stats();
+        assert_eq!(after.sender.sources, statistics.sender.sources);
+        assert_eq!(after.sender.retransmits, statistics.sender.retransmits);
+        assert_eq!(after.sender.repairs, statistics.sender.repairs);
+        assert_eq!(after.sender.tail_repairs, statistics.sender.tail_repairs);
+        assert_eq!(after.receiver.feedback, statistics.receiver.feedback);
+        assert_eq!(driver.bucket.tokens, 0);
+        Ok((ready, wake))
+    }
+}
+
+#[tokio::test]
+async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_probe() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let mut fixture = ReadyWakeFixture::new(kind, false).await?;
+        let first = fixture.now - 5_000;
+        for number in 0..4 {
+            let wire = source(&mut fixture.driver, first + u64::from(number), number)?;
+            if number != 0 {
+                fixture.remote.receive(
+                    &wire,
+                    first + 100 + u64::from(number),
+                    fixture.remote.origin + duration(first + 100 + u64::from(number)),
+                    &resolve(fixture.remote.config),
+                )?;
+            }
+        }
+        assert_eq!(fixture.driver.swift.stats().sender.sources, 4);
+        assert_eq!(fixture.remote.swift.stats().receiver.sources, 3);
+        let number = fixture.remote.records.next_number(Class::User);
+        let body = fixture
+            .remote
+            .swift
+            .poll(fixture.now - 1_000, records::RecordNumber(number.0), false)?
+            .ok_or_else(|| protocol("fixture gap feedback was not produced"))?;
+        assert_eq!(body[0] & swift::KIND_MASK, swift::KIND_FEEDBACK);
+        assert_eq!(body[swift::FEEDBACK_HEADER - 1], 1);
+        assert_eq!(&body[swift::FEEDBACK_HEADER..], &[0, 0]);
+        let mut wire = vec![0; fixture.remote.cover.limits().max_packet_bytes];
+        let sealed = fixture.remote.records.seal_user_in(
+            fixture.remote.feedback_scope,
+            meta(fixture.remote.outer, cover::Phase::Established),
+            body,
+            &mut fixture.remote.seal,
+            &mut wire,
+        )?;
+        fixture.driver.receive(
+            &wire[..sealed.bytes],
+            fixture.now,
+            fixture.driver.origin + duration(fixture.now),
+            &resolve(fixture.driver.config),
+        )?;
+        assert_eq!(fixture.driver.swift.stats().sender.retransmits, 0);
+        let (ready, wake) = fixture.ready_at()?;
+        assert_eq!(
+            wake,
+            fixture.driver.origin + duration(ready),
+            "queued authenticated retransmission slept until a later idle probe"
+        );
+        fixture.driver.progress(ready)?;
+        fixture.driver.send(
+            &fixture.socket,
+            ready,
+            fixture.driver.origin + duration(ready),
+        )?;
+        assert_eq!(fixture.driver.swift.stats().sender.retransmits, 1);
+        assert_eq!(fixture.driver.counters.socket_accepted_packets, 1);
+        assert!(fixture.driver.bucket.allowance() >= fixture.driver.reserve);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn earned_repair_wakes_when_wire_credit_returns_before_the_idle_probe() -> Result {
+    for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        let mut fixture = ReadyWakeFixture::new(kind, true).await?;
+        let _wire = source(&mut fixture.driver, fixture.now - 1, 1)?;
+        assert_eq!(fixture.driver.swift.stats().sender.sources, 1);
+        assert_eq!(fixture.driver.swift.stats().sender.repairs, 0);
+        let (ready, wake) = fixture.ready_at()?;
+        assert_eq!(
+            wake,
+            fixture.driver.origin + duration(ready),
+            "earned repair slept until a later idle probe"
+        );
+        fixture.driver.progress(ready)?;
+        fixture.driver.send(
+            &fixture.socket,
+            ready,
+            fixture.driver.origin + duration(ready),
+        )?;
+        assert_eq!(fixture.driver.swift.stats().sender.repairs, 1);
+        assert_eq!(fixture.driver.counters.socket_accepted_packets, 1);
+        assert!(fixture.driver.bucket.allowance() >= fixture.driver.reserve);
     }
     Ok(())
 }

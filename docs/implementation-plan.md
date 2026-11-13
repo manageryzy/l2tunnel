@@ -113,8 +113,13 @@ reconnect. This follows the factory checkpoint; it does not qualify actual
 CLI/TAP throughput. The [separate native lab](modules/secure-udp-native.md) retains
 clean, delay, 1%/15% loss, sixteen-flow ACK-return, reverse-bulk stress, payload,
 policy/lifecycle and capture acceptance without reducing parent gates.
-The [required runtime/service aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
-passed with stable source inputs; this is local validation rather than native performance.
+The [latest required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
+passed with stable source inputs. The subsequent [immutable CLI/TAP baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
+exercise exact bytes, real policy commits and manual reconnect for both appearances.
+Clean/delay QUIC-like cases passed; both impaired cases failed the unchanged
+80 Mbit/s target. Source-backed deadline/wakeup corrections and the remaining
+matched matrix require new recorded qualification; these finite observations do
+not close FIX-04, FIX-13 or full SW-11.
 
 Additional unfinished source and integration boundaries:
 

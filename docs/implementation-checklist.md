@@ -84,8 +84,11 @@ passed real socket/device and paired-service checks, credential/profile/CLI
 validation, versioned local API, policy and manual reconnect cases, strict Clippy
 and rustdoc. The subsequent [required aggregate](../work/secure-udp-runtime-service-20261113/attempt-1/validation.json)
 passed with stable inputs: 1487 Rust cases including doctests, 271 Python tooling
-cases and 1658 simulator cases. Actual CLI/TAP performance, the full independent-runtime
-impairment matrix and restarted-peer recovery remain open.
+cases and 1658 simulator cases. Subsequent [immutable CLI/TAP baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
+passed exact bytes, policy/lifecycle checks and clean/delay QUIC-like performance;
+both impaired appearances failed the unchanged throughput target. The complete
+native matrix and restarted-peer recovery remain open. The later deadline/wakeup
+correction passed its [source-stable required aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json): 1498 Rust cases including doctests, 285 Python tooling cases and 1658 simulator cases. Its native attempts remain failed, with full evidence retained.
 Swift now consumes the common library's explicit legacy compatibility owners;
 the legacy CLI profile uses retained TLS plus a separate UDP data socket. A new
 same-UDP-pair integration fixture exercises Noise, both appearance codecs,
