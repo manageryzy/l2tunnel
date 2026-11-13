@@ -125,8 +125,8 @@ not a write barrier; stopped full capture/counter audits remain authoritative.
 Independent review then found an observed-growth/EOF edge; its focused regression
 and correction are included in the current source. The initial matrix above stays
 unchanged. Fresh final-source native observations are recorded separately below. The required
-whole-workspace check and evidence-only reconciliation now pass; the local
-checkpoint is still pending. The [first aggregate](../../work/native-capture-drain-20261113/aggregate-attempt-1/validation.json)
+whole-workspace check and evidence-only reconciliation pass, and the exact-byte
+local source checkpoint now exists. The [first aggregate](../../work/native-capture-drain-20261113/aggregate-attempt-1/validation.json)
 was intentionally interrupted for that review fix with frozen inputs; its
 [exact-child interruption record](../../work/native-capture-drain-20261113/aggregate-attempt-1/interruption.json)
 remains a separate failed/incomplete observation.
@@ -162,8 +162,8 @@ simulator cases. Formatting, strict workspace Clippy, rustdoc and CLI checks pas
 all before/after source inputs match. The intentionally interrupted first attempt
 remains failed/incomplete, with its actual command/log and interruption reason.
 This pass adds no platform, carrier, full SW-11, historical A/B or80Mbit/s acceptance.
-NCD-05 records the actual passed evidence-only reconciliation. NCD-06 remains
-open until the local source checkpoint exists.
+NCD-05 records the passed evidence-only reconciliation. NCD-06 records the
+actually completed local source checkpoint; its final status edit is documentation only.
 
 ## Acceptance ledger
 
@@ -172,7 +172,7 @@ open until the local source checkpoint exists.
 - [x] [NCD-03] Pass discriminating delayed/partial-tail, deadline, file identity, producer exit, resource and finally-cleanup regressions alongside all existing native tooling tests. Evidence: all74 [focused cases pass with stable source](../../work/native-capture-drain-20261113/focused-attempt-2/validation.json), including24 new [capture-tail regressions](../../tools/test_secure_udp_native.py). A complete24-key prefix with a partial25th record must wait for its valid boundary, including growth observed after an EOF read; failure/receipt-publication paths still stop and audit all captures.
 - [x] [NCD-04] Run fresh source-pinned current-daemon clean/impaired observations on both appearances, retaining exact native/control/capture/cleanup and unchanged80 target outcomes; do not substitute them for historical matched A/B qualification. Evidence: the [final-source matrix](../../work/native-capture-drain-20261113/native-analysis-attempt-2/validation.json) passes all capture/control/cleanup checks, with two unchanged80 failures. The initial matrix remains preserved separately; historical SBC-04 stays open.
 - [x] [NCD-05] Pass the required frozen-source workspace check and reconcile final documentation against exact non-document inputs, preserving failed attempts and all parent gates. Evidence: [passed required aggregate](../../work/native-capture-drain-20261113/aggregate-attempt-2/validation.json) and [completed evidence-only reconciliation](../../work/native-capture-drain-20261113/aggregate-attempt-2/postcheck/ledger-1/validation.json), with298 checked local links, no missing links and exact non-document inputs.
-- [ ] [NCD-06] Save a coherent exact-byte local source checkpoint after its actual checks/reconciliation pass; close this item only after the commit exists.
+- [x] [NCD-06] Save a coherent exact-byte local source checkpoint after its actual checks/reconciliation pass; close this item only after the commit exists. Evidence: the [completed exact-byte local source checkpoint](../../work/native-capture-drain-20261113/commit-binding-attempt-1/validation.json), commit `04650764169e087a1df137abc84032b9c4a3eb49`, contains exactly the five validated source/document files with a clean worktree and no push/publication. Historical A/B,80Mbit/s and all parent gates remain open.
 
 Full SNL-08/SNL-09/SNL-11, SBC-04, FIX-02/FIX-04/FIX-09, SW-11, all47 P-* modes
 and the remaining carrier/lifecycle/platform requirements retain their full scope.
