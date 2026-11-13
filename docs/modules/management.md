@@ -26,6 +26,11 @@ The additive [whole-message](control-messages.md) and
 [control-stream](control-streams.md) work composes existing bounded fragmentation
 and reliable delivery for complete generic transactions and independent liveness.
 Their implementation and integration gates remain separate from full SW-11.
+The explicit [leased transaction contract](control-streams.md#bounded-transaction-composition)
+now binds the original operation cap and originating digest through terminal
+request/reply custody. Joint stream admission borrows exact retained authority
+from that Peer, while actual message-owner proofs settle final delivery. Legacy
+constructors, wire bytes and selected runtime paths retain their prior contracts.
 The crate has no socket, clock, runtime or random source; it does
 not authenticate records or implement cryptographic primitives. It reuses `Epoch`,
 `ConfigDigest` and `Ticket`; a ticket's target epoch, attempt and digest do not

@@ -121,6 +121,15 @@ Its [source-stable required aggregate](../work/common-control-messages-20261113/
 passes 1555 Rust cases including doctests, 295 Python tooling cases and 1658
 simulator cases. No new native or platform result is inferred from that pass.
 
+The additive [leased transaction checkpoint](modules/control-streams.md#leased-transaction-checkpoint)
+now preserves the original operation deadline and source digest through generic
+commit/retire and final message custody. Both-cover original-socket tests exercise
+exact retired-origin retries, 130 liveness rounds and real submission/acceptance
+backpressure. An explicitly bound Gate dispatches the existing Peer before
+committing its envelope sequence; borrowed message proofs distinguish queued
+acceptance from peer-confirmed whole messages. This does not switch a native data
+profile, enable the contract in the selected service or qualify full SCS-05/SW-11.
+
 ## Library boundary and layering
 
 ```mermaid

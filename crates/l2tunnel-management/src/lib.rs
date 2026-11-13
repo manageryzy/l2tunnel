@@ -171,7 +171,9 @@ pub struct Header {
 }
 
 impl Header {
-    fn same_request(self, other: Self) -> bool {
+    /// Compare immutable logical identity; transmission packet and lane may differ.
+    /// This does not validate the actual authenticated physical lane or body bytes.
+    pub fn same_request(self, other: Self) -> bool {
         Self {
             lane: other.lane,
             packet: other.packet,

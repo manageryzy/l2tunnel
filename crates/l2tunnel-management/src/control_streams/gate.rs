@@ -1,17 +1,49 @@
 //! Pure admission for explicitly negotiated independent control streams.
 //!
-//! Authentication is supplied by the enclosing Control owner. This gate changes
-//! neither legacy admission nor transaction state, and grants no retired-origin
-//! or staged-origin authority.
+//! Authentication is supplied by the enclosing Control owner. Legacy admission
+//! remains unchanged. The explicitly transaction-bound contract delegates exact
+//! retired-origin retries to the leased transaction owner's current cached
+//! request/reply or unaccepted terminal incoming custody. Staged readers never
+//! grant originating management authority.
+
+use std::fmt;
 
 use super::Stream;
 use crate::session_control::{
     Body, Envelope, Limits, NativeReceipt, PeerBinding, ReceiptPolicy, RecoveryTag, Scope,
 };
+use crate::transaction as tx;
 use crate::{Ingress, PacketNumber, ReplayWindow};
 
 /// Existing strict envelope/admission errors, without a second parser grammar.
 pub use crate::session_control::Error;
+
+/// Refusal by the stream gate or the existing transaction owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionError {
+    /// Envelope authentication, binding, grammar, origin or sequence was refused.
+    Gate(Error),
+    /// The transaction owner refused its lease, immutable command or semantics.
+    Transaction(tx::Error),
+    /// The gate and peer have not both selected the leased transaction contract.
+    Contract,
+}
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(output, "control stream transaction error: {self:?}")
+    }
+}
+
+impl std::error::Error for TransactionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Gate(error) => Some(error),
+            Self::Transaction(error) => Some(error),
+            Self::Contract => None,
+        }
+    }
+}
 
 /// Actual data-origin policy; absence of recovery does not invent a feedback tag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +75,7 @@ pub struct Gate {
     active: DataPolicy,
     draining: Option<DataPolicy>,
     replay: [ReplayWindow; 3],
+    transaction_bound: bool,
 }
 
 impl Gate {
@@ -66,7 +99,16 @@ impl Gate {
             settings,
             draining: None,
             replay: [ReplayWindow::default(); 3],
+            transaction_bound: false,
         })
+    }
+
+    /// Select management admission through the leased transaction owner only.
+    /// This explicit contract does not change any legacy envelope or wire bytes.
+    pub fn new_transaction_bound(settings: GateSettings) -> Result<Self, Error> {
+        let mut gate = Self::new(settings)?;
+        gate.transaction_bound = true;
+        Ok(gate)
     }
 
     /// Highest admitted envelope identity in this stream only.
@@ -109,26 +151,12 @@ impl Gate {
         stream: Stream,
         input: &'a [u8],
     ) -> Result<Envelope<'a>, Error> {
-        let Ingress::AuthenticatedManagement {
-            session,
-            lane,
-            sender,
-        } = verified
-        else {
-            return Err(Error::Legacy(crate::Error::UntrustedOrigin));
-        };
-        let binding = self.settings.binding;
-        if session != binding.session
-            || lane != binding.control_lane
-            || sender != binding.remote_role
-        {
-            return Err(Error::Binding);
+        let envelope = self.authenticated_envelope(verified, input)?;
+        if self.transaction_bound && matches!(envelope.body, Body::Management(_)) {
+            return Err(Error::Kind);
         }
-        let envelope = Envelope::decode(input, self.settings.limits)?;
         let actual = envelope.binding;
-        if actual.session != session || actual.lane != lane || actual.sender != sender {
-            return Err(Error::Binding);
-        }
+        let binding = self.settings.binding;
         match (stream, envelope.body) {
             (Stream::Liveness, Body::Ping { .. } | Body::Pong { .. }) => {
                 if actual.scope != self.settings.control {
@@ -164,17 +192,100 @@ impl Gate {
             }
             _ => return Err(Error::Kind),
         }
+        let candidate = self.sequence_candidate(stream, actual.packet)?;
+        self.replay[stream.index()] = candidate;
+        Ok(envelope)
+    }
+
+    /// Dispatch one authenticated Management envelope through the leased owner.
+    /// The caller reserves bounded completion and outbound custody beforehand.
+    /// Admission refusals leave both owners unchanged. A semantic transaction
+    /// error may fail that owner; no rollback or alternative admission is allowed.
+    /// Only successful dispatch commits the stream sequence. An exact cached
+    /// request or retained terminal incoming reply may retry under its original
+    /// expiry; neither restores a retired data policy or repeats lifecycle effects.
+    pub fn receive_transaction<C: tx::Configuration>(
+        &mut self,
+        peer: &mut tx::Peer<C>,
+        verified: Ingress,
+        stream: Stream,
+        input: &[u8],
+        now: tx::Tick,
+        expires: tx::Tick,
+    ) -> Result<tx::Effects<C>, TransactionError> {
+        if !self.transaction_bound || !peer.is_leased() {
+            return Err(TransactionError::Contract);
+        }
+        let envelope = self
+            .authenticated_envelope(verified, input)
+            .map_err(TransactionError::Gate)?;
+        if stream != Stream::Transaction {
+            return Err(TransactionError::Gate(Error::Kind));
+        }
+        let Body::Management(command) = envelope.body else {
+            return Err(TransactionError::Gate(Error::Kind));
+        };
+        let candidate = self
+            .sequence_candidate(stream, envelope.binding.packet)
+            .map_err(TransactionError::Gate)?;
+        let retained_retry = peer
+            .validate_control_origin(verified, command, envelope.binding.scope, now)
+            .map_err(TransactionError::Transaction)?;
+        if !retained_retry {
+            self.policy(envelope.binding.scope)
+                .map_err(TransactionError::Gate)?;
+        }
+        peer.validate_receive_until(verified, command, now, expires)
+            .map_err(TransactionError::Transaction)?;
+        let effects = peer
+            .receive_until(verified, command, now, expires)
+            .map_err(TransactionError::Transaction)?;
+        self.replay[stream.index()] = candidate;
+        Ok(effects)
+    }
+
+    fn authenticated_envelope<'a>(
+        &self,
+        verified: Ingress,
+        input: &'a [u8],
+    ) -> Result<Envelope<'a>, Error> {
+        let Ingress::AuthenticatedManagement {
+            session,
+            lane,
+            sender,
+        } = verified
+        else {
+            return Err(Error::Legacy(crate::Error::UntrustedOrigin));
+        };
+        let binding = self.settings.binding;
+        if session != binding.session
+            || lane != binding.control_lane
+            || sender != binding.remote_role
+        {
+            return Err(Error::Binding);
+        }
+        let envelope = Envelope::decode(input, self.settings.limits)?;
+        let actual = envelope.binding;
+        if actual.session != session || actual.lane != lane || actual.sender != sender {
+            return Err(Error::Binding);
+        }
+        Ok(envelope)
+    }
+
+    fn sequence_candidate(
+        &self,
+        stream: Stream,
+        packet: PacketNumber,
+    ) -> Result<ReplayWindow, Error> {
         let replay = self.replay[stream.index()];
         let expected = replay
             .highest
             .map_or(Some(1), |number| number.0.checked_add(1))
             .ok_or(Error::Exhausted)?;
-        if actual.packet.0 > expected {
+        if packet.0 > expected {
             return Err(Error::Sequence);
         }
-        let candidate = replay.candidate(actual.packet).map_err(Error::Legacy)?;
-        self.replay[stream.index()] = candidate;
-        Ok(envelope)
+        replay.candidate(packet).map_err(Error::Legacy)
     }
 
     fn policy(&self, scope: Scope) -> Result<DataPolicy, Error> {
@@ -203,3 +314,7 @@ fn validate_policy(policy: DataPolicy, limits: Limits) -> Result<(), Error> {
 #[cfg(test)]
 #[path = "gate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transaction_tests.rs"]
+mod transaction_tests;

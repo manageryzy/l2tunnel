@@ -53,6 +53,12 @@ The [required source-stable aggregate](../work/common-control-messages-20261113/
 passes 1555 Rust cases including doctests, 295 Python tooling cases and 1658
 simulator cases; preserved checklist-format failures are described in the module
 ledgers. These are local Linux checks, not new native or non-Linux qualification.
+The subsequent [leased generic transaction checkpoint](modules/control-streams.md#leased-transaction-checkpoint)
+adds fixed operation expiry, exact retired request/reply authority and actual
+proof-gated terminal custody. Its both-cover UDP fixture completes the generic
+transaction with lost final output and forced backpressure, while preserving
+independent liveness. This is not an actual Records User-scope/profile or selected
+service switch; those integration and performance gates remain open.
 
 The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API

@@ -5,10 +5,12 @@
 //! request retirement floors. No sockets, automatic device barriers or crash resume exist here.
 
 mod config;
+mod lease;
 pub use config::{
     Configuration, MODE_BYTES, configuration_digest, decode_mode, encode_mode, mode_digest,
 };
 use config::{decode_configuration, encode_configuration};
+pub use lease::{CachedRetryAuthority, LeaseSettings, Operation, OutboundContext};
 
 use std::fmt;
 
@@ -255,6 +257,7 @@ struct Pending<C: Configuration> {
 
 /// Bounded distributed transaction state for one existing authenticated peer session.
 pub struct Peer<C: Configuration = ModeConfig> {
+    lease: Option<lease::State>,
     identity: Identity,
     settings: Settings,
     supported: Vec<ConfigDigest>,
@@ -308,6 +311,7 @@ impl<C: Configuration> Peer<C> {
         };
         let deadline = add(now, settings.reconcile_timeout_ms)?;
         Ok(Self {
+            lease: None,
             identity,
             settings,
             supported,
@@ -347,7 +351,7 @@ impl<C: Configuration> Peer<C> {
     }
     /// New user admission is permitted only once a transaction/abort completes.
     pub fn can_admit_data(&self) -> bool {
-        self.phase == Phase::Idle
+        self.phase == Phase::Idle && self.operation().is_none()
     }
     /// Bounded request-ledger occupancy, independent of the number of completed transactions.
     pub fn retained_requests(&self) -> usize {
@@ -392,10 +396,17 @@ impl<C: Configuration> Peer<C> {
     /// Coordinator-only proposal. Actual reader allocation/admission fencing is a later `staged` call.
     pub fn propose(&mut self, config: C, now: Tick) -> Result<Effects<C>, Error> {
         self.advance(now)?;
+        if self.is_leased() {
+            return Err(Error::LeaseRequired);
+        }
+        self.propose_inner(config)
+    }
+
+    fn propose_inner(&mut self, config: C) -> Result<Effects<C>, Error> {
         if self.identity.role != Role::Client {
             return Err(Error::NotCoordinator);
         }
-        if self.phase != Phase::Idle {
+        if self.phase != Phase::Idle || self.operation().is_some() {
             return Err(Error::Busy);
         }
         let digest = self.validate_mode(&config)?;
@@ -410,6 +421,7 @@ impl<C: Configuration> Peer<C> {
             digest,
         };
         self.guard.prepare(ticket).map_err(Error::Guard)?;
+        self.begin_operation(ticket)?;
         self.last_attempt = ticket.attempt;
         self.pending = Some(Pending {
             ticket,
@@ -508,6 +520,7 @@ impl<C: Configuration> Peer<C> {
         if self.phase == Phase::Failed {
             return Err(Error::Failed);
         }
+        self.leased_receive_preflight(ingress, bytes)?;
         let admitted = match self.gate.admit(ingress, bytes) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -549,7 +562,12 @@ impl<C: Configuration> Peer<C> {
         if result.is_err() {
             self.phase = Phase::Failed;
         } else if self.identity.role == Role::Client {
-            self.gate.retire_through(frame.header.request);
+            let request = if self.final_request_is_held(frame.header.request) {
+                RequestId(frame.header.request.0.saturating_sub(1))
+            } else {
+                frame.header.request
+            };
+            self.gate.retire_through(request);
         } else {
             self.gate
                 .retire_through(RequestId(frame.header.request.0.saturating_sub(1)));
@@ -579,6 +597,7 @@ impl<C: Configuration> Peer<C> {
                 if not_sent {
                     self.pending = None;
                     self.set_phase(Phase::Idle)?;
+                    self.complete_local_abort();
                     return Ok(Effects {
                         event: Some(Event::Aborted(ticket.attempt)),
                         ..Effects::default()
@@ -592,7 +611,7 @@ impl<C: Configuration> Peer<C> {
             {
                 let message = self.outstanding.clone().ok_or(Error::Unexpected)?;
                 self.phase = Phase::Uncertain;
-                self.deadline = add(now, self.settings.reconcile_timeout_ms)?;
+                self.deadline = self.clamp_lease(add(now, self.settings.reconcile_timeout_ms)?);
                 return Ok(Effects {
                     outbound: Some(self.emit(&message)?),
                     event: Some(Event::Uncertain(message.ticket)),
@@ -622,6 +641,7 @@ impl<C: Configuration> Peer<C> {
     }
 
     fn advance(&mut self, now: Tick) -> Result<(), Error> {
+        self.observe_lease(now)?;
         if now < self.now {
             return Err(Error::Clock);
         }
@@ -631,7 +651,7 @@ impl<C: Configuration> Peer<C> {
     }
     fn set_phase(&mut self, phase: Phase) -> Result<(), Error> {
         self.phase = phase;
-        self.deadline = add(self.now, self.settings.phase_timeout_ms)?;
+        self.deadline = self.clamp_lease(add(self.now, self.settings.phase_timeout_ms)?);
         Ok(())
     }
     fn validate_mode(&self, mode: &C) -> Result<ConfigDigest, Error> {
@@ -682,6 +702,7 @@ impl<C: Configuration> Peer<C> {
                     Fence::decode(&frame.body[8 + C::ENCODED_LEN..], self.active.channels())?;
                 self.guard.prepare(h.ticket).map_err(Error::Guard)?;
                 self.guard.peer_ready(h.ticket).map_err(Error::Guard)?;
+                self.begin_operation(h.ticket)?;
                 self.last_attempt = h.ticket.attempt;
                 self.pending = Some(Pending {
                     ticket: h.ticket,
@@ -761,6 +782,9 @@ impl<C: Configuration> Peer<C> {
                             .ok_or(Error::Exhausted)?
                 {
                     return Err(Error::Unexpected);
+                }
+                if self.operation().is_none() {
+                    self.begin_operation(h.ticket)?;
                 }
                 self.last_attempt = h.ticket.attempt;
                 self.pending = None;
@@ -866,6 +890,7 @@ impl<C: Configuration> Peer<C> {
                 if !matches!(self.phase, Phase::AwaitRetireAck | Phase::Uncertain) {
                     return Err(Error::Unexpected);
                 }
+                self.capture_final_incoming(frame)?;
                 self.pending = None;
                 self.outstanding = None;
                 self.set_phase(Phase::Idle)?;
@@ -878,6 +903,7 @@ impl<C: Configuration> Peer<C> {
                 if self.phase != Phase::Aborting {
                     return Err(Error::Unexpected);
                 }
+                self.capture_final_incoming(frame)?;
                 self.pending = None;
                 self.outstanding = None;
                 self.set_phase(Phase::Idle)?;
@@ -953,6 +979,7 @@ impl<C: Configuration> Peer<C> {
         })
     }
     fn emit(&mut self, message: &Message) -> Result<Vec<u8>, Error> {
+        self.observe_lease(self.now)?;
         let packet = PacketNumber(self.next_packet);
         self.next_packet = self.next_packet.checked_add(1).ok_or_else(|| {
             self.phase = Phase::Failed;
@@ -977,7 +1004,7 @@ impl<C: Configuration> Peer<C> {
         }
         .encode(&mut bytes, limits())
         .map_err(Error::Admission)?;
-        self.next_retry = add(self.now, self.settings.retry_ms)?;
+        self.next_retry = self.clamp_lease(add(self.now, self.settings.retry_ms)?);
         Ok(bytes)
     }
 }
@@ -1010,6 +1037,14 @@ fn reply_to(bytes: &[u8]) -> Result<u64, Error> {
 /// Explicit errors. Authenticated protocol violations fail the session without rollback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// This explicitly leased contract requires an original operation deadline.
+    LeaseRequired,
+    /// An active operation cannot change its original deadline or identity.
+    LeaseConflict,
+    /// The immutable session or operation cap expired; this peer cannot resume.
+    LeaseExpired,
+    /// Exact final-message custody or its authenticated context was not proved.
+    Custody,
     /// Invalid local mode/timing/resource contract.
     Configuration(&'static str),
     /// Caller did not list the target mode as implemented, or duplex lifecycle would change.

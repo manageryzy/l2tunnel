@@ -7,6 +7,9 @@ use mg::{
     session_control as control, transaction as tx,
 };
 
+#[path = "leased.rs"]
+mod leased;
+
 const CONTROL_SCOPE: control::Scope = control::Scope {
     epoch: Epoch(1),
     digest: l2tunnel::core::ConfigDigest([4; 32]),
@@ -27,8 +30,8 @@ fn scope() -> Result<control::Scope> {
     })
 }
 
-fn make_gate(local_role: mg::Role) -> Result<gate::Gate> {
-    Ok(gate::Gate::new(gate::GateSettings {
+fn gate_settings(local_role: mg::Role) -> Result<gate::GateSettings> {
+    Ok(gate::GateSettings {
         binding: control::PeerBinding {
             session: mg::SessionId([31; 16]),
             remote_role: if local_role == mg::Role::Client {
@@ -46,7 +49,11 @@ fn make_gate(local_role: mg::Role) -> Result<gate::Gate> {
             receipts: control::ReceiptPolicy::Cumulative,
         },
         limits: ENVELOPE_LIMITS,
-    })?)
+    })
+}
+
+fn make_gate(local_role: mg::Role) -> Result<gate::Gate> {
+    Ok(gate::Gate::new(gate_settings(local_role)?)?)
 }
 
 fn identity(role: mg::Role) -> tx::Identity {
@@ -122,6 +129,17 @@ impl StreamEndpoint {
         cover: cover::Config,
         role: mg::Role,
     ) -> Result<Self> {
+        Self::new_with_message_limit(socket, root, confirmation, cover, role, 4)
+    }
+
+    fn new_with_message_limit(
+        socket: UdpSocket,
+        root: security::SessionRoot,
+        confirmation: hs::ConfirmationCache,
+        cover: cover::Config,
+        role: mg::Role,
+        message_limit: usize,
+    ) -> Result<Self> {
         let records = record::Records::new(
             root,
             security::LaneId(0),
@@ -172,7 +190,7 @@ impl StreamEndpoint {
             },
             path_mtu: 1500,
             max_message_bytes: 4096,
-            max_outbound_messages: 4,
+            max_outbound_messages: message_limit,
             max_outbound_bytes: 65_536,
             max_fragments: 128,
             max_reassembly_bytes: 32_768,

@@ -84,6 +84,49 @@ impl Ticket {
     pub fn digest(self) -> [u8; 32] {
         self.digest
     }
+
+    /// Actual immutable owner context, for crate-internal custody verification.
+    pub(crate) fn binding(self) -> delivery::Binding {
+        self.binding
+    }
+}
+
+/// Borrowed evidence that the exact complete incoming message was accepted and
+/// its complete-message receipt is retained by this owner. This is not Applied.
+pub struct Accepted<'a> {
+    ticket: Ticket,
+    owner: &'a Owner,
+}
+
+impl Accepted<'_> {
+    /// Exact private identity, not a caller-constructed completion assertion.
+    pub(crate) fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    /// The injected observation that created the retained acceptance receipt.
+    pub(crate) fn observed_at(&self) -> Duration {
+        self.owner.last_now
+    }
+}
+
+/// Borrowed evidence of exact whole-message acceptance plus all source ACKs.
+/// It cannot outlive, mutate or retire its actual confirmation owner.
+pub struct Confirmed<'a> {
+    ticket: Ticket,
+    owner: &'a Owner,
+}
+
+impl Confirmed<'_> {
+    /// Exact private identity, not a caller-constructed completion assertion.
+    pub(crate) fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    /// Injected observation at which whole-message confirmation was checked.
+    pub(crate) fn observed_at(&self) -> Duration {
+        self.owner.last_now
+    }
 }
 
 /// A completed message borrowed until explicit semantic acceptance.
@@ -476,6 +519,21 @@ impl Owner {
         }
     }
 
+    /// Accept exact held custody and borrow proof that its receipt is retained.
+    /// Dispatch semantics before this call; on backpressure retry acceptance
+    /// without dispatching again. The proof grants no transaction effects.
+    pub fn accept_with_receipt(
+        &mut self,
+        ticket: Ticket,
+        now: Duration,
+    ) -> Result<Accepted<'_>, Error> {
+        self.accept(ticket, now)?;
+        Ok(Accepted {
+            ticket,
+            owner: self,
+        })
+    }
+
     /// True only after matching semantic acceptance and every fragment source ACK.
     pub fn confirmed(&mut self, ticket: Ticket, now: Duration) -> Result<bool, Error> {
         self.observe(now)?;
@@ -485,6 +543,19 @@ impl Owner {
             .find(|entry| entry.ticket == ticket)
             .map(|entry| entry.confirmed)
             .ok_or(Error::UnknownTicket)
+    }
+
+    /// Borrow actual complete-message confirmation without retiring retry state.
+    /// A source ACK or a locally emitted receipt cannot create this proof.
+    pub fn confirmation(
+        &mut self,
+        ticket: Ticket,
+        now: Duration,
+    ) -> Result<Option<Confirmed<'_>>, Error> {
+        Ok(self.confirmed(ticket, now)?.then_some(Confirmed {
+            ticket,
+            owner: self,
+        }))
     }
 
     /// Release confirmed retry metadata; a retired submission ID cannot be reused.

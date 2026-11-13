@@ -47,6 +47,21 @@ again. Reserve source slots/bytes so fragmented user commands
 cannot consume every receipt opportunity. Existing ARQ retries that receipt;
 there is no separate receipt retry algorithm or ACK-of-ACK protocol.
 
+The additive `Accepted` and `Confirmed` proofs borrow their actual Owner. Only a
+successful `accept_with_receipt` can issue the first after retaining the exact
+complete-message receipt. Only actual whole-message confirmation can issue the
+second; source ACKs alone remain insufficient. Neither proof has a public
+constructor or Clone/Copy escape. The [leased transaction integration](control-streams.md#leased-transaction-checkpoint)
+checks exact complete-envelope SHA-256/length, full session/lane/local role,
+expected Transaction recovery context, originating policy, final logical
+request/reply and injected observation before releasing operation custody. Bad
+proof/context checks leave peer time unchanged and preserve the borrowed proof
+for a correct retry. These tokens do not authenticate a record or imply Applied.
+The embedding adapter must reuse one immutable envelope/submission per logical
+output, including repeated cached replies; it must not create a fresh envelope
+after final operation custody is released. The [stream contract](control-streams.md#bounded-transaction-composition)
+states the retirement boundary and its ordered-delivery consequence explicitly.
+
 ## Bounds and deadlines
 
 Admit message bytes, fragment count, outgoing retention and IDs atomically.
@@ -76,7 +91,7 @@ liveness through its independent control stream and report recovery status.
 - [x] [SCM-05] Test independent queue/byte/fragment/work limits, atomic refusal, original deadlines, backwards/overflow time and sticky terminal failure without owner reset. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
 - [x] [SCM-06] Compose authenticated Control and the explicit stream wrapper on both original UDP cover pairs, including transaction blockage with independent liveness. Evidence: [focused pass](../../work/common-control-messages-20261113/focused-attempt-2/validation.json).
 - [ ] [SCM-07] Integrate actual selected-carrier runtime dispatch, semantic receipt custody, original operation caps and shared service/API status during complete profile switches.
-- [x] [SCM-08] Pass focused and required aggregate checks with exact source identities and preserve all failed attempts and legacy receipts. Evidence: [required pass](../../work/common-control-messages-20261113/aggregate-attempt-3/validation.json).
+- [x] [SCM-08] Pass focused and required aggregate checks with exact source identities and preserve all failed attempts and legacy receipts. Evidence: [required pass](../../work/leased-control-20261113/aggregate-attempt-1/validation.json).
 
 These child gates preserve CDL-07, MG-01/04..08, SEC-07/08/10, SW-11/SW-15 and
 every other requested record profile, carrier, platform and Python parity gate.
@@ -114,3 +129,11 @@ weakened. Aggregate attempts 1 and 2 remain failed because the new checked ledge
 items first lacked per-item links and then their required `Evidence:` marker.
 Neither reached Rust execution; both raw receipts remain unchanged. After the
 successful aggregate, only evidence prose and checkbox reconciliation change.
+
+The later [leased-custody aggregate](../../work/leased-control-20261113/aggregate-attempt-1/validation.json)
+also passes with frozen sources: 1579 Rust cases including doctests, 295 Python
+tooling cases and 1658 simulator cases. The [leased checkpoint](control-streams.md#leased-transaction-checkpoint)
+records actual borrowed final-custody proofs, both forms of backpressure and
+post-proof delayed-original-source ACKs on both covers. Its [environment record](../../work/leased-control-20261113/aggregate-environment.json)
+preserves the serial Rust test setting. SCM-07 and the complete parent runtime,
+platform, native and mode-switch requirements remain open.
