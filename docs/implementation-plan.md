@@ -67,6 +67,9 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-core` | Typed IDs, capabilities, policy and config validation | Initial mode types and structural validation |
 | `crates/l2tunnel-wire`, `crates/l2tunnel-session` | Versioned records, parsers, session contracts | Bounded wire/framing and local reload guard; distributed transactions live in management |
 | `crates/l2tunnel-auth` | Verified TLS and member authentication | Retained TCP/TLS and generic I/O TLS, exporter/member/config binding and negative tests |
+| `crates/l2tunnel-security` | Shared opaque protection and explicit Swift v2 compatibility | Pure AEAD/HMAC, domains, metadata, replay and adjacent ratchets; existing Swift runtime consumes byte-compatible owners |
+| `crates/l2tunnel-handshake` | Maintained fixed-pattern Noise adapter | Protocol-tested pinned-peer proof, caller entropy/time, public secret handoff and final-confirmation custody; no production credential migration or full lifecycle |
+| `crates/l2tunnel-cover` | Explicit QUIC-header/RTP-like appearance | Bounded pure codecs, without standard transport validity, identification or ISP classification claims |
 | `crates/l2tunnel-transport` | Carrier selection semantics | Capability-aware explicit fallback contract; actual adapters below |
 | `crates/l2tunnel-mux`, `crates/l2tunnel-packet`, `crates/l2tunnel-pipeline` | Classification, connection affinity, common admission | Real parsed frames, bounded affinity/channel scheduling and DRR composition |
 | `crates/l2tunnel-codec` | L2/L3 fragmentation and compression | None/LZ4 frame bytes, bounded reassembly, Python timestamp/delta and aligned body primitives; complete mode integration pending |

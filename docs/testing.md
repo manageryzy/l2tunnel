@@ -278,3 +278,21 @@ actual authenticated tunnel delivery and the QoS hypothesis. Preserve immutable
 per-case receipts/captures and exclude private keys/session secrets from ordinary
 logs. Report requested/effective carrier and protection, fallback/recovery events,
 platform capability limitations and unresolved acceptance gates alongside results.
+
+## Shared record CPU measurements
+
+The [bounded measurement recorder](modules/secure-record-performance.md) runs
+an explicitly prebuilt executable, preserves every requested repetition and
+fails on invalid output, timeouts or source/executable drift. Keep its separate
+build receipt and raw CPU results; fake-executable tooling tests do not measure
+real performance.
+
+`cargo run --release --locked -p l2tunnel --example secure_record_bench -- 100000`
+measures finite seal/cover/parse/open round trips for 64, 512 and 1340-byte opaque
+records, both new appearances and AEAD/HMAC. It verifies every recovered payload,
+reuses caller buffers and emits machine-readable counts, elapsed time, payload
+rate and modeled IPv4 wire cost. These are library CPU measurements on the local
+machine, with fixture keys and no socket, device, loss model or ISP classifier.
+They do not establish native tunnel goodput or replace the full network test
+matrix. Keep raw repetitions, executable/source hashes and commands under
+`work/`, outside disposable Cargo output; do not rewrite historical measurements.

@@ -3,7 +3,8 @@
 //! The caller must authenticate exact frame bytes and their outer management record class
 //! before using [`Ingress::AuthenticatedManagement`]. The transaction module supplies
 //! bounded retry/retirement semantics with injected time and explicit drain evidence.
-//! It does not authenticate records, perform transport delivery or inspect device queues.
+//! Reliable control delivery is separate from transaction semantics; this crate
+//! does not authenticate records, own carrier I/O or inspect device queues.
 
 use std::fmt;
 
@@ -15,6 +16,9 @@ pub mod transaction;
 
 /// Versioned mode-independent authenticated session-control envelopes.
 pub mod session_control;
+
+/// Fixed bounded reliable control service, independent of data-profile epochs.
+pub mod delivery;
 
 /// Fixed header size of the internal draft format, excluding protection outside this crate.
 pub const HEADER_LEN: usize = 112;

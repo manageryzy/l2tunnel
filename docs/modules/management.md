@@ -16,9 +16,12 @@ encrypted packet alone does not implement those operations.
 
 ## Public API and dependency boundary
 
-`l2tunnel-management` depends only on the local `l2tunnel-core` and
-`l2tunnel-session` crates, Rust's standard library, and maintained ring for canonical
-configuration SHA-256. It has no socket, clock, runtime or random source; it does
+`l2tunnel-management` depends on the local `l2tunnel-core`,
+`l2tunnel-session` and `l2tunnel-recovery` crates, Rust's standard library, and maintained ring for canonical
+configuration SHA-256. The [fixed reliable control service](control-delivery.md)
+reuses selective repeat with independent retention, expiry and charged service
+bounds; it is separate from transaction semantics and physical carrier I/O.
+The crate has no socket, clock, runtime or random source; it does
 not authenticate records or implement cryptographic primitives. It reuses `Epoch`,
 `ConfigDigest` and `Ticket`; a ticket's target epoch, attempt and digest do not
 prove that the reload state machine accepts it.

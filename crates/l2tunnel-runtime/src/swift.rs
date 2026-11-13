@@ -14,8 +14,8 @@
 pub use codec::control::Policy;
 use codec::control::{Message, Refusal};
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
+use l2tunnel_security::{self as security, swift_v2 as protection};
 use l2tunnel_swift as codec;
-use ring::{aead, hkdf};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -27,9 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Packet number and authentication tag added to every engine datagram body.
-pub const PROTECTION_BYTES: usize = 24;
-const NUMBER_BYTES: usize = 8;
-const REPLAY_BITS: u64 = 4096;
+pub const PROTECTION_BYTES: usize = protection::OVERHEAD_BYTES;
 const SCALE: u64 = 1_000_000;
 /// Datagrams taken from the socket per readiness event.
 const RECEIVE_BATCH: usize = 128;
@@ -291,178 +289,8 @@ impl Pacer {
     }
 }
 
-/// Sliding anti-replay window over authenticated packet numbers.
-struct Replay {
-    started: bool,
-    highest: u64,
-    bits: Vec<u64>,
-}
-impl Replay {
-    fn new() -> Self {
-        Self {
-            started: false,
-            highest: 0,
-            bits: vec![0; (REPLAY_BITS / 64) as usize],
-        }
-    }
-    fn slot(number: u64) -> (usize, u64) {
-        let bit = number % REPLAY_BITS;
-        ((bit / 64) as usize, 1 << (bit % 64))
-    }
-    fn fresh(&self, number: u64) -> bool {
-        if !self.started || number > self.highest {
-            return true;
-        }
-        if self.highest - number >= REPLAY_BITS {
-            return false;
-        }
-        let (word, mask) = Self::slot(number);
-        self.bits[word] & mask == 0
-    }
-    /// Record a number only after its datagram authenticated.
-    fn commit(&mut self, number: u64) {
-        if !self.started || number > self.highest {
-            let first = if self.started { self.highest + 1 } else { 0 };
-            if number - first >= REPLAY_BITS {
-                self.bits.fill(0);
-            } else {
-                for skipped in first..number {
-                    let (word, mask) = Self::slot(skipped);
-                    self.bits[word] &= !mask;
-                }
-            }
-            let (word, mask) = Self::slot(number);
-            self.bits[word] &= !mask;
-            self.highest = number;
-            self.started = true;
-        }
-        let (word, mask) = Self::slot(number);
-        self.bits[word] |= mask;
-    }
-}
-
-fn nonce(number: u64) -> aead::Nonce {
-    let mut bytes = [0; aead::NONCE_LEN];
-    bytes[4..].copy_from_slice(&number.to_be_bytes());
-    aead::Nonce::assume_unique_for_key(bytes)
-}
-/// Datagrams one direction protects under one key generation. The generation
-/// of a datagram is its packet number divided by this, so both peers change
-/// keys at the same packet without any message. Part of the authenticated
-/// policy.
-pub const KEY_PACKETS: u64 = 1 << 28;
-const KEY_LABEL: &[u8] = b"l2tunnel swift v2 datagram key";
-const NEXT_LABEL: &[u8] = b"l2tunnel swift v2 next secret";
-
-struct Length32;
-impl hkdf::KeyType for Length32 {
-    fn len(&self) -> usize {
-        32
-    }
-}
-/// One generation of a direction's secret. The datagram key and the next
-/// generation's secret are separate HKDF-SHA256 expansions of it, so a
-/// generation's key reveals neither earlier nor later traffic.
-struct Chain {
-    secret: zeroize::Zeroizing<[u8; 32]>,
-    generation: u64,
-}
-impl Chain {
-    fn new(secret: &[u8; 32]) -> Self {
-        Self {
-            secret: zeroize::Zeroizing::new(*secret),
-            generation: 0,
-        }
-    }
-    fn expand(&self, label: &'static [u8]) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
-        let failed = |_| io::Error::other("swift key derivation failed");
-        let mut output = zeroize::Zeroizing::new([0; 32]);
-        hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.secret[..])
-            .expand(&[label], Length32)
-            .map_err(failed)?
-            .fill(&mut output[..])
-            .map_err(failed)?;
-        Ok(output)
-    }
-    fn key(&self) -> io::Result<aead::LessSafeKey> {
-        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &self.expand(KEY_LABEL)?[..])
-            .map(aead::LessSafeKey::new)
-            .map_err(|_| io::Error::other("swift data key rejected"))
-    }
-    fn next(&self) -> io::Result<Self> {
-        Ok(Self {
-            secret: self.expand(NEXT_LABEL)?,
-            generation: self
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("swift key generations exhausted"))?,
-        })
-    }
-}
-/// Receiving keys: the current generation, the previous one while its last
-/// datagrams may still arrive out of order, and the next one once a datagram
-/// claims it. A claim becomes current only after a datagram authenticates
-/// under it, so forged packet numbers cannot move the keys.
-struct Opening {
-    chain: Chain,
-    current: aead::LessSafeKey,
-    previous: Option<aead::LessSafeKey>,
-    next: Option<(Chain, aead::LessSafeKey)>,
-}
-impl Opening {
-    fn new(secret: &[u8; 32]) -> io::Result<Self> {
-        let chain = Chain::new(secret);
-        Ok(Self {
-            current: chain.key()?,
-            chain,
-            previous: None,
-            next: None,
-        })
-    }
-    /// Key for a datagram of `generation`, absent when it is neither the
-    /// current generation nor adjacent to it.
-    fn key(&mut self, generation: u64) -> io::Result<Option<&aead::LessSafeKey>> {
-        let current = self.chain.generation;
-        if generation == current {
-            return Ok(Some(&self.current));
-        }
-        if generation.checked_add(1) == Some(current) {
-            return Ok(self.previous.as_ref());
-        }
-        if current.checked_add(1) != Some(generation) {
-            return Ok(None);
-        }
-        if self.next.is_none() {
-            let chain = self.chain.next()?;
-            let key = chain.key()?;
-            self.next = Some((chain, key));
-        }
-        Ok(self.next.as_ref().map(|(_, key)| key))
-    }
-    /// A datagram of `generation` authenticated.
-    fn confirm(&mut self, generation: u64) {
-        if self.chain.generation.checked_add(1) == Some(generation)
-            && let Some((chain, key)) = self.next.take()
-        {
-            self.previous = Some(std::mem::replace(&mut self.current, key));
-            self.chain = chain;
-        }
-    }
-    /// Forget the previous generation once the replay window has moved
-    /// wholly into the current one.
-    fn retire(&mut self, highest: u64, key_packets: u64) {
-        if self.previous.is_some()
-            && highest
-                >= self
-                    .chain
-                    .generation
-                    .saturating_mul(key_packets)
-                    .saturating_add(REPLAY_BITS)
-        {
-            self.previous = None;
-        }
-    }
-}
+/// Agreed Swift v2 packet interval; unchanged by common packet-protection extraction.
+pub const KEY_PACKETS: u64 = protection::KEY_PACKETS;
 
 /// Socket-free protocol state of one endpoint, driven by explicit time.
 ///
@@ -491,13 +319,9 @@ struct Engine {
     receivers: Vec<codec::Receiver>,
     compressors: Vec<codec::header::Compressor>,
     decompressors: Vec<codec::header::Decompressor>,
-    seal: aead::LessSafeKey,
-    seal_chain: Chain,
-    open: Opening,
-    key_packets: u64,
-    replay: Replay,
+    seal: protection::Sender,
+    open: protection::Receiver,
     pacer: Pacer,
-    number: u64,
     /// Channel served after the last new source, for round-robin fairness.
     turn: usize,
     /// Earliest time of the next feedback datagram.
@@ -533,7 +357,6 @@ impl Engine {
             compressors.push(codec::header::Compressor::new(ethernet));
             decompressors.push(codec::header::Decompressor::new(ethernet));
         }
-        let seal_chain = Chain::new(keys.send);
         Ok(Self {
             config,
             receive: config,
@@ -549,13 +372,11 @@ impl Engine {
             receivers,
             compressors,
             decompressors,
-            seal: seal_chain.key()?,
-            seal_chain,
-            open: Opening::new(keys.receive)?,
-            key_packets: KEY_PACKETS,
-            replay: Replay::new(),
+            seal: protection::Sender::new(keys.send, security::MAX_BODY_BYTES, KEY_PACKETS)
+                .map_err(io::Error::other)?,
+            open: protection::Receiver::new(keys.receive, security::MAX_BODY_BYTES, KEY_PACKETS)
+                .map_err(io::Error::other)?,
             pacer: Pacer::new(config.send_bytes_per_second, largest, now),
-            number: 0,
             turn: 0,
             feedback_at: 0,
             feedback_turn: 0,
@@ -651,7 +472,7 @@ impl Engine {
             .chain((0..channels).map(|step| (self.turn + step) % channels));
         for channel in order {
             if self.senders[channel]
-                .poll(now, self.number, &mut self.body)
+                .poll(now, self.seal.next_number().0, &mut self.body)
                 .map_err(protocol)?
             {
                 self.body[0] = tagged(self.body[0], channel);
@@ -670,27 +491,18 @@ impl Engine {
         if !self.feedback(now) && !self.data(now)? {
             return Ok(None);
         }
-        let number = self.number;
-        self.number = number
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("swift packet numbers exhausted"))?;
-        while self.seal_chain.generation < number / self.key_packets {
-            self.seal_chain = self.seal_chain.next()?;
-            self.seal = self.seal_chain.key()?;
-            self.snapshot.key_generation = self.seal_chain.generation;
-        }
-        self.wire.clear();
-        self.wire.extend_from_slice(&number.to_be_bytes());
-        self.wire.extend_from_slice(&self.body);
-        let tag = self
+        let length = self
+            .body
+            .len()
+            .checked_add(PROTECTION_BYTES)
+            .ok_or_else(|| io::Error::other("swift protected packet size overflow"))?;
+        self.wire.resize(length, 0);
+        let sealed = self
             .seal
-            .seal_in_place_separate_tag(
-                nonce(number),
-                aead::Aad::empty(),
-                &mut self.wire[NUMBER_BYTES..],
-            )
-            .map_err(|_| io::Error::other("swift datagram protection failed"))?;
-        self.wire.extend_from_slice(tag.as_ref());
+            .seal(&self.body, &mut self.wire)
+            .map_err(io::Error::other)?;
+        self.wire.truncate(sealed.bytes);
+        self.snapshot.key_generation = sealed.generation.0;
         let cost = self.config.datagram_cost(self.wire.len());
         self.pacer.charge(cost);
         self.snapshot.datagrams_sent += 1;
@@ -729,29 +541,19 @@ impl Engine {
             self.snapshot.datagrams_rejected += 1;
             return Ok(());
         }
-        let mut prefix = [0; NUMBER_BYTES];
-        prefix.copy_from_slice(&datagram[..NUMBER_BYTES]);
-        let number = u64::from_be_bytes(prefix);
-        if !self.replay.fresh(number) {
-            self.snapshot.datagrams_rejected += 1;
-            return Ok(());
-        }
-        let generation = number / self.key_packets;
-        self.opened.clear();
-        self.opened.extend_from_slice(&datagram[NUMBER_BYTES..]);
-        let opened = match self.open.key(generation)? {
-            Some(key) => key
-                .open_in_place(nonce(number), aead::Aad::empty(), &mut self.opened)
-                .ok(),
-            None => None,
+        self.opened.resize(datagram.len(), 0);
+        let opened = match self.open.open(datagram, &mut self.opened) {
+            Ok(opened) => opened,
+            Err(security::Error::Crypto | security::Error::CounterExhausted) => {
+                return Err(io::Error::other("swift receiving key failure"));
+            }
+            Err(_) => {
+                self.snapshot.datagrams_rejected += 1;
+                return Ok(());
+            }
         };
-        let Some(body) = opened else {
-            self.snapshot.datagrams_rejected += 1;
-            return Ok(());
-        };
-        self.open.confirm(generation);
-        self.replay.commit(number);
-        self.open.retire(self.replay.highest, self.key_packets);
+        let number = opened.number.0;
+        let body = &mut self.opened[..opened.bytes];
         self.snapshot.datagrams_received += 1;
         let malformed = || protocol(codec::Error::Malformed);
         let lead = *body.first().ok_or_else(malformed)?;
@@ -1052,7 +854,7 @@ impl Engine {
             change.send = SendPhase::Barrier;
             self.outbox.push_back(Message::Barrier {
                 epoch: change.epoch,
-                first_number: self.number,
+                first_number: self.seal.next_number().0,
             });
         }
         if let ReceivePhase::Flushing { first_number } = change.receive
@@ -1074,7 +876,7 @@ impl Engine {
             self.source_floor = first_number;
             self.outbox.push_back(Message::BarrierAck {
                 epoch,
-                feedback_from: self.number,
+                feedback_from: self.seal.next_number().0,
             });
         }
         if let Some(change) = &self.change
@@ -1544,8 +1346,16 @@ mod tests {
     #[test]
     fn keys_ratchet_at_fixed_packet_numbers_without_interrupting_traffic() -> io::Result<()> {
         let (mut left, mut right) = pair(12_500_000, 1)?;
-        left.key_packets = 8;
-        right.key_packets = 8;
+        // The production factory always supplies KEY_PACKETS. These fresh
+        // test owners use a short agreed interval to exercise runtime wiring.
+        left.seal = protection::Sender::new(&[1; 32], security::MAX_BODY_BYTES, 8)
+            .map_err(io::Error::other)?;
+        left.open = protection::Receiver::new(&[2; 32], security::MAX_BODY_BYTES, 8)
+            .map_err(io::Error::other)?;
+        right.seal = protection::Sender::new(&[2; 32], security::MAX_BODY_BYTES, 8)
+            .map_err(io::Error::other)?;
+        right.open = protection::Receiver::new(&[1; 32], security::MAX_BODY_BYTES, 8)
+            .map_err(io::Error::other)?;
         let mut now = 0;
         let mut delivered = 0u32;
         let mut held: Option<Vec<u8>> = None;
@@ -1599,44 +1409,34 @@ mod tests {
         assert_eq!(delivered, 400);
         let sent = left.snapshot(now);
         assert!(sent.key_generation >= 40, "{sent:?}");
-        assert_eq!(sent.key_generation, (left.number - 1) / 8);
-        assert_eq!(right.open.chain.generation, sent.key_generation);
+        assert_eq!(sent.key_generation, (left.seal.next_number().0 - 1) / 8);
+        assert_eq!(right.open.generation().0, sent.key_generation);
         assert!(right.snapshot(now).key_generation >= 1);
         assert_eq!(right.snapshot(now).datagrams_rejected, 0);
-        // The retired first generation no longer authenticates, even to a
-        // receiver whose replay window were reset.
+        // Old packets remain rejected. Primitive key-retirement and exact
+        // replay-boundary tests live with the shared protection implementation.
         let first = first.ok_or_else(|| io::Error::other("nothing sent"))?;
-        assert!(right.open.key(0)?.is_none());
-        // The previous generation is kept only while the replay window still
-        // reaches into it.
-        let current = right.open.chain.generation;
-        assert!(right.open.previous.is_some());
-        right.open.retire(current * 8 + REPLAY_BITS - 1, 8);
-        assert!(right.open.previous.is_some());
-        right.open.retire(current * 8 + REPLAY_BITS, 8);
-        assert!(right.open.previous.is_none());
-        assert!(right.open.key(current - 1)?.is_none());
+        let current = right.open.generation().0;
+        assert_eq!(
+            right
+                .open
+                .previous_generation()
+                .map(|generation| generation.0),
+            Some(current - 1)
+        );
         right.accept(now, &first)?;
         assert_eq!(right.snapshot(now).datagrams_rejected, 1);
         // A forged datagram naming the next generation derives the candidate
         // key once but does not move the receiver; one naming a generation
         // further ahead is refused outright.
-        let current = right.open.chain.generation;
+        let current = right.open.generation().0;
         for generation in [current + 1, current + 2, current + 9] {
             let mut forged = vec![0u8; 80];
             forged[..8].copy_from_slice(&(generation * 8).to_be_bytes());
             right.accept(now, &forged)?;
         }
         assert_eq!(right.snapshot(now).datagrams_rejected, 4);
-        assert_eq!(right.open.chain.generation, current);
-        // Each generation's key differs from its neighbours and from the
-        // secret it was derived from.
-        let chain = Chain::new(&[9; 32]);
-        let next = chain.next()?;
-        assert_ne!(chain.expand(KEY_LABEL)?[..], next.expand(KEY_LABEL)?[..]);
-        assert_ne!(chain.expand(KEY_LABEL)?[..], chain.secret[..]);
-        assert_ne!(next.secret[..], chain.secret[..]);
-        assert_eq!(next.generation, 1);
+        assert_eq!(right.open.generation().0, current);
         Ok(())
     }
 
@@ -1758,8 +1558,12 @@ mod tests {
         let stale_source = stale_source.ok_or_else(|| io::Error::other("no stale source"))?;
         let stale_feedback = stale_feedback.ok_or_else(|| io::Error::other("no stale feedback"))?;
         assert!(left.feedback_floor > 0 && right.source_floor > 0);
-        right.replay = Replay::new();
-        left.replay = Replay::new();
+        // Fresh receiving fixtures authenticate these old generation-zero
+        // bytes, isolating the epoch floors from ordinary replay rejection.
+        right.open = protection::Receiver::new(&[1; 32], security::MAX_BODY_BYTES, KEY_PACKETS)
+            .map_err(io::Error::other)?;
+        left.open = protection::Receiver::new(&[2; 32], security::MAX_BODY_BYTES, KEY_PACKETS)
+            .map_err(io::Error::other)?;
         let before = right.snapshot(now).receiver.duplicates;
         right.accept(now, &stale_source)?;
         assert_eq!(right.snapshot(now).receiver.duplicates, before + 1);
@@ -2068,7 +1872,7 @@ mod tests {
             1_000,
             Message::Barrier {
                 epoch: 1,
-                first_number: left.number,
+                first_number: left.seal.next_number().0,
             },
             &*server,
         )?;
@@ -2174,15 +1978,17 @@ mod tests {
 
     #[test]
     fn inconsistent_authenticated_bodies_end_the_session() -> io::Result<()> {
-        let (left, mut right) = pair(12_500_000, 4)?;
-        let send = |body: &[u8], number: u64| -> io::Result<Vec<u8>> {
-            let mut wire = number.to_be_bytes().to_vec();
-            wire.extend_from_slice(body);
-            let tag = left
-                .seal
-                .seal_in_place_separate_tag(nonce(number), aead::Aad::empty(), &mut wire[8..])
-                .map_err(|_| io::Error::other("seal"))?;
-            wire.extend_from_slice(tag.as_ref());
+        let (_, mut right) = pair(12_500_000, 4)?;
+        let mut sender = protection::Sender::new(&[1; 32], security::MAX_BODY_BYTES, KEY_PACKETS)
+            .map_err(io::Error::other)?;
+        let mut skipped = [0; PROTECTION_BYTES + 1];
+        for _ in 0..100 {
+            sender.seal(&[0], &mut skipped).map_err(io::Error::other)?;
+        }
+        let mut send = |body: &[u8], number: u64| -> io::Result<Vec<u8>> {
+            assert_eq!(sender.next_number().0, number);
+            let mut wire = vec![0; body.len() + PROTECTION_BYTES];
+            sender.seal(body, &mut wire).map_err(io::Error::other)?;
             Ok(wire)
         };
         let bodies: [&[u8]; 5] = [
@@ -2684,24 +2490,6 @@ mod tests {
         ] {
             assert!(!path_loss(&io::Error::from(kind)), "{kind:?}");
         }
-    }
-
-    #[test]
-    fn replay_window_tracks_reordering_and_large_jumps() {
-        let mut replay = Replay::new();
-        assert!(replay.fresh(5));
-        replay.commit(5);
-        assert!(!replay.fresh(5));
-        assert!(replay.fresh(3));
-        replay.commit(3);
-        assert!(!replay.fresh(3));
-        replay.commit(5 + REPLAY_BITS);
-        assert!(!replay.fresh(5), "number left the window");
-        assert!(replay.fresh(6));
-        assert!(!replay.fresh(5 + REPLAY_BITS));
-        replay.commit(1 << 40);
-        assert!(replay.fresh((1 << 40) - 1));
-        assert!(!replay.fresh((1 << 40) - REPLAY_BITS));
     }
 
     #[test]

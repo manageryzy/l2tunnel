@@ -49,6 +49,25 @@ remain evidence for their stated scope, not a percentage of product completion.
 
 ## Reading order and detailed task lists
 
+The common-session implementation wave is tracked in
+[packet security](modules/packet-security.md),
+[Noise handshake](modules/noise-handshake.md),
+[carrier appearance](modules/carrier-appearance.md),
+[protected record composition](modules/secure-records.md) and
+[fixed reliable control delivery](modules/control-delivery.md), with
+[finite CPU measurement recording](modules/secure-record-performance.md).
+Swift now consumes the common library's explicit legacy compatibility owners;
+the existing CLI still uses retained TLS plus a separate UDP data socket. A new
+same-UDP-pair integration fixture exercises Noise, both appearance codecs,
+Swift recovery and fixed control with scripted loss and key generations. That
+fixture does not close FIX-13, native performance, credential migration, default
+recovery, OpenVPN/HTTPS composition or full SW-11. The [local wave receipt](../work/shared-session-primitives-20261113/validation.json)
+records its exact tested inputs and result: 1392 Rust cases including doctests,
+245 Python tooling cases and 1658 simulator cases passed with stable inputs.
+The subsequent [evidence-only ledger reconciliation](../work/shared-session-primitives-20261113/postcheck-ledger-validation.json)
+checks updated prose and verifies that all non-document inputs still match that
+aggregate snapshot. Historical receipts remain unchanged.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |

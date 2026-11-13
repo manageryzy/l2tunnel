@@ -1,8 +1,11 @@
 # Shared point-to-point secure session
 
-Status: **planned architecture and acceptance contract**, reviewed with the owner
-on 2026-11-13 (Asia/Tokyo). No WireGuard-like adapter, new carrier composition,
-credential migration or recovery default is implemented by this document.
+Status: **target architecture under implementation**, reviewed with the owner
+on 2026-11-13 (Asia/Tokyo). Scoped pure components now implement packet security,
+cover codecs, a Noise adapter, protected User/Control routing and reliable control
+delivery. Their ledgers distinguish protocol tests and finite loopback fixtures
+from the unfinished client/service, native, recovery and carrier integrations.
+No credential migration or recovery default is enabled by these components.
 The [architecture](../architecture.md), [master ledger](../implementation-checklist.md)
 and [carrier contracts](../overlay-and-carriers.md) retain their wider requirements.
 
@@ -36,9 +39,12 @@ The following requirements were explicitly confirmed in the architecture discuss
 These decisions do **not** choose a Rust dependency, crypto suite, packet layout,
 key-export API, credential conversion, timeout value or NAT-rebinding policy.
 DTLS 1.3 was considered before the owner preferred the lighter WireGuard-like
-direction; it is not the selected implementation. BoringTun and Noise libraries
-are evaluation inputs, not adopted dependencies. Initial carrier names and any
-new API names here are design labels, not accepted CLI syntax.
+direction; it is not the selected implementation. The isolated
+[Noise adapter implementation](noise-handshake.md) pins Clatter 2.3.0 with a
+reviewed public-DH validation boundary. This is an implementation draft, not a
+library or provisioning decision attributed to the owner. BoringTun remains a
+reference. New appearance/API names do not become accepted CLI syntax through
+these pure library changes.
 
 The original OpenVPN-like wire-format handshake requirement has not been explicitly
 relaxed as QUIC-like was. Its composition with the shared internal protocol remains
@@ -52,7 +58,10 @@ is a separate compatibility profile, not its replacement.
 | --- | --- | --- |
 | TLS/member authentication | `l2tunnel-auth` implements verified TLS 1.3, exporter-bound Ed25519 membership and focused loopback tests. | Its generic channel interface still requires an actually verified TLS channel; it is not a standalone message-oriented key exchange. |
 | Swift algorithm | `l2tunnel-swift` owns bounded packing, channel records, retransmission and optional repairs, with caller-supplied time and authenticated bodies. | Preserve this pure boundary while extracting shared security and control. |
-| Swift security/runtime | `client-core/src/swift.rs` exports TLS data roots; `runtime/src/swift.rs` owns ChaCha20-Poly1305, a 4096-packet replay window and an HKDF chain every 2^28 packets. | Separate TCP/TLS control plus UDP data remains; the chain is not a fresh authenticated key exchange. |
+| Swift security/runtime | `client-core/src/swift.rs` exports TLS data roots; the runtime consumes common-library Swift v2 compatibility owners for ChaCha20-Poly1305, replay and the unchanged 2^28-packet chain. | Separate TCP/TLS control plus UDP data remains; extraction does not enable the target common handshake on the CLI. |
+| Common packet security | `l2tunnel-security` implements purpose/direction/lane-separated AEAD and authenticated-cleartext/HMAC, metadata, counters, replay and adjacent generations. | Deterministic ratcheting is not fresh key exchange, time expiry or complete lifecycle recovery. |
+| Maintained handshake adapter | `l2tunnel-handshake` implements fixed pinned-key Noise profiles, explicit confirmation, caller entropy/time, supported consuming key handoff and retained final-confirmation ciphertext. | Upstream is unaudited; anti-amplification/runtime admission, existing-member provisioning and complete lifecycle integration remain separate acceptance work. |
+| Protected records and covers | The facade composes authenticated User/Control routes with QUIC-header or RTP-like appearance and fixed control scope. | Local data-reader staging is not negotiated SW-11; no new CLI carrier is enabled. |
 | Swift control | `l2tunnel-swift/src/control.rs` defines private policy proposal/barrier messages on retained TLS. | SW-13 is within-Swift policy change, not the stable shared control service or SW-11. |
 | Shared control | `l2tunnel-management` has pure framing, admission and transaction contracts; compression switching has scoped runtime evidence. | A universal negotiated control envelope and dispatch across data modes remain open under FIX-11. |
 | UDP admission | `l2tunnel-udp-control` has bounded cookies, retries, replay checks and reliable control bytes, used by standalone OpenVPN-like TLS. | These mechanisms do not establish a WireGuard-like authenticated session or remove the stream dependency. |
@@ -129,11 +138,25 @@ contract, not a claim of unmodified WireGuard compatibility.
 
 Do not use a public handshake hash/channel binding as a secret MAC key. Do not
 extract private cipher state, convert Ed25519 key bytes into X25519 keys, or expose
-secret roots in logs/config/status. A suitable implementation must provide a
-supported protection/key interface or a reviewed maintained extension. No library
-has passed that gate here.
+secret roots in logs/config/status. The scoped Noise adapter consumes documented
+public split-key APIs into the common secret owner and retains a bounded final
+confirmation cache across root release. Its exact adaptations and remaining
+security/runtime gates are recorded in the [adapter ledger](noise-handshake.md).
 
 ## Fixed control and bounded recovery
+
+The [fixed control delivery primitive](control-delivery.md) now reuses bounded
+selective repeat with a fixed control epoch, original expiry, authenticated-origin
+admission and exact shared/reserved wire accounting. The
+[protected record composition](secure-records.md) authenticates the public
+User/Control routing hint with separate key purposes. The
+[original-socket fixture](../../crates/l2tunnel/tests/common_session_udp.rs)
+composes these with Noise and Swift on two connected loopback UDP sockets, with
+scripted source/control loss, final-confirmation loss after root release, exact
+bytes and multiple short test key generations. It retains the socket tuples
+through handshake, user data and control. This is a library integration fixture;
+it does not run TAP/TUN, the shared client service, real netem, production rekey
+cadence, default automatic recovery or a negotiated cross-profile switch.
 
 Control framing and service remain readable while data MUX, codec or recovery
 changes. Management has a bounded reservation within the configured wire budget;
@@ -168,7 +191,8 @@ Numeric timeouts and retention limits remain unset pending design and measuremen
 
 ## Acceptance tasks
 
-All items below are **planned**. Writing this contract does not check a task.
+The parent gates below remain **open**. Scoped child protocol tests and loopback
+fixtures do not complete their full runtime, lifecycle or performance scope.
 
 - [ ] [SEC-01] Freeze the common point-to-point authentication, opaque-record and fixed-control interfaces, canonical binding transcript and resource model; document current versus target behavior and preserve all existing mode requirements.
 - [ ] [SEC-02] Select and pin a maintained WireGuard-like/Noise-based implementation with reviewed cryptographic and public protection/key APIs; establish injected time/randomness, bounded errors, safety/dependency policy and exact adaptation scope without private-state extraction.

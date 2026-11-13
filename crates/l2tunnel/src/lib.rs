@@ -7,18 +7,27 @@ pub const IMPLEMENTATION_STATUS: &str = "Authenticated Linux TCP/TLS, TLS-bootst
 pub use l2tunnel_codec as codec;
 /// Platform-independent mode contracts.
 pub use l2tunnel_core as core;
+/// Explicit QUIC-header and minimal RTP outer appearance codecs, without transport claims.
+pub use l2tunnel_cover as cover;
 /// Platform device boundaries.
 pub use l2tunnel_device as device;
+/// Bounded maintained Noise adapter with caller entropy/time and explicit own-peer trust.
+pub use l2tunnel_handshake as handshake;
 /// Bounded common traffic arbiter.
 pub use l2tunnel_mux as mux;
 /// Recovery-engine boundary.
 pub use l2tunnel_recovery as recovery;
+/// Shared opaque packet protection and explicit legacy Swift compatibility.
+pub use l2tunnel_security as security;
 /// Local reload safety guard.
 pub use l2tunnel_session as session;
 /// Planned carrier capabilities.
 pub use l2tunnel_transport as transport;
 /// Checked inner record framing.
 pub use l2tunnel_wire as wire;
+
+/// Common protected user/control records over explicitly selected appearance codecs.
+pub mod secure_record;
 
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;

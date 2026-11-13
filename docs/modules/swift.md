@@ -41,11 +41,13 @@ current CLI and wire formats below describe observed behavior.
 The current client reuses the existing TLS/member authentication and directional
 exporter secrets, and the shared service owns connect/disconnect/reconnect/status.
 The pure `l2tunnel-swift` engine has no cryptography, socket or real clock.
-However, `l2tunnel-runtime::swift` defines its own protected datagram format,
-replay window and key chain rather than using `l2tunnel-datagram`; SW-13 also
-defines a private control codec instead of the common management transaction.
-These are separate session mechanisms around the algorithm, not another
-cryptographic primitive implementation: AEAD and HKDF use maintained `ring`.
+The runtime now delegates protection, replay and its key chain to the explicit
+`l2tunnel_security::swift_v2` compatibility owners. Their byte-exact legacy format
+and TLS exporter roots remain unchanged; the new common packet format is a
+separate API, not silently enabled on an existing Swift connection. See the
+[packet-security extraction](packet-security.md). SW-13 still uses its private
+TLS control codec rather than the common management transaction. AEAD and HKDF
+continue to use maintained `ring` primitives.
 
 The target correction preserves the algorithm and historical experiments while
 converging authentication/security and management on common session services.

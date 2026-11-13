@@ -26,6 +26,9 @@ l2tunnel-packet = { path = "../l2tunnel-packet" }
 l2tunnel-pipeline = { path = "../l2tunnel-pipeline" }
 l2tunnel-fec = { path = "../l2tunnel-fec" }
 l2tunnel-swift = { path = "../l2tunnel-swift" }
+l2tunnel-security = { path = "../l2tunnel-security" }
+l2tunnel-handshake = { path = "../l2tunnel-handshake" }
+l2tunnel-cover = { path = "../l2tunnel-cover" }
 l2tunnel-datagram = { path = "../l2tunnel-datagram" }
 l2tunnel-active = { path = "../l2tunnel-active" }
 l2tunnel-reliable = { path = "../l2tunnel-reliable" }
@@ -33,3 +36,6 @@ l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
 l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
 l2tunnel-aligned = { path = "../l2tunnel-aligned" }
 l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
+
+[dev-dependencies]
+zeroize = "=1.9.0"

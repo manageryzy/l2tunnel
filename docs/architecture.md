@@ -41,6 +41,15 @@ required. Standard-header parsing, complete protocol validity, identification an
 ISP QoS treatment are separate claims; initial-packet classification is an
 unverified hypothesis to measure on the actual connection.
 
+The first implementation correction now extracts Swift's packet protection into
+a reusable pure library while preserving its v2 wire bytes. New pure Noise,
+appearance, protected User/Control records and reliable control components have
+finite protocol/loopback evidence in their
+[module ledgers](implementation-checklist.md#reading-order-and-detailed-task-lists).
+The same-socket library fixture is distinct from integrating these components
+into the real shared client/service and native device runtime. Those target
+gates remain open; no new carrier/default or automatic recovery is silently enabled.
+
 ## Library boundary and layering
 
 ```mermaid

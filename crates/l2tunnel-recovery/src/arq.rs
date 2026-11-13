@@ -310,6 +310,19 @@ pub fn inspect_packet(
 }
 
 impl SelectiveRepeat {
+    /// Earliest first-source or retry deadline, independent of pending receipts.
+    /// A bounded service can preserve a source opportunity without waking for
+    /// feedback that cannot fit its remaining reservation.
+    pub fn source_deadline(&self) -> Option<Duration> {
+        self.0.source_deadline()
+    }
+
+    /// Earliest pending receipt deadline, independent of ready source work.
+    /// A bounded service can reserve feedback while deferring source admission.
+    pub fn feedback_deadline(&self) -> Option<Duration> {
+        self.0.ack_at
+    }
+
     /// Emit due feedback only, without advancing source attempts or source timers.
     /// Caller must charge this output to the same wire budget as data/repair copies.
     pub fn poll_feedback(
@@ -747,15 +760,21 @@ impl Engine {
         Ok(Some((source.0, length)))
     }
 
-    fn deadline(&self) -> Option<Duration> {
+    fn source_deadline(&self) -> Option<Duration> {
         if self.failure.is_some() {
             return None;
         }
         self.sent
             .values()
             .map(|flight| flight.retry_at.unwrap_or(self.last_now))
-            .chain(self.ack_at)
             .min()
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.source_deadline().into_iter().chain(self.ack_at).min()
     }
 }
 
