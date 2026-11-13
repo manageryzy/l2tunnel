@@ -32,6 +32,7 @@ l2tunnel-device = { path = "../l2tunnel-device" }
 l2tunnel-wire = { path = "../l2tunnel-wire" }
 l2tunnel-management = { path = "../l2tunnel-management" }
 ring = "=0.17.14"
+zeroize = "=1.9.0"
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]

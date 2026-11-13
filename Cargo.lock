@@ -697,6 +697,7 @@ dependencies = [
  "rcgen",
  "ring",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

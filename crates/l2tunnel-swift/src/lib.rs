@@ -33,9 +33,9 @@ pub const KIND_SOURCE: u8 = 0;
 pub const KIND_REPAIR: u8 = 1;
 /// Datagram kind byte of receiver feedback.
 pub const KIND_FEEDBACK: u8 = 2;
-/// Source header: kind and 32-bit sequence number.
+/// Source header: kind and the low 32 bits of the sequence number.
 pub const SOURCE_HEADER: usize = 5;
-/// Repair header: kind, 32-bit end sequence and 8-bit covered count.
+/// Repair header: kind, low 32 bits of the end sequence and 8-bit covered count.
 pub const REPAIR_HEADER: usize = 6;
 /// Feedback header before the explicit request list.
 pub const FEEDBACK_HEADER: usize = 12;
@@ -120,7 +120,7 @@ pub enum Error {
     Configuration,
     /// An authenticated datagram or the recovered stream is structurally invalid.
     Malformed,
-    /// The 32-bit source sequence space of this session is exhausted.
+    /// The 64-bit source sequence space is exhausted; unreachable in practice.
     Exhausted,
     /// A native packet is empty or larger than the configured maximum.
     PacketSize,
@@ -201,6 +201,14 @@ impl ReceiverStats {
     }
 }
 
+/// The 64-bit sequence nearest `reference` whose low 32 bits are `wire`.
+/// Sequences are 64-bit inside the engine and never wrap in practice; the
+/// wire carries their low half, which is unambiguous because every value a
+/// peer may name lies within one flow window of the local reference.
+fn expand(reference: u64, wire: u32) -> Option<u64> {
+    let delta = wire.wrapping_sub(reference as u32) as i32;
+    reference.checked_add_signed(i64::from(delta))
+}
 fn read_u32(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
 }

@@ -1,7 +1,8 @@
 //! Source reception, online repair decoding, ordered unpacking and feedback.
 use super::{
     Config, Error, FEEDBACK_HEADER, FRAME_PREFIX, KIND_FEEDBACK, KIND_REPAIR, KIND_SOURCE,
-    MAX_REQUESTS, REORDER_SOURCES, REPAIR_HEADER, ReceiverStats, SOURCE_HEADER, gf, read_u32,
+    MAX_REQUESTS, REORDER_SOURCES, REPAIR_HEADER, ReceiverStats, SOURCE_HEADER, expand, gf,
+    read_u32,
 };
 use std::collections::VecDeque;
 
@@ -10,7 +11,7 @@ use std::collections::VecDeque;
 struct Row {
     /// Unknown sources only, ascending by sequence. The first is the pivot and
     /// has coefficient one; no other row mentions any row's pivot.
-    terms: Vec<(u32, u8)>,
+    terms: Vec<(u64, u8)>,
     data: Vec<u8>,
 }
 
@@ -23,10 +24,10 @@ fn add_scaled(target: &mut Vec<u8>, source: &[u8], factor: u8) {
 
 /// `target += factor * other` over sparse ascending term lists.
 fn add_terms(
-    target: &mut Vec<(u32, u8)>,
-    other: &[(u32, u8)],
+    target: &mut Vec<(u64, u8)>,
+    other: &[(u64, u8)],
     factor: u8,
-    scratch: &mut Vec<(u32, u8)>,
+    scratch: &mut Vec<(u64, u8)>,
 ) {
     scratch.clear();
     let (mut a, mut b) = (0, 0);
@@ -64,7 +65,7 @@ fn add_terms(
     std::mem::swap(target, scratch);
 }
 
-fn coefficient_of(terms: &[(u32, u8)], sequence: u32) -> Option<(usize, u8)> {
+fn coefficient_of(terms: &[(u64, u8)], sequence: u64) -> Option<(usize, u8)> {
     terms
         .binary_search_by_key(&sequence, |term| term.0)
         .ok()
@@ -77,20 +78,20 @@ const FEEDBACK_REPEATS: u8 = 2;
 pub struct Receiver {
     config: Config,
     /// Next source to unpack; everything below was delivered in order.
-    base: u32,
+    base: u64,
     /// One past the highest source known to exist.
-    end: u32,
+    end: u64,
     /// Sequence of `slots[0]`; history below `base` is kept for repairs.
-    floor: u32,
+    floor: u64,
     slots: VecDeque<Option<Vec<u8>>>,
     rows: Vec<Row>,
-    scratch_terms: Vec<(u32, u8)>,
+    scratch_terms: Vec<(u64, u8)>,
     scratch_vector: Vec<u8>,
     /// Ordered recovered bytes not yet cut into native packets.
     stream: VecDeque<u8>,
     dirty: bool,
     /// Highest sequence known when feedback was last produced.
-    reported_end: u32,
+    reported_end: u64,
     /// Unprompted repeats of the latest feedback still owed, so one lost
     /// acknowledgement does not leave an idle sender waiting for its probe.
     repeats: u8,
@@ -121,6 +122,12 @@ impl Receiver {
             stats: ReceiverStats::default(),
         })
     }
+    /// Begin at an arbitrary sequence, as a long-lived session would be.
+    #[cfg(test)]
+    pub(crate) fn start_at(&mut self, sequence: u64) {
+        (self.base, self.end, self.floor, self.reported_end) =
+            (sequence, sequence, sequence, sequence);
+    }
     #[cfg(test)]
     pub(crate) fn debug_state(&self) -> String {
         format!(
@@ -142,20 +149,21 @@ impl Receiver {
     }
     /// Sources known to exist that are not yet delivered in order.
     pub fn pending(&self) -> u32 {
-        self.end - self.base
+        // Bounded by the flow window, which fits 16 bits.
+        (self.end - self.base) as u32
     }
-    fn slot(&self, sequence: u32) -> Option<&Vec<u8>> {
+    fn slot(&self, sequence: u64) -> Option<&Vec<u8>> {
         let index = usize::try_from(sequence.checked_sub(self.floor)?).ok()?;
         self.slots.get(index)?.as_ref()
     }
-    fn known(&self, sequence: u32) -> bool {
+    fn known(&self, sequence: u64) -> bool {
         sequence < self.base || self.slot(sequence).is_some()
     }
     /// Extend knowledge of the highest sequence; reject one beyond the flow bound.
-    fn observe_end(&mut self, end: u32) -> Result<(), Error> {
+    fn observe_end(&mut self, end: u64) -> Result<(), Error> {
         if end > self.end {
-            let limit = u64::from(self.base) + self.config.flow_sources as u64;
-            if u64::from(end) > limit {
+            let limit = self.base + self.config.flow_sources as u64;
+            if end > limit {
                 return Err(Error::Malformed);
             }
             self.end = end;
@@ -172,8 +180,9 @@ impl Receiver {
         self.dirty = true;
         match body.first() {
             Some(&KIND_SOURCE) => {
-                let sequence =
+                let wire =
                     read_u32(body.get(1..).ok_or(Error::Malformed)?).ok_or(Error::Malformed)?;
+                let sequence = expand(self.base, wire).ok_or(Error::Malformed)?;
                 let payload = body.get(SOURCE_HEADER..).ok_or(Error::Malformed)?;
                 if payload.is_empty() || payload.len() > self.config.symbol_bytes() {
                     return Err(Error::Malformed);
@@ -191,9 +200,10 @@ impl Receiver {
                 self.learn(sequence, owned)?;
             }
             Some(&KIND_REPAIR) => {
-                let end =
+                let wire =
                     read_u32(body.get(1..).ok_or(Error::Malformed)?).ok_or(Error::Malformed)?;
-                let count = u32::from(*body.get(5).ok_or(Error::Malformed)?);
+                let end = expand(self.base, wire).ok_or(Error::Malformed)?;
+                let count = u64::from(*body.get(5).ok_or(Error::Malformed)?);
                 let data = body.get(REPAIR_HEADER..).ok_or(Error::Malformed)?;
                 if count == 0
                     || count as usize > self.config.window
@@ -219,13 +229,13 @@ impl Receiver {
         self.advance()
     }
     /// Reduce a received equation against known sources and held rows.
-    fn equation(&mut self, seed: u64, start: u32, end: u32, data: &[u8]) -> Result<(), Error> {
+    fn equation(&mut self, seed: u64, start: u64, end: u64, data: &[u8]) -> Result<(), Error> {
         let mut vector = std::mem::take(&mut self.scratch_vector);
         vector.clear();
         vector.extend_from_slice(data);
         let mut terms = Vec::new();
         for sequence in start..end {
-            let factor = gf::coefficient(seed, sequence);
+            let factor = gf::coefficient(seed, sequence as u32);
             if sequence < self.base || self.slot(sequence).is_some() {
                 let Some(payload) = self.slot(sequence) else {
                     // History below the floor was already excluded by the caller.
@@ -338,7 +348,7 @@ impl Receiver {
         }
         Ok(())
     }
-    fn store(&mut self, sequence: u32, payload: Vec<u8>) {
+    fn store(&mut self, sequence: u64, payload: Vec<u8>) {
         if let Some(index) = sequence
             .checked_sub(self.floor)
             .and_then(|offset| usize::try_from(offset).ok())
@@ -348,7 +358,7 @@ impl Receiver {
         }
     }
     /// Record a directly received source and substitute it into held rows.
-    fn learn(&mut self, sequence: u32, payload: Vec<u8>) -> Result<(), Error> {
+    fn learn(&mut self, sequence: u64, payload: Vec<u8>) -> Result<(), Error> {
         let length = (payload.len() as u16).to_be_bytes();
         let mut repivot = Vec::new();
         let mut index = 0;
@@ -395,7 +405,7 @@ impl Receiver {
             self.base += 1;
         }
         // Keep one window of delivered history for repairs still in flight.
-        let keep = self.base.saturating_sub(self.config.window as u32);
+        let keep = self.base.saturating_sub(self.config.window as u64);
         while self.floor < keep {
             if let Some(Some(mut payload)) = self.slots.pop_front()
                 && self.spare.len() < 64
@@ -457,11 +467,11 @@ impl Receiver {
         }
         output.clear();
         output.push(KIND_FEEDBACK);
-        output.extend_from_slice(&self.base.to_be_bytes());
-        output.extend_from_slice(&self.end.to_be_bytes());
+        output.extend_from_slice(&(self.base as u32).to_be_bytes());
+        output.extend_from_slice(&(self.end as u32).to_be_bytes());
         let coded_from = self
             .end
-            .saturating_sub(self.config.window as u32)
+            .saturating_sub(self.config.window as u64)
             .max(self.base);
         let mut recent = 0u16;
         for sequence in coded_from..self.end {
@@ -476,7 +486,9 @@ impl Receiver {
         // few later sources show it is not mere reordering. Once sources stop
         // nothing will age the gap, so it is requested like any older one.
         let settled = if self.config.repair_numerator == 0 {
-            self.end.saturating_sub(REORDER_SOURCES).max(self.base)
+            self.end
+                .saturating_sub(u64::from(REORDER_SOURCES))
+                .max(self.base)
         } else {
             coded_from
         };
@@ -492,7 +504,7 @@ impl Receiver {
                 break;
             }
             let offset = sequence - self.base;
-            if offset > u32::from(u16::MAX) {
+            if offset > u64::from(u16::MAX) {
                 break;
             }
             // A row's pivot is determined once that row's other unknowns

@@ -13,7 +13,7 @@
 //! This module performs no authentication, key derivation or device setup.
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_swift as codec;
-use ring::aead;
+use ring::{aead, hkdf};
 use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -114,6 +114,8 @@ pub struct Snapshot {
     pub native_write_drops: u64,
     /// Native bytes removed by header compression, net of record tags.
     pub header_bytes_saved: u64,
+    /// Key generation currently protecting sent datagrams; zero at start.
+    pub key_generation: u64,
 }
 
 fn invalid(message: impl ToString) -> io::Error {
@@ -223,10 +225,122 @@ fn nonce(number: u64) -> aead::Nonce {
     bytes[4..].copy_from_slice(&number.to_be_bytes());
     aead::Nonce::assume_unique_for_key(bytes)
 }
-fn key(bytes: &[u8; 32]) -> io::Result<aead::LessSafeKey> {
-    aead::UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
-        .map(aead::LessSafeKey::new)
-        .map_err(|_| io::Error::other("swift data key rejected"))
+/// Datagrams one direction protects under one key generation. The generation
+/// of a datagram is its packet number divided by this, so both peers change
+/// keys at the same packet without any message. Part of the authenticated
+/// policy.
+pub const KEY_PACKETS: u64 = 1 << 28;
+const KEY_LABEL: &[u8] = b"l2tunnel swift v2 datagram key";
+const NEXT_LABEL: &[u8] = b"l2tunnel swift v2 next secret";
+
+struct Length32;
+impl hkdf::KeyType for Length32 {
+    fn len(&self) -> usize {
+        32
+    }
+}
+/// One generation of a direction's secret. The datagram key and the next
+/// generation's secret are separate HKDF-SHA256 expansions of it, so a
+/// generation's key reveals neither earlier nor later traffic.
+struct Chain {
+    secret: zeroize::Zeroizing<[u8; 32]>,
+    generation: u64,
+}
+impl Chain {
+    fn new(secret: &[u8; 32]) -> Self {
+        Self {
+            secret: zeroize::Zeroizing::new(*secret),
+            generation: 0,
+        }
+    }
+    fn expand(&self, label: &'static [u8]) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+        let failed = |_| io::Error::other("swift key derivation failed");
+        let mut output = zeroize::Zeroizing::new([0; 32]);
+        hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.secret[..])
+            .expand(&[label], Length32)
+            .map_err(failed)?
+            .fill(&mut output[..])
+            .map_err(failed)?;
+        Ok(output)
+    }
+    fn key(&self) -> io::Result<aead::LessSafeKey> {
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &self.expand(KEY_LABEL)?[..])
+            .map(aead::LessSafeKey::new)
+            .map_err(|_| io::Error::other("swift data key rejected"))
+    }
+    fn next(&self) -> io::Result<Self> {
+        Ok(Self {
+            secret: self.expand(NEXT_LABEL)?,
+            generation: self
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("swift key generations exhausted"))?,
+        })
+    }
+}
+/// Receiving keys: the current generation, the previous one while its last
+/// datagrams may still arrive out of order, and the next one once a datagram
+/// claims it. A claim becomes current only after a datagram authenticates
+/// under it, so forged packet numbers cannot move the keys.
+struct Opening {
+    chain: Chain,
+    current: aead::LessSafeKey,
+    previous: Option<aead::LessSafeKey>,
+    next: Option<(Chain, aead::LessSafeKey)>,
+}
+impl Opening {
+    fn new(secret: &[u8; 32]) -> io::Result<Self> {
+        let chain = Chain::new(secret);
+        Ok(Self {
+            current: chain.key()?,
+            chain,
+            previous: None,
+            next: None,
+        })
+    }
+    /// Key for a datagram of `generation`, absent when it is neither the
+    /// current generation nor adjacent to it.
+    fn key(&mut self, generation: u64) -> io::Result<Option<&aead::LessSafeKey>> {
+        let current = self.chain.generation;
+        if generation == current {
+            return Ok(Some(&self.current));
+        }
+        if generation.checked_add(1) == Some(current) {
+            return Ok(self.previous.as_ref());
+        }
+        if current.checked_add(1) != Some(generation) {
+            return Ok(None);
+        }
+        if self.next.is_none() {
+            let chain = self.chain.next()?;
+            let key = chain.key()?;
+            self.next = Some((chain, key));
+        }
+        Ok(self.next.as_ref().map(|(_, key)| key))
+    }
+    /// A datagram of `generation` authenticated.
+    fn confirm(&mut self, generation: u64) {
+        if self.chain.generation.checked_add(1) == Some(generation)
+            && let Some((chain, key)) = self.next.take()
+        {
+            self.previous = Some(std::mem::replace(&mut self.current, key));
+            self.chain = chain;
+        }
+    }
+    /// Forget the previous generation once the replay window has moved
+    /// wholly into the current one.
+    fn retire(&mut self, highest: u64, key_packets: u64) {
+        if self.previous.is_some()
+            && highest
+                >= self
+                    .chain
+                    .generation
+                    .saturating_mul(key_packets)
+                    .saturating_add(REPLAY_BITS)
+        {
+            self.previous = None;
+        }
+    }
 }
 
 /// Socket-free protocol state of one endpoint, driven by explicit time.
@@ -241,7 +355,9 @@ struct Engine {
     compressors: Vec<codec::header::Compressor>,
     decompressors: Vec<codec::header::Decompressor>,
     seal: aead::LessSafeKey,
-    open: aead::LessSafeKey,
+    seal_chain: Chain,
+    open: Opening,
+    key_packets: u64,
     replay: Replay,
     pacer: Pacer,
     number: u64,
@@ -280,14 +396,17 @@ impl Engine {
             compressors.push(codec::header::Compressor::new(ethernet));
             decompressors.push(codec::header::Decompressor::new(ethernet));
         }
+        let seal_chain = Chain::new(keys.send);
         Ok(Self {
             config,
             senders,
             receivers,
             compressors,
             decompressors,
-            seal: key(keys.send)?,
-            open: key(keys.receive)?,
+            seal: seal_chain.key()?,
+            seal_chain,
+            open: Opening::new(keys.receive)?,
+            key_packets: KEY_PACKETS,
             replay: Replay::new(),
             pacer: Pacer::new(config.send_bytes_per_second, largest, now),
             number: 0,
@@ -401,6 +520,11 @@ impl Engine {
         self.number = number
             .checked_add(1)
             .ok_or_else(|| io::Error::other("swift packet numbers exhausted"))?;
+        while self.seal_chain.generation < number / self.key_packets {
+            self.seal_chain = self.seal_chain.next()?;
+            self.seal = self.seal_chain.key()?;
+            self.snapshot.key_generation = self.seal_chain.generation;
+        }
         self.wire.clear();
         self.wire.extend_from_slice(&number.to_be_bytes());
         self.wire.extend_from_slice(&self.body);
@@ -454,16 +578,22 @@ impl Engine {
             self.snapshot.datagrams_rejected += 1;
             return Ok(());
         }
+        let generation = number / self.key_packets;
         self.opened.clear();
         self.opened.extend_from_slice(&datagram[NUMBER_BYTES..]);
-        let Ok(body) = self
-            .open
-            .open_in_place(nonce(number), aead::Aad::empty(), &mut self.opened)
-        else {
+        let opened = match self.open.key(generation)? {
+            Some(key) => key
+                .open_in_place(nonce(number), aead::Aad::empty(), &mut self.opened)
+                .ok(),
+            None => None,
+        };
+        let Some(body) = opened else {
             self.snapshot.datagrams_rejected += 1;
             return Ok(());
         };
+        self.open.confirm(generation);
         self.replay.commit(number);
+        self.open.retire(self.replay.highest, self.key_packets);
         self.snapshot.datagrams_received += 1;
         let malformed = || protocol(codec::Error::Malformed);
         let lead = *body.first().ok_or_else(malformed)?;
@@ -735,6 +865,9 @@ mod tests {
         packet[40..44].copy_from_slice(&counter.to_be_bytes());
         packet
     }
+    fn counter_of(packet: &[u8]) -> u32 {
+        counter(packet).1
+    }
     fn counter(packet: &[u8]) -> (u16, u32) {
         (
             u16::from_be_bytes([packet[20], packet[21]]),
@@ -859,6 +992,110 @@ mod tests {
         let sent = left.snapshot(now).sender;
         assert!(sent.retransmits > 0 && sent.repairs == 0);
         assert!(order.windows(2).any(|pair| pair[0] != pair[1]));
+        Ok(())
+    }
+
+    /// Keys change at fixed packet numbers with no message. Traffic keeps
+    /// flowing across many generations in both directions; stragglers of the
+    /// previous generation are still accepted inside the replay window; a
+    /// forged claim of the next generation, a skipped generation and a
+    /// retired generation authenticate nothing.
+    #[test]
+    fn keys_ratchet_at_fixed_packet_numbers_without_interrupting_traffic() -> io::Result<()> {
+        let (mut left, mut right) = pair(12_500_000, 1)?;
+        left.key_packets = 8;
+        right.key_packets = 8;
+        let mut now = 0;
+        let mut delivered = 0u32;
+        let mut held: Option<Vec<u8>> = None;
+        let mut first: Option<Vec<u8>> = None;
+        for counter in 0..400u32 {
+            now += 2_000;
+            left.offer(now, &segment(7, counter, 900))?;
+            while let Some(wire) = left.produce(now)? {
+                let wire = wire.to_vec();
+                let number = u64::from_be_bytes(wire[..8].try_into().map_err(io::Error::other)?);
+                first.get_or_insert_with(|| wire.clone());
+                // Hold the last datagram of generation 2 back until the
+                // receiver has moved to generation 3.
+                if number == 23 {
+                    held = Some(wire);
+                    continue;
+                }
+                right.accept(now, &wire)?;
+                if number == 26
+                    && let Some(late) = held.take()
+                {
+                    let before = right.snapshot(now).datagrams_received;
+                    right.accept(now, &late)?;
+                    assert_eq!(right.snapshot(now).datagrams_received, before + 1);
+                }
+            }
+            while let Some(packet) = right.pop()? {
+                assert_eq!(counter_of(packet), delivered);
+                delivered += 1;
+            }
+            while let Some(wire) = right.produce(now)? {
+                let wire = wire.to_vec();
+                left.accept(now, &wire)?;
+            }
+        }
+        for _ in 0..200 {
+            now += 5_000;
+            while let Some(wire) = left.produce(now)? {
+                let wire = wire.to_vec();
+                right.accept(now, &wire)?;
+            }
+            while let Some(packet) = right.pop()? {
+                assert_eq!(counter_of(packet), delivered);
+                delivered += 1;
+            }
+            while let Some(wire) = right.produce(now)? {
+                let wire = wire.to_vec();
+                left.accept(now, &wire)?;
+            }
+        }
+        assert_eq!(delivered, 400);
+        let sent = left.snapshot(now);
+        assert!(sent.key_generation >= 40, "{sent:?}");
+        assert_eq!(sent.key_generation, (left.number - 1) / 8);
+        assert_eq!(right.open.chain.generation, sent.key_generation);
+        assert!(right.snapshot(now).key_generation >= 1);
+        assert_eq!(right.snapshot(now).datagrams_rejected, 0);
+        // The retired first generation no longer authenticates, even to a
+        // receiver whose replay window were reset.
+        let first = first.ok_or_else(|| io::Error::other("nothing sent"))?;
+        assert!(right.open.key(0)?.is_none());
+        // The previous generation is kept only while the replay window still
+        // reaches into it.
+        let current = right.open.chain.generation;
+        assert!(right.open.previous.is_some());
+        right.open.retire(current * 8 + REPLAY_BITS - 1, 8);
+        assert!(right.open.previous.is_some());
+        right.open.retire(current * 8 + REPLAY_BITS, 8);
+        assert!(right.open.previous.is_none());
+        assert!(right.open.key(current - 1)?.is_none());
+        right.accept(now, &first)?;
+        assert_eq!(right.snapshot(now).datagrams_rejected, 1);
+        // A forged datagram naming the next generation derives the candidate
+        // key once but does not move the receiver; one naming a generation
+        // further ahead is refused outright.
+        let current = right.open.chain.generation;
+        for generation in [current + 1, current + 2, current + 9] {
+            let mut forged = vec![0u8; 80];
+            forged[..8].copy_from_slice(&(generation * 8).to_be_bytes());
+            right.accept(now, &forged)?;
+        }
+        assert_eq!(right.snapshot(now).datagrams_rejected, 4);
+        assert_eq!(right.open.chain.generation, current);
+        // Each generation's key differs from its neighbours and from the
+        // secret it was derived from.
+        let chain = Chain::new(&[9; 32]);
+        let next = chain.next()?;
+        assert_ne!(chain.expand(KEY_LABEL)?[..], next.expand(KEY_LABEL)?[..]);
+        assert_ne!(chain.expand(KEY_LABEL)?[..], chain.secret[..]);
+        assert_ne!(next.secret[..], chain.secret[..]);
+        assert_eq!(next.generation, 1);
         Ok(())
     }
 

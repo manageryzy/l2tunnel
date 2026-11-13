@@ -20,7 +20,7 @@ covered. The session is owned by the shared lifecycle service, with
 - [x] [SW-12] Read-only `status` over the private local control socket, reporting phase and counters of the live session. Evidence: [response and tests](../../crates/l2tunnel-client-core/src/swift/cli.rs); every [self-test receipt](../../work/swift-selftest41/impaired-1.json) queries both endpoints with the real `status` command.
 - [x] [SW-08] Route swift through the shared service API with disconnect and reconnect: the service owns the authenticated session, sockets and device as one backend; the CLI only parses and prints. Evidence: [service backend](../../crates/l2tunnel-client-core/src/service/owner.rs), [two-service lifecycle test over real loopback TLS and UDP](../../crates/l2tunnel-client-core/src/service/tests/swift.rs), [CLI adapter](../../crates/l2tunnel-client-core/src/swift/cli.rs), and the `lifecycle` block of the [self-test receipts](../../work/swift-selftest43/impaired.json), which disconnects and reconnects the live tunnel with the real commands.
 - [ ] [SW-09] Qualify on real devices and privileged host namespaces, IPv6 underlay, TUN, long soak, CPU and memory.
-- [ ] [SW-10] Rekeying and packet-number or source-sequence rollover without reconnecting; a session ends when its 32-bit per-channel source sequence is exhausted.
+- [x] [SW-10] Rekeying and sequence rollover without reconnecting: each direction's datagram key changes every 2^28 datagrams through an HKDF-SHA256 chain with no message, and source sequences are 64-bit inside the engine with their low 32 bits on the wire. Evidence: [key chain and ratchet test](../../crates/l2tunnel-runtime/src/swift.rs) covering many generations in both directions, a reordered straggler, forged and skipped generations and retirement; [boundary-crossing engine test](../../crates/l2tunnel-swift/src/tests.rs) under 15% loss with and without repairs. A production-cadence rekey (2^28 datagrams, hours at the reference rate) has not been observed in a live run.
 - [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles; the profile is startup-only.
 
 ## Why this design
@@ -49,15 +49,30 @@ Three measurements shaped the rest:
 
 Every UDP payload is `[packet number u64][ciphertext][tag 16]`. The packet
 number is the AEAD nonce, the replay identity and the repair coefficient seed.
-Keys are `KeyPurpose::Data` exporter secrets for each direction on lane 0. The
-plaintext body starts with one byte holding the kind in bits 0–1 and the channel
+The `KeyPurpose::Data` exporter secret of each direction on lane 0 starts a
+chain: generation `g` protects packet numbers `g * 2^28` to `(g + 1) * 2^28 - 1`
+with `HKDF-Expand(secret_g, "l2tunnel swift v2 datagram key")`, and
+`secret_(g+1) = HKDF-Expand(secret_g, "l2tunnel swift v2 next secret")`, both
+HKDF-SHA256. Because the generation is a function of the packet number, both
+peers change keys at the same datagram without negotiating. A receiver derives
+the next generation when a datagram first names it, adopts it only once a
+datagram authenticates under it, keeps the previous generation while the
+replay window still reaches into it, and holds no older secret. The interval
+is part of the authenticated policy. The 64-bit packet number does not wrap.
+
+Sequences are 64-bit in the engines; the wire carries their low 32 bits, which
+each side expands relative to its own confirmed position. Every sequence a
+peer may name lies within one flow window (4096) of that position, so the
+expansion is unambiguous and a session continues across the 32-bit boundary.
+
+The plaintext body starts with one byte holding the kind in bits 0–1 and the channel
 in bits 2–7.
 
 | Kind | Body after the leading byte |
 | --- | --- |
-| 0 source | sequence `u32`, 1 to `symbol_bytes` packed bytes |
-| 1 repair | end sequence `u32`, covered count `u8`, GF(256) combination of `[length u16][payload]` vectors |
-| 2 feedback | base `u32`, end `u32`, missing in newest window `u16`, request count `u8`, request offsets `u16` each; one block per channel, concatenated |
+| 0 source | low 32 bits of the sequence, 1 to `symbol_bytes` packed bytes |
+| 1 repair | low 32 bits of the end sequence, covered count `u8`, GF(256) combination of `[length u16][payload]` vectors |
+| 2 feedback | low 32 bits of base and of end, missing in newest window `u16`, request count `u8`, request offsets `u16` each; one block per channel, concatenated |
 
 Packed bytes are records `[length u16][record]`. A record is tag `0` literal,
 `1` literal that also sets a connection context, or `2` delta: a flag byte and
@@ -135,6 +150,10 @@ loaded by unrelated work measured about 49 Mbit/s (`work/swift-selftest42/`);
 the previous build measured 62–69 Mbit/s under the same load and both builds
 reached 80.0 Mbit/s when it eased, so those runs show the harness's
 sensitivity to scheduling, not a difference between builds.
+
+With the key chain and 64-bit sequences the reference path measured 79.35
+Mbit/s (98.3%), again with a successful disconnect and reconnect
+(`work/swift-selftest44/`).
 
 Retransmissions were 17.5–17.7% of sources on the 15% path. The simulator's
 published candidate uses a 36-byte outer header and no authentication bytes and

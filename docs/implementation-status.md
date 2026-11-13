@@ -22,8 +22,10 @@ This is integration-tested in one local environment only: real devices,
 privileged host namespaces, soak and the other profiles' blocking corrections
 remain open. The session is owned by the shared lifecycle service; the
 self-test [disconnects and reconnects](../work/swift-selftest43/impaired.json)
-the live tunnel through the local commands. Rekeying, negotiated profile
-switching and a clean peer-confirmed drain are not implemented, and no Python mode gate is closed by it.
+the live tunnel through the local commands. Datagram keys change
+automatically every 2^28 datagrams and sequences continue across the 32-bit
+wire boundary, both covered by unit tests only. Negotiated profile switching
+and a clean peer-confirmed drain are not implemented, and no Python mode gate is closed by it.
 
 ## Current verification
 

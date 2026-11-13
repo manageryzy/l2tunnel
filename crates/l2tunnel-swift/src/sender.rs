@@ -1,7 +1,7 @@
 //! Packing, systematic source emission, repair scheduling and retransmission.
 use super::{
     Config, Error, FEEDBACK_HEADER, FRAME_PREFIX, KIND_FEEDBACK, KIND_REPAIR, KIND_SOURCE,
-    MAX_REQUESTS, SenderStats, gf, read_u16, read_u32,
+    MAX_REQUESTS, SenderStats, expand, gf, read_u16, read_u32,
 };
 use std::collections::VecDeque;
 
@@ -22,14 +22,14 @@ pub struct Sender {
     queue_since: u64,
     /// Sent sources with sequence numbers `acked..next`.
     sources: VecDeque<Source>,
-    acked: u32,
-    next: u32,
+    acked: u64,
+    next: u64,
     credit: u32,
     repairs_due: u32,
-    retransmit: VecDeque<u32>,
+    retransmit: VecDeque<u64>,
     smoothed_rtt: u64,
     /// Highest `end` any feedback has reported.
-    sampled_end: u32,
+    sampled_end: u64,
     /// Next idle probe time while unconfirmed sources remain.
     probe_at: Option<u64>,
     probe_interval: u64,
@@ -62,6 +62,11 @@ impl Sender {
             spare: Vec::new(),
             stats: SenderStats::default(),
         })
+    }
+    /// Begin at an arbitrary sequence, as a long-lived session would be.
+    #[cfg(test)]
+    pub(crate) fn start_at(&mut self, sequence: u64) {
+        (self.acked, self.next, self.sampled_end) = (sequence, sequence, sequence);
     }
     #[cfg(test)]
     pub(crate) fn debug_state(&self) -> String {
@@ -130,7 +135,7 @@ impl Sender {
         };
         self.probe_at = Some(now.saturating_add(self.probe_interval));
     }
-    fn source(&mut self, sequence: u32) -> Option<&mut Source> {
+    fn source(&mut self, sequence: u64) -> Option<&mut Source> {
         let index = usize::try_from(sequence.checked_sub(self.acked)?).ok()?;
         self.sources.get_mut(index)
     }
@@ -189,7 +194,7 @@ impl Sender {
             source.last_sent = now;
             source.retransmitted = true;
             output.push(KIND_SOURCE);
-            output.extend_from_slice(&sequence.to_be_bytes());
+            output.extend_from_slice(&(sequence as u32).to_be_bytes());
             output.extend_from_slice(&source.payload);
             self.stats.retransmits += 1;
             return Ok(true);
@@ -211,7 +216,7 @@ impl Sender {
             // Whatever is left starts a new partial symbol.
             self.queue_since = now;
             output.push(KIND_SOURCE);
-            output.extend_from_slice(&sequence.to_be_bytes());
+            output.extend_from_slice(&(sequence as u32).to_be_bytes());
             output.extend_from_slice(&payload);
             self.sources.push_back(Source {
                 payload,
@@ -272,13 +277,13 @@ impl Sender {
             .unwrap_or(0);
         output.clear();
         output.push(KIND_REPAIR);
-        output.extend_from_slice(&self.next.to_be_bytes());
+        output.extend_from_slice(&(self.next as u32).to_be_bytes());
         output.push(count as u8);
         let body = output.len();
         output.resize(body + 2 + widest, 0);
-        let start = self.next - count as u32;
+        let start = self.next - count as u64;
         for (offset, source) in self.sources.range(first..).enumerate() {
-            let factor = gf::coefficient(seed, start + offset as u32);
+            let factor = gf::coefficient(seed, (start + offset as u64) as u32);
             let length = (source.payload.len() as u16).to_be_bytes();
             gf::mul_add(&mut output[body..body + 2], &length, factor);
             gf::mul_add(&mut output[body + 2..], &source.payload, factor);
@@ -290,8 +295,14 @@ impl Sender {
         if body.first() != Some(&KIND_FEEDBACK) || body.len() < FEEDBACK_HEADER {
             return Err(Error::Malformed);
         }
-        let base = read_u32(&body[1..]).ok_or(Error::Malformed)?;
-        let end = read_u32(&body[5..]).ok_or(Error::Malformed)?;
+        // The wire carries the low 32 bits; both lie within one flow window
+        // of what this sender has confirmed.
+        let base = read_u32(&body[1..])
+            .and_then(|wire| expand(self.acked, wire))
+            .ok_or(Error::Malformed)?;
+        let end = read_u32(&body[5..])
+            .and_then(|wire| expand(self.acked, wire))
+            .ok_or(Error::Malformed)?;
         let missing = read_u16(&body[9..]).ok_or(Error::Malformed)?;
         let requests = usize::from(body[11]);
         if base > end
@@ -348,7 +359,7 @@ impl Sender {
         let rto = self.rto();
         for index in 0..requests {
             let offset = read_u16(&body[FEEDBACK_HEADER + 2 * index..]).ok_or(Error::Malformed)?;
-            let Some(sequence) = base.checked_add(u32::from(offset)) else {
+            let Some(sequence) = base.checked_add(u64::from(offset)) else {
                 return Err(Error::Malformed);
             };
             if sequence >= end {

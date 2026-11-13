@@ -108,7 +108,9 @@ impl Settings {
         let policy = self.runtime(config, true)?.codec;
         self.runtime(config, false)?;
         let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-        context.update(b"l2tunnel swift profile v1: packed channels, exact header records\0");
+        context.update(
+            b"l2tunnel swift profile v2: packed channels, exact header records, key ratchet\0",
+        );
         context.update(&base.digest.0);
         for value in [
             policy.datagram_bytes as u64,
@@ -125,6 +127,7 @@ impl Settings {
             policy.max_rto_micros,
             self.forward_kbit,
             self.reverse_kbit,
+            runtime::KEY_PACKETS,
         ] {
             context.update(&value.to_be_bytes());
         }
@@ -175,6 +178,10 @@ pub struct Status {
     pub header_bytes_saved: u64,
     /// Largest per-channel round-trip estimate in microseconds.
     pub round_trip_micros: u64,
+    /// Key generation protecting sent datagrams; keys change automatically
+    /// every [`l2tunnel_runtime::swift::KEY_PACKETS`] datagrams.
+    #[serde(default)]
+    pub key_generation: u64,
 }
 
 impl Status {
@@ -198,6 +205,7 @@ impl Status {
             native_write_drops: snapshot.native_write_drops,
             header_bytes_saved: snapshot.header_bytes_saved,
             round_trip_micros: snapshot.sender.smoothed_rtt_micros,
+            key_generation: snapshot.key_generation,
         }
     }
 }

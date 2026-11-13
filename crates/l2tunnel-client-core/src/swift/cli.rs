@@ -107,6 +107,7 @@ fn line(event: &str, snapshot: &client::Snapshot) -> String {
         "native_written": snapshot.native_written,
         "native_write_drops": snapshot.native_write_drops,
         "header_bytes_saved": snapshot.header_bytes_saved,
+        "key_generation": snapshot.key_generation,
     })
     .to_string()
 }

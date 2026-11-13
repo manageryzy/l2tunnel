@@ -121,9 +121,24 @@ fn transfer(
     per_tick: usize,
     seed: u64,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
+    transfer_from(0, config, packets, loss, reorder, per_tick, seed)
+}
+
+/// As [`transfer`], with both engines starting at sequence `start`.
+fn transfer_from(
+    start: u64,
+    config: Config,
+    packets: u32,
+    loss: u64,
+    reorder: u64,
+    per_tick: usize,
+    seed: u64,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let mut random = Random(seed);
     let mut sender = Sender::new(config)?;
     let mut receiver = Receiver::new(config)?;
+    sender.start_at(start);
+    receiver.start_at(start);
     let mut forward = Link::new(35_000, loss, reorder);
     let mut reverse = Link::new(35_000, loss, reorder);
     let mut offered = 0;
@@ -181,6 +196,30 @@ fn transfer(
             });
         }
     }
+}
+
+/// The wire carries 32 bits of a 64-bit sequence. A session that crosses the
+/// 32-bit boundary keeps delivering exactly, with loss, reordering, repairs
+/// and requested retransmissions on both sides of it.
+#[test]
+fn sequences_cross_the_32_bit_wire_boundary_without_ending_the_session() -> TestResult {
+    for start in [(1u64 << 32) - 700, (5u64 << 32) - 1, (1u64 << 32) + 3] {
+        let arq = Config {
+            repair_numerator: 0,
+            ..config()
+        };
+        for (config, seed) in [(config(), 11), (arq, 12)] {
+            let outcome = transfer_from(start, config, 6_000, 15, 10, 8, seed)?;
+            assert_eq!(outcome.receiver.packets, 6_000);
+            assert!(outcome.sender.sources > 1_400, "{:?}", outcome.sender);
+        }
+    }
+    assert_eq!(crate::expand(0, 5), Some(5));
+    assert_eq!(crate::expand(0, u32::MAX), None);
+    assert_eq!(crate::expand((1 << 32) - 2, 3), Some((1 << 32) + 3));
+    assert_eq!(crate::expand((1 << 32) + 2, u32::MAX), Some((1 << 32) - 1));
+    assert_eq!(crate::expand(7 << 32, 9), Some((7 << 32) + 9));
+    Ok(())
 }
 
 #[test]
