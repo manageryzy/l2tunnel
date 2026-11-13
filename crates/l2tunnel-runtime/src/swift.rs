@@ -11,16 +11,19 @@
 //! the tunnel fills, and does not overrun, a configured path budget.
 //!
 //! This module performs no authentication, key derivation or device setup.
+pub use codec::control::Policy;
+use codec::control::{Message, Refusal};
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_swift as codec;
 use ring::{aead, hkdf};
-use std::future::Future;
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncReadExt, Interest};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
 
 /// Packet number and authentication tag added to every engine datagram body.
 pub const PROTECTION_BYTES: usize = 24;
@@ -116,6 +119,121 @@ pub struct Snapshot {
     pub header_bytes_saved: u64,
     /// Key generation currently protecting sent datagrams; zero at start.
     pub key_generation: u64,
+    /// Committed policy epoch; zero until the first negotiated change.
+    pub policy_epoch: u64,
+    /// Policy of the committed epoch, absent while the startup policy holds.
+    pub policy: Option<Policy>,
+}
+
+/// Longest a direction may take to confirm everything it sent before its
+/// barrier; a session that cannot drain in this time ends with an error.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Both directions of one endpoint's configuration for a proposed policy,
+/// with the canonical digest both peers must derive identically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Resolved {
+    /// Policy of this endpoint's sending engines, pacing and packing queue.
+    pub send: Config,
+    /// Policy of this endpoint's receiving engines: the peer's sending policy.
+    pub receive: Config,
+    /// Digest of the complete configuration.
+    pub digest: [u8; 32],
+}
+
+/// Why a locally requested policy change did not happen. Nothing changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchError {
+    /// Another change is in progress.
+    Busy,
+    /// Only the initiating endpoint of a session proposes changes.
+    NotCoordinator,
+    /// The peer refused the proposal.
+    Rejected,
+    /// The policy is invalid for this session.
+    Invalid,
+    /// The session ended before the change completed; whether the peer
+    /// applied it is unknown and irrelevant, since the session is gone.
+    Closed,
+}
+
+type Reply = oneshot::Sender<Result<u64, SwitchError>>;
+/// Submits policy changes to a running session.
+#[derive(Clone)]
+pub struct Switcher(mpsc::Sender<(Policy, Reply)>);
+/// The runtime's end of a [`Switcher`].
+pub struct Requests(mpsc::Receiver<(Policy, Reply)>);
+/// A request channel holding one waiting change at a time.
+pub fn switcher() -> (Switcher, Requests) {
+    let (sender, receiver) = mpsc::channel(1);
+    (Switcher(sender), Requests(receiver))
+}
+impl Switcher {
+    /// Negotiate `policy` and resolve with the committed epoch once both
+    /// directions have switched. Dropping the future does not cancel a
+    /// change that was already proposed.
+    pub async fn switch(&self, policy: Policy) -> Result<u64, SwitchError> {
+        let (reply, outcome) = oneshot::channel();
+        self.0
+            .try_send((policy, reply))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SwitchError::Busy,
+                mpsc::error::TrySendError::Closed(_) => SwitchError::Closed,
+            })?;
+        outcome.await.unwrap_or(Err(SwitchError::Closed))
+    }
+}
+
+/// Derives the complete configuration of a policy, or refuses it.
+pub type Resolver = Box<dyn Fn(&Policy) -> io::Result<Resolved> + Send + Sync>;
+
+/// How this endpoint takes part in policy changes.
+pub struct Switching {
+    /// Whether this endpoint proposes; exactly one peer of a session does.
+    pub coordinator: bool,
+    /// Local requests, if this frontend exposes any.
+    pub requests: Option<Requests>,
+    /// Derive the complete configuration of a policy, or refuse it.
+    pub resolve: Resolver,
+}
+impl Switching {
+    /// An endpoint that refuses every change.
+    pub fn fixed(coordinator: bool) -> Self {
+        Self {
+            coordinator,
+            requests: None,
+            resolve: Box::new(|_| Err(io::Error::from(io::ErrorKind::Unsupported))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendPhase {
+    /// Proposed, not agreed: still forwarding under the old policy.
+    Proposed,
+    /// Agreed: admission stopped, waiting for every source to be confirmed.
+    Draining {
+        since: u64,
+    },
+    /// Barrier sent, waiting for the peer to replace its receiving state.
+    Barrier,
+    Done,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceivePhase {
+    Open,
+    /// Peer's barrier received: delivering what is held before replacing.
+    Flushing {
+        first_number: u64,
+    },
+    Done,
+}
+struct Change {
+    epoch: u64,
+    policy: Policy,
+    resolved: Resolved,
+    send: SendPhase,
+    receive: ReceivePhase,
 }
 
 fn invalid(message: impl ToString) -> io::Error {
@@ -349,7 +467,23 @@ impl Opening {
 /// leading byte of a datagram body carries the kind in its low bits and the
 /// channel above them; a feedback datagram concatenates one block per channel.
 struct Engine {
+    /// Policy of the sending engines, pacing and packing queue.
     config: Config,
+    /// Policy of the receiving engines.
+    receive: Config,
+    /// Largest datagram body any policy of this session allowed.
+    limit: usize,
+    coordinator: bool,
+    change: Option<Change>,
+    /// Control messages owed to the peer, a handful at most.
+    outbox: VecDeque<Message>,
+    /// Result of the locally requested change, once known.
+    outcome: Option<Result<u64, SwitchError>>,
+    /// Peer sources and repairs numbered below this belong to a drained epoch.
+    source_floor: u64,
+    /// Peer feedback numbered below this describes a drained epoch.
+    feedback_floor: u64,
+    saved_base: u64,
     senders: Vec<codec::Sender>,
     receivers: Vec<codec::Receiver>,
     compressors: Vec<codec::header::Compressor>,
@@ -399,6 +533,15 @@ impl Engine {
         let seal_chain = Chain::new(keys.send);
         Ok(Self {
             config,
+            receive: config,
+            limit: config.codec.datagram_bytes,
+            coordinator: false,
+            change: None,
+            outbox: VecDeque::new(),
+            outcome: None,
+            source_floor: 0,
+            feedback_floor: 0,
+            saved_base: 0,
             senders,
             receivers,
             compressors,
@@ -425,6 +568,14 @@ impl Engine {
     }
     /// The packing queues share one byte budget, like one bottleneck queue.
     fn has_room(&self) -> bool {
+        // Nothing is admitted between agreement and this direction's switch.
+        if self
+            .change
+            .as_ref()
+            .is_some_and(|change| !matches!(change.send, SendPhase::Proposed | SendPhase::Done))
+        {
+            return false;
+        }
         let queued: usize = self.senders.iter().map(codec::Sender::queued).sum();
         queued + self.config.codec.max_packet + codec::FRAME_PREFIX <= self.config.codec.queue_bytes
     }
@@ -461,8 +612,8 @@ impl Engine {
         self.body.clear();
         let block = codec::FEEDBACK_HEADER + 2 * codec::MAX_REQUESTS;
         let mut deferred = false;
-        for step in 0..self.config.channels {
-            let channel = (self.feedback_turn + step) % self.config.channels;
+        for step in 0..self.receive.channels {
+            let channel = (self.feedback_turn + step) % self.receive.channels;
             if self.body.len() + block > self.config.codec.datagram_bytes {
                 // Continue with this channel in the next datagram.
                 deferred = self.receivers[channel].deadline().is_some();
@@ -566,7 +717,7 @@ impl Engine {
     /// Authenticate and apply one received datagram. Unauthenticated input is
     /// counted and ignored; inconsistent authenticated input ends the session.
     fn accept(&mut self, now: u64, datagram: &[u8]) -> io::Result<()> {
-        let limit = self.config.codec.datagram_bytes + PROTECTION_BYTES;
+        let limit = self.limit + PROTECTION_BYTES;
         if datagram.len() <= PROTECTION_BYTES || datagram.len() > limit {
             self.snapshot.datagrams_rejected += 1;
             return Ok(());
@@ -598,15 +749,23 @@ impl Engine {
         let malformed = || protocol(codec::Error::Malformed);
         let lead = *body.first().ok_or_else(malformed)?;
         let channel = usize::from(lead >> 2);
-        if channel >= self.config.channels {
-            return Err(malformed());
-        }
         if lead & codec::KIND_MASK != codec::KIND_FEEDBACK {
+            if number < self.source_floor {
+                // A late copy from an epoch that was confirmed in full.
+                self.snapshot.receiver.duplicates += 1;
+                return Ok(());
+            }
+            if channel >= self.receive.channels {
+                return Err(malformed());
+            }
             body[0] = lead & codec::KIND_MASK;
             self.ready |= 1 << channel;
             return self.receivers[channel]
                 .on_datagram(number, body)
                 .map_err(protocol);
+        }
+        if number < self.feedback_floor {
+            return Ok(());
         }
         let mut rest = body;
         while !rest.is_empty() {
@@ -662,25 +821,247 @@ impl Engine {
         for receiver in &self.receivers {
             snapshot.receiver.add(&receiver.stats());
         }
-        snapshot.header_bytes_saved = self
+        snapshot.header_bytes_saved = self.saved_base
+            + self
+                .compressors
+                .iter()
+                .map(codec::header::Compressor::saved)
+                .sum::<u64>();
+        snapshot
+    }
+    /// Start a locally requested change. `resolved` is this endpoint's
+    /// derivation of the policy.
+    fn request(
+        &mut self,
+        policy: Policy,
+        resolved: io::Result<Resolved>,
+    ) -> Result<(), SwitchError> {
+        if !self.coordinator {
+            return Err(SwitchError::NotCoordinator);
+        }
+        if self.change.is_some() || self.outcome.is_some() {
+            return Err(SwitchError::Busy);
+        }
+        let resolved = resolved.map_err(|_| SwitchError::Invalid)?;
+        if self.snapshot.policy == Some(policy) {
+            // Already in force: a retry of a completed request.
+            self.outcome = Some(Ok(self.snapshot.policy_epoch));
+            return Ok(());
+        }
+        let epoch = self
+            .snapshot
+            .policy_epoch
+            .checked_add(1)
+            .ok_or(SwitchError::Invalid)?;
+        self.change = Some(Change {
+            epoch,
+            policy,
+            resolved,
+            send: SendPhase::Proposed,
+            receive: ReceivePhase::Open,
+        });
+        self.outbox.push_back(Message::Propose { epoch, policy });
+        Ok(())
+    }
+    /// Apply one control message from the authenticated stream. A message
+    /// that does not fit the current state is a protocol violation.
+    fn on_control(
+        &mut self,
+        now: u64,
+        message: Message,
+        resolve: &dyn Fn(&Policy) -> io::Result<Resolved>,
+    ) -> io::Result<()> {
+        let violation = || io::Error::new(io::ErrorKind::InvalidData, "swift control out of state");
+        match message {
+            Message::Propose { epoch, policy } => {
+                if self.coordinator {
+                    return Err(violation());
+                }
+                let refuse = |reason| Message::Reject { epoch, reason };
+                let reply = if let Some(change) = &self.change {
+                    if change.epoch == epoch && change.policy == policy {
+                        // A repeated proposal gets the same answer.
+                        Message::Accept {
+                            epoch,
+                            digest: change.resolved.digest,
+                        }
+                    } else {
+                        refuse(Refusal::Busy)
+                    }
+                } else if self.snapshot.policy_epoch.checked_add(1) != Some(epoch) {
+                    refuse(Refusal::Epoch)
+                } else if let Ok(resolved) = resolve(&policy) {
+                    self.change = Some(Change {
+                        epoch,
+                        policy,
+                        resolved,
+                        send: SendPhase::Draining { since: now },
+                        receive: ReceivePhase::Open,
+                    });
+                    Message::Accept {
+                        epoch,
+                        digest: resolved.digest,
+                    }
+                } else {
+                    refuse(Refusal::Invalid)
+                };
+                self.outbox.push_back(reply);
+            }
+            Message::Accept { epoch, digest } => {
+                let change = self.change.as_mut().ok_or_else(violation)?;
+                if change.epoch != epoch || change.send != SendPhase::Proposed {
+                    return Err(violation());
+                }
+                if change.resolved.digest != digest {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "swift peers derived different configurations",
+                    ));
+                }
+                change.send = SendPhase::Draining { since: now };
+            }
+            Message::Reject { epoch, .. } => {
+                let change = self.change.as_ref().ok_or_else(violation)?;
+                if change.epoch != epoch || change.send != SendPhase::Proposed {
+                    return Err(violation());
+                }
+                self.change = None;
+                self.outcome = Some(Err(SwitchError::Rejected));
+            }
+            Message::Barrier {
+                epoch,
+                first_number,
+            } => {
+                let change = self.change.as_mut().ok_or_else(violation)?;
+                if change.epoch != epoch
+                    || change.send == SendPhase::Proposed
+                    || change.receive != ReceivePhase::Open
+                {
+                    return Err(violation());
+                }
+                change.receive = ReceivePhase::Flushing { first_number };
+            }
+            Message::BarrierAck {
+                epoch,
+                feedback_from,
+            } => {
+                let change = self.change.as_mut().ok_or_else(violation)?;
+                if change.epoch != epoch || change.send != SendPhase::Barrier {
+                    return Err(violation());
+                }
+                change.send = SendPhase::Done;
+                let config = change.resolved.send;
+                self.replace_senders(now, config)?;
+                self.feedback_floor = feedback_from;
+            }
+        }
+        Ok(())
+    }
+    fn replace_senders(&mut self, now: u64, config: Config) -> io::Result<()> {
+        config.validate()?;
+        for sender in &self.senders {
+            self.snapshot.sender.add(&sender.stats());
+        }
+        self.saved_base += self
             .compressors
             .iter()
             .map(codec::header::Compressor::saved)
-            .sum();
-        snapshot
+            .sum::<u64>();
+        let ethernet = config.layer == PacketLayer::Ethernet;
+        self.senders.clear();
+        self.compressors.clear();
+        for _ in 0..config.channels {
+            self.senders
+                .push(codec::Sender::new(config.codec).map_err(invalid)?);
+            self.compressors
+                .push(codec::header::Compressor::new(ethernet));
+        }
+        let largest = config.datagram_cost(config.codec.datagram_bytes + PROTECTION_BYTES);
+        self.pacer = Pacer::new(config.send_bytes_per_second, largest, now);
+        self.limit = self.limit.max(config.codec.datagram_bytes);
+        self.turn = 0;
+        self.config = config;
+        Ok(())
     }
-}
-
-/// Resolve when the retained authenticated control stream closes. The profile
-/// sends nothing on it, so any received byte is a protocol violation.
-pub async fn closed<S: AsyncRead + Unpin>(mut stream: S) -> io::Result<()> {
-    let mut byte = [0];
-    match stream.read(&mut byte).await? {
-        0 => Ok(()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected bytes on the retained swift control stream",
-        )),
+    fn replace_receivers(&mut self, config: Config) -> io::Result<()> {
+        config.validate()?;
+        for receiver in &self.receivers {
+            self.snapshot.receiver.add(&receiver.stats());
+        }
+        let ethernet = config.layer == PacketLayer::Ethernet;
+        self.receivers.clear();
+        self.decompressors.clear();
+        for _ in 0..config.channels {
+            self.receivers
+                .push(codec::Receiver::new(config.codec).map_err(invalid)?);
+            self.decompressors
+                .push(codec::header::Decompressor::new(ethernet));
+        }
+        self.limit = self.limit.max(config.codec.datagram_bytes);
+        self.feedback_turn = 0;
+        self.ready = 0;
+        self.receive = config;
+        Ok(())
+    }
+    /// Advance a change in progress: send this direction's barrier once it
+    /// has drained, replace receiving state once the peer's barrier arrived
+    /// and everything held was delivered, and commit when both are done.
+    fn progress(&mut self, now: u64) -> io::Result<()> {
+        let Some(change) = self.change.as_mut() else {
+            return Ok(());
+        };
+        if let SendPhase::Draining { since } = change.send {
+            if self
+                .senders
+                .iter()
+                .all(|sender| sender.unconfirmed() == 0 && sender.queued() == 0)
+            {
+                change.send = SendPhase::Barrier;
+                self.outbox.push_back(Message::Barrier {
+                    epoch: change.epoch,
+                    first_number: self.number,
+                });
+            } else if now.saturating_sub(since) > DRAIN_TIMEOUT.as_micros() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "swift policy change could not drain in time",
+                ));
+            }
+        }
+        if let ReceivePhase::Flushing { first_number } = change.receive
+            && self.ready == 0
+        {
+            if self
+                .receivers
+                .iter()
+                .any(|receiver| receiver.pending() != 0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "swift barrier before the previous epoch was delivered",
+                ));
+            }
+            change.receive = ReceivePhase::Done;
+            let (epoch, config) = (change.epoch, change.resolved.receive);
+            self.replace_receivers(config)?;
+            self.source_floor = first_number;
+            self.outbox.push_back(Message::BarrierAck {
+                epoch,
+                feedback_from: self.number,
+            });
+        }
+        if let Some(change) = &self.change
+            && change.send == SendPhase::Done
+            && change.receive == ReceivePhase::Done
+        {
+            self.snapshot.policy_epoch = change.epoch;
+            self.snapshot.policy = Some(change.policy);
+            if self.coordinator {
+                self.outcome = Some(Ok(change.epoch));
+            }
+            self.change = None;
+        }
+        Ok(())
     }
 }
 
@@ -713,31 +1094,73 @@ fn micros(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Forward native packets until `liveness` resolves or an error occurs.
+async fn next_request(requests: &mut Option<Requests>) -> Option<(Policy, Reply)> {
+    match requests {
+        Some(requests) => requests.0.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Longest a control frame may take to enter the stream's send buffer.
+const CONTROL_WRITE: Duration = Duration::from_secs(5);
+
+/// Forward native packets until the peer closes `control` or an error occurs.
 ///
-/// `socket` must already be connected to the single peer. `report` receives a
-/// snapshot on every configured interval and once at termination.
-pub async fn run<D, L>(
+/// `socket` must already be connected to the single peer. `control` is the
+/// retained authenticated stream: it carries only the profile's control
+/// messages, and its closure ends the session. `report` receives a snapshot
+/// on every configured interval and once at termination.
+pub async fn run<D, S>(
     device: D,
     socket: UdpSocket,
     keys: Keys<'_>,
     config: Config,
-    liveness: L,
+    control: S,
+    switching: Switching,
     mut report: impl FnMut(&Snapshot),
 ) -> io::Result<()>
 where
     D: PacketDevice<Error = io::Error> + AsRawFd,
-    L: Future<Output = io::Result<()>>,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let start = Instant::now();
     let mut engine = Engine::new(config, &keys, 0)?;
+    engine.coordinator = switching.coordinator;
+    let Switching {
+        mut requests,
+        resolve,
+        ..
+    } = switching;
+    let (mut reader, mut writer) = tokio::io::split(control);
+    let mut inbound: Vec<u8> = Vec::with_capacity(2 * codec::control::MAX_FRAME);
+    let mut chunk = [0u8; 256];
+    let mut frame = Vec::with_capacity(codec::control::MAX_FRAME);
+    let mut waiting: Option<Reply> = None;
     let mut device = AsyncFd::with_interest(device, Interest::READABLE)?;
     let mut interval = config.report_interval.map(tokio::time::interval);
     let mut read = vec![0; READ_BUFFER_BYTES];
     let mut datagram = vec![0; 65_536];
-    tokio::pin!(liveness);
     let result = loop {
         let now = micros(start);
+        engine.progress(now)?;
+        while let Some(message) = engine.outbox.pop_front() {
+            frame.clear();
+            message.encode(&mut frame);
+            tokio::time::timeout(CONTROL_WRITE, async {
+                writer.write_all(&frame).await?;
+                writer.flush().await
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "swift control write stalled")
+            })??;
+        }
+        if let Some(outcome) = engine.outcome.take()
+            && let Some(reply) = waiting.take()
+        {
+            // The requester may have stopped waiting; the change stands.
+            let _ = reply.send(outcome);
+        }
         // Everything the budget allows right now.
         loop {
             let Some(wire) = engine.produce(now)? else {
@@ -766,13 +1189,45 @@ where
         let wait = if engine.deliverable() {
             Duration::ZERO
         } else {
-            engine.wake(now).map_or(Duration::from_secs(3600), |at| {
-                Duration::from_micros(at.saturating_sub(now).max(200))
+            // A change in progress is re-examined at least this often, so
+            // its drain deadline is noticed on an otherwise silent path.
+            let idle = if engine.change.is_some() {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(3600)
+            };
+            engine.wake(now).map_or(idle, |at| {
+                Duration::from_micros(at.saturating_sub(now).max(200)).min(idle)
             })
         };
         tokio::select! {
             biased;
-            result = &mut liveness => break result,
+            read = reader.read(&mut chunk) => {
+                let length = read?;
+                if length == 0 {
+                    break Ok(());
+                }
+                inbound.extend_from_slice(&chunk[..length]);
+                let mut used = 0;
+                while let Some((message, consumed)) =
+                    Message::decode(&inbound[used..]).map_err(protocol)?
+                {
+                    used += consumed;
+                    engine.on_control(micros(start), message, &*resolve)?;
+                }
+                inbound.drain(..used);
+            }
+            request = next_request(&mut requests), if waiting.is_none() => {
+                match request {
+                    Some((policy, reply)) => match engine.request(policy, resolve(&policy)) {
+                        Ok(()) => waiting = Some(reply),
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    },
+                    None => requests = None,
+                }
+            }
             result = socket.readable() => {
                 result?;
                 for _ in 0..RECEIVE_BATCH {
@@ -853,6 +1308,48 @@ mod tests {
             Engine::new(config(rate, channels), &left, 0)?,
             Engine::new(config(rate, channels), &right, 0)?,
         ))
+    }
+    fn test_policy(channels: u8, repair_permille: u16, path_mtu: u16, kbit: u32) -> Policy {
+        Policy {
+            path_mtu,
+            forward_kbit: kbit,
+            reverse_kbit: kbit,
+            channels,
+            window: 32,
+            repair_permille,
+        }
+    }
+    /// Both endpoints derive the same configuration and digest from a policy.
+    fn resolver(client: bool) -> Resolver {
+        Box::new(move |policy| {
+            let make = |kbit: u32| {
+                let mut value = config(u64::from(kbit) * 125, usize::from(policy.channels));
+                value.codec.datagram_bytes = usize::from(policy.path_mtu).saturating_sub(52);
+                value.codec.window = usize::from(policy.window);
+                value.codec.repair_numerator = u32::from(policy.repair_permille);
+                value.codec.flush_micros = 500;
+                value.report_interval = Some(Duration::from_millis(100));
+                value
+            };
+            let (send, receive) = if client {
+                (make(policy.forward_kbit), make(policy.reverse_kbit))
+            } else {
+                (make(policy.reverse_kbit), make(policy.forward_kbit))
+            };
+            send.validate()?;
+            receive.validate()?;
+            let mut digest = [0; 32];
+            digest[..2].copy_from_slice(&policy.path_mtu.to_be_bytes());
+            digest[2..6].copy_from_slice(&policy.forward_kbit.to_be_bytes());
+            digest[6] = policy.channels;
+            digest[7] = policy.window;
+            digest[8..10].copy_from_slice(&policy.repair_permille.to_be_bytes());
+            Ok(Resolved {
+                send,
+                receive,
+                digest,
+            })
+        })
     }
     /// A minimal IPv4/TCP packet of one connection carrying a counter.
     fn segment(port: u16, counter: u32, length: usize) -> Vec<u8> {
@@ -1099,6 +1596,393 @@ mod tests {
         Ok(())
     }
 
+    /// One millisecond of both engines: control messages, datagrams (every
+    /// `lose`-th dropped when nonzero) and delivery. Returns the counters of
+    /// the packets delivered at (right, left).
+    fn step(
+        left: &mut Engine,
+        right: &mut Engine,
+        now: &mut u64,
+        lose: u64,
+        sent: &mut u64,
+    ) -> io::Result<(Vec<u32>, Vec<u32>)> {
+        *now += 1_000;
+        let (client, server) = (resolver(true), resolver(false));
+        left.progress(*now)?;
+        right.progress(*now)?;
+        while let Some(message) = left.outbox.pop_front() {
+            right.on_control(*now, message, &*server)?;
+        }
+        while let Some(message) = right.outbox.pop_front() {
+            left.on_control(*now, message, &*client)?;
+        }
+        let mut delivered = (Vec::new(), Vec::new());
+        for forward in [true, false] {
+            let (from, to) = if forward {
+                (&mut *left, &mut *right)
+            } else {
+                (&mut *right, &mut *left)
+            };
+            while let Some(wire) = from.produce(*now)? {
+                let wire = wire.to_vec();
+                *sent += 1;
+                if lose == 0 || !(*sent).is_multiple_of(lose) {
+                    to.accept(*now, &wire)?;
+                }
+            }
+            while let Some(packet) = to.pop()? {
+                let value = counter_of(packet);
+                if forward {
+                    delivered.0.push(value);
+                } else {
+                    delivered.1.push(value);
+                }
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// A change is agreed, each direction stops admitting, drains under loss,
+    /// crosses its barrier and resumes with the new policy; every packet
+    /// offered before, during and after arrives exactly once and in order,
+    /// and late datagrams of the drained epoch are harmless.
+    #[test]
+    fn policy_change_drains_each_direction_then_switches_without_losing_order() -> io::Result<()> {
+        let (mut left, mut right) = pair(2_500_000, 4)?;
+        left.coordinator = true;
+        let policy = test_policy(2, 200, 1400, 16_000);
+        let (mut now, mut sent) = (0, 0);
+        let (mut offered, mut got) = ((0u32, 0u32), (Vec::new(), Vec::new()));
+        let mut stale_source = None;
+        let mut stale_feedback = None;
+        let mut paused = false;
+        for tick in 0..4_000u32 {
+            for (engine, count) in [(&mut left, &mut offered.0), (&mut right, &mut offered.1)] {
+                if *count < 600 && engine.has_room() {
+                    engine.offer(now, &segment(9, *count, 700))?;
+                    *count += 1;
+                }
+            }
+            if tick == 150 {
+                // Keep one datagram of each kind from the first epoch.
+                left.offer(now, &segment(9, offered.0, 700))?;
+                offered.0 += 1;
+                stale_source = left.produce(now + 1)?.map(<[u8]>::to_vec);
+                if let Some(wire) = &stale_source {
+                    right.accept(now + 1, wire)?;
+                }
+                stale_feedback = right.produce(now + 10_000)?.map(<[u8]>::to_vec);
+                assert_eq!(left.request(policy, resolver(true)(&policy)), Ok(()));
+                assert_eq!(
+                    left.request(policy, resolver(true)(&policy)),
+                    Err(SwitchError::Busy)
+                );
+            }
+            let delivered = step(&mut left, &mut right, &mut now, 7, &mut sent)?;
+            got.0.extend(delivered.0);
+            got.1.extend(delivered.1);
+            if let Some(change) = &left.change
+                && change.send != SendPhase::Proposed
+                && change.send != SendPhase::Done
+            {
+                // Between agreement and the switch nothing is admitted.
+                assert!(!left.has_room());
+                paused = true;
+            }
+        }
+        assert!(paused, "the sending direction never paused");
+        assert_eq!(left.outcome, Some(Ok(1)));
+        assert!(left.change.is_none() && right.change.is_none());
+        for engine in [&left, &right] {
+            let snapshot = engine.snapshot(now);
+            assert_eq!(snapshot.policy_epoch, 1);
+            assert_eq!(snapshot.policy, Some(policy));
+            assert_eq!(engine.config.channels, 2);
+            assert_eq!(engine.receive.channels, 2);
+            assert_eq!(engine.config.codec.datagram_bytes, 1348);
+            assert_eq!(engine.config.send_bytes_per_second, 2_000_000);
+            // Counters of the replaced engines are kept.
+            assert_eq!(snapshot.native_read, u64::from(offered.0.max(offered.1)));
+            assert!(snapshot.sender.sources > 0 && snapshot.receiver.sources > 0);
+        }
+        assert_eq!(offered, (600, 600));
+        assert_eq!(got.0, (0..600).collect::<Vec<u32>>());
+        assert_eq!(got.1, (0..600).collect::<Vec<u32>>());
+        // Datagrams of the drained epoch arriving late are counted and
+        // ignored; they cannot disturb the new engines. The replay window
+        // has moved on, so present them to engines that never saw them.
+        let stale_source = stale_source.ok_or_else(|| io::Error::other("no stale source"))?;
+        let stale_feedback = stale_feedback.ok_or_else(|| io::Error::other("no stale feedback"))?;
+        assert!(left.feedback_floor > 0 && right.source_floor > 0);
+        right.replay = Replay::new();
+        left.replay = Replay::new();
+        let before = right.snapshot(now).receiver.duplicates;
+        right.accept(now, &stale_source)?;
+        assert_eq!(right.snapshot(now).receiver.duplicates, before + 1);
+        left.accept(now, &stale_feedback)?;
+        assert!(!right.deliverable());
+        Ok(())
+    }
+
+    /// Refusals leave the session exactly as it was; messages that do not fit
+    /// the state, a different derived configuration and a direction that
+    /// cannot drain end it with an error.
+    #[test]
+    fn policy_change_refusals_and_violations_are_explicit() -> io::Result<()> {
+        let policy = test_policy(2, 0, 1400, 16_000);
+        let client = resolver(true);
+        let server = resolver(false);
+        let fresh = || -> io::Result<(Engine, Engine)> {
+            let (mut left, right) = pair(2_500_000, 4)?;
+            left.coordinator = true;
+            Ok((left, right))
+        };
+        // Only the coordinator proposes, and only valid policies.
+        let (mut left, mut right) = fresh()?;
+        assert_eq!(
+            right.request(policy, server(&policy)),
+            Err(SwitchError::NotCoordinator)
+        );
+        let invalid = test_policy(0, 0, 1400, 16_000);
+        assert_eq!(
+            left.request(invalid, client(&invalid)),
+            Err(SwitchError::Invalid)
+        );
+        assert!(left.outbox.is_empty() && left.change.is_none());
+        // The peer refuses what it cannot derive; nothing changes and
+        // forwarding continues.
+        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        let propose = left
+            .outbox
+            .pop_front()
+            .ok_or_else(|| io::Error::other("no proposal"))?;
+        let refuse =
+            |_: &Policy| -> io::Result<Resolved> { Err(io::ErrorKind::Unsupported.into()) };
+        right.on_control(0, propose, &refuse)?;
+        assert_eq!(
+            right.outbox.pop_front(),
+            Some(Message::Reject {
+                epoch: 1,
+                reason: Refusal::Invalid
+            })
+        );
+        left.on_control(
+            0,
+            Message::Reject {
+                epoch: 1,
+                reason: Refusal::Invalid,
+            },
+            &*client,
+        )?;
+        assert_eq!(left.outcome.take(), Some(Err(SwitchError::Rejected)));
+        assert!(left.change.is_none() && right.change.is_none() && left.has_room());
+        // A wrong epoch is refused; a repeated proposal gets the same answer;
+        // a different one while busy is refused.
+        right.on_control(0, Message::Propose { epoch: 5, policy }, &*server)?;
+        assert_eq!(
+            right.outbox.pop_front(),
+            Some(Message::Reject {
+                epoch: 5,
+                reason: Refusal::Epoch
+            })
+        );
+        right.on_control(0, propose, &*server)?;
+        let accept = right.outbox.pop_front();
+        assert!(matches!(accept, Some(Message::Accept { epoch: 1, .. })));
+        right.on_control(0, propose, &*server)?;
+        assert_eq!(right.outbox.pop_front(), accept);
+        let other = test_policy(3, 0, 1400, 16_000);
+        right.on_control(
+            0,
+            Message::Propose {
+                epoch: 1,
+                policy: other,
+            },
+            &*server,
+        )?;
+        assert_eq!(
+            right.outbox.pop_front(),
+            Some(Message::Reject {
+                epoch: 1,
+                reason: Refusal::Busy
+            })
+        );
+        // Messages outside their state are violations.
+        for message in [
+            Message::Accept {
+                epoch: 1,
+                digest: [0; 32],
+            },
+            Message::Reject {
+                epoch: 1,
+                reason: Refusal::Busy,
+            },
+            Message::Barrier {
+                epoch: 1,
+                first_number: 0,
+            },
+            Message::BarrierAck {
+                epoch: 1,
+                feedback_from: 0,
+            },
+        ] {
+            let (mut left, _) = fresh()?;
+            assert!(
+                left.on_control(0, message, &*client).is_err(),
+                "{message:?}"
+            );
+        }
+        let (mut left, _) = fresh()?;
+        assert!(left.on_control(0, propose, &*client).is_err());
+        // Agreement on a different configuration ends the session.
+        let (mut left, _) = fresh()?;
+        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        let mismatch = Message::Accept {
+            epoch: 1,
+            digest: [0xEE; 32],
+        };
+        assert!(left.on_control(0, mismatch, &*client).is_err());
+        // A barrier may not precede agreement, and an acknowledgement may
+        // not precede the barrier.
+        let (mut left, _) = fresh()?;
+        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        let early = Message::Barrier {
+            epoch: 1,
+            first_number: 0,
+        };
+        assert!(left.on_control(0, early, &*client).is_err());
+        let (mut left, _) = fresh()?;
+        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        let digest = client(&policy)?.digest;
+        left.on_control(0, Message::Accept { epoch: 1, digest }, &*client)?;
+        let early = Message::BarrierAck {
+            epoch: 1,
+            feedback_from: 0,
+        };
+        assert!(left.on_control(0, early, &*client).is_err());
+        // A direction whose peer never confirms cannot drain: the session
+        // ends at the deadline instead of switching unilaterally.
+        let (mut left, _) = fresh()?;
+        left.offer(0, &segment(9, 0, 700))?;
+        assert!(left.produce(1_000)?.is_some());
+        assert_eq!(left.request(policy, client(&policy)), Ok(()));
+        left.on_control(1_000, Message::Accept { epoch: 1, digest }, &*client)?;
+        left.progress(2_000)?;
+        assert!(
+            left.outbox
+                .iter()
+                .all(|message| !matches!(message, Message::Barrier { .. }))
+        );
+        let deadline = 1_000 + DRAIN_TIMEOUT.as_micros() as u64;
+        left.progress(deadline)?;
+        let error = left.progress(deadline + 1).err();
+        assert_eq!(
+            error.map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        // A barrier that arrives while sources are still missing is refused.
+        let (mut left, mut right) = fresh()?;
+        left.offer(0, &segment(9, 0, 1300))?;
+        left.offer(0, &segment(9, 1, 1300))?;
+        let first = left.produce(1_000)?.map(<[u8]>::to_vec);
+        let second = left.produce(1_000)?.map(<[u8]>::to_vec);
+        assert!(first.is_some());
+        right.accept(
+            1_000,
+            &second.ok_or_else(|| io::Error::other("one datagram"))?,
+        )?;
+        right.on_control(1_000, propose, &*server)?;
+        right.on_control(
+            1_000,
+            Message::Barrier {
+                epoch: 1,
+                first_number: 9,
+            },
+            &*server,
+        )?;
+        // Nothing is deliverable: the first source never arrived.
+        assert!(right.pop()?.is_none());
+        assert!(right.progress(2_000).is_err());
+        Ok(())
+    }
+
+    /// An otherwise idle tunnel carrying one full-size frame every 200 ms
+    /// each way over a 35 ms, 15% loss path: every frame must arrive, and
+    /// none may wait long enough to look lost to its application.
+    #[test]
+    fn sparse_full_size_frames_on_a_lossy_idle_path_are_never_stalled() -> io::Result<()> {
+        let mut config = config(12_375_000, 16);
+        config.codec.flush_micros = 1_000;
+        config.codec.flow_sources = 4096;
+        config.codec.queue_bytes = 250_000;
+        let (a, b) = ([1; 32], [2; 32]);
+        let mut left = Engine::new(
+            config,
+            &Keys {
+                send: &a,
+                receive: &b,
+            },
+            0,
+        )?;
+        let mut right = Engine::new(
+            config,
+            &Keys {
+                send: &b,
+                receive: &a,
+            },
+            0,
+        )?;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // (arrival time, wire) per direction.
+        let mut links: [VecDeque<(u64, Vec<u8>)>; 2] = [VecDeque::new(), VecDeque::new()];
+        let mut sent_at: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+        let mut worst = 0u64;
+        let mut delivered = [0usize; 2];
+        let frames = 3_000u32;
+        let mut now = 0u64;
+        while now < u64::from(frames) * 200_000 + 5_000_000 {
+            now += 500;
+            if now % 200_000 == 0 && sent_at[0].len() < frames as usize {
+                for (side, engine) in [&mut left, &mut right].into_iter().enumerate() {
+                    engine.offer(now, &segment(0, sent_at[side].len() as u32, 1500))?;
+                    sent_at[side].push(now);
+                }
+            }
+            for side in 0..2 {
+                let (from, to) = if side == 0 {
+                    (&mut left, &mut right)
+                } else {
+                    (&mut right, &mut left)
+                };
+                while let Some(wire) = from.produce(now)? {
+                    if random() % 100 >= 15 {
+                        links[side].push_back((now + 35_000, wire.to_vec()));
+                    }
+                }
+                while links[side].front().is_some_and(|(at, _)| *at <= now) {
+                    if let Some((_, wire)) = links[side].pop_front() {
+                        to.accept(now, &wire)?;
+                    }
+                }
+                while let Some(packet) = to.pop()? {
+                    let index = counter_of(packet) as usize;
+                    assert_eq!(index, delivered[side], "out of order");
+                    delivered[side] += 1;
+                    worst = worst.max(now - sent_at[side][index]);
+                }
+            }
+        }
+        assert_eq!(delivered, [frames as usize; 2]);
+        assert!(worst < 1_500_000, "a frame waited {worst} us");
+        Ok(())
+    }
+
     #[test]
     fn inconsistent_authenticated_bodies_end_the_session() -> io::Result<()> {
         let (left, mut right) = pair(12_500_000, 4)?;
@@ -1223,7 +2107,8 @@ mod tests {
 
     /// Two complete runtimes over real loopback UDP sockets and readiness-
     /// driven descriptors: every packet crosses in both directions, exactly
-    /// and in per-connection order, and closing liveness ends both cleanly.
+    /// and in per-connection order, across two negotiated policy changes, and
+    /// closing the control stream ends both cleanly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_runtimes_forward_both_ways_over_loopback_and_stop_on_liveness() -> io::Result<()> {
         use std::os::unix::net::UnixDatagram;
@@ -1234,18 +2119,30 @@ mod tests {
         right_udp.connect(left_udp.local_addr()?).await?;
         let mut applications = Vec::new();
         let mut tasks = Vec::new();
-        let mut stops = Vec::new();
         let mut finals = Vec::new();
-        for (socket, send, receive) in [
-            (left_udp, [5u8; 32], [6u8; 32]),
-            (right_udp, [6; 32], [5; 32]),
+        // The control stream of each runtime, joined by a relay the test can
+        // stop: closing it is the peers' liveness signal.
+        let (left_control, left_relay) = tokio::io::duplex(1024);
+        let (right_control, right_relay) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move {
+            let (mut left, mut right) = (left_relay, right_relay);
+            let _ = tokio::io::copy_bidirectional(&mut left, &mut right).await;
+        });
+        let (switch, requests) = switcher();
+        let mut requests = Some(requests);
+        for (socket, send, receive, control, coordinator) in [
+            (left_udp, [5u8; 32], [6u8; 32], left_control, true),
+            (right_udp, [6; 32], [5; 32], right_control, false),
         ] {
             let (device, application) = UnixDatagram::pair()?;
             device.set_nonblocking(true)?;
             application.set_nonblocking(true)?;
             applications.push(tokio::net::UnixDatagram::from_std(application)?);
-            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-            stops.push(stop);
+            let switching = Switching {
+                coordinator,
+                requests: if coordinator { requests.take() } else { None },
+                resolve: resolver(coordinator),
+            };
             let last = Arc::new(Mutex::new(Snapshot::default()));
             finals.push(last.clone());
             let mut policy = config(2_500_000, 8);
@@ -1256,21 +2153,38 @@ mod tests {
                     send: &send,
                     receive: &receive,
                 };
-                let liveness = async move {
-                    let _ = stopped.await;
-                    Ok(())
-                };
-                run(Pipe(device), socket, keys, policy, liveness, |snapshot| {
-                    if let Ok(mut slot) = last.lock() {
-                        *slot = *snapshot;
-                    }
-                })
+                run(
+                    Pipe(device),
+                    socket,
+                    keys,
+                    policy,
+                    control,
+                    switching,
+                    |snapshot| {
+                        if let Ok(mut slot) = last.lock() {
+                            *slot = *snapshot;
+                        }
+                    },
+                )
                 .await
             }));
         }
         let mut buffer = vec![0u8; 2048];
         let limit = Duration::from_secs(20);
+        let mut changes = Vec::new();
         for round in 0..150u32 {
+            // Two negotiated changes while traffic flows in both directions:
+            // fewer channels with repairs, then a smaller MTU with more
+            // channels and a different budget.
+            if round == 50 || round == 100 {
+                let switch = switch.clone();
+                let policy = if round == 50 {
+                    test_policy(3, 300, 1500, 16_000)
+                } else {
+                    test_policy(16, 0, 1280, 24_000)
+                };
+                changes.push(tokio::spawn(async move { switch.switch(policy).await }));
+            }
             // Eight connections each way per round, then collect all sixteen.
             for port in 0..8u16 {
                 let length = 60 + ((round as usize * 37 + usize::from(port) * 211) % 1400);
@@ -1313,7 +2227,25 @@ mod tests {
                 }
             }
         }
-        drop(stops);
+        let mut epochs = Vec::new();
+        for change in changes {
+            epochs.push(
+                tokio::time::timeout(limit, change)
+                    .await
+                    .map_err(|_| io::Error::other("change did not complete"))?
+                    .map_err(io::Error::other)?,
+            );
+        }
+        assert_eq!(epochs, [Ok(1), Ok(2)]);
+        // A retry of the policy in force is a completed no-op.
+        assert_eq!(switch.switch(test_policy(16, 0, 1280, 24_000)).await, Ok(2));
+        assert_eq!(
+            switch.switch(test_policy(0, 0, 1280, 24_000)).await,
+            Err(SwitchError::Invalid)
+        );
+        // Let both sides publish the committed epoch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        relay.abort();
         for task in tasks {
             tokio::time::timeout(limit, task)
                 .await
@@ -1325,6 +2257,8 @@ mod tests {
             assert_eq!(report.native_read, 1200);
             assert_eq!(report.native_written, 1200);
             assert_eq!(report.datagrams_rejected, 0);
+            assert_eq!(report.policy_epoch, 2);
+            assert_eq!(report.policy, Some(test_policy(16, 0, 1280, 24_000)));
             assert!(report.sender.sources > 0 && report.receiver.feedback > 0);
         }
         Ok(())

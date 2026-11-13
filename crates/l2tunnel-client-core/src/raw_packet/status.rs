@@ -29,7 +29,7 @@ pub enum Traffic {
 pub struct Selection {
     /// Exact startup-only carrier.
     pub carrier: Carrier,
-    /// No independently selected UDP resemblance profile.
+    /// No independently selected UDP framing profile.
     pub udp_cover: Cover,
     /// Native system traffic policy, never TCP window ownership.
     pub traffic: Traffic,

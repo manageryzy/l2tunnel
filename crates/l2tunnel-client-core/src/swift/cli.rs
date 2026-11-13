@@ -10,7 +10,7 @@ pub(super) const OPTIONS: &[&str] = &[
     "--swift-report-ms",
     "--swift-restart",
 ];
-pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. --swift-restart on|off (default off) sets the session up again one second after it ends or fails; a server otherwise exits when its peer leaves. Optional --control-socket serves status, disconnect and reconnect through the shared lifecycle service. No compression, VXLAN, lanes or hot switching.";
+pub(super) const HELP: &str = "Swift stream: --record-profile swift --carrier udp --duplex full --udp-bind IP:PORT --udp-peer IP:PORT --swift-forward-kbit N --swift-reverse-kbit N with a native TAP/TUN --device. Budgets are IP kilobits per second, client-to-server then server-to-client, 64..10000000, and both peers must state both. Optional --path-mtu 576..9000 (default 1500), --swift-channels 1..64 (default 16), --swift-window 1..255 (default 64), --swift-repair-permille 0..1000 (default 0, retransmission only), --swift-report-ms 0|100..60000 (default 0, off). TCP/TLS authenticates and stays open as liveness; data uses paced ChaCha20-Poly1305 UDP with packed sources and requested retransmission, optionally sliding-window repairs. Connections are spread over the channels and each channel delivers in order. Predictable TCP/IPv4 headers are replaced by exact delta records. --swift-restart on|off (default off) sets the session up again one second after it ends or fails; a server otherwise exits when its peer leaves. Optional --control-socket serves status, disconnect, reconnect and set-swift through the shared lifecycle service. Command: set-swift --control-socket PATH with any of --swift-forward-kbit, --swift-reverse-kbit, --swift-channels, --swift-window, --swift-repair-permille, --path-mtu negotiates new values on the live session from the connecting endpoint; each direction confirms everything it sent before it changes, so no packet is lost or reordered. No compression, VXLAN or lanes.";
 pub(super) fn selection(
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
@@ -108,6 +108,7 @@ fn line(event: &str, snapshot: &client::Snapshot) -> String {
         "native_write_drops": snapshot.native_write_drops,
         "header_bytes_saved": snapshot.header_bytes_saved,
         "key_generation": snapshot.key_generation,
+        "policy_epoch": snapshot.policy_epoch,
     })
     .to_string()
 }
@@ -275,7 +276,12 @@ pub(super) async fn execute(
                                 })
                             );
                         }
-                        Completed::Aborted => {}
+                        // A disconnect, or a policy change another local
+                        // client requested; neither ends this frontend.
+                        Completed::Aborted
+                        | Completed::Applied(_)
+                        | Completed::Rejected(_)
+                        | Completed::OutcomeUnknown => {}
                         Completed::Failed(failure) if restart => {
                             println!(
                                 "{}",

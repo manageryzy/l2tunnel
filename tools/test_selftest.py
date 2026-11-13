@@ -48,22 +48,29 @@ class SelfTestHelpers(unittest.TestCase):
     def test_lifecycle_requires_actual_stop_and_resume(self):
         from unittest import mock
         replies = {'disconnect': {'ok': True, 'state': {'phase': 'disconnected', 'epoch': 1}},
-                   'reconnect': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 3}},
-                   'status': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 2}}}
+                   'reconnect': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 0,
+                                                   'swift': {'generation': 3}}},
+                   'status': {'ok': True, 'state': {'phase': 'forwarding', 'epoch': 0}},
+                   'set-swift': {'ok': True, 'state': {
+                       'epoch': 1, 'swift': {'channels': 8, 'repair_permille': 100,
+                                             'generation': 1}}}}
         calls = []
 
-        def control(work, binary, side, command):
+        def control(work, binary, side, command, *options):
             calls.append((side, command))
+            if (side, command) == ('b', 'set-swift'):
+                return {'ok': False, 'code': 'not_coordinator'}
             return replies[command]
         with mock.patch.object(selftest, 'control', control), \
-                mock.patch.object(selftest, 'reachable', side_effect=[False, True]):
+                mock.patch.object(selftest, 'reachable', side_effect=[True, False, True]):
             checks = selftest.lifecycle(Path('/work'), '/bin/l2tunneld')
         self.assertTrue(all(checks.values()), checks)
-        self.assertEqual(calls, [('a', 'disconnect'), ('a', 'reconnect'), ('b', 'status')])
+        self.assertEqual(calls, [('a', 'status'), ('a', 'set-swift'), ('b', 'set-swift'),
+                                 ('a', 'disconnect'), ('a', 'reconnect'), ('b', 'status')])
         # A tunnel that kept forwarding after disconnect is a failure even
         # when every command reported success.
         with mock.patch.object(selftest, 'control', control), \
-                mock.patch.object(selftest, 'reachable', side_effect=[True, True]):
+                mock.patch.object(selftest, 'reachable', side_effect=[True, True, True]):
             checks = selftest.lifecycle(Path('/work'), '/bin/l2tunneld')
         self.assertFalse(checks['traffic_stopped'])
 

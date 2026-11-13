@@ -67,7 +67,7 @@ pub struct WireBudget {
 pub struct Config {
     /// One bidirectional carrier or two independent directional carriers.
     pub duplex: Duplex,
-    /// Explicit custom cover; not OpenVPN or QUIC interoperability.
+    /// Project-specific UDP prefix layout; see [`CoverProfile`] for protocol boundaries.
     pub cover: CoverProfile,
     /// Required datagram confidentiality/integrity protection.
     pub protection: Protection,

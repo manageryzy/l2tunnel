@@ -343,14 +343,19 @@ async fn establish_swift(
     let device = plan.open_readable()?;
     // Observe at least once a second so status stays fresh without printing.
     let session = session.observe_every(std::time::Duration::from_secs(1));
+    let (switcher, requests) = l2tunnel_runtime::swift::switcher();
     let backend = Arc::new(SwiftBackend {
         requested: settings,
         effective: session.config(),
         receive_buffer: session.receive_buffer()?,
         counters: Mutex::new(l2tunnel_runtime::swift::Snapshot::default()),
+        switcher,
+        connection: config,
+        client: matches!(plan.data.endpoint, Endpoint::Client(_)),
+        generation: accepted.operation.value(),
     });
     let sink = backend.clone();
-    let mut runtime: RunFuture = Box::pin(session.run(device, move |snapshot| {
+    let mut runtime: RunFuture = Box::pin(session.run(device, Some(requests), move |snapshot| {
         *sink
             .counters
             .lock()
@@ -373,6 +378,81 @@ async fn establish_swift(
         backend: ObservedBackend::Swift(backend),
         generation: accepted.operation,
     })
+}
+/// Negotiate the requested swift values over the live session. The reply is
+/// built only after the runtime reported the committed epoch or a refusal.
+#[cfg(unix)]
+async fn apply_swift(
+    shared: &Arc<Shared>,
+    swift: &SwiftBackend,
+    request: &local::Request,
+) -> Completed {
+    let handle = Handle(shared.clone());
+    let local::Action::SetSwiftPolicy { policy: change } = &request.action else {
+        return Completed::Rejected(handle.swift_status(false, "unsupported"));
+    };
+    let Some(mut next) = handle
+        .snapshot()
+        .runtime
+        .as_ref()
+        .and_then(Observation::swift)
+        .map(SwiftFrame::current)
+    else {
+        return Completed::Rejected(handle.swift_status(false, "closed"));
+    };
+    let size = |value: Option<u64>, current: usize| {
+        value.map_or(Some(current), |value| usize::try_from(value).ok())
+    };
+    let sizes = (
+        size(change.channels, next.channels),
+        size(change.window, next.window),
+        size(change.path_mtu, next.path_mtu),
+        change
+            .repair_permille
+            .map_or(Some(next.repair_permille), |value| {
+                u32::try_from(value).ok()
+            }),
+    );
+    let (Some(channels), Some(window), Some(path_mtu), Some(repair_permille)) = sizes else {
+        return Completed::Rejected(handle.swift_status(false, "invalid_policy"));
+    };
+    next.forward_kbit = change.forward_kbit.unwrap_or(next.forward_kbit);
+    next.reverse_kbit = change.reverse_kbit.unwrap_or(next.reverse_kbit);
+    (
+        next.channels,
+        next.window,
+        next.path_mtu,
+        next.repair_permille,
+    ) = (channels, window, path_mtu, repair_permille);
+    let policy = match next.session(swift.connection).and_then(|_| next.policy()) {
+        Ok(policy) => policy,
+        Err(_) => return Completed::Rejected(handle.swift_status(false, "invalid_policy")),
+    };
+    use l2tunnel_runtime::swift::SwitchError;
+    match swift.switcher.switch(policy).await {
+        Ok(epoch) => {
+            // The runtime publishes counters periodically; make the reply
+            // show the epoch it just committed.
+            {
+                let mut counters = swift
+                    .counters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                counters.policy_epoch = epoch;
+                counters.policy = Some(policy);
+            }
+            Completed::Applied(handle.swift_status(true, "ok"))
+        }
+        Err(SwitchError::Busy) => Completed::Rejected(handle.swift_status(false, "busy")),
+        Err(SwitchError::NotCoordinator) => {
+            Completed::Rejected(handle.swift_status(false, "not_coordinator"))
+        }
+        Err(SwitchError::Rejected) => Completed::Rejected(handle.swift_status(false, "rejected")),
+        Err(SwitchError::Invalid) => {
+            Completed::Rejected(handle.swift_status(false, "invalid_policy"))
+        }
+        Err(SwitchError::Closed) => Completed::OutcomeUnknown,
+    }
 }
 // One commit point for cancellation, generation, profile and actual readiness.
 // The helper is shared with a real-TLS late-cancel regression, not a test-only hook.
@@ -507,6 +587,24 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         );
                         continue;
                     };
+                    #[cfg(unix)]
+                    if let ObservedBackend::Swift(swift) = &session.backend {
+                        let swift = swift.clone();
+                        let change = apply_swift(&shared, &swift, &request);
+                        tokio::pin!(change);
+                        let result = tokio::select! {
+                            result = &mut change => result,
+                            result = &mut session.runtime => {
+                                let failure = Failure {
+                                    kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |e| e.kind()),
+                                };
+                                stopped(&shared, &mut active, Terminal::Failed(failure));
+                                Completed::OutcomeUnknown
+                            }
+                        };
+                        finish(&shared, accepted.operation, result);
+                        continue;
+                    }
                     // Submission already rejects apply on a datagram backend; this
                     // keeps the owner total without sending any protocol input.
                     let Some(control) = session.backend.managed().cloned() else {

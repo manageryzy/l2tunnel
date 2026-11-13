@@ -80,19 +80,38 @@ Official APIs checked: [ring AEAD](https://docs.rs/ring/0.17.14/ring/aead/struct
 Cached ring HKDF source was also inspected. Dependency advisory review and
 independent security review remain release gates.
 
-## Custom cover prefixes and exact draft format
+## Relationship to the shared-session target
 
-These are explicit custom data-header resemblance profiles, not implementations
-of OpenVPN or QUIC. They contain no handshake and make no promise about active
-probes, TLS concealment, entropy, middlebox acceptance or standard-client
-interoperability. [OpenVPN's documented opcode/peer-ID layout](https://build.openvpn.net/doxygen/network_protocol.html)
-is only a shape reference; QUIC needs TLS/packet/header protection and transport
-state beyond its visible header shape, as explained in the overlay design.
+The [2026-11-13 secure-session contract](secure-session.md) reuses encrypted and
+authenticated data across selected carriers while replacing the preceding
+authentication/bootstrap layer. Swift currently implements a separate compact
+AEAD/replay/ratchet path; neither it nor this codec is the completed common layer.
+SEC-05/SEC-06 must define the shared public protection/key interface, preserving
+compact overhead, domain separation, replay checks and existing AEAD/MAC profiles.
+Do not force the historical fixed header into every new composition or silently
+change old wire bytes and receipts. WireGuard-like does not mean an adopted
+library, exported private cipher state or standard WireGuard interoperability.
+
+QUIC-like's target is header appearance rather than full QUIC packet validity.
+Minimal media appearance is new planned work; this enum contains no media adapter.
+The original OpenVPN wire-handshake requirement remains a separate open gate.
+The format below documents current bytes, not a claim that the target is enabled.
+
+## Project-specific prefixes and exact draft format
+
+The cover names identify project-specific UDP prefix layouts. This codec does
+not implement OpenVPN or QUIC handshakes, transport state or endpoint
+interoperability. It provides no TLS encapsulation, packet-entropy or traffic-shape
+matching, active-probe resistance or middlebox acceptance guarantee.
+[OpenVPN's documented opcode/peer-ID layout](https://build.openvpn.net/doxygen/network_protocol.html)
+is a field-layout reference. QUIC interoperability additionally requires its
+TLS handshake, packet/header protection and transport state, as explained in the
+overlay design.
 
 | Cover | Prefix preceding the common header |
 | --- | --- |
 | `OpenVpnLike` | Four bytes: `0x48` followed by the low 24 bits of the lane ID as a peer-ID hint. The full lane ID remains in the authenticated common header. |
-| `QuicLike` | Nine bytes: `0x40` followed by the first eight session-ID bytes as a connection-ID hint. No QUIC header protection, valid QUIC packet-number encoding or handshake is claimed. |
+| `QuicLike` | Nine bytes: `0x40` followed by the first eight session-ID bytes as a connection-ID hint. QUIC header protection, packet-number encoding and handshakes are outside this codec. |
 
 All prefix bytes are authenticated and checked exactly. The common header is
 44 bytes; all integer fields are big-endian:

@@ -7,6 +7,13 @@ loopback packet tests; native and production qualification gates remain open. Th
 profile with an OpenVPN-like control/data split, not OpenVPN interoperability,
 DTLS, QUIC, or a claim of resistance to every active probe. It uses no TCP socket.
 
+The handshake decision below describes this implemented checkpoint. The later
+[shared secure-session target](secure-session.md) selects a WireGuard-like internal
+authentication/session direction for all carriers; DTLS/Noise discussion below
+is historical evaluation, not a newly adopted dependency. The actual OpenVPN wire
+handshake requirement remains open: this custom gate/TLS framing does not satisfy
+it, and its composition with common inner authentication still needs review.
+
 ## Handshake decision and existing boundaries
 
 Use the existing pinned rustls TLS 1.3 implementation over a bounded reliable UDP

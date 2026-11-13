@@ -71,6 +71,7 @@ async fn local_action(
                 ControlError::Closed => "closed",
             }),
         Action::SwitchActivePolicy { .. }
+        | Action::SetSwiftPolicy { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}
@@ -111,6 +112,7 @@ async fn active_local_action(
     let result = match request.action {
         Action::Status {} => Ok(()),
         Action::SwitchCompression { .. }
+        | Action::SetSwiftPolicy { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}

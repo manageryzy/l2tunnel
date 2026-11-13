@@ -153,7 +153,8 @@ const UDP_OPTIONS: &[&str] = &[
 ];
 const UDP_HELP: &str = r#"UDP options: --carrier udp --udp-bind IP:PORT --udp-peer IP:PORT
   --udp-cover openvpn-like|quic-like --udp-protection aead|integrity (default aead)
-  --path-mtu N (default 1500). These covers are custom resemblance profiles.
+  --path-mtu N (default 1500). These covers select project-specific UDP framing.
+  They do not provide OpenVPN or QUIC interoperability.
 Half duplex also requires --udp-reverse-bind IP:PORT --udp-reverse-peer IP:PORT.
 The forward pair always carries initiator to listener; reverse carries listener to initiator.
 UDP retains authenticated TCP/TLS for bootstrap, recovery feedback and liveness.
@@ -218,7 +219,7 @@ fn udp_settings(
         "quic-like" => CoverProfile::QuicLike,
         _ => {
             return Err(input(
-                "UDP cover must be openvpn-like or quic-like (custom resemblance)",
+                "UDP cover must be openvpn-like or quic-like (project-specific framing)",
             ));
         }
     };
@@ -1135,6 +1136,29 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
         "status" => Action::Status {},
         "disconnect" => Action::Disconnect {},
         "reconnect" => Action::Reconnect {},
+        "set-swift" => {
+            let value = |key: &str| {
+                options
+                    .get(key)
+                    .map(|text| {
+                        text.parse::<u64>()
+                            .map_err(|_| input(format!("invalid {key}")))
+                    })
+                    .transpose()
+            };
+            let policy = local::SwiftChange {
+                forward_kbit: value("--swift-forward-kbit")?,
+                reverse_kbit: value("--swift-reverse-kbit")?,
+                channels: value("--swift-channels")?,
+                window: value("--swift-window")?,
+                repair_permille: value("--swift-repair-permille")?,
+                path_mtu: value("--path-mtu")?,
+            };
+            if policy == local::SwiftChange::default() {
+                return Err(input("set-swift requires at least one value to change"));
+            }
+            Action::SetSwiftPolicy { policy }
+        }
         "drain-proxy" => Action::DrainProxy {},
         "drain-openvpn" => Action::DrainOpenVpn {},
         "set-compression" => Action::SwitchCompression {
@@ -1221,6 +1245,15 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             vec!["--control-socket"]
         }
         "set-compression" => vec!["--control-socket", "--compression"],
+        "set-swift" => vec![
+            "--control-socket",
+            "--swift-forward-kbit",
+            "--swift-reverse-kbit",
+            "--swift-channels",
+            "--swift-window",
+            "--swift-repair-permille",
+            "--path-mtu",
+        ],
         "set-active-policy" => vec!["--control-socket", "--mux-channels", "--qos-dscp"],
         "connect" => vec![
             "--remote",
@@ -1290,6 +1323,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
                     "status"
                         | "disconnect"
                         | "reconnect"
+                        | "set-swift"
                         | "set-compression"
                         | "set-active-policy"
                         | "drain-proxy"

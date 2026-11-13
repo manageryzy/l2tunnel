@@ -1,7 +1,8 @@
 //! Bounded authenticated datagrams for an already authenticated session.
 //!
-//! This library has no UDP bootstrap, socket or device integration. Custom
-//! OpenVPN-like/QUIC-like prefixes are not interoperable protocol implementations.
+//! This library has no UDP bootstrap, socket or device integration. Its prefix
+//! layouts are project-specific; it does not implement OpenVPN or QUIC handshakes
+//! or endpoint interoperability.
 //! Traffic keys use maintained ring HKDF, ChaCha20-Poly1305 or HMAC-SHA256.
 use ring::{aead, hkdf, hmac};
 use std::convert::Infallible;
@@ -50,12 +51,14 @@ impl Direction {
     }
 }
 
-/// Explicit custom data-header resemblance, without a standard-protocol handshake.
+/// Project-specific UDP prefix layout for authenticated tunnel datagrams.
+///
+/// These layouts do not implement OpenVPN or QUIC handshakes or interoperability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverProfile {
-    /// Opcode/peer-hint shape; not an OpenVPN-compatible packet or implementation.
+    /// Four-byte prefix: `0x48` followed by a 24-bit lane-ID hint.
     OpenVpnLike,
-    /// Fixed-bit/connection-ID shape; not QUIC packet/header protection or TLS.
+    /// Nine-byte prefix: `0x40` followed by an eight-byte session-ID hint.
     QuicLike,
 }
 
@@ -118,7 +121,7 @@ pub struct KeyContext {
 pub struct DatagramConfig {
     /// Authenticated context for this directional key.
     pub context: KeyContext,
-    /// Custom prefix shape, not a standard-protocol compatibility promise.
+    /// Project-specific prefix layout; see [`CoverProfile`] for protocol boundaries.
     pub cover: CoverProfile,
     /// Required protection suite; peers cannot select a downgrade by header bits.
     pub protection: Protection,

@@ -243,8 +243,8 @@ the per-turn crypto budget is exhausted is dropped or retained in an already
 reserved finite input slot; it must not be forwarded to the old stream merely
 because crypto was deferred. An authenticated phase candidate rejected for stage,
 format or capacity must likewise never fall through into TLS. This can delay
-retained traffic that resembles a candidate; it cannot create unbounded work or
-a magic-prefix authentication bypass. Flooding and accidental prefix collision
+retained traffic sharing a candidate prefix. Authentication remains required,
+and memory/work bounds still apply. Flooding and accidental prefix collision
 need focused tests.
 
 The proposed transition budget is at most 32 receive/crypto operations per

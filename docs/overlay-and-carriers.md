@@ -1,10 +1,12 @@
 # Internal management, VXLAN and carrier profiles
 
-Status: **planned**, 2026-11-12 (Asia/Tokyo). This document extends the
+Status: **design requirements under review**, 2026-11-13 (Asia/Tokyo). This document extends the
 [architecture](architecture.md) and [implementation plan](implementation-plan.md).
-It specifies contracts and acceptance work; none of the mechanisms below is
-implemented by the current enums, queue primitive or local reload guard. All
-unchecked items require implementation evidence before their status changes.
+It specifies target contracts and acceptance work. Existing protocol components
+and finite Linux runtime receipts are recorded in [implementation status](implementation-status.md)
+and module ledgers; they do not implement every composition specified here.
+All unchecked items require implementation evidence before their status changes.
+This requirements update changes no runtime behavior or historical receipt.
 
 ## Internal Layer 2 management channel
 
@@ -183,79 +185,146 @@ local L2 network needs a separate adapter and is not implied by VTEP support.
 - [ ] [VX-09] Record Windows/Android support separately from Linux interoperability;
   keep unqualified platform/device combinations unavailable.
 
-## Selectable lower carriers and UDP cover
+<a id="selectable-lower-carriers-and-udp-cover"></a>
 
-Keep carrier selection separate from cover style, user packet layer, MUX policy,
-recovery algorithm and duplex mode. Supported combinations must be explicitly
-negotiated and included in the authenticated digest. Preferred deployment order
-remains qualified raw TCP, then ordinary TCP, then UDP; an explicit user selection
-is respected, with visible failure or an authorized configured fallback.
+## Selectable carriers and cover profiles
 
-| Carrier | Connection contract | Cover choices |
+The operator explicitly selects OpenVPN-like, QUIC-like, HTTPS-like or the minimal
+media cover. Swift is packing and recovery inside that selection, not a standalone
+carrier or an automatically selected connection mode. Keep carrier selection,
+user packet layer, MUX policy, record/recovery profile and duplex mode separate.
+Bind supported combinations into the authenticated configuration digest and expose
+requested versus effective values through the shared client/service API. There is
+no target automatic raw/TCP/UDP preference that overrides an explicit selection.
+Compatibility transports remain independently labelled capabilities; an unavailable
+selection fails visibly unless a fallback was explicitly configured.
+
+For each physical lane, handshake, authentication, management and user data retain
+the same connection or UDP socket and five-tuple. Paired half duplex can use two
+independently authenticated lanes; each lane obeys this continuity rule. The
+historical TCP/TLS bootstrap plus separate protected UDP data flow is preserved as
+an experiment and existing implementation, not the target selected-carrier design.
+Reconnection after terminal failure is a new observable connection attempt, not a
+claim that the original connection survived.
+
+| Selected cover | Target connection contract | Evidence and remaining composition gate |
 | --- | --- | --- |
-| `raw_tcp_experimental` | One qualified packet owner from SYN through authentication and data; coherent sequence/window state and required reverse feedback. | Qualified raw profile; valid TLS/HTTPS only while their complete semantics remain in use. |
-| `tcp_tls` | Persistent kernel socket and TLS instance through authentication/data; kernel ACK, congestion, window and retransmission behavior remain authoritative. | TLS stream or actual HTTPS profile. |
-| `udp_authenticated` | Protected independent datagrams, path validation, replay defense and bounded retransmission/pacing. | Explicit `openvpn_like` or `quic_like` custom cover profile. |
+| OpenVPN-like | Actual OpenVPN-format outer handshake and corresponding control/data packet layout on one UDP socket; our own authenticated tunnel payload follows. | The existing standalone profile has real TLS over custom reliable UDP control and finite Linux receipts. Its custom gate/control format does not satisfy the actual OpenVPN wire-handshake requirement. Composition with the common inner session remains open. |
+| QUIC-like | Selected QUIC-looking outer header layout over one UDP socket, with the common inner session and selected recovery. | Header appearance is the requirement; native QUIC ACK/congestion machinery and complete QUIC dissector validity are not required. The current custom prefix is not evidence of effective ISP classification. Genuine QUIC remains a separate implemented/reference capability. |
+| HTTPS-like | Real TCP/TLS handshake, then independently protected TCP-shaped packets on the original ports and sequence space, without ordinary TCP ACK-driven data transport. | The Linux raw transition has finite, separately scoped evidence. General-path qualification and composition with the common inner session remain open. Actual HTTP/2 streaming is an optional distinct compatibility profile, not a substitute. |
+| Minimal media | Audio/video/RTP-like outer packet layout on fixed UDP lanes, with the same common inner authentication, control and data protocol. | New planned cover. Freeze concrete headers, identifiers, sequence/timestamp behavior and handshake placement. This does not request a complete WebRTC/ICE/STUN/TURN/DTLS-SRTP/SCTP stack or valid encoded media. |
 
-Raw operation does not mean suppressing ACKs on a normal kernel socket. A raw
-backend must own and implement its transport state, qualify middlebox behavior,
-and preserve reverse control service. It must not apply host-wide ACK/RST rules
-to commandeer unrelated traffic. Keeping sequence numbers alone does not prove
-flow continuity through NAT or QoS. Normal TCP remains a valid compatibility
-backend with acknowledged limitations on custom recovery and ACK behavior.
+### Common inner authenticated session
 
-### UDP authentication and profile boundaries
+Every cover, including TCP/HTTPS-like, uses one reusable inner authentication,
+key-exchange, replay, rekey and management contract. The selected direction is a
+lightweight WireGuard-like authenticated session lifecycle; the concrete maintained
+implementation and adaptation are still review gates. See the
+[secure-session design](modules/secure-session.md). A library choice, exact wire
+format, new trust provisioning scheme or unsafe exception is not implied by this
+direction. Public protocol APIs still inject time and I/O and own no OS handles,
+privileges, Tokio runtime or device setup.
 
-The first UDP stage joins a session authenticated over the retained TCP/TLS
-control connection, using exporter-derived lane keys and fresh single-use
-join tokens. This stage is explicitly **not UDP-only**. An independently usable
-UDP-only client remains required later and must select a maintained authenticated
-handshake implementation, with its concrete library, protocol transcript and
-reliability behavior reviewed before implementation. No profile may substitute
-header resemblance for key exchange, identity verification or anti-replay.
+The deployment is fixed point-to-point between configured clients and servers.
+Peer identity is not inferred from the outer header, SNI, address alone or a
+successful cookie exchange. No packet-prefix format substitutes for key exchange,
+identity verification or anti-replay. AEAD data remains required; any existing
+separately negotiated integrity-only profile retains authentication and replay
+protection. A WireGuard-like design must not silently remove that profile, adopt
+WireGuard's IP-only payload interface, or expose a new default WireGuard carrier.
 
-For both profiles, specify the complete initial flight, retransmission rules,
-connection/lane identifiers, version rejection, payload transition, path
-validation, rebinding, PMTU behavior and key update. Apply bounded pre-auth work,
-anti-amplification and packet/byte budgets. Default to no SNI where the chosen
-handshake supports it without weakening identity verification. A configured
-cover name is separate from the trusted server identity and becomes observable
-unless separately protected. Packet entropy matching remains outside scope.
+Specify bounded initial flights, retransmission/backoff, duplicate handling,
+final-flight confirmation, replay windows, pre-authentication work/byte/state
+budgets, anti-amplification, key lifetime and overlap, exhaustion and peer restart.
+Keep authenticated management, liveness and rekey available through the selected
+carrier with finite reserved service even while user-data epochs drain or switch.
+Shared protocol semantics do not reuse keys/nonces between directions, lanes,
+sessions or key generations. Ordinary TCP compatibility still adds ordered-stream
+loss blocking; a common inner protocol cannot remove that carrier property.
 
-`openvpn_like` is a custom envelope inspired by OpenVPN's control/data separation
-and observable framing. OpenVPN's published packet layout has opcode/key-ID and
-session/packet identification fields; copying such fields does not implement its
-control protocol or make a standard OpenVPN client a peer.
+Default recovery is bounded automatic recovery from transient path/session loss:
+retry or reauthenticate the configured peer on the selected carrier with bounded
+state, backoff and an explicit terminal outcome. Identity/configuration failures
+must not trigger an authentication downgrade or unconfigured carrier fallback.
+Expose recovery phase, reason, attempt count and effective connection identity.
+Fresh sessions reject stale traffic and reconcile or fail uncertain switching;
+recovery must not label abandoned old records delivered. Exact retry/deadline and
+reconnect/resume semantics remain to be frozen before implementation. Fixed-peer
+operation does not grant unsolicited address retargeting; legacy rebinding/NAT
+qualification remains a separately tracked gate.
+
+### Outer protocol consistency and claim boundaries
+
+OpenVPN's actual control protocol carries session IDs, packet IDs and ACK state
+around TLS. The requested actual wire handshake remains required even though a
+standard OpenVPN client need not become our peer. Freeze the version/profile and
+dissector expectations and identify precisely where our protected payload begins.
+The common inner handshake must coexist with that outer exchange on the same
+socket; replacing it with the existing custom Hello/Retry/Echo is not completion.
 [OpenVPN network protocol](https://build.openvpn.net/doxygen/network_protocol.html)
 
-Use maintained authentication/AEAD primitives for an optional provisioned
-pre-handshake admission key, separate from final member identity and session
-traffic keys. OpenVPN's `tls-auth` authenticates control packets before TLS work,
-while `tls-crypt` additionally encrypts them; `tls-crypt-v2` supports client-specific
-keys and a cookie mode. These mechanisms inform the admission requirement, not a
-claim that our custom profile implements OpenVPN key formats or wire semantics.
-Actual OpenVPN interoperability would require a separate compatible adapter and
-upstream-peer tests. [OpenVPN control protection](https://build.openvpn.net/man/openvpn-2.6/openvpn.8.html)
+OpenVPN `tls-auth`/`tls-crypt` mechanisms can inform pre-authentication protection,
+but shared primitive names do not establish compatible packet layouts or key
+formats. [OpenVPN control protection](https://build.openvpn.net/man/openvpn-2.6/openvpn.8.html)
 
-`quic_like` is a custom UDP cover with a documented initial/established header
-shape. Real QUIC v1 requires much more: long/short headers, connection IDs,
-version handling, packet-number spaces, transport parameters, address validation
-and correctly framed handshakes; client Initial datagrams have a 1200-byte
-minimum. A prefix alone cannot claim these semantics.
-[QUIC transport](https://www.rfc-editor.org/rfc/rfc9000.html)
+QUIC-like deliberately requests header appearance rather than full QUIC transport.
+Document its exact intentional differences. Do not call it standards-conformant
+QUIC, HTTP/3 or a completely parseable/decryptable QUIC session. A genuine QUIC
+adapter instead retains its real packet/header protection, ACKs and congestion
+behavior; preserve its evidence and Python benchmark separately.
+[QUIC transport](https://www.rfc-editor.org/rfc/rfc9000.html),
+[QUIC TLS](https://www.rfc-editor.org/rfc/rfc9001.html)
 
-Real QUIC integrates TLS handshake messages with QUIC protection and header
-protection, rather than transmitting TLS records directly over UDP. Initial keys
-are derivable from public connection information, so QUIC-looking Initial traffic
-does not conceal a ClientHello or provide authenticated tunnel membership.
-[QUIC TLS and Initial protection](https://www.rfc-editor.org/rfc/rfc9001.html)
+Minimal media likewise needs a specific observable RTP-like layout, rather than
+an assertion that arbitrary UDP is WebRTC. RTP-style fields do not establish a
+valid codec, media endpoint or full WebRTC session. Do not add full WebRTC as a
+prerequisite for this requested cover. Packet entropy and full traffic-shape
+matching are not additional acceptance requirements.
+[RTP](https://www.rfc-editor.org/rfc/rfc3550.html)
 
-Keep a genuine QUIC transport adapter and the Python QUIC benchmark as separate
-capabilities. A genuine adapter should use a maintained QUIC implementation, and
-must report its own recovery/congestion behavior when comparing our ARQ/FEC.
-Neither custom cover profile promises indistinguishability, immunity to active
-probes, standard-client interoperability or acceptance by a particular router.
-Freeze captures and test complete state transitions against the intended path.
+Report three claims separately: observed packet/header parseability, interoperability
+with another implementation, and measured classifier/QoS behavior. Full endpoint
+interoperability is not required for these private tunnel covers. QUIC/media header
+recognition does not prove complete protocol validity; valid protocol framing does
+not prove resistance to identification or better ISP priority. The premise that
+initial packets influence this ISP's classification is a measurement hypothesis.
+
+### HTTPS-like packet ownership and failure gates
+
+Retain the original real TCP/TLS handshake requirement. Configurable TLS SNI is an
+outer name; server authentication stays anchored to our own roots/pins/identity
+configuration. Neither an arbitrary cover name nor SNI off permits accepting an
+untrusted server. Decide and verify the exact verifier/name/pin behavior before
+enabling named SNI. Once data leaves TLS record and TCP stream semantics, call it
+a custom HTTPS-like TCP-shaped carrier, not continuing HTTPS.
+
+Prefer one packet owner from SYN through TLS and the packet phase. A normal kernel
+TCP socket continues ACK/window/retransmission processing and can generate RSTs;
+opening a raw socket does not disable the kernel TCP handler. Do not assume that
+copying sequence numbers detaches a kernel connection. Any handoff must prove
+quiescence, original owner transfer, sequence/option/window continuity, bounded
+late old traffic and fail-closed recovery before user traffic is released.
+
+Raw operation needs privileged platform support and exact owned-flow isolation.
+Linux qualification includes raw-socket capability, existing exact-tuple firewall
+policy, kernel ACK/RST ownership and namespace cleanup; never apply host-wide
+ACK/RST suppression. Validate sequence wrap, SYN/FIN consumption, checksums,
+options/timestamps, PMTU, loss/reordering, NAT/conntrack, idle expiry and failure
+cleanup. A stream-validating firewall can reject custom retirement/ACK semantics
+despite the original TLS handshake and unchanged tuple. Windows needs its own
+qualified packet/driver path; ordinary Android VpnService does not grant raw outer
+TCP injection privileges. No Linux receipt establishes those capabilities.
+[TCP](https://www.rfc-editor.org/rfc/rfc9293.html),
+[Linux raw sockets](https://man7.org/linux/man-pages/man7/raw.7.html)
+
+After irreversible handoff failure, report terminal state and use bounded fresh
+authentication/reconnection as specified by the recovery policy. Do not resurrect
+discarded TCP/TLS ownership or silently select HTTP/2/UDP. Keep control-loss,
+key-exhaustion, unconfirmed-drain and permission failures distinguishable.
+
+Carrier work does not narrow the 47-family mode inventory, RLNC/parity, rolling,
+packed, proxy or other existing mode-parity gates. SW-11 still requires negotiated
+epoch switching between Swift and the other record profiles over stable control.
 
 ### Carrier and cover acceptance checklist
 
@@ -266,7 +335,8 @@ Freeze captures and test complete state transitions against the intended path.
 - [ ] [UDP-03] Qualify raw ownership, permissions, sequence/window wrap, options, FIN/RST,
   loss/reorder, NAT/conntrack, idle expiry and shutdown in an isolated lab.
 - [ ] [UDP-04] Freeze the full custom `openvpn_like` envelope/handshake state diagram and
-  packet captures; document every intentional difference from real OpenVPN.
+  packet captures; retain the actual OpenVPN wire-handshake requirement and document
+  every intentional payload/control difference without requiring endpoint interoperability.
 - [ ] [UDP-05] Freeze the full custom `quic_like` envelope/handshake state diagram and
   packet captures; document every intentional difference from real QUIC.
 - [ ] [UDP-06] Select and pin a maintained handshake dependency for UDP-only operation;
@@ -277,7 +347,29 @@ Freeze captures and test complete state transitions against the intended path.
   PMTU, replay windows, rekey and protected metadata with confidentiality off.
 - [ ] [UDP-09] Compare captures and active-probe outcomes for each cover profile; publish
   observed behavior without claiming unprobeability or automatic QoS acceptance.
-- [ ] [UDP-10] Run ARQ/FEC and control-switch tests over both UDP covers and each supported
-  duplex mode; account for all cover/auth/control overhead in parity reports.
+- [ ] [UDP-10] Run ARQ/FEC and control-switch tests over both original UDP covers,
+  the new minimal media cover and each supported duplex mode; account for all
+  cover/auth/control overhead in parity reports.
 - [ ] [UDP-11] Preserve separate receipts for custom cover tests and any future genuine
   OpenVPN/QUIC interoperability; never infer one from the other.
+- [ ] [UDP-12] Specify and integrate the common lightweight WireGuard-like inner
+  authentication/key-exchange/replay/rekey/control contract over every selected cover,
+  including TCP/HTTPS-like. Preserve AEAD, existing integrity-only requirements,
+  injected time/I/O and the full selected record/recovery scope; qualify same-socket
+  and same-five-tuple handshake-to-data continuity per lane. Design alone is not completion.
+- [ ] [UDP-13] Freeze and implement the minimal audio/video/RTP-like cover, including
+  bounded parsers, observable fields, handshake/control placement, MTU accounting and
+  captures; no complete WebRTC stack or valid media codec is required.
+- [ ] [UDP-14] Preserve and qualify real TCP/TLS to custom TCP-shaped HTTPS-like data
+  on the original flow, configurable SNI with independent trusted server identity,
+  packet ownership, kernel ACK/RST isolation, firewall/platform permission gates and
+  bounded failure recovery. Optional HTTP/2 streaming cannot satisfy this item.
+- [ ] [UDP-15] Implement default bounded automatic recovery for fixed point-to-point
+  peers with explicit retry/terminal policy and requested/effective status. Test
+  failed identity, duplicate/replayed handshakes, final-flight loss, rekey overlap,
+  control starvation, uncertain commits and fresh-session stale traffic across all
+  covers; preserve SW-11 and all existing MG/VX/mode-parity acceptance definitions.
+- [ ] [UDP-16] Run the controlled [carrier/classification validation plan](testing.md#carrier-consistency-and-classification-campaign)
+  with source-pinned receipts, matched offered load, randomized repeated comparisons
+  and separate parseability/interoperability/QoS results. Treat initial-packet ISP
+  classification as a hypothesis; retain failures and historical experiments.

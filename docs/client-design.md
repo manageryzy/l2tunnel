@@ -7,6 +7,10 @@ in [the architecture](architecture.md) and the mode requirements in
 until their complete cross-platform contract is met. Linux/server/administrative
 entry points now share real TCP/TLS connect/serve, TAP/TUN/VXLAN device forwarding,
 exclusive identity generation and private Unix status/compression-switch commands.
+Managed TCP, base UDP and Swift CLI paths use a shared lifecycle owner, with
+different supported status/apply operations. Other profiles still have separate
+lifecycle paths; no complete GUI/API parity or default state-retaining outage
+recovery is claimed by that partial implementation.
 See [client runtime](modules/client-runtime.md), [local API](modules/local-api.md)
 and [native evidence](implementation-status.md) for exact implemented scope.
 Windows remains a staging entry point; Android has no JNI or application shell.
@@ -15,6 +19,17 @@ Keep task IDs stable when splitting work into issues. Completing a design does
 not complete its implementation item. Each completed item needs an evidence link
 and a label: `contract-tested`, `implemented`, or `integration-tested`. Record the
 tested OS, carrier, packet layer and configuration with integration evidence.
+
+The approved deployment is fixed point-to-point between an owner's client and
+server. The planned [common inner secure session](modules/secure-session.md) must supply
+authentication, key exchange, record security and management across the selected
+carrier, including TCP/HTTPS. This WireGuard-like responsibility split does not
+choose a WireGuard library, wire format, provisioning flow or cipher negotiation.
+Do not assume account administration, multi-device enrollment or multi-peer
+workflows. Outer carrier selection, inner security and data record/recovery
+selection are separate configuration domains. Swift remains an algorithm inside
+the selected carrier; moving security to the common layer must preserve its
+existing AEAD behavior and all other requested modes.
 
 ## Source projects and ownership
 
@@ -25,16 +40,16 @@ protocol crates remain independent of Tokio, OS handles, clocks and privileges.
 | Source project | Responsibilities | Consumers and boundary |
 | --- | --- | --- |
 | Existing `crates/l2tunnel*` protocol crates | Packet processing, authenticated session, peer management, MUX, QoS, recovery and codec state machines | Portable embedding API; injected time and I/O |
-| Existing partial `crates/l2tunnel-client-core` | Shared managed TCP lifecycle and CLI; other profile lifecycles remain separate | Typed service ownership for connect/cancel/abort/reconnect/apply; portable command schema, separate Unix IPC; no widgets |
+| Existing partial `crates/l2tunnel-client-core` | Shared managed TCP, base UDP and Swift lifecycle/CLI slices; other profile lifecycles remain separate | Typed service ownership with profile-specific connect/cancel/abort/reconnect/apply support; portable command schema, separate Unix IPC; no widgets |
 | Existing `client-core::local`; possible later `l2tunnel-control-api` crate | Bounded Unix status/switch schema; richer events, revisions and operation IDs remain planned | Service/client boundary; distinct from the peer wire protocol |
 | Existing partial `crates/l2tunnel-runtime` | Async execution, timers, socket ownership and managed device forwarding; persistence/telemetry remain planned | Runtime outside public protocol API; injected backend interfaces for client-core |
 | Existing partial `crates/l2tunnel-platform-linux` | TAP/TUN descriptors; helper, network setup and service lifecycle remain planned | Linux-only adapter with one documented ioctl FFI boundary |
 | Planned `crates/l2tunnel-platform-windows` | Wintun/TAP adapters, Windows service integration, native credentials and owned network configuration | Windows-only adapter; independently reviewed driver/FFI boundary |
-| Existing `apps/l2tunnel-linux` and `apps/l2tunnel-windows` | Headless client service and an explicit foreground diagnostic mode | Same client-core and runtime; separate administrative installation from ordinary use |
+| Existing `apps/l2tunnel-linux`; staging `apps/l2tunnel-windows` | Runnable Linux entry point; Windows currently provides help/version/plan only and rejects runtime startup | Planned common client-core/runtime reuse; Windows service/device behavior requires independent implementation and native qualification |
 | Existing `apps/l2tunneld` | Listener/server lifecycle and administrative endpoint | Reuse local control types where meaningful; reject client-only operations |
 | Existing `apps/l2tunnelctl` | CLI commands and machine-readable output | Uses local API; an explicit foreground mode may embed the same client-core |
 | Planned `clients/desktop` | Nonprivileged desktop GUI, profiles, status, operation progress and diagnostics | Linux/Windows first; framework selected at CL-17, no second protocol engine |
-| Existing `apps/l2tunnel-android` | Rust embedding boundary and narrow JNI bridge | Owns explicit descriptor/socket handoffs and translates errors without unwinding across FFI |
+| Existing `apps/l2tunnel-android` staging crate | rlib/cdylib status entry point; no JNI, VpnService or descriptor handoff yet | Planned narrow Android embedding boundary with explicit descriptor/socket ownership and no unwinding across FFI |
 | Planned `clients/android` | Kotlin application, VpnService lifecycle, permission UI, notifications and platform credential adapter | Calls the shared Rust core; Android GUI is independent of desktop toolkit choice |
 | Planned `testkit/client` | Fake device/service backend, local API contract fixtures and scripted client workflows | CLI/GUI parity and lifecycle tests before privileged native validation |
 
@@ -79,16 +94,21 @@ nor the peer management messages are forwarded to a user's TAP bridge or VXLAN.
   shared by file loading, CLI and GUI. Validate unknown fields, ranges, conflicts
   and unsupported combinations; provide a side-effect-free plan/diff operation.
   Use compare-and-set against a configuration revision to reject stale edits.
-- [ ] [CL-07] Expose `raw_tcp`, ordinary TCP and UDP carrier choices with an
-  ordered fallback policy, preferred/effective carrier, privilege availability,
+- [ ] [CL-07] Expose explicitly selected `raw_tcp`, ordinary TCP and UDP carrier
+  choices with an operator-configured fallback policy, requested/effective carrier,
+  privilege availability,
   implementation/qualification status and the reason for fallback. Keep default
   half duplex, full duplex, physical lanes and MUX channels distinct. No preference
   setting may silently weaken authentication or enable an unimplemented backend.
-- [ ] [CL-08] Expose UDP OpenVPN-style and QUIC-style handshake/cover profiles
-  separately from TCP TLS/HTTPS and L2TP profiles. Show the actual implementation's
-  compatibility level and negotiated profile; a resemblance profile is not a
-  claim of OpenVPN/QUIC interoperability. Keep endpoint address, trust/pin, SNI
-  policy and optional cover name separate, with a strict no-SNI option.
+- [ ] [CL-08] Expose OpenVPN-like, QUIC-header and minimal RTP audio/video-like UDP
+  cover choices separately from the original HTTPS TCP/TLS-to-raw path, retained
+  TCP/TLS, optional HTTPS/H2 streaming, genuine QUIC and L2TP profiles. Show actual
+  handshake/outer-layout, parseability and compatibility status; a project-specific
+  framing profile is not a claim of OpenVPN/QUIC interoperability. QUIC header
+  cover does not require native QUIC congestion control; minimal RTP does not
+  imply full WebRTC. Keep endpoint address, trust/pin, SNI policy and optional
+  cover name separate, with a strict no-SNI option. Current root/name verification
+  with SNI disabled does not implement configurable cover SNI or pin verification.
 - [ ] [CL-09] Add TUN/TAP settings and explicit VXLAN attachment settings: local
   device, addresses/routes, MTU, bridge, VNI, endpoints, UDP port, learning/flood
   policy and tenant limits. Advertise supported combinations from the backend;
@@ -115,6 +135,41 @@ instead of hiding why a saved profile cannot run on another platform. Every
 [mode inventory](mode-parity.md) entry needs a capability/status mapping; only
 implemented and qualified combinations may be activated. Retain explicit
 experimental labels and benchmark-only labels.
+All 47 P-* parity entries and every requested recovery, packed, rolling and proxy
+profile retain their full acceptance definitions. SW-11 includes Swift-to-other-
+record-profile epoch switching; exposing only in-Swift parameter changes does not
+complete it.
+
+### Common secure session and fixed-peer recovery
+
+- [ ] [CL-37] Integrate the SEC-01..SEC-12 common inner secure-session contract
+  through the same typed client/service API for every selected carrier, including
+  TCP/HTTPS. Separate requested/effective carrier/cover, security and data-record/
+  recovery policy, with implemented/tested/platform capability limits and failure
+  reasons. Preserve Swift AEAD behavior when security moves to the common layer,
+  mandatory integrity/replay protection and stable management across mode changes.
+  Do not present undecided library, key-provisioning, packet-format or cipher-
+  negotiation choices as owner decisions or available controls.
+- [ ] [CL-38] Make bounded automatic recovery the default for the fixed peer:
+  retain bounded logical session/delivery/recovery state during temporary outage,
+  reconcile it only with authenticated continuity evidence, and expose retry
+  count, deadlines, retained-state limits, pending outcome and terminal expiry.
+  Peer restart requires fresh authentication and a new cryptographic session;
+  never blindly replay old-session packets, reuse nonces, or report a replacement
+  carrier as the retained old connection. Test outage, peer restart, expiry,
+  exhausted retries, cancellation and uncertain mode-switch outcomes. The current
+  optional Swift reconnect that starts fresh ordering state does not satisfy this
+  state-retaining recovery contract.
+- [ ] [CL-39] Validate carrier continuity and cover limits through identical CLI/
+  GUI service operations: carrier handshake, inner authentication, user data and
+  management use the same connection or UDP socket and five-tuple. Report the
+  original HTTPS real TCP/TLS-to-raw path's same-port/sequence-space behavior,
+  ACK/RST/firewall/privilege limitations and recovery separately from optional H2
+  streaming. Validate OpenVPN-like/QUIC-header and minimal RTP audio/video layouts
+  against their selected parser contract, with no native QUIC controller or full
+  WebRTC prerequisite. Keep parser acceptance, interoperability and controlled
+  ISP QoS measurements distinct; separate TCP bootstrap plus UDP data cannot
+  satisfy this target.
 
 ### CLI delivery
 
@@ -255,7 +310,9 @@ Native lifecycle behavior must be validated on the declared Android API levels.
 ## Delivery order
 
 Deliver CL-01 through CL-16 alongside M0–M4 protocol work so native services have
-one reusable lifecycle and administrative API. CL-17 is a decision gate; GUI
+one reusable lifecycle and administrative API. Deliver CL-37 through CL-39 with
+the common secure-session and carrier migration; they do not supersede existing
+CL, SW, SEC or P-* gates. CL-17 is a decision gate; GUI
 implementation follows working service operations. Linux service and isolated
 lab validation provide the first real device path. Windows and Android progress
 in parallel after the common API stabilizes, with independent native gates.

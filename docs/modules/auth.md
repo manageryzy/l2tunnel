@@ -5,7 +5,17 @@ Status: **implemented and integration-tested on local TCP loopback**, 2026-11-12
 `l2tunnel-auth` is an OS/runtime-bound transport adapter. It does not move Tokio,
 socket or clock requirements into the public protocol core. This iteration
 implements real TCP/TLS and post-handshake member authentication, without TAP/TUN
-device setup, multistream joining, UDP/raw transport or traffic disguise.
+device setup, multistream joining, UDP/raw transport, data-carrier encapsulation
+or traffic shaping.
+
+This is the existing TLS adapter's implementation contract. The 2026-11-13
+owner-selected target is a [shared WireGuard-like point-to-point secure session](secure-session.md)
+over the selected carrier, preserving encrypted/authenticated data and replacing
+the separate TLS-bootstrap dependency. That target is planned; this adapter's
+exporter-bound member exchange cannot be treated as a bare datagram handshake.
+HTTPS-like still requires its real outer TCP/TLS handshake. Existing credentials,
+trust tests and historical receipts remain unchanged until a reviewed binding is
+specified; no dependency or credential migration is approved here.
 
 ## Exact initial embedding interface
 
@@ -121,6 +131,7 @@ fresh rcgen development certificates and do not install trust roots on the host.
 - [ ] [MOD-AUTH-09] Integrate authenticated management record classification and traffic framing; the raw post-auth byte stream does not supply those mechanisms.
 - [ ] [MOD-AUTH-10] Add provisioned credential storage/rotation/revocation policy, authenticated lane joining, key-update lifecycle and session teardown.
 - [ ] [MOD-AUTH-11] Independently qualify HTTPS cover, UDP-only/raw carriers, target middleboxes and native Linux/Windows/Android deployments.
+- [ ] [MOD-AUTH-14] Integrate the shared point-to-point authentication/key API through SEC-01..SEC-04 and SEC-09, preserving real outer TLS where required, peer/member/configuration binding, supported secret handling, original deadlines and current compatibility tests without private-state extraction or an implicit credential migration.
 
 ## Verified-channel reuse
 

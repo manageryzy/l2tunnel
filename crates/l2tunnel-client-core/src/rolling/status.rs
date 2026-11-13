@@ -10,15 +10,17 @@ pub enum Carrier {
     /// Genuine maintained QUIC with datagrams.
     Quic,
 }
-/// Custom UDP resemblance profile, never interoperability evidence.
+/// UDP framing selection; custom variants use the project-specific datagram codec.
+///
+/// The custom variants do not implement OpenVPN or QUIC interoperability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cover {
     /// Genuine QUIC has no custom UDP cover.
     NotApplicable,
-    /// Custom OpenVPN resemblance only.
+    /// Four-byte project-specific prefix with a lane-ID hint.
     OpenVpnLike,
-    /// Custom QUIC resemblance only.
+    /// Nine-byte project-specific prefix with a session-ID hint.
     QuicLike,
 }
 impl From<udp::CoverProfile> for Cover {

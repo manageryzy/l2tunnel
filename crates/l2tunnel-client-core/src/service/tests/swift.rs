@@ -245,8 +245,88 @@ async fn swift_forwards_reports_disconnects_and_reconnects_through_the_service()
     assert!(status.ok);
     let state = status.state.ok_or("no state")?;
     assert_eq!(state.phase, "forwarding");
-    assert_eq!(state.epoch, generation.value());
-    assert_eq!(state.swift.ok_or("no swift status")?.channels, 4);
+    assert_eq!(state.epoch, 0);
+    let swift = state.swift.ok_or("no swift status")?;
+    assert_eq!((swift.channels, swift.generation), (4, generation.value()));
+    assert_eq!((swift.forward_kbit, swift.repair_permille), (10_000, 0));
+
+    // A negotiated change from the initiating endpoint: both services report
+    // the committed epoch and the values in force, and traffic continues.
+    let change = |policy| ask(local::Action::SetSwiftPolicy { policy });
+    let reply = client
+        .lifecycle_request(change(local::SwiftChange {
+            forward_kbit: Some(20_000),
+            channels: Some(2),
+            repair_permille: Some(150),
+            ..local::SwiftChange::default()
+        }))
+        .await;
+    assert!(reply.ok, "{}", reply.code);
+    let state = reply.state.ok_or("no state")?;
+    assert_eq!(state.epoch, 1);
+    let swift = state.swift.ok_or("no swift status")?;
+    assert_eq!(
+        (
+            swift.forward_kbit,
+            swift.reverse_kbit,
+            swift.channels,
+            swift.repair_permille
+        ),
+        (20_000, 10_000, 2, 150)
+    );
+    assert_eq!(swift.send_bytes_per_second, 2_500_000);
+    hosts[0].send(&packet(6))?;
+    hosts[1].expect(&packet(6)).await?;
+    hosts[1].send(&packet(7))?;
+    hosts[0].expect(&packet(7)).await?;
+    // The acceptor's own view follows once its runtime reports.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let reply = server
+                .lifecycle_request(ask(local::Action::Status {}))
+                .await;
+            let swift = reply.state.and_then(|state| state.swift);
+            if swift.is_some_and(|swift| {
+                swift.policy_epoch == 1
+                    && swift.channels == 2
+                    && swift.send_bytes_per_second == 1_250_000
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    // Only the initiating endpoint proposes; invalid values and an empty
+    // change are refused; the same values again are a completed no-op.
+    let refused = server
+        .lifecycle_request(change(local::SwiftChange {
+            channels: Some(8),
+            ..local::SwiftChange::default()
+        }))
+        .await;
+    assert_eq!(
+        (refused.ok, refused.code.as_str()),
+        (false, "not_coordinator")
+    );
+    let invalid = client
+        .lifecycle_request(change(local::SwiftChange {
+            channels: Some(65),
+            ..local::SwiftChange::default()
+        }))
+        .await;
+    assert_eq!(
+        (invalid.ok, invalid.code.as_str()),
+        (false, "invalid_policy")
+    );
+    let again = client
+        .lifecycle_request(change(local::SwiftChange {
+            channels: Some(2),
+            ..local::SwiftChange::default()
+        }))
+        .await;
+    assert!(again.ok);
+    assert_eq!(again.state.ok_or("no state")?.epoch, 1);
     // The fixed profile has no negotiated changes.
     let apply = client
         .lifecycle_request(ask(local::Action::SwitchCompression {
@@ -296,7 +376,11 @@ async fn swift_forwards_reports_disconnects_and_reconnects_through_the_service()
     assert!(reply.ok, "{}", reply.code);
     let state = reply.state.ok_or("no state")?;
     assert_eq!(state.phase, "forwarding");
-    assert!(state.epoch > generation.value());
+    // A new session starts again from the configured policy.
+    assert_eq!(state.epoch, 0);
+    let swift = state.swift.ok_or("no swift status")?;
+    assert!(swift.generation > generation.value());
+    assert_eq!((swift.channels, swift.forward_kbit), (4, 10_000));
     connected(&server, second.operation).await?;
     assert_eq!(hosts[0].opened.load(Ordering::SeqCst), 2);
     assert_eq!(hosts[1].opened.load(Ordering::SeqCst), 2);

@@ -1,14 +1,23 @@
-# Swift profile: packed ordered channels over paced protected UDP
+# Swift algorithm and current protected-UDP composition
 
-Status: integration-tested on Linux TAP in owned unprivileged network
-namespaces. The explicit `--record-profile swift` CLI profile carried sixteen
-verified CUBIC flows within 2% of the Python simulator, rerun at the tunnel's
-real per-datagram overhead, on all four self-test paths: 79.7–80.5 Mbit/s
-against 80.72 on the 100/10 Mbit/s, 70 ms, 15% loss reference path. These are
-finite runs in one environment. Real devices, privileged host namespaces, IPv6
-underlay runs, Windows/Android, remote CI and long-duration soak are not
-covered. The session is owned by the shared lifecycle service, with
-`disconnect` and `reconnect` on the local control socket.
+Status: the pure Swift packing/recovery engine is implemented and protocol-tested.
+The current explicit `--record-profile swift --carrier udp` composition is
+implemented, with historical integration receipts from Linux TAP in owned
+unprivileged network namespaces. It authenticates over TCP/TLS and sends data
+over a separate UDP socket; it is not the target selected-carrier architecture.
+It is not the default connection mode. Real devices, privileged host namespaces,
+IPv6 underlay runs, Swift TUN qualification, Windows/Android, remote CI and
+long-duration soak remain open.
+
+The target is a reusable Swift data algorithm above the explicitly selected
+carrier, using the [common secure session](secure-session.md) for inner
+authentication, AEAD, replay protection and key lifecycle on every carrier,
+including HTTPS. The fixed-peer session retains the selected carrier's socket
+and five-tuple from handshake through data and management. A WireGuard-like
+security model does not select a library, require WireGuard wire compatibility,
+or make the current Swift-specific security protocol the common protocol.
+The common implementation and bounded automatic recovery are planned; the
+current CLI and wire formats below describe observed behavior.
 
 - [x] [SW-01] Pure bounded engine: pack native packets across fixed-capacity source symbols, send each once, recover by receiver-requested retransmission with optional sliding-window GF(256) repairs, and deliver one exact ordered stream. Evidence: [engine](../../crates/l2tunnel-swift/src/lib.rs) with [loss, reordering, tail, flush, back-pressure and malformed-input tests](../../crates/l2tunnel-swift/src/tests.rs).
 - [x] [SW-02] Stateless connection classification into ordering channels for Ethernet (one VLAN tag) and raw IPv4/IPv6, with fragments kept together and unknown input on channel zero. Evidence: [classifier and tests](../../crates/l2tunnel-swift/src/flow.rs).
@@ -21,7 +30,30 @@ covered. The session is owned by the shared lifecycle service, with
 - [x] [SW-08] Route swift through the shared service API with disconnect and reconnect: the service owns the authenticated session, sockets and device as one backend; the CLI only parses and prints. Evidence: [service backend](../../crates/l2tunnel-client-core/src/service/owner.rs), [two-service lifecycle test over real loopback TLS and UDP](../../crates/l2tunnel-client-core/src/service/tests/swift.rs), [CLI adapter](../../crates/l2tunnel-client-core/src/swift/cli.rs), and the `lifecycle` block of the [self-test receipts](../../work/swift-selftest43/impaired.json), which disconnects and reconnects the live tunnel with the real commands.
 - [ ] [SW-09] Qualify on real devices and privileged host namespaces, IPv6 underlay, TUN, long soak, CPU and memory.
 - [x] [SW-10] Rekeying and sequence rollover without reconnecting: each direction's datagram key changes every 2^28 datagrams through an HKDF-SHA256 chain with no message, and source sequences are 64-bit inside the engine with their low 32 bits on the wire. Evidence: [key chain and ratchet test](../../crates/l2tunnel-runtime/src/swift.rs) covering many generations in both directions, a reordered straggler, forged and skipped generations and retirement; [boundary-crossing engine test](../../crates/l2tunnel-swift/src/tests.rs) under 15% loss with and without repairs. A production-cadence rekey (2^28 datagrams, hours at the reference rate) has not been observed in a live run.
-- [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles; the profile is startup-only.
+- [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles, retaining authenticated management, matching digests, drain barriers, bounded retries and old-epoch rejection. Cross-profile selection is currently startup-only. SW-13 does not narrow or complete this gate.
+- [ ] [SW-13] Negotiated in-place change of the swift policy (budgets, channels, repair window and proportion, path MTU) on a live session: proposal and digest agreement on the retained authenticated stream, then a per-direction drain barrier, with datagram numbers and keys never reset. Implemented with focused tests ([control messages](../../crates/l2tunnel-swift/src/control.rs), [engine state machine, refusal and violation tests, two-runtime loopback test with two changes under traffic](../../crates/l2tunnel-runtime/src/swift.rs), [service and local `set-swift`](../../crates/l2tunnel-client-core/src/service/tests/swift.rs)); the [saved focused check](../../work/udp-framing-wording-20261113-final/focused-validation.json) passed, but the required aggregate check failed and [native receipts are mixed](#policy-change-receipts). Complete the failure/deadline and native qualification gates before checking this item. Its Swift-specific policy change is not a substitute for SW-11.
+- [ ] [SW-14] Compose the pure Swift algorithm over the explicitly selected carrier and common secure session, without an independent Swift connection/default or mandatory separate TCP/TLS bootstrap. Preserve packing, exact header records, channels, retransmission and optional repairs; prove handshake/data/control socket and five-tuple continuity, exact bytes, replay rejection, carrier overhead and unsupported-combination reporting. Implementation depends on the [common secure-session gates](secure-session.md).
+- [ ] [SW-15] Move Swift policy changes and full SW-11 switching onto the common authenticated session-control service, independent of data profile and carrier. Retain digest agreement, per-direction drain, idempotent retries, original deadlines, delayed old feedback rejection and bounded control progress under saturated traffic. Preserve all other record profiles and Python parity requirements.
+- [ ] [SW-16] Qualify fixed-peer bounded automatic recovery through the shared client/service API, enabled by default in the target design. Retain eligible logical-session delivery and mode-transaction state through temporary path loss and security-key refresh; distinguish peer state loss or explicit replacement sessions requiring authenticated reconciliation or reported loss. Bound liveness, proposal, barrier and retry waits and expose requested/effective recovery state and terminal failure. Test short loss, silent blackholes, restored paths, explicit disconnect and failed reauthentication without changing the host's network state.
+
+## Current layering and target correction
+
+The current client reuses the existing TLS/member authentication and directional
+exporter secrets, and the shared service owns connect/disconnect/reconnect/status.
+The pure `l2tunnel-swift` engine has no cryptography, socket or real clock.
+However, `l2tunnel-runtime::swift` defines its own protected datagram format,
+replay window and key chain rather than using `l2tunnel-datagram`; SW-13 also
+defines a private control codec instead of the common management transaction.
+These are separate session mechanisms around the algorithm, not another
+cryptographic primitive implementation: AEAD and HKDF use maintained `ring`.
+
+The target correction preserves the algorithm and historical experiments while
+converging authentication/security and management on common session services.
+Carrier appearance and its handshake remain separate from Swift recovery.
+The selected carrier must carry both session control and protected user data;
+a separate protected UDP data flow after TCP/TLS bootstrap does not satisfy continuity.
+Outer parseability, endpoint interoperability and measured ISP classification
+remain separate acceptance claims. No current Swift result proves any of them.
 
 ## Why this design
 
@@ -45,10 +77,12 @@ Three measurements shaped the rest:
   (416 KiB effective in the recorded runs). Before this the receiver itself
   dropped about 1.4% of datagrams.
 
-## Wire format
+## Current wire format
 
 Every UDP payload is `[packet number u64][ciphertext][tag 16]`. The packet
 number is the AEAD nonce, the replay identity and the repair coefficient seed.
+Protection is always ChaCha20-Poly1305 AEAD; Swift has no MAC-only or unprotected
+payload setting. Its authenticated packet-number replay window is 4096 packets.
 The `KeyPurpose::Data` exporter secret of each direction on lane 0 starts a
 chain: generation `g` protects packet numbers `g * 2^28` to `(g + 1) * 2^28 - 1`
 with `HKDF-Expand(secret_g, "l2tunnel swift v2 datagram key")`, and
@@ -90,22 +124,73 @@ readiness descriptor. An acceptor's setup operation keeps its listener open
 for up to 24 hours; each accepted TCP connection keeps the original handshake
 timeout.
 
-The private control socket serves three commands through that service:
+The private local control socket serves these commands through that service:
 
 - `status` reports the lifecycle phase (`forwarding`, `disconnected`,
-  `connecting`, `failed`), the generation as `epoch`, and the latest counters.
+  `connecting`, `failed`), the committed policy `epoch`, the separate session
+  `generation`, and the latest counters and effective policy.
 - `disconnect` aborts the live session and leaves the daemon idle. It is a
   local abort, not a peer-confirmed drain; the peer sees its liveness stream
   close.
 - `reconnect` replaces the live session, or connects again when idle, using
   the plan the daemon started with. The reply is sent once the new session is
   actually forwarding, or reports `failed`.
+- `set-swift` requests a negotiated Swift policy change from the initiating
+  endpoint; it does not select another record profile or carrier.
 
 Every session derives fresh keys from its own TLS handshake and starts with
-empty ordering state; packets in flight when a session ends are lost, as on
-any link flap. `--swift-restart on` sets a session up again one second after
-it ends or a setup attempt fails. Without it a daemon exits when its session
-fails or its peer leaves, and after a failed `reconnect`.
+empty ordering state; packets in flight when that session ends are lost.
+A temporary UDP outage does not by itself clear this state: recoverable socket
+errors are treated as loss while the session and bounded retained sources stay
+alive. Recovery can resume on path restoration. A fatal runtime error or closure
+of the retained TLS stream ends the session. Current `--swift-restart` defaults
+to `off`; `on` starts a new setup attempt after one second. This is a fresh
+authenticated session, not continuation of the old packet-number or recovery
+state. Without it a daemon exits when its session fails or its peer leaves,
+and after a failed `reconnect`. Target default bounded automatic recovery is
+tracked in SW-16 and the common secure-session ledger.
+
+## Negotiated policy change
+
+`set-swift` on the connecting endpoint's control socket changes any of the
+forward and reverse budgets, channel count, repair window, repair proportion
+and path MTU without a new handshake. Control messages are framed
+`[length u16][kind u8][fields]` on the retained TLS stream, which is reliable
+and ordered:
+
+1. `Propose{epoch, policy}` from the coordinator (the connecting endpoint).
+   The peer derives the complete configuration exactly as a fresh session with
+   that policy would and answers `Accept{epoch, digest}`, or `Reject` when the
+   policy is invalid, another change is in progress or the epoch is not the
+   next one. The coordinator ends the session if the digest differs from its
+   own derivation.
+2. After agreement each endpoint stops admitting native packets, keeps
+   sending until every source it sent is confirmed and its packing queue is
+   empty, and sends `Barrier{epoch, first_number}` with its next datagram
+   number.
+3. The peer delivers everything it holds, replaces its receiving engines and
+   header contexts, and answers `BarrierAck{epoch, feedback_from}` with its
+   own next datagram number. Only then does the sender replace its sending
+   engines, pacing and header contexts and resume. Sources and repairs
+   numbered below `first_number`, and feedback numbered below
+   `feedback_from`, belong to the drained epoch and are ignored.
+
+The two directions cross their barriers independently; the epoch is committed
+when both have. Focused tests exercise exact ordered delivery across this change;
+that does not prove loss-free switching under every device or outage condition.
+A direction that cannot drain within ten seconds ends the session with an error
+rather than switching unilaterally. A message that does not fit the current state
+ends the session. Only the coordinator proposes; the peer accepts any policy that
+is valid for the session, so the connecting side controls both budgets. A new
+session (reconnect or restart) starts again from the configured policy.
+
+This control protocol assumes a retained reliable TLS stream. The current
+five-second write bound only limits writing a control frame into that stream;
+there is no general Swift heartbeat/dead-peer deadline, and proposal-response
+and barrier-acknowledgement waits have no complete transaction deadline.
+A silent connection can therefore leave a change pending. General common-control
+retry, reconciliation and cross-profile switching remain required by SW-11,
+SW-15 and SW-16; a successful local `set-swift` is not evidence for those gates.
 
 ## Bounds and failure behavior
 
@@ -121,9 +206,9 @@ error. Socket errors that describe the path (full buffer, unbound peer,
 firewall or connection-tracking drop, missing route) are treated as loss; the
 loopback test first exposed this as a transient `EPERM`.
 
-## Measured results
+## Historical measured results
 
-Unprivileged namespaces, `tools/selftest.py`, sixteen CUBIC flows, release
+The following saved runs used unprivileged namespaces, `tools/selftest.py`, sixteen CUBIC flows, release
 build, TAP devices bridged to the traffic hosts, shaper counting IP bytes,
 tunnel budget 99% of the shaped rate:
 
@@ -166,3 +251,26 @@ harness.
 Simultaneous reverse bulk traffic on the 15% path gave 58.2 and 8.1 Mbit/s: the
 10 Mbit/s reverse budget is then shared between reverse data and forward
 acknowledgements. That is a distinct workload, not the reference.
+
+### Policy-change receipts
+
+The later [under-load policy-change receipt](../../work/swift-selftest45/impaired-switch-under-load.json)
+records a committed change, successful lifecycle checks, verified payload and
+sixteen clean flow closes. It measured 63.188 Mbit/s against the 80.72 Mbit/s
+reference, so `meets_reference` is false even though `integrity_passed` and
+`passed` are true: the harness only requires the performance gate when
+`--require-reference` is selected. Preserve the negative receipts as well:
+[the initial run](../../work/swift-selftest45/impaired.json) failed lifecycle
+checks; [the second](../../work/swift-selftest45/impaired-2.json) reached 79.614
+Mbit/s but failed a full-MTU functional check; [the third](../../work/swift-selftest45/impaired-3.json)
+failed a full-MTU check and measured 78.590 Mbit/s below the reference threshold.
+All three report `integrity_passed: false` and `passed: false`. These finite
+receipts do not identify their failures' cause, qualify SW-13 as complete, or
+establish the current source or a different selected carrier's behavior.
+
+The [saved aggregate check](../../work/udp-framing-wording-20261113-final/validation.json)
+failed Clippy in `l2tunnel-runtime::swift` (`manual_is_multiple_of` in a test).
+The [separate focused receipt](../../work/udp-framing-wording-20261113-final/focused-validation.json)
+records 467 passing Rust test executions including doctests and passing rustdoc,
+with the required aggregate check still failed. Neither is a fresh check of
+these documentation edits, a native lab run, remote CI or platform qualification.

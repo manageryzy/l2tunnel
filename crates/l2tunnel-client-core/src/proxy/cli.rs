@@ -224,6 +224,7 @@ mod service {
                 },
                 Action::SwitchCompression { .. }
                 | Action::SwitchActivePolicy { .. }
+                | Action::SetSwiftPolicy { .. }
                 | Action::Disconnect {}
                 | Action::Reconnect {}
                 | Action::DrainOpenVpn {} => Err("unsupported"),

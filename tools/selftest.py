@@ -336,11 +336,11 @@ def udp_probe(address: str, port: int) -> None:
     print(json.dumps({'sizes': len(sizes), 'answered': good}))
 
 
-def control(work: Path, binary: str, side: str, command: str) -> dict:
+def control(work: Path, binary: str, side: str, command: str, *options: str) -> dict:
     """Run one local control command against a live endpoint."""
     space = 'ea' if side == 'a' else 'eb'
     out = ns(space, binary, command, '--control-socket',
-             str(work / f'control-{side}.sock'), check=False)
+             str(work / f'control-{side}.sock'), *options, check=False)
     try:
         return json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -357,6 +357,21 @@ def lifecycle(work: Path, binary: str) -> dict:
     the tunnel must actually stop carrying traffic and actually resume."""
     phase = lambda reply: (reply.get('state') or {}).get('phase')
     checks = {}
+    # A negotiated policy change on the live session: fewer channels and a
+    # proportion of coded repairs, without reconnecting.
+    before = (control(work, binary, 'a', 'status').get('state') or {}).get('epoch') or 0
+    changed = control(work, binary, 'a', 'set-swift', '--swift-channels', '8',
+                      '--swift-repair-permille', '100')
+    state = changed.get('state') or {}
+    swift = state.get('swift') or {}
+    checks['policy_change_committed'] = (bool(changed.get('ok')) and state.get('epoch') == before + 1
+                                         and swift.get('channels') == 8
+                                         and swift.get('repair_permille') == 100
+                                         and swift.get('generation') == 1)
+    checks['traffic_after_policy_change'] = reachable()
+    refused = control(work, binary, 'b', 'set-swift', '--swift-channels', '4')
+    checks['only_initiator_proposes'] = (not refused.get('ok')
+                                         and refused.get('code') == 'not_coordinator')
     reply = control(work, binary, 'a', 'disconnect')
     checks['disconnect_reported'] = bool(reply.get('ok')) and phase(reply) == 'disconnected'
     checks['traffic_stopped'] = not reachable()
@@ -367,7 +382,8 @@ def lifecycle(work: Path, binary: str) -> dict:
             break
         time.sleep(0.5)
     checks['reconnect_reported'] = bool(resumed.get('ok')) and phase(resumed) == 'forwarding'
-    checks['new_generation'] = ((resumed.get('state') or {}).get('epoch') or 0) > 1
+    swift = (resumed.get('state') or {}).get('swift') or {}
+    checks['new_generation'] = (swift.get('generation') or 0) > 1
     checks['traffic_resumed'] = reachable()
     checks['acceptor_forwarding'] = phase(control(work, binary, 'b', 'status')) == 'forwarding'
     return checks
@@ -432,10 +448,17 @@ def run(args: argparse.Namespace) -> int:
 
         script = str(Path(__file__).resolve())
         checks = functional(script)
+        idle_counters = {}
+        if args.profile == 'swift':
+            # Counters right after the idle-path checks, so a failed check
+            # can be attributed to a drop or to delay.
+            for side in ('a', 'b'):
+                state = control(work, args.binary, side, 'status').get('state') or {}
+                idle_counters[side] = state.get('swift')
         result = {'profile': args.profile, 'path': args.path, 'duplex': args.duplex,
                   'flows': args.flows, 'host_mtu': args.host_mtu,
                   'inner_rto_min_ms': args.inner_rto_min_ms, 'ping': ping_summary,
-                  'functional': checks}
+                  'functional': checks, 'functional_counters': idle_counters}
         directions = [('forward', 'ha', 'hb', HOST_B, 'ea')]
         if args.reverse:
             directions.append(('reverse', 'hb', 'ha', HOST_A, 'eb'))
@@ -452,7 +475,16 @@ def run(args: argparse.Namespace) -> int:
             workers.append(subprocess.Popen(
                 ['ip', 'netns', 'exec', source, sys.executable, script, '--worker', 'send',
                  address, str(port), str(args.flows), str(total)]))
-        time.sleep(args.warmup)
+        switched = None
+        if args.switch_at is not None:
+            # Change the policy under load; the verified payload and clean
+            # close of every flow then cover the barrier itself.
+            time.sleep(args.switch_at)
+            switched = control(work, args.binary, 'a', 'set-swift', '--swift-channels', '8',
+                               '--swift-repair-permille', '50')
+            time.sleep(max(0.0, args.warmup - args.switch_at))
+        else:
+            time.sleep(args.warmup)
         before = {space: wan_bytes(space) for space in ('ea', 'eb')}
         time.sleep(args.duration)
         after = {space: wan_bytes(space) for space in ('ea', 'eb')}
@@ -478,6 +510,12 @@ def run(args: argparse.Namespace) -> int:
                                           'phase': (reply.get('state') or {}).get('phase'),
                                           'native_written': swift.get('native_written')}
                 if not reply.get('ok') or not swift.get('native_written'):
+                    passed = False
+            if switched is not None:
+                result['switch_under_load'] = {
+                    'ok': bool(switched.get('ok')),
+                    'epoch': (switched.get('state') or {}).get('epoch')}
+                if not switched.get('ok'):
                     passed = False
             result['lifecycle'] = lifecycle(work, args.binary)
             if not all(result['lifecycle'].values()):
@@ -588,6 +626,9 @@ def main() -> int:
                         help='fail unless forward goodput is within the tolerance of the '
                              'reference')
     parser.add_argument('--output')
+    parser.add_argument('--switch-at', type=float,
+                        help='negotiate a swift policy change this many seconds into the '
+                             'warm-up, under load (must not exceed --warmup)')
     parser.add_argument('--keep-logs', action='store_true')
     parser.add_argument('--log-tail', type=int, default=3000)
     parser.add_argument('extra', nargs='*', help='extra endpoint options after --')

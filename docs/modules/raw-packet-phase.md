@@ -14,6 +14,21 @@ qualification is claimed. Retained TCP/TLS remains the default. Earlier saved na
 unchanged. The remaining sections preserve the design contract; the concrete
 startup-only failure/window decisions below supersede the earlier fallback target.
 
+## Relationship to the reviewed target
+
+The [shared secure-session target](secure-session.md) retains this requested
+real TCP/TLS-to-custom-packet ownership path and its original tuple/sequence
+constraints. It adds common WireGuard-like inner authentication and encrypted
+data/control rather than a separate Swift connection mode. The current
+exporter-bound implementation and startup-only tables below remain historical
+implementation/design scope, not a new owner selection of a library, timeout,
+credential policy or reduced feature set. Four clean Linux integrity-mode native
+cases do not qualify that new composition or general middlebox behavior.
+
+Default bounded recovery must honor the irreversible TLS-to-packet seal; it cannot
+resume TLS on a retired tuple, invent peer state or reset an uncertain mode
+transaction. Integration needs SEC-03/SEC-07..SEC-09 and the full raw/native gates.
+
 ## Decision and compatibility boundary
 
 An ACK-independent *recovery* path is feasible only if we distinguish recovery
@@ -181,8 +196,9 @@ fence. Final byte fences are measured after Seal and compared in step 4. This
 avoids self-referential TLS length assumptions. The demultiplexer is armed
 *before* Seal: an early valid PhaseHello is quarantined and cannot accidentally
 enter rustls or smoltcp as TLS stream bytes. Classification requires valid
-phase-domain authentication, not magic-prefix resemblance; its crypto work and
-queue slots are bounded. Unauthenticated input cannot trigger handoff.
+phase-domain authentication; a matching packet prefix alone is insufficient.
+Its crypto work and queue slots are bounded. Unauthenticated input cannot trigger
+handoff.
 
 After transfer, retain only a finite old-prefix responder, not a second live TCP
 engine. An exact-tuple validated duplicate entirely before the sealed receive
@@ -204,9 +220,10 @@ fresh connection. The existing retained profile remains independently selectable
 
 Use existing `PacketSealer`/`PacketOpener` from
 [l2tunnel-datagram](../../crates/l2tunnel-datagram/src/lib.rs), with fresh
-exporter-bound context including the phase configuration. Its fixed cover prefix
-can remain the existing custom OpenVPN-like shape inside TCP payload; it is not
-OpenVPN, QUIC, TLS or HTTPS. Do not add fake TLS record headers or custom AEAD.
+exporter-bound context including the phase configuration. Its existing
+`OpenVpnLike` project-specific prefix can remain inside TCP payload. This packet
+phase does not implement OpenVPN, QUIC, TLS or HTTPS interoperability. Do not
+prepend TLS record headers to this packet phase or introduce custom AEAD.
 Confidentiality-off selects existing domain-separated HMAC integrity, never
 unauthenticated user payload. TLS record counters are retired with TLS; packet
 nonces continue monotonically under new, distinct exporter-derived packet keys.

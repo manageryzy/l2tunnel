@@ -18,6 +18,16 @@ The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a 
 
 All deployable Python mode families are requirements, including unfavorable modes retained for comparison. Research algorithms remain tracked; analytical upper bounds and noncausal oracles are test tools and cannot be advertised as wire modes.
 
+The target [common secure session](modules/secure-session.md) and explicitly
+selected carrier are composition boundaries around these algorithms, not a
+replacement inventory. Swift remains a reusable packing/recovery algorithm;
+its current separate TCP/TLS-bootstrap and protected-UDP client path does not
+qualify selected-carrier continuity, common security or another mode family.
+RLNC, parity, rolling, packed, proxy and every catalog entry remain in scope.
+Negotiated switching between Swift and the other record profiles retains the
+full SW-11 gate; changing Swift's own policy under SW-13 is only an internal
+policy operation and does not satisfy cross-profile parity or switching.
+
 ## Recovery and scheduling
 
 | Catalog ID | Existing Python implementation | Knobs and behavior that must survive the port | Rust milestone |
@@ -138,7 +148,7 @@ The first three use 90-second traffic, 5-second warmup parameter, 30-second drai
 
 The implementation priority is therefore bounded shared MUX, independently decodable short frames, **0.5 ms source packing and configurable ACK coalescing**, while measuring queueing, reverse capacity and context head-of-line delay. Do not select one redundancy percentage as a universal optimum. Negative, incomplete, unsteady, and baseline observations remain part of the acceptance corpus; the latest 71 outside-plot cases must not be silently discarded.
 
-All these results exclude codec/crypto CPU service and real kernel/TAP scheduling. Compact-wire profiles require zero authentication bytes; raw-IP/CRC byte savings must be recalculated for authenticated TCP/UDP records. Bulk FEC uses coefficient/rank simulation and ledger-recovered source bytes. Link queues, loss process, synthetic inner TCP, known-capacity pacing, stable-window admission and finite drain are material assumptions. None verifies raw TCP sequence continuity, TLS disguise, active-probe behavior, real congestion fairness, platform support or safe configuration switching. The shared TCP/QUIC/KCP observations preserve their actual record path, controller, queue-gate version, runtime and eligibility; they cannot substitute for kernel or real-device benchmarks.
+All these results exclude codec/crypto CPU service and real kernel/TAP scheduling. Compact-wire profiles require zero authentication bytes; raw-IP/CRC byte savings must be recalculated for authenticated TCP/UDP records. Bulk FEC uses coefficient/rank simulation and ledger-recovered source bytes. Link queues, loss process, synthetic inner TCP, known-capacity pacing, stable-window admission and finite drain are material assumptions. None verifies raw TCP sequence continuity, TLS-based traffic classification, active-probe behavior, real congestion fairness, platform support or safe configuration switching. The shared TCP/QUIC/KCP observations preserve their actual record path, controller, queue-gate version, runtime and eligibility; they cannot substitute for kernel or real-device benchmarks.
 
 ## Completion criteria for parity
 
@@ -156,3 +166,18 @@ actual TCP proxy windows, QoS, internal L2 management, VXLAN and OpenVPN-like/QU
 UDP covers are additional requirements, tracked in the
 [implementation checklist](implementation-checklist.md) and its detailed task lists.
 They are not retroactive Python results and do not change these 47 inventory IDs.
+
+The [common inner security and recovery target](modules/secure-session.md)
+adds fixed-peer authentication, AEAD data for all carriers including HTTPS,
+replay/rekey isolation, authenticated control and bounded automatic recovery.
+Its WireGuard-like model has no selected implementation library yet.
+Independent authenticated-cleartext requirements of existing generic UDP/raw
+profiles remain tracked; keeping Swift encrypted does not remove them. Carrier
+appearance work, including the minimal QUIC and RTP/media appearance targets,
+does not establish protocol interoperability or measured ISP QoS treatment.
+The real TCP/TLS bootstrap followed by raw TCP-shaped data in the original
+sequence space remains an independent HTTPS-path requirement, with privilege,
+kernel ACK/RST, firewall, platform and recovery gates. Neither a real HTTP
+stream nor a new inner security library silently substitutes for that path.
+All these additions require their own implementation and runtime evidence;
+none closes or removes an existing P-* task.

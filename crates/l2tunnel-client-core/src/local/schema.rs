@@ -33,11 +33,40 @@ pub enum Action {
         /// Target independent packet compression policy.
         compression: Compression,
     },
+    /// Negotiate a new swift policy on the live session. Absent values keep
+    /// what is in force; the reply reports the committed epoch.
+    SetSwiftPolicy {
+        /// Requested values.
+        policy: SwiftChange,
+    },
     /// Request an exact policy from the session's authenticated active catalog.
     SwitchActivePolicy {
         /// Complete channel/weight policy; partial local mutations are not supported.
         policy: crate::active_managed::Policy,
     },
+}
+/// Swift policy values to change; every field is optional.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwiftChange {
+    /// Client-to-server budget in kilobits of IP bytes per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_kbit: Option<u64>,
+    /// Server-to-client budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_kbit: Option<u64>,
+    /// Ordering channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u64>,
+    /// Sources covered by one repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    /// Proportional repairs per thousand sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_permille: Option<u64>,
+    /// IP path MTU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_mtu: Option<u64>,
 }
 /// One finite, versioned local request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

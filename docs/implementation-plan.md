@@ -11,6 +11,54 @@ progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN ac
 flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.
 Update checkbox evidence and capability status with every implementation change.
 
+## Target architecture and migration scope
+
+The approved target is a fixed point-to-point tunnel between an owner's client
+and server. A reusable common inner secure session must provide peer authentication,
+key exchange, record protection, replay defense, rekeying and authenticated
+management across every selected carrier, including TCP/HTTPS. This is a
+WireGuard-like separation of responsibilities, not a decision to use WireGuard's
+wire protocol, a particular library, provisioning scheme, packet format or cipher
+negotiation. Those contracts remain open in the
+[secure-session design and SEC-01..SEC-12 ledger](modules/secure-session.md).
+Account systems, multi-device enrollment and multi-peer product workflows are
+not assumed by this point-to-point design.
+
+The operator selects the outer carrier/cover independently of the data algorithm:
+OpenVPN-like UDP, QUIC header cover, minimal RTP audio/video-like UDP, or the
+original HTTPS TCP/TLS-to-raw path. Swift provides packing, ordering and recovery
+inside the selected carrier; it is not an independent default carrier. Its
+existing AEAD behavior must survive moving security into the common session.
+All other recovery, codec, packed, rolling, proxy and 47 Python-parity requirements
+remain in scope, including SW-11 switching between Swift and other record profiles.
+QUIC header cover does not require the native QUIC congestion controller. Existing
+genuine QUIC remains a separate implemented transport/reference capability. The
+RTP cover is a minimal media-like encapsulation, not full WebRTC.
+
+Carrier handshake, common inner authentication, data and management continue on
+the same carrier connection or UDP socket and five-tuple. Separate TCP/TLS
+bootstrap followed by another UDP data flow is historical implementation evidence,
+not the target. The HTTPS requirement remains a real TCP/TLS handshake followed
+by raw TCP-shaped packets on the same ports and sequence space without ordinary
+TCP ACK-driven transport. Valid HTTPS/H2 streaming is an optional distinct
+compatibility profile; it does not satisfy that raw requirement. Each cover needs
+its own explicit wire/handshake contract and parser validation. Parseability,
+endpoint interoperability and measured ISP classification remain separate claims.
+
+Default automatic recovery is required with bounded timers, retained state and
+retry work. A temporary outage retains bounded logical session, delivery and
+recovery state for authenticated reconciliation. Peer restart requires fresh
+authentication and a new cryptographic session; never blindly replay old-session
+packets or reuse their nonces. State retention, expiry, terminal failure and any
+fresh carrier connection must be observable. This does not promise preservation
+of the old five-tuple when recovery must create a new carrier connection.
+
+These are planned migration requirements. Current certificate-root/name and
+exporter-bound member APIs, finite Linux receipts, and existing custom UDP/raw
+formats do not implement the common target. Configurable cover SNI independent of
+server trust and pin-based verification remain unfinished. Preserve simulator
+outputs, source-bound receipts and independently useful existing transports.
+
 ## Source projects
 
 | Project | Responsibility | Current state |
@@ -33,7 +81,7 @@ Update checkbox evidence and capability status with every implementation change.
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
 | `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC with optional real FEC |
 | `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP service owns setup/cancel/reconnect/apply; portable schema and private Unix transport; other profile lifecycles and GUI remain open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift CLI paths use the shared service; profile-specific status/apply support differs; other profile lifecycles, default state-retaining recovery and GUI remain open |
 | `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
 | `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Status/help CLI; runtime returns nonzero |
 | `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |
@@ -48,6 +96,8 @@ Additional planned source boundaries (create at the first actual implementation)
 | --- | --- |
 | Native Windows/Android adapter crates | Reviewed driver/FD/JNI boundaries and native device lifecycle |
 | `clients/desktop`, `clients/android` | Future desktop GUI and Kotlin Android GUI/VpnService shell |
+| Common secure-session implementation boundary | Reusable inner authentication, key exchange, protection, replay/rekey and management for every carrier; exact maintained dependency and crate boundary remain undecided |
+| QUIC-header and minimal RTP cover adapters | Explicit outer layouts over the selected UDP socket, independent of the inner secure session and data recovery; no native QUIC controller or full WebRTC implied |
 
 [Client design](client-design.md) assigns service/runtime/platform responsibilities;
 [flow control](flow-control.md) and [overlays](overlay-and-carriers.md) define protocol
@@ -77,34 +127,49 @@ checks. Remote CI is a separate receipt; no remote is configured here.
 
 ### M1: authenticated connection and transport
 
-1. Build persistent TCP + TLS first. Complete TLS, pinned/CA server verification,
-   Ed25519 member authentication bound to exporter/nonces/capabilities, session
-   creation, authenticated lane joins and bounded control messages.
-2. Keep socket and TLS object through auth and data; capture no reconnect/new SYN
-   at the boundary. Test no-SNI mode plus independently configured cover name.
-   Implement valid HTTPS profile, including ALPN and unauthenticated handling.
-3. Add both `openvpn_like` and `quic_like` UDP cover profiles, AEAD/MAC packet
-   protection and staged TLS-authenticated lane bootstrap. Standalone authenticated
-   UDP bootstrap is separately required; explicit UDP must eventually work without
-   TCP reachability. Prove
-   replay windows, role/lane separation, packet-number exhaustion, rekey,
-   downgrade rejection and resource limits. Confidentiality-off retains integrity.
-4. Prototype raw TCP with a single packet owner and a specified bootstrap-to-data
-   transition. Qualify sequence/window/options/RST/conntrack/NAT behavior. Preserve
-   preference raw > TCP > UDP where available; capability mismatch cannot silently
-   activate different semantics. Publish concrete failure reasons and backend state.
-5. Implement the requested L2TP cover adapter with a real protocol contract and
+1. Freeze the common secure-session contract under SEC-01..SEC-12 before choosing
+   a maintained implementation. Specify peer trust/provisioning, authenticated
+   capability/digest binding, authenticated lane joins, key domains, record
+   protection and common management
+   without changing the existing Swift AEAD guarantee. Keep optional inner
+   confidentiality versus mandatory integrity/replay protection explicit; no final
+   packet format or cipher negotiation is selected by this plan.
+2. Compose that same inner session through every selected carrier, including
+   TCP/HTTPS. Preserve the original connection/socket and five-tuple through its
+   handshake-to-data boundary; UDP must work without a second TCP bootstrap flow.
+   Keep existing TCP/TLS and staged UDP receipts as historical scoped evidence.
+3. Specify and validate the OpenVPN-like, QUIC-header and minimal RTP audio/video
+   cover contracts independently. Header-only QUIC does not require native QUIC
+   congestion control; genuine QUIC stays a separate capability/reference. RTP
+   does not imply WebRTC signaling, ICE or a full WebRTC stack. Prove bounded
+   pre-authentication work, replay, role/lane separation, packet-number exhaustion,
+   rekeying, downgrade rejection and exact protected MTU/wire budgets.
+4. Qualify the original HTTPS TCP/TLS-to-raw transition with one packet owner,
+   retained ports and sequence space, configurable SNI independent of our server
+   trust, sequence/window/options behavior, kernel ACK/RST fencing, privileges,
+   firewall/conntrack/NAT behavior and
+   bounded failure recovery. Keep required peer management alive on that same
+   carrier after leaving TLS record transport. Do not substitute H2 streaming or
+   ordinary TCP ACK-driven delivery for the raw requirement.
+5. Preserve retained TCP/TLS and optional valid HTTPS/H2 compatibility paths with
+   their kernel ACK/retransmission/HOL limitations. HTTPS/H2 must honor selected
+   ALPN and bounded unauthenticated HTTP handling. Any fallback needs explicit
+   operator configuration and an observable effective profile; raw unavailability
+   cannot silently select incompatible semantics. Existing genuine QUIC and other
+   requested carrier acceptance gates remain independently tracked.
+6. Implement the requested L2TP cover adapter with a real protocol contract and
    interoperability tests; do not call TCP prefix bytes L2TP.
+7. Implement bounded default automatic recovery, authenticated state reconciliation
+   after temporary outage, and fresh authentication after peer restart. Exercise
+   retained-state expiry, retry exhaustion, duplicate/late packets and uncertain
+   management commits without nonce reuse or blind old-session replay.
 
-TCP compatibility may ship before raw qualification; mark its per-connection HOL
-and kernel ACK behavior explicitly. Native recovery comparisons require datagram
-semantics. Failed raw permission probing must not abort an otherwise compatible
-TCP configuration. All carrier profiles keep the same upper session API.
-
-Exit: loopback multi-lane auth integration, hostile/invalid/replayed inputs, failure
-timeouts, real TLS packet capture, no plaintext tunnel banners, bounded memory,
-TCP fallback without raw privileges, and independent raw/L2TP qualification status.
-No throughput target is accepted using only simulation or encryption-byte counters.
+Exit: actual selected-carrier handshake/data/control integration, exact bytes and
+identity/config binding, hostile/replayed input, original deadlines and bounded
+memory/work, captures of connection continuity, and independent cover/raw/platform
+qualification. Cover parser acceptance does not prove endpoint interoperability
+or improved ISP QoS; the latter needs controlled path measurements. No throughput
+target is accepted using only simulation or encryption-byte counters.
 
 ### M2: frame bytes, shared MUX and basic codecs
 
@@ -168,12 +233,15 @@ unsupported-flow semantics. Do not migrate existing transparent TCP flows into a
 proxy on reload. Complete all FC-* active-flow and QoS gates.
 
 Implement the full PREPARE/READY/DRAIN/COMMIT/RETIRE protocol from architecture.md
-over the stable internal L2 management channel.
+over the stable internal L2 management channel of the common secure session.
 Allow compatible MUX, codec and recovery changes without breaking outer sockets.
 Handle duplicate/lost control messages, old frames, commit uncertainty, shrink
 limits, staged state expiry, simultaneous proposals and peer restart. Packet/key
 counters cannot reset during a switch. Device-layer/trust/endpoint changes use a
 controlled reconnect and must be reported as such.
+SW-11 explicitly includes negotiated epoch switching between Swift and other
+record profiles. An in-Swift policy change does not close that requirement or
+reduce any RLNC, parity, rolling, packed or proxy acceptance gate.
 
 Exit: two-endpoint fault-injection tests at every transition, exactly-once frame
 release, no old/new context mixing, all M4 inventory modes exercised, saturated
@@ -184,7 +252,8 @@ local ReloadGuard is not this milestone.
 
 Build the shared client-core/local control API and full CLI, then desktop GUI
 and Android GUI using the same operations, schema and capability reporting. Follow
-CL-01..CL-36, including asynchronous reload progress, privilege separation and
+CL-01..CL-39, including common secure-session selection, bounded outage recovery,
+asynchronous reload progress, privilege separation and
 CLI/GUI parity. Select a desktop toolkit at its explicit design gate.
 
 Complete Linux TAP/TUN wrappers, Windows Wintun/TAP driver/service handling, and

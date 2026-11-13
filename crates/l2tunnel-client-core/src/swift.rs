@@ -10,7 +10,6 @@ use super::*;
 use l2tunnel_auth::{Direction, KeyPurpose, Secret, SessionInfo};
 use l2tunnel_runtime::swift as runtime;
 pub use l2tunnel_runtime::swift::Snapshot;
-use std::pin::Pin;
 use tokio::net::UdpSocket;
 
 /// Sources that may be outstanding per direction.
@@ -41,6 +40,31 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The negotiable protocol values, as the control stream carries them.
+    pub fn policy(self) -> io::Result<runtime::Policy> {
+        let invalid = |_| io::Error::new(io::ErrorKind::InvalidInput, "swift policy out of range");
+        Ok(runtime::Policy {
+            path_mtu: u16::try_from(self.path_mtu).map_err(invalid)?,
+            forward_kbit: u32::try_from(self.forward_kbit).map_err(invalid)?,
+            reverse_kbit: u32::try_from(self.reverse_kbit).map_err(invalid)?,
+            channels: u8::try_from(self.channels).map_err(invalid)?,
+            window: u8::try_from(self.window).map_err(invalid)?,
+            repair_permille: u16::try_from(self.repair_permille).map_err(invalid)?,
+        })
+    }
+    /// These settings with the negotiable values replaced; addresses and
+    /// reporting are kept.
+    pub fn with_policy(self, policy: runtime::Policy) -> Self {
+        Self {
+            path_mtu: usize::from(policy.path_mtu),
+            forward_kbit: u64::from(policy.forward_kbit),
+            reverse_kbit: u64::from(policy.reverse_kbit),
+            channels: usize::from(policy.channels),
+            window: usize::from(policy.window),
+            repair_permille: u32::from(policy.repair_permille),
+            ..self
+        }
+    }
     fn overhead(self) -> usize {
         if self.peer.is_ipv4() { 28 } else { 48 }
     }
@@ -178,6 +202,27 @@ pub struct Status {
     pub header_bytes_saved: u64,
     /// Largest per-channel round-trip estimate in microseconds.
     pub round_trip_micros: u64,
+    /// Committed policy epoch; zero until the first negotiated change.
+    #[serde(default)]
+    pub policy_epoch: u64,
+    /// Service generation of this session; a reconnect starts a new one.
+    #[serde(default)]
+    pub generation: u64,
+    /// Client-to-server budget in force, kilobits of IP bytes per second.
+    #[serde(default)]
+    pub forward_kbit: u64,
+    /// Server-to-client budget in force.
+    #[serde(default)]
+    pub reverse_kbit: u64,
+    /// Path MTU in force.
+    #[serde(default)]
+    pub path_mtu: u64,
+    /// Repair window in force.
+    #[serde(default)]
+    pub window: u64,
+    /// Proportional repairs per thousand sources in force.
+    #[serde(default)]
+    pub repair_permille: u64,
     /// Key generation protecting sent datagrams; keys change automatically
     /// every [`l2tunnel_runtime::swift::KEY_PACKETS`] datagrams.
     #[serde(default)]
@@ -206,6 +251,8 @@ impl Status {
             header_bytes_saved: snapshot.header_bytes_saved,
             round_trip_micros: snapshot.sender.smoothed_rtt_micros,
             key_generation: snapshot.key_generation,
+            policy_epoch: snapshot.policy_epoch,
+            ..Self::default()
         }
     }
 }
@@ -245,9 +292,16 @@ impl std::os::fd::AsRawFd for Native {
     }
 }
 
+/// The retained authenticated stream of either role.
+trait Control: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Control for T {}
+
 /// One authenticated endpoint ready to forward.
 pub struct Session {
-    control: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
+    control: Box<dyn Control>,
+    settings: Settings,
+    connection: ConnectionConfig,
+    client: bool,
     socket: UdpSocket,
     send: Secret,
     receive: Secret,
@@ -261,6 +315,8 @@ impl Session {
         socket: UdpSocket,
         config: runtime::Config,
         client: bool,
+        settings: Settings,
+        base: ConnectionConfig,
     ) -> io::Result<Self> {
         let export = |direction| {
             connection
@@ -276,7 +332,10 @@ impl Session {
         };
         let (stream, info) = connection.into_parts();
         Ok(Self {
-            control: Box::pin(runtime::closed(stream)),
+            control: Box::new(stream),
+            settings,
+            connection: base,
+            client,
             socket,
             send,
             receive,
@@ -303,12 +362,40 @@ impl Session {
     pub fn config(&self) -> runtime::Config {
         self.config
     }
+    /// Derivation of both directions and the digest for a proposed policy,
+    /// exactly as a fresh session with that policy would be authenticated.
+    fn resolver(&self) -> runtime::Resolver {
+        let (settings, connection, client) = (self.settings, self.connection, self.client);
+        let report = self.config.report_interval;
+        Box::new(move |policy| {
+            let next = settings.with_policy(*policy);
+            let mut send = next.runtime(connection, client)?;
+            send.report_interval = report;
+            Ok(runtime::Resolved {
+                send,
+                receive: next.runtime(connection, !client)?,
+                digest: next.session(connection)?.digest.0,
+            })
+        })
+    }
     /// Forward until the peer closes the retained control stream or an error
-    /// occurs. `report` receives periodic and terminal counters.
-    pub async fn run<D>(self, device: D, report: impl FnMut(&Snapshot)) -> io::Result<()>
+    /// occurs. `report` receives periodic and terminal counters. `requests`
+    /// carries local policy changes; the initiating endpoint proposes them
+    /// and either endpoint accepts any policy valid for the session.
+    pub async fn run<D>(
+        self,
+        device: D,
+        requests: Option<runtime::Requests>,
+        report: impl FnMut(&Snapshot),
+    ) -> io::Result<()>
     where
         D: l2tunnel_device::PacketDevice<Error = io::Error> + std::os::fd::AsRawFd,
     {
+        let switching = runtime::Switching {
+            coordinator: self.client,
+            requests,
+            resolve: self.resolver(),
+        };
         runtime::run(
             device,
             self.socket,
@@ -318,6 +405,7 @@ impl Session {
             },
             self.config,
             self.control,
+            switching,
             report,
         )
         .await
@@ -367,7 +455,7 @@ pub async fn connect(
     )
     .await
     .map_err(base_auth_error)?;
-    Session::new(connection, socket, runtime, true)
+    Session::new(connection, socket, runtime, true, settings, config)
 }
 
 /// Accept one member on `listener` and derive the directional data keys.
@@ -387,7 +475,7 @@ pub async fn accept(
     let connection = auth::server_accept(tcp, tls, members, session, deadline.remaining()?)
         .await
         .map_err(base_auth_error)?;
-    Session::new(connection, socket, runtime, false)
+    Session::new(connection, socket, runtime, false, settings, config)
 }
 
 #[cfg(test)]

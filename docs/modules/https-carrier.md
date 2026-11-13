@@ -6,6 +6,17 @@ from the custom raw packet phase. No raw-packet traffic is relabelled as HTTPS.
 The architecture requires actual HTTP handling, matching negotiated ALPN and
 bounded ordinary behavior for unauthenticated requests.
 
+This module describes the separate genuine HTTPS/HTTP2 compatibility profile.
+The owner's original HTTPS-like requirement remains a real TCP/TLS handshake
+followed by custom TCP-shaped packets on the same ports and sequence space,
+without ordinary TCP ACK-driven data transport. This HTTP2 stream does not
+complete that deliverable. The [shared secure-session target](secure-session.md)
+adds common WireGuard-like internal authentication/protection/control across
+carriers while retaining the required real outer TLS and its own-server trust.
+Its composition, configurable SNI, raw ownership, privilege/firewall policy and
+failure recovery remain explicit gates; neither this module nor its checked
+local tasks establishes that new path.
+
 ## Proposed concrete profile
 
 Use maintained `h2`0.4.19 and `http`1.5.0, both present in the local registry,

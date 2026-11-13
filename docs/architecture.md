@@ -9,6 +9,38 @@ Track implementation in the [checkbox ledger](implementation-checklist.md); deta
 [flow control](flow-control.md), [management/VXLAN/carriers](overlay-and-carriers.md)
 and [CLI/GUI clients](client-design.md) extend this architecture.
 
+## Reviewed target and implementation boundary
+
+The 2026-11-13 owner discussion confirmed a fixed point-to-point deployment for
+studying tunnel transport and QoS between controlled endpoints. The target uses
+one shared internal secure-session protocol across explicitly selected carriers,
+including TCP/HTTPS-like. Swift remains a packing/recovery algorithm inside it.
+The owner preferred lightweight WireGuard-like authentication and session lifecycle,
+while retaining Swift's encrypted and authenticated data. The preceding TLS-based
+bootstrap is the integration boundary being replaced; data security is retained.
+
+The [secure-session contract](modules/secure-session.md) separates those confirmed
+requirements from unselected dependencies, wire formats, key/provisioning APIs,
+timeout values and migration policies. Its SEC-* tasks are all planned. The
+following are evidence boundaries, not a declaration that the target is running:
+
+| Area | Current evidence | Target gap |
+| --- | --- | --- |
+| Pure protocol libraries | Typed, bounded engines with caller-supplied time/I/O boundaries. | Preserve them through common security and carrier composition. |
+| Swift | TLS/member authentication plus separate AEAD UDP data, private TLS policy control and finite Linux TAP receipts. It is explicitly selected, not the CLI default. | Shared carrier-independent authentication/protection/control; original-flow continuity and full SW-11. |
+| Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
+| OpenVPN-like UDP | Real TLS over custom reliable UDP control; standalone native slices exist. | The custom 144-byte gate is not the requested OpenVPN wire-format handshake. |
+| HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
+| Platforms | Linux has named, finite native compositions. Windows is a status/help scaffold; Android has no JNI/VpnService. | New common-session support, Windows and Android execution are unqualified. |
+
+The owner relaxed QUIC-like to header appearance without native QUIC data ACK or
+congestion semantics, and added minimal audio/video media appearance rather than
+a full WebRTC stack. This does not relax the original OpenVPN wire-handshake gate
+or the original HTTPS-like raw requirement. Full endpoint interoperability is not
+required. Standard-header parsing, complete protocol validity, identification and
+ISP QoS treatment are separate claims; initial-packet classification is an
+unverified hypothesis to measure on the actual connection.
+
 ## Library boundary and layering
 
 ```mermaid
@@ -20,13 +52,14 @@ flowchart TB
     Q --> F[Frame validation, fragmentation and lossless codecs]
     F --> M[Shared MUX admission and connection affinity]
     M --> R[Record packing, per-channel release, ARQ / FEC]
-    R --> S[Authenticated multistream session and epoch control]
+    R --> S[Shared AEAD, replay, key generations and logical session]
+    HS[Common WireGuard-like authentication and session lifecycle] --> S
     MG[Stable internal L2 management] --> S
     VX[Explicit VXLAN VTEP adapter] --> Q
-    S --> C[Carrier, optional inner protection and framing]
-    C --> T[Persistent TCP + TLS]
-    C --> U[Authenticated UDP]
-    C --> X[Experimental raw TCP packet engine]
+    S --> C[Explicit carrier appearance and framing]
+    C --> U[Original UDP socket: OpenVPN-like / QUIC-like / media-like]
+    C --> X[Original TCP owner: real TLS then custom packet phase]
+    C --> T[Explicit retained TLS / HTTPS streaming / genuine QUIC compatibility]
 ```
 
 The diagram is conceptual: classification precedes codec selection; the shared
@@ -57,11 +90,15 @@ cleanup; portable command types are separate from Unix IPC. Other profile
 lifecycle paths and negotiated common-control dispatch remain open. These do not complete the
 conceptual stack or authorize unchecked combinations. Each composition must
 bind its selected policies before I/O and reject unsupported combinations.
+The newer common-session correction is tracked by FIX-13 and SEC-*; a service
+wrapper around Swift's current dual-flow design does not satisfy it. The CLI and
+GUI share one service API and report requested/effective carrier, appearance,
+protection, data profile, recovery state and unsupported capability reasons.
 
 ## Connection bootstrap, authentication and multistream joining
 
-The portable first implementation uses maintained Rust TLS (rustls, exact version
-and provider selected/locked at M1), TLS 1.3, and a persistent TCP socket:
+The existing retained-TLS compatibility implementation uses maintained rustls,
+TLS 1.3 and a persistent TCP socket. Its contract and historical tests remain:
 
 1. Dial the endpoint IP/address independently of the optional TLS server name.
    Complete TLS with server identity checked against configured trust roots or a
@@ -84,14 +121,39 @@ and provider selected/locked at M1), TLS 1.3, and a persistent TCP socket:
 6. Negotiate resource budgets, physical lane count, MUX channels, duplex policy,
    carrier capabilities, packet layer, codec/recovery profile and config digest.
    Unknown mandatory features fail closed; optional fallback is explicitly agreed.
-7. Continue using the **same TLS object and TCP socket** for that lane's records.
+7. In the retained-TLS profile, continue using the **same TLS object and TCP socket** for that lane's records.
    No reconnect, new SYN or socket replacement occurs at the auth/data boundary.
 
 Key exchange therefore precedes tunnel-member authentication, while TLS server
 verification protects that exchange from interception. TLS sequence numbers,
 TCP byte sequence numbers and our tunnel packet numbers are distinct spaces.
 TLS record counters are managed by the TLS library. Our counters never reset on a
-mode change, and rotate keys/session before exhaustion.
+mode change, and rotate keys/session before exhaustion. Current public APIs support
+root/name verification with SNI disabled; configurable independent SNI and a public
+pin verifier remain implementation gates rather than implied existing support.
+
+The new target replaces the separate TCP/TLS-bootstrap dependency with one shared
+message-oriented WireGuard-like authentication/session layer. Reuse maintained
+key-exchange and cryptographic implementations. Specify loss/reorder/duplicate
+handling, cookies, original handshake deadlines, anti-amplification, key confirmation,
+replay protection, expiry and rehandshake before releasing data. Bare Noise or
+copying two packet formats does not implement that complete lifecycle.
+
+Both endpoints must authenticate the selected carrier/appearance, packet layer,
+roles, fresh session identity, full configuration digest and capability/resource
+selection. Retain purpose/direction/lane-separated secret derivation and fresh
+packet-number domains without extracting private library state. Existing member
+credentials and lane requirements remain until a reviewed binding is specified;
+the point-to-point deployment does not require account or device-enrollment work.
+
+Use the selected carrier's **same connection or UDP socket and five-tuple** through
+authentication, data and ongoing control. A TCP authentication flow followed by a
+different UDP data flow cannot satisfy this target. For HTTPS-like, outer real
+TCP/TLS is still required and the authenticated transition must retain the original
+TCP owner, ports and coherent sequence space. That outer handshake is distinct
+from the common inner peer-authentication protocol; their exact binding remains
+a SEC-03/SEC-09 acceptance gate. Independent UDP traffic has no required TCP side
+channel. Additional lanes still need authenticated joining and domain separation.
 
 References: [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html),
 [TLS exporter channel binding](https://www.rfc-editor.org/rfc/rfc9266.html),
@@ -99,7 +161,8 @@ References: [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html),
 
 ## SNI, cover protocols and probing
 
-Default `sni = off`; rustls exposes an explicit `enable_sni` setting. A separate
+The retained-TLS implementation has `sni = off`; rustls exposes an explicit
+`enable_sni` setting. The target retains an operator-configurable SNI policy. A separate
 operator-configurable name can be sent when a cover endpoint requires it. That
 name becomes visible without a separately qualified ECH deployment, so it is
 mutually exclusive with the strict no-SNI profile. Neither a free-form name nor
@@ -111,39 +174,42 @@ There is no defensible guarantee of an unprobeable service or automatic router/Q
 acceptance. Acceptance tests instead check no tunnel-specific unauthenticated
 banner, bounded handshake work, generic unauthenticated application failures,
 anti-replay and measured behavior under active probes. TLS behavior itself and
-packet sizes/timing remain observable. Entropy mimicry and traffic-shape matching
+packet sizes/timing remain observable. Packet-entropy and traffic-shape matching
 are explicitly outside the requested scope.
 
-Cover profiles are explicit implementations, not magic header prefixes:
+Cover profiles have explicit protocol and compatibility requirements:
 
 | Profile | Meaning and gate |
 | --- | --- |
-| `tls_stream` | Valid TLS records over the retained TCP connection; not automatically HTTP. |
-| `https` | Real HTTPS request/response handling and authenticated streaming, e.g. a framed HTTP/2 body. Match the negotiated ALPN; unauthenticated requests follow a bounded ordinary HTTP handler. Test flow-control/HOL effects. |
+| `openvpn_like` | Preserve the original actual OpenVPN-format control-handshake and corresponding outer-layout requirement. Internal payload remains ours; full endpoint interoperability is not required. The current custom prefix/gate does not close this composition gate. |
+| `quic_like` | Owner-selected header appearance over the original UDP socket. Native QUIC data ACK, congestion and full protected-frame validity are not required. Keep genuine QUIC as a distinct implemented compatibility/comparison capability. |
+| `media_like` | New minimal audio/video RTP-like appearance on the original UDP socket. Exact fields are proposed protocol work; no full ICE/DTLS-SRTP/SCTP/browser stack or codec interoperability is required. |
+| `https_like` | Original requirement: real TCP/TLS handshake, then authenticated custom TCP-shaped packets on the same ports and sequence space, with user-data recovery outside ordinary TCP ACK-driven transport. This ceases to be genuine TLS/HTTPS after transition. |
+| `tls_stream` | Retained compatibility profile with valid TLS records over the original TCP connection; not automatically HTTP. |
+| HTTPS streaming | Separate compatibility work with actual HTTP request/response, matching ALPN and authenticated streaming, e.g. HTTP/2 DATA. Preserve its own bounds and unauthenticated handler; it does not replace `https_like`. |
 | `l2tp` | A genuine L2TP adapter if required. v2 is UDP/PPP; Ethernet pseudowires require the v3 Ethernet profile. Specify encapsulation, session state and packet overhead before enabling. |
 | `raw_tcp_experimental` | Custom packet carrier, separately qualified; cannot claim valid HTTPS after leaving TLS record semantics. |
 
 See [L2TPv2](https://www.rfc-editor.org/rfc/rfc2661.html) and
 [Ethernet over L2TPv3](https://www.rfc-editor.org/rfc/rfc4719.html).
-TLS-stream and HTTPS are M1 work; L2TP and raw TCP are M1 research gates delivered
-before their corresponding production mode can be enabled, not implied by M0.
+These names describe target contracts, not new accepted CLI values. Existing
+library/CLI selectors and their actual limits remain visible until integration.
+L2TP and broader raw deployment remain independent qualification gates.
 
 ## TCP, raw TCP and UDP capabilities
 
-An explicit `raw_tcp`, `tcp_tls` or `udp_authenticated` selection is authoritative;
-unavailability fails unless the operator configured fallback. Automatic preference
-is qualified raw TCP, then ordinary TCP/TLS, then UDP when permitted and required.
-UDP also requires an explicit `openvpn_like` or `quic_like` cover selection; header
-appearance and carrier reliability are separate capabilities. Implementation order starts with TCP/TLS for a
-portable correct baseline, then UDP to exercise custom loss recovery, while raw
-TCP receives an independent feasibility prototype. `Availability` describes
-implemented, permission-checked, path-qualified backends, not OS guesses. All
-three availability bits are false in the scaffold; enum presence enables nothing.
+The operator explicitly selects the carrier/appearance. Unavailability fails
+unless a fallback was explicitly configured; an automatic raw/TCP/UDP preference
+must not override that choice. Carrier delivery semantics, outer appearance,
+Swift/recovery, native layer and duplex scheduling remain separate capabilities.
+`Availability` must describe implemented, permission-checked, path-qualified
+backends, not OS guesses or enum presence. Current compatibility paths retain
+their existing identities and evidence; no new selector is enabled by this design.
 
 | Backend | Preserved behavior | Important constraints |
 | --- | --- | --- |
 | `tcp_tls` | Original socket, 4-tuple, TCP sequence and TLS state persist after auth. | Reliable ordered delivery, kernel congestion/window/retransmission, outer HOL. Overlay FEC cannot release bytes stuck behind TCP loss. |
-| `udp_authenticated` | Shared authenticated session, lane identities and independent protected packets. | Datagram loss/reordering available to custom ARQ/FEC; own pacing and congestion safety required. UDP is an explicit negotiated fallback, never an auth downgrade. |
+| `udp_authenticated` | Target: common authenticated session on the original UDP socket, with independent protected packets and lane identities. Current base UDP/Swift still have separate TLS control. | Datagram loss/reordering available to custom ARQ/FEC; own pacing and congestion safety required. UDP can be explicitly selected and is never an auth downgrade. |
 | `raw_tcp_experimental` | Goal: original 4-tuple and coherent sequence evolution through bootstrap and packet phase. | Needs packet ownership, permission, state tracking and path tests; not provided by a normal TCP socket. |
 
 Ordinary TCP cannot send indefinitely while ignoring ACKs: ACK progress controls
@@ -169,22 +235,37 @@ Raw TCP design gate:
 - TLS authentication may negotiate an independently authenticated datagram packet
   phase on the same tuple. It is then a custom carrier, not ongoing TLS/HTTPS.
   Its inner packet numbers and cryptographic nonces are independent of TCP seq.
+  The common inner security protocol must be bound to that authenticated ownership
+  transition; replacing bootstrap does not permit skipping the outer TLS gate.
 - Capture both sides across Linux conntrack/NAT and representative target routers;
   test loss, gaps, delayed ACK, sequence wrap, reordering and long idle. Reusing a
   tuple/sequence alone does not prove middlebox acceptance. If it cannot meet the
-  deployment gate, select negotiated TCP compatibility or UDP and expose the reason.
+  deployment gate, fail visibly or use only an explicitly authorized fallback and
+  expose the reason. An irreversible packet-phase seal cannot roll back to TLS.
+
+On Linux, opening a raw socket alone does not stop the kernel TCP handler from
+sending RST or ACK traffic. The current raw opener requires CAP_NET_RAW, rejects
+the initial namespace and validates an existing exact-tuple marked RST policy.
+The caller/lab must separately prove namespace ownership; the opener's namespace
+check is not an ownership oracle. It does not install firewall rules or transfer
+a live kernel TCP socket. Production
+privilege/firewall ownership, rollback/cleanup and crash recovery remain separate
+design gates. Windows needs a separately reviewed packet/driver boundary; Android
+VpnService alone does not establish raw-underlay ownership. Neither platform has
+this runtime implemented. Do not generalize four clean Linux integrity-mode
+receipts into NAT, middlebox, impairment or cross-platform qualification.
 
 [Linux raw socket requirements](https://man7.org/linux/man-pages/man7/raw.7.html)
 
-UDP has two requested custom cover profiles: `openvpn_like` and `quic_like`.
-Implement and test both header/handshake state machines under the common
-authenticated session API. Initial development may use TLS-authenticated lane
-bootstrap with purpose-specific exporter keys and nonce/expiry-bound tokens; that
-stage is explicitly not UDP-only. Standalone UDP bootstrap is also required, with
-a maintained authenticated handshake dependency and no mandatory TCP reachability.
-Keep header resemblance separate from genuine OpenVPN/QUIC interoperability.
-Validation/rebinding, pre-auth work, anti-amplification, replay and PMTU rules apply
-to both. Exact requirements and primary sources are in
+UDP target appearances are `openvpn_like`, `quic_like` and minimal `media_like`.
+Implement their reviewed outer contracts above one common authenticated session,
+without requiring ordinary TCP reachability. Preserve old TLS-bootstrapped UDP
+and standalone custom OpenVPN-like experiments as scoped evidence, not the target
+definition. Actual OpenVPN handshake/layout, header-only QUIC appearance and
+minimal media appearance have different parsing gates; none implies endpoint
+interoperability or identification resistance. Pre-auth work, anti-amplification,
+replay and PMTU bounds apply to all; authenticated rebinding is an unresolved
+policy, not permission to change the normal-flow continuity requirement. See
 [carrier profiles](overlay-and-carriers.md#selectable-lower-carriers-and-udp-cover).
 
 Optional encryption means optional **additional inner** confidentiality on TLS;
@@ -194,6 +275,12 @@ Authenticate all metadata, configuration and payload in either mode. Use separat
 keys per direction/lane/purpose and monotonically unique packet numbers, bounded
 replay windows, authenticated key rotation and fail-closed downgrade handling.
 CRC32 and the simulator's `authentication_bytes` counter are not security.
+The owner clarified that the shared-session migration must preserve Swift's
+current ChaCha20-Poly1305 encrypted/authenticated data; the requested change is
+the preceding authentication/carrier layer. The generic authenticated-cleartext
+requirement above remains tracked, not inferred away. A WireGuard-like extension
+for it needs a reviewed supported secret/protection interface. No private-state
+export, altered cryptographic primitive or unmodified-WireGuard claim is permitted.
 
 ## Half duplex and full duplex
 
@@ -326,6 +413,27 @@ The M0 `ReloadGuard` tests local readiness/digest/epoch/rollback rules. It does
 crash recovery or the distributed protocol. M4 supplies those and tests every
 message-loss boundary before claiming hot switching works.
 
+## Bounded automatic recovery
+
+The owner selected bounded automatic recovery as the target default for the
+point-to-point tunnel. Preserve eligible logical session, unconfirmed data and
+control transaction state through a temporary outage within configured byte,
+record, attempt and time budgets. Security rehandshake/key refresh alone does not
+reset Swift/recovery state, native-delivery obligations or mode epochs. Accepted
+handshake/control operation deadlines remain absolute; retries do not renew them.
+
+Peer restart or loss of state requires fresh authentication and explicit
+reconciliation or a new session. Never report completion from a replayed reply,
+blindly inject old records into new state, or roll back an uncertain commit.
+Expose reconnecting/recovering/failed outcomes and bounded retention pressure
+through the shared client/service API. Retry and retention defaults, authenticated
+rebinding and exact resumption protocol remain SEC-* design/qualification work.
+
+This is not the current Swift lifecycle: recoverable UDP path errors can retain
+its state while TLS remains usable, but automatic restart defaults off; an actual
+restart establishes new keys and empty ordering state. Current EOF-based TLS
+liveness and private control deadlines do not satisfy the new recovery contract.
+
 ## Platform wrappers
 
 | Wrapper | Device/runtime contract |
@@ -342,6 +450,10 @@ message-loss boundary before claiming hot switching works.
 The Android crate is currently an rlib/cdylib staging target with no JNI ABI.
 Native platform integration and native-device tests remain M5 gates. Cross-building
 portable contracts alone does not validate a platform client.
+The Windows entry point is currently a help/status scaffold and rejects runtime
+execution. Linux has implemented TAP/TUN adapters and finite named native tests;
+the common WireGuard-like session and minimal media appearance have no platform
+execution evidence yet. Keep those statuses separate from the wrapper contracts.
 
 GUI and CLI use a shared nonprivileged client core and versioned local API. The
 service owns credentials, native devices and peer transactions; the GUI does not

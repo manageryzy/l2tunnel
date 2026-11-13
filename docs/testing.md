@@ -113,8 +113,9 @@ one-way measurements require verified clock comparability. Collect at least:
   parity inventory. Cover half-duplex and full-duplex operation, optional inner
   encryption, TAP/L2 and TUN/L3 boundaries, and ordinary TCP fallback separately.
 - Coordinated configuration epoch changes under load, including delayed or lost
-  prepare/commit messages, old-epoch frames in flight, rollback, and peer restart.
-  Verify frame delivery and epoch separation at both traffic hosts.
+  prepare/commit messages, old-epoch frames in flight, safe pre-commit rollback,
+  post-commit uncertainty/reconciliation, and peer restart. Verify frame delivery
+  and epoch separation at both traffic hosts.
 
 Count delivered original frames/bytes separately from wire bytes, repair bytes,
 duplicate bytes, acknowledgments, control traffic, and compression savings.
@@ -155,10 +156,125 @@ still implements only its fixed TAP plan; the following extensions are pending:
 | QoS | Saturated bulk plus ordinary interactive/background traffic and competing external TCP | Minimum shares, ceilings, idle borrowing, starvation, P95/P99 sojourn, FEC/retry attribution and lane-count fairness |
 | L2 management | Full data queues, lost/replayed/conflicting control, changed data codec/FEC/MUX and peer restart | Stable control decoding, bounded service/overhead, no user EtherType/MAC escalation, no uncertain-commit rollback |
 | VXLAN | External Linux VTEPs plus bridges, multiple VNIs, VLAN/IPv6, BUM and MTU changes | Byte-preserving pass-through separately from VTEP termination, tenant isolation, FDB bounds and loop prevention |
-| UDP covers | Both cover handshakes and data phases, with TCP blocked for the UDP-only case | Actual capture/identity/replay/PMTU outcomes; custom resemblance distinct from real interoperability |
+| Selected carriers | OpenVPN-like, QUIC-like, HTTPS-like and minimal media cover, each with the same inner session and selected data profile; TCP blocked before UDP-only authentication | Same lane connection/socket/five-tuple through handshake and data; exact declared protocol/header behavior, identity/replay/PMTU and requested/effective state; full endpoint interoperability is a separate optional claim |
 | CLI/GUI | Same scripted operations through CLI and GUI, service restart during switch | Same requested/effective configuration and job result; UI detachment cannot terminate the service accidentally |
 
 Do not route a test probe through a special class unavailable to equivalent user
 traffic. Test management liveness without promising it can bypass bytes already
 queued in a TCP stream. Include total control/auth/cover/repair bytes in comparisons.
 No added gate above has been executed by this planning change.
+
+## Carrier consistency and classification campaign
+
+Status: **planned validation**, 2026-11-13 (Asia/Tokyo). This campaign qualifies the
+selected-cover/common-inner-session architecture in
+[carrier profiles](overlay-and-carriers.md) and [secure-session design](modules/secure-session.md).
+It is not an execution receipt. Existing TCP/TLS, protected UDP, genuine QUIC,
+OpenVPN-like and raw packet-phase receipts keep their original source hashes,
+acceptance criteria, failures and finite scopes. The old TCP/TLS-bootstrap plus
+separate UDP data experiments remain historical controls, not evidence of the
+target same-flow design.
+
+### Protocol and lifecycle gates before ISP measurements
+
+Use the same authenticated inner protocol, selected packing/recovery, native
+payload workload, channel budget and accounting definitions across covers.
+Swift is a selected data algorithm within the cover. Include RLNC/parity,
+rolling, packed, proxy and all existing mode-parity requirements in their own
+qualification matrix; do not replace them with a Swift-only benchmark.
+
+| Gate | Required observations and negative cases |
+| --- | --- |
+| Flow continuity | Capture before the first handshake packet at both endpoints; correlate socket/connection owner, addresses, ports and IP protocol through authenticated user data. Require no second UDP data flow or new TCP SYN at the handshake/data boundary. Prove each lane separately in paired half duplex. |
+| Common inner authentication | Fixed configured peer, wrong identity/key/configuration, tampered/oversized input, replay from another session/lane/direction, loss of each flight, duplicates, reordering, final-response loss and peer restart. Bound unauthenticated CPU work, bytes, allocations, pending states and response amplification. |
+| Replay and rekey | Duplicates and packets outside the declared replay horizon cannot mutate application/control state; failed authentication cannot consume accepted replay state. Exercise overlapping key generations, lost/repeated rekey messages, expiry and counter exhaustion without nonce/key reuse or stale-session acceptance. |
+| Management and mode switching | Saturated user queues, opposite-direction load and changed user codecs/recovery must retain bounded authenticated control/liveness/rekey service on the selected carrier. Preserve request idempotence, digest/epoch matching, exact drain barriers and commit reconciliation; exercise SW-11 between Swift and other record profiles. |
+| Default automatic recovery | Inject short outages, deadline crossings, peer restart and socket loss. Verify configured retry/backoff/state bounds, visible phases/reasons, eventual explicit terminal outcome and fresh authentication where needed. Wrong trust/configuration cannot activate downgrade or an unconfigured carrier. A new connection attempt is labelled as such. |
+| Data scope | Exact payload hashes, frame/native delivery confirmation, arbitrary Ethernet fallback, selected AEAD and existing integrity-only profiles, full/half operation, MUX/channel admission and independent local/native-flight/recovery budgets. No successful compile or enum selection counts as a passing path. |
+
+Hold the original deadline and acceptance policy fixed within each case. A shorter
+outage recovery pass does not replace a longer outage failure. Preserve actual
+outage duration, terminal class, delivery debt and cleanup independently. Record
+unsupported, bound-exhausted, protocol failure and tool failure separately.
+
+### Cover-specific consistency checks
+
+- OpenVPN-like retains the actual OpenVPN wire-handshake requirement. Use an
+  unmodified standard dissector and a declared protocol/profile to inspect reset,
+  session/packet/ACK fields and reassembled outer TLS where visible. Separately
+  verify our inner membership, selected recovery and data protection. A custom
+  opcode prefix or successful project parser does not complete this gate. The
+  composition of that outer exchange with the common inner handshake remains
+  design work; standard OpenVPN endpoint interoperability is not required.
+- QUIC-like checks only its frozen initial/established header-appearance contract,
+  lengths, identifiers and consistency across the same socket. Record what an
+  unmodified dissector recognizes and rejects, without demanding or claiming a
+  complete valid QUIC handshake/session. It need not run native QUIC ACK/congestion
+  machinery. Genuine QUIC is a separate reference with its own transport limits;
+  its results do not validate the appearance-only cover or Swift composition.
+- Minimal media checks the chosen audio/video/RTP-like header layout, stream
+  identifiers, sequence/timestamp policy, packet boundaries and shared inner
+  authentication/control placement. It does not require complete WebRTC signaling,
+  ICE/STUN/TURN, DTLS-SRTP/SCTP or valid encoded audio/video. RTP recognition alone
+  is not evidence of a valid media endpoint or useful QoS classification.
+- HTTPS-like captures a real TCP/TLS handshake and verifies configured SNI
+  independently from our trusted server identity policy. Prove that the later
+  custom packet phase retains original ports and sequence space, with no kernel
+  TCP stream owner continuing ACK-driven data transport. Audit owner transfer,
+  packet checksums/options/windows, gaps/wrap, late old traffic, kernel ACK/RST
+  behavior and exact owned-flow firewall counters. Test permission denial,
+  cancellation and irreversible transition failure. Actual HTTP/2 streaming is a
+  separate compatibility control, not acceptance of the requested raw phase.
+
+Before wider raw-path testing, qualify Linux namespace ownership/capabilities and
+exact-tuple policy, PMTU, NAT/conntrack, idle expiry and stream-validating firewall
+behavior. Never install host-wide ACK/RST suppression or change existing host
+routes/bridges/qdiscs. Windows and Android require separately implemented and
+qualified packet ownership/privilege paths; a Linux pass supplies neither. Record
+clean close separately from bounded terminal teardown and resource cleanup.
+
+### Controlled ISP/QoS hypothesis test
+
+The hypothesis is that initial packets influence classification or priority on
+the owner's connection. The experiment must distinguish this from transport
+recovery, packet-size/timing differences, server load, route changes and ordinary
+congestion. Header resemblance does not establish the ISP's internal label, and
+measured goodput alone cannot prove the classification mechanism.
+
+1. First calibrate the owned lab with clean, rate-only, delay-only, loss-only,
+   burst/reorder and combined conditions. Freeze capture/offload policy, versions,
+   source/binary hashes and exact total encapsulation cost. Verify delivery and
+   lifecycle gates before comparing performance.
+2. On the controlled client/server path, fix endpoint hardware, server location,
+   configured endpoints, MTU, traffic direction, DSCP/ECN policy, offered load,
+   channel count, recovery policy and inner workload. Record the actual route,
+   IP/port/protocol tuple, CPU load and concurrent traffic. Changing TCP to UDP or
+   changing ports is a separately labelled factor, not an isolated handshake test.
+3. Where feasible, compare different initial/cover exchanges with matched
+   post-handshake inner records, outer size/timing policy and offered wire rate.
+   State every difference that cannot be controlled. Include direct traffic and
+   genuine TCP/TLS/QUIC or actual HTTPS references as distinct controls, retaining
+   their native ACK/congestion semantics. Do not attribute their difference to the
+   initial handshake alone.
+4. Randomize case order within repeated time blocks; measure cold connections,
+   warm steady traffic, idle/restart and connection-age effects separately.
+   Predeclare duration, repetitions, stopping/failure rules and comparison metrics
+   before a campaign. Preserve complete failed cases rather than retrying until
+   favorable results or retuning acceptance after observing them.
+5. Measure unique delivered goodput, transfer completion, P50/P95/P99 latency,
+   loss/reordering, handshake/recovery duration, CPU/RSS and total forward/reverse
+   wire bytes, including cookies, protection, management, feedback, repairs and
+   retransmissions. Include controlled competing traffic to test priority rather
+   than only uncongested link speed. Report per-run results and variation.
+6. Observe classifier or queue counters only where available on equipment we
+   control or through an explicit ISP diagnostic. Otherwise report a repeatable
+   performance difference under the tested conditions; label its classification
+   explanation as inference. Initial classification may be revised later in a
+   connection. Neither a positive nor negative finite result generalizes to every
+   ISP, port, load, router or date.
+
+Every report separates observed outer parsing, optional interoperability results,
+actual authenticated tunnel delivery and the QoS hypothesis. Preserve immutable
+per-case receipts/captures and exclude private keys/session secrets from ordinary
+logs. Report requested/effective carrier and protection, fallback/recovery events,
+platform capability limitations and unresolved acceptance gates alongside results.

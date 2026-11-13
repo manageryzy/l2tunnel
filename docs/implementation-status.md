@@ -1,35 +1,78 @@
 # Implementation status
 
-The implementation is incomplete and does not meet the owner's 80 Mbit/s native
-performance requirement. Work now follows the blocking behavior corrections at
+The implementation is incomplete and has not qualified the owner's full native
+performance and mode requirements, including the 80 Mbit/s acceptance target.
+Work now follows the blocking behavior corrections at
 [the top of the implementation checklist](implementation-checklist.md#blocking-behavior-corrections--execute-before-new-feature-work).
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-## Swift profile
+## Architecture target and current Swift composition
 
-The explicit [swift profile](modules/swift.md) is the first client path that
-reaches the reference workload. In `tools/selftest.py` (Linux TAP, unprivileged
+The target separates pure data algorithms, a [common inner secure session](modules/secure-session.md),
+and the explicitly selected appearance carrier. The common fixed-peer security
+model is WireGuard-like, with AEAD data on every carrier including HTTPS;
+the library, common wire contract and runtime integration are not yet selected
+or implemented. The selected carrier must retain the same socket and five-tuple
+through its handshake, user data and authenticated management. Swift is a data
+packing/recovery algorithm, not an independent connection mode or implicit default.
+Bounded automatic recovery is required by default in the target design.
+These targets do not remove RLNC, parity, rolling, packed, proxy, SW-11 or any
+of the 47 Python mode gates. Retaining Swift's AEAD on every carrier does not
+delete independently selected authenticated-cleartext requirements of other
+profiles; their common protection contract remains an explicit design gate.
+
+The current explicit [Swift composition](modules/swift.md) still authenticates
+over TCP/TLS and sends data over a separate UDP socket. It reuses TLS/member
+authentication, exporter secrets and the shared lifecycle service, but defines
+its own AEAD datagram/replay/key-chain envelope and Swift-specific TLS policy
+control. Data is always ChaCha20-Poly1305, with a 4096-packet replay window and
+automatic per-direction HKDF key generations every 2^28 datagrams. The pure
+engine has no socket, real clock, key or device dependency. Convergence on the
+common secure session and selected carrier remains planned under SW-14..SW-16.
+
+Historical `tools/selftest.py` runs (Linux TAP, unprivileged
 namespaces, HTB and netem, sixteen verified CUBIC flows, 100/10 Mbit/s, 70 ms
-RTT, 15% loss each way) it measured 79.74, 80.50 and 79.91 Mbit/s forward
+RTT, 15% loss each way) measured 79.74, 80.50 and 79.91 Mbit/s forward
 goodput against 80.72 Mbit/s from the Python simulator rerun at the tunnel's
 real per-datagram overhead, and 79.23 against 79.04 with the kernel's default
 minimum RTO. The 1% loss, delay-only and clean paths measured 93.41, 93.69 and
 92.80 against 94.55, 94.61 and 94.58. [Receipts](../work/swift-selftest41/impaired-1.json)
 and the simulator runs ([reference path](../work/swift-simulator-reference38/output.log),
 [control paths](../work/swift-simulator-reference40/output.log)) are saved.
-This is integration-tested in one local environment only: real devices,
-privileged host namespaces, soak and the other profiles' blocking corrections
-remain open. The session is owned by the shared lifecycle service; the
+These are integration receipts in one local environment only: real devices,
+privileged host namespaces, Swift TUN/IPv6 underlay, soak, Windows/Android and
+the other profiles' blocking corrections remain open. The
 self-test [disconnects and reconnects](../work/swift-selftest43/impaired.json)
-the live tunnel through the local commands. Datagram keys change
-automatically every 2^28 datagrams and sequences continue across the 32-bit
-wire boundary, both covered by unit tests only. Negotiated profile switching
-and a clean peer-confirmed drain are not implemented, and no Python mode gate is closed by it.
+the live tunnel through the shared service. Key-generation and 32-bit sequence
+boundary behavior have focused tests; no production-cadence 2^28-datagram live
+rekey was observed. The [later baseline receipt](../work/swift-selftest44/impaired.json)
+records 79.35 Mbit/s with lifecycle checks. Temporary UDP path loss can retain
+the live session/recovery state; an actual restart authenticates anew and clears
+the old delivery state. Current automatic restart defaults to off, and the
+retained TLS closure signal has no general Swift heartbeat/dead-peer deadline.
 
-## Current verification
+SW-13 adds negotiated internal Swift policy changes over a private retained-TLS
+control codec, with focused parser/state/loopback/service tests and
+[mixed native receipts](modules/swift.md#policy-change-receipts). The successful
+under-load change measured 63.188 Mbit/s, below the reference acceptance, while
+three other receipts retain functional or lifecycle failures. Full proposal and
+barrier-response deadlines, common-control integration, complete cross-record
+profile switching (SW-11), and peer-confirmed clean drain remain open. SW-13
+does not narrow SW-11 or close any Python mode gate.
 
-The [source30 aggregate check](../work/implementation-wave30/validation.json)
+## Verification evidence
+
+The [latest saved aggregate check](../work/udp-framing-wording-20261113-final/validation.json)
+failed strict Clippy in a Swift runtime test (`manual_is_multiple_of`). Its
+[focused follow-up](../work/udp-framing-wording-20261113-final/focused-validation.json)
+records 467 passing Rust test executions including doctests and passing rustdoc,
+but retains a failed required aggregate check. This documentation review does
+not rerun those checks or change that result. Saved source maps apply to their
+recorded inputs; these edits do not turn the current working tree into a full
+passing checkpoint.
+
+The earlier [source30 aggregate check](../work/implementation-wave30/validation.json)
 passed on code commit `10d4a0b`, including decoder commit `1c98510`:
 1263 Rust test executions, 222 Python tool
 executions and 1658 simulator cases. All recorded source inputs stayed unchanged;
@@ -77,11 +120,11 @@ work before requiring clean shutdown; continuing final-ACK loss must still retur
 `IncompleteClose` at the original five-second bound. Production close bounds are
 unchanged. Earlier dependency failure and exact cleanup repair are recorded below.
 
-## Latest native measurements
+## Historical native measurements for TCP/TLS frame forwarding
 
 The [source25 aggregate](../work/implementation-wave25/validation.json) and
 [release receipt](../work/native-build25/receipt.json) bind the executable and
-copied helpers used for the latest native measurements. Later source repairs
+copied helpers used for these native measurements. Later source repairs
 have not been qualified by those historical runs.
 
 Four serial native TAP/TUN half-duplex cases passed exact payload, EOF, helper
@@ -112,8 +155,9 @@ measurement; two TLS writes alone have not been proved the throughput cause.
 | Python high-performance composition | Codec/recovery libraries and separate aligned/packed/rolling clients exist | No qualified matching native composition; FIX-02 through FIX-04 |
 | TUN flow control and QoS | Transparent active-credit path and fixed TCP-proxy slices | Adaptive native-window growth and complete fairness/pressure gates still fail or remain unrun |
 | Hot mode switching | Authenticated compression changes and finite active-TUN switches | Full codec/recovery/MUX switching matrix and control-under-load correctness remain open |
-| Shared clients | Managed TCP CLI and embedding frontend use one typed retained lifecycle; portable local schema is separate from Unix transport | Other profile lifecycle migration, richer local lifecycle commands, GUI and native Windows/Android remain open under FIX-12 |
-| Carrier/recovery and stable control boundaries | Independent pure crates, fixed runtime compositions and a bounded common control codec | Actual OpenVPN-like recovery composition and negotiated stable control dispatch still require FIX-10/FIX-11 |
+| Shared clients | Managed TCP, base UDP and Swift have a shared retained lifecycle owner; portable local schema is separate from Unix transport | Remaining profile lifecycle migration, full requested/effective capabilities, GUI and native Windows/Android remain open under FIX-12 |
+| Carrier/recovery and stable control boundaries | Independent pure crates, fixed runtime compositions and a bounded common control codec; Swift has a separate private policy codec | Common secure-session integration, actual interchangeable recovery and negotiated stable control dispatch still require the SEC-*, FIX-10/FIX-11 and SW-* gates |
+| Common authentication/security and carrier continuity | Current Swift reuses TLS/member auth but uses separate TCP/TLS control and protected UDP data; other existing slices retain their own documented owners | Common fixed-peer AEAD session across every selected carrier, same-socket handshake/data/control, bounded default recovery and independent appearance/QoS validation are planned; no security library has been chosen |
 
 Use [the architecture](architecture.md), [project boundaries](implementation-plan.md),
 [Python parity contracts](mode-parity.md) and the stable task IDs in the master

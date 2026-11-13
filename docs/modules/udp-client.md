@@ -5,6 +5,14 @@ Clippy, rustdoc and formatting, plus the [source28 aggregate](../../work/impleme
 recorded transport profiles, not the new delivery-bound base identity. Both custom
 covers and protection suites retain the shared carrier/client implementation.
 
+The contract below records the existing TLS-bootstrapped client path and its
+compatibility evidence. It is not the [shared secure-session target](secure-session.md):
+new selected UDP appearances must authenticate, carry data and keep control on
+their original UDP socket without a required TCP side channel. Minimal media
+appearance is not an existing CLI option. Preserve current wire/configuration
+identities and receipts until the separately versioned migration is implemented;
+its status must distinguish this legacy split from the effective new carrier.
+
 ## Mandatory base-frame delivery policy
 
 Base UDP/QUIC frames require a complete final `managed::DeliveryConfig` on public
@@ -77,7 +85,7 @@ The first UDP runtime profile fixes compression for the session. A local hot
 switch API must report unsupported for this profile until its real epoch/barrier
 implementation is integrated. The CLI must not expose TCP's managed handle as
 if it controlled the UDP data path. Status and diagnostics should name actual
-`udp-over-tcp-tls-bootstrap`, cover resemblance, suite and lane count.
+`udp-over-tcp-tls-bootstrap`, selected UDP framing profile, suite and lane count.
 
 ## Optional block FEC extension
 

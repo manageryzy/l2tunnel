@@ -6,6 +6,14 @@ Authenticated network dispatch and actual device drain barriers belong to the ru
 This module refines MG-01, MG-03 and the local replay portion of MG-04, without
 completing any whole management acceptance gate.
 
+The [shared point-to-point session target](secure-session.md) requires this fixed
+authenticated control service through every selected carrier, independently of
+Swift or another data profile. Swift's private TLS policy messages are current
+implementation scope, not the completed common control protocol. SEC-07/SEC-08
+and full SW-11 retain reliable bounded service, duplicate/epoch/digest/deadline
+checks and recovery/reconciliation under loss; a WireGuard-like handshake or
+encrypted packet alone does not implement those operations.
+
 ## Public API and dependency boundary
 
 `l2tunnel-management` depends only on the local `l2tunnel-core` and

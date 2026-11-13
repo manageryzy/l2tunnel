@@ -147,12 +147,31 @@ pub struct SwiftFrame {
     pub receive_buffer: usize,
     /// Latest counters the runtime reported; zero before its first report.
     pub counters: l2tunnel_runtime::swift::Snapshot,
+    /// Service generation that owns this session.
+    pub generation: u64,
 }
 #[cfg(unix)]
 impl SwiftFrame {
     /// Flat non-secret status for the local API.
     pub fn status(&self) -> crate::swift::Status {
-        crate::swift::Status::new(self.effective, &self.counters)
+        let current = self.current();
+        crate::swift::Status {
+            generation: self.generation,
+            forward_kbit: current.forward_kbit,
+            reverse_kbit: current.reverse_kbit,
+            path_mtu: current.path_mtu as u64,
+            window: current.window as u64,
+            repair_permille: u64::from(current.repair_permille),
+            channels: current.channels as u64,
+            ..crate::swift::Status::new(self.effective, &self.counters)
+        }
+    }
+    /// Settings in force: the requested ones until a negotiated change.
+    pub fn current(&self) -> crate::swift::Settings {
+        match self.counters.policy {
+            Some(policy) => self.requested.with_policy(policy),
+            None => self.requested,
+        }
     }
 }
 /// Actual observation of the one live or last backend; variants are never merged.
@@ -208,6 +227,10 @@ struct SwiftBackend {
     effective: l2tunnel_runtime::swift::Config,
     receive_buffer: usize,
     counters: Mutex<l2tunnel_runtime::swift::Snapshot>,
+    switcher: l2tunnel_runtime::swift::Switcher,
+    connection: ConnectionConfig,
+    client: bool,
+    generation: u64,
 }
 struct UdpBackend {
     observer: l2tunnel_runtime::udp::Observer,
@@ -226,15 +249,34 @@ impl ObservedBackend {
                 lanes: udp.observer.status(),
             }))),
             #[cfg(unix)]
-            Self::Swift(swift) => Some(Observation::Swift(Box::new(SwiftFrame {
-                requested: swift.requested,
-                effective: swift.effective,
-                receive_buffer: swift.receive_buffer,
-                counters: *swift
+            Self::Swift(swift) => {
+                let counters = *swift
                     .counters
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            }))),
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // After a negotiated change the effective policy is derived
+                // from the committed one, exactly as the runtime derived it.
+                let effective = counters
+                    .policy
+                    .and_then(|policy| {
+                        swift
+                            .requested
+                            .with_policy(policy)
+                            .runtime(swift.connection, swift.client)
+                            .ok()
+                    })
+                    .map_or(swift.effective, |mut config| {
+                        config.report_interval = swift.effective.report_interval;
+                        config
+                    });
+                Some(Observation::Swift(Box::new(SwiftFrame {
+                    requested: swift.requested,
+                    effective,
+                    receive_buffer: swift.receive_buffer,
+                    counters,
+                    generation: swift.generation,
+                })))
+            }
         }
     }
     fn managed(&self) -> Option<&managed::ControlHandle> {
@@ -433,7 +475,10 @@ impl Handle {
     /// Retained keys still replay their original acceptance.
     pub fn apply(&self, request: local::Request, key: RequestKey) -> Result<Accepted, SubmitError> {
         if request.version != local::VERSION
-            || !matches!(request.action, local::Action::SwitchCompression { .. })
+            || !matches!(
+                request.action,
+                local::Action::SwitchCompression { .. } | local::Action::SetSwiftPolicy { .. }
+            )
         {
             return Err(SubmitError::Unsupported);
         }
@@ -475,13 +520,22 @@ impl Handle {
             return Err(SubmitError::Busy);
         }
         let connected = state.backend.is_some();
-        if matches!(command, Command::Apply(_))
-            && state
-                .backend
-                .as_ref()
-                .is_some_and(|backend| backend.managed().is_none())
+        // Each apply action belongs to one backend; any other pairing is
+        // refused without consuming the key or sending anything.
+        if let Command::Apply(request) = &command
+            && let Some(backend) = &state.backend
         {
-            return Err(SubmitError::Unsupported);
+            let fits = match request.action {
+                local::Action::SwitchCompression { .. } => backend.managed().is_some(),
+                #[cfg(unix)]
+                local::Action::SetSwiftPolicy { .. } => {
+                    matches!(backend, ObservedBackend::Swift(_))
+                }
+                _ => false,
+            };
+            if !fits {
+                return Err(SubmitError::Unsupported);
+            }
         }
         match &command {
             Command::Connect(_) if connected => return Err(SubmitError::State),
@@ -747,7 +801,11 @@ impl Handle {
             ok,
             code: code.into(),
             state: Some(local::Snapshot {
-                epoch: snapshot.generation.map_or(0, OperationId::value),
+                epoch: snapshot
+                    .runtime
+                    .as_ref()
+                    .and_then(Observation::swift)
+                    .map_or(0, |frame| frame.counters.policy_epoch),
                 phase: phase.into(),
                 compression: local::Compression::Off,
                 active: None,
