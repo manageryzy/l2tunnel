@@ -459,8 +459,8 @@ Parent80, full SW-11,47-mode and carrier/lifecycle/platform gates remain open.
 ## Native record identity and physical custody
 
 Status: **implemented, protocol/runtime-fixture-tested and workspace-checked**
-for the scoped SWR-15/SWR-16/SWR-18A precursor; actual local checkpoint
-reconciliation remains pending. Full SWR-18 remains open. The contract preceded production edits. This is
+for the scoped SWR-15/SWR-16/SWR-18A precursor, with reconciled evidence and an
+actual local source checkpoint. Full SWR-18 remains open. The contract preceded production edits. This is
 an engineering prerequisite of full SW-11 and generic authenticated transaction
 fences. It selects no carrier, wire format, default or reduced parent scope.
 
@@ -513,7 +513,7 @@ application, formatting, checks and Git. Keep all existing tests and original
 - [x] [SWR-14] Freeze the checked native identity/count and scope/custody contract before applying production changes, without recording engineering proposals as owner decisions. Evidence: [pre-edit design](../../work/swift-native-identities-20261114/design-v0.md) and [source binding](../../work/swift-native-identities-20261114/design-binding.json).
 - [x] [SWR-15] Implement additive identified admission/extraction and read-only directional boundaries through the same legacy wire paths, checked counters and existing drain guards. Evidence: [shared pure implementation](../../crates/l2tunnel-swift/src/records.rs), [focused pass](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json).
 - [x] [SWR-16] Pass focused regressions for exact wire parity, packing/compression, loss/retransmission, original channel provenance, refusals, exhaustion, incomplete records and asymmetric reset custody. Evidence: [15 public-flow regressions](../../crates/l2tunnel-swift/src/records/tests/native_identity.rs), [focused pass](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json).
-- [ ] [SWR-17] Pass formatting, strict Clippy, rustdoc, relevant consumer regressions and required source-stable workspace checks; save a scoped local checkpoint with actual evidence.
+- [x] [SWR-17] Pass formatting, strict Clippy, rustdoc, relevant consumer regressions and required source-stable workspace checks; save a scoped local checkpoint with actual evidence. Evidence: [preserved first attempt with passing runtime/consumer commands and failed test lint](../../work/swift-native-identities-20261114/focused-attempt-1/validation.json), [test-only cleanup follow-up](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json), [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json), [evidence-only reconciliation](../../work/swift-native-identities-20261114/aggregate-attempt-1/postcheck/ledger-1/validation.json) and [actual source checkpoint2ccbaa8caa88afe86f0499843f01ca8b479911f4](../../work/swift-native-identities-20261114/checkpoint-attempt-1/validation.json). This closes only the scoped native-identity/local-custody precursor.
 - [x] [SWR-18A] Implement the selected Swift runtime local-custody precursor: retain the actual incoming scope/binding/lane/endpoint direction and native identity through bounded FIFO and full device completion, checked local completion vectors, refused reset and irreversible late-write failure tests. This neither supplies authenticated peer count fences nor closes SWR-18. Evidence: [actual runtime custody](../../crates/l2tunnel-runtime/src/secure_udp/transport.rs), [six real-UDP/device hook regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_native_custody_tests.rs) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json). Direct policy-message completion is hook evidence, not reliable generic-transaction proof.
 - [ ] [SWR-18] Retain actual authenticated origin and endpoint direction through physical native completion in the selected runtime, and verify bounded pressure/failure/deadline and negotiated barrier integration; pure extraction counts alone cannot close this gate.
 
@@ -569,5 +569,6 @@ subsequently passes1,692 Rust cases including doctests,376 tooling cases and
 1,658 simulator cases, formatting, strict Clippy, rustdoc and CLI checks. Its
 recorded inputs remain stable. This is local Linux verification without a new
 immutable daemon/native/performance observation, Windows/Android build, remote
-CI or ISP result. Evidence reconciliation and an actual scoped local checkpoint
-are still pending; SWR-18 and every original parent gate remain open.
+CI or ISP result. The [actual source checkpoint2ccbaa8caa88afe86f0499843f01ca8b479911f4](../../work/swift-native-identities-20261114/checkpoint-attempt-1/validation.json)
+saves the verified source and reconciled evidence. SWR-18 and every original
+parent gate remain open.

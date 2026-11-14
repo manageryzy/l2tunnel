@@ -221,7 +221,8 @@ passes Swift tests, strict Clippy and rustdoc. The
 [required frozen-source pass](../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json)
 records1,692 Rust,376 tooling and1,658 simulator cases. SWR-15/SWR-16/SWR-18A's
 pure API and selected local-custody precursor are verified to their stated
-scope; actual scoped checkpoint reconciliation remains pending. This
+scope and saved in [actual source checkpoint2ccbaa8caa88afe86f0499843f01ca8b479911f4](../work/swift-native-identities-20261114/checkpoint-attempt-1/validation.json).
+This
 does not qualify generic switching, other record profiles or full SW-11.
 
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
