@@ -119,7 +119,7 @@ Freeze all recorded inputs during focused/aggregate/build/native snapshots.
 - [x] [HRT-04] Implement/test source-pinned native selector forwarding, startup-event matching and bounded actual thread observations, retaining old omitted-selector behavior and all prior acceptance checks. Evidence: [95 native harness regression tests](../../work/host-runtime-20261114/focused-attempt-1/validation.json).
 - [ ] [HRT-05] Record the 16-case source-stable ABBA matrix with original integrity/control/capture/cleanup/80 verdicts and bounded CPU/switch/thread/wire/pressure evidence; preserve negative and tool-failure outcomes.
 - [x] [HRT-06] Evaluate scheduling efficiency versus useful throughput, wire/pacing/recovery constraints and semantic failures; retain honest limitations and all parent performance/mode/lifecycle/platform gates. Evidence: [negative outcomes and finite comparisons](../../work/host-runtime-20261114/native-analysis-attempt-2/validation.json); overall qualification remains failed.
-- [ ] [HRT-07] Pass focused tests, strict Clippy/rustdoc, required frozen-source checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item.
+- [x] [HRT-07] Pass focused tests, strict Clippy/rustdoc, required frozen-source checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item. Evidence: [required check](../../work/host-runtime-20261114/aggregate-attempt-2/validation.json), [reconciliation](../../work/host-runtime-20261114/aggregate-attempt-2/postcheck/ledger-2/validation.json), and [actual source checkpoint](../../work/host-runtime-20261114/commit-binding-attempt-1/validation.json).
 
 ## Focused implementation evidence
 
@@ -211,8 +211,8 @@ changing retry or expiry behavior.
 
 HRT-05 stays open: the recorded16-case attempt contains missing qualification
 and measurement evidence. HRT-06 records the evaluation of those outcomes, not
-a performance pass. HRT-07 remains open until the required frozen-source check,
-evidence reconciliation and actual local checkpoint exist. SNL-08/09/11, FIX-04,
+a performance pass. HRT-07 records the required frozen-source check, evidence reconciliation and
+actual local source checkpoint below; it does not close HRT-05. SNL-08/09/11, FIX-04,
 full SW-11, all 47 P-* modes, lifecycle/platform and ISP gates retain their scope.
 The omitted runtime default and all selected protocol semantics are unchanged.
 
@@ -226,10 +226,18 @@ stopped before Rust execution because the new checked ledger lines lacked their
 required inline `Evidence:` links; that documentation-only defect was corrected
 before the second attempt. No test, deadline, threshold or assertion was removed.
 These local Linux checks are separate from the failed finite native qualification,
-remote CI, Windows/Android builds and real-device/ISP tests. HRT-07 still awaits
-evidence-only reconciliation and an actual local source checkpoint.
+remote CI, Windows/Android builds and real-device/ISP tests. The actual source checkpoint below binds the required check and subsequent
+evidence-only reconciliation.
 
 The [first evidence-only reconciliation](../../work/host-runtime-20261114/aggregate-attempt-2/postcheck/ledger-1/validation.json)
 passed checklist and local-link checks with every non-document input identical
-to the required aggregate. The next reconciliation binds this evidence text;
-HRT-07 remains unchecked until the local source commit actually exists.
+to the required aggregate. The [second reconciliation](../../work/host-runtime-20261114/aggregate-attempt-2/postcheck/ledger-2/validation.json)
+passed before the source checkpoint was created; its non-document identities
+remain identical to the required check.
+
+The [actual source-checkpoint receipt](../../work/host-runtime-20261114/commit-binding-attempt-1/validation.json)
+records local commit `e1d93f3496e9f27579b58b51d36e8651bbb5cc4c`, its parent/tree,
+all seven committed file hashes, matching aggregate/reconciliation identities and
+a clean worktree at that point. HRT-07 is closed using this existing receipt;
+HRT-05 and every failed/unverified native and parent gate remain open. This
+follow-up changes ledger evidence only. Nothing was pushed or published.
