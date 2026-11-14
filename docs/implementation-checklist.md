@@ -169,8 +169,8 @@ verifies all payload/control/policy/manual-reconnect/thread/cleanup observations
 but retains two capture gaps and an overall failed/incomplete verdict: 14 cases
 have complete evidence, and all eight impaired 80 Mbit/s targets fail at
 76.627–78.681 Mbit/s. Native throughput benefit remains unproved and SWR-12
-remains open. The distinct partial-native-stream drain concern remains open under
-SWR-13. The separate [current-binary kernel comparison](../work/swift-receive-fairness-20261114/kernel-summary-attempt-1/analysis.md)
+remains open. The distinct partial-native-stream drain concern is addressed by
+the scoped SWR-13 correction below. The separate [kernel comparison before this drain correction](../work/swift-receive-fairness-20261114/kernel-summary-attempt-1/analysis.md)
 passes both full perf validators with zero lost events. Current-thread reduces
 observed system CPU and context switching while measured goodput remains
 78.182/78.216 Mbit/s; both original targets still fail. Host I/O is unattributed
