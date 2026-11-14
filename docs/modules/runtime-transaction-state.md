@@ -1,9 +1,14 @@
 # Selected generic transaction custody
 
-Status: **private State interface v0 frozen; implementation pending**. Implements
+Status: **implemented; fourteen focused State cases and finite selected-Driver integration pass**. Implements
 the existing actual leased Peer and Control-owner composition, not another FSM,
-I/O loop or crypto sender. Actual selected-loop/native integration remains open.
+I/O loop or crypto sender. Clean original-socket/native integration passes; complete fault/resource/shared-API qualification remains open.
 All SW-11/profile/carrier/platform/lifecycle/performance requirements remain.
+
+The [required source-stable check](../../work/generic-driver-20261114/driver-aggregate-attempt-1/validation.json) passes1878 Rust
+cases including doctests,376 tooling cases and1658 simulator cases. This local
+Linux result does not close the complete parent resource, fault, shared-API,
+profile, native, platform or performance acceptance.
 
 The detailed design is the source-reviewed
 [transaction state draft](../../work/generic-secure-udp-20261114/transaction-state-design-v0.md),
@@ -19,8 +24,12 @@ integration refinements before production edits:
   argument. Revalidate Bank initial/epoch and derived actual delivery binding.
   TransactionSettings is the actual shared runtime value. No fake resource
   callback, boolean permit, separately mirrored phase or fresh engine on commit.
-- `propose(owner,value,sample)` and `dispatch(owner,sample)` take
-  `sample: impl FnMut() -> io::Result<Duration>`. Sample before preview and again
+- `propose(owner,value,cap,sample)` takes the actual queued local request's
+  once-frozen `cap: transaction::Tick`; the parent retains it across Blocked
+  retries. It never computes a later cap for the same local request. The real
+  Peer validates that cap against now, max_operation_ms and session expiry.
+  `dispatch(owner,sample)` freezes its remote admission cap once as below.
+  Both take `sample: impl FnMut() -> io::Result<Duration>`. Sample before preview and again
   after real target allocation. Both actual Peer entry points are still retried
   only after capacity and original-time validation. No clock lives in State.
 - Local proposal obtains actual Preparation, allocates actual Bank::prepare,
@@ -58,8 +67,16 @@ must not claim that control/Peer/shared runtime owners are fully reserved yet.
 Combined resource admission and actual generic runtime selection remain separate
 mandatory acceptance; do not prune authenticated catalogs to fit memory.
 
-- [ ] [TCS-01] Freeze exact custody/resource/proof interfaces before implementation.
-- [ ] [TCS-02] Consume actual prepared Bank, actual leased Peer and actual Control
+- [x] [TCS-01] Freeze exact custody/resource/proof interfaces before implementation. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json).
+- [x] [TCS-02] Consume actual prepared Bank, actual leased Peer and actual Control Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json).
   messages/proofs with focused failure/capacity/retry/terminal tests.
 - [ ] [TCS-03] Integrate this owner into the existing selected I/O loop and prove
   physical barriers, requested/effective API status and original-socket behavior.
+
+The reliable whole-message owner owns ordinary retransmission once the actual
+current logical Peer output has frozen custody. State service must not call
+Peer.poll merely to burn a fresh inner packet ID/reallocate an output it will
+coalesce. It still observes actual original phase/operation/session expiry and
+uses genuine joint dispatch for new input. Test heavy ordinary service beyond
+retry time while retaining/confirming the exact first envelope, without a new
+inner packet identity; timeout abort/reconciliation still progresses.

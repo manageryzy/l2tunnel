@@ -1119,3 +1119,320 @@ fn real_leased_generic_peers_use_complete_c0_and_old_directional_fences() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn runtime_handoff_recomputes_retained_h0_and_exact_both_role_resolutions() -> Result {
+    for kind in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let value = inputs(kind)?;
+        let profile = value.build()?;
+        let original_settings = profile.settings();
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            let handoff = profile.runtime_contract(role)?;
+            assert_eq!(
+                handoff.expected_configuration(),
+                original_settings.configuration(profile.peers())?
+            );
+            assert_eq!(handoff.expected_configuration(), profile.configuration()?);
+            assert_eq!(handoff.role(), role);
+            assert_eq!(handoff.cover(), original_settings.cover.config(role)?);
+            assert_eq!(handoff.ipv6(), value.settings.gate.path.client.is_ipv6());
+            assert_eq!(handoff.envelope(), profile.envelope());
+            assert_eq!(handoff.catalog().root(), profile.catalog().root());
+            assert_eq!(handoff.initial(), profile.initial());
+            assert_eq!(handoff.data_digest(), profile.data_digest());
+            assert_eq!(handoff.settings(), profile.parameters());
+            assert_ne!(handoff.data_digest().0, handoff.expected_configuration().0);
+            for c in profile.catalog().configurations(profile.envelope()) {
+                assert_eq!(handoff.resolve(c)?, profile.runtime_for(c, role)?);
+            }
+        }
+        assert_eq!(profile.settings(), original_settings);
+        let mut changed = value.clone();
+        changed.peers.responder.0[0] ^= 1;
+        let changed = changed.build()?;
+        assert_ne!(
+            changed
+                .runtime_contract(security::Role::Initiator)?
+                .expected_configuration(),
+            profile
+                .runtime_contract(security::Role::Initiator)?
+                .expected_configuration()
+        );
+    }
+    Ok(())
+}
+
+async fn handoff_pump(parts: &mut l2tunnel_runtime::secure_udp::member::Parts) -> Result {
+    use l2tunnel_cover::{MediaTimestamp, PacketMeta, PacketNumber, Phase};
+    let mut output = vec![0; parts.cover.limits().max_packet_bytes];
+    for phase in [Phase::Handshake, Phase::Established] {
+        let metadata = PacketMeta {
+            phase,
+            packet_number: PacketNumber(parts.next_outer),
+            media_timestamp: MediaTimestamp(parts.next_outer.wrapping_mul(960)),
+        };
+        let length = match phase {
+            Phase::Handshake => {
+                parts
+                    .bootstrap
+                    .poll(tokio::time::Instant::now(), metadata, &mut output)?
+            }
+            Phase::Established => {
+                parts
+                    .joining
+                    .poll(tokio::time::Instant::now(), metadata, &mut output)?
+            }
+        };
+        if let Some(length) = length {
+            parts.next_outer = parts.next_outer.checked_add(1).ok_or("outer exhausted")?;
+            assert_eq!(parts.socket.send(&output[..length]).await?, length);
+        }
+    }
+    let mut input = vec![0; output.len() + 1];
+    for _ in 0..32 {
+        let length = match parts.socket.try_recv(&mut input) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.into()),
+        };
+        let decoded = parts.cover.decode(&input[..length])?;
+        if !parts
+            .bootstrap
+            .receive(decoded, tokio::time::Instant::now())?
+        {
+            assert!(
+                parts
+                    .joining
+                    .receive(decoded, tokio::time::Instant::now())?
+            );
+        }
+    }
+    Ok(())
+}
+
+struct HandoffSide {
+    socket: tokio::net::UdpSocket,
+    records: l2tunnel::secure_record::Records,
+    bootstrap: establish::BootstrapTail,
+    joining: l2tunnel_runtime::secure_udp::member::JoiningTail,
+    cover: l2tunnel_cover::Config,
+    outer: u32,
+}
+
+fn handoff_side(
+    parts: l2tunnel_runtime::secure_udp::member::Parts,
+    contract: &transport::TransactionContract,
+) -> Result<HandoffSide> {
+    use l2tunnel::secure_record::{Records, Scope};
+    assert_eq!(parts.info.role, contract.role());
+    assert_eq!(
+        parts.info.authenticated.configuration,
+        contract.expected_configuration().0
+    );
+    assert_eq!(parts.root.binding(), parts.info.binding);
+    assert_eq!(parts.cover, contract.cover());
+    assert_eq!(parts.socket.local_addr()?.is_ipv6(), contract.ipv6());
+    let config = contract.config();
+    let records = Records::new(
+        parts.root,
+        security::LaneId(0),
+        config.security,
+        security::Protection::ChaCha20Poly1305,
+        parts.cover,
+        Scope {
+            epoch: config.control_epoch,
+            configuration: contract.expected_configuration(),
+        },
+        Scope {
+            epoch: config.data_epoch,
+            configuration: security::ConfigDigest(contract.data_digest().0),
+        },
+    )?;
+    Ok(HandoffSide {
+        socket: parts.socket,
+        records,
+        bootstrap: parts.bootstrap,
+        joining: parts.joining,
+        cover: parts.cover,
+        outer: parts.next_outer,
+    })
+}
+
+async fn handoff_exchange(
+    sender: &mut HandoffSide,
+    receiver: &mut HandoffSide,
+    class: l2tunnel::secure_record::Class,
+    body: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result {
+    let capacity = sender.records.capacity(body.len())?;
+    let mut workspace = vec![0; capacity.seal_workspace_bytes];
+    let mut wire = vec![0; sender.cover.limits().max_packet_bytes];
+    let metadata = l2tunnel_cover::PacketMeta {
+        phase: l2tunnel_cover::Phase::Established,
+        packet_number: l2tunnel_cover::PacketNumber(sender.outer),
+        media_timestamp: l2tunnel_cover::MediaTimestamp(sender.outer.wrapping_mul(960)),
+    };
+    let sealed = sender
+        .records
+        .seal(class, metadata, body, &mut workspace, &mut wire)?;
+    sender.outer = sender.outer.checked_add(1).ok_or("outer exhausted")?;
+    assert_eq!(
+        sender.socket.send(&wire[..sealed.bytes]).await?,
+        sealed.bytes
+    );
+    let mut input = vec![0; receiver.cover.limits().max_packet_bytes + 1];
+    let capacity = receiver.records.capacity(body.len())?;
+    let mut open = vec![0; capacity.open_workspace_bytes];
+    let mut plain = vec![0; body.len()];
+    for _ in 0..128 {
+        let length = tokio::time::timeout_at(deadline, receiver.socket.recv(&mut input)).await??;
+        let decoded = receiver.cover.decode(&input[..length])?;
+        if receiver
+            .bootstrap
+            .receive(decoded, tokio::time::Instant::now())?
+            || receiver
+                .joining
+                .receive(decoded, tokio::time::Instant::now())?
+        {
+            continue;
+        }
+        let opened = receiver
+            .records
+            .open(&input[..length], &mut open, &mut plain)?;
+        assert_eq!(opened.class, class);
+        assert_eq!(&plain[..opened.bytes], body);
+        let scope = match class {
+            l2tunnel::secure_record::Class::User => receiver.records.active_data(),
+            l2tunnel::secure_record::Class::Control => receiver.records.control_scope(),
+        };
+        assert_eq!(opened.scope, scope);
+        return Ok(());
+    }
+    Err("protected handoff receive bound exhausted".into())
+}
+
+#[tokio::test]
+async fn actual_original_socket_factory_roots_handoff_both_roles_and_distinct_scopes() -> Result {
+    use l2tunnel_handshake::{LocalSecret, Psk};
+    use l2tunnel_runtime::secure_udp::{establish, member};
+    use zeroize::Zeroizing;
+    // The actual auth adapter generates the existing Ed25519 fixture. The
+    // X25519 inputs below are distinct explicit test keys, never conversions.
+    let member = l2tunnel_identity::IdentityKey::from_pkcs8(&Zeroizing::new(
+        l2tunnel_auth::MemberKey::generate_pkcs8()?,
+    ))?;
+    for kind in [
+        l2tunnel_cover::Appearance::QuicLike,
+        l2tunnel_cover::Appearance::MediaLike,
+    ] {
+        let sockets = [
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await?,
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await?,
+        ];
+        sockets[0].connect(sockets[1].local_addr()?).await?;
+        sockets[1].connect(sockets[0].local_addr()?).await?;
+        let tuples = [
+            (sockets[0].local_addr()?, sockets[0].peer_addr()?),
+            (sockets[1].local_addr()?, sockets[1].peer_addr()?),
+        ];
+        let mut value = inputs(kind)?;
+        value.settings.gate.path = l2tunnel_udp_control::Path {
+            client: tuples[0].0,
+            server: tuples[1].0,
+        };
+        value.settings.member = member.public_key();
+        let profile = value.build()?;
+        let contracts = [
+            profile.runtime_contract(security::Role::Initiator)?,
+            profile.runtime_contract(security::Role::Responder)?,
+        ];
+        let local = LocalSecret::new(Zeroizing::new([11; 32]));
+        let remote = LocalSecret::new(Zeroizing::new([22; 32]));
+        assert_eq!(local.public_key(), profile.peers().initiator);
+        assert_eq!(remote.public_key(), profile.peers().responder);
+        let client_identity = establish::Identity {
+            peer: remote.public_key(),
+            local,
+            psk: None::<Psk>,
+        };
+        let server_identity = establish::Identity {
+            peer: client_identity.local.public_key(),
+            local: remote,
+            psk: None::<Psk>,
+        };
+        let origin = tokio::time::Instant::now();
+        let deadline = origin + Duration::from_secs(2);
+        let mut server = super::super::Server::new(
+            profile.settings(),
+            profile.peers(),
+            l2tunnel_udp_control::Secret::new([41; 32]),
+            l2tunnel_udp_control::Secret::new([42; 32]),
+            origin,
+        )?;
+        let mut a_entropy = establish::RuntimeEntropy::new();
+        let mut b_entropy = establish::RuntimeEntropy::new();
+        let [a, b] = sockets;
+        let client = super::super::connect(
+            a,
+            profile.settings(),
+            client_identity,
+            &member,
+            l2tunnel_udp_control::Secret::new([41; 32]),
+            deadline,
+            &mut a_entropy,
+        );
+        let accepted = server.accept(b, server_identity, deadline, &mut b_entropy);
+        tokio::pin!(client, accepted);
+        let (early_side, early) = tokio::select! {
+            result=&mut client=>(0,result?), result=&mut accepted=>(1,result?),
+            _=tokio::time::sleep_until(deadline)=>return Err("factory deadline".into()),
+        };
+        let mut early = early.into_parts();
+        let late = loop {
+            tokio::select! {
+                result=&mut client,if early_side==1=>break result?,
+                result=&mut accepted,if early_side==0=>break result?,
+                _=tokio::time::sleep(Duration::from_millis(1))=>handoff_pump(&mut early).await?,
+                _=tokio::time::sleep_until(deadline)=>return Err("factory tail deadline".into()),
+            }
+        };
+        let late: member::Parts = late.into_parts();
+        let parts = if early_side == 0 {
+            [early, late]
+        } else {
+            [late, early]
+        };
+        for (side, parts) in parts.iter().enumerate() {
+            assert_eq!(
+                (parts.socket.local_addr()?, parts.socket.peer_addr()?),
+                tuples[side]
+            );
+            assert_eq!(parts.deadline, deadline);
+            assert_eq!(
+                parts.info.authenticated.configuration,
+                contracts[side].expected_configuration().0
+            );
+        }
+        let [a, b] = parts;
+        let mut a = handoff_side(a, &contracts[0])?;
+        let mut b = handoff_side(b, &contracts[1])?;
+        for class in [
+            l2tunnel::secure_record::Class::User,
+            l2tunnel::secure_record::Class::Control,
+        ] {
+            handoff_exchange(&mut a, &mut b, class, b"initiator handoff", deadline).await?;
+            handoff_exchange(&mut b, &mut a, class, b"responder handoff", deadline).await?;
+        }
+        assert_ne!(
+            a.records.active_data().configuration,
+            a.records.control_scope().configuration
+        );
+        assert_eq!(a.records.active_data(), b.records.active_data());
+        assert_eq!(a.records.control_scope(), b.records.control_scope());
+    }
+    Ok(())
+}

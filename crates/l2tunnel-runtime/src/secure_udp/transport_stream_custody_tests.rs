@@ -41,7 +41,7 @@ async fn rejecting_turn(
             .last_mut()
             .ok_or("missing handed attempt")?;
         let length = attempt.wire_bytes - left[0].driver.ip;
-        let packet = left[0].driver.wire[..length].to_vec();
+        let packet = left[0].driver.buffers.wire[..length].to_vec();
         let receiver = &mut right[0].driver;
         let refuse: Resolver = Box::new(|_| None);
         assert!(receiver.check_expiry(at)?);
@@ -83,7 +83,7 @@ async fn hold_rejected_proposal(
                     Traffic::Ack { stream: streams::Stream::Transaction, prefix } if prefix >= 1)
         });
         let driver = &mut fixture.endpoints[0].driver;
-        if driver.coordinator.pending().is_some()
+        if driver.owner.legacy()?.coordinator.pending().is_some()
             || driver.pending_outcome != Some(policy::Outcome::Rejected)
             || driver.challenge.is_some()
             || !lost_ack
@@ -96,11 +96,17 @@ async fn hold_rejected_proposal(
             .ok_or("Reject discarded the original transport token")?;
         let token = pending.source;
         assert_eq!(pending.id, original.id);
-        assert_eq!(driver.coordinator.outbound(), Some(original));
+        assert_eq!(
+            driver.owner.legacy()?.coordinator.outbound(),
+            Some(original)
+        );
         assert!(!driver.control.confirmed(token, duration(at))?);
-        assert_eq!(driver.coordinator.deadline(), None);
+        assert_eq!(driver.owner.legacy()?.coordinator.deadline(), None);
         assert_eq!(driver.policy_cap, Some(deadline.0));
-        assert_eq!(driver.coordinator.committed().epoch, policy::Epoch(0));
+        assert_eq!(
+            driver.owner.legacy()?.coordinator.committed().epoch,
+            policy::Epoch(0)
+        );
         assert_eq!(driver.source_scope, driver.records.active_data());
         assert_eq!(driver.feedback_scope, driver.records.active_data());
         assert!(driver.target.is_some());
@@ -146,11 +152,15 @@ async fn reject_before_original_source_ack_keeps_custody_until_one_rejected_outc
         let mut response = fixture.request()?;
         let original = fixture.endpoints[0]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .outbound()
             .ok_or("missing original proposal")?;
         let deadline = fixture.endpoints[0]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .deadline()
             .ok_or("missing original deadline")?;
@@ -171,13 +181,19 @@ async fn reject_before_original_source_ack_keeps_custody_until_one_rejected_outc
                 }
             }
             if observed
-                && fixture.endpoints.iter().all(|endpoint| {
-                    let driver = &endpoint.driver;
-                    driver.policy_source.is_none()
-                        && driver.coordinator.outbound().is_none()
-                        && driver.policy_cap.is_none()
-                        && !driver.control.has_dispatched()
-                })
+                && fixture
+                    .endpoints
+                    .iter()
+                    .try_fold(true, |settled, endpoint| {
+                        let driver = &endpoint.driver;
+                        Ok::<_, io::Error>(
+                            settled
+                                && driver.policy_source.is_none()
+                                && driver.owner.legacy()?.coordinator.outbound().is_none()
+                                && driver.policy_cap.is_none()
+                                && !driver.control.has_dispatched(),
+                        )
+                    })?
             {
                 finished = Some(at);
                 break;
@@ -191,9 +207,12 @@ async fn reject_before_original_source_ack_keeps_custody_until_one_rejected_outc
         ));
         for endpoint in &fixture.endpoints {
             let driver = &endpoint.driver;
-            assert_eq!(driver.coordinator.committed().epoch, policy::Epoch(0));
-            assert!(driver.coordinator.pending().is_none());
-            assert_eq!(driver.coordinator.outbound(), None);
+            assert_eq!(
+                driver.owner.legacy()?.coordinator.committed().epoch,
+                policy::Epoch(0)
+            );
+            assert!(driver.owner.legacy()?.coordinator.pending().is_none());
+            assert_eq!(driver.owner.legacy()?.coordinator.outbound(), None);
             assert_eq!(driver.records.active_data(), scope);
             assert_eq!(driver.source_scope, scope);
             assert_eq!(driver.feedback_scope, scope);
@@ -216,11 +235,15 @@ async fn rejected_custody_wakes_and_expires_at_original_cap_without_wire_credit(
             let mut response = fixture.request()?;
             let original = fixture.endpoints[0]
                 .driver
+                .owner
+                .legacy()?
                 .coordinator
                 .outbound()
                 .ok_or("missing original proposal")?;
             let deadline = fixture.endpoints[0]
                 .driver
+                .owner
+                .legacy()?
                 .coordinator
                 .deadline()
                 .ok_or("missing original deadline")?;
@@ -240,8 +263,8 @@ async fn rejected_custody_wakes_and_expires_at_original_cap_without_wire_credit(
             driver.next_report = None;
             assert!(driver.challenge.is_none());
             assert!(driver.native.is_empty());
-            assert!(driver.swift.data_deadline().is_none());
-            assert!(driver.swift.feedback_deadline().is_none());
+            assert!(driver.owner.legacy()?.engine.data_deadline().is_none());
+            assert!(driver.owner.legacy()?.engine.feedback_deadline().is_none());
             assert!(driver.bucket.ready_at(driver.reserve)? > deadline.0);
             assert!(driver.control.deadline() < duration(deadline.0));
             let wake = driver.wake(before)?;
@@ -249,7 +272,10 @@ async fn rejected_custody_wakes_and_expires_at_original_cap_without_wire_credit(
             assert!(driver.check_expiry(before)?);
             assert!(!driver.control.confirmed(token, duration(before))?);
             assert_eq!(driver.policy_cap, Some(deadline.0));
-            assert_eq!(driver.coordinator.outbound(), Some(original));
+            assert_eq!(
+                driver.owner.legacy()?.coordinator.outbound(),
+                Some(original)
+            );
             assert!(matches!(
                 response.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
@@ -264,9 +290,15 @@ async fn rejected_custody_wakes_and_expires_at_original_cap_without_wire_credit(
                 driver.policy_source.as_ref().map(|pending| pending.id),
                 Some(original.id)
             );
-            assert_eq!(driver.coordinator.outbound(), Some(original));
+            assert_eq!(
+                driver.owner.legacy()?.coordinator.outbound(),
+                Some(original)
+            );
             assert_eq!(driver.pending_outcome, Some(policy::Outcome::Rejected));
-            assert_eq!(driver.coordinator.committed().epoch, policy::Epoch(0));
+            assert_eq!(
+                driver.owner.legacy()?.coordinator.committed().epoch,
+                policy::Epoch(0)
+            );
             assert!(matches!(
                 response.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)

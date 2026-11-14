@@ -15,6 +15,9 @@ mod receive_service;
 #[path = "transport_stream_tests.rs"]
 mod streamed;
 
+#[path = "transport_generic_tests.rs"]
+mod generic_selected;
+
 use super::*;
 use l2tunnel_handshake as hs;
 use l2tunnel_identity as identity;
@@ -950,12 +953,18 @@ async fn parts_pair(kind: cover::Appearance) -> Result<(member::Parts, member::P
 }
 fn source(driver: &mut Driver, now: u64, number: u8) -> Result<Vec<u8>> {
     assert_eq!(
-        driver.swift.offer(now, &ethernet(number))?,
+        driver
+            .owner
+            .legacy_mut()?
+            .engine
+            .offer(now, &ethernet(number))?,
         records::Admission::Accepted
     );
     let seed = driver.records.next_number(Class::User);
     let body = driver
-        .swift
+        .owner
+        .legacy_mut()?
+        .engine
         .poll(now, records::RecordNumber(seed.0), true)?
         .ok_or_else(|| protocol("fixture source not emitted"))?;
     let mut wire = vec![0; driver.cover.limits().max_packet_bytes];
@@ -963,7 +972,7 @@ fn source(driver: &mut Driver, now: u64, number: u8) -> Result<Vec<u8>> {
         driver.source_scope,
         meta(driver.outer, cover::Phase::Established),
         body,
-        &mut driver.seal,
+        &mut driver.buffers.seal,
         &mut wire,
     )?;
     driver.outer += 1;
@@ -1042,17 +1051,17 @@ fn authenticated_pong(driver: &mut Driver, now: u64, nonce: u64) -> Result<Vec<u
     );
     let emitted = driver
         .control
-        .poll(duration(now), 4096, &mut driver.control_wire)?
+        .poll(duration(now), 4096, &mut driver.buffers.control_wire)?
         .ok_or_else(|| protocol("fixture Pong source missing"))?;
     let sealed = driver.records.seal(
         Class::Control,
         meta(driver.outer, cover::Phase::Established),
-        &driver.control_wire[..emitted.bytes],
-        &mut driver.seal,
-        &mut driver.wire,
+        &driver.buffers.control_wire[..emitted.bytes],
+        &mut driver.buffers.seal,
+        &mut driver.buffers.wire,
     )?;
     driver.outer += 1;
-    Ok(driver.wire[..sealed.bytes].to_vec())
+    Ok(driver.buffers.wire[..sealed.bytes].to_vec())
 }
 
 #[tokio::test]
@@ -1111,7 +1120,7 @@ async fn original_established_lease_expires_despite_fresh_authenticated_pong_and
                 .submit(b"expired", duration(lease)),
             Err(delivery::Error::Expired)
         );
-        let stopped = b.snapshot(lease, false);
+        let stopped = b.snapshot(lease, false)?;
         assert!(!stopped.running);
         assert_eq!(stopped.terminal, Some(StopReason::LeaseExpired));
         assert_eq!(stopped.liveness.last_pong_micros, Some(lease - 1));
@@ -1164,7 +1173,7 @@ async fn stale_and_mismatched_authenticated_pongs_cannot_renew_the_original_chal
             b.progress(deadline).err().map(|error| error.kind()),
             Some(io::ErrorKind::TimedOut)
         );
-        let stopped = b.snapshot(deadline, false);
+        let stopped = b.snapshot(deadline, false)?;
         assert!(!stopped.running);
         assert_eq!(stopped.terminal, Some(StopReason::PeerTimeout));
         assert_eq!(stopped.liveness.outstanding, Some(2));
@@ -1210,7 +1219,7 @@ async fn exact_or_late_matching_authenticated_pong_cannot_clear_an_expired_chall
                 b.progress(arrival).err().map(|error| error.kind()),
                 Some(io::ErrorKind::TimedOut)
             );
-            let stopped = b.snapshot(arrival, false);
+            let stopped = b.snapshot(arrival, false)?;
             assert_eq!(stopped.terminal, Some(StopReason::PeerTimeout));
             assert_eq!(stopped.liveness.deadline_micros, Some(deadline));
         }
@@ -1289,24 +1298,29 @@ async fn authenticated_malformed_control_is_not_receipted_or_reclassified_as_use
         .submit(b"not an L2SC envelope", Duration::ZERO)?;
     let emitted = a
         .control
-        .poll(Duration::ZERO, 4096, &mut a.control_wire)?
+        .poll(Duration::ZERO, 4096, &mut a.buffers.control_wire)?
         .ok_or_else(|| protocol("control fixture not emitted"))?;
     let sealed = a.records.seal(
         Class::Control,
         meta(a.outer, cover::Phase::Established),
-        &a.control_wire[..emitted.bytes],
-        &mut a.seal,
-        &mut a.wire,
+        &a.buffers.control_wire[..emitted.bytes],
+        &mut a.buffers.seal,
+        &mut a.buffers.wire,
     )?;
     assert_eq!(
-        b.receive(&a.wire[..sealed.bytes], 1, instant, &resolve(config))
-            .err()
-            .map(|error| error.kind()),
+        b.receive(
+            &a.buffers.wire[..sealed.bytes],
+            1,
+            instant,
+            &resolve(config)
+        )
+        .err()
+        .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
     );
     assert_eq!(b.counters.wire_packets, 0);
     assert_eq!(b.envelope_rx, 1);
-    assert_eq!(b.swift.stats().receiver.packets, 0);
+    assert_eq!(b.owner.legacy()?.engine.stats().receiver.packets, 0);
     Ok(())
 }
 
@@ -1328,7 +1342,8 @@ async fn forged_usage_guard_cannot_terminate_or_burn_the_next_valid_small_record
     let mut forged = valid.clone();
     forged.resize(1200, 0);
     assert_eq!(
-        b.records.open(&forged, &mut b.open, &mut b.plain),
+        b.records
+            .open(&forged, &mut b.buffers.open, &mut b.buffers.plain),
         Err(record::Error::Security(security::Error::KeyUsageExhausted))
     );
     let verified = b.live.last_verified_micros;
@@ -1360,14 +1375,19 @@ async fn full_native_queue_still_rejects_empty_unknown_user_and_services_control
                 Class::User,
                 meta(a.outer, cover::Phase::Established),
                 body,
-                &mut a.seal,
-                &mut a.wire,
+                &mut a.buffers.seal,
+                &mut a.buffers.wire,
             )?;
             a.outer += 1;
             assert_eq!(
-                b.receive(&a.wire[..sealed.bytes], 2, instant, &resolve(config))
-                    .err()
-                    .map(|error| error.kind()),
+                b.receive(
+                    &a.buffers.wire[..sealed.bytes],
+                    2,
+                    instant,
+                    &resolve(config)
+                )
+                .err()
+                .map(|error| error.kind()),
                 Some(io::ErrorKind::InvalidData)
             );
             assert_eq!(b.counters.native_backpressure_drops, 0);
@@ -1389,16 +1409,21 @@ async fn full_native_queue_still_rejects_empty_unknown_user_and_services_control
         );
         let emitted = a
             .control
-            .poll(duration(4), 4096, &mut a.control_wire)?
+            .poll(duration(4), 4096, &mut a.buffers.control_wire)?
             .ok_or_else(|| protocol("fixture Ping missing"))?;
         let sealed = a.records.seal(
             Class::Control,
             meta(a.outer, cover::Phase::Established),
-            &a.control_wire[..emitted.bytes],
-            &mut a.seal,
-            &mut a.wire,
+            &a.buffers.control_wire[..emitted.bytes],
+            &mut a.buffers.seal,
+            &mut a.buffers.wire,
         )?;
-        b.receive(&a.wire[..sealed.bytes], 4, instant, &resolve(config))?;
+        b.receive(
+            &a.buffers.wire[..sealed.bytes],
+            4,
+            instant,
+            &resolve(config),
+        )?;
         assert_eq!(b.remote_ping, 1);
         assert_eq!(b.pong, Some(1));
         b.submit_control(5)?;
@@ -1598,7 +1623,7 @@ async fn native_write_crossing_expiry_is_counted_once_without_retained_duplicate
                 .map(|error| error.kind()),
             Some(io::ErrorKind::WouldBlock)
         );
-        let stopped = fixture.driver.snapshot(deadline, false);
+        let stopped = fixture.driver.snapshot(deadline, false)?;
         assert_eq!(stopped.performance.native_write_batch_packets, 1);
         assert_eq!(stopped.counters.native_pending_packets, 0);
         assert_eq!(stopped.counters.native_written, 1);
@@ -1707,11 +1732,35 @@ async fn expired_lease_has_no_native_or_new_policy_request_effects() -> Result {
             assert_eq!(fixture.driver.counters.native_written, 0);
             assert_eq!(fixture.driver.counters.native_read, 0);
             assert_eq!(fixture.driver.native.len(), 1);
-            assert!(fixture.driver.coordinator.pending().is_none());
-            assert!(fixture.driver.coordinator.outbound().is_none());
-            assert!(fixture.driver.coordinator.take_outcome().is_none());
+            assert!(
+                fixture
+                    .driver
+                    .owner
+                    .legacy()?
+                    .coordinator
+                    .pending()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .driver
+                    .owner
+                    .legacy()?
+                    .coordinator
+                    .outbound()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .driver
+                    .owner
+                    .legacy_mut()?
+                    .coordinator
+                    .take_outcome()
+                    .is_none()
+            );
             assert_eq!(
-                fixture.driver.coordinator.committed().epoch,
+                fixture.driver.owner.legacy()?.coordinator.committed().epoch,
                 policy::Epoch(0)
             );
         }
@@ -1754,8 +1803,8 @@ async fn native_read_crossing_lease_expiry_is_not_admitted_to_swift() -> Result 
         1
     );
     assert_eq!(fixture.driver.counters.native_read, 0);
-    assert_eq!(fixture.driver.swift.unconfirmed(), 0);
-    assert_eq!(fixture.driver.swift.stats().native_read, 0);
+    assert_eq!(fixture.driver.owner.legacy()?.engine.unconfirmed(), 0);
+    assert_eq!(fixture.driver.owner.legacy()?.engine.stats().native_read, 0);
     assert_eq!(fixture.driver.terminal, Some(StopReason::LeaseExpired));
     Ok(())
 }
@@ -1788,7 +1837,7 @@ async fn event_expiry_preserves_lease_challenge_native_and_policy_priority() -> 
             .driver
             .request(2, policy_value(), reply, &resolve(config))?;
         assert_eq!(
-            fixture.driver.coordinator.deadline(),
+            fixture.driver.owner.legacy()?.coordinator.deadline(),
             Some(policy::Time(50))
         );
         if matches!(reason, StopReason::LeaseExpired | StopReason::PeerTimeout) {
@@ -1832,10 +1881,18 @@ async fn event_expiry_preserves_lease_challenge_native_and_policy_priority() -> 
         assert_eq!(fixture.driver.counters.native_written, 0);
         assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
         assert_eq!(
-            fixture.driver.coordinator.committed().epoch,
+            fixture.driver.owner.legacy()?.coordinator.committed().epoch,
             policy::Epoch(0)
         );
-        assert!(fixture.driver.coordinator.take_outcome().is_none());
+        assert!(
+            fixture
+                .driver
+                .owner
+                .legacy_mut()?
+                .coordinator
+                .take_outcome()
+                .is_none()
+        );
         assert_eq!(result.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         drop(ready);
         drop(fixture);
@@ -1888,16 +1945,25 @@ impl ReadyWakeFixture {
 
     fn ready_at(&mut self) -> Result<(u64, Instant)> {
         let driver = &mut self.driver;
-        assert!(driver.swift.data_ready(self.now));
+        assert!(driver.owner.legacy()?.engine.data_ready(self.now));
         // With flush=0, free source retention and no queued native bytes, only
         // an idle probe remains in data_deadline despite the already-ready work.
         assert_eq!(driver.send.records.codec.flush_micros, 0);
-        assert!(driver.swift.unconfirmed() < driver.send.records.codec.flow_sources);
-        assert!(driver.swift.data_deadline().is_some_and(|at| at > self.now));
-        assert!(driver.swift.feedback_deadline().is_none());
+        assert!(
+            driver.owner.legacy()?.engine.unconfirmed() < driver.send.records.codec.flow_sources
+        );
+        assert!(
+            driver
+                .owner
+                .legacy()?
+                .engine
+                .data_deadline()
+                .is_some_and(|at| at > self.now)
+        );
+        assert!(driver.owner.legacy()?.engine.feedback_deadline().is_none());
         assert!(driver.native.is_empty());
         assert!(driver.challenge.is_none());
-        assert!(driver.coordinator.deadline().is_none());
+        assert!(driver.owner.legacy()?.coordinator.deadline().is_none());
         assert!(driver.next_report.is_none());
         assert!(driver.ingress.left > 0);
         assert!(driver.control.drained());
@@ -1912,15 +1978,22 @@ impl ReadyWakeFixture {
         let required = driver.records.capacity(maximum)?.packet_bytes + driver.ip + driver.reserve;
         let ready = driver.bucket.ready_at(required)?;
         assert!(ready > self.now + 100);
-        assert!(driver.swift.data_deadline().is_some_and(|at| at > ready));
+        assert!(
+            driver
+                .owner
+                .legacy()?
+                .engine
+                .data_deadline()
+                .is_some_and(|at| at > ready)
+        );
         assert!(driver.next_ping > ready);
         assert!(driver.lease > ready);
         assert!(driver.control.deadline() > duration(ready));
         let number = driver.records.next_number(Class::User);
-        let statistics = driver.swift.stats();
+        let statistics = driver.owner.legacy()?.engine.stats();
         let wake = driver.wake(self.now)?;
         assert_eq!(driver.records.next_number(Class::User), number);
-        let after = driver.swift.stats();
+        let after = driver.owner.legacy()?.engine.stats();
         assert_eq!(after.sender.sources, statistics.sender.sources);
         assert_eq!(after.sender.retransmits, statistics.sender.retransmits);
         assert_eq!(after.sender.repairs, statistics.sender.repairs);
@@ -1947,12 +2020,27 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
                 )?;
             }
         }
-        assert_eq!(fixture.driver.swift.stats().sender.sources, 4);
-        assert_eq!(fixture.remote.swift.stats().receiver.sources, 3);
+        assert_eq!(
+            fixture.driver.owner.legacy()?.engine.stats().sender.sources,
+            4
+        );
+        assert_eq!(
+            fixture
+                .remote
+                .owner
+                .legacy()?
+                .engine
+                .stats()
+                .receiver
+                .sources,
+            3
+        );
         let number = fixture.remote.records.next_number(Class::User);
         let body = fixture
             .remote
-            .swift
+            .owner
+            .legacy_mut()?
+            .engine
             .poll(fixture.now - 1_000, records::RecordNumber(number.0), false)?
             .ok_or_else(|| protocol("fixture gap feedback was not produced"))?;
         assert_eq!(body[0] & swift::KIND_MASK, swift::KIND_FEEDBACK);
@@ -1963,7 +2051,7 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
             fixture.remote.feedback_scope,
             meta(fixture.remote.outer, cover::Phase::Established),
             body,
-            &mut fixture.remote.seal,
+            &mut fixture.remote.buffers.seal,
             &mut wire,
         )?;
         fixture.driver.receive(
@@ -1972,7 +2060,17 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
             fixture.driver.origin + duration(fixture.now),
             &resolve(fixture.driver.config),
         )?;
-        assert_eq!(fixture.driver.swift.stats().sender.retransmits, 0);
+        assert_eq!(
+            fixture
+                .driver
+                .owner
+                .legacy()?
+                .engine
+                .stats()
+                .sender
+                .retransmits,
+            0
+        );
         let (ready, wake) = fixture.ready_at()?;
         assert_eq!(
             wake,
@@ -1985,7 +2083,17 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
             ready,
             fixture.driver.origin + duration(ready),
         )?;
-        assert_eq!(fixture.driver.swift.stats().sender.retransmits, 1);
+        assert_eq!(
+            fixture
+                .driver
+                .owner
+                .legacy()?
+                .engine
+                .stats()
+                .sender
+                .retransmits,
+            1
+        );
         assert_eq!(fixture.driver.counters.socket_accepted_packets, 1);
         assert!(fixture.driver.bucket.allowance() >= fixture.driver.reserve);
     }
@@ -1997,8 +2105,14 @@ async fn earned_repair_wakes_when_wire_credit_returns_before_the_idle_probe() ->
     for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
         let mut fixture = ReadyWakeFixture::new(kind, true).await?;
         let _wire = source(&mut fixture.driver, fixture.now - 1, 1)?;
-        assert_eq!(fixture.driver.swift.stats().sender.sources, 1);
-        assert_eq!(fixture.driver.swift.stats().sender.repairs, 0);
+        assert_eq!(
+            fixture.driver.owner.legacy()?.engine.stats().sender.sources,
+            1
+        );
+        assert_eq!(
+            fixture.driver.owner.legacy()?.engine.stats().sender.repairs,
+            0
+        );
         let (ready, wake) = fixture.ready_at()?;
         assert_eq!(
             wake,
@@ -2011,7 +2125,10 @@ async fn earned_repair_wakes_when_wire_credit_returns_before_the_idle_probe() ->
             ready,
             fixture.driver.origin + duration(ready),
         )?;
-        assert_eq!(fixture.driver.swift.stats().sender.repairs, 1);
+        assert_eq!(
+            fixture.driver.owner.legacy()?.engine.stats().sender.repairs,
+            1
+        );
         assert_eq!(fixture.driver.counters.socket_accepted_packets, 1);
         assert!(fixture.driver.bucket.allowance() >= fixture.driver.reserve);
     }

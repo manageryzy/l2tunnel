@@ -149,6 +149,18 @@ settlement while Liveness continues. The focused and required frozen-source work
 explicit embedding selection, with unchanged CLI defaults and local API schemas;
 generic Management/DataFeedback, full SW-11 and native saturation remain open.
 
+
+The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
+now has an explicitly selected runtime-library API in that same sole I/O loop.
+Finite Unix tests use actual original UDP sockets, maintained authentication,
+canonical H0/D0 scopes, two reserved engines and physical native writes through
+two nonzero asymmetric switches. Whole-message proofs retain the original cap;
+separate status exposes requested/current configuration and incomplete resource
+preallocation. Shared CLI/service/API selection, Driver impairment/pressure
+qualification, complete reservation, cross-profile SW-11 and broader
+carrier/lifecycle/platform/performance acceptance remain open. Existing defaults
+and strict v1/v2 bytes are preserved. No new native throughput result is claimed.
+
 ## Library boundary and layering
 
 ```mermaid

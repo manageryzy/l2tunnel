@@ -49,7 +49,9 @@ fn drain_setup(socket: &tokio::net::UdpSocket) -> Result {
 fn sealed_source(driver: &mut Driver, now: u64) -> Result<Vec<u8>> {
     let seed = driver.records.next_number(Class::User);
     let body = driver
-        .swift
+        .owner
+        .legacy_mut()?
+        .engine
         .poll(now, records::RecordNumber(seed.0), true)?
         .ok_or_else(|| protocol("receive-service fixture source not emitted"))?;
     assert_eq!(body[0] & swift::KIND_MASK, swift::KIND_SOURCE);
@@ -58,7 +60,7 @@ fn sealed_source(driver: &mut Driver, now: u64) -> Result<Vec<u8>> {
         driver.source_scope,
         meta(driver.outer, cover::Phase::Established),
         body,
-        &mut driver.seal,
+        &mut driver.buffers.seal,
         &mut wire,
     )?;
     driver.outer = driver.outer.checked_add(1).ok_or_else(exhausted)?;
@@ -92,13 +94,17 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
     let high = port(1)?;
     for number in 0..8 {
         assert_eq!(
-            remote.swift.offer(1, &frame(low, number))?,
+            remote
+                .owner
+                .legacy_mut()?
+                .engine
+                .offer(1, &frame(low, number))?,
             records::Admission::Accepted
         );
     }
     let high_packet = frame(high, 200);
     assert_eq!(
-        remote.swift.offer(1, &high_packet)?,
+        remote.owner.legacy_mut()?.engine.offer(1, &high_packet)?,
         records::Admission::Accepted
     );
     let mut input = [0; 1501];
@@ -113,7 +119,9 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
         local.receive(&input[..length], 1, origin + duration(1), &resolve(config))?;
         assert!(
             local
-                .swift
+                .owner
+                .legacy()?
+                .engine
                 .channel_stats(expected_channel)
                 .and_then(|c| c.receive)
                 .is_some_and(|c| c.sources == 1)
@@ -140,9 +148,9 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
     if blocked {
         assert!(!write_one(&mut local, &mut device).await?);
         assert_eq!(local.counters.native_written, 0);
-        let before = local.swift.stats();
+        let before = local.owner.legacy()?.engine.stats();
         local.collect_native(2)?;
-        assert_eq!(local.swift.stats(), before);
+        assert_eq!(local.owner.legacy()?.engine.stats(), before);
         assert_eq!(local.native.len(), 1);
         assert_eq!(local.native.front().map(|packet| packet.since()), Some(1));
         assert_eq!(local.performance.counters.native_write_would_block, 1);
@@ -182,7 +190,7 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
     local.collect_native(5)?;
     assert!(local.native.is_empty());
     assert_eq!(local.native.bytes(), 0);
-    assert!(local.swift.receive_drained());
+    assert!(local.owner.legacy()?.engine.receive_drained());
     assert_eq!(local.counters.native_written, 9);
     assert_eq!(local.performance.counters.native_write_batch_packets, 9);
     assert_eq!(local.performance.counters.native_pending_packets_high, 1);

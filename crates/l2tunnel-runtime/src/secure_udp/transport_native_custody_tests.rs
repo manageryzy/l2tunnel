@@ -40,7 +40,9 @@ fn packet(channel: usize, channels: usize, number: u8) -> Result<Vec<u8>> {
 
 fn count(driver: &Driver, channel: usize) -> Result<u64> {
     Ok(driver
-        .swift
+        .owner
+        .legacy()?
+        .engine
         .boundary(
             records::Direction::Receive,
             records::ChannelId::new(channel).ok_or("invalid fixture channel")?,
@@ -53,7 +55,9 @@ fn count(driver: &Driver, channel: usize) -> Result<u64> {
 fn seal_next(driver: &mut Driver, now: u64, kind: u8) -> Result<Vec<u8>> {
     let seed = driver.records.next_number(Class::User);
     let body = driver
-        .swift
+        .owner
+        .legacy_mut()?
+        .engine
         .poll(now, records::RecordNumber(seed.0), true)?
         .ok_or("fixture has no Swift output")?;
     assert_eq!(body[0] & swift::KIND_MASK, kind);
@@ -67,7 +71,7 @@ fn seal_next(driver: &mut Driver, now: u64, kind: u8) -> Result<Vec<u8>> {
         scope,
         meta(driver.outer, cover::Phase::Established),
         body,
-        &mut driver.seal,
+        &mut driver.buffers.seal,
         &mut wire,
     )?;
     driver.outer = driver.outer.checked_add(1).ok_or_else(exhausted)?;
@@ -178,7 +182,13 @@ impl Fixture {
     }
 
     async fn receive(&mut self, packet: &[u8]) -> Result<records::NativeIdentity> {
-        let identity = match self.remote.swift.offer_identified(self.now, packet)? {
+        let identity = match self
+            .remote
+            .owner
+            .legacy_mut()?
+            .engine
+            .offer_identified(self.now, packet)?
+        {
             records::IdentifiedAdmission::Accepted(identity) => identity,
             other => return Err(format!("fixture admission refused: {other:?}").into()),
         };
@@ -207,7 +217,7 @@ impl Fixture {
             self.now,
         )
         .await?;
-        assert!(self.remote.swift.send_drained());
+        assert!(self.remote.owner.legacy()?.engine.send_drained());
         Ok(())
     }
 
@@ -236,10 +246,14 @@ impl Fixture {
 
 fn take_output(driver: &mut Driver, now: u64) -> Result<swift::control::Message> {
     let output = driver
+        .owner
+        .legacy()?
         .coordinator
         .outbound()
         .ok_or("missing genuine coordinator output")?;
     driver
+        .owner
+        .legacy_mut()?
         .coordinator
         .complete_outbound(policy::Time(now), output.id)?;
     Ok(output.message)
@@ -255,11 +269,11 @@ fn deliver_profile(
     Ok(())
 }
 
-fn hooks(driver: &mut Driver) -> Hooks<'_> {
-    Hooks {
+fn hooks(driver: &mut Driver) -> Result<Hooks<'_>> {
+    Ok(Hooks {
         info: &driver.info,
         next: records::RecordNumber(driver.records.next_number(Class::User).0),
-        engine: &mut driver.swift,
+        engine: &mut driver.owner.legacy_mut()?.engine,
         written: &mut driver.written,
         retired_send: &mut driver.retired_send,
         retired_receive: &mut driver.retired_receive,
@@ -270,7 +284,7 @@ fn hooks(driver: &mut Driver) -> Hooks<'_> {
         target: driver.target,
         native_pending: !driver.native.is_empty(),
         bucket: &mut driver.bucket,
-    }
+    })
 }
 
 /// Return the genuine local barrier while the opposite receive barrier waits on
@@ -303,12 +317,20 @@ fn waiting_for_physical_receive(fixture: &mut Fixture) -> Result<swift::control:
     deliver_profile(&mut fixture.driver, fixture.now, old, remote_barrier)?;
     fixture.driver.progress(fixture.now)?;
     assert!(
-        fixture.driver.coordinator.outbound().is_none(),
+        fixture
+            .driver
+            .owner
+            .legacy()?
+            .coordinator
+            .outbound()
+            .is_none(),
         "physical custody must withhold BarrierAck"
     );
     assert!(matches!(
         fixture
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .pending()
             .map(|pending| pending.receive),
@@ -318,7 +340,7 @@ fn waiting_for_physical_receive(fixture: &mut Fixture) -> Result<swift::control:
     assert_eq!(fixture.driver.receive.records.channels, 2);
     assert!(fixture.driver.retired_receive.is_none());
     assert_eq!(
-        fixture.driver.coordinator.committed().epoch,
+        fixture.driver.owner.legacy()?.coordinator.committed().epoch,
         policy::Epoch(0)
     );
     Ok(local_barrier)
@@ -384,7 +406,7 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
             !fixture
                 .driver
                 .written
-                .matches_extracted(&fixture.driver.swift, origin)
+                .matches_extracted(&fixture.driver.owner.legacy()?.engine, origin)
         );
         assert_eq!(fixture.driver.counters.native_written, 0);
         // The synthetic WouldBlock cleared readiness despite the real socket
@@ -412,7 +434,7 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
             fixture
                 .driver
                 .written
-                .matches_extracted(&fixture.driver.swift, origin)
+                .matches_extracted(&fixture.driver.owner.legacy()?.engine, origin)
         );
         assert!(fixture.driver.native.is_empty());
         assert_eq!(fixture.driver.counters.native_written, 2);
@@ -502,12 +524,12 @@ async fn empty_fifo_cannot_reset_receive_with_mismatched_physical_generation_or_
         assert!(fixture.write().await?);
         fixture.received_once(&packet)?;
         assert!(fixture.driver.native.is_empty());
-        assert!(fixture.driver.swift.receive_drained());
+        assert!(fixture.driver.owner.legacy()?.engine.receive_drained());
         let old = fixture.driver.feedback_scope;
         let origin = fixture.driver.written.origin;
         let counts = fixture.driver.written.counts;
-        let before = fixture.driver.swift.stats();
-        let floor = fixture.driver.swift.source_floor();
+        let before = fixture.driver.owner.legacy()?.engine.stats();
+        let floor = fixture.driver.owner.legacy()?.engine.source_floor();
         let direction = fixture.driver.receive;
         let (reply, _result) = oneshot::channel();
         fixture.driver.request(
@@ -541,7 +563,7 @@ async fn empty_fifo_cannot_reset_receive_with_mismatched_physical_generation_or_
                 _ => fixture.driver.written.counts[1] = 0,
             }
             {
-                let mut actual = hooks(&mut fixture.driver);
+                let mut actual = hooks(&mut fixture.driver)?;
                 assert!(!policy::Hooks::status(&actual).receive_drained);
                 assert!(
                     policy::Hooks::replace_receive(
@@ -554,8 +576,8 @@ async fn empty_fifo_cannot_reset_receive_with_mismatched_physical_generation_or_
             }
             assert_eq!(fixture.driver.feedback_scope, old);
             assert_eq!(fixture.driver.receive, direction);
-            assert_eq!(fixture.driver.swift.source_floor(), floor);
-            assert_eq!(fixture.driver.swift.stats(), before);
+            assert_eq!(fixture.driver.owner.legacy()?.engine.source_floor(), floor);
+            assert_eq!(fixture.driver.owner.legacy()?.engine.stats(), before);
             assert_eq!(count(&fixture.driver, 1)?, 1);
             assert!(fixture.driver.retired_receive.is_none());
             assert_eq!(fixture.driver.counters.native_written, 1);
@@ -564,9 +586,9 @@ async fn empty_fifo_cannot_reset_receive_with_mismatched_physical_generation_or_
         fixture.driver.written.origin = origin;
         fixture.driver.written.channels = 2;
         fixture.driver.written.counts = counts;
-        assert!(policy::Hooks::status(&hooks(&mut fixture.driver)).receive_drained);
+        assert!(policy::Hooks::status(&hooks(&mut fixture.driver)?).receive_drained);
         assert_eq!(
-            fixture.driver.coordinator.committed().epoch,
+            fixture.driver.owner.legacy()?.coordinator.committed().epoch,
             policy::Epoch(0)
         );
     }
@@ -585,7 +607,9 @@ async fn directional_policy_hooks_keep_physical_old_witness_and_collect_in_feedb
         assert!(
             fixture
                 .driver
-                .swift
+                .owner
+                .legacy()?
+                .engine
                 .boundary(
                     records::Direction::Receive,
                     records::ChannelId::new(2).ok_or("fixture channel")?
@@ -600,7 +624,7 @@ async fn directional_policy_hooks_keep_physical_old_witness_and_collect_in_feedb
             !fixture
                 .driver
                 .written
-                .matches_extracted(&fixture.driver.swift, original)
+                .matches_extracted(&fixture.driver.owner.legacy()?.engine, original)
         );
         fixture.time.store(fixture.now, Ordering::SeqCst);
         assert!(fixture.write().await?);
@@ -681,19 +705,17 @@ async fn directional_policy_hooks_keep_physical_old_witness_and_collect_in_feedb
         fixture.driver.progress(fixture.now)?;
         fixture.remote.progress(fixture.now)?;
         assert_eq!(
-            fixture.driver.coordinator.committed().epoch,
+            fixture.driver.owner.legacy()?.coordinator.committed().epoch,
             policy::Epoch(1)
         );
         assert_eq!(fixture.driver.records.active_data(), target);
         assert!(fixture.driver.retired_send.is_none());
         assert!(fixture.driver.retired_receive.is_none());
         assert_eq!(fixture.driver.written.counts[2], 1);
-        assert!(
-            fixture
-                .driver
-                .written
-                .matches_extracted(&fixture.driver.swift, fixture.driver.written.origin)
-        );
+        assert!(fixture.driver.written.matches_extracted(
+            &fixture.driver.owner.legacy()?.engine,
+            fixture.driver.written.origin
+        ));
         assert_eq!(fixture.driver.counters.native_written, 2);
     }
     Ok(())
@@ -757,7 +779,7 @@ async fn noncanonical_retained_native_boundaries_block_scope_settlement_without_
                 let retained_send = fixture.driver.retired_send;
                 let retained_receive = fixture.driver.retired_receive;
                 let written = fixture.driver.written.boundary();
-                let statistics = fixture.driver.swift.stats();
+                let statistics = fixture.driver.owner.legacy()?.engine.stats();
                 let number = fixture.driver.records.next_number(Class::User);
                 assert_eq!(
                     fixture
@@ -773,7 +795,7 @@ async fn noncanonical_retained_native_boundaries_block_scope_settlement_without_
                 assert_eq!(fixture.driver.retired_send, retained_send);
                 assert_eq!(fixture.driver.retired_receive, retained_receive);
                 assert_eq!(fixture.driver.written.boundary(), written);
-                assert_eq!(fixture.driver.swift.stats(), statistics);
+                assert_eq!(fixture.driver.owner.legacy()?.engine.stats(), statistics);
                 assert_eq!(fixture.driver.records.next_number(Class::User), number);
                 assert_eq!(fixture.driver.counters.native_written, 1);
                 assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
@@ -851,13 +873,23 @@ async fn physical_success_commits_native_identity_once_even_when_completion_fail
                 1
             );
             assert_eq!(
-                fixture.driver.coordinator.committed().epoch,
+                fixture.driver.owner.legacy()?.coordinator.committed().epoch,
                 policy::Epoch(0)
             );
-            assert!(fixture.driver.coordinator.outbound().is_none());
+            assert!(
+                fixture
+                    .driver
+                    .owner
+                    .legacy()?
+                    .coordinator
+                    .outbound()
+                    .is_none()
+            );
             assert!(matches!(
                 fixture
                     .driver
+                    .owner
+                    .legacy()?
                     .coordinator
                     .pending()
                     .map(|pending| pending.receive),

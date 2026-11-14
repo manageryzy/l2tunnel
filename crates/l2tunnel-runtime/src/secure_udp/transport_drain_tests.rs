@@ -286,7 +286,7 @@ async fn pending_and_wouldblock_predrain_retain_output_and_allow_input_and_contr
         );
         drop(ready);
         assert_eq!(fixture.driver.counters.native_read, 1);
-        assert!(fixture.driver.swift.data_ready(now + 1));
+        assert!(fixture.driver.owner.legacy()?.engine.data_ready(now + 1));
         assert!(
             fixture
                 .driver

@@ -152,7 +152,7 @@ impl LossFixture {
             },
         };
         let view = recovery::inspect_packet(
-            &driver.control_wire[..length],
+            &driver.buffers.control_wire[..length],
             context,
             driver.config.control.recovery.max_source_bytes,
         )?;
@@ -215,7 +215,7 @@ impl LossFixture {
         let length =
             tokio::time::timeout(Duration::from_secs(1), to.socket.recv(&mut wire)).await??;
         assert_eq!(length + from.driver.ip, wire_bytes);
-        assert_eq!(&wire[..length], &from.driver.wire[..length]);
+        assert_eq!(&wire[..length], &from.driver.buffers.wire[..length]);
         let mut attempt = Attempt {
             side,
             at,
@@ -300,16 +300,34 @@ impl LossFixture {
         Ok(())
     }
     async fn fresh_user(&mut self, side: Side, at: u64) -> Result {
-        let before = self.driver(side).swift.stats().sender.sources;
+        let before = self
+            .driver(side)
+            .owner
+            .legacy()?
+            .engine
+            .stats()
+            .sender
+            .sources;
         assert_eq!(
             self.driver_mut(side)
-                .swift
+                .owner
+                .legacy_mut()?
+                .engine
                 .offer(at - 1_000, &ethernet(7))?,
             records::Admission::Accepted
         );
         for _ in 0..8 {
             self.turn(side, at, &mut |_| false).await?;
-            if self.driver(side).swift.stats().sender.sources > before {
+            if self
+                .driver(side)
+                .owner
+                .legacy()?
+                .engine
+                .stats()
+                .sender
+                .sources
+                > before
+            {
                 return Ok(());
             }
         }
@@ -608,11 +626,14 @@ async fn refilling_shared_credit_preserves_control_attempts_and_reserve_under_qu
         let a = fixture.driver_mut(Side::A);
         for number in 0..64 {
             assert_eq!(
-                a.swift.offer(start - 1_000, &ethernet(number))?,
+                a.owner
+                    .legacy_mut()?
+                    .engine
+                    .offer(start - 1_000, &ethernet(number))?,
                 records::Admission::Accepted
             );
         }
-        assert!(a.swift.data_ready(start));
+        assert!(a.owner.legacy()?.engine.data_ready(start));
         a.bucket.tokens = 0;
         a.bucket.last = start;
         let mut fault = |_: &Attempt| true;
@@ -677,7 +698,17 @@ async fn refilling_shared_credit_preserves_control_attempts_and_reserve_under_qu
             .ok_or_else(|| protocol("queued User was not emitted"))?;
         assert!(matches!(fixture.attempts[user].traffic, Traffic::User));
         assert!(fixture.driver(Side::A).bucket.allowance() >= reserve);
-        assert_eq!(fixture.driver(Side::A).swift.stats().sender.sources, 1);
+        assert_eq!(
+            fixture
+                .driver(Side::A)
+                .owner
+                .legacy()?
+                .engine
+                .stats()
+                .sender
+                .sources,
+            1
+        );
         let retry = fixture
             .turn(Side::A, ready + 200_000, &mut fault)
             .await?

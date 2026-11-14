@@ -1,7 +1,8 @@
 # Generic transactions on the selected secure UDP transport
 
-Status: **directional peers and canonical values protocol-tested; authenticated
-client construction tested; selected generic driver integration pending**. This
+Status: **generic Swift transactions implemented and finite local Unix Driver
+integration-tested; shared service/frontend selection and complete resource,
+fault, profile, native and platform qualification remain open**. This
 workstream connects the existing generic leased management peer to actual
 record engines, common protected records, stable control and physical native
 completion on the selected original UDP socket. It is required work beneath
@@ -16,6 +17,47 @@ decision. The first frozen interface below is recorded in the
 and [source binding](../../work/generic-secure-udp-20261114/directional-design-binding.json).
 Other interfaces remain draft until the integrator records their exact revision
 before implementation. A design or public enum does not implement a mode.
+
+## Current explicit runtime checkpoint
+
+The [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json) passes
+119 selected transport/component cases, 16 client handoff cases and 121 management
+cases, with strict all-target/all-feature Clippy. Its separately reported six
+Generic and two legacy fairness cases are subsets of the 119, not extra cases.
+The [required source-stable workspace check](../../work/generic-driver-20261114/driver-aggregate-attempt-1/validation.json)
+also passes1878 Rust cases including doctests,376 tooling cases and1658 simulator
+cases. It includes full workspace format/strict Clippy/Rust tests, codec feature
+checks, strict rustdoc, CLI/tool validation and the real simulator/KCP suite.
+These are local Linux checks; no privileged lab, remote CI, Windows/Android
+native execution or current-source performance result is implied.
+
+The actual public `run_transaction` uses the same sole I/O loop, original
+connected socket and Records owner, fixed Control H0 and true canonical User D0.
+Its complete-C channel and separate snapshot preserve requested/current values,
+actual operation, physical scope, capacities and incomplete resource status.
+
+Both covers pass real Noise/member construction, H0/D0/socket/role/cover/deadline
+checks, nonzero native-device/AEAD/UDP traffic on every old/new channel through
+2/3→4/1→2/3, liveness and public readiness/cancellation. Physical native writes
+at cap−1/cap/cap+1 and successful I/O crossing the exact original cap preserve
+irreversible facts without false promotion or duplicate output. Fourteen State
+cases include real whole-message pressure, immutable caps, interrupted work,
+nonzero fences, cached final retries and callback failure; those component facts
+are distinct from the Driver's clean same-socket integration.
+
+Original failed attempts remain saved: incomplete workspace migration, legacy
+stack overflow, scripted readiness timeout and strict-lint failures. The owner
+never approved a scope reduction. Generic-only State backing is now fallibly
+reserved; the sole async loop returns final snapshots rather than Driver through
+nested wrappers. Legacy fairness passes without larger stacks or changed limits.
+
+This is an explicit runtime-library entry point. CLI/service generic selection,
+strict shared API v3, Driver loss/reorder/final-proof-pressure qualification,
+complete management/Peer reservation, other record profiles/full SW-11,
+OpenVPN/raw-HTTPS migration, recovery/fresh-DH, Windows/Android and all47 complete
+parity gates remain open. No current-source native/performance run is inferred;
+the original80 Mbit/s target is unchanged. Historical checkpoints below retain
+their original inputs and isolation boundaries.
 
 ## Composition and compatibility
 
@@ -403,3 +445,195 @@ field order and validation. Root focused attempt3 passes all14 authenticated
 plan cases including existing digest/field-mutation and actual-factory tests.
 The selected driver, full shared resources and exact version3 status are still
 required; GST-01 is not a backend or GUI completion claim.
+
+## Explicit runtime handoff contract v0
+
+The actual authenticated Profile supplies a public checked runtime value,
+without making runtime depend on client or inferring a backend from streams:
+
+```rust
+TransactionContract::new(expected_configuration: security::ConfigDigest,
+    role: security::Role, config: transport::Config, cover: cover::Config,
+    ipv6: bool, envelope: swift_configuration::EnvelopeDigest,
+    catalog: swift_configuration::Catalog, settings: TransactionSettings)
+    -> io::Result<TransactionContract>
+TransactionContract::{expected_configuration,role,config,cover,ipv6,envelope,
+    catalog,initial,data_digest,settings}(&self) -> ...
+TransactionContract::resolve(&self, value: swift_configuration::Configuration)
+    -> io::Result<transport::Config>
+transaction_profile::Profile::runtime_contract(&self, role: security::Role)
+    -> io::Result<transport::TransactionContract>
+```
+
+All fields are private. Put the runtime value in transport_contract.rs (a child
+of the existing transport), and re-export TransactionContract there. Constructor
+validates shared settings, exact initial descriptor/role mapping and all finite
+catalog descriptors against the original immutable template digest, same native
+format, streams, cover/IP/body/MTU geometry. Resolve admits only exact complete
+values under E/catalog, updating both directions, active MTU and derived stream
+MTUs without changing any immutable field. D0 is the real management digest of
+C0, and H0 is retained separately. No reconstruction of the full client H0 hash
+graph is claimed in runtime: the real Profile recomputes it from its retained
+complete settings/pins at handoff. Actual Driver must still verify H0, role,
+cover, IP family, binding, endpoints and original setup deadline against Parts.
+No crypto root, OS handle, clock, device, backend fallback or allocation permit
+is constructed here. Catalog validation does not reserve engines/control/native
+storage. Existing hash fields/order, Profile calls, defaults and v1/v2 bytes stay.
+
+- [x] [GHC-01] Implement the checked runtime handoff and real Profile consumer, preserving the acyclic H0/E/catalog/C0/D0 graph and exact legacy values. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
+- [x] [GHC-02] Test both roles/covers, asymmetric complete values, catalog/native/geometry/envelope refusals and actual original-socket factory handoff; run strict required checks. Evidence: [required source-stable check](../../work/generic-driver-20261114/driver-aggregate-attempt-1/validation.json) and the focused receipt above.
+- [ ] [GHC-03] Consume the contract in the explicit selected Driver before any legacy allocation and verify actual Parts/resource/readiness boundaries.
+
+## Fixed runtime byte buffers v0
+
+Shared byte backing is a real preparation dependency, distinct from engine
+and logical message retention. Add private `transport_buffers.rs` with checked
+fallible constructors and exact retained-layout observation:
+
+```rust
+Buffers::new(wire: usize, secure_packet: usize, plain: usize,
+    control_packet: usize, control_message: usize, frame: usize) -> io::Result<Buffers>
+// pub(super) Vec<u8> fields: wire, seal, open, plain, control_wire, control_input, frame
+Buffers::capacity_bytes(&self) -> usize
+Inputs::new(native: usize, datagram: usize) -> io::Result<Inputs>
+// pub(super) Vec<u8> fields: native, datagram
+Inputs::capacity_bytes(&self) -> usize
+```
+
+Use checked Layout arrays/sums, try_reserve_exact, reject zero/overflow before
+allocation; charge all buffers, including empty frame capacity and duplicate
+seal/open scratch. Initialize every workspace to its required length except
+frame, which starts empty. Failures drop all partial allocations and publish
+no owner. No grow/replace API is introduced. Test every actual allocation
+failure index through private constructor injection and exact retained layouts.
+Root must still split borrowed Buffer fields correctly and account for these
+actual owners alongside native/engine/control/Peer custody before qualification.
+This module alone does not reserve all management internals or complete GSU-05.
+
+The actual runtime Counters report `workspace_capacity_bytes` from the seven
+owned Buffers and `loop_input_capacity_bytes` from the two owned Inputs. Fill
+both observations before the final readiness clock sample. These are retained
+byte capacities, not a claim that all Driver/control resources are reserved.
+Strict client status v1/v2 layouts remain unchanged.
+
+- [x] [RBF-01] Implement real fallible seven-workspace/two-input allocation and exact requested layout accounting; cover all constructor failure positions. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
+- [x] [RBF-02] Consume the actual owners in the existing I/O loop before its final readiness clock sample, preserving all bytes, quotas and original deadlines. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
+- [ ] [RBF-03] Validate exact combined-owner accounting in the selected generic driver; retain complete GSU-05/SRS-07 and every native/performance gate.
+
+## Single data/control owner in the existing loop v0
+
+The [source-pinned selected-driver draft](../../work/generic-driver-20261114/selected-driver-integration-v0.md)
+identifies actual consumers and authority/borrow constraints. The next additive
+refactor introduces private `transport_owner.rs`:
+
+```rust
+struct Legacy { engine: records::Engine, coordinator: policy::Coordinator }
+enum DataOwner { Legacy(Legacy), Generic(ReservedState) }
+ReservedState::new(state: transactions::State) -> io::Result<ReservedState>
+enum Entry<'a> { Legacy(&'a mut records::Engine), Reserved(storage::Entry<'a>) }
+DataOwner::legacy(&self) -> io::Result<&Legacy>
+DataOwner::legacy_mut(&mut self) -> io::Result<&mut Legacy>
+DataOwner::engine(&self, epoch: core::Epoch) -> io::Result<&records::Engine>
+DataOwner::entry(&mut self, epoch: core::Epoch) -> io::Result<Entry<'_>>
+```
+
+Legacy fields are accessible only to the parent, and no Generic constructor
+allocates a legacy Engine or Coordinator. The first inline Generic(State)
+implementation caused a real legacy fairness test to overflow its default stack
+(integrated attempt 2); its exact stack attribution is not yet measured. Revise
+this private ownership contract to a fallible exact one-element Vec<State> cell
+for Generic only, retaining Legacy inline. The private cell publishes only after
+Layout validation, try_reserve_exact(1), exact capacity validation and insertion;
+it exposes no vector mutation or extraction. Its immutable length-one invariant
+allows private State forwarding and is unrelated to peer input. Account the
+actual State backing layout plus Driver inline, subtracting embedded Set once.
+No infallible Box or larger test stack may stand in for this ownership repair.
+The shared async loop returns only its typed final snapshot, never Driver itself;
+the legacy stack failure continued in focused attempt 4 while the complete owner
+was still returned through nested wrapper futures. The sole loop retains its owner.
+A narrowly explained large-enum lint exception remains permitted for the inline
+Legacy variant. No unused-code lint suppression is permitted. Legacy epoch lookup preserves the existing single-engine
+directional-scope policy; Generic delegates only to its actual State/Bank.
+
+Entry forwards the actual offer_identified/poll/accept/pop_identified operations
+with exact types, without Deref/DerefMut, replacements, Engine extraction or
+configuration mutation. A borrowed output stays tied to the live Entry until
+its immediate copy/seal; no payload Vec copy is added for the borrow checker.
+
+Replace the actual Driver's two ownership fields with DataOwner, keeping the
+existing run/run_clock APIs and exact legacy behavior. Legacy hooks receive
+only that actual Legacy engine/coordinator, never the reserved Entry. Change
+the private legacy snapshot accessor to io::Result if needed for explicit
+wrong-selection errors; do not fabricate legacy policy fields for Generic.
+Adapt existing fixtures to real legacy access and preserve every assertion.
+The unchanged legacy constructor selects Legacy; the additive explicit generic
+constructor selects the actual reserved State. Construction and clean same-socket
+integration do not imply complete fault/resource/API/profile qualification.
+
+- [x] [DOW-01] Refactor actual existing Driver ownership and restricted Entry access while preserving its public/default/wire behavior and finite original fixtures. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
+- [ ] [DOW-02] Construct and consume the authenticated Generic variant in that same I/O loop, with one crypto number/seed owner and actual epoch/disposition/native barriers.
+- [ ] [DOW-03] Run strict required checks and original-socket/native/API validation on the complete selected path; keep full SW-11/resource/profile/platform/performance scope.
+
+## Explicit generic session integration v0
+
+The selected Driver draft above is an engineering contract, not an owner scope
+change. Add a public `run_transaction` beside the unchanged legacy `run` API,
+using `TransactionContract`, a complete-Configuration request channel and a
+separate `TransactionSnapshot`/`TransactionStopped` result. Both wrappers enter
+one selected I/O loop. Generic status reports actual Peer phase/epoch/config,
+physically installed data scope, actual Bank usage, common security counters
+and fixed byte-buffer capacities; legacy policy fields are never fabricated.
+
+The generic constructor consumes the original authenticated Parts exactly once,
+validates H0/role/cover/IP/session/socket/setup deadline, creates one Records
+owner with fixed Control H0 and initial User D0, one leased Control owner and the
+actual Bank/State. It constructs no legacy Engine/Coordinator. A resource
+observation must explicitly distinguish actually charged native/buffer backing
+from management/Peer allocations that are not yet fully preallocated; functional
+integration cannot close GSU-05/SRS-07 on that subtotal.
+
+An outcome-held server may jointly dispatch only the exact actual cached final
+request under the same retained operation and original cap, with no Preparation.
+Its byte-identical coalesced current reply needs no additional output slot. This
+exception never admits a new operation, Barrier or Commit and cannot allocate
+another Bank. Actual final acceptance/confirmation still controls release.
+
+The shared expiry-only guard also observes the actual State retained operation
+deadline and any retained outcome cap before/after physical native I/O. It keeps
+lease, liveness and native-stall precedence, and does not run a protocol FSM
+inside a synchronous native write. An unadmitted queued-request cap remains a
+request refusal rather than session-terminal authority.
+
+One bounded parent outcome retains the actual State outcome until the matching
+leased Peer operation is released by real whole-message proofs; only then may
+a local switch call report success. New admission waits for that custody.
+
+One parent-owned Action retains its exact operation and applied physical work
+across Blocked completions. Stage registers the exact reader and freezes the
+old admitted fence. Drain requires old Engine send/receive drain, exact local
+admission and peer extraction fences, empty old native queue and identical
+physical NativeWritten fence. Committed promotes Records, exact local config
+and NativeWritten only after that barrier. Retired removes the actual old
+reader and Bank. Aborted cancels only a nonpromoted reader. Uncertain never
+rolls back. The physical native write completion ordering stays unchanged.
+
+Expose `Peer::peer_fence(&self) -> Option<&transaction::Fence>` as a read-only
+borrow of actual pending peer counts; no packet reparse or mirrored fence grants
+authority. Check this known fence before native enqueue even during Stage.
+Actual target preparation is admitted only at the sole loop clock seam, sampling
+again after Bank allocation; ordinary progress does not allocate another Bank.
+
+`Owner::ready_nontransaction()` observes actual eligible Liveness and data-profile
+messages without treating retained Transaction input as immediately dispatchable.
+It is read-only and leaves Transaction custody with joint State/Owner admission.
+
+Generic ingress checks the real Peer reader, exact C digest and actual Bank
+before accepting current/staged/draining data. Staged data cannot be extracted
+before local commit; draining data cannot be redelivered. Service both actual
+generations with the common wire bucket, fixed Control reserve, global User
+record numbers and immediate borrowed seal. Old recovery remains enabled while
+new native admission is stopped. Original local request caps survive retries.
+
+- [x] [GDI-01] Construct and explicitly select the real generic owner in the same I/O loop, retaining exact legacy behavior and separate honest status. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
+- [ ] [GDI-02] Apply actual lifecycle actions with independent physical native fences, old/new reader routing and fixed original caps; exercise failure and pressure paths.
+- [ ] [GDI-03] Verify actual same-socket sessions, loss/reorder recovery, liveness during switch and at least two nonzero switches; preserve all broader functionality/resource/performance gates.

@@ -1,8 +1,13 @@
 # Owned duplex generations for the generic driver
 
-Status: **private interface v0 frozen; implementation pending**. This is a
+Status: **implemented; nine focused Bank cases and finite selected-Driver integration pass**. This is a
 resource/lifecycle prerequisite for GSU-04/GSU-05 and SRS-07. It does not close
 full SW-11, combined control memory admission or any native/performance gate.
+
+The [required source-stable check](../../work/generic-driver-20261114/driver-aggregate-attempt-1/validation.json) passes1878 Rust
+cases including doctests,376 tooling cases and1658 simulator cases. This local
+Linux result does not close the complete parent resource, fault, shared-API,
+profile, native, platform or performance acceptance.
 
 Add `secure_udp/transport_engines.rs`, a child of the existing transport. It
 owns one actual Swift storage Set and at most two exact canonical generations.
@@ -65,6 +70,6 @@ The authenticated combined ceiling is still a root prerequisite. external_bytes
 must represent actual owners; this module reports it honestly and cannot prove
 that scalar itself reserves control storage. No catalog pruning/default change.
 
-- [ ] [EGB-01] Freeze the private interface and actual two-generation invariants before edits.
-- [ ] [EGB-02] Implement real pre-allocation, exact operation matching and one-way lifecycle with focused refusal/old-state preservation tests using actual leased Peers.
+- [x] [EGB-01] Freeze the private interface and actual two-generation invariants before edits. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json).
+- [x] [EGB-02] Implement real pre-allocation, exact operation matching and one-way lifecycle with focused refusal/old-state preservation tests using actual leased Peers. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json).
 - [ ] [EGB-03] Consume the bank in the selected actual driver and prove physical native/control barriers. Keep full GSU-04/GSU-05/SRS-07 open until their complete requirements pass.

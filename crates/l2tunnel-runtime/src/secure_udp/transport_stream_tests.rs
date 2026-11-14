@@ -302,7 +302,7 @@ impl FaultFixture {
             .checked_sub(driver.config.control.wire_overhead)
             .ok_or("stream control accounting underflow")?;
         let wrapped = streams::Frame::decode(
-            &driver.control_wire[..length],
+            &driver.buffers.control_wire[..length],
             streams::Limits {
                 max_packet_bytes: driver.config.control.recovery.max_source_bytes
                     + recovery::DATA_HEADER_BYTES,
@@ -382,7 +382,7 @@ impl FaultFixture {
         let length =
             tokio::time::timeout(Duration::from_secs(1), to.socket.recv(&mut wire)).await??;
         assert_eq!(length + from.driver.ip, wire_bytes);
-        assert_eq!(&wire[..length], &from.driver.wire[..length]);
+        assert_eq!(&wire[..length], &from.driver.buffers.wire[..length]);
         let mut attempt = Attempt {
             side,
             number,
@@ -447,7 +447,7 @@ impl FaultFixture {
                 numbers.windows(2).all(|pair| pair[0] < pair[1]),
                 "stream reset/reused shared Control nonce"
             );
-            let metrics = endpoint.driver.snapshot(now, true).performance;
+            let metrics = endpoint.driver.snapshot(now, true)?.performance;
             assert_eq!(
                 metrics.bootstrap_ip_bytes
                     + metrics.control_ip_bytes
@@ -482,14 +482,29 @@ impl FaultFixture {
                 }
             }
             if applied
-                && self.endpoints.iter().all(|endpoint| {
-                    endpoint.driver.coordinator.pending().is_none()
-                        && endpoint.driver.policy_source.is_none()
-                })
+                && self.endpoints.iter().try_fold(true, |settled, endpoint| {
+                    Ok::<_, io::Error>(
+                        settled
+                            && endpoint
+                                .driver
+                                .owner
+                                .legacy()?
+                                .coordinator
+                                .pending()
+                                .is_none()
+                            && endpoint.driver.policy_source.is_none(),
+                    )
+                })?
             {
                 for endpoint in &self.endpoints {
                     assert_eq!(
-                        endpoint.driver.coordinator.committed().epoch,
+                        endpoint
+                            .driver
+                            .owner
+                            .legacy()?
+                            .coordinator
+                            .committed()
+                            .epoch,
                         policy::Epoch(1)
                     );
                     assert_eq!(endpoint.driver.send.records.channels, 3);
@@ -512,6 +527,8 @@ async fn blocked_transaction_data_keeps_130_actual_liveness_rounds_independent_o
         let mut response = fixture.request()?;
         let deadline = fixture.endpoints[0]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .deadline()
             .ok_or("missing policy deadline")?;
@@ -541,11 +558,23 @@ async fn blocked_transaction_data_keeps_130_actual_liveness_rounds_independent_o
                 }
             }
             let coordinator = &fixture.endpoints[0].driver;
-            assert_eq!(coordinator.coordinator.deadline(), Some(deadline));
-            assert_eq!(coordinator.coordinator.committed().epoch, policy::Epoch(0));
+            assert_eq!(
+                coordinator.owner.legacy()?.coordinator.deadline(),
+                Some(deadline)
+            );
+            assert_eq!(
+                coordinator.owner.legacy()?.coordinator.committed().epoch,
+                policy::Epoch(0)
+            );
             assert!(coordinator.policy_source.is_some());
             assert!(
-                fixture.endpoints[1].driver.coordinator.pending().is_none(),
+                fixture.endpoints[1]
+                    .driver
+                    .owner
+                    .legacy()?
+                    .coordinator
+                    .pending()
+                    .is_none(),
                 "blocked production Transaction source unexpectedly dispatched"
             );
             assert!(matches!(
@@ -601,11 +630,15 @@ async fn source_ack_without_whole_acceptance_keeps_the_exact_swift_output_token(
         let mut response = fixture.request()?;
         let original = fixture.endpoints[0]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .outbound()
             .ok_or("missing Propose token")?;
         let deadline = fixture.endpoints[0]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .deadline()
             .ok_or("missing policy deadline")?;
@@ -651,9 +684,18 @@ async fn source_ack_without_whole_acceptance_keeps_the_exact_swift_output_token(
                 assert_eq!(pending.id, original.id);
                 let token = pending.source;
                 assert!(!driver.control.confirmed(token, duration(at))?);
-                assert_eq!(driver.coordinator.outbound(), Some(original));
-                assert_eq!(driver.coordinator.deadline(), Some(deadline));
-                assert_eq!(driver.coordinator.committed().epoch, policy::Epoch(0));
+                assert_eq!(
+                    driver.owner.legacy()?.coordinator.outbound(),
+                    Some(original)
+                );
+                assert_eq!(
+                    driver.owner.legacy()?.coordinator.deadline(),
+                    Some(deadline)
+                );
+                assert_eq!(
+                    driver.owner.legacy()?.coordinator.committed().epoch,
+                    policy::Epoch(0)
+                );
                 assert!(matches!(
                     response.try_recv(),
                     Err(oneshot::error::TryRecvError::Empty)

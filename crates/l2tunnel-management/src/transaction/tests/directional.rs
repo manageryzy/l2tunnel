@@ -586,3 +586,50 @@ fn packed255_is_a_policy_constraint_without_shrinking_generic_or_legacy_maxima()
     )?;
     Ok(())
 }
+
+#[test]
+fn peer_fence_observes_exact_old_sender_counts_until_real_retirement() -> Result<(), Error> {
+    let initial = Policy::new(2, 3);
+    let target = Policy::new(4, 1);
+    let (mut client, mut server) = endpoints(initial, target.clone(), true)?;
+    let local = Fence::new(&[2, 7])?;
+    let remote = Fence::new(&[3, 5, 11])?;
+    assert!(client.peer_fence().is_none() && server.peer_fence().is_none());
+    start(&mut client, &mut server, target, &local, &remote)?;
+    assert_eq!(client.peer_fence(), Some(&remote));
+    assert_eq!(server.peer_fence(), Some(&local));
+    let phase = (client.phase(), server.phase());
+    for _ in 0..3 {
+        assert_eq!(
+            client.peer_fence().ok_or(Error::Unexpected)?.counts(),
+            &[3, 5, 11]
+        );
+        assert_eq!(
+            server.peer_fence().ok_or(Error::Unexpected)?.counts(),
+            &[2, 7]
+        );
+        assert_eq!((client.phase(), server.phase()), phase);
+    }
+    let barrier = outgoing(client.confirm_drained(&local, &remote, Tick(0))?)?;
+    server.receive(origin(Role::Client), &barrier, Tick(0))?;
+    let barrier_ack = outgoing(server.confirm_drained(&remote, &local, Tick(0))?)?;
+    let commit = outgoing(client.receive(origin(Role::Server), &barrier_ack, Tick(0))?)?;
+    let committed = server.receive(origin(Role::Client), &commit, Tick(0))?;
+    assert_eq!(server.sender_channels(Role::Client), 4);
+    assert_eq!(server.sender_channels(Role::Server), 1);
+    assert_eq!(server.peer_fence(), Some(&local));
+    assert_eq!(client.peer_fence(), Some(&remote));
+    let retire = outgoing(client.receive(origin(Role::Server), &outgoing(committed)?, Tick(0))?)?;
+    assert_eq!(client.peer_fence(), Some(&remote));
+    let reply = outgoing(server.receive(origin(Role::Client), &retire, Tick(0))?)?;
+    assert!(server.peer_fence().is_none());
+    // The real sender still owns RETIRE until its reply arrives. Its timed
+    // fresh-packet retry may use the final cache without reopening a peer fence.
+    let retry = outgoing(client.poll(Tick(10))?)?;
+    let cached = server.receive(origin(Role::Client), &retry, Tick(10))?;
+    assert!(cached.event.is_none() && cached.outbound.is_some());
+    assert!(server.peer_fence().is_none());
+    client.receive(origin(Role::Server), &reply, Tick(10))?;
+    assert!(client.peer_fence().is_none());
+    Ok(())
+}

@@ -81,6 +81,18 @@ explicit; the CLI still chooses legacy control. Generic Management/DataFeedback,
 shared API/frontend selection, full SW-11 and native/platform qualification remain
 open. Runtime Snapshot custody observations do not change strict local API bytes.
 
+
+The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
+now has an explicitly selected runtime-library API in that same sole I/O loop.
+Finite Unix tests use actual original UDP sockets, maintained authentication,
+canonical H0/D0 scopes, two reserved engines and physical native writes through
+two nonzero asymmetric switches. Whole-message proofs retain the original cap;
+separate status exposes requested/current configuration and incomplete resource
+preallocation. Shared CLI/service/API selection, Driver impairment/pressure
+qualification, complete reservation, cross-profile SW-11 and broader
+carrier/lifecycle/platform/performance acceptance remain open. Existing defaults
+and strict v1/v2 bytes are preserved. No new native throughput result is claimed.
+
 The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API
 tests, strict Clippy and rustdoc. Actual paired UDP/service fixtures exercise

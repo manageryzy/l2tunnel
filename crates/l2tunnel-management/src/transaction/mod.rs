@@ -424,6 +424,11 @@ impl<C: Configuration> Peer<C> {
     fn sender_channels_for(&self, config: &C, sender: Role) -> u16 {
         self.fence_contract.channels(config, sender)
     }
+    /// Actual pending peer's exclusive old native-delivery fence, when received.
+    /// This immutable observation grants no drain or physical-completion authority.
+    pub fn peer_fence(&self) -> Option<&Fence> {
+        self.pending.as_ref()?.peer.as_ref()
+    }
     /// Locally committed data epoch.
     pub fn active_epoch(&self) -> Epoch {
         self.guard.active().epoch

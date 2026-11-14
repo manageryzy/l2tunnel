@@ -272,7 +272,7 @@ impl Crossing {
         let length =
             tokio::time::timeout(Duration::from_secs(1), to.socket.recv(&mut wire)).await??;
         assert_eq!(length + from.driver.ip, charge);
-        assert_eq!(&wire[..length], &from.driver.wire[..length]);
+        assert_eq!(&wire[..length], &from.driver.buffers.wire[..length]);
         wire.truncate(length);
         assert!(self.fixture.attempts.len() < 40_000);
         let attempt = self.fixture.attempts.len();
@@ -303,7 +303,7 @@ impl Crossing {
                     endpoint
                         .driver
                         .control
-                        .poll(duration(now), 0, &mut endpoint.driver.control_wire)?
+                        .poll(duration(now), 0, &mut endpoint.driver.buffers.control_wire)?
                         .is_none()
                 );
                 endpoint
@@ -470,9 +470,11 @@ impl Crossing {
                 .joining
                 .receive(decoded, driver.origin + duration(now))?
         );
-        let opened = driver
-            .records
-            .open(&flight.wire, &mut driver.open, &mut driver.plain)?;
+        let opened = driver.records.open(
+            &flight.wire,
+            &mut driver.buffers.open,
+            &mut driver.buffers.plain,
+        )?;
         assert_eq!(opened.class, Class::Control);
         assert_eq!(opened.number.0, attempt.number);
         assert_eq!(opened.scope, driver.records.control_scope());
@@ -483,7 +485,7 @@ impl Crossing {
                 lane: mg::LaneId(LANE),
                 sender: driver.remote(),
             },
-            &driver.plain[..opened.bytes],
+            &driver.buffers.plain[..opened.bytes],
             duration(now),
         )?;
         self.fixture.attempts[flight.attempt].dropped = false;
@@ -497,6 +499,8 @@ async fn crossing(kind: cover::Appearance, work: usize, alignment: usize) -> Res
     let mut first = case.request(start, policy_value())?;
     let first_deadline = case.fixture.endpoints[0]
         .driver
+        .owner
+        .legacy()?
         .coordinator
         .deadline()
         .ok_or("first cap")?;
@@ -548,6 +552,8 @@ async fn crossing(kind: cover::Appearance, work: usize, alignment: usize) -> Res
     assert_eq!(
         case.fixture.endpoints[1]
             .driver
+            .owner
+            .legacy()?
             .coordinator
             .committed()
             .epoch,
@@ -558,6 +564,8 @@ async fn crossing(kind: cover::Appearance, work: usize, alignment: usize) -> Res
     let mut second = case.request(second_start, second_policy())?;
     let second_deadline = case.fixture.endpoints[0]
         .driver
+        .owner
+        .legacy()?
         .coordinator
         .deadline()
         .ok_or("second cap")?;
@@ -643,12 +651,32 @@ async fn crossing(kind: cover::Appearance, work: usize, alignment: usize) -> Res
             Err(error) => return Err(error.into()),
         }
         if completed.is_some()
-            && case.fixture.endpoints.iter().all(|endpoint| {
-                endpoint.driver.coordinator.committed().epoch == policy::Epoch(2)
-                    && endpoint.driver.coordinator.pending().is_none()
-                    && endpoint.driver.policy_source.is_none()
-                    && endpoint.driver.target.is_none()
-            })
+            && case
+                .fixture
+                .endpoints
+                .iter()
+                .try_fold(true, |settled, endpoint| {
+                    Ok::<_, io::Error>(
+                        settled
+                            && endpoint
+                                .driver
+                                .owner
+                                .legacy()?
+                                .coordinator
+                                .committed()
+                                .epoch
+                                == policy::Epoch(2)
+                            && endpoint
+                                .driver
+                                .owner
+                                .legacy()?
+                                .coordinator
+                                .pending()
+                                .is_none()
+                            && endpoint.driver.policy_source.is_none()
+                            && endpoint.driver.target.is_none(),
+                    )
+                })?
         {
             assert!(at < second_deadline.0);
             let final_scope = record::Scope {
@@ -717,18 +745,20 @@ async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usiz
             break;
         }
     }
+    let a = &case.fixture.endpoints[0].driver;
+    let b = &case.fixture.endpoints[1].driver;
+    let a_legacy = a.owner.legacy()?;
+    let b_legacy = b.owner.legacy()?;
     let prepared = prepared.ok_or_else(|| {
-        let a = &case.fixture.endpoints[0].driver;
-        let b = &case.fixture.endpoints[1].driver;
         format!(
             "tiny-window first custody was not retained: applied={applied}, final={:?}, receipts={}, acks={}, a_committed={:?}, b_committed={:?}, a_pending={:?}, b_pending={:?}, a_control={:?}, b_control={:?}",
             case.final_message,
             case.receipts.len(),
             case.acknowledgments.len(),
-            a.coordinator.committed(),
-            b.coordinator.committed(),
-            a.coordinator.pending(),
-            b.coordinator.pending(),
+            a_legacy.coordinator.committed(),
+            b_legacy.coordinator.committed(),
+            a_legacy.coordinator.pending(),
+            b_legacy.coordinator.pending(),
             a.control.retained(),
             b.control.retained(),
         )
@@ -834,9 +864,12 @@ async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usiz
     let ingress = driver.counters.received_packets;
     assert_ne!(driver.live.outstanding, Some(nonce));
     assert_eq!(driver.live.last_pong_micros, Some(now));
-    let waited = driver.coordinator.pending().is_none();
+    let waited = driver.owner.legacy()?.coordinator.pending().is_none();
     if waited {
-        assert_eq!(driver.coordinator.committed().epoch, policy::Epoch(1));
+        assert_eq!(
+            driver.owner.legacy()?.coordinator.committed().epoch,
+            policy::Epoch(1)
+        );
         assert!(driver.target.is_none());
         assert_eq!(driver.records.active_data(), first_scope);
         assert!(driver.control.ready_for_dispatch(None)?);
@@ -846,6 +879,8 @@ async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usiz
     // packet. Repeated empty turns must neither redispatch nor renew this lease.
     driver.service_control(now, &crossing_resolver(driver.config))?;
     let pending = driver
+        .owner
+        .legacy()?
         .coordinator
         .pending()
         .ok_or("ready command stalled without further ingress")?;
@@ -860,6 +895,8 @@ async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usiz
         assert_eq!(driver.policy_cap, Some(cap));
         assert_eq!(
             driver
+                .owner
+                .legacy()?
                 .coordinator
                 .outstanding()
                 .filter(|output| matches!(
@@ -901,6 +938,8 @@ async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usiz
     assert_eq!(driver.policy_cap, Some(cap));
     assert_eq!(
         driver
+            .owner
+            .legacy()?
             .coordinator
             .pending()
             .ok_or("unconfirmed second policy vanished")?

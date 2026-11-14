@@ -242,6 +242,26 @@ impl Profile {
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
         self.settings.configuration(self.peers)
     }
+    /// Recompute the actual setup digest from retained own trust and hand off
+    /// the exact complete local role contract. This reserves no runtime storage.
+    pub fn runtime_contract(
+        &self,
+        role: security::Role,
+    ) -> io::Result<transport::TransactionContract> {
+        transport::TransactionContract::new(
+            self.configuration()?,
+            role,
+            match role {
+                security::Role::Initiator => self.initiator,
+                security::Role::Responder => self.responder,
+            },
+            self.settings.cover.config(role)?,
+            self.settings.gate.path.client.is_ipv6(),
+            self.envelope,
+            self.catalog.clone(),
+            self.parameters,
+        )
+    }
     /// Resolve only an exact supported complete value under this envelope.
     /// Actual multi-epoch allocation admission remains the driver's responsibility.
     pub fn runtime_for(

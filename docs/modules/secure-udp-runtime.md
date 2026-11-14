@@ -17,6 +17,14 @@ Finite local Unix focused and required aggregate checks pass. CLI defaults and s
 remain legacy; generic Management/DataFeedback dispatch, full SW-11, native
 saturation and platform qualification are separate open gates.
 
+The additive [generic transaction entry point](generic-secure-udp.md) now shares
+this exact I/O loop and original socket. Finite Unix tests cover canonical User
+D0 versus fixed Control H0, actual two-generation preparation and physical native
+barriers through two nonzero asymmetric switches. The separate runtime snapshot
+reports incomplete resource preallocation; shared CLI/service/API selection,
+DataFeedback, other profiles/full SW-11 and Driver impairment/pressure/native
+qualification remain open. This does not change legacy defaults or API v1/v2.
+
 The [source-stable focused receipt](../../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 transport tests, 21 shared-client secure-UDP tests, retained service/local
 API tests, strict Clippy and rustdoc. Transport fixtures use two independent Tokio

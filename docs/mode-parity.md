@@ -32,6 +32,13 @@ retains that same boundary: SwiftPolicyV1 and independent Liveness are actual
 adapter functions; generic Management/DataFeedback and other record engines remain
 open requirements. It changes none of the 47 catalog acceptance definitions.
 
+The additive [generic Swift runtime](modules/generic-secure-udp.md) now passes
+finite same-socket/native-device tests with canonical complete configurations
+and two nonzero asymmetric Swift switches. This runtime-library selection does
+not provide DataFeedback/other profile integration, shared CLI/API selection,
+complete fault/resource qualification or full cross-profile SW-11. Every complete
+catalog gate below retains its original definition and remains open.
+
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s
 compact simulator sensitivity from current Rust directional hash/channel ordering.

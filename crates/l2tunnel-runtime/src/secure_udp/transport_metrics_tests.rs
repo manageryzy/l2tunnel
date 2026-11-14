@@ -41,25 +41,25 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
         driver.send(&fixture.socket, now, driver.origin + duration(now))?;
         assert_eq!(
             driver
-                .snapshot(now, true)
+                .snapshot(now, true)?
                 .performance
                 .user_credit_blocked_polls,
             0
         );
         assert_eq!(
-            driver.swift.offer(now, &ethernet(9))?,
+            driver.owner.legacy_mut()?.engine.offer(now, &ethernet(9))?,
             records::Admission::Accepted
         );
         let number = driver.records.next_number(Class::User);
-        let statistics = driver.swift.stats();
+        let statistics = driver.owner.legacy()?.engine.stats();
         driver.send(&fixture.socket, now, driver.origin + duration(now))?;
         assert_eq!(driver.records.next_number(Class::User), number);
-        assert_eq!(driver.swift.stats(), statistics);
+        assert_eq!(driver.owner.legacy()?.engine.stats(), statistics);
         let maximum = driver.send.records.codec.datagram_bytes;
         let required = driver.records.capacity(maximum)?.packet_bytes + driver.ip + driver.reserve;
         let ready = driver.bucket.ready_at(required)?;
         let middle = now + (ready - now) / 2;
-        let partial = driver.snapshot(middle, true);
+        let partial = driver.snapshot(middle, true)?;
         assert_eq!(partial.performance.user_credit_blocked_polls, 1);
         assert_eq!(
             partial.performance.credit_wait_observed_micros,
@@ -67,13 +67,13 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
         );
         assert_eq!(partial.performance.credit_ready_late_micros, 0);
         assert_eq!(
-            driver.snapshot(middle, true).performance,
+            driver.snapshot(middle, true)?.performance,
             partial.performance
         );
         let resumed = ready + 777;
         driver.progress(resumed)?;
         driver.send(&fixture.socket, resumed, driver.origin + duration(resumed))?;
-        let sent = driver.snapshot(resumed, true);
+        let sent = driver.snapshot(resumed, true)?;
         assert_eq!(sent.performance.user_packets, 1);
         assert_eq!(sent.performance.credit_wait_observed_micros, resumed - now);
         assert_eq!(sent.performance.credit_ready_late_micros, 777);
@@ -109,7 +109,7 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
             remote_now,
             fixture.remote.origin + duration(remote_now),
         )?;
-        let received = fixture.remote.snapshot(remote_now, true);
+        let received = fixture.remote.snapshot(remote_now, true)?;
         assert_eq!(received.performance.feedback_packets, 1);
         assert_eq!(received.performance.user_packets, 0);
         reconcile(&received);
@@ -123,7 +123,7 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
             true,
         )?;
         driver.send(&fixture.socket, resumed, driver.origin + duration(resumed))?;
-        let control = driver.snapshot(resumed, true);
+        let control = driver.snapshot(resumed, true)?;
         assert_eq!(control.performance.control_packets, 1);
         assert_eq!(control.performance.user_credit_blocked_polls, 1);
         assert!(control.performance.user_not_ready_polls > 0);
@@ -142,24 +142,24 @@ async fn owed_but_not_due_feedback_is_not_counted_as_credit_blocked() -> Result 
         let (_, mut remote) = Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
         let wire = source(&mut remote, 0, 1)?;
         local.receive(&wire, 1, origin + duration(1), &resolve(config))?;
-        assert_eq!(local.swift.feedback_deadline(), Some(0));
-        assert!(!local.swift.feedback_ready(1));
+        assert_eq!(local.owner.legacy()?.engine.feedback_deadline(), Some(0));
+        assert!(!local.owner.legacy()?.engine.feedback_ready(1));
         local.bucket.tokens = 0;
         local.bucket.last = 1;
         local.send(&socket, 1, origin + duration(1))?;
         assert_eq!(
             local
-                .snapshot(1, true)
+                .snapshot(1, true)?
                 .performance
                 .user_credit_blocked_polls,
             0
         );
         let due = config.receive.records.codec.feedback_micros;
-        assert!(local.swift.feedback_ready(due));
+        assert!(local.owner.legacy()?.engine.feedback_ready(due));
         local.send(&socket, due, origin + duration(due))?;
         assert_eq!(
             local
-                .snapshot(due, true)
+                .snapshot(due, true)?
                 .performance
                 .user_credit_blocked_polls,
             1
@@ -174,7 +174,7 @@ async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Resul
         let mut selected = config(kind);
         selected.native.pending_packets = 1;
         let mut fixture = NativeEventFixture::new(kind, selected).await?;
-        let initial = fixture.driver.snapshot(1, true);
+        let initial = fixture.driver.snapshot(1, true)?;
         assert_eq!(initial.performance.native_pending_packets_high, 1);
         assert_eq!(
             initial.performance.native_pending_bytes_high,
@@ -184,7 +184,7 @@ async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Resul
         let mut ready = fixture.device.writable_mut().await?;
         assert!(!fixture.driver.write_native(&mut ready, || Ok(1))?);
         drop(ready);
-        let blocked = fixture.driver.snapshot(1, true);
+        let blocked = fixture.driver.snapshot(1, true)?;
         assert_eq!(blocked.performance.native_write_would_block, 1);
         assert_eq!(blocked.counters.native_written, 0);
         assert_eq!(blocked.counters.native_pending_packets, 1);
@@ -200,7 +200,7 @@ async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Resul
         assert_eq!(
             fixture
                 .driver
-                .snapshot(2, true)
+                .snapshot(2, true)?
                 .performance
                 .native_output_full_polls,
             blocked.performance.native_output_full_polls + 1

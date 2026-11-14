@@ -47,14 +47,18 @@ fn ping(driver: &mut Driver) -> Result<Vec<u8>> {
     assert_eq!(driver.live.outstanding, Some(1));
     let emission = driver
         .control
-        .poll(duration(REMOTE_TIME), 4096, &mut driver.control_wire)?
+        .poll(
+            duration(REMOTE_TIME),
+            4096,
+            &mut driver.buffers.control_wire,
+        )?
         .ok_or_else(|| protocol("fairness fixture Ping was not emitted"))?;
     let mut wire = vec![0; driver.cover.limits().max_packet_bytes];
     let sealed = driver.records.seal(
         Class::Control,
         meta(driver.outer, cover::Phase::Established),
-        &driver.control_wire[..emission.bytes],
-        &mut driver.seal,
+        &driver.buffers.control_wire[..emission.bytes],
+        &mut driver.buffers.seal,
         &mut wire,
     )?;
     driver.outer = driver.outer.checked_add(1).ok_or_else(exhausted)?;
@@ -249,10 +253,10 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
             remote.native.front().map(|packet| packet.bytes()),
             Some(native.as_slice())
         );
-        assert_eq!(remote.swift.stats().receiver.packets, 1);
+        assert_eq!(remote.owner.legacy()?.engine.stats().receiver.packets, 1);
     } else {
         assert!(remote.native.is_empty());
-        assert_eq!(remote.swift.stats().receiver.packets, 0);
+        assert_eq!(remote.owner.legacy()?.engine.stats().receiver.packets, 0);
     }
     Ok(())
 }

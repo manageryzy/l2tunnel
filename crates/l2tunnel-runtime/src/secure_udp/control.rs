@@ -10,6 +10,12 @@ use l2tunnel_management::{
 use l2tunnel_recovery as recovery;
 use std::{io, time::Duration};
 
+#[path = "control_leased.rs"]
+mod leased;
+#[cfg(test)]
+pub(crate) use leased::PendingEffect;
+pub(crate) use leased::{Attempt, DispatchProgress, FrozenOutput};
+
 /// Explicit per-stream storage/recovery bounds under one shared service budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
@@ -114,6 +120,7 @@ struct Outgoing {
     scope: sc::Scope,
     deadline: Duration,
     auto_retire: bool,
+    confirmed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -122,9 +129,12 @@ struct Held {
     scope: sc::Scope,
     deadline: Duration,
     dispatched: bool,
+    leased: bool,
 }
 
 struct Streamed {
+    leased: bool,
+    reservation: Option<leased::Reservation>,
     owners: [messages::Owner; 3],
     gate: streams::gate::Gate,
     settings: Settings,
@@ -157,6 +167,7 @@ pub(crate) struct Owner {
     expires: Duration,
     now: Duration,
     max_packet: usize,
+    failed: bool,
 }
 
 impl Owner {
@@ -219,6 +230,8 @@ impl Owner {
                 .ok_or_else(|| invalid("wrapper size overflow"))?;
             (
                 Backend::Streamed(Box::new(Streamed {
+                    leased: false,
+                    reservation: None,
                     owners,
                     gate,
                     settings,
@@ -266,6 +279,7 @@ impl Owner {
             expires,
             now,
             max_packet,
+            failed: false,
         })
     }
 
@@ -312,6 +326,9 @@ impl Owner {
             }
             Backend::Streamed(streamed) => {
                 let stream = outgoing_stream(body)?;
+                if streamed.leased && stream == streams::Stream::Transaction {
+                    return Err(invalid("leased Management requires frozen Peer output"));
+                }
                 let i = index(stream);
                 if auto_retire && stream != streams::Stream::Liveness {
                     return Err(invalid("profile tokens require explicit completion"));
@@ -355,6 +372,7 @@ impl Owner {
                             scope,
                             deadline,
                             auto_retire,
+                            confirmed: false,
                         });
                         streamed.next[i] = next;
                         Ok(Some(token))
@@ -472,8 +490,11 @@ impl Owner {
                         envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
                     )
                     .map_err(protocol)?;
-                    if outgoing_stream(envelope.body)? != stream {
+                    if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
                         return Err(protocol("control body was substituted across streams"));
+                    }
+                    if streamed.leased && stream == streams::Stream::Transaction {
+                        continue;
                     }
                     let scope = envelope.binding.scope;
                     if stream == streams::Stream::Transaction && deferred == Some(scope) {
@@ -511,6 +532,7 @@ impl Owner {
                         scope,
                         deadline,
                         dispatched: false,
+                        leased: false,
                     });
                     streamed.receive_cursor = (i + 1) % 3;
                     return Ok(Some(incoming));
@@ -539,12 +561,40 @@ impl Owner {
                 envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
             )
             .map_err(protocol)?;
-            if outgoing_stream(envelope.body)? != stream {
+            if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
                 return Err(protocol("control body was substituted across streams"));
             }
             if stream != streams::Stream::Transaction || deferred != Some(envelope.binding.scope) {
                 return Ok(true);
             }
+        }
+        Ok(false)
+    }
+
+    /// Observe only work serviced by the nontransaction dispatcher. Transaction
+    /// bytes remain exclusively with the leased State, including blocked or
+    /// malformed candidates. This hint changes no gate, cursor, time or custody.
+    pub(crate) fn ready_nontransaction(&self) -> io::Result<bool> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return Ok(false);
+        };
+        for stream in [streams::Stream::Liveness, streams::Stream::DataFeedback] {
+            let i = index(stream);
+            if streamed.held[i].is_some() {
+                continue;
+            }
+            let Some(delivery) = streamed.owners[i].pending() else {
+                continue;
+            };
+            let envelope = sc::Envelope::decode(
+                delivery.bytes(),
+                envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+            )
+            .map_err(protocol)?;
+            if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
+                return Err(protocol("control body was substituted across streams"));
+            }
+            return Ok(true);
         }
         Ok(false)
     }
@@ -561,6 +611,11 @@ impl Owner {
                     .as_mut()
                     .filter(|held| held.incoming == incoming)
                     .ok_or_else(|| invalid("unknown presented control message"))?;
+                if held.leased {
+                    return Err(invalid(
+                        "leased custody requires a borrowed acceptance callback",
+                    ));
+                }
                 held.dispatched = true;
                 match streamed.owners[i].accept(ticket, now) {
                     Ok(()) => {
@@ -644,6 +699,12 @@ impl Owner {
                     .owners
                     .iter()
                     .map(messages::Owner::expiry)
+                    .chain(
+                        streamed
+                            .reservation
+                            .as_ref()
+                            .map(leased::Reservation::deadline),
+                    )
                     .min()
                     .unwrap_or(self.expires);
                 if streamed.packets_left == 0 {
@@ -683,6 +744,12 @@ impl Owner {
                 .owners
                 .iter()
                 .map(messages::Owner::expiry)
+                .chain(
+                    streamed
+                        .reservation
+                        .as_ref()
+                        .map(leased::Reservation::deadline),
+                )
                 .chain([self.expires])
                 .min()
                 .unwrap_or(self.expires),
@@ -744,8 +811,15 @@ impl Owner {
                 let i = index(streams::Stream::Transaction);
                 streamed.outgoing[i]
                     .iter()
+                    .filter(|entry| !streamed.leased || !entry.confirmed)
                     .map(|entry| entry.deadline)
                     .chain(streamed.held[i].map(|held| held.deadline))
+                    .chain(
+                        streamed
+                            .reservation
+                            .as_ref()
+                            .map(leased::Reservation::deadline),
+                    )
                     .min()
             }
         }
@@ -822,6 +896,9 @@ impl Owner {
     }
 
     fn observe(&mut self, now: Duration) -> io::Result<()> {
+        if self.failed {
+            return Err(protocol("control proof callback failed"));
+        }
         if now < self.now {
             return Err(protocol("control time moved backwards"));
         }
@@ -832,9 +909,19 @@ impl Owner {
             ));
         }
         if let Backend::Streamed(streamed) = &mut self.backend {
+            if streamed
+                .reservation
+                .as_ref()
+                .is_some_and(|reservation| now >= reservation.deadline())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original frozen control message deadline",
+                ));
+            }
             for i in 0..3 {
                 streamed.owners[i].tick(now).map_err(protocol)?;
-                if let Some(held) = streamed.held[i].filter(|held| held.dispatched)
+                if let Some(held) = streamed.held[i].filter(|held| held.dispatched && !held.leased)
                     && let TokenKind::Streamed { ticket, .. } = held.incoming.token.kind
                 {
                     match streamed.owners[i].accept(ticket, now) {
@@ -948,3 +1035,7 @@ fn exhausted() -> io::Error {
 #[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "control_leased_tests.rs"]
+mod leased_tests;

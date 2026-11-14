@@ -72,8 +72,11 @@ GSU-01..GSU-10: asymmetric sender fences, complete canonical configuration,
 borrowed control proofs, actual engine/device custody and selected runtime/API
 integration. Explicit directional peers and complete canonical values now have
 focused protocol evidence; the authenticated client construction has real
-factory tests. Selected generic driver/device/resource integration remains
-pending. Read-only preparation is tracked by
+factory tests. The explicit runtime-library entry point now passes finite
+same-socket/device tests, two nonzero switches and native operation-cap guards.
+Shared service/API selection, Driver fault qualification and full resources remain
+pending; [GDI-01..GDI-03](modules/generic-secure-udp.md) retain that scope.
+Read-only preparation is tracked by
 [MPR-01..MPR-05](modules/transaction-preparation.md), actual fallible native
 completion storage by [NQP-01..NQP-05](modules/runtime-native-storage.md),
 prepared generations by [EGB-01..EGB-03](modules/runtime-engine-bank.md), and
