@@ -229,7 +229,12 @@ post-qdisc bytes must not be charged with the configured loss a second time.
 The [first evidence-only reconciliation](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/postcheck/ledger-1/validation.json)
 passed checklist and 288 local-link checks after recording these outcomes;
 every non-document input remains identical to the required workspace check.
-Actual local checkpoint binding is still required for SGD-08.
+The [second reconciliation](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/postcheck/ledger-2/validation.json)
+passed before the [actual source checkpoint](../../work/secure-udp-diagnostics-20261114/commit-binding-attempt-1/validation.json)
+was created. Local commit `49ea663697b6e33a5511ce58e85dfdbd6727655e` binds all
+19 committed file hashes, its parent/tree, focused/required/build/native/kernel
+receipts and a clean worktree at that point. SGD-08 closes using that existing
+proof; this follow-up changes only ledger evidence. Nothing was pushed or published.
 
 ## Acceptance ledger
 
@@ -240,4 +245,4 @@ Actual local checkpoint binding is still required for SGD-08.
 - [x] [SGD-05] Implement the operation-bound bounded shared-service API, atomic terminal evidence and nonblocking CLI failure projection without strict local API changes; pass expiry/cancellation/drop/reconnect/retirement/provider-error/output regressions. Evidence: [recorded contract](../../work/secure-udp-diagnostics-20261114/design-v0.md) and [focused pass](../../work/secure-udp-diagnostics-20261114/focused-attempt-4/validation.json).
 - [x] [SGD-06] Record the fresh source-stable 16-case native ABBA attempt with original functional/capture/cleanup/80 verdicts and requested/effective/thread/CPU/wire/setup evidence; preserve failures and missing observations without claiming full qualification. Evidence: [complete evidence-verified matrix with eight failed 80 targets](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json) and [byte-exact archive](../../work/secure-udp-diagnostics-20261114/native-observations-attempt-1/archive-validation.json).
 - [x] [SGD-07] Evaluate the original and new setup/capture/performance evidence, preserving all HRT/SNL/FIX/SW-11/mode/platform/lifecycle gates and distinguishing structural observation from authenticated runtime results. Evidence: [fresh matrix](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json), [bounded kernel comparison and limits](../../work/secure-udp-diagnostics-20261114/kernel-summary-attempt-1/validation.json), and [preserved historical structural setup evidence](../../work/host-runtime-20261114/setup-analysis-attempt-1/validation.json).
-- [ ] [SGD-08] Pass focused tests, strict lint/rustdoc, required frozen-source workspace checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item.
+- [x] [SGD-08] Pass focused tests, strict lint/rustdoc, required frozen-source workspace checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item. Evidence: [focused pass](../../work/secure-udp-diagnostics-20261114/focused-attempt-4/validation.json), [required check](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/validation.json), [reconciliation](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/postcheck/ledger-2/validation.json), and [actual source checkpoint](../../work/secure-udp-diagnostics-20261114/commit-binding-attempt-1/validation.json).
