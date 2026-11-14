@@ -6,6 +6,10 @@
 use crate::{cover, security};
 use std::fmt;
 
+/// Explicit selected v2 consumption; legacy constructors and bytes are unchanged.
+#[path = "secure_record_refresh.rs"]
+pub mod refresh;
+
 /// Public route bytes before the complete common packet-security record.
 pub const ROUTE_BYTES: usize = 9;
 
@@ -105,6 +109,8 @@ pub enum Error {
     Cover(cover::Error),
     /// The maintained common security owner rejected the operation.
     Security(security::Error),
+    /// Selected refresh ownership/time/protection rejected the operation.
+    Refresh(security::refresh::Error),
 }
 
 impl fmt::Display for Error {
@@ -123,6 +129,24 @@ impl From<security::Error> for Error {
         Self::Security(value)
     }
 }
+impl From<security::refresh::Error> for Error {
+    fn from(value: security::refresh::Error) -> Self {
+        Self::Refresh(value)
+    }
+}
+
+// Retain the existing inline legacy owner layout. Selected v2 is one fallibly
+// reserved private singleton; no per-packet allocation or duplicate owner exists.
+#[allow(clippy::large_enum_variant)]
+enum Owners {
+    Legacy {
+        data_sender: security::Sender,
+        data_receiver: security::Receiver,
+        control_sender: security::Sender,
+        control_receiver: security::Receiver,
+    },
+    Refreshable(Vec<security::refresh::Owners>),
+}
 
 /// Fixed-domain secure records, without clocks, I/O or per-packet allocations.
 ///
@@ -137,10 +161,7 @@ pub struct Records {
     control: Scope,
     data: Scope,
     additional: Option<DataReader>,
-    data_sender: security::Sender,
-    data_receiver: security::Receiver,
-    control_sender: security::Sender,
-    control_receiver: security::Receiver,
+    owners: Owners,
 }
 
 impl Records {
@@ -169,23 +190,37 @@ impl Records {
             control,
             data,
             additional: None,
-            data_sender,
-            data_receiver,
-            control_sender,
-            control_receiver,
+            owners: Owners::Legacy {
+                data_sender,
+                data_receiver,
+                control_sender,
+                control_receiver,
+            },
         })
     }
 
     /// Exact checked capacities before reserving a sending packet number.
     pub fn capacity(&self, plaintext_bytes: usize) -> Result<Capacity, Error> {
-        capacity_for(self.cover, self.limits, self.protection, plaintext_bytes)
+        if matches!(self.owners, Owners::Refreshable(_)) {
+            refresh::capacity(self.cover, self.limits, self.protection, plaintext_bytes)
+        } else {
+            capacity_for(self.cover, self.limits, self.protection, plaintext_bytes)
+        }
     }
 
     /// Inspect the next unique class-specific number without reserving it.
     pub fn next_number(&self, class: Class) -> security::PacketNumber {
-        match class {
-            Class::User => self.data_sender.next_number(),
-            Class::Control => self.control_sender.next_number(),
+        match &self.owners {
+            Owners::Legacy {
+                data_sender,
+                control_sender,
+                ..
+            } => match class {
+                Class::User => data_sender.next_number(),
+                Class::Control => control_sender.next_number(),
+            },
+            // The private constructor retains exactly one immutable cell.
+            Owners::Refreshable(owners) => owners[0].next_number(refresh::class(class)),
         }
     }
 
@@ -315,6 +350,9 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
+        if matches!(self.owners, Owners::Refreshable(_)) {
+            return Err(security::refresh::Error::Mode.into());
+        }
         if outer.phase != cover::Phase::Established {
             return Err(Error::Phase);
         }
@@ -329,9 +367,17 @@ impl Records {
             extra: &route,
         };
         let packet = &mut workspace[ROUTE_BYTES..capacity.seal_workspace_bytes];
+        let Owners::Legacy {
+            data_sender,
+            control_sender,
+            ..
+        } = &mut self.owners
+        else {
+            return Err(security::refresh::Error::Mode.into());
+        };
         let sealed = match class {
-            Class::User => self.data_sender.seal(metadata, plaintext, packet)?,
-            Class::Control => self.control_sender.seal(metadata, plaintext, packet)?,
+            Class::User => data_sender.seal(metadata, plaintext, packet)?,
+            Class::Control => control_sender.seal(metadata, plaintext, packet)?,
         };
         workspace[..ROUTE_BYTES].copy_from_slice(&route);
         let bytes =
@@ -353,6 +399,9 @@ impl Records {
         workspace: &mut [u8],
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
+        if matches!(self.owners, Owners::Refreshable(_)) {
+            return Err(security::refresh::Error::Mode.into());
+        }
         let decoded = self.cover.decode(packet)?;
         if decoded.phase != cover::Phase::Established {
             return Err(Error::Phase);
@@ -376,9 +425,17 @@ impl Records {
             configuration: scope.configuration,
             extra: &route,
         };
+        let Owners::Legacy {
+            data_receiver,
+            control_receiver,
+            ..
+        } = &mut self.owners
+        else {
+            return Err(security::refresh::Error::Mode.into());
+        };
         let opened = match class {
-            Class::User => self.data_receiver.open(metadata, protected, workspace)?,
-            Class::Control => self.control_receiver.open(metadata, protected, workspace)?,
+            Class::User => data_receiver.open(metadata, protected, workspace)?,
+            Class::Control => control_receiver.open(metadata, protected, workspace)?,
         };
         plaintext[..opened.bytes].copy_from_slice(&workspace[..opened.bytes]);
         Ok(Opened {

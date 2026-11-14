@@ -60,6 +60,66 @@ pub struct SchedulerConfig {
     pub per_flow_packets: usize,
 }
 
+impl SchedulerConfig {
+    /// Validate limits and class policy without allocating scheduler storage.
+    pub fn validate(self, classes: &[ClassConfig]) -> Result<(), ConfigError> {
+        if self.base_quantum_bytes == 0
+            || self.max_classes == 0
+            || self.max_flows == 0
+            || self.max_packet_bytes == 0
+            || self.max_queued_bytes == 0
+            || self.max_queued_packets == 0
+            || self.per_flow_bytes == 0
+            || self.per_flow_packets == 0
+        {
+            return Err(ConfigError::ZeroLimit);
+        }
+        if self.max_packet_bytes > self.per_flow_bytes
+            || self.per_flow_bytes > self.max_queued_bytes
+            || self.per_flow_packets > self.max_queued_packets
+        {
+            return Err(ConfigError::InconsistentBounds);
+        }
+        if classes.is_empty() {
+            return Err(ConfigError::NoClasses);
+        }
+        if classes.len() > self.max_classes {
+            return Err(ConfigError::TooManyClasses);
+        }
+        // ClassId covers the complete u16 domain; validation needs no heap map.
+        let mut seen = [0_u64; 1024];
+        for class in classes {
+            if class.weight == 0 {
+                return Err(ConfigError::ZeroWeight);
+            }
+            weighted_quantum(self, class.weight, 1).ok_or(ConfigError::Arithmetic)?;
+            let index = usize::from(class.id.value());
+            let mask = 1_u64 << (index % 64);
+            let word = &mut seen[index / 64];
+            if *word & mask != 0 {
+                return Err(ConfigError::DuplicateClass);
+            }
+            *word |= mask;
+        }
+        Ok(())
+    }
+
+    /// Validate one weight against an existing class and return its byte quantum.
+    /// A missing class is checked after zero flow weight, matching registration.
+    /// The supplied class weight must come from validated class configuration.
+    pub fn flow_quantum(
+        self,
+        class_weight: Option<u32>,
+        flow_weight: u32,
+    ) -> Result<u64, FlowError> {
+        if flow_weight == 0 {
+            return Err(FlowError::ZeroWeight);
+        }
+        let class_weight = class_weight.ok_or(FlowError::UnknownClass)?;
+        weighted_quantum(self, class_weight, flow_weight).ok_or(FlowError::Arithmetic)
+    }
+}
+
 /// An immutable class multiplier; not an aggregate class bandwidth guarantee.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClassConfig {
@@ -237,39 +297,11 @@ pub struct Scheduler {
 impl Scheduler {
     /// Validate configuration and construct an empty scheduler without I/O.
     pub fn new(config: SchedulerConfig, classes: &[ClassConfig]) -> Result<Self, ConfigError> {
-        if config.base_quantum_bytes == 0
-            || config.max_classes == 0
-            || config.max_flows == 0
-            || config.max_packet_bytes == 0
-            || config.max_queued_bytes == 0
-            || config.max_queued_packets == 0
-            || config.per_flow_bytes == 0
-            || config.per_flow_packets == 0
-        {
-            return Err(ConfigError::ZeroLimit);
-        }
-        if config.max_packet_bytes > config.per_flow_bytes
-            || config.per_flow_bytes > config.max_queued_bytes
-            || config.per_flow_packets > config.max_queued_packets
-        {
-            return Err(ConfigError::InconsistentBounds);
-        }
-        if classes.is_empty() {
-            return Err(ConfigError::NoClasses);
-        }
-        if classes.len() > config.max_classes {
-            return Err(ConfigError::TooManyClasses);
-        }
-        let mut class_map = BTreeMap::new();
-        for class in classes {
-            if class.weight == 0 {
-                return Err(ConfigError::ZeroWeight);
-            }
-            weighted_quantum(config, class.weight, 1).ok_or(ConfigError::Arithmetic)?;
-            if class_map.insert(class.id, class.weight).is_some() {
-                return Err(ConfigError::DuplicateClass);
-            }
-        }
+        config.validate(classes)?;
+        let class_map = classes
+            .iter()
+            .map(|class| (class.id, class.weight))
+            .collect();
         Ok(Self {
             config,
             classes: class_map,
@@ -472,11 +504,8 @@ impl Scheduler {
     }
 
     fn flow_quantum(&self, class: ClassId, weight: u32) -> Result<u64, FlowError> {
-        if weight == 0 {
-            return Err(FlowError::ZeroWeight);
-        }
-        let class_weight = self.classes.get(&class).ok_or(FlowError::UnknownClass)?;
-        weighted_quantum(self.config, *class_weight, weight).ok_or(FlowError::Arithmetic)
+        self.config
+            .flow_quantum(self.classes.get(&class).copied(), weight)
     }
 
     fn admission_failure(&self, id: FlowId, length: usize) -> Option<AdmissionErrorKind> {
@@ -629,6 +658,9 @@ fn weighted_quantum(config: SchedulerConfig, class_weight: u32, flow_weight: u32
     quantum.checked_add(maximum_packet.checked_sub(1)?)?;
     Some(quantum)
 }
+
+#[cfg(test)]
+mod validation_tests;
 
 #[cfg(test)]
 mod tests {

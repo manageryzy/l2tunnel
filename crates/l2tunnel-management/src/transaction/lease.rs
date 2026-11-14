@@ -6,7 +6,7 @@
 
 use super::{
     Configuration, Effects, Error, Frame, Header, Identity, Ingress, Message, MessageKind, Peer,
-    Phase, RequestId, Role, Tick, Ticket, add, limits, opposite, reply_to,
+    Phase, RequestId, Role, Tick, Ticket, add, configuration_limits, opposite, reply_to,
 };
 use crate::{messages, session_control};
 use l2tunnel_core::Epoch;
@@ -368,7 +368,8 @@ impl<C: Configuration> Peer<C> {
     pub fn outbound_context(&self, emitted: &[u8]) -> Result<OutboundContext, Error> {
         self.readonly_time(self.now)?;
         let operation = self.operation().ok_or(Error::LeaseRequired)?;
-        let frame = Frame::decode(emitted, limits()).map_err(Error::Admission)?;
+        let frame =
+            Frame::decode(emitted, configuration_limits::<C>()?).map_err(Error::Admission)?;
         if frame.header.packet.0 == 0 || frame.header.packet.0 >= self.next_packet {
             return Err(Error::Custody);
         }
@@ -610,7 +611,7 @@ impl<C: Configuration> Peer<C> {
         {
             return Err(Error::Admission(crate::Error::BindingMismatch));
         }
-        let frame = Frame::decode(bytes, limits()).map_err(Error::Admission)?;
+        let frame = Frame::decode(bytes, configuration_limits::<C>()?).map_err(Error::Admission)?;
         let header = frame.header;
         if header.session != session
             || header.lane != lane
@@ -765,7 +766,8 @@ impl<C: Configuration> Peer<C> {
         let session_control::Body::Management(management) = envelope.body else {
             return Err(Error::Custody);
         };
-        let frame = Frame::decode(management, limits()).map_err(|_| Error::Custody)?;
+        let frame =
+            Frame::decode(management, configuration_limits::<C>()?).map_err(|_| Error::Custody)?;
         let header = frame.header;
         let (source, destination) = if sender == self.identity.role {
             (self.identity.local, self.identity.remote)

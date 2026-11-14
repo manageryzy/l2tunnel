@@ -1,20 +1,26 @@
 # In-session fresh-DH refresh
 
-Status: **engineering proposal, before implementation or API freeze**, 2026-11-14.
+Status: **first pure slice implemented and protocol-tested; complete matrix, runtime integration and retained recovery remain open**, 2026-11-14.
 This child retains every deliverable of [SEC-06/SEC-08](secure-session.md),
 [the architecture](../architecture.md) and the [master ledger](../implementation-checklist.md).
 It specifies a complete first pure Records/Noise slice. It does not enable a
 runtime rekey option, a recovery default, a new carrier or full SW-11. The wire
-and API choices below are proposed implementation choices, not owner decisions.
-No production source or test has been changed or executed for this proposal.
+and API choices below are engineering implementation choices, not owner decisions.
+The [affected checkpoint](../../work/record-composition-20261114/scoped-checkpoint-validation.json)
+records actual pure-library execution and legacy-consumer regressions. It does
+not qualify fresh-DH on a production socket/device or complete every row below.
+The implementation-boundary refinement below was source-reviewed at the
+parent-reported clean checkpoint `e5c2b93`; it supersedes the earlier generic-root
+handoff proposal. The earlier source binding remains historical evidence.
 
-## Current source and the actual gap
+## Retained legacy boundary and original gap
 
 - [Handshake](../../crates/l2tunnel-handshake/src/lib.rs) uses pinned Clatter 2.3.0
   IK/IKpsk2, explicit ephemeral entropy, fixed flights and consuming public split
   keys. Both confirmations are required before its root handoff. Its final
-  ciphertext cache survives root release. A new confirmed root currently creates
-  new packet owners at number zero.
+  ciphertext cache survives root release. Legacy confirmed-root constructors
+  still create new packet owners at number zero; the explicit selected v2 path
+  below consumes separate opaque authority and preserves continuing counters.
 - [Security](../../crates/l2tunnel-security/src/context.rs) provides unique
   purpose/direction/lane owners. [Sender/Receiver](../../crates/l2tunnel-security/src/record.rs)
   and [keys](../../crates/l2tunnel-security/src/keys.rs) implement continuing
@@ -85,34 +91,42 @@ envelope digest names a complete locally checked carrier/resource contract; it
 is not accepted instead of actual geometry checks. It excludes H0 to avoid a
 digest cycle: initial H0 commits this selection and its envelope input.
 
-After both actual initial confirmations, the maintained adapter imports split
-secrets together with its actual role/profile/prologue, ordered pins and final
-transcript into a private security `RefreshAuthority`. The root owns it until
-`Records::new_refreshable` takes it while reserving the four existing domains.
-The old root is then dropped. The authority is non-Clone, has no public
+After both actual initial confirmations, the maintained adapter's new
+`finish_refreshable_with_confirmation` returns an opaque `ConfirmedInitial` and
+the existing final cache. It imports actual split secrets, role/profile/prologue,
+ordered pins and final transcript into its privately held security initial
+backing. It returns no generic SessionRoot. `Records::new_refreshable` consumes
+this actual handshake-owned value into four managed v2 domains and their private
+`RefreshAuthority`. The remaining initial root material is then dropped. The
+authority is non-Clone, has no public
 constructor from Info/digests/flags, no raw-secret getter and no secret Debug.
 Legacy split-key import creates no refresh authority. The new context-bearing
 import requires the actual owned split secrets and is the documented trusted
 maintained-adapter boundary; it cannot authenticate arbitrary user metadata by
 itself. No `attach_context(Info)` escape is added.
 
-Initial unique-domain ownership is checked before any allocation or publication:
-the selected constructor refuses a root with any previously minted unmanaged
-purpose/direction/lane owner. It cannot forget the root registry, derive a
-second set, or assume an external owner was dropped. The first pure constructor
-requires an empty domain registry and publishes its four managed domains as one
-checked construction. This restriction is observable, not a hidden fallback.
+Initial unique-domain ownership is checked before publication. The only accepted
+registry shapes are untouched, or precisely one privately managed, retired
+Joining pair on the selected lane. `ConfirmedInitial::joining` consumes the
+initial owner into `InitialJoining`, which owns the actual initial-v1 AEAD Joining
+sender and receiver. It exposes narrow seal/open/retransmit operations, no root
+getter, no mutable Sender/Receiver reference and no generic derivation. Such a
+mutable reference would permit `mem::replace` to escape the actual owner.
+`InitialJoining::retire` consumes and drops those exact two owners before returning
+the same ConfirmedInitial with a private retirement stamp. Registry entries remain
+tombstones; no reset/removal/duplicate derivation occurs. A second Joining pair
+or any unmanaged purpose/direction/lane is refused. A completed stamp proves
+crypto-owner closure only, never member authentication.
 
-The current member driver derives Joining owners before returning its root.
-Consequently it is **not yet a compatible v2 handoff** under that strict rule.
-The later runtime integration must introduce an opaque managed Joining-completed
-handoff that proves those owners were consumed/retired, or reserve the complete
-managed set before the member gate. Public Info, a registry reset, and a claimed
-drop flag cannot discharge that dependency. The first pure fixture cannot claim
-actual service membership or runtime readiness from a fabricated member value.
+The current runtime member driver still returns a generic root after minting
+Joining owners. It cannot be passed to this new facade constructor. Later runtime
+plumbing must carry the opaque managed owner through actual membership admission.
+The pure fixture uses existing `MemberProof::sign`, `verify_member`, Allowlist and
+the actual protected acceptance bytes while retaining InitialJoining. It cannot
+claim service membership or runtime readiness from fabricated Info.
 
-The initial member gate continues to hold the actual root until existing member
-proof/acceptance succeeds. Refresh does not newly grant membership, change an
+The initial member controller must continue holding the actual initial owner
+until existing member proof/acceptance succeeds. Refresh does not newly grant membership, change an
 allowlist, convert Ed25519 into X25519 or replace own-server trust. The opaque
 authority is carried through that existing custody, never reconstructed from the
 public member status. A restart that lost this owner cannot mint a continuation.
@@ -286,8 +300,21 @@ have private fields and no Clone/Debug; public copies below are observations.
 Handshake::new_refreshable(config: Config, selection: refresh::Selection,
     local: LocalSecret, peer: PeerKey, psk: Option<Psk>, now: Time,
     entropy: &mut impl Entropy) -> Result<Handshake, Error>;
-// Existing finish_with_confirmation consumes actual verified split keys;
-// selected construction privately includes authority in its returned root.
+Handshake::finish_refreshable_with_confirmation(self, now: Time)
+    -> Result<refresh::InitialEstablished, refresh::Error>;
+// InitialEstablished {initial: ConfirmedInitial, confirmation: super::ConfirmationCache}
+// Old finish/finish_with_confirmation accept only ordinary construction;
+// selected finish accepts only new_refreshable construction. No root escape.
+refresh::ConfirmedInitial::joining(self, limits: Limits, now: Time,
+    original_deadline: Time) -> Result<refresh::InitialJoining, refresh::Error>;
+refresh::InitialJoining::seal(&mut self, now: Time, body: &[u8], output: &mut [u8])
+    -> Result<security::Sealed, refresh::Error>;
+refresh::InitialJoining::open(&mut self, now: Time, input: &[u8], output: &mut [u8])
+    -> Result<security::Opened, refresh::Error>;
+refresh::InitialJoining::retransmit(&mut self, now: Time, output: &mut [u8])
+    -> Result<usize, refresh::Error>;
+refresh::InitialJoining::retire(self, now: Time)
+    -> Result<refresh::ConfirmedInitial, refresh::Error>;
 
 refresh::Exchange::new(admission: security::refresh::Admission,
     local: LocalSecret, peer: PeerKey, psk: Option<Psk>, now: Time,
@@ -305,7 +332,8 @@ refresh::Exchange::finish_with_confirmation(self, now: Time)
 // refresh::Flight {kind: FlightKind, bytes: usize} counts header+Noise bytes.
 
 // secure_record.rs: one existing Records with explicit selected backing
-Records::new_refreshable(root: SessionRoot, lane: LaneId, limits: Limits,
+Records::new_refreshable(initial: handshake::refresh::ConfirmedInitial,
+    lane: LaneId, limits: Limits,
     protection: Protection, cover: cover::Config, control: Scope, data: Scope,
     now: Time, session_expires: Time)
     -> Result<Records, Error>;
@@ -343,6 +371,74 @@ Records::open_at(&mut self, now: Time, packet: &[u8], workspace: &mut [u8],
 // refresh::Sealed {record: Sealed, key_epoch: KeyEpoch, ratchet_base: PacketNumber}
 // refresh::Opened {record: Opened, key_epoch: KeyEpoch, ratchet_base: PacketNumber}
 ```
+
+InitialJoining fixes metadata to epoch1, actual initial H0 and `extra=[3]`,
+matching current Joining bytes. Its seal/open buffers contain the security record
+without outer route/cover; the existing member composition adds byte3 and cover.
+It seals once at number0, retaining that exact ciphertext for retransmit, and
+accepts only the peer number0. Retirement requires one actual successful seal
+and open; neither observation verifies a member signature. Its fixed lifetime is
+the minimum of caller original deadline, initial Noise deadline and initial key
+expiry. Retrograde/expired time fails before I/O; a short output does not consume
+the one sealing opportunity. Repeated sealing never creates another nonce owner.
+
+Cross-crate installation is explicit safe public consumption, not friend access:
+
+```rust,ignore
+ConfirmedInitial::install(self, lane: LaneId, limits: Limits,
+    protection: Protection, control_epoch: Epoch, control_digest: ConfigDigest,
+    now: Time, session_expires: Time)
+    -> Result<security::refresh::Owners, security::refresh::Error>;
+AuthenticatedRefresh::prepare_into(self, owners: &mut security::refresh::Owners,
+    now: Time) -> Result<security::refresh::Prepared, security::refresh::Error>;
+```
+
+`security::refresh::Owners` is opaque actual four-domain backing, with restricted
+byte seal/open/lifecycle methods and no raw root, mutable packet-owner reference,
+counter setter or public authority constructor. Install checks exact selection,
+registry/stamp, role/binding and times before returning it. The facade constructor
+still accepts only ConfirmedInitial; prepare accepts only AuthenticatedRefresh.
+It preflights actual cover/packet geometry before calling these consuming methods.
+Security's lower-level split-secret import remains a documented trusted adapter
+boundary; its output cannot be supplied as a fake facade initial/fresh proof.
+Handshake depends only on security, and neither depends on the facade. Existing
+Bindings still require honest caller policy: checking capacities cannot recompute
+the complete envelope H0 from a cover object alone or prove member admission.
+
+ConfirmedInitial and InitialJoining expose only copied `binding() ->
+SessionBinding`, `authenticated() -> handshake::Binding`, `role() -> Role`,
+`pins() -> (PeerKey, PeerKey)` in global order, and `selection() -> Selection`.
+These let the actual pure fixture build the existing signed member Context from
+real handshake output; none can recreate either owner. The initial v1 Joining
+root and selected v2 seed are derived once from the same consumed split secrets
+under their distinct existing-v1/new-v2 labels. Only the private managed Joining
+path can use that initial v1 root; it cannot mint User/Management owners. The
+four v2 domains are published only once, and the initial seed is then dropped.
+
+Time conversion is explicit: new facade/handshake methods use existing
+`handshake::Time`; low-level security uses `refresh::Tick(pub u64)` in the same
+microsecond clock domain. Install/prepare perform the checked domain conversion,
+not an OS-clock read. `Selection::new(SelectionSpec)` validates the public input
+spec matching the 132-byte field table; `encode`, `decode`, `spec` and `digest`
+return bounded canonical bytes or nonsecret observations. The checked Selection
+and every authority/material/managed-owner field stay private.
+
+The new typed error surface is deliberately small:
+
+| Boundary | Exact categories and effects |
+| --- | --- |
+| `security::refresh::Error` | `Configuration`, `Context`, `Mode`, `Domains`, `State`, `Busy`, `Conflict`, `Retired`, `TimeRegression`, `Deadline`, `KeyExpired`, `OverlapActive`, `EpochExhausted`, `CopiesExhausted`, `Allocation`, `Protection(security::Error)`; all carry bounded data only. Existing protection errors retain length/output/replay/generation/counter/byte-use meaning. |
+| `handshake::refresh::Error` | `Credentials`, `Handshake(handshake::Error)`, `Security(security::refresh::Error)`; actual supplied pins/PSK fail Credentials before entropy/flight. No provider Display string is retained. |
+| facade `secure_record::Error` | Add `Refresh(security::refresh::Error)`; retain all old variants/error paths for v1. Selected install/prepare consumption returns this typed security error, not an invented authentication flag. |
+| old/new finish mismatch | Ordinary `finish`/`finish_with_confirmation` on selected construction return existing `handshake::Error::State`; selected finish on ordinary construction returns the wrapped State. Neither exposes a root or upgrades a legacy handshake. |
+
+Validation/capacity/context/refusal paths do not reserve a new ID/nonce, replace
+owners or extend time. A valid local begin allocates its target exactly once;
+credential/entropy failure afterward requires explicit preactivation abort and
+never reuses that target. A consumed bad material value is dropped, not returned
+as a reusable import. A cryptographic sending attempt burns its number; callers
+must not treat that failure as an atomic rollback. Secret owners drop on terminal
+failure; no destructor reports successful authentication or control completion.
 
 The refresh confirmation cache retains the immutable 72-byte refresh header and
 delegates exact 73-byte ciphertext custody to the existing cache; output is 145
@@ -416,6 +512,32 @@ Explicit preactivation abort likewise burns the allocated selector and cannot
 undo numbers already used for request/control output. An abort after activation
 is refused; it is not a rollback mechanism.
 
+Pre-production API completion: both facade `Records::abort_refresh(target:
+KeyEpoch, now: handshake::Time) -> Result<(), secure_record::Error>` and backing
+`Owners::abort_refresh(target: KeyEpoch, now: Tick) -> Result<(), refresh::Error>`
+require the exact current target. They check original time/caps first, return
+`Context` for a different target and `State` after activation, and clear only an
+unactivated attempt/prepared slot. The allocated-selector high-water mark,
+already consumed packet numbers/replay and all original session/key deadlines
+survive. A later begin is a new operation with a new selector, never a retry
+that renews the canceled cap. Expired or retrograde cancellation returns its
+typed time error; it cannot resurrect the expired operation.
+
+Safety refinement recorded during implementation: an endpoint that has
+authenticated any target-key record has evidence that its peer already activated.
+Even while the local phase is Prepared, `abort_refresh` returns `State` and retains
+both contexts. The check uses the private authenticated target receive base or
+activation custody, never a public observation. An untouched candidate can be
+canceled before its original cap; that cancellation keeps the old valid context
+and burns the target. The first pure implementation instead terminates at an
+unresolved operation cap, including a locally Requested/Prepared attempt: local
+phase alone does not prove that the remote has not activated. Safe automatic
+preactivation discard/continuation and retained recovery remain required
+follow-on work. This is an engineering safety boundary, not an owner decision or
+proof of timeout recovery. The additive refinement receipt records that the
+narrow abort guard was authored before this paragraph; historical pre-edit
+receipts are preserved.
+
 Deadline/retrograde checks precede semantic work; all lengths/capacities and
 checked epoch/number arithmetic precede sender reservation. Cryptographic attempts
 burn a global sending number, including provider failure. Authentication failure
@@ -448,6 +570,25 @@ Proposed disjoint implementation ownership after review:
   work/byte/cipher caches, original socket/tails, explicit selection/status and
   complete resource admission. No current runtime/control source is changed here.
 
+The precise first implementation file boundary is:
+
+| Owner | Files and limits |
+| --- | --- |
+| Refresh lane | `l2tunnel-security/src/{context,record,keys}.rs` for narrow existing-algorithm factoring; new `refresh.rs` and `refresh/{selection,authority,owners,tests}.rs`. Reuse existing replay implementation; no second replay algorithm or v1 vector rewrite. |
+| Refresh lane | `l2tunnel-handshake/src/lib.rs` for selected prologue/finish factoring; new `refresh.rs` and `refresh_tests.rs`. Public split APIs only; existing crypto adapter and dependency pins unchanged. |
+| Refresh lane | `l2tunnel/src/secure_record.rs`, new `secure_record_refresh.rs`, and `l2tunnel/tests/session_refresh.rs`. One existing Records selected backing, no parallel record composition or forged Initial constructor. |
+| Root | crate `lib.rs` registrations/reexports, manifests if a demonstrated need appears, full checks/source receipts and final ledger reconciliation. Other common configuration/record adapters remain disjoint workers' files. |
+
+No runtime/control/identity source is required for this pure slice. In particular
+it does not change `identity::ServerPending` to accept a claimed member flag.
+The fixture calls the existing actual verifier while retaining managed custody;
+the later service must carry equivalent actual gates through its own typed owner.
+The first complete path must include real initial confirmations and real member
+proof/allowlist/acceptance, both refresh roles and final-loss custody, and actual
+four-domain key installation with continuing numbers. Writing only new enums or
+constructors does not deliver it. Full reserved-memory/allocator qualification is
+not claimed by the bounded key-slot geometry.
+
 The follow-on MUST provide independently live lifecycle work while a transaction
 is incomplete, using the existing reliable-message/fragment ownership rather than
 inventing another management stack. If requests become fragmented, opaque actual
@@ -464,6 +605,34 @@ remain full required follow-ons. A restarted peer cannot reuse an old selector,
 logical session or counter from public metadata. It needs fresh authentication
 and explicit reconciliation or a new logical session; inner TCP survival is not
 guaranteed. All mode/parity gates retain their original scope.
+
+## Protocol-tested first slice
+
+The affected checkpoint passes eight new security cases, four actual handshake
+cases and two facade cases. The latter exercise four finite cover/protection/
+Noise-profile compositions, real Ed25519 MemberProof/Allowlist verification and
+managed Joining acceptance before constructing selected Records. They use real
+maintained fresh Noise split keys, final-confirmation loss/cache retry after one
+peer activates, old traffic beyond the request snapshot, continuing packet numbers,
+shared replay, activation/overlap/retirement and preserved local data scopes.
+This is an in-memory pure composition; no fresh-DH UDP/runtime/native claim follows.
+
+Source review found and corrected old-key fencing in both current/additional
+slot orientations, and cancellation after authenticated peer activation/new-key
+traffic. Focused regressions cover those states, original deadline/monotonic
+latches, selector/counter exhaustion and failed-auth state preservation. Raw
+split-import tests remain explicitly separate from the real handshake/member
+fixture. Initial compatibility vectors and the existing selected UDP runtime/
+service tests pass. Complete allocation/erasure qualification, every-flight loss/
+reorder and concurrent actual native/transaction-debt preservation still require
+their full stated gates. All SREF rows below retain their complete definitions.
+
+Strict affected Clippy/rustdoc/format checks pass with explicit reuse. The later
+changes are one documented inline-authority lint annotation and one private
+equivalent split-key tuple alias; normalization verifies no runtime expression
+changed after functional execution. Failed attempts and the build inventory
+sampling caveat remain in the receipt. No new full `tools/check.py`, selected
+runtime rekey, recovery default, native, CI or non-Linux qualification is claimed.
 
 ## Acceptance ledger
 

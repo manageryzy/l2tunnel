@@ -1,6 +1,8 @@
 use super::*;
 use l2tunnel_core::{Delivery, Mapping, RecordLayout};
 
+mod encoding;
+
 fn modes() -> (ModeConfig, ModeConfig) {
     let initial = ModeConfig {
         channels: 2,

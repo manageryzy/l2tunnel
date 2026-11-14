@@ -7,6 +7,74 @@ use crate::{
 use ring::{aead, hmac};
 use zeroize::{Zeroize, Zeroizing};
 
+/// The same maintained protection operation serves all explicit wire profiles.
+pub(crate) fn seal_key(
+    key: &Key,
+    number: u64,
+    aad: &[u8],
+    plaintext: &[u8],
+    header: usize,
+    output: &mut [u8],
+) -> Result<(), Error> {
+    let body_end = header + plaintext.len();
+    output[header..body_end].copy_from_slice(plaintext);
+    match key {
+        Key::Aead(key) => {
+            let tag = key
+                .seal_in_place_separate_tag(
+                    nonce(number),
+                    aead::Aad::from(aad),
+                    &mut output[header..body_end],
+                )
+                .map_err(|_| {
+                    output[header..].zeroize();
+                    Error::Crypto
+                })?;
+            output[body_end..].copy_from_slice(tag.as_ref());
+        }
+        Key::Mac(key) => {
+            let mut mac = hmac::Context::with_key(key);
+            mac.update(aad);
+            mac.update(plaintext);
+            output[body_end..].copy_from_slice(mac.sign().as_ref());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn open_key(
+    key: &Key,
+    number: u64,
+    aad: &[u8],
+    payload: &[u8],
+    body_bytes: usize,
+    output: &mut [u8],
+    mac_input: &mut Vec<u8>,
+) -> Result<(), Error> {
+    match key {
+        Key::Aead(key) => {
+            let buffer = &mut output[..payload.len()];
+            buffer.copy_from_slice(payload);
+            if key
+                .open_in_place(nonce(number), aead::Aad::from(aad), buffer)
+                .is_err()
+            {
+                buffer.zeroize();
+                return Err(Error::Authentication);
+            }
+        }
+        Key::Mac(key) => {
+            mac_input.clear();
+            mac_input.extend_from_slice(aad);
+            mac_input.extend_from_slice(&payload[..body_bytes]);
+            hmac::verify(key, mac_input, &payload[body_bytes..])
+                .map_err(|_| Error::Authentication)?;
+            output[..body_bytes].copy_from_slice(&payload[..body_bytes]);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Profile {
     Common {
@@ -220,28 +288,14 @@ impl Sender {
         }
         self.body_bytes = body_bytes;
         output[..header.len()].copy_from_slice(header);
-        let body_end = header.len() + plaintext.len();
-        output[header.len()..body_end].copy_from_slice(plaintext);
-        match &self.key {
-            Key::Aead(key) => {
-                let result = key.seal_in_place_separate_tag(
-                    nonce(number),
-                    aead::Aad::from(aad.as_slice()),
-                    &mut output[header.len()..body_end],
-                );
-                let tag = result.map_err(|_| {
-                    output[header.len()..length].zeroize();
-                    Error::Crypto
-                })?;
-                output[body_end..length].copy_from_slice(tag.as_ref());
-            }
-            Key::Mac(key) => {
-                let mut mac = hmac::Context::with_key(key);
-                mac.update(aad.as_slice());
-                mac.update(plaintext);
-                output[body_end..length].copy_from_slice(mac.sign().as_ref());
-            }
-        }
+        seal_key(
+            &self.key,
+            number,
+            aad.as_slice(),
+            plaintext,
+            header.len(),
+            &mut output[..length],
+        )?;
         Ok(Sealed {
             number: PacketNumber(number),
             generation,
@@ -344,28 +398,15 @@ impl Receiver {
         {
             return Err(Error::KeyUsageExhausted);
         }
-        match &key.key {
-            Key::Aead(key) => {
-                let buffer = &mut output[..packet.len() - header];
-                buffer.copy_from_slice(&packet[header..]);
-                if key
-                    .open_in_place(nonce(number), aead::Aad::from(aad.as_slice()), buffer)
-                    .is_err()
-                {
-                    buffer.zeroize();
-                    return Err(Error::Authentication);
-                }
-            }
-            Key::Mac(key) => {
-                self.mac_input.clear();
-                self.mac_input.extend_from_slice(aad.as_slice());
-                self.mac_input
-                    .extend_from_slice(&packet[header..header + body_bytes]);
-                hmac::verify(key, &self.mac_input, &packet[header + body_bytes..])
-                    .map_err(|_| Error::Authentication)?;
-                output[..body_bytes].copy_from_slice(&packet[header..header + body_bytes]);
-            }
-        }
+        open_key(
+            &key.key,
+            number,
+            aad.as_slice(),
+            &packet[header..],
+            body_bytes,
+            output,
+            &mut self.mac_input,
+        )?;
         key.body_bytes = used;
         self.opening.confirm(generation);
         self.replay.commit(number);

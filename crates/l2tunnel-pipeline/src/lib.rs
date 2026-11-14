@@ -88,6 +88,40 @@ pub struct PipelineConfig {
     pub queue: QueueLimits,
 }
 
+impl PipelineConfig {
+    /// Validate complete scalar policy without constructing packet owners.
+    pub fn validate(self) -> Result<(), PipelineError> {
+        let minimum = match self.profile {
+            Profile::TapSystem => 14,
+            Profile::TunDrr(_) => 20,
+        };
+        if self.queue.bytes < self.parse.max_packet_bytes
+            || self.queue.packets == 0
+            || self.parse.max_packet_bytes < minimum
+        {
+            return Err(PipelineError::InvalidConfig);
+        }
+        let mut header = [0u8; 14];
+        header[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+        classify(PacketLayer::Ethernet, &header, self.parse).map_err(PipelineError::Parse)?;
+        self.flows.validate().map_err(PipelineError::Flow)?;
+        // The preceding bounds also establish every scalar MUX constructor check.
+        if let Profile::TunDrr(policy) = self.profile {
+            if policy.max_weight == 0 {
+                return Err(PipelineError::InvalidConfig);
+            }
+            let scheduler = scheduler_config(self, policy);
+            scheduler
+                .validate(&TUN_CLASSES)
+                .map_err(PipelineError::QosConfig)?;
+            scheduler
+                .flow_quantum(Some(1), policy.max_weight)
+                .map_err(PipelineError::QosFlow)?;
+        }
+        Ok(())
+    }
+}
+
 /// Metadata returned on admission and final handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketMetadata {
@@ -265,19 +299,7 @@ pub struct Pipeline {
 impl Pipeline {
     /// Construct without I/O; validate every bound and the largest allowed weight.
     pub fn new(config: PipelineConfig) -> Result<Self, PipelineError> {
-        let minimum = match config.profile {
-            Profile::TapSystem => 14,
-            Profile::TunDrr(_) => 20,
-        };
-        if config.queue.bytes < config.parse.max_packet_bytes
-            || config.queue.packets == 0
-            || config.parse.max_packet_bytes < minimum
-        {
-            return Err(PipelineError::InvalidConfig);
-        }
-        let mut header = [0u8; 14];
-        header[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
-        classify(PacketLayer::Ethernet, &header, config.parse).map_err(PipelineError::Parse)?;
+        config.validate()?;
         let flows = FlowTable::new(config.flows).map_err(PipelineError::Flow)?;
         let mux = Mux::new(
             config.flows.channels,
@@ -287,35 +309,10 @@ impl Pipeline {
         .map_err(|_| PipelineError::InvalidConfig)?;
         let qos = match config.profile {
             Profile::TapSystem => None,
-            Profile::TunDrr(policy) => {
-                if policy.max_weight == 0 {
-                    return Err(PipelineError::InvalidConfig);
-                }
-                let mut scheduler = Scheduler::new(
-                    SchedulerConfig {
-                        base_quantum_bytes: policy.base_quantum_bytes,
-                        max_classes: 1,
-                        max_flows: config.flows.capacity,
-                        max_packet_bytes: config.parse.max_packet_bytes,
-                        max_queued_bytes: config.queue.bytes,
-                        max_queued_packets: config.queue.packets,
-                        per_flow_bytes: policy.per_flow.bytes,
-                        per_flow_packets: policy.per_flow.packets,
-                    },
-                    &[ClassConfig {
-                        id: ClassId::new(0),
-                        weight: 1,
-                    }],
-                )
-                .map_err(PipelineError::QosConfig)?;
-                scheduler
-                    .register_flow(qos_flow(FlowId(0), policy.max_weight))
-                    .map_err(PipelineError::QosFlow)?;
-                scheduler
-                    .remove_flow(l2tunnel_qos::FlowId::new(0))
-                    .map_err(PipelineError::QosFlow)?;
-                Some(scheduler)
-            }
+            Profile::TunDrr(policy) => Some(
+                Scheduler::new(scheduler_config(config, policy), &TUN_CLASSES)
+                    .map_err(PipelineError::QosConfig)?,
+            ),
         };
         Ok(Self {
             config,
@@ -842,6 +839,24 @@ impl Pipeline {
     }
 }
 
+const TUN_CLASSES: [ClassConfig; 1] = [ClassConfig {
+    id: ClassId::new(0),
+    weight: 1,
+}];
+
+fn scheduler_config(config: PipelineConfig, policy: TunQosConfig) -> SchedulerConfig {
+    SchedulerConfig {
+        base_quantum_bytes: policy.base_quantum_bytes,
+        max_classes: 1,
+        max_flows: config.flows.capacity,
+        max_packet_bytes: config.parse.max_packet_bytes,
+        max_queued_bytes: config.queue.bytes,
+        max_queued_packets: config.queue.packets,
+        per_flow_bytes: policy.per_flow.bytes,
+        per_flow_packets: policy.per_flow.packets,
+    }
+}
+
 fn qos_flow(id: FlowId, weight: u32) -> FlowConfig {
     FlowConfig {
         id: l2tunnel_qos::FlowId::new(id.0),
@@ -872,3 +887,6 @@ fn add_usage(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod validation_tests;

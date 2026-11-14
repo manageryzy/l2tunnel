@@ -21,6 +21,7 @@ pub(crate) fn expand(prk: &hkdf::Prk, info: &[&[u8]]) -> Result<Zeroizing<[u8; 3
 pub(crate) enum Labels {
     Common,
     SwiftV2,
+    RefreshV2,
 }
 impl Labels {
     fn key(self, protection: Protection) -> &'static [u8] {
@@ -28,12 +29,15 @@ impl Labels {
             (Self::SwiftV2, _) => b"l2tunnel swift v2 datagram key",
             (Self::Common, Protection::ChaCha20Poly1305) => b"l2tunnel packet security v1 AEAD key",
             (Self::Common, Protection::HmacSha256) => b"l2tunnel packet security v1 MAC key",
+            (Self::RefreshV2, Protection::ChaCha20Poly1305) => b"l2tunnel/packet/v2/aead-key\0",
+            (Self::RefreshV2, Protection::HmacSha256) => b"l2tunnel/packet/v2/mac-key\0",
         }
     }
     fn next(self) -> &'static [u8] {
         match self {
             Self::SwiftV2 => b"l2tunnel swift v2 next secret",
             Self::Common => b"l2tunnel packet security v1 next secret",
+            Self::RefreshV2 => b"l2tunnel/packet/v2/next-secret\0",
         }
     }
 }

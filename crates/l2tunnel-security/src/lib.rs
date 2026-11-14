@@ -11,6 +11,9 @@ mod record;
 mod replay;
 pub mod swift_v2;
 
+/// Explicit fresh-DH key lifecycle with continuing packet/replay ownership.
+pub mod refresh;
+
 pub use context::{
     ConfigDigest, Direction, Epoch, LaneId, Limits, Metadata, Protection, Purpose, Role,
     SessionBinding, SessionId, SessionRoot,

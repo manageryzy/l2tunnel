@@ -29,6 +29,19 @@ pub struct FlowTableConfig {
     pub idle_timeout: Duration,
 }
 
+impl FlowTableConfig {
+    /// Validate scalar bounds without allocating a table or consuming identities.
+    pub fn validate(self) -> Result<(), FlowError> {
+        if !(1..=65536).contains(&self.capacity)
+            || !(1..=256).contains(&self.channels)
+            || self.idle_timeout.is_zero()
+        {
+            return Err(FlowError::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
 /// Explicit table lifecycle and binding failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowError {
@@ -128,12 +141,7 @@ impl PreparedAssignment<'_> {
 impl FlowTable {
     /// Create an empty table; local identifiers begin at one.
     pub fn new(config: FlowTableConfig) -> Result<Self, FlowError> {
-        if !(1..=65536).contains(&config.capacity)
-            || !(1..=256).contains(&config.channels)
-            || config.idle_timeout.is_zero()
-        {
-            return Err(FlowError::InvalidConfig);
-        }
+        config.validate()?;
         Ok(Self {
             config,
             entries: BTreeMap::new(),
@@ -332,6 +340,9 @@ impl FlowTable {
         })
     }
 }
+
+#[cfg(test)]
+mod validation_tests;
 
 #[cfg(test)]
 mod tests {

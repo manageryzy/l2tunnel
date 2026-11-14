@@ -237,11 +237,19 @@ provides the [directional record owners](modules/directional-record-endpoints.md
 [Swift adapter](modules/swift-record-adapter.md) and actual
 [control wrapper backing](modules/control-wrapper-storage.md). It retains full
 stage acceptance and common cross-profile composition as open work. Complete
-directional Aligned/Packed encoding exceeds the current512-byte transaction
-configuration bound; the next composition must version the full configuration
-and all dependent bounds, preserving every field and independent direction.
-The [fresh-DH proposal](modules/session-refresh.md) remains design-only, including
-the unresolved managed Joining handoff and required runtime/lifecycle follow-ons.
+directional Aligned/Packed encoding exceeds the transaction configuration's
+legacy512-byte bound. The explicit
+[CompleteV2 extension](modules/transaction-configuration-encoding.md) and shared
+scalar validation now pass a [119-test affected batch](../work/record-composition-20261114/foundation-attempt-1/validation.json).
+The [complete configuration](modules/record-configuration.md) source preserves
+every selected field and independent direction. The
+[448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
+also protocol-tests the [fresh-DH contract's](modules/session-refresh.md) selected
+initial/managed Joining/member/refresh/Records path. Actual common Engine and
+runtime/resource/API composition, full stage acceptance, runtime fresh-DH
+lifecycle and complete retained recovery remain open. Passing unaffected
+checks are reused; a failed new expected literal was repaired with one exact
+test rerun rather than repeating the whole batch.
 
 ## Ordered milestones and exit gates
 

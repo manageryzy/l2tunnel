@@ -8,7 +8,8 @@ mod config;
 mod lease;
 mod preparation;
 pub use config::{
-    Configuration, MODE_BYTES, configuration_digest, decode_mode, encode_mode, mode_digest,
+    Configuration, ConfigurationEncoding, MODE_BYTES, configuration_digest, configuration_limits,
+    decode_mode, encode_mode, maximum_prepare_bytes, mode_digest,
 };
 use config::{decode_configuration, encode_configuration};
 pub use lease::{CachedRetryAuthority, LeaseSettings, Operation, OutboundContext};
@@ -392,7 +393,8 @@ impl<C: Configuration> Peer<C> {
                 epoch,
                 digest,
             }),
-            gate: AdmissionGate::new(binding, limits()).map_err(Error::Admission)?,
+            gate: AdmissionGate::new(binding, configuration_limits::<C>()?)
+                .map_err(Error::Admission)?,
             phase: Phase::Idle,
             pending: None,
             outstanding: None,
@@ -1105,7 +1107,7 @@ impl<C: Configuration> Peer<C> {
             header,
             body: &message.body,
         }
-        .encode(&mut bytes, limits())
+        .encode(&mut bytes, configuration_limits::<C>()?)
         .map_err(Error::Admission)?;
         self.next_retry = self.clamp_lease(add(self.now, self.settings.retry_ms)?);
         Ok(bytes)

@@ -28,11 +28,21 @@ design, interface agreement, concurrent implementation and integration.
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),
-[fallible control wrapper storage](modules/control-wrapper-storage.md) and the
-design-only [in-session fresh-DH proposal](modules/session-refresh.md).
+[fallible control wrapper storage](modules/control-wrapper-storage.md),
+[complete configuration encoding](modules/transaction-configuration-encoding.md),
+[common configuration](modules/record-configuration.md),
+[common engine prerequisites](modules/common-record-engine.md) and
+[in-session fresh-DH](modules/session-refresh.md).
 Their leaf evidence does not close full SW-11, complete resource admission or
 retained-state recovery. Existing mode, native, platform and performance gates
 retain their full definitions.
+
+The [current448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
+qualifies the selected scalar/CompleteV2/common-configuration and first pure
+fresh-DH behavior with explicit reuse. Actual selected fresh-DH runtime,
+common record Engine/Bank, full SW-11, complete resources, retained recovery and
+required full stage/native/platform acceptance remain open. The saved failed
+attempts and precise repair are not relabeled as passing aggregates.
 
 ## Blocking behavior corrections — execute before new feature work
 
@@ -290,6 +300,10 @@ does not qualify generic switching, other record profiles or full SW-11.
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |
 | Shared point-to-point security | SEC-01..SEC-12 | [Secure session](modules/secure-session.md) | maintained implementation/API review, opaque records, injected time, preserved data protection |
+| Complete configuration wire bounds | TCE-01..TCE-05 | [Explicit encoding](modules/transaction-configuration-encoding.md) | actual typed limits/Peer/lease; selected runtime/resource/API integration remains open |
+| Complete directional record policies | RCF-01..RCF-06 | [Canonical record configuration](modules/record-configuration.md) | complete field-preserving values/catalogs; representation does not install a runtime capability |
+| Common record engine composition | CRE-01..CRE-08 | [Actual-owner adapter](modules/common-record-engine.md) | shared scalar prerequisite tested; actual engines/MUX/fences/storage/Driver composition remains open |
+| Authenticated fresh-DH lifecycle | SREF-01..SREF-08 | [Session refresh](modules/session-refresh.md) | real selected initial/refresh authority, continuing counters/replay; runtime and retained recovery remain separate |
 | TUN active flow control and QoS | FC-01..FC-25 | [Flow control](flow-control.md) | bounded records, authenticated feedback; TCP proxy needs owned TCP legs |
 | Internal L2 management/reload | MG-01..MG-08 | [Management protocol](overlay-and-carriers.md) | authenticated session; stable control framing before hot data modes |
 | Whole-message control custody | SCM-01..SCM-08 | [Control messages](modules/control-messages.md) | existing ARQ/fragmentation, explicit completion custody and original deadlines |

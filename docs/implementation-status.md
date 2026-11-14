@@ -7,7 +7,23 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The latest [scoped foundation checkpoint](../work/common-foundation-20261114/scoped-checkpoint-validation.json)
+The current [affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
+combines448 unique passing cases with bounded parallel execution and explicit
+evidence reuse. It implements shared scalar validation, CompleteV2 transaction
+bounds through actual Peer/gate/leased decoders, complete1304-byte directional
+Swift/Aligned/Packed policies/catalogs and the first pure authenticated fresh-DH
+path. Actual Noise/member/Joining/Records composition preserves continuing
+counters/replay through activation/overlap/retirement. Legacy values and selected
+UDP runtime/service regressions pass. Strict affected Clippy/rustdoc/format
+checks pass; failed attempts and the build-sampling caveat remain preserved.
+After the new compatibility-test literal repair, only that exact failed case
+was repeated.283 simulator/tooling/config/vendor inputs remain unchanged and
+those suites were not repeated. This is not a new full `tools/check.py`, fresh-DH
+runtime/native, performance, CI or platform pass. The actual common record Engine,
+selected runtime/resource integration, complete SW-11, retained recovery and
+required full-stage acceptance remain open.
+
+The preceding [scoped foundation checkpoint](../work/common-foundation-20261114/scoped-checkpoint-validation.json)
 adds pure directional ARQ/Reliable/Aligned/Packed owners, checked Swift channel
 admission and typed output, and actual fallible generic control-wrapper storage.
 It composes586 affected passing cases with explicit unchanged evidence reuse;
@@ -15,7 +31,8 @@ strict affected Clippy/rustdoc/format checks pass. Its initial runtime stack
 failure and focused correction are preserved. This is not a new full workspace
 or native pass. Required stage acceptance, cross-profile Driver/Bank integration,
 full resources and retained-state recovery remain open. The
-[fresh-DH refresh contract](modules/session-refresh.md) is design-only.
+[fresh-DH refresh contract](modules/session-refresh.md) now has protocol-tested
+pure source; no selected-runtime rekey capability is qualified.
 
 The preceding functionality wave implements explicit generic Swift shared-service
 and APIv3 selection, real three-stream reserved ARQ consumers and actual sole-loop

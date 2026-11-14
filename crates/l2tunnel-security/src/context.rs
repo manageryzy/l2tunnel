@@ -37,13 +37,13 @@ pub enum Direction {
     ResponderToInitiator = 2,
 }
 impl Role {
-    fn sending(self) -> Direction {
+    pub(crate) fn sending(self) -> Direction {
         match self {
             Self::Initiator => Direction::InitiatorToResponder,
             Self::Responder => Direction::ResponderToInitiator,
         }
     }
-    fn receiving(self) -> Direction {
+    pub(crate) fn receiving(self) -> Direction {
         match self {
             Self::Initiator => Direction::ResponderToInitiator,
             Self::Responder => Direction::InitiatorToResponder,
@@ -160,6 +160,17 @@ pub struct SessionRoot {
     owners: Vec<Domain>,
 }
 impl SessionRoot {
+    pub(crate) fn managed_registry(&self, lane: LaneId, retired_joining: bool) -> bool {
+        if !retired_joining {
+            return self.owners.is_empty();
+        }
+        self.owners.len() == 2
+            && self
+                .owners
+                .iter()
+                .all(|domain| domain.purpose == Purpose::Joining && domain.lane == lane)
+            && self.owners[0].direction != self.owners[1].direction
+    }
     /// Public authenticated session/transcript context, never a secret MAC key.
     /// This observation creates no owner and changes no key, replay or counter.
     pub const fn binding(&self) -> SessionBinding {

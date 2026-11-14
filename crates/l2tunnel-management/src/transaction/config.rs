@@ -7,11 +7,32 @@ use l2tunnel_core::{
 /// Exact length of the version-1 canonical mode configuration.
 pub const MODE_BYTES: usize = 24;
 
+/// Explicit local canonical-value contract; never selected by an incoming length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationEncoding {
+    /// Existing canonical values, preserving the 512-byte constructor boundary.
+    LegacyV1,
+    /// Complete versioned profile values with at most 4096 canonical bytes.
+    CompleteV2,
+}
+
+impl ConfigurationEncoding {
+    /// Hard canonical-byte limit before callbacks or allocation.
+    pub const fn maximum_bytes(self) -> usize {
+        match self {
+            Self::LegacyV1 => 512,
+            Self::CompleteV2 => 4096,
+        }
+    }
+}
+
 /// Fixed canonical policy contract for the existing bounded transaction engine.
 /// Implementations are trusted local code; decoded peer values still validate
 /// and must re-encode byte-exactly before admission.
 pub trait Configuration: Clone + Eq {
-    /// Exact encoding size, validated in 1..=512 before allocation.
+    /// Explicit trusted-local encoding contract; existing implementations stay legacy.
+    const ENCODING: ConfigurationEncoding = ConfigurationEncoding::LegacyV1;
+    /// Exact size, validated against ENCODING before callbacks or allocation.
     const ENCODED_LEN: usize;
     /// Nonempty digest domain, bounded to 128 bytes and unique to this policy.
     const DIGEST_DOMAIN: &'static [u8];
@@ -34,10 +55,45 @@ pub trait Configuration: Clone + Eq {
 }
 
 fn validate_type<C: Configuration>() -> Result<(), Error> {
-    if !(1..=512).contains(&C::ENCODED_LEN) || !(1..=128).contains(&C::DIGEST_DOMAIN.len()) {
+    if !(1..=C::ENCODING.maximum_bytes()).contains(&C::ENCODED_LEN)
+        || !(1..=128).contains(&C::DIGEST_DOMAIN.len())
+    {
         return Err(Error::Configuration("canonical policy size or domain"));
     }
     Ok(())
+}
+
+/// Exact largest PREPARE for one old global sender's fence, without allocation.
+/// This checks geometry only; actual frame/message/resource admission stays external.
+pub fn maximum_prepare_bytes<C: Configuration>(sender_channels: u16) -> Result<usize, Error> {
+    validate_type::<C>()?;
+    if !(1..=256).contains(&sender_channels) {
+        return Err(Error::Configuration(
+            "canonical policy sender channel count",
+        ));
+    }
+    usize::from(sender_channels)
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(2))
+        .and_then(|bytes| bytes.checked_add(C::ENCODED_LEN))
+        .and_then(|bytes| bytes.checked_add(8))
+        .and_then(|bytes| bytes.checked_add(crate::HEADER_LEN))
+        .ok_or(Error::Exhausted)
+}
+
+/// Exact existing or explicitly extended frame/request-gate limits for this type.
+/// A runtime must admit these real bounds separately from whole-message storage.
+pub fn configuration_limits<C: Configuration>() -> Result<crate::Limits, Error> {
+    validate_type::<C>()?;
+    let mut limits = super::limits();
+    if C::ENCODING == ConfigurationEncoding::CompleteV2 {
+        limits.max_frame_bytes = limits.max_frame_bytes.max(maximum_prepare_bytes::<C>(256)?);
+        limits.max_retained_bytes = limits
+            .max_frame_bytes
+            .checked_mul(limits.max_requests)
+            .ok_or(Error::Exhausted)?;
+    }
+    Ok(limits)
 }
 
 pub(super) fn encode_configuration<C: Configuration>(config: &C) -> Result<Vec<u8>, Error> {

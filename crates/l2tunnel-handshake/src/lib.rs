@@ -6,6 +6,8 @@
 //! in `docs/modules/noise-handshake.md`. Application data is never a handshake input.
 
 mod crypto;
+/// Explicit maintained-Noise fresh-DH lane, separate from deterministic ratchets.
+pub mod refresh;
 
 use clatter::bytearray::{ByteArray, SensitiveByteArray};
 use clatter::crypto::cipher::ChaChaPoly;
@@ -31,6 +33,7 @@ const PROLOGUE_DOMAIN: &[u8] = b"l2tunnel/noise-proof/v1\0";
 
 type Noise = NqHandshakeCore<CheckedX25519, ChaChaPoly, Sha256, UnavailableRandom>;
 type Transport = TransportState<ChaChaPoly, Sha256>;
+type FinishedKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>, ConfirmationCache);
 
 /// Caller-supplied monotonic microseconds in one unchanged clock domain.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -252,6 +255,8 @@ pub struct Handshake {
     retired: bool,
     received: Vec<Cached>,
     sent: Vec<Cached>,
+    finish_kind: refresh::FinishKind,
+    refresh_setup: Option<refresh::InitialSetup>,
 }
 
 impl Handshake {
@@ -264,6 +269,27 @@ impl Handshake {
         psk: Option<Psk>,
         now: Time,
         entropy: &mut impl Entropy,
+    ) -> Result<Self, Error> {
+        Self::construct(
+            config,
+            local,
+            peer,
+            psk,
+            now,
+            entropy,
+            refresh::Construction::Legacy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Fixed existing handshake inputs plus explicit prologue selection.
+    fn construct(
+        config: Config,
+        local: LocalSecret,
+        peer: PeerKey,
+        psk: Option<Psk>,
+        now: Time,
+        entropy: &mut impl Entropy,
+        construction: refresh::Construction<'_>,
     ) -> Result<Self, Error> {
         if now >= config.deadline {
             return Err(Error::Deadline);
@@ -304,6 +330,34 @@ impl Handshake {
         ] {
             prologue.extend_from_slice(&field);
         }
+        let (finish_kind, refresh_setup) = match construction {
+            refresh::Construction::Legacy => (refresh::FinishKind::Legacy, None),
+            refresh::Construction::Initial(selection) => {
+                prologue
+                    .try_reserve_exact(30 + 132)
+                    .map_err(|_| Error::Protection)?;
+                prologue.extend_from_slice(b"l2tunnel/refresh-selection/v1\0");
+                prologue.extend_from_slice(&selection.canonical_bytes());
+                let setup = refresh::InitialSetup {
+                    selection,
+                    pins: [initiator_key, responder_key],
+                    psk: psk.as_ref().map(|psk| {
+                        l2tunnel_security::refresh::psk_commitment(&psk.0[..], &prologue)
+                    }),
+                    prologue_hash: l2tunnel_security::refresh::prologue_hash(&prologue),
+                };
+                (refresh::FinishKind::Initial, Some(setup))
+            }
+            refresh::Construction::Exchange(context) => {
+                prologue.clear();
+                prologue
+                    .try_reserve_exact(26 + context.len())
+                    .map_err(|_| Error::Protection)?;
+                prologue.extend_from_slice(b"l2tunnel/noise-refresh/v1\0");
+                prologue.extend_from_slice(context);
+                (refresh::FinishKind::Exchange, None)
+            }
+        };
         let pattern = match config.profile {
             Profile::Ik => noise_ik(),
             Profile::IkPsk2 => noise_ik_psk2(),
@@ -335,6 +389,8 @@ impl Handshake {
             retired: false,
             received: Vec::with_capacity(2),
             sent: Vec::with_capacity(2),
+            finish_kind,
+            refresh_setup,
         })
     }
 
@@ -549,6 +605,24 @@ impl Handshake {
     /// No root is released before local emission and verified peer confirmation.
     /// The runtime still owns send success, readiness and amplification policy.
     pub fn finish_with_confirmation(mut self, now: Time) -> Result<Established, Error> {
+        if self.finish_kind != refresh::FinishKind::Legacy {
+            return Err(Error::State);
+        }
+        let (forward_owned, reverse_owned, confirmation) = self.take_finished(now)?;
+        let root = SessionRoot::from_split_keys(
+            forward_owned,
+            reverse_owned,
+            SessionBinding {
+                session: self.config.binding.session,
+                transcript: self.transcript,
+            },
+            self.config.role,
+        )
+        .map_err(|_| Error::Protection)?;
+        Ok(Established { root, confirmation })
+    }
+
+    fn take_finished(&mut self, now: Time) -> Result<FinishedKeys, Error> {
         self.check(now)?;
         if !self.is_complete() {
             return Err(Error::State);
@@ -580,17 +654,7 @@ impl Handshake {
         forward_owned.copy_from_slice(forward.as_slice());
         reverse_owned.copy_from_slice(reverse.as_slice());
         drop((forward, reverse));
-        let root = SessionRoot::from_split_keys(
-            forward_owned,
-            reverse_owned,
-            SessionBinding {
-                session: self.config.binding.session,
-                transcript: self.transcript,
-            },
-            self.config.role,
-        )
-        .map_err(|_| Error::Protection)?;
-        Ok(Established { root, confirmation })
+        Ok((forward_owned, reverse_owned, confirmation))
     }
 }
 

@@ -34,6 +34,9 @@ pub mod secure_record;
 /// Complete canonical Swift configurations and exact transaction catalogs.
 pub mod swift_configuration;
 
+/// Complete versioned common record values and exact transaction catalogs.
+pub mod record_configuration;
+
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;
 /// Authenticated aligned-symbol composition; clocks and native I/O stay external.
