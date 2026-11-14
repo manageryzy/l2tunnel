@@ -160,11 +160,17 @@ liveness and fresh-session reconnect with periodic reporting disabled. Actual
 observations precede successful completion; requested/current/physical values
 and incomplete resources remain distinct. All three generic control streams
 now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
-CLI selection, the complete generic IPC/negative-service/fault matrix, full
+The additive [complete-plan CLI](modules/generic-transaction-cli.md) now exposes
+explicit generic selection, complete-C APIv3 commands and bounded full-catalog
+inspection. Its [source-stable batch](../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json)
+passes1960 Rust cases including doctests,376 tooling cases and1658 simulator
+cases. The external probe executes34 real CLI processes per cover against
+actual authenticated shared-service owners and UnixDatagram PacketDevices,
+including2 switches and fresh reconnect. It does not qualify successful
+production CLI TAP/TUN startup. Existing defaults and fixed v1/v2 bytes remain
+preserved. The complete generic IPC/negative-service/fault matrix, full
 reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
-acceptance remain open. Existing defaults and strict v1/v2 schemas are preserved;
-exact generic IPC compatibility cases remain tracked separately. No native or
-performance run was added during this functionality wave.
+acceptance remain open. No new native or performance run is inferred.
 
 ## Library boundary and layering
 

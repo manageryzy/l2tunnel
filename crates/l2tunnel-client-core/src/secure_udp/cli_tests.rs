@@ -58,16 +58,22 @@ fn explicit_carrier_selection_is_pure_and_global_views_match() -> io::Result<()>
             .ok_or_else(|| input("missing selection"))?;
         let server = selection("serve", &server, server_config)?
             .ok_or_else(|| input("missing selection"))?;
-        let a = client.build(
+        let Built::Legacy(a) = client.build(
             client_config,
             peers,
             l2tunnel_identity::MemberPublicKey([7; 32]),
-        )?;
-        let b = server.build(
+        )?
+        else {
+            return Err(input("legacy selector changed backend"));
+        };
+        let Built::Legacy(b) = server.build(
             server_config,
             peers,
             l2tunnel_identity::MemberPublicKey([7; 32]),
-        )?;
+        )?
+        else {
+            return Err(input("legacy selector changed backend"));
+        };
         assert_eq!(a.configuration(peers)?, b.configuration(peers)?);
         assert_eq!(a.settings().cover, b.settings().cover);
         assert_eq!(a.runtime(security::Role::Initiator).path_mtu, 1500);
@@ -94,13 +100,16 @@ fn short_setup_deadline_bounds_derived_cookie_and_retry_without_extending_it() -
     for deadline in [Duration::from_millis(300), Duration::from_millis(50)] {
         let mut connection = configuration(&options)?;
         connection.handshake_timeout = deadline;
-        let profile = selection("connect", &options, connection)?
+        let Built::Legacy(profile) = selection("connect", &options, connection)?
             .ok_or_else(|| input("missing explicit carrier"))?
             .build(
                 connection,
                 peers,
                 l2tunnel_identity::MemberPublicKey([7; 32]),
-            )?;
+            )?
+        else {
+            return Err(input("legacy selector changed backend"));
+        };
         let gate = profile.settings().gate;
         assert_eq!(profile.connection().handshake_timeout, deadline);
         assert_eq!(gate.handshake_timeout, deadline);

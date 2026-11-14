@@ -75,19 +75,28 @@ focused protocol evidence; the authenticated client construction has real
 factory tests. The explicit runtime-library entry point now passes finite
 same-socket/device tests, two nonzero switches and native operation-cap guards.
 Explicit shared Prepared/service/APIv3 selection now passes finite paired-owner
-and IPC status/switch checks. CLI selection, the complete generic IPC/negative/
-fault matrix and full resources remain pending;
+and IPC status/switch checks. Complete-plan CLI selection/inspection/APIv3 commands
+now have finite external-process evidence; production CLI TAP/TUN startup, the
+complete generic IPC/negative/fault matrix and full resources remain pending;
 [GDI-01..GDI-03](modules/generic-secure-udp.md) retain their complete scope.
 Detailed fault rows are tracked by
 [GDF-01..GDF-09](modules/generic-driver-faults.md), shared Prepared/APIv3
 selection by [GCS-01..GCS-09](modules/generic-client-service.md), and actual
 sole-loop input charging by [RBF-04/RBF-05](modules/generic-secure-udp.md).
+The explicit generic CLI plan, complete-C command and bounded inspection are
+tracked by [GCL-01..GCL-08](modules/generic-transaction-cli.md), retaining the
+full GCS-09 external-selection and compatibility acceptance.
 The [CRS-01..CRS-07 contract](modules/control-recovery-storage.md) retains actual
 fallible management ARQ backing and its now-selected three-stream consumers,
-with partial-drop/differential/pressure and full resource admission requirements
-still open. The [required source-stable functionality aggregate](../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json)
-passes1919 Rust cases including doctests,376 tooling cases and1658 simulator
-cases, including strict Clippy/rustdoc. This wave adds no native/performance measurement.
+with actual partial backing release,130 complete receive-window reuse cycles,
+byte-pressure and differential cases now component-tested. Reserved-control
+pressure/liveness and constructor-boundary cleanup pass; literal later-stream
+dependency reservation failure and full resource admission remain open.
+The [required source-stable batch](../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json)
+passes1960 Rust cases including doctests,376 tooling cases and1658 simulator
+cases, including strict Clippy/rustdoc and34 external CLI processes per cover.
+Its service fixtures use UnixDatagram PacketDevices, not production TAP/TUN
+startup. This wave adds no native/performance measurement.
 Read-only preparation is tracked by
 [MPR-01..MPR-05](modules/transaction-preparation.md), actual fallible native
 completion storage by [NQP-01..NQP-05](modules/runtime-native-storage.md),

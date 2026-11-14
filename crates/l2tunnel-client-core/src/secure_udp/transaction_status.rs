@@ -13,6 +13,11 @@ pub const CANONICAL_CHARACTERS: usize = CONFIGURATION_BYTES * 2;
 pub struct CanonicalConfiguration(String);
 
 impl CanonicalConfiguration {
+    /// Parse exact lowercase canonical text through the existing complete decoder.
+    pub fn parse(text: &str) -> io::Result<Self> {
+        decode_configuration(text)?;
+        Ok(Self(text.to_owned()))
+    }
     /// Encode one existing checked complete value without changing any field.
     pub fn from_configuration(configuration: Configuration) -> io::Result<Self> {
         let mut bytes = [0; CONFIGURATION_BYTES];
@@ -81,8 +86,7 @@ impl<'de> Deserialize<'de> for CanonicalConfiguration {
                 )
             }
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                decode_configuration(value).map_err(E::custom)?;
-                Ok(CanonicalConfiguration(value.to_owned()))
+                CanonicalConfiguration::parse(value).map_err(E::custom)
             }
         }
         deserializer.deserialize_str(Visitor)

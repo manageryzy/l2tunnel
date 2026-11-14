@@ -36,9 +36,12 @@ The additive [generic Swift runtime](modules/generic-secure-udp.md) now passes
 finite same-socket/native-device tests with canonical complete configurations
 and two nonzero asymmetric Swift switches. Explicit shared Prepared/service/APIv3
 selection now also has finite paired-owner and IPC status/switch evidence.
-DataFeedback/other profile integration, CLI selection, the complete generic IPC/
-failure/fault/resource matrix and full cross-profile SW-11 remain open. Every
-complete catalog gate below retains its original definition and remains open.
+Explicit complete-plan CLI/inspection/APIv3 commands now pass a finite
+[external-process/shared-service batch](modules/generic-transaction-cli.md).
+Successful production CLI TAP/TUN startup, DataFeedback/other profile integration,
+the complete generic IPC/failure/fault/resource matrix and full cross-profile
+SW-11 remain open. Every complete catalog gate below retains its original
+definition and remains open.
 
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s

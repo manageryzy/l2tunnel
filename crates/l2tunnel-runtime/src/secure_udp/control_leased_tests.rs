@@ -97,6 +97,15 @@ struct Lab {
     owners: [Owner; 2],
     peers: [tx::Peer; 2],
     now: Duration,
+    emitted: Vec<WireFrame>,
+}
+
+struct WireFrame {
+    side: usize,
+    stream: streams::Stream,
+    at: Duration,
+    refill_start: Duration,
+    wire_bytes: usize,
 }
 
 impl Lab {
@@ -105,17 +114,44 @@ impl Lab {
     }
 
     fn with_settings(selected: Settings) -> Result<Self> {
+        Self::with_construction(selected, false)
+    }
+
+    fn reserved(selected: Settings) -> Result<Self> {
+        Self::with_construction(selected, true)
+    }
+
+    fn with_construction(selected: Settings, reserved: bool) -> Result<Self> {
         let catalog = modes();
         let make = |role| -> Result<(Owner, tx::Peer)> {
-            let owner = Owner::new_leased(
-                base(),
-                selected,
-                binding(role),
-                control_scope(),
-                data_scope(1, &catalog[0])?,
-                Duration::ZERO,
-                Duration::from_secs(10),
-            )?;
+            let owner = if reserved {
+                let mut limits = [recovery::storage::Limits { capacity_bytes: 0 }; 3];
+                for (limit, settings) in limits.iter_mut().zip(selected.streams) {
+                    limit.capacity_bytes =
+                        recovery::storage::Plan::for_arq(settings.delivery.recovery)?
+                            .capacity_bytes();
+                }
+                Owner::new_leased_reserved_arq(
+                    base(),
+                    selected,
+                    binding(role),
+                    control_scope(),
+                    data_scope(1, &catalog[0])?,
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                    limits,
+                )?
+            } else {
+                Owner::new_leased(
+                    base(),
+                    selected,
+                    binding(role),
+                    control_scope(),
+                    data_scope(1, &catalog[0])?,
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                )?
+            };
             let identity = tx::Identity {
                 session: binding(role).session,
                 role,
@@ -148,6 +184,7 @@ impl Lab {
             owners: [client_owner, server_owner],
             peers: [client, server],
             now: Duration::ZERO,
+            emitted: Vec::new(),
         })
     }
 
@@ -178,6 +215,19 @@ impl Lab {
                         max_packet_bytes: 236,
                     },
                 )?;
+                let Backend::Streamed(streamed) = &source.backend else {
+                    return Err("leased pump requires streamed owner".into());
+                };
+                self.emitted.push(WireFrame {
+                    side,
+                    stream: frame.stream,
+                    at: self.now,
+                    refill_start: streamed
+                        .refill
+                        .checked_sub(streamed.quota.interval)
+                        .ok_or("invalid actual quota refill")?,
+                    wire_bytes: emission.wire_bytes,
+                });
                 let drop = side == 1
                     && drop_server_transaction_data
                     && frame.stream == streams::Stream::Transaction
@@ -295,6 +345,98 @@ impl Lab {
         self.accept(1 - side, &effect, false)?;
         self.confirm(side, &frozen, false, true)?;
         Ok(effect)
+    }
+
+    fn assert_shared_wire_quota(&self) {
+        let mut windows = std::collections::BTreeMap::new();
+        for frame in &self.emitted {
+            assert!(streams::Stream::ALL.contains(&frame.stream));
+            assert!(frame.at >= frame.refill_start);
+            assert!(frame.at < frame.refill_start + base().interval);
+            let totals = windows
+                .entry((frame.side, frame.refill_start))
+                .or_insert((0, 0));
+            totals.0 += 1;
+            totals.1 += frame.wire_bytes;
+            assert!(totals.0 <= base().packets_per_interval);
+            assert!(totals.1 <= base().bytes_per_interval);
+        }
+        assert!(
+            self.emitted
+                .iter()
+                .any(|frame| frame.stream == streams::Stream::Transaction)
+        );
+        assert!(
+            self.emitted
+                .iter()
+                .any(|frame| frame.stream == streams::Stream::Liveness)
+        );
+    }
+
+    /// Both messages must reach semantic acceptance, real confirmation and retirement.
+    fn ping_pong(&mut self, nonce: u64, drop_server_transaction_data: bool) -> Result {
+        let ping = self.owners[0]
+            .submit(
+                control_scope(),
+                sc::Body::Ping { nonce },
+                self.now,
+                CAP_DURATION,
+                false,
+            )?
+            .ok_or("reserved Ping admission")?;
+        let mut pong = None;
+        let mut received_pong = false;
+        let mut ping_confirmed = false;
+        let mut pong_confirmed = false;
+        for _ in 0..100 {
+            self.pump_filtered(drop_server_transaction_data)?;
+            let mut scratch = [0; 2048];
+            if pong.is_none()
+                && let Some(incoming) = self.owners[1].next(self.now, &mut scratch)?
+            {
+                assert_eq!(incoming.stream, Some(streams::Stream::Liveness));
+                let envelope =
+                    sc::Envelope::decode(&scratch[..incoming.bytes], envelope_limits(2048)?)?;
+                assert_eq!(envelope.binding.scope, control_scope());
+                assert_eq!(envelope.body, sc::Body::Ping { nonce });
+                self.owners[1].accepted(incoming, self.now)?;
+                pong = Some(
+                    self.owners[1]
+                        .submit(
+                            control_scope(),
+                            sc::Body::Pong { nonce },
+                            self.now,
+                            CAP_DURATION,
+                            false,
+                        )?
+                        .ok_or("reserved Pong admission")?,
+                );
+            }
+            if !received_pong && let Some(incoming) = self.owners[0].next(self.now, &mut scratch)? {
+                assert_eq!(incoming.stream, Some(streams::Stream::Liveness));
+                let envelope =
+                    sc::Envelope::decode(&scratch[..incoming.bytes], envelope_limits(2048)?)?;
+                assert_eq!(envelope.binding.scope, control_scope());
+                assert_eq!(envelope.body, sc::Body::Pong { nonce });
+                self.owners[0].accepted(incoming, self.now)?;
+                received_pong = true;
+            }
+            if !ping_confirmed && self.owners[0].confirmed(ping, self.now)? {
+                self.owners[0].retire(ping, self.now)?;
+                ping_confirmed = true;
+            }
+            if let Some(pong) = pong
+                && !pong_confirmed
+                && self.owners[1].confirmed(pong, self.now)?
+            {
+                self.owners[1].retire(pong, self.now)?;
+                pong_confirmed = true;
+            }
+            if received_pong && ping_confirmed && pong_confirmed {
+                return Ok(());
+            }
+        }
+        Err("bounded reserved Ping/Pong did not confirm and retire".into())
     }
 }
 
@@ -518,6 +660,263 @@ fn liveness_does_not_overwrite_retained_transaction_bytes_or_force_acceptance() 
 }
 
 const CAP_DURATION: Duration = Duration::from_millis(CAP.0);
+
+fn reserved_pressure_lab() -> Result<Lab> {
+    let mut selected = settings();
+    for stream in &mut selected.streams {
+        stream.message_lifetime = Duration::from_secs(5);
+    }
+    let lab = Lab::reserved(selected)?;
+    for owner in &lab.owners {
+        let usage = owner
+            .arq_storage_usage()
+            .ok_or("missing actual reserved stream owners")?;
+        for (actual, settings) in usage.into_iter().zip(selected.streams) {
+            assert_eq!(
+                actual.capacity_bytes,
+                recovery::storage::Plan::for_arq(settings.delivery.recovery)?.capacity_bytes()
+            );
+            assert_eq!(actual.limit_bytes, actual.capacity_bytes);
+        }
+    }
+    Ok(lab)
+}
+
+fn actual_pool_usage(lab: &Lab) -> Result<[[recovery::storage::Usage; 3]; 2]> {
+    Ok([
+        lab.owners[0]
+            .arq_storage_usage()
+            .ok_or("missing client pools")?,
+        lab.owners[1]
+            .arq_storage_usage()
+            .ok_or("missing server pools")?,
+    ])
+}
+
+fn assert_original_held_effect(
+    lab: &Lab,
+    effect: &PendingEffect<ModeConfig>,
+    bytes: &[u8],
+    original_message_deadline: Duration,
+) -> Result {
+    assert_eq!(effect.envelope(), bytes);
+    assert_eq!(effect.operation().expires(), CAP);
+    for peer in &lab.peers {
+        assert_eq!(
+            peer.operation()
+                .ok_or("lost original Peer operation")?
+                .expires(),
+            CAP
+        );
+    }
+    let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+        return Err("wrong reserved backend".into());
+    };
+    let held = streamed.held[index(streams::Stream::Transaction)]
+        .ok_or("lost actual retained Transaction effect")?;
+    assert_eq!(held.incoming, effect.incoming());
+    assert_eq!(held.deadline, original_message_deadline);
+    assert!(held.dispatched && held.leased);
+    Ok(())
+}
+
+fn held_effect_deadline(lab: &Lab) -> Result<Duration> {
+    let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+        return Err("wrong reserved backend".into());
+    };
+    Ok(streamed.held[index(streams::Stream::Transaction)]
+        .ok_or("missing actual held Transaction")?
+        .deadline)
+}
+
+#[test]
+fn reserved_held_transaction_allows_sixteen_confirmed_ping_pong_pairs_with_shared_quota() -> Result
+{
+    let mut lab = reserved_pressure_lab()?;
+    let usage = actual_pool_usage(&lab)?;
+    let prepare = lab.prepare()?;
+    let frozen = lab.send(0, &prepare)?;
+    let deadline = frozen.deadline();
+    let effect = lab.dispatched(1)?;
+    let exact = effect.envelope().to_vec();
+    let held_deadline = held_effect_deadline(&lab)?;
+    let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
+    for nonce in 1..=16 {
+        lab.ping_pong(nonce, false)?;
+        assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+        assert_eq!(frozen.deadline(), deadline);
+        assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
+        assert_eq!(actual_pool_usage(&lab)?, usage);
+        let mut called = false;
+        assert_eq!(
+            lab.owners[0].with_confirmed(
+                frozen.token().ok_or("missing original token")?,
+                lab.now,
+                |_| {
+                    called = true;
+                    Ok(())
+                },
+            )?,
+            Attempt::Blocked
+        );
+        assert!(!called);
+    }
+    assert!(lab.now < Duration::from_secs(2));
+    lab.assert_shared_wire_quota();
+    lab.accept(1, &effect, false)?;
+    lab.confirm(0, &frozen, false, true)?;
+    assert!(!lab.owners[1].has_dispatched());
+    assert_eq!(actual_pool_usage(&lab)?, usage);
+    lab.assert_shared_wire_quota();
+    Ok(())
+}
+
+#[test]
+fn reserved_saturated_transaction_preserves_effect_while_sixteen_ping_pong_pairs_settle() -> Result
+{
+    let mut lab = reserved_pressure_lab()?;
+    let usage = actual_pool_usage(&lab)?;
+    let prepare = lab.prepare()?;
+    let frozen = lab.send(0, &prepare)?;
+    let first = lab.dispatched(1)?;
+    let Backend::Streamed(streamed) = &mut lab.owners[1].backend else {
+        return Err("wrong reserved backend".into());
+    };
+    let transaction = &mut streamed.owners[index(streams::Stream::Transaction)];
+    transaction.submit(
+        messages::SubmissionId(999),
+        &[0x73; 600],
+        lab.now,
+        lab.now + Duration::from_secs(2),
+    )?;
+    for _ in 0..8 {
+        transaction.tick(lab.now)?;
+    }
+    assert_eq!(transaction.retained().recovery.send_records, 3);
+    lab.accept(1, &first, false)?;
+    let _ready = lab.peers[1].staged(tx::Fence::new(&[0, 0])?, lab.tick()?)?;
+    for _ in 0..10 {
+        lab.pump_filtered(true)?;
+    }
+    let retry = lab.peers[0]
+        .poll(lab.tick()?)?
+        .outbound
+        .ok_or("missing real PREPARE retry")?;
+    let repeated = lab.send(0, &retry)?;
+    let mut slot = None;
+    for _ in 0..100 {
+        lab.pump_filtered(true)?;
+        if lab.owners[1].dispatch_transaction(&mut lab.peers[1], lab.now, CAP, &mut slot)?
+            == DispatchProgress::Dispatched
+        {
+            break;
+        }
+    }
+    let effect = slot.ok_or("saturated Transaction did not dispatch actual retry")?;
+    let exact = effect.envelope().to_vec();
+    let held_deadline = held_effect_deadline(&lab)?;
+    let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
+    for nonce in 1..=16 {
+        let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+            return Err("wrong reserved backend".into());
+        };
+        assert_eq!(
+            streamed.owners[index(streams::Stream::Transaction)]
+                .retained()
+                .recovery
+                .send_records,
+            base().recovery.send_records
+        );
+        let mut called = false;
+        assert_eq!(
+            lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| {
+                called = true;
+                Ok(())
+            })?,
+            Attempt::Blocked
+        );
+        assert!(!called);
+        lab.ping_pong(nonce, true)?;
+        assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+        assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
+        assert_eq!(frozen.deadline(), CAP_DURATION);
+        assert_eq!(repeated.deadline(), CAP_DURATION);
+        assert_eq!(actual_pool_usage(&lab)?, usage);
+        let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+            return Err("wrong reserved backend".into());
+        };
+        assert_eq!(
+            streamed.owners[index(streams::Stream::Transaction)]
+                .retained()
+                .recovery
+                .send_records,
+            base().recovery.send_records
+        );
+    }
+    assert!(lab.now < Duration::from_secs(2));
+    lab.assert_shared_wire_quota();
+    let mut settled = false;
+    for _ in 0..100 {
+        lab.pump()?;
+        if lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| Ok(()))?
+            == Attempt::Complete(())
+        {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert_eq!(effect.envelope(), exact);
+    assert!(!lab.owners[1].has_dispatched());
+    lab.confirm(0, &frozen, false, true)?;
+    lab.confirm(0, &repeated, false, true)?;
+    assert_eq!(actual_pool_usage(&lab)?, usage);
+    lab.assert_shared_wire_quota();
+    Ok(())
+}
+
+#[test]
+fn reserved_liveness_never_renews_original_held_operation_cap() -> Result {
+    let mut lab = reserved_pressure_lab()?;
+    let usage = actual_pool_usage(&lab)?;
+    let prepare = lab.prepare()?;
+    let frozen = lab.send(0, &prepare)?;
+    let effect = lab.dispatched(1)?;
+    let exact = effect.envelope().to_vec();
+    let held_deadline = held_effect_deadline(&lab)?;
+    for nonce in 1..=16 {
+        lab.ping_pong(nonce, false)?;
+    }
+    assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+    assert_eq!(frozen.deadline(), CAP_DURATION);
+    assert_eq!(lab.owners[0].expiry(), CAP_DURATION);
+    lab.assert_shared_wire_quota();
+    lab.now = CAP_DURATION;
+    let mut called = false;
+    assert!(
+        lab.owners[0]
+            .with_confirmed(
+                frozen.token().ok_or("missing original token")?,
+                lab.now,
+                |_| {
+                    called = true;
+                    Ok(())
+                }
+            )
+            .is_err()
+    );
+    assert!(!called);
+    for peer in &mut lab.peers {
+        assert_eq!(peer.poll(CAP), Err(tx::Error::LeaseExpired));
+        assert_eq!(peer.phase(), tx::Phase::Failed);
+    }
+    assert_eq!(effect.envelope(), exact);
+    assert_eq!(effect.operation().expires(), CAP);
+    assert_eq!(held_effect_deadline(&lab)?, held_deadline);
+    assert!(lab.owners[1].has_dispatched());
+    assert_eq!(actual_pool_usage(&lab)?, usage);
+    Ok(())
+}
 
 #[test]
 fn frozen_retry_is_exact_and_confirmed_intermediate_does_not_renew_message_deadline() -> Result {

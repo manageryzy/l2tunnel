@@ -104,6 +104,8 @@ pub(crate) struct Allocation {
     fail_at: Option<usize>,
     #[cfg(test)]
     attempts: usize,
+    #[cfg(test)]
+    trace: Option<ConstructionTraceHandle>,
 }
 impl Allocation {
     pub(crate) fn new(limit: usize) -> Self {
@@ -115,6 +117,8 @@ impl Allocation {
             fail_at: None,
             #[cfg(test)]
             attempts: 0,
+            #[cfg(test)]
+            trace: None,
         }
     }
 
@@ -143,6 +147,12 @@ impl Allocation {
         }
         self.used = total;
         self.allocations += usize::from(bytes != 0);
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace
+                .borrow_mut()
+                .record(ConstructionEventKind::Reserved, self.allocations, &values);
+        }
         Ok(values)
     }
 
@@ -164,6 +174,110 @@ impl Allocation {
         Self {
             fail_at: Some(fail_at),
             ..Self::new(limit)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn traced(
+        limit: usize,
+        fail_at: Option<usize>,
+        trace: ConstructionTraceHandle,
+    ) -> Self {
+        Self {
+            trace: Some(trace),
+            fail_at,
+            ..Self::new(limit)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace(&self) -> Option<ConstructionTraceHandle> {
+        self.trace.clone()
+    }
+}
+
+// Test bookkeeping belongs to one constructor, never to a retained slot or to
+// the allocator. Pointer integers identify the actual safe Vec values only.
+#[cfg(test)]
+pub(crate) type ConstructionTraceHandle = std::rc::Rc<std::cell::RefCell<ConstructionTrace>>;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConstructionEventKind {
+    Reserved,
+    Owned,
+    Released,
+    Published,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConstructionEvent {
+    pub(crate) kind: ConstructionEventKind,
+    pub(crate) reservation: usize,
+    pub(crate) pointer: usize,
+    pub(crate) capacity: usize,
+    pub(crate) bytes: usize,
+}
+
+#[cfg(test)]
+impl ConstructionEvent {
+    pub(crate) fn for_vec<T>(
+        kind: ConstructionEventKind,
+        reservation: usize,
+        values: &Vec<T>,
+    ) -> Self {
+        Self {
+            kind,
+            reservation,
+            pointer: values.as_ptr() as usize,
+            capacity: values.capacity(),
+            bytes: std::mem::size_of::<T>().saturating_mul(values.capacity()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ConstructionTrace {
+    // Two metadata reservations plus at most64 payloads in each direction;
+    // every successful reservation has reserve, ownership and terminal events.
+    events: [Option<ConstructionEvent>; 3 * (2 + 64 + 64)],
+    length: usize,
+    pub(crate) overflow: bool,
+}
+
+#[cfg(test)]
+impl Default for ConstructionTrace {
+    fn default() -> Self {
+        Self {
+            events: [None; 3 * (2 + 64 + 64)],
+            length: 0,
+            overflow: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ConstructionTrace {
+    pub(crate) fn events(&self) -> impl Iterator<Item = ConstructionEvent> + '_ {
+        self.events.iter().flatten().copied()
+    }
+
+    pub(crate) fn record<T>(
+        &mut self,
+        kind: ConstructionEventKind,
+        reservation: usize,
+        values: &Vec<T>,
+    ) {
+        self.record_value(ConstructionEvent::for_vec(kind, reservation, values));
+    }
+
+    pub(crate) fn record_value(&mut self, event: ConstructionEvent) {
+        if let Some(slot) = self.events.get_mut(self.length) {
+            *slot = Some(event);
+            self.length += 1;
+        } else {
+            self.overflow = true;
         }
     }
 }

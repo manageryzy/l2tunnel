@@ -8,6 +8,10 @@ use l2tunnel_swift::{policy, records};
 use l2tunnel_udp_control as gate;
 #[path = "setup_output.rs"]
 mod setup_output;
+#[path = "transaction_cli.rs"]
+mod transaction_cli;
+#[path = "transaction_cli_output.rs"]
+mod transaction_cli_output;
 
 pub(super) const OPTIONS: &[&str] = &[
     "--noise-profile",
@@ -17,8 +21,9 @@ pub(super) const OPTIONS: &[&str] = &[
     "--session-admission-key-file",
     "--session-cookie-key-file",
     "--max-path-mtu",
+    "--swift-transaction-plan",
 ];
-pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Full recovery, cross-profile switching, other carrier/platform qualification remain open.";
+pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open.";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
@@ -31,11 +36,93 @@ pub(crate) struct Selection {
     pub(crate) profile: hs::Profile,
     pub(crate) report: Option<Duration>,
 }
+#[derive(Clone, Copy)]
+struct Common {
+    appearance: l2tunnel_cover::Appearance,
+    role: security::Role,
+    local: SocketAddr,
+    peer: SocketAddr,
+    maximum_mtu: usize,
+    profile: hs::Profile,
+}
+impl From<Selection> for Common {
+    fn from(value: Selection) -> Self {
+        Self {
+            appearance: value.appearance,
+            role: value.role,
+            local: value.local,
+            peer: value.peer,
+            maximum_mtu: value.maximum_mtu,
+            profile: value.profile,
+        }
+    }
+}
+
+pub(super) struct Selected(Choice);
+enum Choice {
+    Legacy(Selection),
+    Transaction(Common, Box<transaction_cli::Plan>),
+}
+enum Built {
+    Legacy(Box<Profile>),
+    Transaction(Box<secure_udp::transaction_profile::Profile>),
+}
+impl Selected {
+    fn common(&self) -> Common {
+        match &self.0 {
+            Choice::Legacy(value) => (*value).into(),
+            Choice::Transaction(common, _) => *common,
+        }
+    }
+    fn transaction(&self) -> bool {
+        matches!(self.0, Choice::Transaction(_, _))
+    }
+    fn report_interval(&self) -> Option<Duration> {
+        match &self.0 {
+            Choice::Legacy(value) => Some(value.report.unwrap_or(Duration::from_secs(1))),
+            Choice::Transaction(_, plan) => plan.report_interval(),
+        }
+    }
+    fn build(
+        &self,
+        connection: ConnectionConfig,
+        peers: establish::Peers,
+        member: l2tunnel_identity::MemberPublicKey,
+    ) -> io::Result<Built> {
+        match &self.0 {
+            Choice::Legacy(value) => value
+                .build(connection, peers, member)
+                .map(Box::new)
+                .map(Built::Legacy),
+            Choice::Transaction(common, plan) => {
+                let (overhead, maximum_body) = common.geometry()?;
+                let raw = common.raw(
+                    plan.initial().path_mtu(),
+                    connection.handshake_timeout,
+                    peers,
+                    member,
+                )?;
+                plan.build(connection, raw, peers, maximum_body, overhead)
+                    .map(Box::new)
+                    .map(Built::Transaction)
+            }
+        }
+    }
+}
+
 pub(super) fn selection(
     command: &str,
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
-) -> io::Result<Option<Selection>> {
+) -> io::Result<Option<Selected>> {
+    selection_for(command, options, config, false)
+}
+fn selection_for(
+    command: &str,
+    options: &BTreeMap<String, String>,
+    config: ConnectionConfig,
+    inspection: bool,
+) -> io::Result<Option<Selected>> {
     let appearance = match options.get("--carrier").map(String::as_str) {
         Some("quic-like") => l2tunnel_cover::Appearance::QuicLike,
         Some("media-like") => l2tunnel_cover::Appearance::MediaLike,
@@ -72,20 +159,37 @@ pub(super) fn selection(
     if options.get("--record-profile").map(String::as_str) != Some("swift")
         || config.duplex != Duplex::Full
         || config.compression != Compression::None
-        || options
-            .keys()
-            .any(|key| !allowed.contains(&key.as_str()) && !OPTIONS.contains(&key.as_str()))
+        || options.keys().any(|key| {
+            !(allowed.contains(&key.as_str())
+                || OPTIONS.contains(&key.as_str())
+                || inspection && key == "--role")
+        })
     {
         return Err(input(
             "secure UDP requires explicit Swift/full/no-compression and only its documented options",
         ));
     }
-    required(options, "--device")?;
-    for key in [
-        "--noise-private-key-file",
-        "--noise-peer-key-file",
-        "--session-admission-key-file",
-    ] {
+    if inspection {
+        if !options.contains_key("--swift-transaction-plan")
+            || [
+                "--device",
+                "--control-socket",
+                "--session-admission-key-file",
+                "--session-cookie-key-file",
+                "--runtime-model",
+            ]
+            .iter()
+            .any(|key| options.contains_key(*key))
+        {
+            return Err(input(
+                "inspection requires a transaction plan and excludes runtime-only options",
+            ));
+        }
+    } else {
+        required(options, "--device")?;
+        required(options, "--session-admission-key-file")?;
+    }
+    for key in ["--noise-private-key-file", "--noise-peer-key-file"] {
         required(options, key)?;
     }
     let role = match command {
@@ -98,7 +202,9 @@ pub(super) fn selection(
         }
         "serve" if !options.contains_key("--identity") => {
             required(options, "--allow-key")?;
-            required(options, "--session-cookie-key-file")?;
+            if !inspection {
+                required(options, "--session-cookie-key-file")?;
+            }
             security::Role::Responder
         }
         _ => {
@@ -130,6 +236,41 @@ pub(super) fn selection(
             "secure UDP requires a fixed distinct nonzero endpoint pair",
         ));
     }
+    let maximum_mtu = number(options, "--max-path-mtu", 9000)?;
+    if let Some(path) = options.get("--swift-transaction-plan") {
+        if [
+            "--path-mtu",
+            "--swift-forward-kbit",
+            "--swift-reverse-kbit",
+            "--swift-channels",
+            "--swift-window",
+            "--swift-repair-permille",
+            "--swift-report-ms",
+        ]
+        .iter()
+        .any(|key| options.contains_key(*key))
+        {
+            return Err(input(
+                "transaction plan conflicts with legacy Swift mutable/report options",
+            ));
+        }
+        let plan = transaction_cli::Plan::read(std::path::Path::new(path))?;
+        let initial = plan.initial().path_mtu();
+        if !(576..=9000).contains(&maximum_mtu) || !(576..=maximum_mtu).contains(&initial) {
+            return Err(input("transaction initial MTU/capacity is out of range"));
+        }
+        return Ok(Some(Selected(Choice::Transaction(
+            Common {
+                appearance,
+                role,
+                local,
+                peer,
+                maximum_mtu,
+                profile,
+            },
+            Box::new(plan),
+        ))));
+    }
     let forward_kbit = required(options, "--swift-forward-kbit")?
         .parse()
         .map_err(|_| input("invalid forward budget"))?;
@@ -144,7 +285,7 @@ pub(super) fn selection(
         window: number(options, "--swift-window", 64)?,
         repair_permille: number(options, "--swift-repair-permille", 0)?,
     };
-    let maximum_mtu = number(options, "--max-path-mtu", 9000)?;
+
     if !(576..=9000).contains(&policy.path_mtu)
         || !(usize::from(policy.path_mtu)..=9000).contains(&maximum_mtu)
         || !(64..=10_000_000).contains(&policy.forward_kbit)
@@ -160,7 +301,7 @@ pub(super) fn selection(
         value @ 100..=60_000 => Some(Duration::from_millis(value)),
         _ => return Err(input("report interval must be0 or100..60000ms")),
     };
-    Ok(Some(Selection {
+    Ok(Some(Selected(Choice::Legacy(Selection {
         appearance,
         role,
         local,
@@ -169,7 +310,7 @@ pub(super) fn selection(
         maximum_mtu,
         profile,
         report,
-    }))
+    }))))
 }
 
 fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
@@ -181,13 +322,28 @@ fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
     result.copy_from_slice(context.finish().as_ref());
     result
 }
-impl Selection {
-    pub(crate) fn build(
+impl Common {
+    fn geometry(self) -> io::Result<(usize, usize)> {
+        let ip = if self.local.is_ipv6() { 48 } else { 28 };
+        let header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
+            13
+        } else {
+            14
+        };
+        let overhead = ip + header + 9 + security::COMMON_PREFIX_BYTES + 16;
+        let maximum_body = self
+            .maximum_mtu
+            .checked_sub(overhead)
+            .ok_or_else(|| input("capacity below secure framing"))?;
+        Ok((overhead, maximum_body))
+    }
+    fn raw(
         self,
-        connection: ConnectionConfig,
+        path_mtu: usize,
+        handshake_timeout: Duration,
         peers: establish::Peers,
         member: l2tunnel_identity::MemberPublicKey,
-    ) -> io::Result<Profile> {
+    ) -> io::Result<secure_udp::Settings> {
         let ip = if self.local.is_ipv6() { 48 } else { 28 };
         let header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
             13
@@ -199,14 +355,6 @@ impl Selection {
         } else {
             14
         };
-        let overhead = ip + header + 9 + security::COMMON_PREFIX_BYTES + 16;
-        let body = usize::from(self.policy.path_mtu)
-            .checked_sub(overhead)
-            .ok_or_else(|| input("path MTU below secure framing"))?;
-        let maximum_body = self
-            .maximum_mtu
-            .checked_sub(overhead)
-            .ok_or_else(|| input("capacity below secure framing"))?;
         let ids = |domain: &[u8]| -> io::Result<[u8; 8]> {
             public_digest(domain, peers)[..8]
                 .try_into()
@@ -229,8 +377,15 @@ impl Selection {
             initiator_ssrc: l2tunnel_cover::Ssrc(ssrc(b"l2tunnel/service/SSRC/initiator/v1\0")?),
             responder_ssrc: l2tunnel_cover::Ssrc(ssrc(b"l2tunnel/service/SSRC/responder/v1\0")?),
             payload_type: 96,
-            max_packet_bytes: self.maximum_mtu - ip - header + handshake_header,
-            max_protected_bytes: self.maximum_mtu - ip - header,
+            max_packet_bytes: self
+                .maximum_mtu
+                .checked_sub(ip + header)
+                .and_then(|value| value.checked_add(handshake_header))
+                .ok_or_else(|| input("cover capacity overflow"))?,
+            max_protected_bytes: self
+                .maximum_mtu
+                .checked_sub(ip + header)
+                .ok_or_else(|| input("capacity below cover framing"))?,
         };
         let path = match self.role {
             security::Role::Initiator => gate::Path {
@@ -248,7 +403,7 @@ impl Selection {
             1,
         )
         .map_err(io::Error::other)?;
-        gate.path_mtu = usize::from(self.policy.path_mtu);
+        gate.path_mtu = path_mtu;
         gate.outer_overhead = cover.bootstrap_overhead(self.local.is_ipv6())?;
         gate.arq.max_source_bytes = gate
             .path_mtu
@@ -257,13 +412,21 @@ impl Selection {
             )
             .ok_or_else(|| input("bootstrap MTU cannot hold ARQ framing"))?
             .min(1200);
-        gate.arq.send_bytes = gate.arq.max_source_bytes * gate.arq.send_records;
-        gate.arq.receive_bytes = gate.arq.max_source_bytes * gate.arq.receive_records;
-        gate.handshake_timeout = connection.handshake_timeout;
-        gate.cookie_ttl = gate.cookie_ttl.min(connection.handshake_timeout);
-        gate.maximum_rto = gate.maximum_rto.min(connection.handshake_timeout);
+        gate.arq.send_bytes = gate
+            .arq
+            .max_source_bytes
+            .checked_mul(gate.arq.send_records)
+            .ok_or_else(|| input("bootstrap send capacity overflow"))?;
+        gate.arq.receive_bytes = gate
+            .arq
+            .max_source_bytes
+            .checked_mul(gate.arq.receive_records)
+            .ok_or_else(|| input("bootstrap receive capacity overflow"))?;
+        gate.handshake_timeout = handshake_timeout;
+        gate.cookie_ttl = gate.cookie_ttl.min(handshake_timeout);
+        gate.maximum_rto = gate.maximum_rto.min(handshake_timeout);
         gate.initial_rto = gate.initial_rto.min(gate.maximum_rto);
-        let selected = secure_udp::Settings {
+        Ok(secure_udp::Settings {
             gate,
             cover,
             profile: self.profile,
@@ -280,7 +443,27 @@ impl Selection {
                 receive_packets_per_interval: 128,
             },
             bootstrap_receive_packets_per_interval: 128,
-        };
+        })
+    }
+}
+impl Selection {
+    pub(crate) fn build(
+        self,
+        connection: ConnectionConfig,
+        peers: establish::Peers,
+        member: l2tunnel_identity::MemberPublicKey,
+    ) -> io::Result<Profile> {
+        let common = Common::from(self);
+        let (overhead, maximum_body) = common.geometry()?;
+        let body = usize::from(self.policy.path_mtu)
+            .checked_sub(overhead)
+            .ok_or_else(|| input("path MTU below secure framing"))?;
+        let selected = common.raw(
+            usize::from(self.policy.path_mtu),
+            connection.handshake_timeout,
+            peers,
+            member,
+        )?;
         let direction = |forward: bool| -> policy::Direction {
             let rate = u64::from(if forward {
                 self.policy.forward_kbit
@@ -394,29 +577,74 @@ impl Selection {
     }
 }
 
+pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
+    let role = required(options, "--role")?;
+    if !matches!(role, "connect" | "serve") {
+        return Err(input("role must be connect or serve"));
+    }
+    let connection = configuration(options)?;
+    let selected = selection_for(role, options, connection, true)?
+        .ok_or_else(|| input("inspection requires explicit secure UDP carrier"))?;
+    let common = selected.common();
+    let noise = credentials::NoiseIdentity::new(
+        credentials::read_secret(std::path::Path::new(required(
+            options,
+            "--noise-private-key-file",
+        )?))?,
+        hs::PeerKey(credentials::read_public(std::path::Path::new(required(
+            options,
+            "--noise-peer-key-file",
+        )?))?),
+        common.profile,
+        options
+            .get("--noise-psk-file")
+            .map(|path| credentials::read_secret(std::path::Path::new(path)))
+            .transpose()?,
+    )?;
+    let peers = noise.peers(common.role);
+    let member = if role == "connect" {
+        credentials::read_member(std::path::Path::new(required(options, "--identity")?))?
+            .public_key()
+    } else {
+        l2tunnel_identity::MemberPublicKey(credentials::read_public(std::path::Path::new(
+            required(options, "--allow-key")?,
+        ))?)
+    };
+    let Built::Transaction(profile) = selected.build(connection, peers, member)? else {
+        return Err(input("inspection requires explicit transaction plan"));
+    };
+    let value = transaction_cli_output::inspection(&profile, common.role)?;
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &value).map_err(io::Error::other)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(super) async fn execute(
     command: &str,
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
-    selected: Selection,
+    selected: Selected,
 ) -> io::Result<()> {
     use crate::service::{self, Completed, Terminal};
     use std::path::Path;
-    let report_interval = selected.report.unwrap_or(Duration::from_secs(1));
+    let report_interval = selected.report_interval();
+    let generic = selected.transaction();
+    let common = selected.common();
     let noise = credentials::NoiseIdentity::new(
         credentials::read_secret(Path::new(required(options, "--noise-private-key-file")?))?,
         hs::PeerKey(credentials::read_public(Path::new(required(
             options,
             "--noise-peer-key-file",
         )?))?),
-        selected.profile,
+        common.profile,
         options
             .get("--noise-psk-file")
             .map(|path| credentials::read_secret(Path::new(path)))
             .transpose()?,
     )?;
-    let peers = noise.peers(selected.role);
+    let peers = noise.peers(common.role);
     let admission = credentials::Secret32::new(credentials::read_secret(Path::new(required(
         options,
         "--session-admission-key-file",
@@ -431,11 +659,17 @@ pub(super) async fn execute(
         "connect" => {
             let member = credentials::read_member(Path::new(required(options, "--identity")?))?;
             let profile = selected.build(config, peers, member.public_key())?;
-            service::Prepared::secure_udp_client(
-                profile,
-                credentials::Client::new(noise, member, admission)?,
-                attachment,
-            )?
+            let credentials = credentials::Client::new(noise, member, admission)?;
+            match profile {
+                Built::Legacy(profile) => {
+                    service::Prepared::secure_udp_client(*profile, credentials, attachment)?
+                }
+                Built::Transaction(profile) => service::Prepared::secure_udp_transaction_client(
+                    *profile,
+                    credentials,
+                    attachment,
+                )?,
+            }
         }
         "serve" => {
             let member = l2tunnel_identity::MemberPublicKey(credentials::read_public(Path::new(
@@ -444,11 +678,18 @@ pub(super) async fn execute(
             let cookie = credentials::Secret32::new(credentials::read_secret(Path::new(
                 required(options, "--session-cookie-key-file")?,
             ))?)?;
-            service::Prepared::secure_udp_server(
-                selected.build(config, peers, member)?,
-                credentials::Server::new(noise, admission, cookie)?,
-                attachment,
-            )?
+            let profile = selected.build(config, peers, member)?;
+            let credentials = credentials::Server::new(noise, admission, cookie)?;
+            match profile {
+                Built::Legacy(profile) => {
+                    service::Prepared::secure_udp_server(*profile, credentials, attachment)?
+                }
+                Built::Transaction(profile) => service::Prepared::secure_udp_transaction_server(
+                    *profile,
+                    credentials,
+                    attachment,
+                )?,
+            }
         }
         _ => return Err(input("unsupported secure UDP command")),
     };
@@ -466,7 +707,8 @@ pub(super) async fn execute(
         let mut cursor = accepted.operation.value().saturating_sub(1);
         let mut live = None;
         let mut last_performance = secure_udp::performance::Cursor::default();
-        let mut report_tick = tokio::time::interval(report_interval);
+        let mut report_tick =
+            tokio::time::interval(report_interval.unwrap_or(Duration::from_secs(1)));
         report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut output = output::Sink::stdout();
         let mut output_tick = tokio::time::interval(Duration::from_millis(5));
@@ -480,10 +722,15 @@ pub(super) async fn execute(
             };
             tokio::select! {
                 terminal = stopped => {
+                    let generation = live;
                     live = None;
                     let terminal = terminal.map_err(submit)?;
-                    emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
-                    output.emit(serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
+                    if generic {
+                        emit_transaction(life.snapshot().runtime.as_ref(), generation, TransactionEvent::Terminal(terminal), &mut output);
+                    } else {
+                        emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
+                        output.emit(serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
+                    }
                     if let Terminal::Failed(failure) = terminal {
                         output.flush_turn();
                         return Err(io::Error::new(failure.kind, "secure UDP runtime failed"));
@@ -494,14 +741,22 @@ pub(super) async fn execute(
                     cursor = operation.value();
                     match result {
                         Completed::Connected { generation } => {
+                            if generic && let Some(previous) = live.take() {
+                                let terminal = life.wait_stopped(previous).await.map_err(submit)?;
+                                emit_transaction(life.snapshot().runtime.as_ref(), Some(previous), TransactionEvent::Terminal(terminal), &mut output);
+                            }
                             live = Some(generation);
                             let snapshot = life.snapshot();
-                            let frame = snapshot.runtime.as_ref().and_then(service::Observation::secure_udp);
-                            match frame.map(service::SecureUdpFrame::status).transpose() {
-                                Ok(Some(status)) => output.emit(serde_json::json!({"event":"secure_udp_ready","status":status})),
-                                _ => output.projection_error(),
+                            if generic {
+                                emit_transaction(snapshot.runtime.as_ref(), Some(generation), TransactionEvent::Ready, &mut output);
+                            } else {
+                                let frame = snapshot.runtime.as_ref().and_then(service::Observation::secure_udp);
+                                match frame.map(service::SecureUdpFrame::status).transpose() {
+                                    Ok(Some(status)) => output.emit(serde_json::json!({"event":"secure_udp_ready","status":status})),
+                                    _ => output.projection_error(),
+                                }
+                                emit_performance(frame, &mut last_performance, &mut output);
                             }
-                            emit_performance(frame, &mut last_performance, &mut output);
                         }
                         Completed::Failed(failure) => {
                             let mut diagnostic = output::Sink::stderr();
@@ -512,12 +767,24 @@ pub(super) async fn execute(
                             return Err(io::Error::new(failure.kind, "secure UDP setup failed"));
                         },
                         Completed::Cancelled => return Err(io::Error::new(io::ErrorKind::Interrupted, "secure UDP setup cancelled")),
-                        Completed::Aborted => live = None,
+                        Completed::Aborted => {
+                            if generic && let Some(generation) = live.take() {
+                                // Completion may win select before wait_stopped. Observe
+                                // the real release before forgetting its generation.
+                                let terminal = life.wait_stopped(generation).await.map_err(submit)?;
+                                emit_transaction(life.snapshot().runtime.as_ref(), Some(generation), TransactionEvent::Terminal(terminal), &mut output);
+                            }
+                            live = None;
+                        }
                         Completed::Applied(_) | Completed::Rejected(_) | Completed::OutcomeUnknown => {}
                     }
                 }
-                _ = report_tick.tick() => {
-                    emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
+                _ = report_tick.tick(), if report_interval.is_some() => {
+                    if generic {
+                        if live.is_some() { emit_transaction(life.snapshot().runtime.as_ref(), live, TransactionEvent::Status, &mut output); }
+                    } else {
+                        emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
+                    }
                 }
                 _ = output_tick.tick(), if output.has_pending() => {},
             }
@@ -537,6 +804,38 @@ pub(super) async fn execute(
         }
     };
     tokio::select! { result = run => result, result = lifecycle => result, result = local => result }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_transaction(
+    observation: Option<&crate::service::Observation>,
+    generation: Option<crate::service::OperationId>,
+    event: TransactionEvent,
+    output: &mut output::Sink,
+) {
+    let value = match (
+        observation.and_then(crate::service::Observation::secure_udp_transaction),
+        generation,
+    ) {
+        (Some(frame), Some(generation)) => match event {
+            TransactionEvent::Ready => transaction_cli_output::ready(frame, generation.value()),
+            TransactionEvent::Status => transaction_cli_output::status(frame, generation.value()),
+            TransactionEvent::Terminal(terminal) => {
+                transaction_cli_output::terminal(frame, generation.value(), terminal)
+            }
+        },
+        _ => Err(input("missing matching generic transaction observation")),
+    };
+    match value {
+        Ok(value) => output.emit(value),
+        Err(_) => output.projection_error(),
+    }
+}
+#[cfg(target_os = "linux")]
+enum TransactionEvent {
+    Ready,
+    Status,
+    Terminal(crate::service::Terminal),
 }
 
 #[cfg(target_os = "linux")]
@@ -991,3 +1290,7 @@ mod output {
 #[cfg(test)]
 #[path = "cli_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transaction_cli_integration_tests.rs"]
+mod transaction_integration_tests;

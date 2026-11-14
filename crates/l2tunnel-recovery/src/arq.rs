@@ -469,6 +469,147 @@ macro_rules! engine_api {
 engine_api!(SelectiveRepeat, Profile::Selective);
 engine_api!(CarrierOnly, Profile::CarrierOnly);
 
+// This temporary owner is never retained by Engine. Failed construction drops
+// its actual buffers; successful construction transfers the same backing once.
+struct Construction {
+    sent: Vec<SendSlot>,
+    received: Vec<ReceiveSlot>,
+    #[cfg(test)]
+    trace: Option<crate::storage::ConstructionTraceHandle>,
+    #[cfg(test)]
+    metadata: [Option<usize>; 2],
+    #[cfg(test)]
+    send_payloads: [Option<usize>; WINDOW_LIMIT],
+    #[cfg(test)]
+    receive_payloads: [Option<usize>; WINDOW_LIMIT],
+}
+
+impl Construction {
+    fn new(_allocation: &crate::storage::Allocation) -> Self {
+        Self {
+            sent: Vec::new(),
+            received: Vec::new(),
+            #[cfg(test)]
+            trace: _allocation.trace(),
+            #[cfg(test)]
+            metadata: [None; 2],
+            #[cfg(test)]
+            send_payloads: [None; WINDOW_LIMIT],
+            #[cfg(test)]
+            receive_payloads: [None; WINDOW_LIMIT],
+        }
+    }
+
+    fn publish(mut self) -> (Sent, Received) {
+        #[cfg(test)]
+        {
+            self.record_inventory(crate::storage::ConstructionEventKind::Published);
+        }
+        (
+            Sent::Reserved(std::mem::take(&mut self.sent)),
+            Received::Reserved(std::mem::take(&mut self.received)),
+        )
+    }
+
+    #[cfg(test)]
+    fn record<T>(
+        &self,
+        kind: crate::storage::ConstructionEventKind,
+        reservation: Option<usize>,
+        values: &Vec<T>,
+    ) {
+        if let (Some(trace), Some(reservation)) = (&self.trace, reservation) {
+            trace.borrow_mut().record(kind, reservation, values);
+        }
+    }
+
+    #[cfg(test)]
+    fn record_inventory(&self, kind: crate::storage::ConstructionEventKind) {
+        self.record(kind, self.metadata[0], &self.sent);
+        self.record(kind, self.metadata[1], &self.received);
+        for (slot, reservation) in self.sent.iter().zip(self.send_payloads) {
+            self.record(kind, reservation, &slot.flight.payload);
+        }
+        for (slot, reservation) in self.received.iter().zip(self.receive_payloads) {
+            self.record(kind, reservation, &slot.payload);
+        }
+    }
+
+    fn release<T>(
+        values: Vec<T>,
+        #[cfg(test)] trace: &Option<crate::storage::ConstructionTraceHandle>,
+        #[cfg(test)] reservation: Option<usize>,
+    ) {
+        #[cfg(test)]
+        let event = reservation.map(|reservation| {
+            crate::storage::ConstructionEvent::for_vec(
+                crate::storage::ConstructionEventKind::Released,
+                reservation,
+                &values,
+            )
+        });
+        drop(values);
+        #[cfg(test)]
+        if let (Some(trace), Some(event)) = (trace, event) {
+            // This event follows the actual Vec drop; saved pointers are never
+            // read as memory or used to claim allocator/page reclamation.
+            trace.borrow_mut().record_value(event);
+        }
+    }
+}
+
+impl Drop for Construction {
+    fn drop(&mut self) {
+        // Successful publication has moved both arrays out. The same release
+        // statements below handle every partial construction in all builds.
+        if self.sent.capacity() == 0 && self.received.capacity() == 0 {
+            return;
+        }
+        let sent = self.sent.iter_mut();
+        #[cfg(test)]
+        let sent = sent.zip(self.send_payloads);
+        for slot in sent {
+            #[cfg(test)]
+            let (slot, reservation) = slot;
+            Self::release(
+                std::mem::take(&mut slot.flight.payload),
+                #[cfg(test)]
+                &self.trace,
+                #[cfg(test)]
+                reservation,
+            );
+        }
+        let received = self.received.iter_mut();
+        #[cfg(test)]
+        let received = received.zip(self.receive_payloads);
+        for slot in received {
+            #[cfg(test)]
+            let (slot, reservation) = slot;
+            Self::release(
+                std::mem::take(&mut slot.payload),
+                #[cfg(test)]
+                &self.trace,
+                #[cfg(test)]
+                reservation,
+            );
+        }
+        Self::release(
+            std::mem::take(&mut self.sent),
+            #[cfg(test)]
+            &self.trace,
+            #[cfg(test)]
+            self.metadata[0],
+        );
+        Self::release(
+            std::mem::take(&mut self.received),
+            #[cfg(test)]
+            &self.trace,
+            #[cfg(test)]
+            self.metadata[1],
+        );
+    }
+}
+
 impl Engine {
     fn new_reserved(
         config: ArqConfig,
@@ -476,11 +617,30 @@ impl Engine {
         allocation: &mut crate::storage::Allocation,
     ) -> Result<Self, crate::storage::Error> {
         let plan = crate::storage::Plan::for_arq(config)?;
-        let mut sent = allocation.vec::<SendSlot>(config.send_records)?;
-        let mut received = allocation.vec::<ReceiveSlot>(config.receive_records)?;
+        let mut construction = Construction::new(allocation);
+        construction.sent = allocation.vec::<SendSlot>(config.send_records)?;
+        #[cfg(test)]
+        {
+            construction.metadata[0] = Some(allocation.usage().allocations);
+            construction.record(
+                crate::storage::ConstructionEventKind::Owned,
+                construction.metadata[0],
+                &construction.sent,
+            );
+        }
+        construction.received = allocation.vec::<ReceiveSlot>(config.receive_records)?;
+        #[cfg(test)]
+        {
+            construction.metadata[1] = Some(allocation.usage().allocations);
+            construction.record(
+                crate::storage::ConstructionEventKind::Owned,
+                construction.metadata[1],
+                &construction.received,
+            );
+        }
         for _ in 0..config.send_records {
             let payload = allocation.vec::<u8>(config.max_source_bytes)?;
-            sent.push(SendSlot {
+            construction.sent.push(SendSlot {
                 source: None,
                 flight: Flight {
                     payload,
@@ -489,12 +649,32 @@ impl Engine {
                     rto: config.initial_rto,
                 },
             });
+            #[cfg(test)]
+            {
+                let index = construction.sent.len() - 1;
+                construction.send_payloads[index] = Some(allocation.usage().allocations);
+                construction.record(
+                    crate::storage::ConstructionEventKind::Owned,
+                    construction.send_payloads[index],
+                    &construction.sent[index].flight.payload,
+                );
+            }
         }
         for _ in 0..config.receive_records {
-            received.push(ReceiveSlot {
+            construction.received.push(ReceiveSlot {
                 source: None,
                 payload: allocation.vec::<u8>(config.max_source_bytes)?,
             });
+            #[cfg(test)]
+            {
+                let index = construction.received.len() - 1;
+                construction.receive_payloads[index] = Some(allocation.usage().allocations);
+                construction.record(
+                    crate::storage::ConstructionEventKind::Owned,
+                    construction.receive_payloads[index],
+                    &construction.received[index].payload,
+                );
+            }
         }
         let usage = allocation.usage();
         if usage.capacity_bytes != plan.capacity_bytes()
@@ -502,12 +682,13 @@ impl Engine {
         {
             return Err(crate::storage::Error::Invariant);
         }
+        let (sent, received) = construction.publish();
         Ok(Self::from_backing(
             config,
             context,
             Profile::Selective,
-            Sent::Reserved(sent),
-            Received::Reserved(received),
+            sent,
+            received,
             Some(usage),
         ))
     }

@@ -170,6 +170,98 @@ pub(crate) struct Owner {
     failed: bool,
 }
 
+/// Unpublished actual owners; errors release every earlier completed stream.
+/// This guard is temporary construction state, not part of the retained owner.
+#[derive(Default)]
+struct StreamConstruction {
+    owners: [Option<(streams::Stream, messages::Owner)>; 3],
+    #[cfg(test)]
+    observer: Option<Box<dyn FnMut(StreamConstructionDrop)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamConstructionDrop {
+    Before(streams::Stream, Option<recovery::storage::Usage>),
+    After(streams::Stream),
+}
+
+impl StreamConstruction {
+    fn collect(
+        mut self,
+        settings: Settings,
+        binding: delivery::Binding,
+        limits: Option<[recovery::storage::Limits; 3]>,
+        mut factory: impl FnMut(
+            streams::Stream,
+            messages::Settings,
+            delivery::Binding,
+            Option<recovery::storage::Limits>,
+        ) -> io::Result<messages::Owner>,
+    ) -> io::Result<[messages::Owner; 3]> {
+        for (index, (stream, settings)) in streams::Stream::ALL
+            .into_iter()
+            .zip(settings.streams)
+            .enumerate()
+        {
+            let binding = streams::delivery_binding(binding, stream).map_err(invalid)?;
+            self.owners[index] = Some((
+                stream,
+                factory(
+                    stream,
+                    settings,
+                    binding,
+                    limits.map(|limits| limits[index]),
+                )?,
+            ));
+        }
+        let [
+            Some((_, transaction)),
+            Some((_, liveness)),
+            Some((_, feedback)),
+        ] = std::mem::take(&mut self.owners)
+        else {
+            return Err(invalid("control stream count"));
+        };
+        Ok([transaction, liveness, feedback])
+    }
+}
+
+impl Drop for StreamConstruction {
+    fn drop(&mut self) {
+        for owner in &mut self.owners {
+            if let Some((_stream, owner)) = owner.take() {
+                #[cfg(test)]
+                if let Some(observer) = &mut self.observer {
+                    observer(StreamConstructionDrop::Before(
+                        _stream,
+                        owner.arq_storage_usage(),
+                    ));
+                }
+                drop(owner);
+                #[cfg(test)]
+                if let Some(observer) = &mut self.observer {
+                    observer(StreamConstructionDrop::After(_stream));
+                }
+            }
+        }
+    }
+}
+
+fn construct_stream_owners(
+    settings: Settings,
+    binding: delivery::Binding,
+    limits: Option<[recovery::storage::Limits; 3]>,
+    factory: impl FnMut(
+        streams::Stream,
+        messages::Settings,
+        delivery::Binding,
+        Option<recovery::storage::Limits>,
+    ) -> io::Result<messages::Owner>,
+) -> io::Result<[messages::Owner; 3]> {
+    StreamConstruction::default().collect(settings, binding, limits, factory)
+}
+
 impl Owner {
     #[allow(clippy::too_many_arguments)] // The frozen boundary names each independent context.
     pub(crate) fn new(
@@ -236,30 +328,23 @@ impl Owner {
                     }
                 }
             }
-            let owners = streams::Stream::ALL
-                .into_iter()
-                .zip(settings.streams)
-                .enumerate()
-                .map(|(index, (stream, settings))| {
-                    let stream_binding =
-                        streams::delivery_binding(binding, stream).map_err(invalid)?;
-                    match arq_limits {
-                        Some(limits) => messages::Owner::new_reserved_arq(
-                            settings,
-                            stream_binding,
-                            now,
-                            expires,
-                            limits[index],
-                        )
+            let owners = construct_stream_owners(
+                settings,
+                binding,
+                arq_limits,
+                |_, settings, stream_binding, limit| match limit {
+                    Some(limit) => messages::Owner::new_reserved_arq(
+                        settings,
+                        stream_binding,
+                        now,
+                        expires,
+                        limit,
+                    )
+                    .map_err(invalid),
+                    None => messages::Owner::new(settings, stream_binding, now, expires)
                         .map_err(invalid),
-                        None => messages::Owner::new(settings, stream_binding, now, expires)
-                            .map_err(invalid),
-                    }
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let owners: [messages::Owner; 3] = owners
-                .try_into()
-                .map_err(|_| invalid("control stream count"))?;
+                },
+            )?;
             let maximum = settings
                 .streams
                 .iter()

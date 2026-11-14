@@ -2,6 +2,7 @@
 
 use super::*;
 use l2tunnel_core::{ConfigDigest, Epoch};
+use std::{cell::RefCell, rc::Rc};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn base() -> delivery::Settings {
@@ -73,6 +74,115 @@ fn make(role: mg::Role) -> Result<Owner> {
         Duration::from_secs(5),
         limits()?,
     )?)
+}
+
+fn construction_trace(events: Rc<RefCell<Vec<StreamConstructionDrop>>>) -> StreamConstruction {
+    StreamConstruction {
+        owners: std::array::from_fn(|_| None),
+        observer: Some(Box::new(move |event| events.borrow_mut().push(event))),
+    }
+}
+
+#[test]
+fn later_factory_errors_drop_actual_earlier_reserved_streams_before_returning() -> Result {
+    for failed_index in [1, 2] {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut called = Vec::new();
+        let mut completed = Vec::new();
+        let result = construction_trace(events.clone()).collect(
+            selected(),
+            binding(mg::Role::Client),
+            Some(limits()?),
+            |stream, settings, actual_binding, limit| {
+                called.push(stream);
+                assert_eq!(
+                    actual_binding,
+                    streams::delivery_binding(binding(mg::Role::Client), stream)
+                        .map_err(invalid)?
+                );
+                if index(stream) == failed_index {
+                    return Err(io::Error::other("injected later stream constructor error"));
+                }
+                let owner = messages::Owner::new_reserved_arq(
+                    settings,
+                    actual_binding,
+                    Duration::ZERO,
+                    Duration::from_secs(5),
+                    limit.ok_or_else(|| invalid("missing selected stream limit"))?,
+                )
+                .map_err(invalid)?;
+                completed.push((stream, owner.arq_storage_usage()));
+                Ok(owner)
+            },
+        );
+        let error = result.err().ok_or("failed constructor published owners")?;
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "injected later stream constructor error");
+        assert_eq!(called, streams::Stream::ALL[..=failed_index]);
+        assert_eq!(completed.len(), failed_index);
+        let expected: Vec<_> = completed
+            .into_iter()
+            .flat_map(|(stream, usage)| {
+                assert!(usage.is_some());
+                [
+                    StreamConstructionDrop::Before(stream, usage),
+                    StreamConstructionDrop::After(stream),
+                ]
+            })
+            .collect();
+        assert_eq!(*events.borrow(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn successful_collector_transfers_all_actual_owners_without_constructor_release() -> Result {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut called = Vec::new();
+    let owners = construction_trace(events.clone()).collect(
+        selected(),
+        binding(mg::Role::Client),
+        Some(limits()?),
+        |stream, settings, binding, limit| {
+            called.push(stream);
+            messages::Owner::new_reserved_arq(
+                settings,
+                binding,
+                Duration::ZERO,
+                Duration::from_secs(5),
+                limit.ok_or_else(|| invalid("missing selected stream limit"))?,
+            )
+            .map_err(invalid)
+        },
+    )?;
+    assert_eq!(called, streams::Stream::ALL);
+    let actual = owners
+        .iter()
+        .map(|owner| {
+            owner
+                .arq_storage_usage()
+                .ok_or("missing transferred actual pool")
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected: usize = selected()
+        .streams
+        .into_iter()
+        .map(|settings| {
+            recovery::storage::Plan::for_arq(settings.delivery.recovery)
+                .map(|plan| plan.capacity_bytes())
+        })
+        .sum::<std::result::Result<_, _>>()?;
+    assert_eq!(
+        actual
+            .iter()
+            .map(|usage| usage.capacity_bytes)
+            .sum::<usize>(),
+        expected
+    );
+    assert!(events.borrow().is_empty());
+    drop(owners);
+    assert!(events.borrow().is_empty());
+    Ok(())
 }
 
 #[test]

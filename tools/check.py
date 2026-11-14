@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +47,7 @@ def main() -> None:
     run(sys.executable, 'tools/generate_packed_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run('cargo', 'fmt', '--all', '--check')
     run('cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings')
-    run('cargo', 'test', '--workspace', '--all-features', '--locked')
+    run('cargo', 'test', '--workspace', '--all-features', '--locked', '--no-fail-fast')
     run('cargo', 'test', '-p', 'l2tunnel-codec', '--no-default-features', '--locked')
     run('cargo', 'doc', '--workspace', '--no-deps', '--locked', env={**os.environ, 'RUSTDOCFLAGS': '-D warnings'})
     run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnelctl', '--', 'plan')
@@ -55,7 +57,16 @@ def main() -> None:
     if sys.platform == 'linux':
         # Real two-process loopback run of the CLI base UDP path; unprivileged.
         run('cargo', 'build', '--quiet', '--locked', '-p', 'l2tunneld')
-        run(sys.executable, 'tools/udp_cli_loopback.py', 'target/debug/l2tunneld')
+        daemon = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve() / 'debug' / 'l2tunneld'
+        run(sys.executable, 'tools/udp_cli_loopback.py', str(daemon))
+        # Real external CLI against authenticated shared service/Unix devices.
+        # This does not attach production TAP/TUN or qualify native performance.
+        directory = Path(tempfile.mkdtemp(prefix='l2tunnel-gcl-'))
+        print(f'External CLI probe directory (retained on failure): {directory}', flush=True)
+        run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core',
+            '--example', 'generic_cli_process_probe', '--', '--binary', str(daemon),
+            '--work-dir', str(directory / 'probe'))
+        shutil.rmtree(directory)
     if sys.platform == 'linux':
         run(sys.executable, '-m', 'unittest', 'tools.test_secure_udp_native', 'tools.test_secure_udp_capture_observations', '-v')
         run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_check_simulator', 'tools.test_selftest', '-v')

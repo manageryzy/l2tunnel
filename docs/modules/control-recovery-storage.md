@@ -3,8 +3,11 @@
 Status: **fallible reserved ARQ backing and actual management consumers are
 implemented and component/finite Driver integration-tested**. The explicit
 generic constructor selects all three reserved stream owners; existing callers
-retain the map-backed default. Complete allocation-failure/differential/pressure
-qualification remains open. The required source-stable aggregate passes. This is
+retain the map-backed default. Finite backing-drop, full receive-pool reuse and
+differential qualification now passes, together with reserved-control liveness
+under Transaction pressure. Literal later-stream dependency reservation failure
+and full whole-message resource qualification remain open. The required
+source-stable aggregate passes. This is
 a resource prerequisite beneath GSU-05/SRS-07, not completion of those items,
 full SW-11, native qualification, platforms or the80 Mbit/s gate.
 
@@ -199,6 +202,55 @@ maximum retries, retry duration, wire encoding, diagnostics or validation rules.
 A separately discovered arithmetic defect requires an explicit narrow contract
 and discriminating regression, not an unreported change in this storage work.
 
+## Construction and differential evidence refinement
+
+This engineering refinement was frozen before implementation and retains every
+CRS acceptance definition below. Its finite executed evidence is recorded in the
+current checkpoint; it is not an owner decision or a reduction of any parent.
+
+The recovery constructor will use one temporary guard owning the actual send and
+receive metadata Vecs from their first successful reservation. Each payload Vec
+will transfer immediately into a slot already owned by that guard. Successful
+construction moves those same vectors into the actual Engine without copying;
+failure drops the unpublished inventory. No retained slot fields, extra payload
+pool, packet-path observer, allocator replacement or global/thread-local fail hook
+is added. The existing Plan, Limits, Usage, public constructors, wire format and
+protocol/error ordering remain unchanged.
+
+A test-only per-construction trace will associate each successful nonzero
+reservation with its real pointer, capacity and layout, then record guard
+ownership. On constructor failure the guard will use the same actual take/drop
+statements in production and tests for every payload and metadata Vec; only
+metadata capture and the event after each completed drop are test-only. Saved
+pointer values are identifiers only and are never dereferenced after
+drop. Fixed bounded test bookkeeping remains outside retained slot layouts. On
+success the trace records transfer to the published Engine instead of a failure
+release. Failpoints cover every reservation, including the second metadata Vec
+and the last receive payload. These observations prove the safe Vec-drop path,
+not physical-page reclamation or allocator/RSS behavior.
+
+Additional recovery tests will retain all receive slots simultaneously for more
+than64 complete windows in both directions, including an empty source and
+reordered arrival. Actual ACK processing will confirm the sender while receiver
+payloads remain charged until application delivery; every metadata/payload
+pointer and capacity must survive reuse. A separate receive-byte pressure case
+will leave free slots and sequence-window room, reject a saved packet atomically,
+then admit it at an earlier injected time after one source drains. This
+distinguishes byte pressure and rejected-input clock behavior from count/window
+pressure. New legacy/reserved differential traces will cover malformed packets,
+context/profile mismatches and mixed valid/invalid ACKs without replacing the
+existing loss, retry, high-ID, output-pressure and CarrierOnly evidence.
+
+The runtime stream collector has a separate constructor-boundary error seam.
+Its tests may observe actual earlier reserved Owners dropping after a later
+factory returns an error, plus reserved liveness under held/saturated Transaction
+custody and the shared quota. That seam is not an allocator refusal inside a
+dependency crate. Keep its evidence distinct from recovery's direct reservation
+failpoints and from budget preflight. The complete CRS-06 deliverable remains
+subject to root's evidence review; this refinement does not silently redefine it
+or claim full control-owner reservation, GSU-05/SRS-07, full SW-11 or native
+qualification.
+
 ## Slot operations preserve ordered-map semantics
 
 Bounded linear scans are sufficient for at most64 slots and require no sorting
@@ -318,20 +370,30 @@ records25 recovery,126 management,42 control and11 selected Generic cases,
 including the existing legacy paths, with strict Clippy. These command totals
 are component scopes, not a full resource-qualification count.
 
-CRS-02 still lacks explicit observation of partial backing release at each
-failure. CRS-03's130-cycle test fills all sender slots but drains receive slots
-immediately; it does not prove repeated full receive-pool recycling or distinct
-receive-byte exhaustion. CRS-04 still needs malformed/profile/mixed-valid-invalid
-ACK differential cases. CRS-06 lacks observed later-stream allocation-failure
-cleanup and a dedicated reserved liveness-under-Transaction-pressure case.
-Their full task definitions below remain open. Actual all-stream charges are
-included once before readiness, but external allocation still precedes final
-combined Bank admission. Complete construction-peak enforcement remains open.
+The [combined functionality batch](../../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json)
+now passes every direct constructor reservation refusal with real post-drop
+inventory,130 simultaneous full receive windows in both directions, distinct
+receive-byte pressure and malformed/context/profile/mixed-ACK differential traces.
+Production and test construction use the same actual take/drop statements; only
+trace observation is test-only. These are finite safe Vec-drop observations,
+not physical-page reclamation or natural operating-system allocation exhaustion.
+
+The actual fixed-array stream collector also releases genuine earlier reserved
+Owners when a later factory returns an error. Reserved held/saturated Transaction
+fixtures complete16 confirmed Ping/Pong pairs under one packet/byte allowance,
+preserve all six real ARQ Usage values and retain the separate receiver-message,
+sender-frozen and Peer-operation caps. They are component tests, not new carrier
+or native measurements. CRS-06 remains open for literal later-stream dependency
+reservation failure; constructor-boundary injection is not that evidence. Actual
+all-stream charges remain included once before readiness, but external allocation
+still precedes final combined Bank admission. Complete construction-peak
+enforcement and full message/fragment/bridge/Peer/catalog/bootstrap/report
+resources remain open.
 
 - [x] [CRS-01] Freeze the additive API, exact retained-layout ledger, failure/error ordering, actual consumer path and pre-edit source binding without claiming an owner scope decision. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
-- [ ] [CRS-02] Implement checked allocation-free planning and actual fallible exact backing, with exact/one-short budgets, invalid configurations/layouts, every constructor allocation failpoint and complete partial-drop evidence.
-- [ ] [CRS-03] Use the existing Engine algorithm over reserved send/receive slots. Prove immutable pointer/capacity inventory through more than64 full-window reuse cycles, including empty sources, byte-bound versus count-bound pressure and undelivered receive retention.
-- [ ] [CRS-04] Prove byte/error/timer/statistics/retention equivalence of legacy and reserved SelectiveRepeat under loss, reordered/tied retries, selective ACK holes, duplicate/conflicting sources, withheld application output, malformed/context/profile/ACK failures, high/nonwrapping IDs, output pressure, clock/overflow/retry exhaustion and zero retries. Preserve existing CarrierOnly tests and handoff behavior.
+- [x] [CRS-02] Implement checked allocation-free planning and actual fallible exact backing, with exact/one-short budgets, invalid configurations/layouts, every constructor allocation failpoint and complete partial-drop evidence. Evidence: [source-stable combined checks](../../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json); full resource/runtime/native parents remain open.
+- [x] [CRS-03] Use the existing Engine algorithm over reserved send/receive slots. Prove immutable pointer/capacity inventory through more than64 full-window reuse cycles, including empty sources, byte-bound versus count-bound pressure and undelivered receive retention. Evidence: [source-stable combined checks](../../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json); full resource/runtime/native parents remain open.
+- [x] [CRS-04] Prove byte/error/timer/statistics/retention equivalence of legacy and reserved SelectiveRepeat under loss, reordered/tied retries, selective ACK holes, duplicate/conflicting sources, withheld application output, malformed/context/profile/ACK failures, high/nonwrapping IDs, output pressure, clock/overflow/retry exhaustion and zero retries. Preserve existing CarrierOnly tests and handoff behavior. Evidence: [source-stable combined checks](../../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json); full resource/runtime/native parents remain open.
 - [x] [CRS-05] Implement actual reserved delivery Service and whole-message ARQ consumers plus shared allocation-free validation. Exercise real fragments,45-byte acceptance receipts, real Accepted/Confirmed proofs and original caps through these owners. Preserve their non-ARQ storage limitations explicitly. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [ ] [CRS-06] Select all three reserved ARQ owners in the actual generic runtime constructor, charge their actual aggregate once before readiness, reject insufficient total without catalog pruning, and test later-stream failure cleanup, shared quotas, independent liveness and legacy/default compatibility.
 - [x] [CRS-07] Run focused recovery/management/runtime regressions, required formatting, strict Clippy/rustdoc and frozen-source `python3 tools/check.py`; preserve failed attempts and commands actually executed before a coherent checkpoint. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json); broader parent gates remain open.

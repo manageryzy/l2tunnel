@@ -53,6 +53,11 @@ fn options(args: &[String], allowed: &[&str]) -> io::Result<BTreeMap<String, Str
         if pair.len() != 2 || !allowed.contains(&pair[0].as_str()) || pair[1].starts_with("--") {
             return Err(input("unknown option or missing option value; use --help"));
         }
+        if pair[0] == "--configuration"
+            && pair[1].len() > crate::secure_udp::transaction_status::CANONICAL_CHARACTERS
+        {
+            return Err(input("complete configuration exceeds608 characters"));
+        }
         if parsed.insert(pair[0].clone(), pair[1].clone()).is_some() {
             return Err(input("duplicate option"));
         }
@@ -1151,6 +1156,22 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
         "status" => Action::Status {},
         "disconnect" => Action::Disconnect {},
         "reconnect" => Action::Reconnect {},
+        "switch-swift-configuration" => {
+            if !options.contains_key("--api-version")
+                || number(options, "--api-version", VERSION)? != local::TRANSACTION_VERSION
+            {
+                return Err(input(
+                    "complete Swift configuration requires explicit --api-version 3",
+                ));
+            }
+            Action::SwitchSwiftConfiguration {
+                configuration:
+                    crate::secure_udp::transaction_status::CanonicalConfiguration::parse(required(
+                        options,
+                        "--configuration",
+                    )?)?,
+            }
+        }
         "set-swift" => {
             let value = |key: &str| {
                 options
@@ -1197,7 +1218,7 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
     };
     let version = number(options, "--api-version", VERSION)?;
     if !local::supported_version(version) {
-        return Err(input("api-version must be explicitly 1 or 2"));
+        return Err(input("api-version must be explicitly 1, 2 or 3"));
     }
     let response = local::request(
         required(options, "--control-socket")?,
@@ -1266,6 +1287,26 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             vec!["--control-socket"]
         }
         "set-compression" => vec!["--control-socket", "--compression"],
+        "switch-swift-configuration" => vec!["--control-socket", "--configuration"],
+        "inspect-swift-transaction-plan" => vec![
+            "--role",
+            "--carrier",
+            "--record-profile",
+            "--duplex",
+            "--compression",
+            "--layer",
+            "--max-packet",
+            "--udp-bind",
+            "--udp-peer",
+            "--max-path-mtu",
+            "--swift-transaction-plan",
+            "--noise-profile",
+            "--noise-private-key-file",
+            "--noise-peer-key-file",
+            "--noise-psk-file",
+            "--identity",
+            "--allow-key",
+        ],
         "set-swift" => vec![
             "--control-socket",
             "--swift-forward-kbit",
@@ -1337,6 +1378,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             | "disconnect"
             | "reconnect"
             | "set-swift"
+            | "switch-swift-configuration"
             | "set-compression"
             | "set-active-policy"
             | "drain-proxy"
@@ -1351,6 +1393,15 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
         if command == "openvpn-keygen" {
             return standalone::generate(&options);
+        }
+        if command == "inspect-swift-transaction-plan" {
+            #[cfg(unix)]
+            return secure_udp_frontend::inspect(&options);
+            #[cfg(not(unix))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "generic transaction plan construction is implemented on Unix only",
+            ));
         }
         if local_api {
             // One private IPC exchange needs I/O and timers, not a worker pool.
@@ -1375,6 +1426,10 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     }
 }
+#[cfg(all(test, unix))]
+#[path = "generic_cli_tests.rs"]
+mod generic_transaction_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -86,7 +86,7 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
 | `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; new same-socket secure-UDP Swift/control driver has finite Unix socket/device tests |
 | `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; QUIC-header/media-like Swift has version2 status/control, and explicit generic Prepared selection adds complete-C APIv3 with paired-service fixtures; generic CLI and complete failure/resource matrices, native qualification, other profile lifecycles, default state-retaining recovery and GUI remain open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; QUIC-header/media-like Swift has version2 status/control, and explicit generic Prepared selection adds complete-C APIv3 with paired-service fixtures; explicit complete-plan CLI/inspection/APIv3 commands have finite external-process evidence; production CLI attachment and complete failure/resource matrices, native qualification, other profile lifecycles, default state-retaining recovery and GUI remain open |
 | `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
 | `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Status/help CLI; runtime returns nonzero |
 | `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |
@@ -157,11 +157,17 @@ liveness and fresh-session reconnect with periodic reporting disabled. Actual
 observations precede successful completion; requested/current/physical values
 and incomplete resources remain distinct. All three generic control streams
 now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
-CLI selection, the complete generic IPC/negative-service/fault matrix, full
+The additive [complete-plan CLI](modules/generic-transaction-cli.md) now exposes
+explicit generic selection, complete-C APIv3 commands and bounded full-catalog
+inspection. Its [source-stable batch](../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json)
+passes1960 Rust cases including doctests,376 tooling cases and1658 simulator
+cases. The external probe executes34 real CLI processes per cover against
+actual authenticated shared-service owners and UnixDatagram PacketDevices,
+including2 switches and fresh reconnect. It does not qualify successful
+production CLI TAP/TUN startup. Existing defaults and fixed v1/v2 bytes remain
+preserved. The complete generic IPC/negative-service/fault matrix, full
 reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
-acceptance remain open. Existing defaults and strict v1/v2 schemas are preserved;
-exact generic IPC compatibility cases remain tracked separately. No native or
-performance run was added during this functionality wave.
+acceptance remain open. No new native or performance run is inferred.
 
 Additional unfinished source and integration boundaries:
 

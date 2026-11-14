@@ -3,9 +3,11 @@
 Status: **explicit generic Prepared/service selection and additive APIv3 are
 implemented and finite local Unix integration-tested**. The existing actor runs
 the [generic selected Driver](generic-secure-udp.md) over its original authenticated
-socket. CLI selection, the complete generic IPC/failure matrix and broader
-qualification remain open; version2 and the existing CLI still select
-SwiftPolicyV1. The required source-stable aggregate passes; scoped evidence is recorded below.
+socket. The additive complete-plan CLI now exposes this same owner, with finite
+external-process command/inspection evidence. Successful production CLI TAP/TUN
+startup, the complete generic IPC/failure matrix and broader qualification remain
+open. Version2 and CLI startup without the explicit plan retain SwiftPolicyV1.
+The required source-stable aggregate passes; scoped evidence is recorded below.
 
 This is an engineering integration contract, not an owner decision or a change
 to [architecture](../architecture.md), [client requirements](../client-design.md)
@@ -361,12 +363,17 @@ records5 Prepared,8 status,7 atomic,16 secure-service and12 local API cases,
 the selected runtime/component regressions and strict Clippy. Earlier failed
 attempts are retained; this receipt does not imply native/GUI/platform acceptance.
 
-GCS-06 remains open: generic v3 lifecycle and v1/v2 zero-effect refusal have
-in-process evidence, but not the complete new-profile real IPC matrix or a fixed
-v2 byte golden. GCS-07 remains open: the complete generic credential/setup/device/
-cancellation/failure matrix has not been exercised through the actual new owner.
-Legacy service negatives do not replace these cases. GCS-09 has no CLI
-implementation yet. Full requirements above are unchanged.
+The [complete-plan CLI batch](generic-transaction-cli.md) adds fixed literal
+v1/v2 request and full v2 secure-UDP reply goldens, real v3 malformed/bounded IPC,
+idle-service zero-effect version refusals and finite reply-loss/mismatch/no-retry
+cases. Its external probe runs34 CLI processes per cover with actual generic
+service owners,2 asymmetric switches and fresh authenticated reconnect.
+GCS-06 remains open for its complete authenticated-profile/max-reply/timeout/UID
+matrix. GCS-07 retains the complete generic credential/setup/device/cancellation/
+failure matrix; legacy service negatives do not replace these cases. GCS-09 is
+implemented at the frontend and externally command-tested, but successful
+production CLI connect/serve TAP/TUN startup remains unqualified. Full requirements
+above are unchanged.
 
 The current runtime and service have finite local Unix socket/device evidence.
 The shipped CLI native attachment is Linux TunTap. Windows remains a staging
