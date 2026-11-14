@@ -171,12 +171,14 @@ async fn owed_but_not_due_feedback_is_not_counted_as_credit_blocked() -> Result 
 #[tokio::test]
 async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Result {
     for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-        let mut fixture = NativeEventFixture::new(kind, config(kind)).await?;
+        let mut selected = config(kind);
+        selected.native.pending_packets = 1;
+        let mut fixture = NativeEventFixture::new(kind, selected).await?;
         let initial = fixture.driver.snapshot(1, true);
         assert_eq!(initial.performance.native_pending_packets_high, 1);
         assert_eq!(
             initial.performance.native_pending_bytes_high,
-            fixture.driver.native_bytes as u64
+            fixture.driver.native.bytes() as u64
         );
         fixture.device.get_mut().inner.blocked = true;
         let mut ready = fixture.device.writable_mut().await?;
@@ -186,7 +188,14 @@ async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Resul
         assert_eq!(blocked.performance.native_write_would_block, 1);
         assert_eq!(blocked.counters.native_written, 0);
         assert_eq!(blocked.counters.native_pending_packets, 1);
-        fixture.driver.config.native.pending_packets = 1;
+        assert_eq!(
+            blocked.counters.native_storage_capacity_bytes,
+            initial.counters.native_storage_capacity_bytes
+        );
+        assert!(
+            blocked.counters.native_storage_capacity_bytes
+                > selected.native.pending_packets * selected.send.records.max_native
+        );
         fixture.driver.collect_native(2)?;
         assert_eq!(
             fixture
@@ -194,7 +203,7 @@ async fn actual_native_wouldblock_and_queue_high_water_are_observable() -> Resul
                 .snapshot(2, true)
                 .performance
                 .native_output_full_polls,
-            1
+            blocked.performance.native_output_full_polls + 1
         );
     }
     Ok(())

@@ -995,7 +995,7 @@ async fn replay_and_tamper_never_gain_control_authority_or_liveness() -> Result 
     b.collect_native(3)?;
     assert_eq!(b.native.len(), 1);
     assert_eq!(
-        b.native.front().map(|packet| packet.bytes.as_slice()),
+        b.native.front().map(|packet| packet.bytes()),
         Some(ethernet(7).as_slice())
     );
     Ok(())
@@ -1265,9 +1265,9 @@ async fn native_capacity_withholds_before_swift_accept_and_preserves_control_own
     b.receive(&second, 2, instant, &resolve(config))?;
     assert_eq!(b.counters.native_backpressure_drops, 1);
     assert_eq!(b.native.len(), 1);
-    assert_eq!(b.native_bytes, 256);
+    assert_eq!(b.native.bytes(), 256);
     assert_eq!(
-        b.native.front().map(|packet| packet.bytes.as_slice()),
+        b.native.front().map(|packet| packet.bytes()),
         Some(ethernet(1).as_slice())
     );
     assert_eq!(b.records.control_scope().epoch, security::Epoch(1));
@@ -1522,7 +1522,7 @@ async fn native_writable_event_observes_the_original_stall_boundary_before_io() 
                 assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
                 assert_eq!(fixture.driver.counters.native_written, 1);
                 assert!(fixture.driver.native.is_empty());
-                assert_eq!(fixture.driver.native_bytes, 0);
+                assert_eq!(fixture.driver.native.bytes(), 0);
                 let length = fixture.peer.recv(&mut packet)?;
                 assert_eq!(&packet[..length], ethernet(1));
                 assert!(fixture.driver.terminal.is_none());
@@ -1535,10 +1535,10 @@ async fn native_writable_event_observes_the_original_stall_boundary_before_io() 
                 assert_eq!(fixture.driver.counters.native_written, 0);
                 assert_eq!(fixture.driver.native.len(), 1);
                 assert_eq!(
-                    fixture.driver.native.front().map(|packet| packet.since),
+                    fixture.driver.native.front().map(|packet| packet.since()),
                     Some(1)
                 );
-                assert_eq!(fixture.driver.native_bytes, ethernet(1).len());
+                assert_eq!(fixture.driver.native.bytes(), ethernet(1).len());
                 assert_eq!(fixture.driver.terminal, Some(StopReason::NativeStall));
                 assert_eq!(
                     fixture
@@ -1580,7 +1580,7 @@ async fn native_write_crossing_expiry_is_counted_once_without_retained_duplicate
         assert_eq!(fixture.driver.terminal, Some(StopReason::NativeStall));
         assert_eq!(fixture.driver.counters.native_written, 1);
         assert!(fixture.driver.native.is_empty());
-        assert_eq!(fixture.driver.native_bytes, 0);
+        assert_eq!(fixture.driver.native.bytes(), 0);
         assert!(
             !fixture
                 .driver
@@ -1649,7 +1649,7 @@ async fn native_success_is_accounted_when_completion_clock_or_check_fails() -> R
             1
         );
         assert!(fixture.driver.native.is_empty());
-        assert_eq!(fixture.driver.native_bytes, 0);
+        assert_eq!(fixture.driver.native.bytes(), 0);
         let mut packet = [0; 512];
         let length = fixture.peer.recv(&mut packet)?;
         assert_eq!(&packet[..length], ethernet(1));
@@ -1826,7 +1826,7 @@ async fn event_expiry_preserves_lease_challenge_native_and_policy_priority() -> 
         assert_eq!(fixture.driver.terminal, Some(reason));
         assert_eq!(fixture.driver.native.len(), 1);
         assert_eq!(
-            fixture.driver.native.front().map(|packet| packet.since),
+            fixture.driver.native.front().map(|packet| packet.since()),
             Some(1)
         );
         assert_eq!(fixture.driver.counters.native_written, 0);

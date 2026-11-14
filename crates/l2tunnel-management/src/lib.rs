@@ -369,6 +369,13 @@ impl ReplayWindow {
     }
 }
 
+struct AdmissionCandidate<'a> {
+    frame: Frame<'a>,
+    admission: Admission,
+    replay: ReplayWindow,
+    retained_bytes: usize,
+}
+
 struct StoredRequest {
     header: Header,
     body: Vec<u8>,
@@ -448,6 +455,32 @@ impl AdmissionGate {
         ingress: Ingress,
         input: &'a [u8],
     ) -> Result<AdmittedFrame<'a>, Error> {
+        let candidate = self.candidate(ingress, input)?;
+        let frame = candidate.frame;
+        if candidate.admission == Admission::NewRequest {
+            let mut body = Vec::new();
+            body.try_reserve_exact(frame.body.len())
+                .map_err(|_| Error::Allocation)?;
+            body.extend_from_slice(frame.body);
+            self.requests.push(StoredRequest {
+                header: frame.header,
+                body,
+            });
+            self.retained_bytes = candidate.retained_bytes;
+        }
+        self.replay = candidate.replay;
+        Ok(AdmittedFrame {
+            admission: candidate.admission,
+            frame,
+        })
+    }
+
+    // Inspect the actual admission path without allocating custody or committing replay.
+    fn candidate<'a>(
+        &self,
+        ingress: Ingress,
+        input: &'a [u8],
+    ) -> Result<AdmissionCandidate<'a>, Error> {
         let Ingress::AuthenticatedManagement {
             session,
             lane,
@@ -480,10 +513,11 @@ impl AdmissionGate {
             if !prior.header.same_request(h) || prior.body != frame.body {
                 return Err(Error::RequestConflict);
             }
-            self.replay = replay;
-            return Ok(AdmittedFrame {
+            return Ok(AdmissionCandidate {
                 admission: Admission::RepeatedRequest,
                 frame,
+                replay,
+                retained_bytes: self.retained_bytes,
             });
         }
         let retained_bytes = self
@@ -495,16 +529,11 @@ impl AdmissionGate {
         {
             return Err(Error::Capacity);
         }
-        let mut body = Vec::new();
-        body.try_reserve_exact(frame.body.len())
-            .map_err(|_| Error::Allocation)?;
-        body.extend_from_slice(frame.body);
-        self.requests.push(StoredRequest { header: h, body });
-        self.retained_bytes = retained_bytes;
-        self.replay = replay;
-        Ok(AdmittedFrame {
+        Ok(AdmissionCandidate {
             admission: Admission::NewRequest,
             frame,
+            replay,
+            retained_bytes,
         })
     }
 }

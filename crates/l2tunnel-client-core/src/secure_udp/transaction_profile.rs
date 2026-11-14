@@ -16,30 +16,8 @@ use ring::digest;
 use std::io;
 use std::time::Duration;
 
-/// Explicit immutable transaction and combined retention contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Parameters {
-    /// Generic peer retry, phase and uncertainty timing, in injected milliseconds.
-    pub protocol: transaction::Settings,
-    /// Maximum original operation duration, without renewal by retries or phases.
-    pub max_operation_ms: u64,
-    /// Combined current/prepared/draining and associated native custody ceiling.
-    /// The runtime must admit actual reservations against this authenticated bound.
-    pub retained_bytes: usize,
-}
-impl Parameters {
-    fn validate(self, runtime: transport::Config) -> io::Result<()> {
-        self.protocol.validate().map_err(io::Error::other)?;
-        if self.max_operation_ms == 0
-            || u128::from(self.max_operation_ms) > runtime.lifetime.lease.as_millis()
-            || self.retained_bytes == 0
-        {
-            return Err(invalid("transaction lifetime or retained-storage contract"));
-        }
-        u64::try_from(self.retained_bytes).map_err(io::Error::other)?;
-        Ok(())
-    }
-}
+/// Shared immutable runtime contract; field encoding and client call syntax are unchanged.
+pub use transport::TransactionSettings as Parameters;
 
 /// Immutable complete catalog and authenticated setup/data digest construction.
 #[derive(Clone, Debug)]

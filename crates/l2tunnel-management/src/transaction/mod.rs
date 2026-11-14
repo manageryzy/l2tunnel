@@ -6,11 +6,13 @@
 
 mod config;
 mod lease;
+mod preparation;
 pub use config::{
     Configuration, MODE_BYTES, configuration_digest, decode_mode, encode_mode, mode_digest,
 };
 use config::{decode_configuration, encode_configuration};
 pub use lease::{CachedRetryAuthority, LeaseSettings, Operation, OutboundContext};
+pub use preparation::Preparation;
 
 use std::fmt;
 
@@ -479,14 +481,14 @@ impl<C: Configuration> Peer<C> {
         self.propose_inner(config)
     }
 
-    fn propose_inner(&mut self, config: C) -> Result<Effects<C>, Error> {
+    fn proposal_ticket(&self, config: &C) -> Result<Ticket, Error> {
         if self.identity.role != Role::Client {
             return Err(Error::NotCoordinator);
         }
         if self.phase != Phase::Idle || self.operation().is_some() {
             return Err(Error::Busy);
         }
-        let digest = self.validate_mode(&config)?;
+        let digest = self.validate_mode(config)?;
         let ticket = Ticket {
             attempt: self.last_attempt.checked_add(1).ok_or(Error::Exhausted)?,
             epoch: Epoch(
@@ -497,6 +499,11 @@ impl<C: Configuration> Peer<C> {
             ),
             digest,
         };
+        Ok(ticket)
+    }
+
+    fn propose_inner(&mut self, config: C) -> Result<Effects<C>, Error> {
+        let ticket = self.proposal_ticket(&config)?;
         self.guard.prepare(ticket).map_err(Error::Guard)?;
         self.begin_operation(ticket)?;
         self.last_attempt = ticket.attempt;
@@ -747,6 +754,34 @@ impl<C: Configuration> Peer<C> {
         Ok(())
     }
 
+    // The caller preserves its existing prefix/error ordering before this shared check.
+    fn first_prepare(&self, frame: Frame<'_>, truncated: Error) -> Result<(C, Fence), Error> {
+        let h = frame.header;
+        if self.phase != Phase::Idle
+            || h.ticket.attempt <= self.last_attempt
+            || h.source_epoch != self.active_epoch()
+            || h.ticket.epoch.0
+                != self
+                    .active_epoch()
+                    .0
+                    .checked_add(1)
+                    .ok_or(Error::Exhausted)?
+        {
+            return Err(Error::Unexpected);
+        }
+        let end = 8usize.checked_add(C::ENCODED_LEN).ok_or(Error::Malformed)?;
+        let canonical = frame.body.get(8..end).ok_or(truncated)?;
+        let next = decode_configuration::<C>(canonical)?;
+        if self.validate_mode(&next)? != h.ticket.digest {
+            return Err(Error::Unexpected);
+        }
+        let peer = Fence::decode(
+            frame.body.get(end..).ok_or(Error::Malformed)?,
+            self.sender_channels(opposite(self.identity.role)),
+        )?;
+        Ok((next, peer))
+    }
+
     fn request(&mut self, frame: Frame<'_>) -> Result<Effects<C>, Error> {
         let h = frame.header;
         if frame.body.len() < 8 || reply_to(frame.body)? != 0 || h.request.0 <= self.last_command {
@@ -759,27 +794,7 @@ impl<C: Configuration> Peer<C> {
         };
         let result = match h.kind {
             MessageKind::Prepare => {
-                if self.phase != Phase::Idle
-                    || h.ticket.attempt <= self.last_attempt
-                    || h.source_epoch != self.active_epoch()
-                    || h.ticket.epoch.0
-                        != self
-                            .active_epoch()
-                            .0
-                            .checked_add(1)
-                            .ok_or(Error::Exhausted)?
-                    || frame.body.len() < 8 + C::ENCODED_LEN
-                {
-                    return Err(Error::Unexpected);
-                }
-                let next = decode_configuration::<C>(&frame.body[8..8 + C::ENCODED_LEN])?;
-                if self.validate_mode(&next)? != h.ticket.digest {
-                    return Err(Error::Unexpected);
-                }
-                let peer = Fence::decode(
-                    &frame.body[8 + C::ENCODED_LEN..],
-                    self.sender_channels(opposite(self.identity.role)),
-                )?;
+                let (next, peer) = self.first_prepare(frame, Error::Unexpected)?;
                 self.guard.prepare(h.ticket).map_err(Error::Guard)?;
                 self.guard.peer_ready(h.ticket).map_err(Error::Guard)?;
                 self.begin_operation(h.ticket)?;

@@ -348,10 +348,10 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
             .iter()
             .map(|packet| {
                 (
-                    packet.origin,
-                    packet.identity,
-                    packet.since,
-                    packet.bytes.clone(),
+                    packet.metadata().origin,
+                    packet.metadata().identity,
+                    packet.since(),
+                    packet.bytes().to_vec(),
                 )
             })
             .collect();
@@ -364,10 +364,10 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
                 .native
                 .iter()
                 .map(|packet| (
-                    packet.origin,
-                    packet.identity,
-                    packet.since,
-                    packet.bytes.clone()
+                    packet.metadata().origin,
+                    packet.metadata().identity,
+                    packet.since(),
+                    packet.bytes().to_vec()
                 ))
                 .collect::<Vec<_>>(),
             before
@@ -377,7 +377,7 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
                 .driver
                 .native
                 .iter()
-                .all(|packet| packet.origin == origin)
+                .all(|packet| packet.metadata().origin == origin)
         );
         assert_eq!(fixture.driver.written.counts[1], 0);
         assert!(
@@ -394,7 +394,11 @@ async fn would_block_retains_original_native_identity_origin_age_and_physical_ve
         fixture.device = AsyncFd::with_interest(device, Interest::WRITABLE)?;
         assert!(fixture.write().await?);
         assert_eq!(
-            fixture.driver.native.front().map(|packet| packet.identity),
+            fixture
+                .driver
+                .native
+                .front()
+                .map(|packet| packet.metadata().identity),
             Some(second_identity)
         );
         assert_eq!(fixture.driver.written.counts[1], 1);
@@ -430,14 +434,14 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
             .native
             .front()
             .ok_or("missing fixture native packet")?
-            .since;
+            .since();
         // These are deliberately inconsistent local metadata, not authenticated
         // peer flows. Genuine bytes and pure extracted boundaries remain intact.
         for variant in 0..8 {
             let front = fixture
                 .driver
                 .native
-                .front_mut()
+                .front_metadata_mut()
                 .ok_or("missing fixture native packet")?;
             front.origin = origin;
             front.identity = identity;
@@ -467,7 +471,7 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
             assert_eq!(fixture.driver.counters.native_written, 0);
             assert_eq!(fixture.driver.native.len(), 1);
             assert_eq!(
-                fixture.driver.native.front().map(|packet| packet.since),
+                fixture.driver.native.front().map(|packet| packet.since()),
                 Some(age)
             );
             assert_eq!(count(&fixture.driver, 1)?, 1);
@@ -477,7 +481,7 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
         let front = fixture
             .driver
             .native
-            .front_mut()
+            .front_metadata_mut()
             .ok_or("missing fixture native packet")?;
         front.origin = origin;
         front.identity = identity;
@@ -636,11 +640,20 @@ async fn directional_policy_hooks_keep_physical_old_witness_and_collect_in_feedb
             .native
             .front()
             .ok_or("missing target native packet")?;
-        assert_eq!(queued.origin.scope, fixture.driver.feedback_scope);
-        assert_ne!(queued.origin.scope, fixture.driver.records.active_data());
-        assert_eq!(queued.origin.binding, fixture.driver.info.binding);
         assert_eq!(
-            queued.origin.direction,
+            queued.metadata().origin.scope,
+            fixture.driver.feedback_scope
+        );
+        assert_ne!(
+            queued.metadata().origin.scope,
+            fixture.driver.records.active_data()
+        );
+        assert_eq!(
+            queued.metadata().origin.binding,
+            fixture.driver.info.binding
+        );
+        assert_eq!(
+            queued.metadata().origin.direction,
             security::Direction::ResponderToInitiator
         );
         assert_eq!(fixture.driver.retired_receive, Some(retired));
@@ -787,7 +800,7 @@ async fn physical_success_commits_native_identity_once_even_when_completion_fail
                 .native
                 .front()
                 .ok_or("missing fixture native packet")?
-                .since;
+                .since();
             let deadline = add(since, fixture.driver.config.native.stall_timeout)?;
             fixture.time.store(deadline - 1, Ordering::SeqCst);
             if failure == 0 {
@@ -827,7 +840,7 @@ async fn physical_success_commits_native_identity_once_even_when_completion_fail
                 identity.record.0 + 1
             );
             assert!(fixture.driver.native.is_empty());
-            assert_eq!(fixture.driver.native_bytes, 0);
+            assert_eq!(fixture.driver.native.bytes(), 0);
             assert_eq!(fixture.driver.counters.native_written, 1);
             assert_eq!(
                 fixture

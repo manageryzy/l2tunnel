@@ -213,6 +213,41 @@ impl Gate {
         now: tx::Tick,
         expires: tx::Tick,
     ) -> Result<tx::Effects<C>, TransactionError> {
+        let (command, candidate) =
+            self.transaction_candidate(peer, verified, stream, input, now, expires)?;
+        let effects = peer
+            .receive_until(verified, command, now, expires)
+            .map_err(TransactionError::Transaction)?;
+        self.replay[stream.index()] = candidate;
+        Ok(effects)
+    }
+
+    /// Inspect the real joint gate and Peer without committing either sequence.
+    /// A returned intent requires actual target storage before effectful dispatch.
+    pub fn preview_transaction<C: tx::Configuration>(
+        &self,
+        peer: &tx::Peer<C>,
+        verified: Ingress,
+        stream: Stream,
+        input: &[u8],
+        now: tx::Tick,
+        expires: tx::Tick,
+    ) -> Result<Option<tx::Preparation<C>>, TransactionError> {
+        let (command, _) =
+            self.transaction_candidate(peer, verified, stream, input, now, expires)?;
+        peer.preview_receive_until(verified, command, now, expires)
+            .map_err(TransactionError::Transaction)
+    }
+
+    fn transaction_candidate<'a, C: tx::Configuration>(
+        &self,
+        peer: &tx::Peer<C>,
+        verified: Ingress,
+        stream: Stream,
+        input: &'a [u8],
+        now: tx::Tick,
+        expires: tx::Tick,
+    ) -> Result<(&'a [u8], ReplayWindow), TransactionError> {
         if !self.transaction_bound || !peer.is_leased() {
             return Err(TransactionError::Contract);
         }
@@ -237,11 +272,7 @@ impl Gate {
         }
         peer.validate_receive_until(verified, command, now, expires)
             .map_err(TransactionError::Transaction)?;
-        let effects = peer
-            .receive_until(verified, command, now, expires)
-            .map_err(TransactionError::Transaction)?;
-        self.replay[stream.index()] = candidate;
-        Ok(effects)
+        Ok((command, candidate))
     }
 
     fn authenticated_envelope<'a>(

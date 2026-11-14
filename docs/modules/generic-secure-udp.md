@@ -42,6 +42,9 @@ complete integration, resource, mode, native, platform and performance scope.
 The actual engine storage review also remains a preparation prerequisite.
 Its additive fallible owner is tracked in [Swift storage](swift-storage.md),
 SRS-01..SRS-07; pure allocation tests do not complete GSU-05.
+The [read-only preparation interface](transaction-preparation.md), MPR-01..MPR-05,
+connects actual engine preparation before leased Peer/joint admission; it does
+not itself implement the selected driver.
 Sender retained-source debt is `flow_sources`, not the repair window; queue
 high-water capacities persist per channel. Receiver history/equation terms,
 stream growth, header scratch, shared workspaces and construction transients
@@ -331,3 +334,72 @@ No worker runs Cargo or edits another worker's files.
 - [ ] [GSU-08] Pass focused regressions, strict formatting/lint/rustdoc and required frozen-source workspace checks; reconcile evidence and save an actual scoped local checkpoint.
 - [ ] [GSU-09] Record immutable selected Linux native functional/performance observations with the original targets and preserved failed/unavailable outcomes; qualify other platforms and devices only with their actual evidence.
 - [ ] [GSU-10] Integrate and test actual Swift-to-other-profile switching, reliable/packed/RLNC/parity/rolling/proxy engines and complete typed feedback/native receipts with matching security, channel and custody semantics; retain every full SW-11 and47-mode gate until its complete acceptance passes.
+
+## Borrowed first-PREPARE view v0
+
+Before any target allocation, the real leased Control owner supplies:
+
+```rust
+Owner::preview_transaction<C>(&self, peer: &transaction::Peer<C>,
+    now: Duration, cap: transaction::Tick)
+    -> io::Result<Option<PendingTransaction<'_, C>>>
+PendingTransaction::{incoming,envelope,deadline,preparation}(&self) -> ...
+PendingTransaction::into_preparation(self) -> Option<transaction::Preparation<C>>
+```
+
+The view has private construction and borrows the actual Transaction message
+owner without copying/popping its bytes. It exposes the exact existing Incoming,
+original message deadline, complete envelope and optional new-stage intent from
+the real joint Gate preview. No view is returned while older leased incoming
+effects are held. Backward time, failed/expired owner, expired original message,
+or invalid joint preflight is an error without mutation, identity consumption,
+new lease or sequence advancement. It grants no acceptance/authentication proof.
+The caller freezes the operation cap once, resamples time after real allocation,
+and actual dispatch revalidates. Repeated views never extend a deadline.
+
+- [ ] [LTV-01] Freeze and implement the borrowed joint-preflight view; test real
+  pending bytes, identity, invalid admission, held work and original deadlines.
+- [ ] [LTV-02] Consume the view in the selected real driver with an actual prepared
+  engine guard before the joint mutation. No fake resource permit is sufficient.
+
+The existing transport's native payload owner is tracked in
+[fallible native completion storage](runtime-native-storage.md), NQP-01..NQP-04.
+It is a shared resource prerequisite, not completed GSU-05/SRS-07.
+
+The private two-generation engine owner is tracked in
+[owned duplex generations](runtime-engine-bank.md), EGB-01..EGB-03. Its actual
+prepared allocation must precede Peer admission; it grants no commit or physical
+completion authority.
+
+## Shared transaction settings v0
+
+Move the identical Parameters value from client transaction_profile to public
+`transport::TransactionSettings`, and re-export it from the client as Parameters.
+Keep its exact fields/protocol validation and authenticated hash order unchanged:
+`protocol: transaction::Settings`, `max_operation_ms: u64`, `retained_bytes: usize`.
+Provide `validate(self, runtime: Config) -> io::Result<()>` in runtime. This removes
+a duplicate cross-layer contract; it does not select a backend or implement a
+GUI/driver. Existing golden configuration bytes and call syntax must remain.
+
+- [x] [GST-01] Share the exact settings value at the runtime boundary, preserve Evidence: [frozen focused checks](../../work/generic-driver-20261114/focused-attempt-3/validation.json).
+  authenticated field order and validate both role templates with actual tests.
+
+The borrowed view additionally uses the actual message owner's additive
+`messages::Owner::check_time(&self, now: Duration) -> Result<(), messages::Error>`.
+This readonly seam checks sticky failure first, backward observation, checked
+relative nanosecond conversion, and the actual earliest immutable expiry (all
+held/outbound/reassembly/session caps). It performs no work, expiry removal,
+receipt, counter or time mutation. Preserve existing effectful observe error
+ordering and behaviour; this is advisory preflight, never acceptance.
+
+The next private State consumer is specified in
+[selected generic transaction custody](runtime-transaction-state.md),
+TCS-01..TCS-03. It owns the real prepared engine Bank before admission and uses
+actual borrowed message proofs. This interface is an engineering contract, not
+a selected implementation or owner decision.
+
+The shared settings relocation retains the existing Parameters alias, exact
+field order and validation. Root focused attempt3 passes all14 authenticated
+plan cases including existing digest/field-mutation and actual-factory tests.
+The selected driver, full shared resources and exact version3 status are still
+required; GST-01 is not a backend or GUI completion claim.

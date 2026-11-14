@@ -646,6 +646,25 @@ impl Owner {
         (DATA_HEADER_BYTES + self.settings.delivery.recovery.max_source_bytes).max(ACK_PACKET_BYTES)
     }
 
+    /// Check actual time and immutable expiry without work or state mutation.
+    /// This advisory view neither accepts a message nor renews any original cap.
+    pub fn check_time(&self, now: Duration) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if now < self.last_now {
+            return Err(Error::NonMonotonicTime);
+        }
+        let relative = now
+            .checked_sub(self.origin)
+            .ok_or(Error::NonMonotonicTime)?;
+        u64::try_from(relative.as_nanos()).map_err(|_| Error::TimeOverflow)?;
+        if now >= self.expiry() {
+            return Err(Error::Expired);
+        }
+        Ok(())
+    }
+
     fn observe(&mut self, now: Duration) -> Result<(), Error> {
         if let Some(error) = self.failed {
             return Err(error);

@@ -9,13 +9,13 @@ use l2tunnel_core as core;
 use l2tunnel_cover as cover;
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_management::{
-    self as mg, control_streams as streams, delivery, session_control as control,
+    self as mg, control_streams as streams, delivery, session_control as control, transaction,
 };
 use l2tunnel_recovery as recovery;
 use l2tunnel_security as security;
 use l2tunnel_swift::{self as swift, policy, records};
 use ring::digest;
-use std::{collections::VecDeque, future::Future, io, os::fd::AsRawFd, time::Duration};
+use std::{future::Future, io, os::fd::AsRawFd, time::Duration};
 use tokio::{
     io::{Interest, unix::AsyncFd},
     sync::{mpsc, oneshot},
@@ -28,6 +28,9 @@ const LANE: u32 = 0;
 
 #[path = "transport_performance.rs"]
 mod performance;
+
+#[path = "transport_native.rs"]
+mod native_storage;
 pub use performance::Performance;
 
 /// Immutable authenticated full-wire bucket, including control and feedback.
@@ -325,6 +328,33 @@ pub struct Lifetime {
     /// Original total bound for one queued challenge, including local congestion.
     pub pong_timeout: Duration,
 }
+/// Immutable generic transaction and combined retained-storage contract.
+/// This value is explicitly authenticated by the client plan; it does not select
+/// the backend or reserve engines/native/control storage by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionSettings {
+    /// Generic retry, phase and uncertainty timing, in injected milliseconds.
+    pub protocol: transaction::Settings,
+    /// Maximum original operation duration, never renewed by retries or phases.
+    pub max_operation_ms: u64,
+    /// Combined current/prepared/draining engines and associated custody ceiling.
+    pub retained_bytes: usize,
+}
+impl TransactionSettings {
+    /// Check the exact authenticated limits against an actual runtime template.
+    pub fn validate(self, runtime: Config) -> io::Result<()> {
+        self.protocol.validate().map_err(invalid)?;
+        if self.max_operation_ms == 0
+            || u128::from(self.max_operation_ms) > runtime.lifetime.lease.as_millis()
+            || self.retained_bytes == 0
+        {
+            return Err(invalid("transaction lifetime or retained-storage contract"));
+        }
+        u64::try_from(self.retained_bytes).map_err(invalid)?;
+        Ok(())
+    }
+}
+
 /// Immutable local half of the parent's globally ordered authenticated contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -736,6 +766,9 @@ pub struct Counters {
     pub native_pending_packets: usize,
     /// Exact retained native bytes.
     pub native_pending_bytes: usize,
+    /// Actual requested native-pool heap layouts, including all empty buffers.
+    /// Excludes allocator overhead, inline owners, RSS and kernel storage.
+    pub native_storage_capacity_bytes: usize,
     /// Last actual User sealing identity.
     pub user_number: Option<security::PacketNumber>,
     /// Last actual Control sealing identity.
@@ -1108,8 +1141,6 @@ impl NativeWritten {
 struct Native {
     origin: NativeOrigin,
     identity: records::NativeIdentity,
-    bytes: Vec<u8>,
-    since: u64,
 }
 struct PendingPolicy {
     id: policy::OutboundId,
@@ -1152,8 +1183,7 @@ struct Driver {
     control_input: Vec<u8>,
     frame: Vec<u8>,
     envelope_rx: u64,
-    native: VecDeque<Native>,
-    native_bytes: usize,
+    native: native_storage::Queue<Native>,
     written: NativeWritten,
     retired_send: Option<NativeBoundary>,
     retired_receive: Option<NativeBoundary>,
@@ -1410,8 +1440,11 @@ impl Driver {
                 control_input: vec![0; control_message],
                 frame: Vec::with_capacity(swift::control::MAX_FRAME),
                 envelope_rx: 1,
-                native: VecDeque::with_capacity(config.native.pending_packets),
-                native_bytes: 0,
+                native: native_storage::Queue::new(
+                    config.native.pending_packets,
+                    config.native.pending_bytes,
+                    config.send.records.max_native,
+                )?,
                 written: NativeWritten::new(
                     NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
                     config.receive.records.channels,
@@ -1457,7 +1490,8 @@ impl Driver {
     fn snapshot(&self, now: u64, running: bool) -> Snapshot {
         let mut counters = self.counters;
         counters.native_pending_packets = self.native.len();
-        counters.native_pending_bytes = self.native_bytes;
+        counters.native_pending_bytes = self.native.bytes();
+        counters.native_storage_capacity_bytes = self.native.capacity_bytes();
         Snapshot {
             running,
             elapsed_micros: now,
@@ -1609,7 +1643,7 @@ impl Driver {
     // This guard has no delivery, policy-completion or refill side effects.
     // Event branches must check fresh time before removing any original expiry.
     fn check_expiry(&mut self, now: u64) -> io::Result<bool> {
-        self.check_expiry_with_native(now, self.native.front().map(|packet| packet.since))
+        self.check_expiry_with_native(now, self.native.front().map(|packet| packet.since()))
     }
     fn check_expiry_with_native(
         &mut self,
@@ -2155,11 +2189,7 @@ impl Driver {
         Ok(())
     }
     fn native_room(&self) -> bool {
-        self.native.len() < self.config.native.pending_packets
-            && self
-                .native_bytes
-                .checked_add(self.config.send.records.max_native)
-                .is_some_and(|bytes| bytes <= self.config.native.pending_bytes)
+        self.native.can_acquire()
     }
     fn collect_native(&mut self, now: u64) -> io::Result<()> {
         // Every source/repair admitted to this installed receive engine passed
@@ -2179,19 +2209,23 @@ impl Driver {
                     .saturating_add(1);
                 break;
             }
+            // Acquire actual existing output storage before advancing extraction.
+            // The lease returns its buffer on empty/error paths automatically.
+            let lease = self
+                .native
+                .acquire()
+                .ok_or_else(|| protocol("native lease disappeared"))?;
             let Some(packet) = self.swift.pop_identified().map_err(native_record_error)? else {
                 break;
             };
-            self.native_bytes = self
-                .native_bytes
-                .checked_add(packet.bytes.len())
-                .ok_or_else(|| protocol("native queue bytes overflow"))?;
-            self.native.push_back(Native {
-                origin,
-                identity: packet.identity,
-                bytes: packet.bytes.to_vec(),
-                since: now,
-            });
+            lease.copy(
+                Native {
+                    origin,
+                    identity: packet.identity,
+                },
+                now,
+                packet.bytes,
+            )?;
             self.performance.counters.native_pending_packets_high = self
                 .performance
                 .counters
@@ -2201,7 +2235,7 @@ impl Driver {
                 .performance
                 .counters
                 .native_pending_bytes_high
-                .max(self.native_bytes as u64);
+                .max(self.native.bytes() as u64);
         }
         Ok(())
     }
@@ -2328,27 +2362,26 @@ impl Driver {
         let Some(packet) = self.native.front() else {
             return Ok(false);
         };
-        let completion = self.written.preflight(packet.origin, packet.identity)?;
-        let packet_bytes = packet.bytes.len();
-        let packet_since = packet.since;
-        if packet_bytes > self.native_bytes {
+        let completion = self
+            .written
+            .preflight(packet.metadata().origin, packet.metadata().identity)?;
+        let packet_bytes = packet.bytes().len();
+        let packet_since = packet.since();
+        if packet_bytes > self.native.bytes() {
             return Err(protocol("native output byte ownership mismatch"));
         }
-        let result = try_native_write(ready, &packet.bytes);
+        let result = try_native_write(ready, packet.bytes());
         if matches!(&result, Ok(true)) {
             // Commit irreversible complete-device acceptance before sampling a
             // fresh clock or returning any later expiry/invariant failure.
             self.written.complete(completion);
-            self.native_bytes -= packet_bytes;
             self.counters.native_written = self.counters.native_written.saturating_add(1);
             self.performance.counters.native_write_batch_packets = self
                 .performance
                 .counters
                 .native_write_batch_packets
                 .saturating_add(1);
-            self.native
-                .pop_front()
-                .ok_or_else(|| protocol("native output ownership disappeared"))?;
+            self.native.complete_front()?;
         }
         if matches!(&result, Ok(false)) {
             self.performance.counters.native_write_would_block = self
@@ -2582,7 +2615,7 @@ impl Driver {
                 .transpose()?,
             self.native
                 .front()
-                .map(|packet| add(packet.since, self.config.native.stall_timeout))
+                .map(|packet| add(packet.since(), self.config.native.stall_timeout))
                 .transpose()?,
             self.next_report,
         ]

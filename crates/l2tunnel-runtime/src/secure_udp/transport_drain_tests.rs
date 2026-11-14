@@ -266,7 +266,7 @@ async fn pending_and_wouldblock_predrain_retain_output_and_allow_input_and_contr
         assert_eq!(fixture.driver.counters.native_written, 0);
         assert_eq!(fixture.driver.native.len(), 1);
         assert_eq!(
-            fixture.driver.native.front().map(|packet| packet.since),
+            fixture.driver.native.front().map(|packet| packet.since()),
             Some(now)
         );
         assert_eq!(
@@ -342,14 +342,10 @@ async fn predrain_obeys_batch_attempt_quota_and_keeps_fifo_remainder_exact() -> 
         assert_eq!(writes.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.driver.native.len(), 1);
         assert_eq!(
-            fixture
-                .driver
-                .native
-                .front()
-                .map(|packet| packet.bytes.as_slice()),
+            fixture.driver.native.front().map(|packet| packet.bytes()),
             Some(ethernet(3).as_slice())
         );
-        assert_eq!(fixture.driver.native_bytes, 256);
+        assert_eq!(fixture.driver.native.bytes(), 256);
         let mut native = [0; 512];
         for number in [1, 2] {
             let length = peer.recv(&mut native)?;
@@ -411,7 +407,7 @@ async fn predrain_keeps_original_expiry_and_irreversible_completion_accounting()
                 assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
                 assert_eq!(fixture.driver.counters.native_written, 0);
                 assert_eq!(
-                    fixture.driver.native.front().map(|packet| packet.since),
+                    fixture.driver.native.front().map(|packet| packet.since()),
                     Some(1)
                 );
                 assert_eq!(fixture.driver.terminal, Some(StopReason::NativeStall));
@@ -454,7 +450,7 @@ async fn predrain_keeps_original_expiry_and_irreversible_completion_accounting()
                 1
             );
             assert!(fixture.driver.native.is_empty());
-            assert_eq!(fixture.driver.native_bytes, 0);
+            assert_eq!(fixture.driver.native.bytes(), 0);
             let mut native = [0; 512];
             let length = fixture.peer.recv(&mut native)?;
             assert_eq!(&native[..length], ethernet(1));

@@ -132,9 +132,9 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
     )?;
     local.collect_native(1)?;
     assert_eq!(local.native.len(), 1);
-    assert_eq!(local.native_bytes, frame(low, 0).len());
+    assert_eq!(local.native.bytes(), frame(low, 0).len());
     assert_eq!(
-        local.native.front().map(|packet| packet.bytes.as_slice()),
+        local.native.front().map(|packet| packet.bytes()),
         Some(frame(low, 0).as_slice())
     );
     if blocked {
@@ -144,7 +144,7 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
         local.collect_native(2)?;
         assert_eq!(local.swift.stats(), before);
         assert_eq!(local.native.len(), 1);
-        assert_eq!(local.native.front().map(|packet| packet.since), Some(1));
+        assert_eq!(local.native.front().map(|packet| packet.since()), Some(1));
         assert_eq!(local.performance.counters.native_write_would_block, 1);
         assert_eq!(
             host.recv(&mut input).err().map(|e| e.kind()),
@@ -181,7 +181,7 @@ async fn case(kind: cover::Appearance, blocked: bool) -> Result {
     }
     local.collect_native(5)?;
     assert!(local.native.is_empty());
-    assert_eq!(local.native_bytes, 0);
+    assert_eq!(local.native.bytes(), 0);
     assert!(local.swift.receive_drained());
     assert_eq!(local.counters.native_written, 9);
     assert_eq!(local.performance.counters.native_write_batch_packets, 9);

@@ -6,7 +6,7 @@
 
 use super::{
     Configuration, Effects, Error, Frame, Header, Identity, Ingress, Message, MessageKind, Peer,
-    Phase, RequestId, Role, Tick, Ticket, add, decode_configuration, limits, opposite, reply_to,
+    Phase, RequestId, Role, Tick, Ticket, add, limits, opposite, reply_to,
 };
 use crate::{messages, session_control};
 use l2tunnel_core::Epoch;
@@ -272,6 +272,12 @@ impl<C: Configuration> Peer<C> {
         now: Tick,
         expires: Tick,
     ) -> Result<(), Error> {
+        self.validate_receive_cap(now, expires)?;
+        let frame = self.verified_frame(verified, bytes)?;
+        self.validate_operation_frame(frame)
+    }
+
+    pub(super) fn validate_receive_cap(&self, now: Tick, expires: Tick) -> Result<(), Error> {
         self.readonly_time(now)?;
         if !self.is_leased() {
             return Err(Error::LeaseRequired);
@@ -283,8 +289,7 @@ impl<C: Configuration> Peer<C> {
         } else {
             self.validate_new_cap(now, expires)?;
         }
-        let frame = self.verified_frame(verified, bytes)?;
-        self.validate_operation_frame(frame)
+        Ok(())
     }
 
     /// Read-only exact origin authority before an outer stream sequence commits.
@@ -550,7 +555,7 @@ impl<C: Configuration> Peer<C> {
         self.validate_operation_frame(self.verified_frame(verified, bytes)?)
     }
 
-    fn readonly_time(&self, now: Tick) -> Result<(), Error> {
+    pub(super) fn readonly_time(&self, now: Tick) -> Result<(), Error> {
         if let Some(lease) = self.lease.as_ref()
             && (lease.expired
                 || now >= lease.settings.session_expires
@@ -569,7 +574,7 @@ impl<C: Configuration> Peer<C> {
         add(now, self.settings.reconcile_timeout_ms)?;
         Ok(())
     }
-    fn validate_new_cap(&self, now: Tick, expires: Tick) -> Result<(), Error> {
+    pub(super) fn validate_new_cap(&self, now: Tick, expires: Tick) -> Result<(), Error> {
         let lease = self.lease.as_ref().ok_or(Error::LeaseRequired)?;
         if expires <= now
             || expires > lease.settings.session_expires
@@ -579,14 +584,18 @@ impl<C: Configuration> Peer<C> {
         }
         Ok(())
     }
-    fn current_origin(&self) -> session_control::Scope {
+    pub(super) fn current_origin(&self) -> session_control::Scope {
         let active = self.guard.active();
         session_control::Scope {
             epoch: active.epoch,
             digest: active.digest,
         }
     }
-    fn verified_frame<'a>(&self, verified: Ingress, bytes: &'a [u8]) -> Result<Frame<'a>, Error> {
+    pub(super) fn verified_frame<'a>(
+        &self,
+        verified: Ingress,
+        bytes: &'a [u8],
+    ) -> Result<Frame<'a>, Error> {
         let Ingress::AuthenticatedManagement {
             session,
             lane,
@@ -614,6 +623,13 @@ impl<C: Configuration> Peer<C> {
         Ok(frame)
     }
     fn validate_operation_frame(&self, frame: Frame<'_>) -> Result<(), Error> {
+        self.operation_frame(frame).map(|_| ())
+    }
+
+    pub(super) fn operation_frame(
+        &self,
+        frame: Frame<'_>,
+    ) -> Result<Option<(C, super::Fence)>, Error> {
         if self
             .gate
             .retired_through
@@ -651,7 +667,7 @@ impl<C: Configuration> Peer<C> {
                     return Err(Error::Custody);
                 }
             }
-            return Ok(());
+            return Ok(None);
         }
         if self.identity.role != Role::Server || self.phase != Phase::Idle {
             return Err(Error::LeaseRequired);
@@ -671,20 +687,8 @@ impl<C: Configuration> Peer<C> {
             return Err(Error::Unexpected);
         }
         match header.kind {
-            MessageKind::Prepare => {
-                let end = 8usize.checked_add(C::ENCODED_LEN).ok_or(Error::Malformed)?;
-                let canonical = frame.body.get(8..end).ok_or(Error::Malformed)?;
-                let next = decode_configuration::<C>(canonical)?;
-                if self.validate_mode(&next)? != header.ticket.digest {
-                    return Err(Error::Unexpected);
-                }
-                super::Fence::decode(
-                    frame.body.get(end..).ok_or(Error::Malformed)?,
-                    self.sender_channels(opposite(self.identity.role)),
-                )?;
-                Ok(())
-            }
-            MessageKind::Reject if frame.body.len() == 8 => Ok(()),
+            MessageKind::Prepare => self.first_prepare(frame, Error::Malformed).map(Some),
+            MessageKind::Reject if frame.body.len() == 8 => Ok(None),
             _ => Err(Error::Unexpected),
         }
     }

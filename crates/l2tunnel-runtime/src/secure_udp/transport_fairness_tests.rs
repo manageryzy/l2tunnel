@@ -246,7 +246,7 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
     if native_input {
         assert_eq!(remote.native.len(), 1);
         assert_eq!(
-            remote.native.front().map(|packet| packet.bytes.as_slice()),
+            remote.native.front().map(|packet| packet.bytes()),
             Some(native.as_slice())
         );
         assert_eq!(remote.swift.stats().receiver.packets, 1);

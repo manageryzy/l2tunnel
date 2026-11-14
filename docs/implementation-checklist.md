@@ -73,7 +73,13 @@ borrowed control proofs, actual engine/device custody and selected runtime/API
 integration. Explicit directional peers and complete canonical values now have
 focused protocol evidence; the authenticated client construction has real
 factory tests. Selected generic driver/device/resource integration remains
-pending. Full SW-11, other profiles and every original
+pending. Read-only preparation is tracked by
+[MPR-01..MPR-05](modules/transaction-preparation.md), actual fallible native
+completion storage by [NQP-01..NQP-05](modules/runtime-native-storage.md),
+prepared generations by [EGB-01..EGB-03](modules/runtime-engine-bank.md), and
+bounded custody integration by [TCS-01..TCS-03](modules/runtime-transaction-state.md).
+These retain complete GSU-04/GSU-05 and SRS-07 acceptance.
+Full SW-11, other profiles and every original
 mode/native/platform/performance gate retain their complete definitions.
 The [original-socket native driver](modules/secure-udp-runtime.md) has its own
 bounded transport and runtime validation gates. The
@@ -244,6 +250,10 @@ does not qualify generic switching, other record profiles or full SW-11.
 | Streamed Swift runtime control | SUC-01..SUC-08 | [Selected runtime custody](modules/streamed-swift-control.md) | authenticated explicit backend, original caps and semantic custody; generic switching remains open |
 | Swift byte-transfer correction | SBC-01..SBC-06 | [Bounded bulk transfer](modules/swift-bulk-copy.md) | source-bound perf evidence, exact ownership/bytes and immutable pre/post measurements |
 | Swift fallible engine storage | SRS-01..SRS-07 | [Owned engine storage](modules/swift-storage.md) | complete capacity/failure/pool reuse before actual generic driver preparation; GSU-05 and full SW-11 remain open |
+| Read-only leased preparation | MPR-01..MPR-05 | [Preparation preflight](modules/transaction-preparation.md) | actual Gate/Peer validation before resource construction; selected driver consumption remains open |
+| Native completion storage | NQP-01..NQP-05 | [Owned native pool](modules/runtime-native-storage.md) | fallible physical-output custody in the existing driver; full combined memory/API/native gates remain open |
+| Generic duplex generations | EGB-01..EGB-03 | [Two-generation bank](modules/runtime-engine-bank.md) | actual prepared/current/draining engines; physical control/native proofs remain external |
+| Generic transaction custody | TCS-01..TCS-03 | [Actual State consumer](modules/runtime-transaction-state.md) | one leased Peer, real prepared allocation and whole-message proofs; selected driver integration remains open |
 | Native capture tail | NCD-01..NCD-06 | [Bounded capture witness](modules/native-capture-drain.md) | exact final probe fingerprints before capture stop; original final audits and performance gates retained |
 | Host-runtime comparison | HRT-01..HRT-07 | [Explicit process host](modules/host-runtime.md) | scoped selector tested; fresh complete evidence-verified 16-case ABBA; eight impaired 80 targets and parent gates remain open |
 | Secure UDP diagnostics | SGD-01..SGD-14 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4/options/setup/quote/counter observations; all16 fresh captures verified and checkpoint saved; finite native/kernel evidence retains eight failed80 targets |

@@ -947,3 +947,6 @@ fn joint_sequence_gaps_and_replay_refuse_before_the_transaction_owner_changes() 
     );
     Ok(())
 }
+
+#[path = "transaction_tests/preparation.rs"]
+mod preparation;

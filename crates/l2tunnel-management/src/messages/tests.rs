@@ -1211,3 +1211,188 @@ fn construction_enforces_complete_wire_and_independent_completion_reservations()
     ));
     Ok(())
 }
+
+#[test]
+fn readonly_time_check_never_observes_future_or_poisoned_invalid_time() -> TestResult {
+    let origin = Duration::from_millis(10);
+    let mut owner = Owner::new(
+        settings(),
+        binding(Role::Client),
+        origin,
+        Duration::from_secs(2),
+    )?;
+    let before = (
+        owner.last_now,
+        owner.failed,
+        owner.phase,
+        owner.idle_actions,
+        owner.retained(),
+    );
+    assert_eq!(
+        owner.check_time(origin - Duration::from_nanos(1)),
+        Err(Error::NonMonotonicTime)
+    );
+    assert_eq!(
+        owner.check_time(Duration::from_secs(u64::MAX)),
+        Err(Error::TimeOverflow)
+    );
+    assert_eq!(owner.check_time(Duration::from_secs(1)), Ok(()));
+    assert_eq!(
+        (
+            owner.last_now,
+            owner.failed,
+            owner.phase,
+            owner.idle_actions,
+            owner.retained()
+        ),
+        before
+    );
+    // A future successful preview must not make this actual original time stale.
+    owner.tick(origin)?;
+    assert_eq!(owner.last_now, origin);
+    assert_eq!(owner.failed, None);
+    Ok(())
+}
+
+#[test]
+fn readonly_time_check_preserves_actual_sticky_failure_before_other_errors() -> TestResult {
+    let origin = Duration::from_millis(10);
+    let mut owner = Owner::new(
+        settings(),
+        binding(Role::Client),
+        origin,
+        Duration::from_secs(2),
+    )?;
+    assert_eq!(
+        owner.tick(origin - Duration::from_nanos(1)),
+        Err(Error::NonMonotonicTime)
+    );
+    let before = (owner.last_now, owner.failed, owner.retained());
+    for now in [Duration::ZERO, origin, Duration::from_secs(u64::MAX)] {
+        assert_eq!(owner.check_time(now), Err(Error::NonMonotonicTime));
+        assert_eq!((owner.last_now, owner.failed, owner.retained()), before);
+    }
+    let mut expired = Owner::new(
+        settings(),
+        binding(Role::Client),
+        Duration::ZERO,
+        Duration::from_millis(20),
+    )?;
+    assert_eq!(expired.tick(Duration::from_millis(20)), Err(Error::Expired));
+    assert_eq!(expired.check_time(Duration::ZERO), Err(Error::Expired));
+    assert_eq!(
+        expired.check_time(Duration::from_secs(u64::MAX)),
+        Err(Error::Expired)
+    );
+    Ok(())
+}
+
+#[test]
+fn readonly_time_check_uses_real_outbound_held_partial_and_session_caps() -> TestResult {
+    let config = settings();
+    let bytes = ordinary_prepare()?.bytes;
+    let deadline = Duration::from_millis(700);
+    let mut sender = Owner::new(
+        config,
+        binding(Role::Client),
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )?;
+    sender.submit(SubmissionId(1), &bytes, Duration::ZERO, deadline)?;
+    let before = (sender.last_now, sender.failed, sender.retained());
+    assert_eq!(sender.expiry(), deadline);
+    assert_eq!(
+        sender.check_time(deadline - Duration::from_nanos(1)),
+        Ok(())
+    );
+    assert_eq!(sender.check_time(deadline), Err(Error::Expired));
+    assert_eq!((sender.last_now, sender.failed, sender.retained()), before);
+    assert_eq!(sender.check_time(Duration::ZERO), Ok(()));
+
+    let packets = first_sources(config, &bytes)?;
+    for complete in [false, true] {
+        let mut receiver = Owner::new(
+            config,
+            binding(Role::Server),
+            Duration::ZERO,
+            Duration::from_secs(2),
+        )?;
+        for packet in packets
+            .iter()
+            .take(if complete { packets.len() } else { 1 })
+        {
+            receiver.receive(ingress(Role::Client), packet, Duration::ZERO)?;
+        }
+        receiver.tick(Duration::ZERO)?;
+        if complete {
+            assert_eq!(receiver.pending().ok_or(Error::Protocol)?.bytes(), bytes);
+        } else {
+            assert!(receiver.pending().is_none());
+            assert_eq!(receiver.retained().incomplete_messages, 1);
+        }
+        let original = receiver.expiry();
+        let before = (
+            receiver.last_now,
+            receiver.failed,
+            receiver.retained(),
+            receiver
+                .pending()
+                .map(|item| (item.ticket(), item.deadline())),
+        );
+        assert_eq!(
+            receiver.check_time(original - Duration::from_nanos(1)),
+            Ok(())
+        );
+        assert_eq!(receiver.check_time(original), Err(Error::Expired));
+        assert_eq!(
+            receiver.check_time(original + Duration::from_nanos(1)),
+            Err(Error::Expired)
+        );
+        assert_eq!(
+            (
+                receiver.last_now,
+                receiver.failed,
+                receiver.retained(),
+                receiver
+                    .pending()
+                    .map(|item| (item.ticket(), item.deadline()))
+            ),
+            before
+        );
+        assert_eq!(receiver.check_time(Duration::ZERO), Ok(()));
+    }
+    let owner = Owner::new(config, binding(Role::Client), Duration::ZERO, deadline)?;
+    assert_eq!(owner.check_time(deadline - Duration::from_nanos(1)), Ok(()));
+    assert_eq!(owner.check_time(deadline), Err(Error::Expired));
+    assert_eq!(owner.failed, None);
+    Ok(())
+}
+
+#[test]
+fn readonly_time_check_excludes_only_actual_confirmed_outbound_expiry() -> TestResult {
+    let bytes = ordinary_prepare()?.bytes;
+    let mut network = Network::new(settings(), false)?;
+    let deadline = Duration::from_millis(700);
+    let ticket = network.peers[0].submit(SubmissionId(1), &bytes, Duration::ZERO, deadline)?;
+    network.await_pending(1)?;
+    let incoming = network.peers[1].pending().ok_or(Error::Protocol)?.ticket();
+    let now = network.now();
+    network.peers[1].accept(incoming, now)?;
+    network.await_confirmed(0, ticket)?;
+    assert_eq!(network.peers[0].retained().outbound_messages, 1);
+    let before = (
+        network.peers[0].last_now,
+        network.peers[0].failed,
+        network.peers[0].retained(),
+    );
+    assert_eq!(network.peers[0].check_time(deadline), Ok(()));
+    assert_eq!(
+        (
+            network.peers[0].last_now,
+            network.peers[0].failed,
+            network.peers[0].retained()
+        ),
+        before
+    );
+    Ok(())
+}
