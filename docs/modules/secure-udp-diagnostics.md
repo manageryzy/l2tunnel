@@ -1,5 +1,9 @@
 # Secure UDP capture and setup diagnostics
 
+The original SGD-01..SGD-08 evidence below describes its named checkpoint.
+The subsequent native capture-observation correction has its own contract and
+ledger at the end; historical failed receipts remain unchanged.
+
 Status: **implemented, contract-tested and finitely Linux integration-tested**;
 the fresh 16-case matrix has complete evidence, with all eight impaired cases
 still failing the original 80 Mbit/s target. Separate kernel observations are
@@ -246,3 +250,139 @@ proof; this follow-up changes only ledger evidence. Nothing was pushed or publis
 - [x] [SGD-06] Record the fresh source-stable 16-case native ABBA attempt with original functional/capture/cleanup/80 verdicts and requested/effective/thread/CPU/wire/setup evidence; preserve failures and missing observations without claiming full qualification. Evidence: [complete evidence-verified matrix with eight failed 80 targets](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json) and [byte-exact archive](../../work/secure-udp-diagnostics-20261114/native-observations-attempt-1/archive-validation.json).
 - [x] [SGD-07] Evaluate the original and new setup/capture/performance evidence, preserving all HRT/SNL/FIX/SW-11/mode/platform/lifecycle gates and distinguishing structural observation from authenticated runtime results. Evidence: [fresh matrix](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json), [bounded kernel comparison and limits](../../work/secure-udp-diagnostics-20261114/kernel-summary-attempt-1/validation.json), and [preserved historical structural setup evidence](../../work/host-runtime-20261114/setup-analysis-attempt-1/validation.json).
 - [x] [SGD-08] Pass focused tests, strict lint/rustdoc, required frozen-source workspace checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item. Evidence: [focused pass](../../work/secure-udp-diagnostics-20261114/focused-attempt-4/validation.json), [required check](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/validation.json), [reconciliation](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/postcheck/ledger-2/validation.json), and [actual source checkpoint](../../work/secure-udp-diagnostics-20261114/commit-binding-attempt-1/validation.json).
+
+## Native capture observations
+
+Status: **implemented, contract-tested and workspace-checked**, with a fresh
+evidence-verified native matrix; its eight impaired performance targets fail.
+Final evidence reconciliation and the local checkpoint remain pending. This contract was recorded before
+production edits in the [saved design](../../work/native-capture-observations-20261114/design-v0.md). The later
+[receive-fairness matrix](../../work/swift-receive-fairness-20261114/native-analysis-attempt-1/validation.json)
+retains two capture gaps. Case02 lost 24,979/22,768/12,017 packets in its three
+capture observers, but raising before returning erased their parsed numeric
+projection from the receipt. Case03 rejected a native ICMP type3/code3 quote as
+an invalid echo. Its saved snapshot permits structural inspection only; a late
+UDP reply to a closed socket is a hypothesis, not an established cause. The
+80 Mbit/s failures and original capture verdicts remain unchanged.
+
+Keep `capture_counts`' exact successful three-counter dictionary and existing
+ObservationError/BoundExhausted failure categories. Parse bounded ASCII decimal
+uint64 counters from exactly one unambiguous complete line per field. Do not
+invent missing zeroes. Attach a copied complete observation to qualification
+exceptions as `capture_counter_observation`: schema1, counters, actual return
+code, complete parse status, passed/rejected qualification and all applicable
+static reasons (`packet_cap`, `kernel_dropped`, `process_exit`). Keep original
+first-failure precedence/message while retaining every applicable reason.
+
+The receipt's separate `capture_counter_observations` map retains complete
+parsed observations on success or rejection. Existing strict counter fields
+remain absent for rejected captures. Stop/log/parse failures without a complete
+triple remain unavailable; publication failure must not bypass other owned
+stops, final audit or cleanup, or discard an earlier error. Preserve the old
+count-equality-only `capture_complete` calls; add an explicit strict option used
+by real `run_case` requiring complete valid counters, zero drops and packet cap.
+Any supplied nonzero/invalid drop count is rejected even in count-only calls.
+Neither received=captured nor captured+dropped=received is assumed.
+
+Keep `_native_icmp_sample` and its echo dictionary/key grammar unchanged. A new
+shared cursor/final dispatcher separately validates classic native UDP
+port-unreachable messages: fixed complete outer/quoted IPv4 headers, reversed
+owned HOST endpoints, no reserved/fragment flags, type3/code3, zero unused word,
+valid quoted IP checksum, complete quoted UDP header, matching IP/UDP extents,
+one port24461 and a distinct nonzero client port, and actual probe UDP lengths
+8/9/26/72/520/1208/1480. Bound outer IP extent to56..1500 and no more than
+28+quoted IP extent. Unsupported types, options, quotes and extensions fail
+explicitly. The classic layout follows [RFC792](https://www.rfc-editor.org/rfc/rfc792);
+longer original-datagram quotes are compatible with [RFC1812 section4.3.2.3](https://www.rfc-editor.org/rfc/rfc1812#section-4.3.2.3).
+This lab subset does not implement [RFC4884 multipart extensions](https://www.rfc-editor.org/rfc/rfc4884).
+
+Verify the full ICMP checksum when its declared extent is captured. Otherwise
+report `not_observed_truncated_snapshot`, never full checksum/payload validity.
+Historical probes do not retain ephemeral socket instances; quote recognition
+proves supported structure, not exact probe membership, authentication or cause.
+Store only flat header observations in separate `native_icmp_errors` with
+count/samples/omitted; echo sample shape stays exact. Both live/final parsers
+share a hard128 total ICMP-record bound and store at most16 error summaries.
+The 129th observation fails before cursor/key/count commit. Errors satisfy none
+of the24 exact echo keys. Persist available error observations in drain reports.
+
+Root owns production, check registration, docs, execution, build/native commands
+and Git. One worker owns only the new focused test module; other workers review
+constraints and future generic-control integration without repository edits.
+Preserve all104 existing harness tests. New tests cover the exact saved160-byte
+snapshot, complete checksum cases, malformed/unsupported headers/quotes, shared
+bounds, live/final parity, all24 keys, EOF/deadlines/identity, numeric rejected
+counters and orchestration cleanup/publication failures. Freeze sources during
+recorded old/focused/full/build/native checks. A fresh16-case observation retains
+original35ms each way/15% loss,16 flows,100/10 shaping,99/9.9 policy,5s warmup,
+20s measurement and80 target. No filter, snap length, capture buffer, deadline,
+retry, host setting, default, protocol byte or parent requirement changes.
+
+- [x] [SGD-09] Record/review the native quote/counter-observation contract, exact saved provenance, unchanged hard gates and implementation ownership before production edits. Evidence: [pre-edit contract](../../work/native-capture-observations-20261114/design-v0.md), [exact known-record extraction](../../work/native-capture-observations-20261114/fixture-extraction.json) and [old-source failures](../../work/native-capture-observations-20261114/old-source-attempt-1/validation.json).
+- [x] [SGD-10] Preserve old-source failures and implement focused exact-snapshot, strict-negative-counter, shared-bound, malformed/EOF/deadline and cleanup/publication regressions alongside every existing harness test. Evidence: [old-source failures](../../work/native-capture-observations-20261114/old-source-attempt-1/validation.json), [27 new tests](../../tools/test_secure_udp_capture_observations.py) and [all131 harness cases passing with frozen source](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json).
+- [x] [SGD-11] Implement one shared bounded native ICMP dispatcher with separate error observations and unchanged echo/WAN grammar,24-key witness and final audit requirements. Evidence: [shared implementation](../../tools/secure_udp_native.py) and [frozen-source focused pass](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json).
+- [x] [SGD-12] Retain complete parsed negative counter observations without successful strict counter fields; preserve original errors, stop/final audit/cleanup and enforce explicit zero-drop qualification in real runs. Evidence: [shared counter/finalization implementation](../../tools/secure_udp_native.py) and [counter, finalization and retained harness regressions](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json).
+- [x] [SGD-13] Pass frozen-source focused and required checks; record a fresh immutable16-case native attempt and independent analysis with original targets and all failed/unavailable outcomes retained. Evidence: [required second aggregate](../../work/native-capture-observations-20261114/aggregate-attempt-2/validation.json), [all16 evidence-verified observations](../../work/native-capture-observations-20261114/native-analysis-attempt-1/validation.json), [additive field validation](../../work/native-capture-observations-20261114/additive-observation-analysis-attempt-1/validation.json) and [byte-exact archive](../../work/native-capture-observations-20261114/native-observations-attempt-1/archive-validation.json). Eight clean native cases pass; all eight impaired80 targets retain failed verdicts.
+- [ ] [SGD-14] Reconcile actual source/build/native evidence, distinguish structural/functional/performance/platform claims, and save an actual local checkpoint before closing this correction.
+
+The [source-stable focused check](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json)
+passes all104 retained harness cases and27 new cases plus Python compilation.
+Compared with the [old-source assertion failures](../../work/native-capture-observations-20261114/old-source-attempt-1/validation.json),
+its only non-document input difference is `tools/secure_udp_native.py`; all
+regression assertions are unchanged. Both parsers accept the exact saved
+snapshot as one structural error with no echo key. Rejected numeric observations,
+complete checksum failures, shared bounds, identity/EOF/deadlines and owned
+cleanup/publication are finite tooling contracts, not new native or throughput
+results. The 200-byte fixture and provenance are under
+[hashed tooling inputs](../../tools/fixtures/native_capture/port-unreachable-20261114.json),
+so old/focused/full/build source maps bind their exact bytes without changing
+historical receipt formats.
+
+The [first required aggregate](../../work/native-capture-observations-20261114/aggregate-attempt-1/validation.json)
+failed the existing OpenVPN runtime impaired-close test with `IncompleteClose`.
+Its [preserved analysis](../../work/native-capture-observations-20261114/aggregate-attempt-1/close-failure-review.md)
+finds that the last activity plus the existing maximum-RTO quiet interval can
+exceed the unchanged five-second budget. It does not establish a production
+close defect or causation by this Python correction. One unchanged-source
+[isolated diagnostic](../../work/openvpn-close-single-20261114/isolated-attempt-1/validation.json)
+and the [second required aggregate](../../work/native-capture-observations-20261114/aggregate-attempt-2/validation.json)
+pass; neither erases the first failure or claims to repair it. The second
+aggregate records 1,671 Rust cases including doctests, 376 tooling cases and
+1,658 simulator cases, formatting, strict Clippy, rustdoc and CLI checks, with
+all inputs stable. No assertion, close budget or retry was relaxed.
+
+The [fresh immutable build](../../work/native-capture-observations-20261114/native-build-attempt-1/build-receipt.json)
+binds binary `cbcabdf19368ee9979a60215ff7e0902414f52367cc4750a3b50537b9a87ddae`
+to those same frozen inputs. Its completed 16-case ABBA observation retains the
+original paths, shaping, policy, measurement intervals and targets. All16
+capture, exact-payload, control, policy, manual-reconnect, thread and cleanup
+observations are verified. Eight clean cases pass at92.174–92.469 Mbit/s. Eight
+impaired cases fail only the original80 Mbit/s target at77.190–78.680 Mbit/s.
+This records finite local Linux integration evidence, not full performance,
+carrier, lifecycle, platform or ISP qualification. Previous capture failures
+retain their original verdicts.
+
+The [additive observation audit](../../work/native-capture-observations-20261114/additive-observation-analysis-attempt-1/validation.json)
+checks all48 strict stderr-counter projections and the available native-error
+summaries without upgrading any original verdict. Its final and exact committed
+drain-prefix PCAP audit reproduces the pinned production parser; it is not an
+independently implemented protocol parser. Recorded process return codes are
+source-bound observations and cannot be reconstructed from stderr. Structural
+ICMP observations do not prove authentication or exact probe membership.
+All fresh native ICMP-error counts are zero; positive quote recognition is
+covered by the retained exact fixture and focused contracts, not these runs.
+Initial observer receipt-not-yet-created errors remain recorded; final artifact
+custody and completed observations are verified separately.
+
+The separate [same-binary kernel comparison](../../work/native-capture-observations-20261114/kernel-summary-attempt-1/analysis.md)
+passes both complete raw-record and resolved-symbol validators with zero lost
+events. Multi-thread/current-thread goodput is78.140/78.140 Mbit/s; both80 targets
+fail. Kernel event-period shares are67.77/64.55%; measured system-time means are
+0.590/0.310 cores, and matched-thread switch rates are19,152/6,862 per second.
+These use their recorded, distinct sampling/counter intervals rather than
+substituting the20-second goodput denominator. Both processes together record
+zero storage-read bytes and372,736 storage-write bytes in each case. Shared
+host I/O PSI is low and unattributed. Scheduling, epoll, TUN writes and UDP paths
+are observed inclusive contexts; their percentages overlap. One instrumented
+observation per model with unquantified profiler overhead establishes neither
+a unique bottleneck nor a default change. All original parent gates remain open.

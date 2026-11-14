@@ -422,3 +422,21 @@ Windows/Android build, remote CI or real-device/ISP result is asserted. The
 preceding binary's native/perf receipts remain tied to that binary. SWR-12 and
 all original parent performance, carrier, lifecycle, full SW-11 and catalog
 requirements remain open.
+
+The subsequent [capture-observation correction](secure-udp-diagnostics.md#native-capture-observations)
+now records a [required frozen-source pass](../../work/native-capture-observations-20261114/aggregate-attempt-2/validation.json)
+and a [fresh immutable16-case native matrix](../../work/native-capture-observations-20261114/native-analysis-attempt-1/validation.json)
+that includes this receive-service and partial-custody code. All16 capture,
+exact-payload, control, policy, manual-reconnect, thread and cleanup observations
+are verified. Eight clean cases pass; eight impaired cases fail only the
+unchanged80 Mbit/s target at77.190–78.680 Mbit/s. The
+[additive field audit](../../work/native-capture-observations-20261114/additive-observation-analysis-attempt-1/validation.json)
+retains original verdicts and distinguishes counter projection checks from
+reproduction of the pinned production PCAP parser. The historical two capture
+gaps remain failed observations. The separate
+[same-binary kernel comparison](../../work/native-capture-observations-20261114/kernel-summary-attempt-1/analysis.md)
+observes lower system CPU and switching with current-thread and unchanged
+78.140 Mbit/s goodput; one instrumented observation per model establishes no
+causal throughput gain or default change. SWR-12's final reconciliation and
+actual local checkpoint are still pending; parent80, full SW-11,47-mode and
+carrier/lifecycle/platform gates remain open.

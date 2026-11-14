@@ -188,6 +188,26 @@ SWR-12/capture gaps nor claims a native performance gain or full
 SW-11/profile/platform completion; preceding native/perf receipts retain their
 original binary identities and verdicts.
 
+The next [native capture-observation correction](modules/secure-udp-diagnostics.md#native-capture-observations)
+tracks SGD-09..SGD-14: retain complete rejected tcpdump counters and separately
+validate the saved native UDP port-unreachable grammar. It preserves all24
+echo keys, zero-drop/final audit requirements and every original performance,
+carrier, mode, lifecycle and platform gate. The
+[focused131-case harness check](../work/native-capture-observations-20261114/focused-attempt-1/validation.json)
+passes with unchanged regression assertions after reproducing both old-source
+failures. The [second required frozen-source aggregate](../work/native-capture-observations-20261114/aggregate-attempt-2/validation.json)
+passes1,671 Rust,376 tooling and1,658 simulator cases; the first OpenVPN close
+failure remains preserved without a claimed production fix. The
+[fresh same-build16-case matrix](../work/native-capture-observations-20261114/native-analysis-attempt-1/validation.json)
+has complete capture/payload/control/policy/thread/cleanup evidence: eight clean
+cases pass and eight impaired cases fail only80 Mbit/s at77.190–78.680 Mbit/s.
+The [additive field audit](../work/native-capture-observations-20261114/additive-observation-analysis-attempt-1/validation.json)
+passes without reclassifying historical failures. The separate
+[kernel comparison](../work/native-capture-observations-20261114/kernel-summary-attempt-1/analysis.md)
+observes lower system CPU and switching with current-thread, with unchanged
+78.140 Mbit/s goodput. Local checkpoint reconciliation remains pending; parent
+performance, full SW-11,47-mode and carrier/lifecycle/platform gates remain open.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |
@@ -200,7 +220,7 @@ original binary identities and verdicts.
 | Swift byte-transfer correction | SBC-01..SBC-06 | [Bounded bulk transfer](modules/swift-bulk-copy.md) | source-bound perf evidence, exact ownership/bytes and immutable pre/post measurements |
 | Native capture tail | NCD-01..NCD-06 | [Bounded capture witness](modules/native-capture-drain.md) | exact final probe fingerprints before capture stop; original final audits and performance gates retained |
 | Host-runtime comparison | HRT-01..HRT-07 | [Explicit process host](modules/host-runtime.md) | scoped selector tested; fresh complete evidence-verified 16-case ABBA; eight impaired 80 targets and parent gates remain open |
-| Secure UDP diagnostics | SGD-01..SGD-08 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4 options and shared setup observations; finite native/kernel evidence retains failed 80 targets |
+| Secure UDP diagnostics | SGD-01..SGD-14 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4/options/setup/quote/counter observations; all16 fresh captures verified; finite native/kernel evidence retains eight failed80 targets and checkpoint reconciliation |
 | VXLAN | VX-01..VX-09 | [Overlay design](overlay-and-carriers.md) | L2 frame validation, tenancy and MTU accounting |
 | UDP covers | UDP-01..UDP-16 | [Carrier design](overlay-and-carriers.md) | selected authenticated bootstrap; UDP-only is its own gate |
 | CLI/GUI/native clients | CL-01..CL-39 | [Client plan](client-design.md) | shared client-core/local API; native adapters independently qualified |

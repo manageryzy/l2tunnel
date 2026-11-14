@@ -1,0 +1,15 @@
+{
+  "scope": "Byte-exact saved global header plus one known native record; whole archived file hash reverified, no packet scan or historical verdict change.",
+  "archive_manifest_sha256": "7d83d003df360d9d999199862dd5345507a2eae347211642ece8d4889f6bda81",
+  "source_capture": "work/swift-receive-fairness-20261114/native-observations-attempt-1/03-a-quic-like-impaired/native-a.pcap",
+  "source_capture_sha256": "488faaa05518b765852fc3865e762ede85cb0d2fa0d94827f70d364d6fee00e4",
+  "source_capture_bytes": 48257708,
+  "source_record_offset": 4920,
+  "source_record_bytes": 176,
+  "source_record_sha256": "9901f227ff3a52c434c471b9935b0f2042572fee3a0b67ee2d7c36bb6ded85dc",
+  "captured_bytes": 160,
+  "original_frame_bytes": 590,
+  "fixture": "port-unreachable-20261114.pcap",
+  "fixture_bytes": 200,
+  "fixture_sha256": "ccb7f1c935ee5688b975b96a5df3be5d2692d7b5f7a3623e3d7376f28d34eca6"
+}

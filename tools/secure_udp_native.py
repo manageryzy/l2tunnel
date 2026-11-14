@@ -632,6 +632,66 @@ def _native_icmp_sample(ip: bytes, total: int) -> dict | None:
         'ip_bytes': total, 'df': bool(fragment & 0x4000), 'payload_prefix': ip[28:44].hex()}
 
 
+def _native_icmp_error(ip: bytes, total: int) -> dict:
+    """Classify the owned lab's classic UDP quote, not socket membership or cause."""
+    if (len(ip) < 56 or ip[0] != 0x45 or total < 56 or total > 1500
+            or int.from_bytes(ip[2:4], 'big') != total
+            or int.from_bytes(ip[6:8], 'big') & 0xbfff
+            or ip[20:22] != bytes([3, 3]) or ip[24:28] != bytes(4)):
+        raise ValueError('unsupported native ICMP port-unreachable header/extent')
+    if (ip[28] != 0x45 or ip[37] != 17 or int.from_bytes(ip[34:36], 'big') & 0xbfff
+            or bounded.checksum(ip[28:48])):
+        raise ValueError('unsupported native ICMP quoted IPv4 header')
+    source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+    quoted_source, quoted_destination = socket.inet_ntoa(ip[40:44]), socket.inet_ntoa(ip[44:48])
+    quoted_total = int.from_bytes(ip[30:32], 'big')
+    source_port, destination_port, udp_bytes = struct.unpack('!HHH', ip[48:54])
+    if ({source, destination} != set(HOST.values())
+            or quoted_source != destination or quoted_destination != source
+            or udp_bytes not in (8, 9, 26, 72, 520, 1208, 1480)
+            or quoted_total != 20 + udp_bytes or total > 28 + quoted_total
+            or (source_port == 24461) == (destination_port == 24461)
+            or source_port == 0 or destination_port == 0):
+        raise ValueError('unsupported native ICMP port-unreachable quote')
+    complete = total <= len(ip)
+    if complete and bounded.checksum(ip[20:total]):
+        raise ValueError('invalid complete native ICMP checksum')
+    return {'source': source, 'address': destination, 'type': 3, 'code': 3, 'ip_bytes': total,
+        'quoted_source': quoted_source, 'quoted_address': quoted_destination,
+        'quoted_source_port': source_port, 'quoted_destination_port': destination_port,
+        'quoted_protocol': 17, 'quoted_ip_bytes': quoted_total, 'quoted_udp_bytes': udp_bytes,
+        'checksum_status': 'verified' if complete else 'not_observed_truncated_snapshot'}
+
+
+def _native_icmp_observation(ip: bytes, total: int) -> tuple[dict | None, dict | None]:
+    """Keep echo fingerprints and structural native error observations separate."""
+    if len(ip) < 20:
+        raise ValueError('truncated native IPv4 header')
+    if ip[9] != 1:
+        return None, None
+    if ip[0] != 0x45 or len(ip) < 28:
+        raise ValueError('unsupported native ICMP IPv4 options/truncated header')
+    if ip[20:22] == bytes([3, 3]):
+        return None, _native_icmp_error(ip, total)
+    return _native_icmp_sample(ip, total), None
+
+
+def _record_native_icmp(echo: dict, errors: dict, sample: dict | None, error: dict | None) -> None:
+    if sample is None and error is None:
+        return
+    if len(echo['samples']) + errors['count'] >= 128:
+        raise BoundExhausted('native ICMP observation ceiling exhausted')
+    if sample is not None:
+        echo['requests' if sample['type'] == 8 else 'replies'] += 1
+        echo['samples'].append(sample)
+    else:
+        errors['count'] += 1
+        if len(errors['samples']) < 16:
+            errors['samples'].append(error)
+        else:
+            errors['omitted'] += 1
+
+
 class _NativeCaptureCursor:
     """Observe one owned growing pcap without rescanning accepted records."""
     def __init__(self, path: Path):
@@ -639,6 +699,7 @@ class _NativeCaptureCursor:
         self._offset = self._packets = self._bytes_read = self._size = 0
         self._format, self._closed = None, False
         self._icmp = {'requests': 0, 'replies': 0, 'samples': []}
+        self._icmp_errors = {'count': 0, 'samples': [], 'omitted': 0}
 
     @property
     def offset(self):
@@ -655,6 +716,10 @@ class _NativeCaptureCursor:
     @property
     def native_icmp(self):
         return {**self._icmp, 'samples': [dict(sample) for sample in self._icmp['samples']]}
+
+    @property
+    def native_icmp_errors(self):
+        return {**self._icmp_errors, 'samples': [dict(sample) for sample in self._icmp_errors['samples']]}
 
     def close(self):
         self._closed = True
@@ -731,21 +796,16 @@ class _NativeCaptureCursor:
                 break
             if self._packets + 1 >= BOUNDS['capture_packets']:
                 raise BoundExhausted('capture packet ceiling exhausted')
-            sample = None
             if frame[12:14] != b'\x08\x06':
                 if frame[12:14] != b'\x08\x00':
                     raise ValueError('unexpected IP family/underlay Ethernet type')
                 ip, total = _captured_ipv4(frame, original)
-                sample = _native_icmp_sample(ip, total)
-                if sample is not None and len(self._icmp['samples']) >= 128:
-                    raise BoundExhausted('native ICMP observation ceiling exhausted')
+                sample, error = _native_icmp_observation(ip, total)
+                _record_native_icmp(self._icmp, self._icmp_errors, sample, error)
             # An incomplete or malformed record cannot adopt a cursor or key.
             self._offset += 16 + captured
             self._packets += 1
             result['records_read'] += 1
-            if sample is not None:
-                self._icmp['requests' if sample['type'] == 8 else 'replies'] += 1
-                self._icmp['samples'].append(sample)
         self._check_file(terminal)
         if not result['incomplete'] and self._size > self._offset:
             result['at_end'] = False
@@ -822,7 +882,8 @@ def drain_native_capture(process, path, phases, deadline, *, clock=time.monotoni
             seen = {_native_icmp_key(sample) for sample in cursor.native_icmp['samples']}
             missing = [sample for sample in expected if _native_icmp_key(sample) not in seen]
             report.update(matched_keys=24 - len(missing), missing=missing, offset=cursor.offset,
-                packets=cursor.packets, bytes_read=cursor.bytes_read, process_returncode=code)
+                packets=cursor.packets, bytes_read=cursor.bytes_read, process_returncode=code,
+                native_icmp_errors=cursor.native_icmp_errors)
             now = clock()
             if now >= deadline:
                 raise BoundExhausted('original case deadline exhausted during capture drain')
@@ -837,7 +898,8 @@ def drain_native_capture(process, path, phases, deadline, *, clock=time.monotoni
     except Exception as error:
         failure = error
         if cursor is not None:
-            report.update(offset=cursor.offset, packets=cursor.packets, bytes_read=cursor.bytes_read)
+            report.update(offset=cursor.offset, packets=cursor.packets, bytes_read=cursor.bytes_read,
+                native_icmp_errors=cursor.native_icmp_errors)
             if expected is not None:
                 seen = {_native_icmp_key(sample) for sample in cursor.native_icmp['samples']}
                 missing = [sample for sample in expected if _native_icmp_key(sample) not in seen]
@@ -873,6 +935,7 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
         raise ObservationError('capture realtime/monotonic clock offset unstable')
     result = {'packets': 0, 'arp': 0, 'udp': 0, 'tcp': 0, 'handshake': 0, 'established': 0, 'icmp_path_errors': 0,
         'native_icmp': {'requests': 0, 'replies': 0, 'samples': []},
+        'native_icmp_errors': {'count': 0, 'samples': [], 'omitted': 0},
         'directions': {side: {'packets': 0, 'ip_bytes': 0, 'measurement_min_ip_bytes': 0, 'measurement_max_ip_bytes': 0} for side in ('a', 'b')},
         'user_epochs': {}, 'snapshot_bytes': BOUNDS['capture_snaplen'], 'payload_integrity': 'endpoint exact probes, not truncated capture'}
     def account_ip(direction, total, seconds, fraction, precision):
@@ -908,13 +971,8 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
                 raise ValueError('unexpected IP family/underlay Ethernet type')
             ip, total = _captured_ipv4(frame, original)
             if local_side is None:
-                sample = _native_icmp_sample(ip, total)
-                if sample is not None:
-                    observed = result['native_icmp']
-                    if len(observed['samples']) >= 128:
-                        raise BoundExhausted('native ICMP observation ceiling exhausted')
-                    observed['requests' if sample['type'] == 8 else 'replies'] += 1
-                    observed['samples'].append(sample)
+                sample, error = _native_icmp_observation(ip, total)
+                _record_native_icmp(result['native_icmp'], result['native_icmp_errors'], sample, error)
                 continue
             if ip[0] != 0x45:
                 raise ValueError('unsupported protected WAN IPv4 options')
@@ -1009,22 +1067,43 @@ def icmp_capture_complete(audit: dict, phases: dict) -> dict:
     return {'probes': checked, 'scope': 'captured complete IP extent, DF requests and fresh payload prefix; complete ICMP checksum/payload validated by endpoint'}
 
 
+def _capture_counter_observation(values: dict, returncode: int | None) -> dict:
+    reasons = []
+    if values['captured'] >= BOUNDS['capture_packets']:
+        reasons.append('packet_cap')
+    if values['kernel_dropped']:
+        reasons.append('kernel_dropped')
+    if type(returncode) is not int or returncode not in (0, -signal.SIGINT):
+        reasons.append('process_exit')
+    return {'schema': 1, 'counters': dict(values), 'returncode': returncode,
+        'parse_status': 'complete', 'qualification': 'rejected' if reasons else 'passed',
+        'qualification_reasons': reasons}
+
+
 def capture_counts(log: Path, process: subprocess.Popen) -> dict:
     bounded.stop(process, interrupt=True)
     text = bounded.read_log(log)
     values = {}
-    for field, expression in [('captured', r'(\d+) packets captured'), ('received', r'(\d+) packets received by filter'),
-                              ('kernel_dropped', r'(\d+) packets dropped by kernel')]:
-        matches = re.findall(expression, text)
-        if len(matches) != 1:
+    for field, suffix in [('captured', ' packets captured'), ('received', ' packets received by filter'),
+                          ('kernel_dropped', ' packets dropped by kernel')]:
+        lines = [line for line in text.splitlines() if suffix in line]
+        if len(lines) != 1:
             raise ObservationError('tcpdump final counters missing/ambiguous')
-        values[field] = int(matches[0])
-    if values['captured'] >= BOUNDS['capture_packets']:
-        raise BoundExhausted('tcpdump packet ceiling exhausted')
-    if values['kernel_dropped']:
-        raise ObservationError('capture lost packets in kernel')
-    if process.returncode not in (0, -signal.SIGINT):
-        raise ObservationError('tcpdump failed: ' + str(process.returncode))
+        match = re.fullmatch(r'([0-9]{1,20})' + re.escape(suffix), lines[0])
+        if match is None or int(match[1]) > (1 << 64) - 1:
+            raise ObservationError('tcpdump final counter outside bounded unsigned grammar')
+        values[field] = int(match[1])
+    observation = _capture_counter_observation(values, process.returncode)
+    reasons = observation['qualification_reasons']
+    if reasons:
+        if 'packet_cap' in reasons:
+            error = BoundExhausted('tcpdump packet ceiling exhausted')
+        elif 'kernel_dropped' in reasons:
+            error = ObservationError('capture lost packets in kernel')
+        else:
+            error = ObservationError('tcpdump failed: ' + str(process.returncode))
+        error.capture_counter_observation = observation
+        raise error
     return values
 
 
@@ -1035,7 +1114,24 @@ def aligned_peers(peers: dict, require_epoch: bool = True) -> dict:
     return peers
 
 
-def capture_complete(audit: dict, counters: dict) -> None:
+def capture_complete(audit: dict, counters: dict, *, require_lossless: bool = False) -> None:
+    """Check record equality; only explicit strict calls qualify lossless capture."""
+    if type(require_lossless) is not bool:
+        raise ValueError('explicit capture qualification flag required')
+    if 'kernel_dropped' in counters:
+        dropped = counters['kernel_dropped']
+        if type(dropped) is not int or not 0 <= dropped < 1 << 64 or dropped != 0:
+            raise ObservationError('capture lost packets or has invalid kernel drop count')
+    if require_lossless:
+        if (set(counters) != {'captured', 'received', 'kernel_dropped'}
+                or any(type(value) is not int or not 0 <= value < 1 << 64 for value in counters.values())):
+            raise ObservationError('complete bounded capture counters required')
+        if counters['captured'] >= BOUNDS['capture_packets']:
+            raise BoundExhausted('tcpdump packet ceiling exhausted')
+    if type(audit.get('packets')) is not int or not 0 <= audit['packets'] < 1 << 64:
+        raise ValueError('bounded parsed capture record count required')
+    if type(counters.get('captured')) is not int or not 0 <= counters['captured'] < 1 << 64:
+        raise ObservationError('bounded captured counter required')
     if audit['packets'] != counters['captured']:
         raise ValueError('parsed capture records differ from tcpdump captured count')
 
@@ -1144,7 +1240,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         'build_receipt_sha256': bounded.file_hash(output / 'build-receipt.json'),
         'executed_helpers': verify_helpers(build, output, True), 'cleanup': 'pending'})
     processes, captures, commands, samples, errors = [], {}, [], [], []
-    capture_counters = {}
+    capture_counters, capture_counter_observations = {}, {}
     anchors, reference_result = [clock_anchor()], None
     public, daemon_starttimes, runtime_events = None, {}, None
 
@@ -1402,16 +1498,27 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         finally:
             # Drain or publication failure must not bypass any owned stop.
             for name, (child, log, capture) in captures.items():
+                observation = None
                 try:
                     counts = capture_counts(log, child)
                     capture_counters[name] = counts
+                    observation = _capture_counter_observation(counts, child.returncode)
                     receipt.update(**{name + '_capture_counters': counts})
                 except Exception as error:
+                    observation = getattr(error, 'capture_counter_observation', observation)
                     errors.append({'status': failure_status(error), 'capture': name, 'error': f'{type(error).__name__}: {error}'})
                     try:
                         bounded.stop(child)
                     except Exception:
                         pass
+                if observation is not None:
+                    try:
+                        capture_counter_observations[name] = observation
+                        receipt.update(capture_counter_observations=dict(capture_counter_observations))
+                    except Exception as error:
+                        errors.append({'status': failure_status(error), 'capture': name,
+                            'phase': 'capture_counter_observation_receipt',
+                            'error': f'{type(error).__name__}: {error}'[:4096]})
         anchors.append(clock_anchor())
         if captures and public:
             try:
@@ -1422,7 +1529,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 for name, audit in audits.items():
                     if name not in capture_counters:
                         raise ObservationError('capture has no trustworthy final tcpdump counters: ' + name)
-                    capture_complete(audit, capture_counters[name])
+                    capture_complete(audit, capture_counters[name], require_lossless=True)
                 if not audits['native-a']['arp']:
                     raise ValueError('no actual native ARP witnessed')
                 receipt.update(capture_audits=audits)
