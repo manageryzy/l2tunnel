@@ -327,6 +327,25 @@ fn secure_udp_prepared_rejects_wrong_layer_or_unreadable_attachment_before_io() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secure_udp_service_forwards_switches_reports_and_reconnects_same_owner() -> Result {
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    );
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 2);
+    secure_udp_service_lifecycle_fixture().await
+}
+
+#[tokio::test]
+async fn current_thread_secure_udp_service_preserves_full_lifecycle() -> Result {
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    secure_udp_service_lifecycle_fixture().await
+}
+
+async fn secure_udp_service_lifecycle_fixture() -> Result {
     for appearance in [
         l2tunnel_cover::Appearance::QuicLike,
         l2tunnel_cover::Appearance::MediaLike,

@@ -33,6 +33,8 @@ pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
 mod datagram_profiling;
 #[path = "delivery_cli.rs"]
 mod delivery_frontend;
+#[path = "host_runtime_cli.rs"]
+mod host_runtime;
 #[path = "profiling_cli.rs"]
 mod profiling;
 #[path = "openvpn/cli.rs"]
@@ -1236,6 +1238,9 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", swift_frontend::HELP);
         #[cfg(unix)]
         println!("\n{}", secure_udp_frontend::HELP);
+        println!(
+            "\nHost experiment: --runtime-model multi-thread|current-thread, only for Linux quic-like/media-like Swift connect/serve. Omission keeps the existing multi-thread runtime. Explicit selection emits one host_runtime schema1 observation on stderr; it does not change peer configuration or the control backend."
+        );
         println!("\n{}", raw_packet_frontend::HELP);
         println!("\n{}", delivery_frontend::HELP);
         println!(
@@ -1307,6 +1312,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     };
     if matches!(command.as_str(), "connect" | "serve") {
+        allowed.push("--runtime-model");
         allowed.push("--carrier");
         allowed.push("--profile-ms");
         allowed.extend_from_slice(delivery_frontend::OPTIONS);
@@ -1339,7 +1345,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     if local_api {
         allowed.push("--api-version");
     }
-    let result = options(&args[1..], &allowed).and_then(|options| {
+    let result = options(&args[1..], &allowed).and_then(|mut options| {
         if command == "keygen" {
             return generate(&options);
         }
@@ -1353,10 +1359,13 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
                 .build()?
                 .block_on(execute_api(command, &options));
         }
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(execute(command, &options))
+        let model = host_runtime::take(&mut options)?;
+        let (runtime, observation) = host_runtime::build(model)?;
+        if let Some(observation) = observation {
+            let encoded = serde_json::to_string(&observation).map_err(io::Error::other)?;
+            writeln!(io::stderr().lock(), "{encoded}")?;
+        }
+        runtime.block_on(execute(command, &options))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

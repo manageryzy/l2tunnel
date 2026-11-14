@@ -40,6 +40,8 @@ BOUNDS = {'case': 240, 'cleanup': 30, 'launcher': 300, 'startup': 35,
     'capture_snaplen': 160, 'status_samples': 96, 'log_bytes': 4 * 1024 * 1024}
 INITIAL = {'path_mtu': 1500, 'forward_kbit': 99_000, 'reverse_kbit': 9_900,
            'channels': 16, 'window': 64, 'repair_permille': 0}
+RUNTIME_MODELS = ('multi-thread', 'current-thread')
+RUNTIME_THREAD_LIMIT = 2048
 POLICY_FIELDS = set(INITIAL)
 STATUS_FIELDS = set(('generation carrier algorithm protection requested effective maximum_path_mtu running '
     'session transcript configuration outer member initiator_noise responder_noise local peer policy_epoch '
@@ -72,12 +74,30 @@ def failure_status(error: Exception) -> str:
     return 'failed'
 
 
-def plan(lab_id: str, cover: str, path: str, workload: str) -> dict:
+def _runtime_environment(runtime_model: str | None) -> dict | None:
+    if runtime_model is None:
+        return None
+    if type(runtime_model) is not str or runtime_model not in RUNTIME_MODELS:
+        raise ValueError('explicit supported host runtime model required')
+    if os.environ.get('TOKIO_WORKER_THREADS') is not None:
+        raise ValueError('explicit runtime experiment refuses inherited TOKIO_WORKER_THREADS')
+    return {'TOKIO_WORKER_THREADS': None}
+
+
+def _runtime_experiment(case: dict) -> bool:
+    environment = _runtime_environment(case.get('runtime_model'))
+    if environment is not None and case.get('runtime_environment') != environment:
+        raise ValueError('explicit runtime experiment environment provenance differs')
+    return environment is not None
+
+
+def plan(lab_id: str, cover: str, path: str, workload: str, runtime_model: str | None = None) -> dict:
+    environment = _runtime_environment(runtime_model)
     spec = lab.LabSpec(lab_id)
     if cover not in ('quic-like', 'media-like') or path not in PATHS or workload not in ('forward16', 'reverse-stress'):
         raise ValueError('explicit supported cover/path/workload required')
     delay, loss = PATHS[path]
-    return {'lab_id': lab_id, 'cover': cover, 'path': path, 'workload': workload,
+    result = {'lab_id': lab_id, 'cover': cover, 'path': path, 'workload': workload,
         'namespaces': spec.namespaces, 'layer': 'tap', 'algorithm': 'swift', 'protection': 'chacha20-poly1305',
         'noise_profile': 'ik', 'udp_pair': [WAN['a'] + ':24440', WAN['b'] + ':24440'],
         'path_mtu': 1500, 'maximum_path_mtu': 9000, 'max_native': 1600,
@@ -91,6 +111,9 @@ def plan(lab_id: str, cover: str, path: str, workload: str) -> dict:
         'initial_topology_commands': lab.plan_document(spec)['commands'],
         'not_qualified': ['ISP/QoS classification', 'protocol interoperability/identification resistance',
             'Windows/Android', 'automatic retained-state recovery', 'full SW-11', 'OpenVPN/raw HTTPS']}
+    if environment is not None:
+        result.update(runtime_model=runtime_model, runtime_environment=environment)
+    return result
 
 
 def verify_helpers(build: dict, directory: Path, loaded: bool = False) -> dict:
@@ -123,6 +146,7 @@ def verify_fresh_namespace(descriptors: dict[str, int], original: dict, current:
 
 
 def daemon_command(case: dict, side: str, binary: Path, secrets: Path) -> list[str]:
+    explicit_runtime = _runtime_experiment(case)
     if side not in ('a', 'b'):
         raise ValueError('explicit endpoint side required')
     other = 'b' if side == 'a' else 'a'
@@ -138,6 +162,8 @@ def daemon_command(case: dict, side: str, binary: Path, secrets: Path) -> list[s
         '--control-socket', str(secrets / f'control-{side}.sock')]
     argv += (['--identity', str(secrets / 'member.der')] if side == 'a' else
              ['--allow-key', str(secrets / 'member.pub'), '--session-cookie-key-file', str(secrets / 'cookie.key')])
+    if explicit_runtime:
+        argv += ['--runtime-model', case['runtime_model']]
     return argv
 
 
@@ -194,6 +220,31 @@ def ready_event(path: Path) -> dict:
             if isinstance(value, dict) and value.get('event') == 'secure_udp_ready':
                 return value
     raise ObservationError('no bounded secure UDP ready event: ' + str(path))
+
+
+def host_runtime_event(path: Path, requested: str) -> dict:
+    if type(requested) is not str or requested not in RUNTIME_MODELS:
+        raise ValueError('explicit supported host runtime model required')
+    found = None
+    fields = {'event', 'schema', 'requested', 'effective', 'worker_threads'}
+    for line in bounded.read_log(path).splitlines():
+        if not line.startswith('{'):
+            continue
+        value = bounded.strict_json(line)
+        if not isinstance(value, dict) or value.get('event') != 'host_runtime':
+            continue
+        if found is not None:
+            raise ObservationError('duplicate bounded host runtime startup event')
+        if (set(value) != fields or type(value['schema']) is not int or value['schema'] != 1
+                or value['requested'] != requested or value['effective'] != requested
+                or type(value['worker_threads']) is not int
+                or not 1 <= value['worker_threads'] <= RUNTIME_THREAD_LIMIT
+                or requested == 'current-thread' and value['worker_threads'] != 1):
+            raise ObservationError('host runtime startup event model/schema/worker count mismatch')
+        found = value
+    if found is None:
+        raise ObservationError('no bounded host runtime startup event: ' + str(path))
+    return found
 
 
 def record_functional(receipt, field, operation, observe_status, deadline):
@@ -395,7 +446,7 @@ def daemon_stat(raw: str, pid: int) -> dict:
     return dict(zip(('user_ticks', 'system_ticks', 'starttime_ticks', 'virtual_bytes', 'resident_pages'), values))
 
 
-def daemon_memory(raw: str, pid: int) -> dict:
+def daemon_memory(raw: str, pid: int, *, include_threads: bool = False) -> dict:
     if len(raw.encode('utf-8')) > PROC_BYTES:
         raise ObservationError('owned process status exceeds fixed byte limit')
     fields = {}
@@ -407,15 +458,20 @@ def daemon_memory(raw: str, pid: int) -> dict:
         fields[name] = int(values[0])
     if fields.pop('Pid') != pid or fields.pop('Tgid') != pid or fields['high_water_kib'] < fields['rss_kib']:
         raise ObservationError('owned process status identity/memory mismatch')
+    if include_threads:
+        values = re.findall(r'^Threads:\s+(\d+)$', raw, re.MULTILINE)
+        if len(values) != 1 or len(values[0]) > 4 or not 1 <= int(values[0]) <= RUNTIME_THREAD_LIMIT:
+            raise ObservationError('missing/duplicate/invalid owned process Threads field')
+        fields['threads'] = int(values[0])
     return fields
 
 
-def daemon_resources(child: subprocess.Popen, starttime: int | None = None) -> dict:
+def daemon_resources(child: subprocess.Popen, starttime: int | None = None, *, include_threads: bool = False) -> dict:
     if child.poll() is not None:
         raise ObservationError('launched daemon exited before resource observation')
     base = Path('/proc') / str(child.pid)
     before = daemon_stat(bounded_proc_text(base / 'stat'), child.pid)
-    memory = daemon_memory(bounded_proc_text(base / 'status'), child.pid)
+    memory = daemon_memory(bounded_proc_text(base / 'status'), child.pid, include_threads=include_threads)
     after = daemon_stat(bounded_proc_text(base / 'stat'), child.pid)
     if (child.poll() is not None or before['starttime_ticks'] != after['starttime_ticks']
             or starttime is not None and after['starttime_ticks'] != starttime
@@ -1052,6 +1108,7 @@ def capture_command(name: str, destination: Path) -> list[str]:
 
 
 def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> dict:
+    explicit_runtime = _runtime_experiment(case)
     spec = lab.LabSpec(case['lab_id'])
     spaces, deadline = spec.namespaces, time.monotonic() + BOUNDS['case']
     binary, state_dir = output / 'l2tunnel-native', Path('/run/l2tunnel-secure-native')
@@ -1062,7 +1119,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
     processes, captures, commands, samples, errors = [], {}, [], [], []
     capture_counters = {}
     anchors, reference_result = [clock_anchor()], None
-    public, daemon_starttimes = None, {}
+    public, daemon_starttimes, runtime_events = None, {}, None
 
     def command(role, *argv, cap=BOUNDS['command']):
         vector = (['ip', 'netns', 'exec', spaces[role]] if role else []) + list(argv)
@@ -1122,7 +1179,8 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
         if len(samples) >= BOUNDS['status_samples']:
             raise BoundExhausted('status sample ceiling exhausted')
         samples.append({'at_ns': time.monotonic_ns(), 'phase': label, 'peers': statuses(require_epoch=False),
-            'daemon_resources': {side: daemon_resources(daemons[side][0], daemon_starttimes[side]) for side in ('a', 'b')},
+            'daemon_resources': {side: daemon_resources(daemons[side][0], daemon_starttimes[side],
+                **({'include_threads': True} if explicit_runtime else {})) for side in ('a', 'b')},
             'host_loadavg': list(os.getloadavg()),
             'wan': {side: json.loads(command('endpoint_' + side, 'ip', '-j', '-s', 'link', 'show', 'dev', 'wan0')) for side in ('a', 'b')}})
 
@@ -1236,7 +1294,12 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
             for child, log in daemons.values():
                 bounded.wait_log(child, log, '"event":"secure_udp_ready"', min(deadline, time.monotonic() + BOUNDS['startup']))
             receipt.update(initial_ready={side: ready_event(value[1]) for side, value in daemons.items()})
-            initial_resources = {side: daemon_resources(value[0]) for side, value in daemons.items()}
+            if explicit_runtime:
+                runtime_events = {side: host_runtime_event(value[1], case['runtime_model'])
+                    for side, value in daemons.items()}
+                receipt.update(host_runtime=runtime_events)
+            initial_resources = {side: daemon_resources(value[0], **({'include_threads': True} if explicit_runtime else {}))
+                for side, value in daemons.items()}
             daemon_starttimes = {side: value['starttime_ticks'] for side, value in initial_resources.items()}
             initial = statuses(INITIAL)
             receipt.update(initial_status=initial, initial_daemon_resources=initial_resources)
@@ -1278,6 +1341,9 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
                 lambda: functional('reconnected', output, deadline, launch, command, receipt),
                 lambda side: rpc(side, 'status', cap=2), deadline)
             sample('after-reconnect')
+            if explicit_runtime and runtime_events != {
+                    side: host_runtime_event(value[1], case['runtime_model']) for side, value in daemons.items()}:
+                raise ObservationError('original daemon host runtime observation changed after reconnect')
     except Exception as error:
         errors.append({'status': failure_status(error), 'error': f'{type(error).__name__}: {error}'})
     finally:
@@ -1361,6 +1427,7 @@ def run_case(case: dict, output: Path, build: dict, namespace_proof: dict) -> di
 
 
 def worker(case: dict, output: Path, build: dict, descriptors: dict[str, int], token: str) -> int:
+    _runtime_experiment(case)
     info = output.stat()
     if (output.is_symlink() or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700
             or token != f'{info.st_dev}:{info.st_ino}' or Path(__file__).resolve() != output / 'secure_udp_native.py'):
@@ -1444,6 +1511,7 @@ def worker_file_limits():
 
 
 def launch_isolated(case: dict, output: Path, binary: Path, receipt_path: Path) -> int:
+    explicit_runtime = _runtime_experiment(case)
     # Never adopt an existing output. Once this exclusive directory exists,
     # preflight/copy/namespace/worker failures all receive a terminal receipt.
     output.mkdir(mode=0o700)
@@ -1476,6 +1544,8 @@ def launch_isolated(case: dict, output: Path, binary: Path, receipt_path: Path) 
             '--binary', str(output / 'l2tunnel-native'), '--build-receipt', str(output / 'build-receipt.json'),
             '--frozen-worker', f'{identity.st_dev}:{identity.st_ino}', '--namespace-fds',
             ','.join(f'{name}:{value}' for name, value in descriptors.items()), '--apply']
+        if explicit_runtime:
+            argv += ['--runtime-model', case['runtime_model']]
         environment = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME')}
         environment.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1')
         limits = worker_file_limits()
@@ -1520,6 +1590,7 @@ def main(argv=None) -> int:
     parser.add_argument('--cover', choices=('quic-like', 'media-like'), required=True)
     parser.add_argument('--path', choices=tuple(PATHS), required=True)
     parser.add_argument('--workload', choices=('forward16', 'reverse-stress'), default='forward16')
+    parser.add_argument('--runtime-model', choices=RUNTIME_MODELS)
     parser.add_argument('--lab-id', default='secureudp')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--binary', type=Path, required=True)
@@ -1528,7 +1599,8 @@ def main(argv=None) -> int:
     parser.add_argument('--frozen-worker', help=argparse.SUPPRESS)
     parser.add_argument('--namespace-fds', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    case = plan(args.lab_id, args.cover, args.path, args.workload)
+    case = plan(args.lab_id, args.cover, args.path, args.workload,
+        **({'runtime_model': args.runtime_model} if args.runtime_model is not None else {}))
     if not args.apply:
         print(json.dumps({'status': 'dry_run', 'case': case, 'mutations': 'none'}, indent=2))
         return 0

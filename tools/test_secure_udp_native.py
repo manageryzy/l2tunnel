@@ -498,6 +498,323 @@ else:
         with self.assertRaises(ValueError): h.capture_command('host-interface', Path('/owned/capture.pcap'))
 
 
+class HostRuntimeContracts(unittest.TestCase):
+    def runtime_case(self, model='current-thread', appearance='quic-like'):
+        with patch.dict(h.os.environ, {}, clear=True):
+            return h.plan('unit', appearance, 'impaired', 'forward16', model)
+
+    def runtime_event(self, model='current-thread', workers=1):
+        return {'event': 'host_runtime', 'schema': 1, 'requested': model,
+                'effective': model, 'worker_threads': workers}
+
+    def legacy_argv(self, appearance, side):
+        other = 'b' if side == 'a' else 'a'
+        argv = ['/binary', 'connect' if side == 'a' else 'serve', '--carrier', appearance,
+            '--record-profile', 'swift', '--duplex', 'full', '--compression', 'off', '--layer', 'tap',
+            '--device', 'tap0', '--max-packet', '1600', '--path-mtu', '1500', '--max-path-mtu', '9000',
+            '--udp-bind', h.WAN[side] + ':24440', '--udp-peer', h.WAN[other] + ':24440',
+            '--noise-profile', 'ik', '--noise-private-key-file', f'/keys/noise-{side}.key',
+            '--noise-peer-key-file', f'/keys/noise-{other}.pub',
+            '--session-admission-key-file', '/keys/admission.key', '--swift-forward-kbit', '99000',
+            '--swift-reverse-kbit', '9900', '--swift-channels', '16', '--swift-window', '64',
+            '--swift-repair-permille', '0', '--swift-report-ms', '1000',
+            '--control-socket', f'/keys/control-{side}.sock']
+        return argv + (['--identity', '/keys/member.der'] if side == 'a' else
+            ['--allow-key', '/keys/member.pub', '--session-cookie-key-file', '/keys/cookie.key'])
+
+    def test_omitted_runtime_preserves_exact_legacy_plan_fields_and_daemon_argv(self):
+        fields = set(('lab_id cover path workload namespaces layer algorithm protection noise_profile udp_pair '
+            'path_mtu maximum_path_mtu max_native initial_policy flows shared_htb_mbps one_way_delay_ms '
+            'loss_percent_per_direction inner_tcp inner_rto_min_ms warmup_seconds measurement_seconds '
+            'max_bytes_per_direction_flow probe_original_seconds forward_lab_target_mbps target_provenance '
+            'reverse_bulk bounds fresh_outer_namespaces capture initial_topology_commands not_qualified').split())
+        for appearance in ('quic-like', 'media-like'):
+            with self.subTest(cover=appearance), patch.dict(h.os.environ, {'TOKIO_WORKER_THREADS': '7'}, clear=True):
+                original = case(appearance)
+                self.assertEqual(original, h.plan('unit', appearance, 'impaired', 'forward16', None))
+                self.assertEqual(set(original), fields)
+                self.assertEqual(original['initial_policy'], {'path_mtu': 1500, 'forward_kbit': 99000,
+                    'reverse_kbit': 9900, 'channels': 16, 'window': 64, 'repair_permille': 0})
+                self.assertEqual(original['forward_lab_target_mbps'], 80)
+                self.assertEqual((original['warmup_seconds'], original['measurement_seconds']), (5, 20))
+                self.assertEqual((original['one_way_delay_ms'], original['loss_percent_per_direction']), (35, 15))
+                for side in ('a', 'b'):
+                    self.assertEqual(h.daemon_command(original, side, Path('/binary'), Path('/keys')),
+                                     self.legacy_argv(appearance, side))
+                self.assertEqual(h.os.environ['TOKIO_WORKER_THREADS'], '7')
+
+    def test_explicit_runtime_adds_only_host_plan_metadata_and_both_daemon_flags(self):
+        for appearance in ('quic-like', 'media-like'):
+            for model in ('multi-thread', 'current-thread'):
+                with self.subTest(cover=appearance, model=model), patch.dict(h.os.environ, {}, clear=True):
+                    original = case(appearance)
+                    selected = h.plan('unit', appearance, 'impaired', 'forward16', model)
+                    self.assertEqual(selected, {**original, 'runtime_model': model,
+                        'runtime_environment': {'TOKIO_WORKER_THREADS': None}})
+                    for side in ('a', 'b'):
+                        self.assertEqual(h.daemon_command(selected, side, Path('/binary'), Path('/keys')),
+                            self.legacy_argv(appearance, side) + ['--runtime-model', model])
+                    self.assertEqual(set(h.os.environ), set())
+
+    def test_invalid_runtime_model_is_rejected_before_any_process_or_input(self):
+        for model in ('', 'single-thread', 'CURRENT-THREAD', True, 1, [], {}):
+            with self.subTest(model=model), patch.dict(h.os.environ, {}, clear=True), \
+                    patch.object(h.subprocess, 'Popen') as spawn, \
+                    patch.object(h.bounded, 'verified_build_receipt') as verify:
+                with self.assertRaises(ValueError):
+                    h.plan('unit', 'quic-like', 'impaired', 'forward16', model)
+            spawn.assert_not_called(); verify.assert_not_called()
+
+    def test_native_parser_dry_run_forwards_explicit_selection_without_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'not-created'
+            for model in ('multi-thread', 'current-thread'):
+                with self.subTest(model=model), patch.dict(h.os.environ, {}, clear=True), \
+                        contextlib.redirect_stdout(io.StringIO()) as text, \
+                        patch.object(h.subprocess, 'Popen') as spawn, \
+                        patch.object(h.bounded, 'verified_build_receipt') as verify, \
+                        patch.object(h, 'namespace_ids') as namespaces:
+                    self.assertEqual(h.main(['--cover', 'media-like', '--path', 'impaired', '--lab-id', 'unit',
+                        '--output', str(output), '--binary', '/not-read', '--runtime-model', model]), 0)
+                value = json.loads(text.getvalue())
+                self.assertEqual(value['case'], self.runtime_case(model, 'media-like'))
+                self.assertEqual(value['mutations'], 'none')
+                self.assertFalse(output.exists())
+                spawn.assert_not_called(); verify.assert_not_called(); namespaces.assert_not_called()
+
+    def test_native_parser_rejects_invalid_and_missing_runtime_choice_before_setup(self):
+        for suffix in (['--runtime-model', 'fake'], ['--runtime-model']):
+            with self.subTest(suffix=suffix), patch.dict(h.os.environ, {}, clear=True), \
+                    contextlib.redirect_stderr(io.StringIO()), patch.object(h, 'plan') as planner, \
+                    patch.object(h.subprocess, 'Popen') as spawn:
+                with self.assertRaises(SystemExit) as caught:
+                    h.main(['--cover', 'quic-like', '--path', 'clean', '--output', '/unused',
+                            '--binary', '/unused', *suffix])
+            self.assertEqual(caught.exception.code, 2)
+            planner.assert_not_called(); spawn.assert_not_called()
+
+    def test_native_apply_forwards_optional_runtime_to_launcher(self):
+        for model in (None, 'multi-thread', 'current-thread'):
+            flags = [] if model is None else ['--runtime-model', model]
+            with self.subTest(model=model), patch.dict(h.os.environ, {}, clear=True), \
+                    patch.object(h.sys, 'platform', 'linux'), patch.object(h, 'launch_isolated', return_value=0) as launch:
+                self.assertEqual(h.main(['--cover', 'quic-like', '--path', 'impaired', '--lab-id', 'unit',
+                    '--output', '/unused', '--binary', '/binary', '--build-receipt', '/build', '--apply', *flags]), 0)
+            observed, output, binary, receipt = launch.call_args.args
+            self.assertEqual(observed, self.runtime_case(model))
+            self.assertEqual((output, binary, receipt), (Path('/unused'), Path('/binary'), Path('/build')))
+
+    def test_native_copied_worker_forwards_runtime_without_changing_namespace_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory).resolve()
+            for model in (None, 'multi-thread', 'current-thread'):
+                flags = [] if model is None else ['--runtime-model', model]
+                with self.subTest(model=model), patch.dict(h.os.environ, {}, clear=True), \
+                        patch.object(h.sys, 'platform', 'linux'), \
+                        patch.object(h.bounded, 'verified_build_receipt', return_value={'verified': True}), \
+                        patch.object(h, 'worker', return_value=0) as worker:
+                    self.assertEqual(h.main(['--cover', 'quic-like', '--path', 'impaired', '--lab-id', 'unit',
+                        '--output', str(output), '--binary', str(output / 'l2tunnel-native'),
+                        '--build-receipt', str(output / 'build-receipt.json'), '--apply',
+                        '--frozen-worker', 'device:inode', '--namespace-fds', 'user:11,net:12,mnt:13', *flags]), 0)
+                selected, observed_output, build, descriptors, token = worker.call_args.args
+                self.assertEqual(selected, self.runtime_case(model))
+                self.assertEqual(observed_output, output)
+                self.assertEqual(build, {'verified': True})
+                self.assertEqual(descriptors, {'user': 11, 'net': 12, 'mnt': 13})
+                self.assertEqual(token, 'device:inode')
+
+    def test_actual_launcher_forwards_model_to_copied_worker_and_preserves_omitted_override(self):
+        for model in (None, 'multi-thread', 'current-thread'):
+            environment = {'TOKIO_WORKER_THREADS': '7'} if model is None else {}
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(h.os.environ, environment, clear=True):
+                root = Path(directory); output = root / 'fresh'
+                binary = root / 'binary'; binary.write_bytes(b'unit-fixture-binary')
+                receipt = root / 'build.json'; receipt.write_text('{}')
+                sources = {'tools/' + name: h.bounded.file_hash(Path(h.__file__).parent / name) for name in h.HELPERS}
+                build = {'source_sha256_after': sources}
+                child = Mock(pid=123456); child.wait.return_value = 0
+
+                def spawn(argv, **kwargs):
+                    expected = [] if model is None else ['--runtime-model', model]
+                    self.assertEqual(argv.count('--runtime-model'), 0 if model is None else 1)
+                    if expected:
+                        index = argv.index('--runtime-model')
+                        self.assertEqual(argv[index:index + 2], expected)
+                    self.assertEqual(argv[argv.index('--cover') + 1], 'quic-like')
+                    self.assertEqual(argv[argv.index('--workload') + 1], 'forward16')
+                    self.assertEqual(kwargs['env'].get('TOKIO_WORKER_THREADS'), environment.get('TOKIO_WORKER_THREADS'))
+                    h.bounded.Receipt(output / 'receipt.json', {'status': 'passed', 'cleanup': 'passed'})
+                    return child
+
+                with patch.object(h.bounded, 'verified_build_receipt', return_value=build), \
+                        patch.object(h.shutil, 'which', return_value='/usr/bin/unshare'), \
+                        patch.object(h.subprocess, 'Popen', side_effect=spawn) as launched, \
+                        patch.object(h, 'terminate_owned_group') as stop:
+                    selected = h.plan('unit', 'quic-like', 'impaired', 'forward16', model)
+                    self.assertEqual(h.launch_isolated(selected, output, binary, receipt), 0)
+                launched.assert_called_once(); stop.assert_called_once_with(child)
+                self.assertEqual(dict(h.os.environ), environment)
+                saved = json.loads((output / 'launch-receipt.json').read_text())
+                self.assertEqual(saved['status'], 'passed')
+                self.assertEqual(saved['plan'], selected)
+
+    def test_explicit_inherited_worker_override_refuses_even_empty_without_sanitizing_environment(self):
+        for value in ('', '1', '7', 'invalid'):
+            for model in ('multi-thread', 'current-thread'):
+                environment = {'TOKIO_WORKER_THREADS': value, 'OTHER_UNIT_FIELD': 'retained'}
+                with self.subTest(value=value, model=model), patch.dict(h.os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(ValueError, 'TOKIO_WORKER_THREADS'):
+                        h.plan('unit', 'quic-like', 'impaired', 'forward16', model)
+                    self.assertEqual(dict(h.os.environ), environment)
+
+    def test_explicit_daemon_command_rejects_inherited_override_or_forged_environment_provenance(self):
+        selected = self.runtime_case()
+        with patch.dict(h.os.environ, {'TOKIO_WORKER_THREADS': '1'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'TOKIO_WORKER_THREADS'):
+                h.daemon_command(selected, 'a', Path('/binary'), Path('/keys'))
+            self.assertEqual(h.os.environ['TOKIO_WORKER_THREADS'], '1')
+        for provenance in (None, {}, {'TOKIO_WORKER_THREADS': '1'},
+                {'TOKIO_WORKER_THREADS': None, 'unreviewed': None}):
+            with self.subTest(provenance=provenance), patch.dict(h.os.environ, {}, clear=True):
+                corrupted = {**selected, 'runtime_environment': provenance}
+                with self.assertRaises(ValueError):
+                    h.daemon_command(corrupted, 'b', Path('/binary'), Path('/keys'))
+
+    def test_direct_launcher_refuses_newly_inherited_override_before_verify_copy_or_spawn(self):
+        selected = self.runtime_case()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(h.os.environ, {'TOKIO_WORKER_THREADS': ''}, clear=True), \
+                patch.object(h.bounded, 'verified_build_receipt') as verify, \
+                patch.object(h.shutil, 'copyfile') as copy_file, patch.object(h.subprocess, 'Popen') as spawn:
+            output = Path(directory) / 'fresh'
+            with self.assertRaisesRegex(ValueError, 'TOKIO_WORKER_THREADS'):
+                h.launch_isolated(selected, output, Path('/not-read'), Path('/not-read'))
+            self.assertFalse(output.exists())
+            self.assertEqual(h.os.environ['TOKIO_WORKER_THREADS'], '')
+        verify.assert_not_called(); copy_file.assert_not_called(); spawn.assert_not_called()
+
+    def test_direct_run_case_refuses_newly_inherited_override_before_receipt_or_system_activity(self):
+        selected = self.runtime_case('multi-thread')
+        with patch.dict(h.os.environ, {'TOKIO_WORKER_THREADS': '1'}, clear=True), \
+                patch.object(h.bounded, 'Receipt') as receipt, patch.object(h, 'resource_context') as resources, \
+                patch.object(h.bounded, 'bounded_lab') as topology, patch.object(h.bounded, 'launch') as spawn:
+            with self.assertRaisesRegex(ValueError, 'TOKIO_WORKER_THREADS'):
+                h.run_case(selected, Path('/not-created'), {}, {})
+            self.assertEqual(h.os.environ['TOKIO_WORKER_THREADS'], '1')
+        receipt.assert_not_called(); resources.assert_not_called(); topology.assert_not_called(); spawn.assert_not_called()
+
+    def test_startup_runtime_event_has_actual_five_field_schema_and_does_not_replace_ready(self):
+        for model, workers in (('multi-thread', 3), ('current-thread', 1)):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'daemon.log'
+                event = self.runtime_event(model, workers)
+                ready = {'event': 'secure_udp_ready', 'status': status()['state']['secure_udp']}
+                path.write_text('ordinary startup text\n' + json.dumps(event) + '\n' + json.dumps(ready)
+                    + '\n' + json.dumps({'event': 'secure_udp_terminal'}) + '\n')
+                self.assertEqual(h.host_runtime_event(path, model), event)
+                self.assertEqual(h.ready_event(path), ready)
+
+    def test_startup_runtime_event_requires_exactly_one_even_when_duplicate_differs(self):
+        event = self.runtime_event()
+        for events in ([], [event, event], [event, self.runtime_event('multi-thread', 3)]):
+            with self.subTest(events=events), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'daemon.log'
+                path.write_text('\n'.join(json.dumps(row) for row in events)
+                    + '\n' + json.dumps({'event': 'secure_udp_ready'}) + '\n')
+                with self.assertRaises((ValueError, h.ObservationError)):
+                    h.host_runtime_event(path, 'current-thread')
+
+    def test_startup_runtime_event_rejects_unsupported_requested_model_before_reading_log(self):
+        for model in ('fake', '', None, True, [], {}):
+            with self.subTest(model=model), patch.object(h.bounded, 'read_log') as read:
+                with self.assertRaises(ValueError):
+                    h.host_runtime_event(Path('/not-read'), model)
+            read.assert_not_called()
+
+    def test_startup_runtime_event_rejects_missing_unknown_or_wrongly_typed_fields(self):
+        original = self.runtime_event()
+        invalid = [{name: value for name, value in original.items() if name != field} for field in original]
+        invalid += [{**original, 'unknown': 1}, {**original, 'schema': True}, {**original, 'schema': 1.0},
+            {**original, 'schema': 2}, {**original, 'requested': 'multi-thread'},
+            {**original, 'effective': 'multi-thread'}, {**original, 'effective': None},
+            {**original, 'requested': ['current-thread']}]
+        for event in invalid:
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'daemon.log'; path.write_text(json.dumps(event) + '\n')
+                with self.assertRaises((ValueError, h.ObservationError)):
+                    h.host_runtime_event(path, 'current-thread')
+
+    def test_startup_runtime_event_rejects_duplicate_json_keys_and_unbounded_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daemon.log'
+            path.write_text('{"event":"host_runtime","schema":1,"schema":1,"requested":"current-thread",'
+                '"effective":"current-thread","worker_threads":1}\n')
+            with self.assertRaises((ValueError, h.ObservationError)):
+                h.host_runtime_event(path, 'current-thread')
+            path.write_bytes(b'x' * (h.bounded.LOG_LIMIT + 1))
+            with self.assertRaises((ValueError, RuntimeError, h.ObservationError)):
+                h.host_runtime_event(path, 'current-thread')
+
+    def test_startup_runtime_workers_are_bounded_integers_and_current_thread_reports_one(self):
+        for model in ('multi-thread', 'current-thread'):
+            invalid = [True, False, -1, 0, 1.0, '1', None, 2049, 1 << 64]
+            if model == 'current-thread': invalid += [2, 2048]
+            for workers in invalid:
+                with self.subTest(model=model, workers=workers), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / 'daemon.log'
+                    path.write_text(json.dumps(self.runtime_event(model, workers)) + '\n')
+                    with self.assertRaises((ValueError, h.ObservationError)):
+                        h.host_runtime_event(path, model)
+        for workers in (1, 7, 2048):
+            with self.subTest(multithread_workers=workers), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'daemon.log'
+                event = self.runtime_event('multi-thread', workers); path.write_text(json.dumps(event) + '\n')
+                self.assertEqual(h.host_runtime_event(path, 'multi-thread'), event)
+
+    def test_optional_threads_parser_preserves_old_shape_but_records_actual_extra_threads(self):
+        for threads in (1, 3, 2048):
+            raw = process_status() + f'Threads:\t{threads}\n'
+            with self.subTest(threads=threads):
+                self.assertEqual(h.daemon_memory(raw, 123), {'rss_kib': 1024, 'high_water_kib': 2048})
+                self.assertEqual(h.daemon_memory(raw, 123, include_threads=True),
+                    {'rss_kib': 1024, 'high_water_kib': 2048, 'threads': threads})
+        malformed = process_status() + 'Threads:\tinvalid\nThreads:\t0\n'
+        self.assertEqual(h.daemon_memory(malformed, 123), {'rss_kib': 1024, 'high_water_kib': 2048})
+
+    def test_explicit_threads_require_bounded_positive_single_field_and_matching_pid(self):
+        invalid = [process_status(), process_status(124) + 'Threads:\t3\n',
+            process_status().replace('Tgid:\t123', 'Tgid:\t124') + 'Threads:\t3\n',
+            process_status() + 'Threads:\t1\nThreads:\t2\n',
+            process_status() + 'Threads:\t0\n', process_status() + 'Threads:\t-1\n',
+            process_status() + 'Threads:\t1.0\n', process_status() + 'Threads:\tTrue\n',
+            process_status() + 'Threads:\t2049\n', process_status() + f'Threads:\t{1 << 64}\n',
+            process_status() + 'Threads:\t2 units\n', process_status() + 'x' * h.PROC_BYTES]
+        for raw in invalid:
+            with self.subTest(raw=raw[-48:]), self.assertRaises(h.ObservationError):
+                h.daemon_memory(raw, 123, include_threads=True)
+
+    def test_explicit_resources_reuse_the_same_status_read_and_keep_pid_exit_guards(self):
+        child = Mock(pid=123); child.poll.return_value = None
+        with patch.object(h, 'bounded_proc_text', side_effect=[process_stat(),
+                process_status() + 'Threads:\t3\n', process_stat(user=107)]) as read:
+            value = h.daemon_resources(child, 500, include_threads=True)
+        self.assertEqual(value['threads'], 3)
+        self.assertEqual(value['user_ticks'], 107)
+        self.assertEqual([call.args[0] for call in read.call_args_list],
+            [Path('/proc/123/stat'), Path('/proc/123/status'), Path('/proc/123/stat')])
+        for changed in (process_stat(start=501), process_stat(user=99)):
+            with self.subTest(changed=changed), patch.object(h, 'bounded_proc_text',
+                    side_effect=[process_stat(), process_status() + 'Threads:\t3\n', changed]), \
+                    self.assertRaises(h.ObservationError):
+                h.daemon_resources(child, 500, include_threads=True)
+        child.poll.side_effect = [None, 0]
+        with patch.object(h, 'bounded_proc_text', side_effect=[process_stat(),
+                process_status() + 'Threads:\t3\n', process_stat()]), self.assertRaises(h.ObservationError):
+            h.daemon_resources(child, 500, include_threads=True)
+
+
 class CaptureContracts(unittest.TestCase):
     anchors = [{'offset_ns': 0, 'uncertainty_ns': 0}, {'offset_ns': 0, 'uncertainty_ns': 0}]
 
