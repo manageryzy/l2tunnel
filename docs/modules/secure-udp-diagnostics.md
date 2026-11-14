@@ -255,7 +255,7 @@ proof; this follow-up changes only ledger evidence. Nothing was pushed or publis
 
 Status: **implemented, contract-tested and workspace-checked**, with a fresh
 evidence-verified native matrix; its eight impaired performance targets fail.
-Final evidence reconciliation and the local checkpoint remain pending. This contract was recorded before
+Evidence is reconciled and an actual local source checkpoint is saved. This contract was recorded before
 production edits in the [saved design](../../work/native-capture-observations-20261114/design-v0.md). The later
 [receive-fairness matrix](../../work/swift-receive-fairness-20261114/native-analysis-attempt-1/validation.json)
 retains two capture gaps. Case02 lost 24,979/22,768/12,017 packets in its three
@@ -323,7 +323,7 @@ retry, host setting, default, protocol byte or parent requirement changes.
 - [x] [SGD-11] Implement one shared bounded native ICMP dispatcher with separate error observations and unchanged echo/WAN grammar,24-key witness and final audit requirements. Evidence: [shared implementation](../../tools/secure_udp_native.py) and [frozen-source focused pass](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json).
 - [x] [SGD-12] Retain complete parsed negative counter observations without successful strict counter fields; preserve original errors, stop/final audit/cleanup and enforce explicit zero-drop qualification in real runs. Evidence: [shared counter/finalization implementation](../../tools/secure_udp_native.py) and [counter, finalization and retained harness regressions](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json).
 - [x] [SGD-13] Pass frozen-source focused and required checks; record a fresh immutable16-case native attempt and independent analysis with original targets and all failed/unavailable outcomes retained. Evidence: [required second aggregate](../../work/native-capture-observations-20261114/aggregate-attempt-2/validation.json), [all16 evidence-verified observations](../../work/native-capture-observations-20261114/native-analysis-attempt-1/validation.json), [additive field validation](../../work/native-capture-observations-20261114/additive-observation-analysis-attempt-1/validation.json) and [byte-exact archive](../../work/native-capture-observations-20261114/native-observations-attempt-1/archive-validation.json). Eight clean native cases pass; all eight impaired80 targets retain failed verdicts.
-- [ ] [SGD-14] Reconcile actual source/build/native evidence, distinguish structural/functional/performance/platform claims, and save an actual local checkpoint before closing this correction.
+- [x] [SGD-14] Reconcile actual source/build/native evidence, distinguish structural/functional/performance/platform claims, and save an actual local checkpoint before closing this correction. Evidence: [non-document inputs unchanged after reconciliation](../../work/native-capture-observations-20261114/aggregate-attempt-2/postcheck/ledger-2/validation.json) and [actual source checkpoint5df423ae05e0cb1e84dbbc6cef971b0c5851bf7e](../../work/native-capture-observations-20261114/checkpoint-attempt-1/validation.json). This closes the scoped observation correction; all original failed80 targets and parent gates remain open.
 
 The [source-stable focused check](../../work/native-capture-observations-20261114/focused-attempt-1/validation.json)
 passes all104 retained harness cases and27 new cases plus Python compilation.

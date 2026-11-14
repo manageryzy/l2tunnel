@@ -205,8 +205,10 @@ The [additive field audit](../work/native-capture-observations-20261114/additive
 passes without reclassifying historical failures. The separate
 [kernel comparison](../work/native-capture-observations-20261114/kernel-summary-attempt-1/analysis.md)
 observes lower system CPU and switching with current-thread, with unchanged
-78.140 Mbit/s goodput. Local checkpoint reconciliation remains pending; parent
-performance, full SW-11,47-mode and carrier/lifecycle/platform gates remain open.
+78.140 Mbit/s goodput. The [actual source checkpoint5df423ae05e0cb1e84dbbc6cef971b0c5851bf7e](../work/native-capture-observations-20261114/checkpoint-attempt-1/validation.json)
+saves the reconciled correction and evidence. SGD-14 and the scoped SWR-12
+observation/checkpoint deliverable are complete; parent performance, full
+SW-11,47-mode and carrier/lifecycle/platform gates remain open.
 
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
@@ -220,7 +222,7 @@ performance, full SW-11,47-mode and carrier/lifecycle/platform gates remain open
 | Swift byte-transfer correction | SBC-01..SBC-06 | [Bounded bulk transfer](modules/swift-bulk-copy.md) | source-bound perf evidence, exact ownership/bytes and immutable pre/post measurements |
 | Native capture tail | NCD-01..NCD-06 | [Bounded capture witness](modules/native-capture-drain.md) | exact final probe fingerprints before capture stop; original final audits and performance gates retained |
 | Host-runtime comparison | HRT-01..HRT-07 | [Explicit process host](modules/host-runtime.md) | scoped selector tested; fresh complete evidence-verified 16-case ABBA; eight impaired 80 targets and parent gates remain open |
-| Secure UDP diagnostics | SGD-01..SGD-14 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4/options/setup/quote/counter observations; all16 fresh captures verified; finite native/kernel evidence retains eight failed80 targets and checkpoint reconciliation |
+| Secure UDP diagnostics | SGD-01..SGD-14 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4/options/setup/quote/counter observations; all16 fresh captures verified and checkpoint saved; finite native/kernel evidence retains eight failed80 targets |
 | VXLAN | VX-01..VX-09 | [Overlay design](overlay-and-carriers.md) | L2 frame validation, tenancy and MTU accounting |
 | UDP covers | UDP-01..UDP-16 | [Carrier design](overlay-and-carriers.md) | selected authenticated bootstrap; UDP-only is its own gate |
 | CLI/GUI/native clients | CL-01..CL-39 | [Client plan](client-design.md) | shared client-core/local API; native adapters independently qualified |
