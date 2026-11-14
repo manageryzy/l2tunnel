@@ -4,6 +4,10 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+pub(crate) mod backing;
+mod transaction;
+use backing::{Basis, Generations, History, Terminals};
+
 /// Hard live-generation count ceiling.
 pub const MAX_GENERATIONS: usize = 64;
 /// Hard distinct accepted symbol identities per generation.
@@ -106,11 +110,15 @@ struct Row {
 }
 
 impl Row {
-    fn from_view(view: SymbolView<'_>) -> Self {
+    fn empty() -> Self {
         Self {
-            coefficients: view.coefficients.to_vec(),
-            payload: view.payload.to_vec(),
+            coefficients: Vec::new(),
+            payload: Vec::new(),
         }
+    }
+    fn clear(&mut self) {
+        self.coefficients.clear();
+        self.payload.clear();
     }
 
     fn eliminate(&mut self, row: &Self, factor: u8) {
@@ -150,15 +158,8 @@ struct Generation {
     width: usize,
     deadline: u64,
     reservation: usize,
-    basis: Vec<Option<Row>>,
-    received: BTreeMap<SymbolId, Row>,
-    rank: usize,
-}
-
-struct Prepared {
-    basis: Vec<Option<Row>>,
-    row: Row,
-    innovative: bool,
+    basis: Basis,
+    received: History,
     rank: usize,
 }
 
@@ -170,78 +171,6 @@ impl Generation {
             required_rank: self.count,
             received_symbols: self.received.len(),
         }
-    }
-
-    fn prepare(&self, view: SymbolView<'_>) -> Result<Prepared, Error> {
-        let received = Row::from_view(view);
-        let mut row = received.clone();
-        let mut basis = self.basis.clone();
-        for (pivot, existing) in basis.iter().enumerate() {
-            if let Some(existing) = existing {
-                let factor = *row.coefficients.get(pivot).ok_or(Error::Arithmetic)?;
-                if factor != 0 {
-                    row.eliminate(existing, factor);
-                }
-            }
-        }
-        let Some(pivot) = row
-            .coefficients
-            .iter()
-            .position(|&coefficient| coefficient != 0)
-        else {
-            if row.payload.iter().any(|&byte| byte != 0) {
-                return Err(Error::Conflict);
-            }
-            return Ok(Prepared {
-                basis,
-                row: received,
-                innovative: false,
-                rank: self.rank,
-            });
-        };
-        row.normalize(pivot)?;
-        row.validate_identifiable()?;
-        for existing in basis.iter_mut().flatten() {
-            let factor = *existing.coefficients.get(pivot).ok_or(Error::Arithmetic)?;
-            if factor != 0 {
-                existing.eliminate(&row, factor);
-            }
-            existing.validate_identifiable()?;
-        }
-        *basis.get_mut(pivot).ok_or(Error::Arithmetic)? = Some(row);
-        let rank = self.rank.checked_add(1).ok_or(Error::Arithmetic)?;
-        if rank == self.count {
-            // Every final row must be a canonical identity row, including all
-            // original length bytes and required zero extension.
-            let mut maximum_length = 0;
-            for (index, recovered) in basis.iter().enumerate() {
-                let recovered = recovered.as_ref().ok_or(Error::Arithmetic)?;
-                if recovered
-                    .coefficients
-                    .iter()
-                    .enumerate()
-                    .any(|(column, &coefficient)| coefficient != u8::from(column == index))
-                {
-                    return Err(Error::Arithmetic);
-                }
-                maximum_length = maximum_length.max(original_length(&recovered.payload)?);
-            }
-            if maximum_length.checked_add(2).ok_or(Error::Arithmetic)? != self.width {
-                return Err(Error::InvalidSource);
-            }
-        }
-        Ok(Prepared {
-            basis,
-            row: received,
-            innovative: true,
-            rank,
-        })
-    }
-
-    fn commit(&mut self, symbol: SymbolId, prepared: Prepared) {
-        self.basis = prepared.basis;
-        self.rank = prepared.rank;
-        self.received.insert(symbol, prepared.row);
     }
 }
 
@@ -258,8 +187,10 @@ enum Terminal {
 pub struct Decoder {
     context: FecContext,
     config: DecoderConfig,
-    generations: BTreeMap<GenerationId, Generation>,
-    terminal: BTreeMap<GenerationId, Terminal>,
+    generations: Generations,
+    terminal: Terminals,
+    work: transaction::Work,
+    usage: Option<crate::storage::Usage>,
     highest: Option<GenerationId>,
     reserved: usize,
     last_now: u64,
@@ -272,12 +203,71 @@ impl Decoder {
         Ok(Self {
             context,
             config,
-            generations: BTreeMap::new(),
-            terminal: BTreeMap::new(),
+            generations: Generations::Legacy(BTreeMap::new()),
+            terminal: Terminals::Legacy(BTreeMap::new()),
+            work: transaction::Work::legacy(),
+            usage: None,
             highest: None,
             reserved: 0,
             last_now: 0,
         })
+    }
+
+    /// Provision the complete actual decoder before accepting any packet.
+    pub fn new_reserved(
+        context: FecContext,
+        config: DecoderConfig,
+        limits: crate::storage::Limits,
+    ) -> Result<Self, crate::storage::Error> {
+        let plan = crate::storage::DecoderPlan::for_decoder(config)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(crate::storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        let mut allocation = crate::storage::Allocation::new(limits.capacity_bytes);
+        Self::reserved_with(context, config, plan, &mut allocation)
+    }
+    pub(crate) fn reserved_with(
+        context: FecContext,
+        config: DecoderConfig,
+        plan: crate::storage::DecoderPlan,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, crate::storage::Error> {
+        let (generations, terminal, work) = backing::reserved(config, allocation)?;
+        let usage = allocation.usage();
+        if usage.capacity_bytes != plan.capacity_bytes() {
+            return Err(crate::storage::Error::Invariant);
+        }
+        Ok(Self {
+            context,
+            config,
+            generations,
+            terminal,
+            work,
+            usage: Some(usage),
+            highest: None,
+            reserved: 0,
+            last_now: 0,
+        })
+    }
+    /// Actual retained backing; legacy construction has no reservation claim.
+    pub fn storage_usage(&self) -> Option<crate::storage::Usage> {
+        self.usage
+    }
+    #[cfg(test)]
+    pub(crate) fn transaction_rows_used(&self) -> usize {
+        self.work.rows_used()
+    }
+    #[cfg(test)]
+    pub(crate) fn backing_fingerprint(&self) -> Vec<(usize, usize)> {
+        let mut output = Vec::new();
+        self.generations.fingerprint(&mut output);
+        self.terminal.fingerprint(&mut output);
+        self.work.fingerprint(&mut output);
+        output.sort_unstable();
+        output
     }
 
     /// Accept a previously authenticated complete symbol, with atomic rejection.
@@ -337,26 +327,32 @@ impl Decoder {
             self.config
                 .block
                 .work(view.source_count, view.coded_bytes)?;
-            new_generation = Some(Generation {
-                count: view.source_count,
-                width: view.coded_bytes,
-                deadline,
-                reservation,
-                basis: vec![None; view.source_count],
-                received: BTreeMap::new(),
-                rank: 0,
-            });
-            new_generation.as_ref().ok_or(Error::Arithmetic)?
+            if self.generations.vacant().is_none() {
+                new_generation = Some(Generation {
+                    count: view.source_count,
+                    width: view.coded_bytes,
+                    deadline,
+                    reservation,
+                    basis: Basis::Legacy(vec![None; view.source_count]),
+                    received: History::Legacy(BTreeMap::new()),
+                    rank: 0,
+                });
+            }
+            new_generation
+                .as_ref()
+                .or_else(|| self.generations.vacant())
+                .ok_or(Error::Arithmetic)?
         };
         self.config
             .block
             .work(view.source_count, view.coded_bytes)?;
-        let prepared = generation.prepare(view)?;
+        let received_symbols = generation.received.len() + 1;
+        let prepared = self.work.prepare(generation, view)?;
         let progress = Progress {
             generation: view.generation,
             rank: prepared.rank,
             required_rank: view.source_count,
-            received_symbols: generation.received.len() + 1,
+            received_symbols,
         };
         let status = if prepared.rank == view.source_count {
             AcceptStatus::Complete(progress)
@@ -365,14 +361,22 @@ impl Decoder {
         } else {
             AcceptStatus::Dependent(progress)
         };
-        if let Some(mut generation) = new_generation {
-            generation.commit(view.symbol, prepared);
-            self.reserved += generation.reservation;
-            self.generations.insert(view.generation, generation);
-        } else if let Some(generation) = self.generations.get_mut(&view.generation) {
-            generation.commit(view.symbol, prepared);
+        if let Some(generation) = self.generations.get_mut(&view.generation) {
+            self.work.commit(generation, view.symbol, prepared)?;
         } else {
-            return Err(Error::Arithmetic);
+            let reservation = self
+                .config
+                .reservation(view.source_count, view.coded_bytes)?;
+            let deadline = now_ticks
+                .checked_add(self.config.max_lifetime_ticks)
+                .ok_or(Error::DeadlineOverflow)?;
+            let generation = self.generations.publish(view.generation, new_generation)?;
+            generation.count = view.source_count;
+            generation.width = view.coded_bytes;
+            generation.deadline = deadline;
+            generation.reservation = reservation;
+            self.work.commit(generation, view.symbol, prepared)?;
+            self.reserved += reservation;
         }
         self.highest = Some(
             self.highest
@@ -399,63 +403,117 @@ impl Decoder {
         if state.rank != state.count {
             return Err(Error::InsufficientRank);
         }
-        let mut sources = Vec::with_capacity(state.count);
-        for row in &state.basis {
-            let row = row.as_ref().ok_or(Error::Arithmetic)?;
-            let length = original_length(&row.payload)?;
-            sources.push(
-                row.payload
-                    .get(2..length + 2)
-                    .ok_or(Error::Arithmetic)?
-                    .to_vec(),
-            );
-        }
-        let reservation = state.reservation;
-        let remaining = self
-            .reserved
-            .checked_sub(reservation)
-            .ok_or(Error::Arithmetic)?;
-        self.generations.remove(&generation);
-        self.reserved = remaining;
-        self.terminal.insert(generation, Terminal::Delivered);
+        let sources = self
+            .decoded_sources(generation)?
+            .map(<[u8]>::to_vec)
+            .collect();
+        self.commit_decoded(generation)?;
         Ok(DecodedBlock {
             generation,
             sources,
         })
     }
 
-    /// Explicitly expire every due generation and retain bounded terminal IDs.
+    /// Borrow complete original sources without allocating an owned output.
+    pub fn decoded_sources(&self, generation: GenerationId) -> Result<DecodedSources<'_>, Error> {
+        self.check_generation(generation)?;
+        let state = self
+            .generations
+            .get(&generation)
+            .ok_or(Error::UnknownGeneration)?;
+        if self.last_now >= state.deadline {
+            return Err(Error::Expired);
+        }
+        if state.rank != state.count {
+            return Err(Error::InsufficientRank);
+        }
+        for index in 0..state.count {
+            original_length(&state.basis.get(index).ok_or(Error::Arithmetic)?.payload)?;
+        }
+        Ok(DecodedSources { state, next: 0 })
+    }
+    /// Retire a validated complete generation after caller-owned copies succeed.
+    pub fn commit_decoded(&mut self, generation: GenerationId) -> Result<(), Error> {
+        self.decoded_sources(generation)?;
+        let state = self
+            .generations
+            .get(&generation)
+            .ok_or(Error::UnknownGeneration)?;
+        let remaining = self
+            .reserved
+            .checked_sub(state.reservation)
+            .ok_or(Error::Arithmetic)?;
+        self.terminal.insert(generation, Terminal::Delivered)?;
+        self.generations.remove(&generation);
+        self.reserved = remaining;
+        Ok(())
+    }
+    /// Explicit owned-output convenience; selected reserved consumers use expire_into.
     pub fn expire(&mut self, now_ticks: u64) -> Result<Vec<ExpiredGeneration>, Error> {
         self.check_time(now_ticks)?;
-        let expired: Vec<_> = self
+        let due = self
             .generations
             .iter()
             .filter(|(_, state)| now_ticks >= state.deadline)
-            .map(|(&generation, state)| ExpiredGeneration {
-                generation,
-                rank: state.rank,
-                required_rank: state.count,
-            })
-            .collect();
+            .count();
+        let mut result = vec![
+            ExpiredGeneration {
+                generation: GenerationId(0),
+                rank: 0,
+                required_rank: 0
+            };
+            due
+        ];
+        let count = self.expire_into(now_ticks, &mut result)?;
+        result.truncate(count);
+        Ok(result)
+    }
+    /// Expire into caller-owned storage; short output leaves all state unchanged.
+    pub fn expire_into(
+        &mut self,
+        now_ticks: u64,
+        output: &mut [ExpiredGeneration],
+    ) -> Result<usize, Error> {
+        self.check_time(now_ticks)?;
+        let count = self
+            .generations
+            .iter()
+            .filter(|(_, state)| now_ticks >= state.deadline)
+            .count();
+        if output.len() < count {
+            return Err(Error::OutputTooSmall { required: count });
+        }
         let release = self
             .generations
-            .values()
-            .filter(|state| now_ticks >= state.deadline)
-            .try_fold(0_usize, |sum, state| {
+            .iter()
+            .filter(|(_, state)| now_ticks >= state.deadline)
+            .try_fold(0usize, |sum, (_, state)| {
                 sum.checked_add(state.reservation).ok_or(Error::Arithmetic)
             })?;
         let remaining = self
             .reserved
             .checked_sub(release)
             .ok_or(Error::Arithmetic)?;
-        for entry in &expired {
+        for (target, (&generation, state)) in output.iter_mut().zip(
+            self.generations
+                .iter()
+                .filter(|(_, state)| now_ticks >= state.deadline),
+        ) {
+            *target = ExpiredGeneration {
+                generation,
+                rank: state.rank,
+                required_rank: state.count,
+            };
+        }
+        output[..count].sort_unstable_by_key(|entry| entry.generation);
+        for entry in &output[..count] {
+            self.terminal.insert(entry.generation, Terminal::Expired)?;
             self.generations.remove(&entry.generation);
-            self.terminal.insert(entry.generation, Terminal::Expired);
         }
         self.reserved = remaining;
         self.last_now = now_ticks;
         self.prune_terminal();
-        Ok(expired)
+        Ok(count)
     }
 
     /// Current rank/count for a live generation, including undelivered completion.
@@ -497,8 +555,8 @@ impl Decoder {
             if generation > highest
                 && self
                     .generations
-                    .keys()
-                    .any(|live| live.0 < self.floor(generation))
+                    .iter()
+                    .any(|(live, _)| live.0 < self.floor(generation))
             {
                 return Err(Error::WindowBlocked);
             }
@@ -513,7 +571,30 @@ impl Decoder {
     fn prune_terminal(&mut self) {
         if let Some(highest) = self.highest {
             let floor = self.floor(highest);
-            self.terminal.retain(|generation, _| generation.0 >= floor);
+            self.terminal.retain_floor(floor);
         }
     }
 }
+
+/// Validated complete originals borrowed from one live decoder generation.
+pub struct DecodedSources<'a> {
+    state: &'a Generation,
+    next: usize,
+}
+impl<'a> Iterator for DecodedSources<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.state.count {
+            return None;
+        }
+        let row = self.state.basis.get(self.next)?;
+        self.next += 1;
+        let length = original_length(&row.payload).ok()?;
+        row.payload.get(2..length + 2)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.state.count - self.next;
+        (n, Some(n))
+    }
+}
+impl ExactSizeIterator for DecodedSources<'_> {}

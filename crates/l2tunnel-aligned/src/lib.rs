@@ -15,6 +15,8 @@ use std::{fmt, time::Duration};
 
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
+/// Complete fallible backing for actual directional codec/recovery owners.
+pub mod storage;
 
 pub use l2tunnel_codec::aligned_receiver::{
     ChannelId, Delivery, Prepared, RecordIdentity, UnitWitness,
@@ -282,8 +284,196 @@ pub struct Endpoint {
     handoff: Option<(u64, usize, Duration)>,
     now: Duration,
     failure: Option<Error>,
+    usage: Option<storage::Usage>,
 }
 impl Endpoint {
+    /// Reserve complete actual same-policy duplex backing without fallback.
+    pub fn new_reserved(
+        config: Config,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        Self::new_duplex_reserved(config, config, context, limits)
+    }
+    /// Reserve all actual independently configured direction owners and workspaces.
+    pub fn new_duplex_reserved(
+        send: Config,
+        receive: Config,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_duplex(send, receive)?;
+        Self::new_reserved_profile(plan, context, limits)
+    }
+    /// Actual complete retained heap; an allocating endpoint returns None.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.usage
+    }
+    fn new_reserved_profile(
+        plan: storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        if context.session == 0 {
+            return Err(storage::Error::Endpoint(Error::Configuration));
+        }
+        let mut allocation = storage::Allocation::new(&plan, limits)?;
+        Self::assemble_reserved(plan, context, limits, &mut allocation)
+    }
+    fn assemble_reserved(
+        plan: storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+        allocation: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        use l2tunnel_codec::aligned_storage as codec;
+        let config = plan.send_config();
+        let receive_config = plan.receive_config();
+        let send_direction = match context.role {
+            EndpointRole::Initiator => receiver::Direction::InitiatorToResponder,
+            EndpointRole::Responder => receiver::Direction::ResponderToInitiator,
+        };
+        let receive_direction = match context.role {
+            EndpointRole::Initiator => receiver::Direction::ResponderToInitiator,
+            EndpointRole::Responder => receiver::Direction::InitiatorToResponder,
+        };
+        let send_scope = receiver::Scope {
+            session: context.session.to_be_bytes(),
+            epoch: Epoch(context.epoch),
+            direction: send_direction,
+        };
+        let receive_scope = receiver::Scope {
+            direction: receive_direction,
+            ..send_scope
+        };
+        let mut construction = storage::Construction::default();
+        #[cfg(test)]
+        {
+            construction.trace = allocation.trace.clone();
+        }
+        let (sender, sender_usage) = if let Some(packed) = plan.send_packed() {
+            let mut cell = allocation.vec(1)?;
+            let sender = l2tunnel_codec::packed_sender::Sender::new_reserved(
+                send_scope,
+                packed.sender(),
+                codec::Limits {
+                    capacity_bytes: plan.sender,
+                },
+            )
+            .map_err(storage::Error::Codec)?;
+            let usage = sender.storage_usage().ok_or(storage::Error::Invariant)?;
+            cell.push(sender);
+            (packed::SenderOwner::Packed(cell), usage)
+        } else {
+            let mut cell = allocation.vec(1)?;
+            let sender = sender::Sender::new_reserved(
+                send_scope,
+                sender_config(config),
+                codec::Limits {
+                    capacity_bytes: plan.sender,
+                },
+            )
+            .map_err(storage::Error::Codec)?;
+            let usage = sender.storage_usage().ok_or(storage::Error::Invariant)?;
+            cell.push(sender);
+            (packed::SenderOwner::Aligned(cell), usage)
+        };
+        construction.sender = Some(sender);
+        let packing = plan.send_packed().map(|p| p.options());
+        let receive_packing = plan.receive_packed().map(|p| p.options());
+        let symbols = receive_packing.map_or(0, |p| {
+            usize::from(p.max_units) * receive_config.receiver.body.symbol_bytes
+        });
+        construction.packed_symbols = allocation.bytes(symbols)?;
+        construction.recovery = Some(
+            Reliable::new_duplex_reserved(
+                config.recovery,
+                receive_config.recovery,
+                context,
+                l2tunnel_reliable::storage::Limits {
+                    capacity_bytes: plan.reliable_plan().capacity_bytes(),
+                },
+            )
+            .map_err(storage::Error::Reliable)?,
+        );
+        construction.receiver = Some(
+            receiver::Receiver::new_reserved(
+                receive_scope,
+                receive_config.receiver,
+                codec::Limits {
+                    capacity_bytes: plan.receiver.capacity_bytes(),
+                },
+            )
+            .map_err(storage::Error::Codec)?,
+        );
+        construction.send_buffer = allocation.bytes(config.recovery.arq.max_source_bytes)?;
+        construction.receive_buffer =
+            allocation.bytes(receive_config.recovery.arq.max_source_bytes)?;
+        let recovery_usage = construction
+            .recovery
+            .as_ref()
+            .and_then(Reliable::storage_usage)
+            .ok_or(storage::Error::Invariant)?;
+        let receiver_usage = construction
+            .receiver
+            .as_ref()
+            .and_then(receiver::Receiver::storage_usage)
+            .ok_or(storage::Error::Invariant)?;
+        let (wrapper, wrapper_allocations) = allocation.actual();
+        let capacity_bytes = storage::sum(&[
+            wrapper,
+            sender_usage.capacity_bytes,
+            recovery_usage.capacity_bytes,
+            receiver_usage.capacity_bytes,
+        ])?;
+        let allocations = storage::sum(&[
+            wrapper_allocations,
+            sender_usage.allocations,
+            recovery_usage.allocations,
+            receiver_usage.allocations,
+        ])?;
+        if wrapper != plan.wrapper || capacity_bytes != plan.capacity_bytes() {
+            return Err(storage::Error::Invariant);
+        }
+        let sender = construction
+            .sender
+            .take()
+            .ok_or(storage::Error::Invariant)?;
+        let recovery = construction
+            .recovery
+            .take()
+            .ok_or(storage::Error::Invariant)?;
+        let receiver = construction
+            .receiver
+            .take()
+            .ok_or(storage::Error::Invariant)?;
+        let packed_symbols = std::mem::take(&mut construction.packed_symbols);
+        let send_buffer = std::mem::take(&mut construction.send_buffer);
+        let receive_buffer = std::mem::take(&mut construction.receive_buffer);
+        construction.transferred(capacity_bytes);
+        Ok(Self {
+            config,
+            receive_config,
+            receive_scope,
+            send_scope,
+            sender,
+            packing,
+            receive_packing,
+            packed_symbols,
+            recovery,
+            receiver,
+            send_buffer,
+            receive_buffer,
+            handoff: None,
+            now: Duration::ZERO,
+            failure: None,
+            usage: Some(storage::Usage {
+                limit_bytes: limits.capacity_bytes,
+                capacity_bytes,
+                allocations,
+            }),
+        })
+    }
     /// Construct opposite direction domains from the authenticated local role.
     pub fn new(config: Config, context: RecoveryContext) -> Result<Self, Error> {
         Self::new_profile(config, context, None)
@@ -344,17 +534,17 @@ impl Endpoint {
             receive_scope,
             send_scope,
             sender: match packing {
-                Some(p) => packed::SenderOwner::Packed(Box::new(
+                Some(p) => packed::SenderOwner::Packed(vec![
                     l2tunnel_codec::packed_sender::Sender::new(
                         send_scope,
                         p.config(config).sender(),
                     )
                     .map_err(Error::PackedSender)?,
-                )),
-                None => packed::SenderOwner::Aligned(Box::new(
+                ]),
+                None => packed::SenderOwner::Aligned(vec![
                     sender::Sender::new(send_scope, sender_config(config))
                         .map_err(Error::Sender)?,
-                )),
+                ]),
             },
             packing,
             receive_packing,
@@ -372,6 +562,7 @@ impl Endpoint {
             handoff: None,
             now: Duration::ZERO,
             failure: None,
+            usage: None,
         })
     }
     /// Retain one already-MUX-admitted native frame; success is not peer delivery.
@@ -562,6 +753,16 @@ impl Endpoint {
             self.receiver.pending()
         }
     }
+    /// Original expiry of pending native custody, excluding recovery/packing work.
+    pub fn pending_deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            None
+        } else {
+            self.receiver
+                .pending_deadline()
+                .map(|tick| Duration::from_millis(tick.0))
+        }
+    }
     /// Commit only after complete native-device acceptance, checking expiry first.
     pub fn commit_delivery(&mut self, now: Duration) -> Result<(), Error> {
         self.advance(now)?;
@@ -678,7 +879,7 @@ impl Endpoint {
     }
     fn pump_send(&mut self) -> Result<(), Error> {
         if let packed::SenderOwner::Packed(sender) = &mut self.sender {
-            let result = sender
+            let result = sender[0]
                 .poll(packed::micros(self.now)?)
                 .map_err(Error::PackedSender);
             self.terminal_result(result)?;
@@ -811,7 +1012,16 @@ impl Endpoint {
         let width = self.receive_config.receiver.body.symbol_bytes;
         let units = view.units().map_err(Error::PackedEnvelope)?;
         let count = units.len();
-        let mut inputs = Vec::with_capacity(count);
+        let mut inputs: [receiver::AuthenticatedSymbol<'_>; 255] =
+            std::array::from_fn(|_| receiver::AuthenticatedSymbol {
+                identity: receiver::SymbolIdentity {
+                    scope: self.receive_scope,
+                    source: receiver::SourceId(0),
+                    record: receiver::RecordId(0),
+                },
+                bytes: &[],
+            });
+        let mut received = 0;
         for (unit, symbol) in units.zip(self.packed_symbols.chunks_exact_mut(width)) {
             symbol.fill(0);
             symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
@@ -822,19 +1032,29 @@ impl Endpoint {
                     return Err(Error::Policy);
                 }
             }
-            inputs.push(receiver::AuthenticatedSymbol {
+            inputs[received] = receiver::AuthenticatedSymbol {
                 identity: unit.identity,
                 bytes: symbol,
-            });
+            };
+            received += 1;
         }
-        if inputs.len() != count {
+        if received != count {
             return Err(Error::Identity);
         }
-        let outcomes = self
+        let mut outcomes = [receiver::Admission::Accepted; 255];
+        let admitted = self
             .receiver
-            .admit_validated_batch_authenticated(&inputs, ticks(self.now)?)
+            .admit_validated_batch_authenticated_into(
+                &inputs[..count],
+                ticks(self.now)?,
+                &mut outcomes[..count],
+            )
             .map_err(Error::Receiver)?;
-        if outcomes.iter().any(|a| *a != receiver::Admission::Accepted) {
+        if admitted != count
+            || outcomes[..count]
+                .iter()
+                .any(|a| *a != receiver::Admission::Accepted)
+        {
             return Err(Error::Identity);
         }
         Ok(())

@@ -147,6 +147,30 @@ pub struct Encoder {
     scratch: Vec<u8>,
 }
 impl Encoder {
+    pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
+        crate::aligned_storage::array_bytes::<u8>(
+            config
+                .max_frame_bytes
+                .checked_add(29)
+                .ok_or(crate::aligned_storage::Error::Layout)?,
+        )
+    }
+    pub(crate) fn new_in(
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let map = |e| crate::aligned_storage::Error::Sender(crate::aligned_sender::Error::Body(e));
+        let config = config.validate().map_err(map)?;
+        let header = HeaderEncoder::new(HeaderProfile::TcpDelta, config.max_frame_bytes)
+            .map_err(Error::Header)
+            .map_err(map)?;
+        let scratch = allocation.bytes(header.max_encoded_len())?;
+        Ok(Self {
+            config,
+            header,
+            scratch,
+        })
+    }
     /// Validate bounds and allocate at most maximum native bytes plus 29 scratch bytes.
     pub fn new(config: Config) -> Result<Self, Error> {
         let config = config.validate()?;
@@ -287,6 +311,39 @@ pub struct Decoder {
     native: Vec<u8>,
 }
 impl Decoder {
+    pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
+        crate::aligned_storage::sum(&[
+            crate::aligned_storage::array_bytes::<u8>(
+                config
+                    .max_frame_bytes
+                    .checked_add(44)
+                    .ok_or(crate::aligned_storage::Error::Layout)?,
+            )?,
+            crate::aligned_storage::array_bytes::<u8>(config.max_frame_bytes)?,
+        ])
+    }
+    pub(crate) fn new_in(
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let map =
+            |e| crate::aligned_storage::Error::Receiver(crate::aligned_receiver::Error::Body(e));
+        let config = config.validate().map_err(map)?;
+        Ok(Self {
+            config,
+            header: HeaderDecoder::new(config.max_frame_bytes)
+                .map_err(Error::Header)
+                .map_err(map)?,
+            expanded: allocation.bytes(config.max_frame_bytes + 44)?,
+            native: allocation.bytes(config.max_frame_bytes)?,
+        })
+    }
+    pub(crate) fn checkpoint(&self) -> HeaderDecoder {
+        self.header.clone()
+    }
+    pub(crate) fn restore(&mut self, header: HeaderDecoder) {
+        self.header = header;
+    }
     /// Validate bounds and allocate at most twice maximum native bytes plus 44 bytes.
     pub fn new(config: Config) -> Result<Self, Error> {
         let config = config.validate()?;

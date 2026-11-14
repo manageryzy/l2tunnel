@@ -1,12 +1,13 @@
 # Common record engine composition
 
-Status: **shared scalar prerequisite implemented and protocol-tested; actual common Engine remains draft**
-from `e5c2b93`. The actual common Engine remains **draft v0**, requiring a separate
-engineering freeze before implementation. This document records no new owner
-decision, default carrier or scope reduction. The
+Status: **actual functional Engine implemented and protocol-tested; reserved
+mixed-generation/runtime composition remains planned**. The explicit
+`new_functional` owner follows the frozen interface below; it is not a runtime
+fallback. This document records no new owner decision, default carrier or scope reduction. The
 [pre-edit source binding](../../work/record-composition-20261114/common-record-engine/source-binding-v0.json)
-identifies the inspected inputs. No new adapter, reservation or runtime result
-is established by this slice.
+identifies the inspected prerequisite inputs. The subsequent
+[functional pre-edit binding](../../work/common-record-engine-20261114/functional-engine-preedit-v0.json)
+precedes this implementation. Runtime/resource integration is not established.
 
 Compose the actual Swift, duplex Aligned and duplex Packed owners. Do not add
 another recovery/FEC algorithm, header codec, classifier, MUX, transaction FSM,
@@ -135,7 +136,7 @@ before owner construction or old-owner mutation. Keep Swift's existing matching
 native-layer/maximum constraint observable while retaining its independent
 codec/channel policies. Never replace unequal directions by their maximum.
 
-Proposed subsequent pure adapter surface, pending a separate engineering freeze:
+The actual functional adapter follows this engineering-frozen pure surface:
 
 ```rust
 pub struct Tick(pub u64); // injected microseconds
@@ -165,6 +166,103 @@ A reserved constructor may accept a family only after its actual storage exists.
 No success-returning reserved stub or dummy branch is permitted.
 
 ## Transactional MUX admission
+
+### Frozen functional composition interface
+
+The next integrator-owned slice adds actual `l2tunnel::record_engine`, rather
+than another algorithm. Its explicit `Engine::new_functional(configuration,
+context, geometry, native_limits)` owns one actual Pipeline and exactly one
+Swift, Aligned or Packed duplex record owner. It preserves unequal directions
+through the configuration's global-role projection. There is no default/fallback
+constructor or selected-runtime capability claim. Swift initially uses one
+occupied existing storage Set slot; the second slot remains empty metadata.
+This is not the eventual movable mixed-generation reserved owner.
+
+`Context { session:u128, epoch:u64, role:management::Role }` is trusted local
+binding input, not authentication authority. Both identities are nonzero. The
+actual configuration digest is computed from the complete supplied value.
+`Geometry { forward_overhead_bytes:usize, reverse_overhead_bytes:usize }` is the
+caller's exact complete-wire overhead contract. Both authoritative output maxima
+plus their directional overhead must fit path MTU and burst; Aligned/Packed's
+existing outer charge must match exactly. No overhead is charged twice.
+`NativeLimits { stall_micros:u64 }` is explicit, positive, immutable and belongs
+in the externally authenticated resource envelope before runtime selection.
+
+The functional constructor rejects represented Active/tunnel-credit, TCP-proxy
+and native-window requests, because their real owners are not installed here.
+It consumes the complete actual Pipeline policy. Directional rate/burst values
+remain exact and observable via the immutable complete configuration; connection
+pacing and physical half/full-duplex scheduling are external required services.
+Every emission requires the same caller-supplied shared packet/wire allowance,
+already limited by that external service. This comparison entry point cannot
+qualify a configured runtime until those services, complete reserved Pipeline
+backing and actual mixed generations consume their full policies. No requested
+feature or later acceptance definition is removed by those explicit refusals.
+
+The concrete operation names are `enqueue`, `admit_one`, `poll`,
+`accept_authenticated`, `prepare_native`, `pending_native`, `commit_native`,
+`tick`, `deadline`, `drained`, `statistics`, `configuration` and `qualification`.
+All use caller-injected `Tick(u64)` microseconds. `enqueue` preserves the original
+Vec in its typed error. `admit_one` calls the actual Pipeline `offer_front` once,
+passes exact PacketMetadata/channel/bytes to the maintained record owner, and
+returns the existing `Admitted<ProfileIdentity>` with the original owned packet.
+Only actual identified acceptance removes the queue head. Codec refusal is
+retryable only where it proves no native admission; partial authoritative codec
+failure is terminal and retains queue bytes solely for cleanup.
+
+`poll(now, security_number, allow_data, output, shared_budget, unit_witnesses)`
+preflights complete output/witness/allowance geometry before consuming output.
+It returns exact bytes, actual typed branch, full wire cost, unchanged full64
+security/GF number and witness count. Swift feedback stays live with data off;
+Aligned/Packed use actual feedback/data polls and authoritative inspectors.
+Swift witnesses are explicitly unavailable; no source number is converted into
+a native fragment proof. Caller retains emitted/sealed bytes through physical
+WouldBlock; repolling is never a resend operation. Authentication/replay remain
+the enclosing selected session's responsibility.
+
+`prepare_native(now, work, original_deadline, output)` preflights a caller-owned
+maximum native slot and checked local token before extraction. It returns Idle,
+Progress, an already-pending observation or an actual newly prepared immutable
+metadata/token. The caller retains that exact output slot until complete device
+acceptance. Another prepare cannot overwrite an existing pending slot or renew
+its original cap. The retained deadline is the smaller of the supplied original
+cap and first prepare plus configured stall; actual Aligned deadlines can expire
+earlier and stay authoritative through a pending-only expiry accessor, distinct
+from ARQ retry timers. Swift copies its actual borrowed identified
+extraction once; Aligned leaves its real pending delivery uncommitted.
+
+`commit_native(now, exact_token)` is a trusted physical-owner operation after a
+complete device write. A stale token changes no pending output. It commits the
+actual Aligned receiver and local physical count only once; Swift extraction
+and device completion remain distinct. Counter capacity is preflighted before
+native extraction. A reported whole physical write is counted once even when
+completion crosses expiry or an earlier terminal error; that observation does
+not complete the failed record owner or qualify a drain fence. Tokens are meaningful only within their
+originating Engine; a future Bank must bind its own unique slot/generation too.
+Local accepted/prepared/committed totals are observations, never fence authority
+or `RecordId+1`. Expired or terminal state cannot be retried as a new preparation.
+No adapter payload queue, second classifier, security owner or mutable backend
+escape is introduced. Root owns its facade registration, source and actual
+three-profile composition tests; the queue lane owns the RAH interfaces.
+
+The [source-stable five-package batch](../../work/common-record-engine-20261114/records-attempt-1/validation.json)
+passes255 library cases, including10 initial facade Engine tests. They compose
+each actual profile with TAP and transparent TUN in both asymmetric directions,
+exercise real Full/Busy then exact retry, preserve original bytes/channel/identity,
+retain feedback while data is disabled, check full64 packet numbers, exact shared
+wire charges, native pending/one-time completion and terminal deadline handling.
+Output ceilings come from the authoritative Reliable scalar maximum, not a
+possibly larger configured safety ceiling. New pending-only expiry accessors
+retain actual record lifetime independently of recovery retry timers.
+The [11 exact downstream regressions](../../work/common-record-engine-20261114/downstream-attempt-1/validation.json)
+exercise current legacy runtime/client/Active callers. They do not install this
+new Engine into those runtimes. All CRE-02..CRE-08 definitions remain open until
+their full composition, width/resource/fence and acceptance conditions hold.
+Two [exact follow-up regressions](../../work/common-record-engine-20261114/regressions-attempt-1/validation.json)
+verify a loose60000-byte recovery ceiling does not reject an actual fitting
+output, and late native preparation retains the original record expiry despite
+an earlier ARQ retry deadline. Only these two appended tests were run again;
+the previous32 facade cases are reused with a byte-exact unchanged source prefix.
 
 All original traffic, including probes/TCP controls, uses the existing actual
 Pipeline classification, configured byte/count budget and selected channel.

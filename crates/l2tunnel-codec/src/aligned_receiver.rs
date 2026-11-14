@@ -93,8 +93,8 @@ pub struct Limits {
     pub lifetime_ticks: u64,
 }
 impl Limits {
-    /// Conservative bound on explicit payload and fixed-slot metadata storage.
-    /// Allocator bookkeeping is platform-specific and is not included.
+    /// Historical allocating-owner scalar bound, excluding allocator overhead.
+    /// The separate complete ReceiverPlan counts actual reserved versions and journals.
     pub fn memory_bound_bytes(self) -> Result<usize, Error> {
         self.body.body_capacity().map_err(Error::Body)?;
         if !(1..=256).contains(&self.channels)
@@ -129,7 +129,7 @@ impl Limits {
             .checked_add(self.lookahead_fragments)
             .and_then(|n| n.checked_add(self.body.max_frame_bytes))
             .and_then(|n| n.checked_add(65_535))
-            .and_then(|n| n.checked_add(size_of::<Receiver>()))
+            .and_then(|n| n.checked_add(size_of::<LegacyLayout>()))
             .ok_or(Error::Configuration)?;
         for (count, width) in products {
             total = count
@@ -183,6 +183,12 @@ pub enum Error {
     NoPending,
     /// Optional semantic preflight found a complete record behind a missing context/head.
     UnresolvedContext,
+    /// Caller batch outcome storage cannot hold every unit.
+    OutputTooSmall,
+    /// A caller-owned returned outcome allocation failed.
+    Allocation,
+    /// Reserved backing contradicted its checked capacity or ownership inventory.
+    Storage,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -267,7 +273,7 @@ struct Record {
     channel: ChannelId,
     id: RecordId,
     bytes: Vec<u8>,
-    pieces: Vec<bool>,
+    pieces: Vec<u8>,
     count: usize,
     fragment_capacity: usize,
     padding: Padding,
@@ -312,8 +318,29 @@ pub struct Receiver {
     pending: Option<Pending>,
     last_time: Option<Tick>,
     failure: Option<Error>,
+    reserved: Option<storage::Reserved>,
+}
+// Compatibility-only original field types; never used as reservation authority.
+#[allow(dead_code)]
+struct LegacyLayout {
+    scope: Scope,
+    limits: Limits,
+    channels: Vec<Channel>,
+    records: Vec<Option<Record>>,
+    proofs: Vec<Option<Proof>>,
+    floor: Option<SourceId>,
+    staged: Decoder,
+    native: Vec<u8>,
+    pending: Option<Pending>,
+    last_time: Option<Tick>,
+    failure: Option<Error>,
 }
 impl Receiver {
+    /// Compatibility-only original inline size for historical outer scalar guards.
+    /// This is not actual owner capacity, a storage Plan, or an observed Usage.
+    pub const fn legacy_inline_bytes() -> usize {
+        size_of::<LegacyLayout>()
+    }
     /// Validate all fixed allocation products and reserve progress independently of lookahead.
     pub fn new(scope: Scope, limits: Limits) -> Result<Self, Error> {
         limits.memory_bound_bytes()?;
@@ -347,6 +374,7 @@ impl Receiver {
             pending: None,
             last_time: None,
             failure: None,
+            reserved: None,
         })
     }
     /// Expected absolute record; None means this channel consumed its last u64 ID.
@@ -367,6 +395,9 @@ impl Receiver {
         symbols: &[AuthenticatedSymbol<'_>],
         now: Tick,
     ) -> Result<Vec<Admission>, Error> {
+        if self.reserved.is_some() {
+            return self.reserved_owned_batch(symbols, now, false);
+        }
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
@@ -403,6 +434,9 @@ impl Receiver {
         symbols: &[AuthenticatedSymbol<'_>],
         now: Tick,
     ) -> Result<Vec<Admission>, Error> {
+        if self.reserved.is_some() {
+            return self.reserved_owned_batch(symbols, now, true);
+        }
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
@@ -516,7 +550,7 @@ impl Receiver {
                 } else {
                     let index = parsed.offset / parsed.capacity;
                     let end = parsed.offset + parsed.body.len();
-                    if existing.pieces[index] {
+                    if existing.pieces[index] != 0 {
                         if existing.bytes[parsed.offset..end] != *parsed.body {
                             return Err(Error::Conflict);
                         }
@@ -525,15 +559,12 @@ impl Receiver {
                         // The final fragment is validated in a bounded temporary copy
                         // before changing the admitted record or replay ledger.
                         if existing.count + 1 == parsed.fragments {
-                            let mut complete = existing.bytes.clone();
-                            complete[parsed.offset..end].copy_from_slice(parsed.body);
-                            if explicit_length(&complete)? != complete.len() {
-                                return Err(Error::Malformed);
-                            }
+                            self.validate_completion(slot, parsed.offset, parsed.body)?;
                         }
+                        self.touch_record(slot, true)?;
                         let entry = self.records[slot].as_mut().ok_or(Error::Malformed)?;
                         entry.bytes[parsed.offset..end].copy_from_slice(parsed.body);
-                        entry.pieces[index] = true;
+                        entry.pieces[index] = 1;
                         entry.count += 1;
                         Admission::Accepted
                     }
@@ -550,12 +581,13 @@ impl Receiver {
                     .iter()
                     .position(Option::is_none)
                     .ok_or(Error::Capacity)?;
-                let mut bytes = vec![0; parsed.total];
+                self.touch_record(slot, false)?;
+                let (mut bytes, mut pieces) =
+                    self.record_buffers(parsed.total, parsed.fragments)?;
                 bytes[parsed.offset..parsed.offset + parsed.body.len()]
                     .copy_from_slice(parsed.body);
-                let mut pieces = vec![false; parsed.fragments];
                 if parsed.fragments != 0 {
-                    pieces[parsed.offset / parsed.capacity] = true;
+                    pieces[parsed.offset / parsed.capacity] = 1;
                 }
                 self.records[slot] = Some(Record {
                     channel: parsed.channel,
@@ -571,13 +603,15 @@ impl Receiver {
                 Admission::Accepted
             }
         };
+        self.touch_proof(proof_slot)?;
+        let bytes = self.proof_buffer(symbol)?;
         self.proofs[proof_slot] = Some(Proof {
             source: identity.source,
             record: identity.record,
-            bytes: symbol.to_vec(),
+            bytes,
             deadline,
         });
-        self.advance_sources();
+        self.advance_sources()?;
         self.last_time = Some(now);
         Ok(outcome)
     }
@@ -647,6 +681,7 @@ impl Receiver {
                 };
             match decoded {
                 aligned_body::Decoded::Context { .. } => {
+                    self.touch_channel(usize::from(channel.0))?;
                     self.channels[usize::from(channel.0)]
                         .decoder
                         .copy_context_from(&self.staged);
@@ -678,17 +713,34 @@ impl Receiver {
             bytes: &self.native[..pending.written],
         })
     }
+    /// Original expiry of the actual pending native record, excluding other work.
+    pub fn pending_deadline(&self) -> Option<Tick> {
+        if self.failure.is_some() {
+            return None;
+        }
+        let pending = self.pending?;
+        Some(self.records.get(pending.slot)?.as_ref()?.deadline)
+    }
     /// Commit only after complete native-device acceptance; WouldBlock must not call this.
     pub fn commit_delivery(&mut self, now: Tick) -> Result<(), Error> {
         self.check_time(now)?;
         let pending = self.pending.ok_or(Error::NoPending)?;
-        let entry = self.records[pending.slot]
-            .as_mut()
-            .ok_or(Error::Malformed)?;
         if pending.early {
-            entry.early_delivered = true;
+            self.touch_record(pending.slot, true)?;
+            self.records[pending.slot]
+                .as_mut()
+                .ok_or(Error::Malformed)?
+                .early_delivered = true;
         } else {
-            self.channels[usize::from(entry.channel.0)]
+            let channel = usize::from(
+                self.records[pending.slot]
+                    .as_ref()
+                    .ok_or(Error::Malformed)?
+                    .channel
+                    .0,
+            );
+            self.touch_channel(channel)?;
+            self.channels[channel]
                 .decoder
                 .copy_context_from(&self.staged);
             self.retire(pending.slot)?;
@@ -733,7 +785,7 @@ impl Receiver {
             if !entry.early_delivered
                 && (entry.bytes.first() != Some(&0)
                     || (!entry.pieces.is_empty()
-                        && !entry.pieces.first().copied().unwrap_or(false)))
+                        && entry.pieces.first().copied().unwrap_or(0) == 0))
             {
                 status.native_records += 1;
             }
@@ -794,15 +846,20 @@ impl Receiver {
     }
     fn retire(&mut self, slot: usize) -> Result<(), Error> {
         let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
-        let channel = &mut self.channels[usize::from(entry.channel.0)];
-        if channel.expected != Some(entry.id) {
+        let index = usize::from(entry.channel.0);
+        let id = entry.id;
+        if self.channels[index].expected != Some(id) {
             return Err(Error::Malformed);
         }
-        channel.expected = entry.id.0.checked_add(1).map(RecordId);
-        self.records[slot] = None;
+        self.touch_channel(index)?;
+        self.touch_record(slot, false)?;
+        self.channels[index].expected = id.0.checked_add(1).map(RecordId);
+        if let Some(record) = self.records[slot].take() {
+            self.recycle_record(record)?;
+        }
         Ok(())
     }
-    fn advance_sources(&mut self) {
+    fn advance_sources(&mut self) -> Result<(), Error> {
         while let Some(floor) = self.floor {
             let index = (floor.0 % self.limits.source_window as u64) as usize;
             if !self.proofs[index]
@@ -811,11 +868,18 @@ impl Receiver {
             {
                 break;
             }
-            self.proofs[index] = None;
+            self.touch_proof(index)?;
+            if let Some(proof) = self.proofs[index].take() {
+                self.recycle_proof(proof)?;
+            }
             self.floor = floor.0.checked_add(1).map(SourceId);
         }
+        Ok(())
     }
 }
+
+#[path = "aligned_receiver/storage.rs"]
+mod storage;
 /// Inspect a complete original symbol using the same bounded receiver parser.
 /// This authenticates nothing and creates no peer byte or delivery authority.
 pub fn unit_witness(

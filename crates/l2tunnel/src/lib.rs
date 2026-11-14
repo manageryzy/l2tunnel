@@ -37,6 +37,9 @@ pub mod swift_configuration;
 /// Complete versioned common record values and exact transaction catalogs.
 pub mod record_configuration;
 
+/// Actual shared-queue composition of existing Swift, Aligned and Packed owners.
+pub mod record_engine;
+
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;
 /// Authenticated aligned-symbol composition; clocks and native I/O stay external.

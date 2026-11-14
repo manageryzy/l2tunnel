@@ -168,6 +168,9 @@ The actual facade common Engine consumer owns real Swift/Aligned/Packed callback
 integration checks: selected channel different from legacy hash, actual Full/Busy,
 original profile identity and exact retry. Queue-only callback tests qualify
 the seam, not record-profile integration or physical delivery.
+The [actual functional Engine batch](../../work/common-record-engine-20261114/records-attempt-1/validation.json)
+now passes those maintained-profile compositions. RAH-06 stays open for its
+complete parent resource, selected runtime/native and stage acceptance conditions.
 
 New callbacks/ownership moves allocate no backing. Existing legacy construction
 and enqueue storage remain unreserved. Complete fallible MUX/Pipeline/FlowTable/

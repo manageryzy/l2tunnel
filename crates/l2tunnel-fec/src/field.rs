@@ -66,13 +66,30 @@ pub fn compact_coefficients(seed: u32, first_source: u32, count: u16) -> Result<
 
 /// Exact coding.py Cauchy row; source count plus repair index must be below 256.
 pub fn cauchy_coefficients(sources: u16, repair_index: u16) -> Result<Vec<u8>, Error> {
+    cauchy_column(sources, repair_index)?;
+    let mut result = vec![0; usize::from(sources)];
+    cauchy_into(sources, repair_index, &mut result)?;
+    Ok(result)
+}
+
+pub(crate) fn cauchy_into(sources: u16, repair_index: u16, output: &mut [u8]) -> Result<(), Error> {
+    let column = cauchy_column(sources, repair_index)?;
+    let required = usize::from(sources);
+    if output.len() < required {
+        return Err(Error::OutputTooSmall { required });
+    }
+    for (source, coefficient) in output[..required].iter_mut().enumerate() {
+        *coefficient = inverse((source as u16 ^ column) as u8).ok_or(Error::InvalidCoefficients)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cauchy_column(sources: u16, repair_index: u16) -> Result<u16, Error> {
     let column = sources
         .checked_add(repair_index)
         .ok_or(Error::InvalidCoefficients)?;
     if sources == 0 || column >= 256 {
         return Err(Error::InvalidCoefficients);
     }
-    (0..sources)
-        .map(|source| inverse((source ^ column) as u8).ok_or(Error::InvalidCoefficients))
-        .collect()
+    Ok(column)
 }

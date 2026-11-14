@@ -206,13 +206,13 @@ pub struct Config {
     pub hold_micros: u64,
 }
 impl Config {
-    /// Fixed buffer plus object storage, excluding allocator bookkeeping.
+    /// Historical allocating-owner scalar guard, not actual reserved capacity.
     pub fn memory_bound_bytes(self) -> Result<usize, Error> {
         geometry(self.symbol_bytes)?;
         if !(1..=1000).contains(&self.hold_micros) {
             return Err(Error::Configuration);
         }
-        Ok(self.symbol_bytes + std::mem::size_of::<Packer>())
+        Ok(self.symbol_bytes + std::mem::size_of::<LegacyLayout>())
     }
 }
 /// Why a source became immutable and eligible for recovery ownership.
@@ -268,6 +268,19 @@ pub struct Status {
 /// One fixed-size buffer, no internal source queue and no ambient clock.
 pub struct Packer {
     config: Config,
+    buffer: Vec<u8>,
+    length: usize,
+    count: u8,
+    copies: u8,
+    deadline: Option<u64>,
+    last_now: u64,
+    reason: Option<SealReason>,
+}
+// Exact original field types retain the old scalar bound after fallible Vec
+// backing was added. Actual new owner headers are charged by their real plans.
+#[allow(dead_code)]
+pub(crate) struct LegacyLayout {
+    config: Config,
     buffer: Box<[u8]>,
     length: usize,
     count: u8,
@@ -277,12 +290,27 @@ pub struct Packer {
     reason: Option<SealReason>,
 }
 impl Packer {
+    pub(crate) fn new_in(
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        Ok(Self {
+            config,
+            buffer: allocation.bytes(config.symbol_bytes)?,
+            length: 0,
+            count: 0,
+            copies: 0,
+            deadline: None,
+            last_now: 0,
+            reason: None,
+        })
+    }
     /// Validate all limits before allocating the sole symbol buffer.
     pub fn new(config: Config) -> Result<Self, Error> {
         config.memory_bound_bytes()?;
         Ok(Self {
             config,
-            buffer: vec![0; config.symbol_bytes].into_boxed_slice(),
+            buffer: vec![0; config.symbol_bytes],
             length: 0,
             count: 0,
             copies: 0,

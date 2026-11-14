@@ -19,7 +19,8 @@ pub struct Config {
     pub first_record: RecordId,
 }
 impl Config {
-    /// Conservative explicit allocations/metadata bound, excluding allocator overhead.
+    /// Historical allocating-owner scalar guard, excluding allocator overhead.
+    /// Reserved backing uses the separate complete aligned_storage::SenderPlan.
     pub fn memory_bound_bytes(self) -> Result<usize, Error> {
         self.body.body_capacity()?;
         if !(1..=256).contains(&self.channels) {
@@ -30,7 +31,7 @@ impl Config {
             + (count + 1) * size_of::<Encoder>()
             + count * size_of::<Channel>()
             + self.body.symbol_bytes
-            + size_of::<Sender>();
+            + size_of::<LegacyLayout>();
         if total > 32 * 1024 * 1024 {
             return Err(Error::Configuration);
         }
@@ -82,6 +83,18 @@ struct Pending {
     context: bool,
     offset: usize,
 }
+// Compatibility-only original inline shape for the historical scalar guard.
+// This is never actual new reserved memory, a Plan, or an observed Usage.
+#[allow(dead_code)]
+pub(crate) struct LegacyLayout {
+    config: Config,
+    scope: Scope,
+    channels: Vec<Channel>,
+    staged: Encoder,
+    bodies: Vec<u8>,
+    symbol: Vec<u8>,
+    pending: Option<Pending>,
+}
 /// Exact meaningful unit borrowed from the existing bounded symbol scratch.
 /// No recovery source identity or native-delivery acknowledgment is assigned here.
 pub struct PendingUnit<'a> {
@@ -105,8 +118,62 @@ pub struct Sender {
     bodies: Vec<u8>,
     symbol: Vec<u8>,
     pending: Option<Pending>,
+    usage: Option<crate::aligned_storage::Usage>,
 }
 impl Sender {
+    pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
+        use crate::aligned_storage::{array_bytes, product, sum};
+        let count = usize::from(config.channels);
+        sum(&[
+            array_bytes::<Channel>(count)?,
+            product(count + 1, Encoder::reserved_bytes(config.body)?)?,
+            array_bytes::<u8>(config.body.max_frame_bytes + 29)?,
+            array_bytes::<u8>(config.body.symbol_bytes)?,
+        ])
+    }
+    /// Reserve all actual channel/stage buffers before admitting a native frame.
+    pub fn new_reserved(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let plan = crate::aligned_storage::SenderPlan::for_config(config)?;
+        if scope.session == [0; 16] {
+            return Err(crate::aligned_storage::Error::Sender(Error::Configuration));
+        }
+        let mut allocation =
+            crate::aligned_storage::Allocation::new(plan.capacity_bytes(), limits)?;
+        let mut result = Self::new_in(scope, config, &mut allocation)?;
+        result.usage = Some(allocation.finish(plan.capacity_bytes())?);
+        Ok(result)
+    }
+    /// Complete retained heap observation; legacy construction reports None.
+    pub fn storage_usage(&self) -> Option<crate::aligned_storage::Usage> {
+        self.usage
+    }
+    pub(crate) fn new_in(
+        scope: Scope,
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let mut channels = allocation.vec(usize::from(config.channels))?;
+        for _ in 0..config.channels {
+            channels.push(Channel {
+                encoder: Encoder::new_in(config.body, allocation)?,
+                next: Some(config.first_record),
+            });
+        }
+        Ok(Self {
+            config,
+            scope,
+            channels,
+            staged: Encoder::new_in(config.body, allocation)?,
+            bodies: allocation.bytes(config.body.max_frame_bytes + 29)?,
+            symbol: allocation.bytes(config.body.symbol_bytes)?,
+            pending: None,
+            usage: None,
+        })
+    }
     /// Validate and allocate a context per channel plus one transactional stage.
     pub fn new(scope: Scope, config: Config) -> Result<Self, Error> {
         config.memory_bound_bytes()?;
@@ -128,6 +195,7 @@ impl Sender {
             bodies: vec![0; config.body.max_frame_bytes + 29],
             symbol: vec![0; config.body.symbol_bytes],
             pending: None,
+            usage: None,
         })
     }
     /// Whether one native frame still has symbols awaiting recovery ownership.

@@ -108,39 +108,64 @@ pub(crate) fn encode(
     coefficients: &[u8],
     payload: &[u8],
 ) -> Result<EncodedSymbol, Error> {
+    let size = HEADER_BYTES
+        .checked_add(coefficients.len())
+        .and_then(|n| n.checked_add(payload.len()))
+        .ok_or(Error::Arithmetic)?;
+    let mut bytes = vec![0; size];
+    encode_into(
+        context,
+        generation,
+        symbol,
+        kind,
+        coefficients,
+        payload,
+        &mut bytes,
+    )?;
+    Ok(EncodedSymbol {
+        generation,
+        symbol,
+        bytes,
+    })
+}
+
+pub(crate) fn encode_into(
+    context: FecContext,
+    generation: GenerationId,
+    symbol: SymbolId,
+    kind: SymbolKind,
+    coefficients: &[u8],
+    payload: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
     let count = u16::try_from(coefficients.len()).map_err(|_| Error::InvalidDimensions)?;
     let width = u16::try_from(payload.len()).map_err(|_| Error::InvalidDimensions)?;
     let size = HEADER_BYTES
         .checked_add(coefficients.len())
         .and_then(|n| n.checked_add(payload.len()))
         .ok_or(Error::Arithmetic)?;
-    let mut bytes = Vec::with_capacity(size);
-    bytes.extend_from_slice(b"FE");
-    bytes.extend_from_slice(&[
-        1,
-        match kind {
-            SymbolKind::Systematic => 0,
-            SymbolKind::Repair => 1,
-        },
-        context.direction.wire(),
-        0,
-    ]);
-    bytes.extend_from_slice(&count.to_be_bytes());
-    bytes.extend_from_slice(&context.session.0);
-    bytes.extend_from_slice(&context.epoch.0.to_be_bytes());
-    bytes.extend_from_slice(&context.channel.0.to_be_bytes());
-    bytes.extend_from_slice(&generation.0.to_be_bytes());
-    bytes.extend_from_slice(&symbol.0.to_be_bytes());
-    bytes.extend_from_slice(&width.to_be_bytes());
-    bytes.extend_from_slice(&count.to_be_bytes());
-    bytes.extend_from_slice(&[0; 4]);
-    bytes.extend_from_slice(coefficients);
-    bytes.extend_from_slice(payload);
-    Ok(EncodedSymbol {
-        generation,
-        symbol,
-        bytes,
-    })
+    if output.len() < size {
+        return Err(Error::OutputTooSmall { required: size });
+    }
+    output[..HEADER_BYTES].fill(0);
+    output[..2].copy_from_slice(b"FE");
+    output[2] = 1;
+    output[3] = match kind {
+        SymbolKind::Systematic => 0,
+        SymbolKind::Repair => 1,
+    };
+    output[4] = context.direction.wire();
+    output[6..8].copy_from_slice(&count.to_be_bytes());
+    output[8..24].copy_from_slice(&context.session.0);
+    output[24..32].copy_from_slice(&context.epoch.0.to_be_bytes());
+    output[32..36].copy_from_slice(&context.channel.0.to_be_bytes());
+    output[36..44].copy_from_slice(&generation.0.to_be_bytes());
+    output[44..48].copy_from_slice(&symbol.0.to_be_bytes());
+    output[48..50].copy_from_slice(&width.to_be_bytes());
+    output[50..52].copy_from_slice(&count.to_be_bytes());
+    output[HEADER_BYTES..HEADER_BYTES + coefficients.len()].copy_from_slice(coefficients);
+    output[HEADER_BYTES + coefficients.len()..size].copy_from_slice(payload);
+    Ok(size)
 }
 
 fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> {

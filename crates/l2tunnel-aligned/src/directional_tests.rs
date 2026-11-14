@@ -1,6 +1,9 @@
 use super::*;
 use l2tunnel_codec::aligned_receiver::RecordId;
 
+#[path = "storage_tests.rs"]
+mod storage_tests;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn ms(value: u64) -> Duration {
@@ -126,6 +129,9 @@ macro_rules! probe {
                             ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
                         match self.prepare(channel, now, 8)? {
                             Prepared::Ready => {
+                                let original_deadline =
+                                    self.pending_deadline().ok_or(Error::Identity)?;
+                                assert!(original_deadline > now);
                                 let frame = self.pending().ok_or(Error::Identity)?;
                                 let item = (
                                     RecordIdentity {
@@ -136,8 +142,10 @@ macro_rules! probe {
                                 );
                                 // Native custody remains immutable until the actual commit boundary.
                                 assert_eq!(self.pending().ok_or(Error::Identity)?.bytes, item.1);
+                                assert_eq!(self.pending_deadline(), Some(original_deadline));
                                 result.push(item);
                                 self.commit_delivery(now)?;
+                                assert_eq!(self.pending_deadline(), None);
                                 progress = true;
                             }
                             Prepared::Progress => progress = true,

@@ -10,6 +10,9 @@ pub mod tcp_header;
 /// Python-compatible aligned record body transforms, without channel delivery.
 pub mod aligned_body;
 
+/// Fallible backing plans for the actual aligned and packed codec owners.
+pub mod aligned_storage;
+
 mod fragment;
 mod frame;
 

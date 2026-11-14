@@ -26,7 +26,7 @@ following are evidence boundaries, not a declaration that the target is running:
 
 | Area | Current evidence | Target gap |
 | --- | --- | --- |
-| Pure protocol libraries | Typed, bounded engines with caller-supplied time/I/O boundaries. | Preserve them through common security and carrier composition. |
+| Pure protocol libraries | Typed bounded engines with injected time/I/O; actual reserved FEC/Reliable/Aligned/Packed backing and a protocol-tested functional common Engine using the actual Pipeline/MUX. | Complete reserved common queues/mixed generations, selected runtime integration and complete allocator qualification; preserve boundaries through common security/carriers. |
 | Swift | Historical TLS/separate-UDP receipts remain preserved. The explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures and finite Linux CLI/TAP baselines now exist. | The full native matrix and impaired 80 Mbit/s target, complete session lifecycle, every other carrier and full SW-11. |
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
 | OpenVPN-like UDP | Real TLS over custom reliable UDP control; standalone native slices exist. | The custom 144-byte gate is not the requested OpenVPN wire-format handshake. |

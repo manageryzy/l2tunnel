@@ -8,7 +8,9 @@ use l2tunnel_recovery::{
     RecoveryEngine, RecoveryError, Retained, SelectiveRepeat, Statistics as ArqStatistics,
     inspect_packet,
 };
-use std::collections::{BTreeMap, VecDeque};
+mod backing;
+mod legacy_layout;
+pub mod storage;
 use std::fmt;
 use std::time::Duration;
 
@@ -284,14 +286,17 @@ pub struct Reliable {
     decoder: fec::Decoder,
     send_fec: fec::FecContext,
     receive_fec: fec::FecContext,
-    building: Vec<Vec<u8>>,
+    building: backing::Building,
     building_deadline: Option<Duration>,
     next_fresh_source: u64,
     next_generation: Option<fec::GenerationId>,
-    outgoing: VecDeque<Outgoing>,
-    restored: BTreeMap<u64, Restored>,
+    outgoing: backing::Queue,
+    restored: backing::RestoredMap,
     restored_bytes: usize,
-    fec_deadlines: BTreeMap<fec::GenerationId, u64>,
+    fec_deadlines: backing::Deadlines,
+    encoder: Option<fec::BlockEncoder>,
+    expired: Vec<fec::ExpiredGeneration>,
+    usage: Option<storage::Usage>,
     scratch: Vec<u8>,
     maximum_packet: usize,
     receive_maximum_packet: usize,
@@ -302,6 +307,12 @@ pub struct Reliable {
 }
 
 impl ReliableConfig {
+    /// Exact maximum actual inner output after validating the complete policy.
+    /// This excludes configured outer overhead and allocates no protocol owner.
+    pub fn maximum_packet_bytes(self) -> Result<usize, Error> {
+        self.maximum_packet()
+    }
+
     /// Validate complete geometry and limits without constructing any engine.
     pub fn validate(self) -> Result<(), Error> {
         self.maximum_packet().map(|_| ())
@@ -373,6 +384,13 @@ impl ReliableConfig {
 }
 
 impl Reliable {
+    /// Compatibility-only pre-RRS inline layout for the existing codec scalar
+    /// acceptance gate. This is not actual reserved capacity or Usage; enclosing
+    /// storage plans must charge the current real `size_of::<Reliable>()`.
+    pub const fn legacy_inline_bytes() -> usize {
+        legacy_layout::reliable_bytes()
+    }
+
     /// Validate canonical cross-module limits before constructing bounded state.
     pub fn new(config: ReliableConfig, context: RecoveryContext) -> Result<Self, Error> {
         Self::new_duplex(config, config, context)
@@ -403,14 +421,17 @@ impl Reliable {
             decoder,
             send_fec,
             receive_fec,
-            building: Vec::with_capacity(count),
+            building: backing::Building::legacy(count),
             building_deadline: None,
             next_fresh_source: 0,
             next_generation: Some(fec::GenerationId(0)),
-            outgoing: VecDeque::with_capacity(symbols),
-            restored: BTreeMap::new(),
+            outgoing: backing::Queue::legacy(symbols),
+            restored: backing::RestoredMap::legacy(),
             restored_bytes: 0,
-            fec_deadlines: BTreeMap::new(),
+            fec_deadlines: backing::Deadlines::legacy(),
+            encoder: None,
+            expired: Vec::new(),
+            usage: None,
             scratch,
             maximum_packet,
             receive_maximum_packet,
@@ -419,6 +440,145 @@ impl Reliable {
             failure: None,
             statistics: Statistics::default(),
         })
+    }
+
+    /// Provision every actual nested and wrapper owner before publication.
+    pub fn new_duplex_reserved(
+        config: ReliableConfig,
+        receive_config: ReliableConfig,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_duplex(config, receive_config)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        let mut allocation = storage::Allocation::new(limits.capacity_bytes);
+        Self::reserved_with(config, receive_config, context, plan, &mut allocation)
+    }
+    pub(crate) fn reserved_with(
+        config: ReliableConfig,
+        receive_config: ReliableConfig,
+        context: RecoveryContext,
+        plan: storage::Plan,
+        a: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        let arq = SelectiveRepeat::new_duplex_reserved(
+            config.arq,
+            receive_config.arq,
+            context,
+            l2tunnel_recovery::storage::Limits {
+                capacity_bytes: plan.arq.capacity_bytes(),
+            },
+        )
+        .map_err(storage::Error::Recovery)?;
+        let send_fec = fec_context(context, false);
+        let receive_fec = fec_context(context, true);
+        let encoder = fec::BlockEncoder::new_reserved(
+            send_fec,
+            config.fec.block,
+            fec::storage::Limits {
+                capacity_bytes: plan.encoder.capacity_bytes(),
+            },
+        )
+        .map_err(storage::Error::Fec)?;
+        let decoder = fec::Decoder::new_reserved(
+            receive_fec,
+            receive_config.fec,
+            fec::storage::Limits {
+                capacity_bytes: plan.decoder.capacity_bytes(),
+            },
+        )
+        .map_err(storage::Error::Fec)?;
+        let arq_usage = arq.storage_usage().ok_or(storage::Error::Invariant)?;
+        let encoder_usage = encoder.storage_usage().ok_or(storage::Error::Invariant)?;
+        let decoder_usage = decoder.storage_usage().ok_or(storage::Error::Invariant)?;
+        if arq_usage.capacity_bytes != plan.arq.capacity_bytes()
+            || encoder_usage.capacity_bytes != plan.encoder.capacity_bytes()
+            || decoder_usage.capacity_bytes != plan.decoder.capacity_bytes()
+        {
+            return Err(storage::Error::Invariant);
+        }
+        let maximum_packet = config.maximum_packet().map_err(storage::Error::Reliable)?;
+        let receive_maximum_packet = receive_config
+            .maximum_packet()
+            .map_err(storage::Error::Reliable)?;
+        let building = backing::Building::reserved(
+            config.fec.block.max_sources,
+            DATA_HEADER_BYTES + config.arq.max_source_bytes,
+            a,
+        )?;
+        let outgoing = backing::Queue::reserved(
+            config.fec.block.max_sources + config.repair_symbols,
+            maximum_packet,
+            a,
+        )?;
+        let restored = backing::RestoredMap::reserved(
+            receive_config.max_restored_packets,
+            DATA_HEADER_BYTES + receive_config.arq.max_source_bytes,
+            a,
+        )?;
+        let fec_deadlines = backing::Deadlines::reserved(receive_config.fec.max_generations, a)?;
+        let expired = backing::expired(receive_config.fec.max_generations, a)?;
+        let mut scratch = a.vec(arq.send_max_packet_bytes())?;
+        scratch.resize(arq.send_max_packet_bytes(), 0);
+        let wrapper = a.usage();
+        let bytes = storage::add(
+            wrapper.capacity_bytes,
+            storage::add(
+                arq_usage.capacity_bytes,
+                storage::add(encoder_usage.capacity_bytes, decoder_usage.capacity_bytes)?,
+            )?,
+        )?;
+        let allocations = storage::add(
+            wrapper.allocations,
+            storage::add(
+                arq_usage.allocations,
+                storage::add(encoder_usage.allocations, decoder_usage.allocations)?,
+            )?,
+        )?;
+        if bytes != plan.capacity_bytes() {
+            return Err(storage::Error::Invariant);
+        }
+        let usage = storage::Usage {
+            limit_bytes: wrapper.limit_bytes,
+            capacity_bytes: bytes,
+            allocations,
+        };
+        Ok(Self {
+            config,
+            receive_config,
+            context,
+            arq,
+            decoder,
+            send_fec,
+            receive_fec,
+            building,
+            building_deadline: None,
+            next_fresh_source: 0,
+            next_generation: Some(fec::GenerationId(0)),
+            outgoing,
+            restored,
+            restored_bytes: 0,
+            fec_deadlines,
+            encoder: Some(encoder),
+            expired,
+            usage: Some(usage),
+            scratch,
+            maximum_packet,
+            receive_maximum_packet,
+            prefer_feedback: true,
+            now: Duration::ZERO,
+            failure: None,
+            statistics: Statistics::default(),
+        })
+    }
+    /// Actual complete backing, including idle nested and wrapper storage.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.usage
     }
 
     /// Read the authoritative ARQ source allocator without consuming an identity.
@@ -455,7 +615,7 @@ impl Reliable {
                 self.source_id(inner).or_else(|error| self.fail(error))?;
                 self.ensure_restored(1, inner.len())?;
                 self.advance(now)?;
-                self.enqueue(inner.to_vec(), false)?;
+                self.enqueue(inner, false)?;
                 self.pump()?;
             }
             2 => {
@@ -602,8 +762,9 @@ impl Reliable {
                     _ => return self.fail(Error::Malformed),
                 };
                 if source < self.next_fresh_source {
-                    let bytes = wrap(1, &self.scratch[..length]);
-                    return self.emit(bytes, Emission::Retry, output, budget).map(Some);
+                    return self
+                        .emit_scratch(1, length, Emission::Retry, output, budget)
+                        .map(Some);
                 }
                 if source != self.next_fresh_source {
                     return self.fail(Error::SourceConflict);
@@ -614,7 +775,7 @@ impl Reliable {
                             .ok_or(Error::TimeOverflow)?,
                     );
                 }
-                self.building.push(self.scratch[..length].to_vec());
+                self.building.push(&self.scratch[..length])?;
                 self.next_fresh_source = self
                     .next_fresh_source
                     .checked_add(1)
@@ -654,12 +815,7 @@ impl Reliable {
             .deadline()
             .into_iter()
             .chain(self.building_deadline)
-            .chain(
-                self.fec_deadlines
-                    .values()
-                    .copied()
-                    .map(Duration::from_millis),
-            )
+            .chain(self.fec_deadlines.minimum().map(Duration::from_millis))
             .min()
     }
 
@@ -703,7 +859,7 @@ impl Reliable {
             building_packets: self.building.len(),
             building_bytes: self.building.iter().map(Vec::len).sum(),
             outbound_packets: self.outgoing.len(),
-            outbound_bytes: self.outgoing.iter().map(|entry| entry.bytes.len()).sum(),
+            outbound_bytes: self.outgoing.bytes(),
             restored_packets: self.restored.len(),
             restored_bytes: self.restored_bytes,
             fec_reserved_bytes: self.decoder.reserved_bytes(),
@@ -737,41 +893,69 @@ impl Reliable {
         let accepted = self.decoder.accept(inner, ticks);
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
-                let block = self
-                    .decoder
-                    .take_decoded(view.generation)
-                    .or_else(|error| self.fail(error.into()))?;
-                self.fec_deadlines.remove(&view.generation);
-                let first = self
-                    .source_id(block.sources.first().ok_or(Error::Malformed)?)
-                    .or_else(|error| self.fail(error))?;
-                for (index, source) in block.sources.iter().enumerate() {
-                    let identity = self.source_id(source).or_else(|error| self.fail(error))?;
-                    if identity != first.checked_add(index as u64).ok_or(Error::Exhausted)? {
-                        return self.fail(Error::SourceConflict);
+                let checked = (|| -> Result<(), Error> {
+                    let mut sources = self.decoder.decoded_sources(view.generation)?;
+                    let first = self.source_id(sources.next().ok_or(Error::Malformed)?)?;
+                    for (index, source) in
+                        self.decoder.decoded_sources(view.generation)?.enumerate()
+                    {
+                        let identity = self.source_id(source)?;
+                        if identity != first.checked_add(index as u64).ok_or(Error::Exhausted)? {
+                            return Err(Error::SourceConflict);
+                        }
+                        if self
+                            .restored
+                            .get(&identity)
+                            .is_some_and(|old| old.bytes != source)
+                        {
+                            return Err(Error::SourceConflict);
+                        }
                     }
-                    self.validate_duplicate(identity, source)?;
+                    Ok(())
+                })();
+                if let Err(error) = checked {
+                    return self.fail(error);
                 }
-                self.statistics.decoded_source_vectors = self
-                    .statistics
-                    .decoded_source_vectors
-                    .saturating_add(block.sources.len() as u64);
                 let direct_identity = systematic
                     .map(|source| self.source_id(source))
                     .transpose()?;
-                for source in block.sources {
-                    let recovered = Some(self.source_id(&source)?) != direct_identity;
-                    self.enqueue(source, recovered)?;
+                let sources = self.decoder.decoded_sources(view.generation)?;
+                let count = sources.len();
+                for source in sources {
+                    let identity = source_id_with(
+                        self.context,
+                        self.receive_config.arq.max_source_bytes,
+                        source,
+                    )?;
+                    if !self.restored.contains_key(&identity) {
+                        let total = self
+                            .restored_bytes
+                            .checked_add(source.len())
+                            .ok_or(Error::Exhausted)?;
+                        self.restored.insert(
+                            identity,
+                            source,
+                            Some(identity) != direct_identity,
+                        )?;
+                        self.restored_bytes = total;
+                    }
                 }
+                self.decoder.commit_decoded(view.generation)?;
+                self.fec_deadlines.remove(&view.generation);
+                self.statistics.decoded_source_vectors = self
+                    .statistics
+                    .decoded_source_vectors
+                    .saturating_add(count as u64);
             }
             Ok(_) => {
-                self.fec_deadlines.entry(view.generation).or_insert(
+                self.fec_deadlines.insert(
+                    view.generation,
                     ticks
                         .checked_add(self.receive_config.fec.max_lifetime_ticks)
                         .ok_or(Error::TimeOverflow)?,
-                );
+                )?;
                 if let Some(source) = systematic {
-                    self.enqueue(source.to_vec(), false)?;
+                    self.enqueue(source, false)?;
                 }
             }
             Err(
@@ -785,7 +969,7 @@ impl Reliable {
                 self.statistics.skipped_fec_packets =
                     self.statistics.skipped_fec_packets.saturating_add(1);
                 if let Some(source) = systematic {
-                    self.enqueue(source.to_vec(), false)?;
+                    self.enqueue(source, false)?;
                 }
             }
             Err(error) => return self.fail(error.into()),
@@ -803,33 +987,38 @@ impl Reliable {
         let Some(generation) = self.next_generation else {
             return self.fail(Error::Exhausted);
         };
-        let sources: Vec<_> = self.building.iter().map(Vec::as_slice).collect();
-        let count = sources.len();
-        let mut encoder =
-            fec::BlockEncoder::new(self.send_fec, generation, self.config.fec.block, &sources)?;
+        let count = self.building.len();
         let repairs = count
             .checked_mul(self.config.repair_symbols)
             .ok_or(Error::Exhausted)?
             .div_ceil(self.config.fec.block.max_sources);
-        let mut outgoing = VecDeque::with_capacity(count + repairs);
+        let mut legacy_encoder;
+        let encoder = if let Some(encoder) = &mut self.encoder {
+            encoder.seal_sources(generation, self.building.iter().map(Vec::as_slice))?;
+            encoder
+        } else {
+            let sources: Vec<_> = self.building.iter().map(Vec::as_slice).collect();
+            legacy_encoder =
+                fec::BlockEncoder::new(self.send_fec, generation, self.config.fec.block, &sources)?;
+            &mut legacy_encoder
+        };
+        let size = ENVELOPE_BYTES + fec::HEADER_BYTES + count + encoder.coded_bytes();
         for index in 0..count {
-            let packet = encoder.systematic(fec::SourceId(
-                u16::try_from(index).map_err(|_| Error::Exhausted)?,
-            ))?;
-            outgoing.push_back(Outgoing {
-                bytes: wrap(3, &packet.bytes),
-                emission: Emission::Systematic,
-            });
+            self.outgoing.push(size, Emission::Systematic, |output| {
+                let bytes = encoder
+                    .systematic_into(fec::SourceId(index as u16), &mut output[ENVELOPE_BYTES..])?;
+                write_header(3, output);
+                Ok(ENVELOPE_BYTES + bytes)
+            })?;
         }
         for repair in 0..repairs {
-            let coefficients = fec::cauchy_coefficients(count as u16, repair as u16)?;
-            let packet = encoder.repair(&coefficients)?;
-            outgoing.push_back(Outgoing {
-                bytes: wrap(3, &packet.bytes),
-                emission: Emission::Repair,
-            });
+            self.outgoing.push(size, Emission::Repair, |output| {
+                let bytes =
+                    encoder.cauchy_repair_into(repair as u16, &mut output[ENVELOPE_BYTES..])?;
+                write_header(3, output);
+                Ok(ENVELOPE_BYTES + bytes)
+            })?;
         }
-        self.outgoing = outgoing;
         self.building.clear();
         self.building_deadline = None;
         self.next_generation = generation.0.checked_add(1).map(fec::GenerationId);
@@ -847,13 +1036,8 @@ impl Reliable {
         let Some(length) = self.arq.poll_feedback(self.now, &mut self.scratch)? else {
             return Ok(None);
         };
-        self.emit(
-            wrap(2, &self.scratch[..length]),
-            Emission::Feedback,
-            output,
-            budget,
-        )
-        .map(Some)
+        self.emit_scratch(2, length, Emission::Feedback, output, budget)
+            .map(Some)
     }
 
     fn emit_front(
@@ -867,26 +1051,42 @@ impl Reliable {
         if !self.allowed(front.bytes.len(), budget)? {
             return Ok(None);
         }
-        let packet = self.outgoing.pop_front().ok_or(Error::Exhausted)?;
-        self.emit(packet.bytes, packet.emission, output, budget)
-            .map(Some)
+        let length = front.bytes.len();
+        let emission = front.emission;
+        output[..length].copy_from_slice(&front.bytes);
+        self.outgoing.discard_front()?;
+        self.charge(length, emission, budget)?;
+        Ok(Some(length))
     }
-
-    fn emit(
+    fn emit_scratch(
         &mut self,
-        bytes: Vec<u8>,
+        kind: u8,
+        length: usize,
         emission: Emission,
         output: &mut [u8],
         budget: &mut OutboundBudget,
     ) -> Result<usize, Error> {
-        let charge = bytes
-            .len()
-            .checked_add(self.config.outer_overhead_bytes)
-            .ok_or(Error::Exhausted)?;
-        if budget.packets == 0 || budget.wire_bytes < charge || output.len() < bytes.len() {
+        let bytes = ENVELOPE_BYTES.checked_add(length).ok_or(Error::Exhausted)?;
+        if !self.allowed(bytes, budget)? || output.len() < bytes {
             return Err(Error::Exhausted);
         }
-        output[..bytes.len()].copy_from_slice(&bytes);
+        write_header(kind, output);
+        output[ENVELOPE_BYTES..bytes].copy_from_slice(&self.scratch[..length]);
+        self.charge(bytes, emission, budget)?;
+        Ok(bytes)
+    }
+    fn charge(
+        &mut self,
+        bytes: usize,
+        emission: Emission,
+        budget: &mut OutboundBudget,
+    ) -> Result<(), Error> {
+        let charge = bytes
+            .checked_add(self.config.outer_overhead_bytes)
+            .ok_or(Error::Exhausted)?;
+        if budget.packets == 0 || budget.wire_bytes < charge {
+            return Err(Error::Exhausted);
+        }
         budget.packets -= 1;
         budget.wire_bytes -= charge;
         self.statistics.emitted_packets = self.statistics.emitted_packets.saturating_add(1);
@@ -902,7 +1102,7 @@ impl Reliable {
         };
         *statistic = statistic.saturating_add(1);
         self.prefer_feedback = !matches!(emission, Emission::Feedback);
-        Ok(bytes.len())
+        Ok(())
     }
 
     fn allowed(&self, bytes: usize, budget: &OutboundBudget) -> Result<bool, Error> {
@@ -953,18 +1153,18 @@ impl Reliable {
         Ok(())
     }
 
-    fn enqueue(&mut self, bytes: Vec<u8>, recovered: bool) -> Result<(), Error> {
-        let identity = self.source_id(&bytes).or_else(|error| self.fail(error))?;
-        self.validate_duplicate(identity, &bytes)?;
+    fn enqueue(&mut self, bytes: &[u8], recovered: bool) -> Result<(), Error> {
+        let identity = self.source_id(bytes).or_else(|error| self.fail(error))?;
+        self.validate_duplicate(identity, bytes)?;
         if self.restored.contains_key(&identity) {
             return Ok(());
         }
-        self.restored_bytes = self
+        let total = self
             .restored_bytes
             .checked_add(bytes.len())
             .ok_or(Error::Exhausted)?;
-        self.restored
-            .insert(identity, Restored { bytes, recovered });
+        self.restored.insert(identity, bytes, recovered)?;
+        self.restored_bytes = total;
         Ok(())
     }
 
@@ -991,11 +1191,21 @@ impl Reliable {
     }
 
     fn advance(&mut self, now: Duration) -> Result<(), Error> {
-        let expired = self.decoder.expire(milliseconds(now)?)?;
-        for generation in expired {
-            self.fec_deadlines.remove(&generation.generation);
-            self.statistics.expired_generations =
-                self.statistics.expired_generations.saturating_add(1);
+        if self.usage.is_some() {
+            let count = self
+                .decoder
+                .expire_into(milliseconds(now)?, &mut self.expired)?;
+            for generation in &self.expired[..count] {
+                self.fec_deadlines.remove(&generation.generation);
+                self.statistics.expired_generations =
+                    self.statistics.expired_generations.saturating_add(1);
+            }
+        } else {
+            for generation in self.decoder.expire(milliseconds(now)?)? {
+                self.fec_deadlines.remove(&generation.generation);
+                self.statistics.expired_generations =
+                    self.statistics.expired_generations.saturating_add(1);
+            }
         }
         self.now = now;
         Ok(())
@@ -1052,6 +1262,16 @@ fn fec_context(context: RecoveryContext, peer: bool) -> fec::FecContext {
         },
     }
 }
+fn write_header(kind: u8, output: &mut [u8]) {
+    output[..ENVELOPE_BYTES].copy_from_slice(&[b'L', b'2', b'R', b'F', 1, kind, 0, 0]);
+}
+fn source_id_with(context: RecoveryContext, maximum: usize, bytes: &[u8]) -> Result<u64, Error> {
+    match inspect_packet(bytes, context, maximum)? {
+        PacketView::Data { source, .. } => Ok(source.0),
+        _ => Err(Error::Malformed),
+    }
+}
+#[cfg(test)]
 fn wrap(kind: u8, inner: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(ENVELOPE_BYTES + inner.len());
     bytes.extend_from_slice(b"L2RF");
@@ -1077,3 +1297,6 @@ mod tests;
 
 #[cfg(test)]
 mod directional_tests;
+
+#[cfg(test)]
+mod storage_tests;

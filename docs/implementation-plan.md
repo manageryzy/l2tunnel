@@ -245,8 +245,12 @@ The [complete configuration](modules/record-configuration.md) source preserves
 every selected field and independent direction. The
 [448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
 also protocol-tests the [fresh-DH contract's](modules/session-refresh.md) selected
-initial/managed Joining/member/refresh/Records path. Actual common Engine and
-runtime/resource/API composition, full stage acceptance, runtime fresh-DH
+initial/managed Joining/member/refresh/Records path. The subsequent
+[actual common Engine and backing checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
+implements transactional real-queue admission, reserved FEC/Reliable/Aligned/Packed
+libraries and the explicit functional three-profile Engine. It passes affected
+library and selected downstream caller tests with bounded parallelism. Reserved
+Engine/Bank and selected runtime/resource/API composition, full stage acceptance, runtime fresh-DH
 lifecycle and complete retained recovery remain open. Passing unaffected
 checks are reused; a failed new expected literal was repaired with one exact
 test rerun rather than repeating the whole batch.

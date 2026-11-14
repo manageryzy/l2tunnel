@@ -7,7 +7,23 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The current [affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
+The current [affected checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
+adds transactional admission through the actual MUX/DRR/Pipeline, actual reserved
+FEC/Reliable/Aligned/Packed backing and an explicit functional common Engine.
+It combines317 distinct passing cases plus92 codec executions with LZ4 disabled;
+the two final regressions run alone after an append-only test-source change.
+All283 recorded simulator/tooling/config/vendor/CI inputs remain unchanged and
+those suites were not repeated.
+The Engine uses the real queues and one real duplex profile, preserving unequal
+directions, actual identities/typed output, shared wire allowance and immutable
+native pending/completion semantics. This pure library composition is
+protocol-tested; it is not installed into the current selected runtime. Complete
+reserved Pipeline/mixed-generation Bank, external configured pacing/credit/proxy
+owners, full SW-11, nested allocator/inventory acceptance and full stage/native/
+platform/performance qualification remain open. The receipt separates compiler,
+test and strict-check time and records exact unchanged-input evidence reuse.
+
+The preceding [affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
 combines448 unique passing cases with bounded parallel execution and explicit
 evidence reuse. It implements shared scalar validation, CompleteV2 transaction
 bounds through actual Peer/gate/leased decoders, complete1304-byte directional
@@ -19,7 +35,7 @@ checks pass; failed attempts and the build-sampling caveat remain preserved.
 After the new compatibility-test literal repair, only that exact failed case
 was repeated.283 simulator/tooling/config/vendor inputs remain unchanged and
 those suites were not repeated. This is not a new full `tools/check.py`, fresh-DH
-runtime/native, performance, CI or platform pass. The actual common record Engine,
+runtime/native, performance, CI or platform pass. The reserved common record Engine,
 selected runtime/resource integration, complete SW-11, retained recovery and
 required full-stage acceptance remain open.
 

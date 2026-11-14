@@ -45,7 +45,8 @@ impl Config {
     pub fn envelope(self) -> packed_envelope::Config {
         self.sender().envelope()
     }
-    /// Explicit peak codec/preflight/source scratch, excluding reliable/caller storage.
+    /// Historical allocating-owner scalar gate, excluding caller storage.
+    /// Actual reserved capacity is reported only by storage::Plan/Usage.
     pub fn codec_memory_bound_bytes(self) -> Result<usize, Error> {
         let sender = self
             .sender()
@@ -64,7 +65,7 @@ impl Config {
             .and_then(|n| n.checked_add(2 * source))
             .and_then(|n| n.checked_add(units * self.base.receiver.body.symbol_bytes))
             .and_then(|n| n.checked_add(units * size_of::<receiver::AuthenticatedSymbol<'_>>()))
-            .and_then(|n| n.checked_add(size_of::<super::Endpoint>()))
+            .and_then(|n| n.checked_add(size_of::<LegacyEndpointLayout>()))
             .filter(|n| *n <= 256 * 1024 * 1024)
             .ok_or(Error::Configuration)
     }
@@ -119,6 +120,32 @@ impl Config {
             .ok_or(Error::Configuration)
     }
 }
+// Compatibility-only pre-storage header shape. Byte arrays stand for original
+// dependency inline headers; they allocate no memory and grant no reservation.
+// Every actual new dependency/codec/header layout is counted by storage::Plan.
+#[allow(dead_code)]
+enum LegacySenderOwner {
+    Aligned(Box<()>),
+    Packed(Box<()>),
+}
+#[allow(dead_code)]
+struct LegacyEndpointLayout {
+    config: super::Config,
+    receive_config: super::Config,
+    receive_scope: receiver::Scope,
+    send_scope: receiver::Scope,
+    sender: LegacySenderOwner,
+    packing: Option<Options>,
+    receive_packing: Option<Options>,
+    packed_symbols: Vec<u8>,
+    recovery: [u8; l2tunnel_reliable::Reliable::legacy_inline_bytes()],
+    receiver: [u8; receiver::Receiver::legacy_inline_bytes()],
+    send_buffer: Vec<u8>,
+    receive_buffer: Vec<u8>,
+    handoff: Option<(u64, usize, Duration)>,
+    now: Duration,
+    failure: Option<Error>,
+}
 impl Options {
     pub(super) fn config(self, base: super::Config) -> Config {
         Config {
@@ -133,26 +160,26 @@ pub(super) fn micros(now: Duration) -> Result<u64, Error> {
     u64::try_from(now.as_micros()).map_err(|_| Error::Time)
 }
 pub(super) enum SenderOwner {
-    Aligned(Box<sender::Sender>),
-    Packed(Box<packed_sender::Sender>),
+    Aligned(Vec<sender::Sender>),
+    Packed(Vec<packed_sender::Sender>),
 }
 impl SenderOwner {
     pub(super) fn is_pending(&self) -> bool {
         match self {
-            Self::Aligned(s) => s.is_pending(),
-            Self::Packed(s) => !s.is_idle(),
+            Self::Aligned(s) => s[0].is_pending(),
+            Self::Packed(s) => !s[0].is_idle(),
         }
     }
     pub(super) fn staged_frame(&self) -> bool {
         match self {
-            Self::Aligned(s) => s.is_pending(),
-            Self::Packed(s) => s.status().staged_frame,
+            Self::Aligned(s) => s[0].is_pending(),
+            Self::Packed(s) => s[0].status().staged_frame,
         }
     }
     pub(super) fn packing(&self) -> Option<packed_sender::Status> {
         match self {
             Self::Aligned(_) => None,
-            Self::Packed(s) => Some(s.status()),
+            Self::Packed(s) => Some(s[0].status()),
         }
     }
     pub(super) fn stage(
@@ -164,8 +191,8 @@ impl SenderOwner {
     ) -> Result<receiver::RecordIdentity, Error> {
         match self {
             Self::Aligned(s) => match policy {
-                NativePolicy::EthernetHeaders => s.stage_identified(channel, frame),
-                NativePolicy::RawIp => s.stage_raw_identified(channel, frame),
+                NativePolicy::EthernetHeaders => s[0].stage_identified(channel, frame),
+                NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame),
             }
             .map_err(|e| {
                 if e == sender::Error::Busy {
@@ -175,8 +202,10 @@ impl SenderOwner {
                 }
             }),
             Self::Packed(s) => match policy {
-                NativePolicy::EthernetHeaders => s.stage_identified(channel, frame, micros(now)?),
-                NativePolicy::RawIp => s.stage_raw_identified(channel, frame, micros(now)?),
+                NativePolicy::EthernetHeaders => {
+                    s[0].stage_identified(channel, frame, micros(now)?)
+                }
+                NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame, micros(now)?),
             }
             .map_err(|e| {
                 if e == packed_sender::Error::Busy {
@@ -193,14 +222,16 @@ impl SenderOwner {
         output: &mut [u8],
     ) -> Result<usize, Error> {
         match self {
-            Self::Aligned(s) => s.write_pending(source, output).map_err(Error::Sender),
-            Self::Packed(s) => s.write_pending(source, output).map_err(Error::PackedSender),
+            Self::Aligned(s) => s[0].write_pending(source, output).map_err(Error::Sender),
+            Self::Packed(s) => s[0]
+                .write_pending(source, output)
+                .map_err(Error::PackedSender),
         }
     }
     pub(super) fn commit_source(&mut self) -> Result<(), Error> {
         match self {
-            Self::Aligned(s) => s.commit_source().map_err(Error::Sender),
-            Self::Packed(s) => s.commit_source().map_err(Error::PackedSender),
+            Self::Aligned(s) => s[0].commit_source().map_err(Error::Sender),
+            Self::Packed(s) => s[0].commit_source().map_err(Error::PackedSender),
         }
     }
 }
@@ -208,6 +239,28 @@ impl SenderOwner {
 /// Explicit packed capability; no automatic detection or ordinary-wire fallback.
 pub struct Endpoint(super::Endpoint);
 impl Endpoint {
+    /// Fallibly reserve the complete actual equal-policy Packed endpoint.
+    pub fn new_reserved(
+        config: Config,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        Self::new_duplex_reserved(config, config, context, limits)
+    }
+    /// Reserve independent Packed send/receive policies without unused halves.
+    pub fn new_duplex_reserved(
+        send: Config,
+        receive: Config,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_packed_duplex(send, receive)?;
+        super::Endpoint::new_reserved_profile(plan, context, limits).map(Self)
+    }
+    /// Complete actual retained heap; allocating construction reports None.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.0.storage_usage()
+    }
     /// Allocate one exclusive pair of codec/recovery owners after full validation.
     pub fn new(config: Config, context: RecoveryContext) -> Result<Self, Error> {
         super::Endpoint::new_profile(config.base, context, Some(config.options())).map(Self)
@@ -266,7 +319,7 @@ impl Endpoint {
     pub fn flush(&mut self, now: Duration) -> Result<(), Error> {
         self.0.advance(now)?;
         let result = match &mut self.0.sender {
-            SenderOwner::Packed(s) => s.flush(micros(now)?).map_err(Error::PackedSender),
+            SenderOwner::Packed(s) => s[0].flush(micros(now)?).map_err(Error::PackedSender),
             SenderOwner::Aligned(_) => Err(Error::Configuration),
         };
         self.0.terminal_result(result)?;
@@ -306,6 +359,10 @@ impl Endpoint {
     /// Immutable native output awaiting actual complete device acceptance.
     pub fn pending(&self) -> Option<Delivery<'_>> {
         self.0.pending()
+    }
+    /// Original expiry of pending native custody, excluding recovery/packing work.
+    pub fn pending_deadline(&self) -> Option<Duration> {
+        self.0.pending_deadline()
     }
     /// Commit only actual whole-frame native acceptance, never semantic simulation.
     pub fn commit_delivery(&mut self, now: Duration) -> Result<(), Error> {

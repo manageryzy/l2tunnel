@@ -7,10 +7,11 @@ use std::fmt;
 mod decoder;
 pub mod field;
 pub mod rolling;
+pub mod storage;
 mod wire;
 
 pub use decoder::{
-    AcceptStatus, DecodedBlock, Decoder, DecoderConfig, ExpiredGeneration, Progress,
+    AcceptStatus, DecodedBlock, DecodedSources, Decoder, DecoderConfig, ExpiredGeneration, Progress,
 };
 pub use field::{cauchy_coefficients, compact_coefficients};
 pub use wire::{HEADER_BYTES, SymbolKind, SymbolView, inspect};
@@ -134,6 +135,13 @@ impl BlockConfig {
 /// Explicit failure without a panic on peer packet bytes or local configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// A reusable encoder has no sealed generation yet.
+    Unsealed,
+    /// Caller output cannot hold the exact encoded result.
+    OutputTooSmall {
+        /// Required caller capacity.
+        required: usize,
+    },
     /// Invalid local dimension/count/memory/work/time configuration.
     InvalidConfig,
     /// Source count, vector width or original source length is outside local caps.
@@ -204,6 +212,11 @@ pub struct BlockEncoder {
     sources: Vec<Vec<u8>>,
     width: usize,
     next_repair: Option<SymbolId>,
+    count: usize,
+    sealed: bool,
+    coefficients: Vec<u8>,
+    repair_payload: Vec<u8>,
+    usage: Option<storage::Usage>,
 }
 
 impl BlockEncoder {
@@ -249,14 +262,254 @@ impl BlockEncoder {
             sources: padded,
             width,
             next_repair,
+            count: sources.len(),
+            sealed: true,
+            coefficients: Vec::new(),
+            repair_payload: Vec::new(),
+            usage: None,
         })
+    }
+
+    /// Reserve reusable backing without inventing a sealed generation.
+    pub fn new_reserved(
+        context: FecContext,
+        config: BlockConfig,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::EncoderPlan::for_encoder(config)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        let mut allocation = storage::Allocation::new(limits.capacity_bytes);
+        Self::reserved_with(context, config, plan, &mut allocation)
+    }
+    pub(crate) fn reserved_with(
+        context: FecContext,
+        config: BlockConfig,
+        plan: storage::EncoderPlan,
+        a: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        let n = config.max_sources;
+        let w = config.max_source_bytes + 2;
+        let mut sources = a.vec(n)?;
+        for _ in 0..n {
+            sources.push(a.vec(w)?);
+        }
+        let mut coefficients = a.vec(n)?;
+        coefficients.resize(n, 0);
+        let mut repair_payload = a.vec(w)?;
+        repair_payload.resize(w, 0);
+        let usage = a.usage();
+        if usage.capacity_bytes != plan.capacity_bytes() {
+            return Err(storage::Error::Invariant);
+        }
+        Ok(Self {
+            context,
+            generation: GenerationId(0),
+            config,
+            sources,
+            width: 0,
+            next_repair: None,
+            count: 0,
+            sealed: false,
+            coefficients,
+            repair_payload,
+            usage: Some(usage),
+        })
+    }
+    /// Replace a reusable block only with a strictly newer generation identity.
+    pub fn seal_sources<'a, I>(&mut self, generation: GenerationId, sources: I) -> Result<(), Error>
+    where
+        I: ExactSizeIterator<Item = &'a [u8]> + Clone,
+    {
+        self.config.validate()?;
+        if self.sealed && generation <= self.generation {
+            return Err(Error::StaleGeneration);
+        }
+        let count = sources.len();
+        if count == 0 || count > self.config.max_sources {
+            return Err(Error::InvalidDimensions);
+        }
+        // Capture stable borrows once, with a fixed bounded stack inventory. A
+        // custom Clone iterator need not replay the same items on later passes.
+        let mut borrowed = [None; MAX_SOURCES];
+        let mut actual = 0usize;
+        let mut maximum = 0usize;
+        for source in sources {
+            if actual >= count || source.is_empty() || source.len() > self.config.max_source_bytes {
+                return Err(Error::InvalidDimensions);
+            }
+            borrowed[actual] = Some(source);
+            actual += 1;
+            maximum = maximum.max(source.len());
+        }
+        if actual != count {
+            return Err(Error::InvalidDimensions);
+        }
+        let width = maximum.checked_add(2).ok_or(Error::Arithmetic)?;
+        self.config.dimensions(count, width)?;
+        self.config.work(count, width)?;
+        if self.usage.is_some() {
+            if self.sources.len() < count
+                || self
+                    .sources
+                    .iter()
+                    .take(count)
+                    .any(|s| s.capacity() < width)
+            {
+                return Err(Error::Capacity);
+            }
+            for (target, source) in self
+                .sources
+                .iter_mut()
+                .zip(borrowed[..count].iter().flatten())
+            {
+                target.clear();
+                target.resize(width, 0);
+                target[..2].copy_from_slice(&(source.len() as u16).to_be_bytes());
+                target[2..2 + source.len()].copy_from_slice(source);
+            }
+        } else {
+            let mut padded = Vec::with_capacity(count);
+            for source in borrowed[..count].iter().flatten() {
+                let mut v = vec![0; width];
+                v[..2].copy_from_slice(&(source.len() as u16).to_be_bytes());
+                v[2..2 + source.len()].copy_from_slice(source);
+                padded.push(v);
+            }
+            self.sources = padded;
+        }
+        self.generation = generation;
+        self.count = count;
+        self.width = width;
+        self.next_repair = Some(SymbolId(count as u32));
+        self.sealed = true;
+        Ok(())
+    }
+    /// Actual retained backing; legacy construction makes no reserved claim.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.usage
+    }
+    /// Encode a systematic record directly into caller-owned storage.
+    pub fn systematic_into(&mut self, source: SourceId, output: &mut [u8]) -> Result<usize, Error> {
+        if !self.sealed {
+            return Err(Error::Unsealed);
+        }
+        let index = usize::from(source.0);
+        if index >= self.count {
+            return Err(Error::InvalidDimensions);
+        }
+        let required = HEADER_BYTES + self.count + self.width;
+        if output.len() < required {
+            return Err(Error::OutputTooSmall { required });
+        }
+        if self.usage.is_none() && self.coefficients.len() < self.count {
+            self.coefficients.resize(self.count, 0);
+        }
+        self.coefficients[..self.count].fill(0);
+        self.coefficients[index] = 1;
+        wire::encode_into(
+            self.context,
+            self.generation,
+            SymbolId(u32::from(source.0)),
+            SymbolKind::Systematic,
+            &self.coefficients[..self.count],
+            &self.sources[index],
+            output,
+        )
+    }
+    /// Encode one repair directly into caller storage, consuming its ID once.
+    pub fn repair_into(&mut self, coefficients: &[u8], output: &mut [u8]) -> Result<usize, Error> {
+        if !self.sealed {
+            return Err(Error::Unsealed);
+        }
+        if coefficients.len() != self.count || coefficients.iter().all(|&c| c == 0) {
+            return Err(Error::InvalidCoefficients);
+        }
+        self.config.work(self.count, self.width)?;
+        let symbol = self.next_repair.ok_or(Error::SymbolExhausted)?;
+        let required = HEADER_BYTES + self.count + self.width;
+        if output.len() < required {
+            return Err(Error::OutputTooSmall { required });
+        }
+        if self.usage.is_none() && self.repair_payload.len() < self.width {
+            self.repair_payload.resize(self.width, 0);
+        }
+        repair_payload(
+            coefficients,
+            &self.sources[..self.count],
+            &mut self.repair_payload[..self.width],
+        );
+        let bytes = wire::encode_into(
+            self.context,
+            self.generation,
+            symbol,
+            SymbolKind::Repair,
+            coefficients,
+            &self.repair_payload[..self.width],
+            output,
+        )?;
+        self.next_repair = symbol.0.checked_add(1).map(SymbolId);
+        Ok(bytes)
+    }
+    /// Existing Cauchy arithmetic using retained coefficient/output workspaces.
+    pub fn cauchy_repair_into(
+        &mut self,
+        repair_index: u16,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        if !self.sealed {
+            return Err(Error::Unsealed);
+        }
+        field::cauchy_column(self.count as u16, repair_index)?;
+        self.config.work(self.count, self.width)?;
+        let symbol = self.next_repair.ok_or(Error::SymbolExhausted)?;
+        let required = HEADER_BYTES + self.count + self.width;
+        if output.len() < required {
+            return Err(Error::OutputTooSmall { required });
+        }
+        if self.usage.is_none() {
+            self.coefficients.resize(self.count, 0);
+            self.repair_payload.resize(self.width, 0);
+        }
+        field::cauchy_into(
+            self.count as u16,
+            repair_index,
+            &mut self.coefficients[..self.count],
+        )?;
+        repair_payload(
+            &self.coefficients[..self.count],
+            &self.sources[..self.count],
+            &mut self.repair_payload[..self.width],
+        );
+        let bytes = wire::encode_into(
+            self.context,
+            self.generation,
+            symbol,
+            SymbolKind::Repair,
+            &self.coefficients[..self.count],
+            &self.repair_payload[..self.width],
+            output,
+        )?;
+        self.next_repair = symbol.0.checked_add(1).map(SymbolId);
+        Ok(bytes)
     }
 
     /// Return one canonical systematic packet; repeated calls are byte-identical.
     pub fn systematic(&self, source: SourceId) -> Result<EncodedSymbol, Error> {
+        if !self.sealed {
+            return Err(Error::Unsealed);
+        }
         let index = usize::from(source.0);
-        let payload = self.sources.get(index).ok_or(Error::InvalidDimensions)?;
-        let mut coefficients = vec![0; self.sources.len()];
+        let payload = self
+            .sources
+            .get(index)
+            .filter(|_| index < self.count)
+            .ok_or(Error::InvalidDimensions)?;
+        let mut coefficients = vec![0; self.count];
         coefficients[index] = 1;
         wire::encode(
             self.context,
@@ -273,18 +526,16 @@ impl BlockEncoder {
     /// No randomness is hidden here: caller policy chooses coefficients. Every
     /// successful call consumes a fresh repair identity, even for dependent rows.
     pub fn repair(&mut self, coefficients: &[u8]) -> Result<EncodedSymbol, Error> {
-        if coefficients.len() != self.sources.len() || coefficients.iter().all(|&value| value == 0)
-        {
+        if !self.sealed {
+            return Err(Error::Unsealed);
+        }
+        if coefficients.len() != self.count || coefficients.iter().all(|&value| value == 0) {
             return Err(Error::InvalidCoefficients);
         }
-        self.config.work(self.sources.len(), self.width)?;
+        self.config.work(self.count, self.width)?;
         let symbol = self.next_repair.ok_or(Error::SymbolExhausted)?;
         let mut payload = vec![0; self.width];
-        for (coefficient, source) in coefficients.iter().zip(&self.sources) {
-            for (out, byte) in payload.iter_mut().zip(source) {
-                *out ^= field::multiply(*coefficient, *byte);
-            }
-        }
+        repair_payload(coefficients, &self.sources[..self.count], &mut payload);
         let encoded = wire::encode(
             self.context,
             self.generation,
@@ -299,11 +550,20 @@ impl BlockEncoder {
 
     /// Sealed source count.
     pub fn source_count(&self) -> usize {
-        self.sources.len()
+        self.count
     }
     /// Coded vector bytes, including coded valid length and zero extension.
     pub fn coded_bytes(&self) -> usize {
         self.width
+    }
+}
+
+fn repair_payload(coefficients: &[u8], sources: &[Vec<u8>], payload: &mut [u8]) {
+    payload.fill(0);
+    for (coefficient, source) in coefficients.iter().zip(sources) {
+        for (out, byte) in payload.iter_mut().zip(source) {
+            *out ^= field::multiply(*coefficient, *byte);
+        }
     }
 }
 
@@ -330,3 +590,6 @@ fn original_length(payload: &[u8]) -> Result<usize, Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod storage_tests;

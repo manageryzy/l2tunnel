@@ -28,7 +28,7 @@ impl Config {
             max_units: self.max_units,
         }
     }
-    /// Conservative explicit allocations, excluding caller output/allocator overhead.
+    /// Historical allocating-owner scalar guard, not reserved backing capacity.
     pub fn memory_bound_bytes(self) -> Result<usize, Error> {
         if self.sender.body.symbol_bytes != self.packing.symbol_bytes
             || !(1..=255).contains(&self.work_limit)
@@ -41,7 +41,7 @@ impl Config {
         let total = self.sender.memory_bound_bytes().map_err(Error::Aligned)?
             + self.packing.memory_bound_bytes().map_err(Error::Packing)?
             + usize::from(self.max_units) * size_of::<RecordId>()
-            + size_of::<Sender>();
+            + size_of::<LegacyLayout>();
         if total > 64 * 1024 * 1024 {
             return Err(Error::Configuration);
         }
@@ -98,8 +98,67 @@ pub struct Sender {
     next_unit: Option<SourceId>,
     first_unit: Option<SourceId>,
     failure: Option<Error>,
+    usage: Option<crate::aligned_storage::Usage>,
+}
+#[allow(dead_code)]
+pub(crate) struct LegacyLayout {
+    scope: Scope,
+    config: Config,
+    aligned: aligned::LegacyLayout,
+    packing: packed::LegacyLayout,
+    records: Vec<RecordId>,
+    next_unit: Option<SourceId>,
+    first_unit: Option<SourceId>,
+    failure: Option<Error>,
 }
 impl Sender {
+    pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
+        use crate::aligned_storage::{array_bytes, sum};
+        sum(&[
+            aligned::Sender::reserved_bytes(config.sender)?,
+            array_bytes::<u8>(config.packing.symbol_bytes)?,
+            array_bytes::<RecordId>(usize::from(config.max_units))?,
+        ])
+    }
+    /// Reserve the actual aligned stage, timed source and unit identities once.
+    pub fn new_reserved(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let plan = crate::aligned_storage::PackedSenderPlan::for_config(config)?;
+        if scope.session == [0; 16] {
+            return Err(crate::aligned_storage::Error::PackedSender(
+                Error::Configuration,
+            ));
+        }
+        let mut allocation =
+            crate::aligned_storage::Allocation::new(plan.capacity_bytes(), limits)?;
+        let mut result = Self::new_in(scope, config, &mut allocation)?;
+        result.usage = Some(allocation.finish(plan.capacity_bytes())?);
+        Ok(result)
+    }
+    /// Actual complete backing observation; legacy construction reports None.
+    pub fn storage_usage(&self) -> Option<crate::aligned_storage::Usage> {
+        self.usage
+    }
+    pub(crate) fn new_in(
+        scope: Scope,
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        Ok(Self {
+            scope,
+            config,
+            aligned: aligned::Sender::new_in(scope, config.sender, allocation)?,
+            packing: packed::Packer::new_in(config.packing, allocation)?,
+            records: allocation.vec(usize::from(config.max_units))?,
+            next_unit: Some(config.first_unit),
+            first_unit: None,
+            failure: None,
+            usage: None,
+        })
+    }
     /// Validate all products before allocating packet/metadata storage.
     pub fn new(scope: Scope, config: Config) -> Result<Self, Error> {
         config.memory_bound_bytes()?;
@@ -112,6 +171,7 @@ impl Sender {
             next_unit: Some(config.first_unit),
             first_unit: None,
             failure: None,
+            usage: None,
         })
     }
     fn live(&self) -> Result<(), Error> {
