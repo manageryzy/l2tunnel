@@ -217,6 +217,17 @@ pub struct Engine {
     base: Stats,
 }
 
+struct InitialStorage {
+    senders: Vec<Sender>,
+    receivers: Vec<Receiver>,
+    compressors: Vec<header::Compressor>,
+    decompressors: Vec<header::Decompressor>,
+    body: Vec<u8>,
+    block: Vec<u8>,
+    native: Vec<u8>,
+    record: Vec<u8>,
+}
+
 fn tagged(kind: u8, channel: usize) -> u8 {
     kind | ((channel as u8) << 2)
 }
@@ -236,29 +247,127 @@ impl Engine {
             compressors.push(header::Compressor::new(ethernet));
             decompressors.push(header::Decompressor::new(ethernet));
         }
-        Ok(Self {
-            send: config,
-            receive: config,
-            limit: config.codec.datagram_bytes,
+        Ok(Self::from_storage(
+            config,
+            config,
+            InitialStorage {
+                senders,
+                receivers,
+                compressors,
+                decompressors,
+                body: Vec::with_capacity(config.codec.datagram_bytes),
+                block: Vec::with_capacity(crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS),
+                native: Vec::with_capacity(config.codec.max_packet),
+                record: Vec::with_capacity(config.codec.max_packet),
+            },
+        ))
+    }
+
+    fn validate_directions(send: Config, receive: Config) -> Result<(), Error> {
+        send.validate()?;
+        receive.validate()?;
+        if send.layer != receive.layer || send.max_native != receive.max_native {
+            return Err(Error::Configuration);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserved_heap_bytes(send: Config, receive: Config) -> Result<usize, Error> {
+        Self::validate_directions(send, receive)?;
+        let send_heap = Sender::reserved_bytes(send.codec)?
+            .checked_add(header::Compressor::reserved_bytes(send.max_native)?)
+            .and_then(|bytes| bytes.checked_mul(send.channels))
+            .ok_or(crate::Error::Storage)?;
+        let receive_heap = Receiver::reserved_bytes(receive.codec)?
+            .checked_add(header::Decompressor::reserved_bytes()?)
+            .and_then(|bytes| bytes.checked_mul(receive.channels))
+            .ok_or(crate::Error::Storage)?;
+        let mut total = 0usize;
+        for bytes in [
+            crate::storage::array_bytes::<Sender>(send.channels)?,
+            crate::storage::array_bytes::<Receiver>(receive.channels)?,
+            crate::storage::array_bytes::<header::Compressor>(send.channels)?,
+            crate::storage::array_bytes::<header::Decompressor>(receive.channels)?,
+            send_heap,
+            receive_heap,
+            crate::storage::array_bytes::<u8>(
+                send.codec.datagram_bytes.max(receive.codec.datagram_bytes),
+            )?,
+            crate::storage::array_bytes::<u8>(crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS)?,
+            crate::storage::array_bytes::<u8>(receive.max_native)?,
+            crate::storage::array_bytes::<u8>(send.codec.max_packet.max(receive.codec.max_packet))?,
+        ] {
+            total = total.checked_add(bytes).ok_or(crate::Error::Storage)?;
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn new_reserved(
+        send: Config,
+        receive: Config,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, Error> {
+        Self::validate_directions(send, receive)?;
+        let mut senders = allocation.vec(send.channels)?;
+        let mut receivers = allocation.vec(receive.channels)?;
+        let mut compressors = allocation.vec(send.channels)?;
+        let mut decompressors = allocation.vec(receive.channels)?;
+        for _ in 0..send.channels {
+            senders.push(Sender::new_reserved(send.codec, allocation)?);
+            compressors.push(header::Compressor::new_reserved(
+                send.layer == Layer::Ethernet,
+                send.max_native,
+                allocation,
+            )?);
+        }
+        for _ in 0..receive.channels {
+            receivers.push(Receiver::new_reserved(receive.codec, allocation)?);
+            decompressors.push(header::Decompressor::new_reserved(
+                receive.layer == Layer::Ethernet,
+                allocation,
+            )?);
+        }
+        Ok(Self::from_storage(
+            send,
+            receive,
+            InitialStorage {
+                senders,
+                receivers,
+                compressors,
+                decompressors,
+                body: allocation
+                    .vec(send.codec.datagram_bytes.max(receive.codec.datagram_bytes))?,
+                block: allocation.vec(crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS)?,
+                native: allocation.vec(receive.max_native)?,
+                record: allocation.vec(send.codec.max_packet.max(receive.codec.max_packet))?,
+            },
+        ))
+    }
+
+    fn from_storage(send: Config, receive: Config, storage: InitialStorage) -> Self {
+        Self {
+            send,
+            receive,
+            limit: send.codec.datagram_bytes.max(receive.codec.datagram_bytes),
             source_floor: RecordNumber(0),
             feedback_floor: RecordNumber(0),
             admitted: [0; crate::MAX_CHANNELS],
             extracted: [0; crate::MAX_CHANNELS],
-            senders,
-            receivers,
-            compressors,
-            decompressors,
+            senders: storage.senders,
+            receivers: storage.receivers,
+            compressors: storage.compressors,
+            decompressors: storage.decompressors,
             turn: 0,
             receive_turn: 0,
             feedback_at: 0,
             feedback_turn: 0,
             ready: 0,
-            body: Vec::with_capacity(config.codec.datagram_bytes),
-            block: Vec::with_capacity(crate::FEEDBACK_HEADER + 2 * crate::MAX_REQUESTS),
-            native: Vec::with_capacity(config.codec.max_packet),
-            record: Vec::with_capacity(config.codec.max_packet),
+            body: storage.body,
+            block: storage.block,
+            native: storage.native,
+            record: storage.record,
             base: Stats::default(),
-        })
+        }
     }
 
     /// Current sending policy.
@@ -358,7 +467,7 @@ impl Engine {
             channel: ChannelId::new(channel).ok_or(Error::Configuration)?,
             record: NativeRecordId(self.admitted[channel]),
         };
-        self.compressors[channel].compress(packet, &mut self.record);
+        self.compressors[channel].compress_checked(packet, &mut self.record)?;
         if !self.senders[channel].push_packet(now, &self.record)? {
             return Err(Error::Admission);
         }
@@ -666,5 +775,7 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 mod tests;

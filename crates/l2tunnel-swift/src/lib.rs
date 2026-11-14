@@ -27,6 +27,7 @@ pub mod policy;
 mod receiver;
 pub mod records;
 mod sender;
+pub mod storage;
 
 pub use receiver::Receiver;
 pub use sender::Sender;
@@ -128,6 +129,10 @@ pub enum Error {
     Exhausted,
     /// A native packet is empty or larger than the configured maximum.
     PacketSize,
+    /// Checked storage layout, capacity or reserved-pool invariant failure.
+    Storage,
+    /// A fallible backing allocation was refused by the allocator.
+    Allocation,
 }
 
 impl std::fmt::Display for Error {
@@ -137,6 +142,8 @@ impl std::fmt::Display for Error {
             Self::Malformed => "malformed authenticated swift data",
             Self::Exhausted => "swift sequence space exhausted",
             Self::PacketSize => "native packet size outside the configured bound",
+            Self::Storage => "swift reserved storage capacity violated",
+            Self::Allocation => "swift backing allocation failed",
         })
     }
 }

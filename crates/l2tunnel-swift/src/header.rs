@@ -205,6 +205,7 @@ pub struct Compressor {
     slots: [Context; SLOTS],
     next: usize,
     scratch: Vec<u8>,
+    reserved: bool,
     saved: u64,
 }
 
@@ -216,8 +217,41 @@ impl Compressor {
             slots: [EMPTY; SLOTS],
             next: 0,
             scratch: Vec::new(),
+            reserved: false,
             saved: 0,
         }
+    }
+    pub(crate) fn reserved_bytes(max_native: usize) -> Result<usize, Error> {
+        crate::storage::array_bytes::<u8>(max_native)
+    }
+    pub(crate) fn new_reserved(
+        ethernet: bool,
+        max_native: usize,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            scratch: allocation.vec(max_native)?,
+            reserved: true,
+            ..Self::new(ethernet)
+        })
+    }
+    pub(crate) fn compress_checked(
+        &mut self,
+        packet: &[u8],
+        record: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        if self.reserved
+            && (self.scratch.capacity() < packet.len()
+                || record.capacity()
+                    < packet
+                        .len()
+                        .checked_add(MAX_EXPANSION)
+                        .ok_or(Error::Storage)?)
+        {
+            return Err(Error::Storage);
+        }
+        self.compress(packet, record);
+        Ok(())
     }
     /// Bytes removed so far, net of the record tags added to literal packets.
     pub fn saved(&self) -> u64 {
@@ -325,6 +359,8 @@ impl Compressor {
 pub struct Decompressor {
     link: usize,
     slots: [Context; SLOTS],
+    probe: Vec<u8>,
+    reserved: bool,
 }
 
 impl Decompressor {
@@ -333,7 +369,22 @@ impl Decompressor {
         Self {
             link: if ethernet { ETHERNET } else { 0 },
             slots: [EMPTY; SLOTS],
+            probe: Vec::new(),
+            reserved: false,
         }
+    }
+    pub(crate) fn reserved_bytes() -> Result<usize, Error> {
+        crate::storage::array_bytes::<u8>(MAX_HEADER)
+    }
+    pub(crate) fn new_reserved(
+        ethernet: bool,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            probe: allocation.vec(MAX_HEADER)?,
+            reserved: true,
+            ..Self::new(ethernet)
+        })
     }
     /// Restore the packet of one record into `packet` (cleared first). A
     /// record no compressor could have produced, or a packet longer than
@@ -344,6 +395,9 @@ impl Decompressor {
         max_packet: usize,
         packet: &mut Vec<u8>,
     ) -> Result<(), Error> {
+        if self.reserved && (self.probe.capacity() < MAX_HEADER || packet.capacity() < max_packet) {
+            return Err(Error::Storage);
+        }
         packet.clear();
         let (&tag, body) = record.split_first().ok_or(Error::Malformed)?;
         let slot = usize::from(tag >> 2);
@@ -368,9 +422,15 @@ impl Decompressor {
                     return Err(Error::Malformed);
                 }
                 // Fields are consumed first; what remains is the payload.
-                let mut probe = Vec::new();
                 let mut fields = rest;
-                rebuild(self.link, &context, flags, &mut fields, &[], &mut probe)?;
+                rebuild(
+                    self.link,
+                    &context,
+                    flags,
+                    &mut fields,
+                    &[],
+                    &mut self.probe,
+                )?;
                 let consumed = rest.len() - fields.len();
                 let mut fields = take(&mut rest, consumed)?;
                 if context.length + rest.len() > max_packet {
@@ -628,6 +688,105 @@ mod tests {
                 frame = next;
             }
         }
+    }
+
+    #[test]
+    fn reserved_header_workspaces_reuse_exact_backing_through_delta_and_literal()
+    -> Result<(), Error> {
+        let max_native = 1600;
+        let mut allocation = crate::storage::Allocation::new(max_native + MAX_HEADER);
+        let mut compressor = Compressor::new_reserved(true, max_native, &mut allocation)?;
+        let mut decompressor = Decompressor::new_reserved(true, &mut allocation)?;
+        assert_eq!(allocation.used(), max_native + MAX_HEADER);
+        let mut record = Vec::with_capacity(max_native + MAX_EXPANSION);
+        let mut restored = Vec::with_capacity(max_native);
+        let pointers = (
+            compressor.scratch.as_ptr(),
+            decompressor.probe.as_ptr(),
+            record.as_ptr(),
+            restored.as_ptr(),
+        );
+        let mut legacy = Pair::new(true);
+        for index in 0..600u32 {
+            let data = (index as usize * 53) % (max_native - 66 + 1);
+            let packet = segment(
+                40_000 + (index % 4) as u16,
+                index as u16,
+                index.wrapping_mul(1009),
+                index.wrapping_mul(23),
+                (index.wrapping_mul(100), index.wrapping_mul(13)),
+                data,
+            );
+            compressor.compress_checked(&packet, &mut record)?;
+            legacy.compressor.compress(&packet, &mut legacy.record);
+            assert_eq!(record, legacy.record);
+            decompressor.decompress(&record, max_native, &mut restored)?;
+            assert_eq!(restored, packet);
+        }
+        let literal = vec![0xA5; max_native];
+        compressor.compress_checked(&literal, &mut record)?;
+        assert_eq!(record.len(), max_native + MAX_EXPANSION);
+        decompressor.decompress(&record, max_native, &mut restored)?;
+        assert_eq!(restored, literal);
+        assert_eq!(
+            (
+                compressor.scratch.as_ptr(),
+                decompressor.probe.as_ptr(),
+                record.as_ptr(),
+                restored.as_ptr()
+            ),
+            pointers
+        );
+        assert_eq!(compressor.scratch.capacity(), max_native);
+        assert_eq!(decompressor.probe.capacity(), MAX_HEADER);
+        assert_eq!(record.capacity(), max_native + MAX_EXPANSION);
+        assert_eq!(restored.capacity(), max_native);
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_header_capacity_refusal_preserves_output_and_context() -> Result<(), Error> {
+        let mut allocation = crate::storage::Allocation::new(1600 + MAX_HEADER);
+        let mut compressor = Compressor::new_reserved(true, 1600, &mut allocation)?;
+        let mut decompressor = Decompressor::new_reserved(true, &mut allocation)?;
+        let packet = segment(40_000, 7, 1000, 9, (100, 50), 10);
+        let mut short_record = vec![0xBB];
+        assert_eq!(
+            compressor.compress_checked(&packet, &mut short_record),
+            Err(Error::Storage)
+        );
+        assert_eq!(short_record, [0xBB]);
+        assert!(compressor.slots.iter().all(|context| context.length == 0));
+        assert_eq!(compressor.saved(), 0);
+        let mut record = Vec::with_capacity(1601);
+        compressor.compress_checked(&packet, &mut record)?;
+        let mut short_output = vec![0xCC];
+        assert_eq!(
+            decompressor.decompress(&record, 1600, &mut short_output),
+            Err(Error::Storage)
+        );
+        assert_eq!(short_output, [0xCC]);
+        assert!(decompressor.slots.iter().all(|context| context.length == 0));
+        let mut output = Vec::with_capacity(1600);
+        decompressor.decompress(&record, 1600, &mut output)?;
+        assert_eq!(output, packet);
+        let snapshot = decompressor.slots.map(|c| (c.header, c.length, c.payload));
+        let probe = decompressor.probe.as_ptr();
+        for invalid in [
+            &[DELTA, F_SEQ, 0x80][..],
+            &[DELTA, F_CONTROL, 0, 0, 0, 0][..],
+        ] {
+            assert_eq!(
+                decompressor.decompress(invalid, 1600, &mut output),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                decompressor.slots.map(|c| (c.header, c.length, c.payload)),
+                snapshot
+            );
+            assert_eq!(decompressor.probe.as_ptr(), probe);
+        }
+        Ok(())
     }
 
     #[test]

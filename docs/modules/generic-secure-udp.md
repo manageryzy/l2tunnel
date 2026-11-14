@@ -40,6 +40,8 @@ those helpers are consumed by a production driver. GSU-03..GSU-10 retain their
 complete integration, resource, mode, native, platform and performance scope.
 
 The actual engine storage review also remains a preparation prerequisite.
+Its additive fallible owner is tracked in [Swift storage](swift-storage.md),
+SRS-01..SRS-07; pure allocation tests do not complete GSU-05.
 Sender retained-source debt is `flow_sources`, not the repair window; queue
 high-water capacities persist per channel. Receiver history/equation terms,
 stream growth, header scratch, shared workspaces and construction transients

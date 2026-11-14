@@ -6,29 +6,66 @@ use super::{
 };
 use std::collections::VecDeque;
 
+type Term = (u64, u8);
+
 /// One pending equation: `sum(coefficient * vector(sequence)) = data`, where a
 /// source vector is its 16-bit length followed by its bytes, zero extended.
 struct Row {
     /// Unknown sources only, ascending by sequence. The first is the pivot and
     /// has coefficient one; no other row mentions any row's pivot.
-    terms: Vec<(u64, u8)>,
+    terms: Vec<Term>,
     data: Vec<u8>,
 }
 
-fn add_scaled(target: &mut Vec<u8>, source: &[u8], factor: u8) {
+fn vec_room<T>(reserved: bool, target: &Vec<T>, additional: usize) -> Result<(), Error> {
+    let needed = target.len().checked_add(additional).ok_or(Error::Storage)?;
+    if reserved && needed > target.capacity() {
+        return Err(Error::Storage);
+    }
+    Ok(())
+}
+
+fn add_scaled(
+    target: &mut Vec<u8>,
+    source: &[u8],
+    factor: u8,
+    reserved: bool,
+    maximum: usize,
+) -> Result<(), Error> {
+    if source.len() > maximum || target.len() > maximum {
+        return Err(Error::Storage);
+    }
     if target.len() < source.len() {
+        vec_room(reserved, target, source.len() - target.len())?;
         target.resize(source.len(), 0);
     }
     gf::mul_add(target, source, factor);
+    Ok(())
+}
+
+fn push_term(
+    target: &mut Vec<Term>,
+    term: Term,
+    reserved: bool,
+    maximum: usize,
+) -> Result<(), Error> {
+    if target.len() >= maximum {
+        return Err(Error::Storage);
+    }
+    vec_room(reserved, target, 1)?;
+    target.push(term);
+    Ok(())
 }
 
 /// `target += factor * other` over sparse ascending term lists.
 fn add_terms(
-    target: &mut Vec<(u64, u8)>,
-    other: &[(u64, u8)],
+    target: &mut Vec<Term>,
+    other: &[Term],
     factor: u8,
-    scratch: &mut Vec<(u64, u8)>,
-) {
+    scratch: &mut Vec<Term>,
+    reserved: bool,
+    maximum: usize,
+) -> Result<(), Error> {
     scratch.clear();
     let (mut a, mut b) = (0, 0);
     while a < target.len() || b < other.len() {
@@ -36,33 +73,34 @@ fn add_terms(
         let right = other.get(b).copied();
         match (left, right) {
             (Some((x, c)), Some((y, _))) if x < y => {
-                scratch.push((x, c));
+                push_term(scratch, (x, c), reserved, maximum)?;
                 a += 1;
             }
             (Some((x, _)), Some((y, d))) if y < x => {
-                scratch.push((y, gf::mul(d, factor)));
+                push_term(scratch, (y, gf::mul(d, factor)), reserved, maximum)?;
                 b += 1;
             }
             (Some((x, c)), Some((_, d))) => {
                 let value = c ^ gf::mul(d, factor);
                 if value != 0 {
-                    scratch.push((x, value));
+                    push_term(scratch, (x, value), reserved, maximum)?;
                 }
                 a += 1;
                 b += 1;
             }
             (Some(term), None) => {
-                scratch.push(term);
+                push_term(scratch, term, reserved, maximum)?;
                 a += 1;
             }
             (None, Some((y, d))) => {
-                scratch.push((y, gf::mul(d, factor)));
+                push_term(scratch, (y, gf::mul(d, factor)), reserved, maximum)?;
                 b += 1;
             }
             (None, None) => break,
         }
     }
     std::mem::swap(target, scratch);
+    Ok(())
 }
 
 fn coefficient_of(terms: &[(u64, u8)], sequence: u64) -> Option<(usize, u8)> {
@@ -73,6 +111,39 @@ fn coefficient_of(terms: &[(u64, u8)], sequence: u64) -> Option<(usize, u8)> {
 }
 
 const FEEDBACK_REPEATS: u8 = 2;
+
+struct Geometry {
+    slots: usize,
+    rows: usize,
+    objects: usize,
+    vector: usize,
+    stream: usize,
+}
+impl Geometry {
+    fn new(config: Config) -> Result<Self, Error> {
+        config.validate()?;
+        let slots = config
+            .flow_sources
+            .checked_add(config.window)
+            .ok_or(Error::Storage)?;
+        let rows = config.window.checked_mul(2).ok_or(Error::Storage)?;
+        let objects = rows.checked_add(1).ok_or(Error::Storage)?;
+        let vector = config.symbol_bytes().checked_add(2).ok_or(Error::Storage)?;
+        let stream = config
+            .flow_sources
+            .checked_mul(config.symbol_bytes())
+            .and_then(|bytes| bytes.checked_add(config.max_packet))
+            .and_then(|bytes| bytes.checked_add(FRAME_PREFIX))
+            .ok_or(Error::Storage)?;
+        Ok(Self {
+            slots,
+            rows,
+            objects,
+            vector,
+            stream,
+        })
+    }
+}
 
 /// One direction's receiving engine.
 pub struct Receiver {
@@ -85,8 +156,10 @@ pub struct Receiver {
     floor: u64,
     slots: VecDeque<Option<Vec<u8>>>,
     rows: Vec<Row>,
-    scratch_terms: Vec<(u64, u8)>,
-    scratch_vector: Vec<u8>,
+    scratch_terms: Vec<Term>,
+    row_spare: Vec<Row>,
+    repivot: Vec<Row>,
+    reserved: bool,
     /// Ordered recovered bytes not yet cut into native packets.
     stream: VecDeque<u8>,
     dirty: bool,
@@ -112,7 +185,9 @@ impl Receiver {
             slots: VecDeque::new(),
             rows: Vec::new(),
             scratch_terms: Vec::new(),
-            scratch_vector: Vec::new(),
+            row_spare: Vec::new(),
+            repivot: Vec::new(),
+            reserved: false,
             stream: VecDeque::new(),
             dirty: false,
             reported_end: 0,
@@ -121,6 +196,109 @@ impl Receiver {
             spare: Vec::new(),
             stats: ReceiverStats::default(),
         })
+    }
+    /// Requested owned heap layouts, excluding this inline receiver and outputs.
+    pub(crate) fn reserved_bytes(config: Config) -> Result<usize, Error> {
+        use crate::storage::array_bytes;
+        let shape = Geometry::new(config)?;
+        let source_data = array_bytes::<u8>(shape.vector)?
+            .checked_mul(shape.slots)
+            .ok_or(Error::Storage)?;
+        let row_data = array_bytes::<Term>(config.flow_sources)?
+            .checked_add(array_bytes::<u8>(shape.vector)?)
+            .and_then(|bytes| bytes.checked_mul(shape.objects))
+            .ok_or(Error::Storage)?;
+        [
+            array_bytes::<Option<Vec<u8>>>(shape.slots)?,
+            array_bytes::<Vec<u8>>(shape.slots)?,
+            source_data,
+            array_bytes::<Row>(shape.rows)?,
+            array_bytes::<Row>(shape.objects)?,
+            array_bytes::<Row>(shape.rows)?,
+            row_data,
+            array_bytes::<Term>(config.flow_sources)?,
+            array_bytes::<u8>(shape.stream)?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| {
+            sum.checked_add(bytes).ok_or(Error::Storage)
+        })
+    }
+    /// Provision all packet-time receiver storage through the shared allocation.
+    pub(crate) fn new_reserved(
+        config: Config,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, Error> {
+        let shape = Geometry::new(config)?;
+        let mut spare = allocation.vec(shape.slots)?;
+        for _ in 0..shape.slots {
+            spare.push(allocation.vec(shape.vector)?);
+        }
+        let mut row_spare = allocation.vec(shape.objects)?;
+        for _ in 0..shape.objects {
+            row_spare.push(Row {
+                terms: allocation.vec(config.flow_sources)?,
+                data: allocation.vec(shape.vector)?,
+            });
+        }
+        Ok(Self {
+            config,
+            base: 0,
+            end: 0,
+            floor: 0,
+            slots: allocation.deque(shape.slots)?,
+            rows: allocation.vec(shape.rows)?,
+            scratch_terms: allocation.vec(config.flow_sources)?,
+            row_spare,
+            repivot: allocation.vec(shape.rows)?,
+            reserved: true,
+            stream: allocation.deque(shape.stream)?,
+            dirty: false,
+            reported_end: 0,
+            repeats: 0,
+            last_feedback: 0,
+            spare,
+            stats: ReceiverStats::default(),
+        })
+    }
+    fn take_source(&mut self) -> Result<Vec<u8>, Error> {
+        match self.spare.pop() {
+            Some(mut source) => {
+                source.clear();
+                Ok(source)
+            }
+            None if self.reserved => Err(Error::Storage),
+            None => Ok(Vec::new()),
+        }
+    }
+    fn recycle_source(&mut self, mut source: Vec<u8>) -> Result<(), Error> {
+        source.clear();
+        if self.reserved {
+            vec_room(true, &self.spare, 1)?;
+            self.spare.push(source);
+        } else if self.spare.len() < 64 {
+            self.spare.push(source);
+        }
+        Ok(())
+    }
+    fn take_row(&mut self) -> Result<Row, Error> {
+        match self.row_spare.pop() {
+            Some(row) => Ok(row),
+            None if self.reserved => Err(Error::Storage),
+            None => Ok(Row {
+                terms: Vec::new(),
+                data: Vec::new(),
+            }),
+        }
+    }
+    fn recycle_row(&mut self, mut row: Row) -> Result<(), Error> {
+        row.terms.clear();
+        row.data.clear();
+        if self.reserved {
+            vec_room(true, &self.row_spare, 1)?;
+        }
+        self.row_spare.push(row);
+        Ok(())
     }
     /// Begin at an arbitrary sequence, as a long-lived session would be.
     #[cfg(test)]
@@ -166,15 +344,21 @@ impl Receiver {
     /// Extend knowledge of the highest sequence; reject one beyond the flow bound.
     fn observe_end(&mut self, end: u64) -> Result<(), Error> {
         if end > self.end {
-            let limit = self.base + self.config.flow_sources as u64;
-            if end > limit {
+            let debt = end.checked_sub(self.base).ok_or(Error::Malformed)?;
+            if debt > self.config.flow_sources as u64 {
                 return Err(Error::Malformed);
             }
-            self.end = end;
-            let needed = (self.end - self.floor) as usize;
+            let needed = end
+                .checked_sub(self.floor)
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or(Error::Storage)?;
+            if self.reserved && needed > self.slots.capacity() {
+                return Err(Error::Storage);
+            }
             if self.slots.len() < needed {
                 self.slots.resize_with(needed, || None);
             }
+            self.end = end;
         }
         Ok(())
     }
@@ -197,8 +381,11 @@ impl Receiver {
                     return Ok(());
                 }
                 self.observe_end(end)?;
-                let mut owned = self.spare.pop().unwrap_or_default();
-                owned.clear();
+                let mut owned = self.take_source()?;
+                if let Err(error) = vec_room(self.reserved, &owned, payload.len()) {
+                    self.recycle_source(owned)?;
+                    return Err(error);
+                }
                 owned.extend_from_slice(payload);
                 self.stats.sources += 1;
                 self.learn(sequence, owned)?;
@@ -234,32 +421,38 @@ impl Receiver {
     }
     /// Reduce a received equation against known sources and held rows.
     fn equation(&mut self, seed: u64, start: u64, end: u64, data: &[u8]) -> Result<(), Error> {
-        let mut vector = std::mem::take(&mut self.scratch_vector);
-        vector.clear();
-        vector.extend_from_slice(data);
-        let mut terms = Vec::new();
-        for sequence in start..end {
-            let factor = gf::coefficient(seed, sequence as u32);
-            if sequence < self.base || self.slot(sequence).is_some() {
-                let Some(payload) = self.slot(sequence) else {
-                    // History below the floor was already excluded by the caller.
-                    self.scratch_vector = vector;
-                    return Err(Error::Malformed);
-                };
-                if payload.len() + 2 > vector.len() {
-                    self.scratch_vector = vector;
-                    return Err(Error::Malformed);
+        let mut row = self.take_row()?;
+        let prepared = (|| {
+            vec_room(self.reserved, &row.data, data.len())?;
+            row.data.extend_from_slice(data);
+            for sequence in start..end {
+                let factor = gf::coefficient(seed, sequence as u32);
+                if sequence < self.base || self.slot(sequence).is_some() {
+                    let payload = self.slot(sequence).ok_or(Error::Malformed)?;
+                    if payload.len() + 2 > row.data.len() {
+                        return Err(Error::Malformed);
+                    }
+                    let length = (payload.len() as u16).to_be_bytes();
+                    gf::mul_add(&mut row.data[..2], &length, factor);
+                    gf::mul_add(&mut row.data[2..], payload, factor);
+                } else {
+                    push_term(
+                        &mut row.terms,
+                        (sequence, factor),
+                        self.reserved,
+                        self.config.flow_sources,
+                    )?;
                 }
-                let length = (payload.len() as u16).to_be_bytes();
-                gf::mul_add(&mut vector[..2], &length, factor);
-                gf::mul_add(&mut vector[2..], payload, factor);
-            } else {
-                terms.push((sequence, factor));
             }
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            self.recycle_row(row)?;
+            return Err(error);
         }
-        if terms.is_empty() {
+        if row.terms.is_empty() {
             self.stats.useless_repairs += 1;
-            self.scratch_vector = vector;
+            self.recycle_row(row)?;
             return Ok(());
         }
         // Bounded equations: make room by forgetting the one about the oldest
@@ -269,13 +462,9 @@ impl Receiver {
             && let Some(oldest) = (0..self.rows.len())
                 .min_by_key(|index| self.rows[*index].terms.first().map(|term| term.0))
         {
-            self.rows.swap_remove(oldest);
+            let old = self.rows.swap_remove(oldest);
+            self.recycle_row(old)?;
         }
-        let row = Row {
-            terms,
-            data: vector.clone(),
-        };
-        self.scratch_vector = vector;
         if self.insert(row)? {
             self.stats.useful_repairs += 1;
         } else {
@@ -286,145 +475,235 @@ impl Receiver {
     /// Reduce a row by every held pivot, normalise it and clear its own pivot
     /// from the other rows. Returns whether it added an independent equation.
     fn insert(&mut self, mut row: Row) -> Result<bool, Error> {
-        for other in &self.rows {
-            let Some(&(pivot, _)) = other.terms.first() else {
-                continue;
+        let result = (|| {
+            let maximum = self.config.symbol_bytes() + 2;
+            for other in &self.rows {
+                let Some(&(pivot, _)) = other.terms.first() else {
+                    continue;
+                };
+                if let Some((_, factor)) = coefficient_of(&row.terms, pivot) {
+                    add_terms(
+                        &mut row.terms,
+                        &other.terms,
+                        factor,
+                        &mut self.scratch_terms,
+                        self.reserved,
+                        self.config.flow_sources,
+                    )?;
+                    add_scaled(&mut row.data, &other.data, factor, self.reserved, maximum)?;
+                }
+            }
+            let Some(&(pivot, lead)) = row.terms.first() else {
+                return if row.data.iter().any(|byte| *byte != 0) {
+                    Err(Error::Malformed)
+                } else {
+                    Ok(false)
+                };
             };
-            if let Some((_, factor)) = coefficient_of(&row.terms, pivot) {
-                add_terms(
-                    &mut row.terms,
-                    &other.terms,
-                    factor,
-                    &mut self.scratch_terms,
-                );
-                add_scaled(&mut row.data, &other.data, factor);
+            let inverse = gf::inv(lead).ok_or(Error::Malformed)?;
+            for term in &mut row.terms {
+                term.1 = gf::mul(term.1, inverse);
+            }
+            gf::scale(&mut row.data, inverse);
+            for other in &mut self.rows {
+                if let Some((_, factor)) = coefficient_of(&other.terms, pivot) {
+                    add_terms(
+                        &mut other.terms,
+                        &row.terms,
+                        factor,
+                        &mut self.scratch_terms,
+                        self.reserved,
+                        self.config.flow_sources,
+                    )?;
+                    add_scaled(&mut other.data, &row.data, factor, self.reserved, maximum)?;
+                }
+            }
+            vec_room(self.reserved, &self.rows, 1)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => {
+                self.rows.push(row);
+                Ok(true)
+            }
+            result => {
+                self.recycle_row(row)?;
+                result
             }
         }
-        let Some(&(pivot, lead)) = row.terms.first() else {
-            // A consistent sender leaves no residue in a dependent equation.
-            return if row.data.iter().any(|byte| *byte != 0) {
-                Err(Error::Malformed)
-            } else {
-                Ok(false)
-            };
-        };
-        let inverse = gf::inv(lead).ok_or(Error::Malformed)?;
-        for term in &mut row.terms {
-            term.1 = gf::mul(term.1, inverse);
-        }
-        gf::scale(&mut row.data, inverse);
-        for other in &mut self.rows {
-            if let Some((_, factor)) = coefficient_of(&other.terms, pivot) {
-                add_terms(
-                    &mut other.terms,
-                    &row.terms,
-                    factor,
-                    &mut self.scratch_terms,
-                );
-                add_scaled(&mut other.data, &row.data, factor);
-            }
-        }
-        self.rows.push(row);
-        Ok(true)
     }
     /// Turn every single-unknown row into a recovered source.
     fn solve(&mut self) -> Result<(), Error> {
         while let Some(index) = self.rows.iter().position(|row| row.terms.len() == 1) {
-            let row = self.rows.swap_remove(index);
+            let mut row = self.rows.swap_remove(index);
             let sequence = row.terms[0].0;
-            let length = usize::from(u16::from_be_bytes([
-                *row.data.first().ok_or(Error::Malformed)?,
-                *row.data.get(1).ok_or(Error::Malformed)?,
-            ]));
-            if length == 0
-                || length > self.config.symbol_bytes()
-                || row.data.len() < 2 + length
-                || row.data[2 + length..].iter().any(|byte| *byte != 0)
-            {
-                return Err(Error::Malformed);
-            }
-            let mut payload = row.data;
+            let parsed = (|| {
+                let length = usize::from(u16::from_be_bytes([
+                    *row.data.first().ok_or(Error::Malformed)?,
+                    *row.data.get(1).ok_or(Error::Malformed)?,
+                ]));
+                if length == 0
+                    || length > self.config.symbol_bytes()
+                    || row.data.len() < 2 + length
+                    || row.data[2 + length..].iter().any(|byte| *byte != 0)
+                {
+                    return Err(Error::Malformed);
+                }
+                Ok(length)
+            })();
+            let length = match parsed {
+                Ok(length) => length,
+                Err(error) => {
+                    self.recycle_row(row)?;
+                    return Err(error);
+                }
+            };
+            let mut payload = match self.take_source() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.recycle_row(row)?;
+                    return Err(error);
+                }
+            };
+            std::mem::swap(&mut payload, &mut row.data);
             payload.truncate(2 + length);
             payload.drain(..2);
             self.stats.recovered += 1;
             // In reduced form no other row mentions this pivot.
-            self.store(sequence, payload);
+            let result = self.store(sequence, payload);
+            self.recycle_row(row)?;
+            result?;
         }
         Ok(())
     }
-    fn store(&mut self, sequence: u64, payload: Vec<u8>) {
+    fn store(&mut self, sequence: u64, payload: Vec<u8>) -> Result<(), Error> {
         if let Some(index) = sequence
             .checked_sub(self.floor)
             .and_then(|offset| usize::try_from(offset).ok())
             && let Some(slot) = self.slots.get_mut(index)
         {
+            if slot.is_some() {
+                self.recycle_source(payload)?;
+                return Err(Error::Storage);
+            }
             *slot = Some(payload);
+            return Ok(());
         }
+        self.recycle_source(payload)?;
+        Err(Error::Malformed)
     }
     /// Record a directly received source and substitute it into held rows.
     fn learn(&mut self, sequence: u64, payload: Vec<u8>) -> Result<(), Error> {
         let length = (payload.len() as u16).to_be_bytes();
-        let mut repivot = Vec::new();
-        let mut index = 0;
-        while index < self.rows.len() {
-            let row = &mut self.rows[index];
-            if let Some((position, factor)) = coefficient_of(&row.terms, sequence) {
-                if row.data.len() < payload.len() + 2 {
-                    row.data.resize(payload.len() + 2, 0);
-                }
-                gf::mul_add(&mut row.data[..2], &length, factor);
-                gf::mul_add(&mut row.data[2..], &payload, factor);
-                row.terms.remove(position);
-                if row.terms.is_empty() {
-                    // A consistent sender leaves nothing behind.
-                    if row.data.iter().any(|byte| *byte != 0) {
-                        return Err(Error::Malformed);
+        let mut payload = Some(payload);
+        // Moving the preallocated metadata vector does not allocate. Every exit
+        // restores it, including errors while reinserting earlier pivot rows.
+        let mut repivot = std::mem::take(&mut self.repivot);
+        let result = (|| {
+            let source = payload.as_ref().ok_or(Error::Storage)?;
+            let mut index = 0;
+            while index < self.rows.len() {
+                let row = &mut self.rows[index];
+                if let Some((position, factor)) = coefficient_of(&row.terms, sequence) {
+                    let needed = source.len() + 2;
+                    if row.data.len() < needed {
+                        vec_room(self.reserved, &row.data, needed - row.data.len())?;
+                        row.data.resize(needed, 0);
                     }
-                    self.rows.swap_remove(index);
-                    continue;
+                    gf::mul_add(&mut row.data[..2], &length, factor);
+                    gf::mul_add(&mut row.data[2..], source, factor);
+                    row.terms.remove(position);
+                    if row.terms.is_empty() {
+                        let inconsistent = row.data.iter().any(|byte| *byte != 0);
+                        let old = self.rows.swap_remove(index);
+                        self.recycle_row(old)?;
+                        if inconsistent {
+                            return Err(Error::Malformed);
+                        }
+                        continue;
+                    }
+                    if position == 0 {
+                        vec_room(self.reserved, &repivot, 1)?;
+                        repivot.push(self.rows.swap_remove(index));
+                        continue;
+                    }
                 }
-                if position == 0 {
-                    repivot.push(self.rows.swap_remove(index));
-                    continue;
+                index += 1;
+            }
+            self.store(sequence, payload.take().ok_or(Error::Storage)?)?;
+            // Preserve the old reinsertion order. After an error, remaining
+            // rows return to the pool instead of being dropped by Drain.
+            let mut inserted = Ok(());
+            for row in repivot.drain(..) {
+                if inserted.is_ok() {
+                    inserted = self.insert(row).map(|_| ());
+                } else if let Err(error) = self.recycle_row(row) {
+                    inserted = Err(error);
                 }
             }
-            index += 1;
+            inserted?;
+            self.solve()
+        })();
+        let mut result = result;
+        if let Some(payload) = payload
+            && let Err(error) = self.recycle_source(payload)
+        {
+            result = Err(error);
         }
-        self.store(sequence, payload);
-        // A row that lost its pivot is reinserted; its remaining unknowns are
-        // not pivots of any other row, so only normalisation is needed.
-        for row in repivot {
-            self.insert(row)?;
+        for row in repivot.drain(..) {
+            if let Err(error) = self.recycle_row(row) {
+                result = Err(error);
+            }
         }
-        self.solve()
+        self.repivot = repivot;
+        result
     }
     /// Move in-order sources into the byte stream and trim history.
     fn advance(&mut self) -> Result<(), Error> {
-        while self.base < self.end {
-            let index = (self.base - self.floor) as usize;
+        let mut next = self.base;
+        let mut bytes = 0usize;
+        while next < self.end {
+            let index = next
+                .checked_sub(self.floor)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or(Error::Storage)?;
             let Some(Some(payload)) = self.slots.get(index) else {
                 break;
             };
+            bytes = bytes.checked_add(payload.len()).ok_or(Error::Storage)?;
+            next = next.checked_add(1).ok_or(Error::Storage)?;
+        }
+        let needed = self.stream.len().checked_add(bytes).ok_or(Error::Storage)?;
+        let bound = self
+            .config
+            .flow_sources
+            .checked_mul(self.config.symbol_bytes())
+            .and_then(|count| count.checked_add(self.config.max_packet))
+            .and_then(|count| count.checked_add(FRAME_PREFIX))
+            .ok_or(Error::Storage)?;
+        if needed > bound {
+            return Err(Error::Malformed);
+        }
+        if self.reserved && needed > self.stream.capacity() {
+            return Err(Error::Storage);
+        }
+        while self.base < next {
+            let index = usize::try_from(self.base - self.floor).map_err(|_| Error::Storage)?;
+            let payload = self
+                .slots
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or(Error::Storage)?;
             self.stream.extend(payload.iter());
             self.base += 1;
         }
         // Keep one window of delivered history for repairs still in flight.
         let keep = self.base.saturating_sub(self.config.window as u64);
         while self.floor < keep {
-            if let Some(Some(mut payload)) = self.slots.pop_front()
-                && self.spare.len() < 64
-            {
-                payload.clear();
-                self.spare.push(payload);
+            if let Some(Some(payload)) = self.slots.pop_front() {
+                self.recycle_source(payload)?;
             }
             self.floor += 1;
-        }
-        // Everything the flow bound admits plus one unfinished packet.
-        let bound = self.config.flow_sources * self.config.symbol_bytes()
-            + self.config.max_packet
-            + FRAME_PREFIX;
-        if self.stream.len() > bound {
-            return Err(Error::Malformed);
         }
         Ok(())
     }
@@ -543,3 +822,7 @@ impl Receiver {
 #[cfg(test)]
 #[path = "receiver_byte_queue_tests.rs"]
 mod byte_queue_tests;
+
+#[cfg(test)]
+#[path = "receiver_storage_tests.rs"]
+mod storage_tests;
