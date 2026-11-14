@@ -41,9 +41,16 @@ API. No task is complete just because its enum/trait or crate compiles.
    specified by its module design, with public docs and explicit errors. Use
    injected time/I/O and bounded memory; no success-returning placeholders for
    missing networking, cryptography or device setup.
-4. **Test locally.** Run the module's focused behavior/failure tests and Clippy.
-   Report exact commands/results. Cargo may serialize access to the shared target
-   directory; do not kill another worker's build or modify its files to unblock it.
+4. **Test the affected behavior.** Select focused behavior/failure tests and
+   dependency regressions from the actual diff. Execute independent test cases
+   with bounded parallelism; serialize only demonstrated shared-resource
+   conflicts. Sharing Cargo's build directory does not require
+   `RUST_TEST_THREADS=1`. Reuse passing evidence for unchanged tests whose inputs
+   and dependencies are unchanged, and state that reuse explicitly. A local
+   failure repair first reruns the failing and affected tests, not the complete
+   workspace. Report exact commands, selection, results and elapsed time. Cargo
+   may serialize builds; do not kill another worker's build or modify its files
+   to unblock it.
 5. **Review interfaces and failures.** A second worker or the integrator checks
    arithmetic, ownership, state reset, hostile inputs, denial-of-service limits and
    claims. Fix material findings and add a regression test where appropriate.
@@ -51,12 +58,19 @@ API. No task is complete just because its enum/trait or crate compiles.
    shared contracts, then exercises meaningful module combinations. Reconcile
    module TODOs, master gates and catalog status. An independently tested primitive
    does not satisfy a larger end-to-end gate.
-7. **Run the required suite.** Run `python3 tools/check.py` through
+7. **Run the required suite at stage acceptance.** Combine ready module changes
+   before the full regression. Do not repeat unrelated simulator, native or
+   tooling suites after each leaf repair. Run `python3 tools/check.py` through
    `tools/record_check.py --output work/<fresh-wave>`; save output, source
    hashes and tested scope. The input map covers Rust/app/tool/config/docs/vendor
    files, CI/Cargo configuration, root manifests and `.editorconfig`, and the
    complete `simulator/src` oracle tree used by golden checks (excluding caches).
    Earlier receipts retain their original recorded scope and are not rewritten.
+   An affected-test receipt is not a new full-suite pass. Full acceptance
+   definitions remain unchanged. Independent isolated functional cases may run
+   in bounded parallel groups from one immutable build; performance comparisons
+   retain their controlled campaign conditions. Reuse an already successful
+   source-bound build instead of invoking Cargo again solely to copy its binary.
    Freeze the recorded source inputs during aggregate checks and builds in the
    live checkout. Workers may inspect or design in `work/`, but must not edit
    those inputs until the integrator releases them. Source copies can archive

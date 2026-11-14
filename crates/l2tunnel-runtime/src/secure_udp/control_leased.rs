@@ -171,6 +171,7 @@ impl Owner {
         .into_leased(control_scope, data_scope)
     }
 
+    #[cfg(test)] // Preserve the preceding private runtime backing as a compatibility regression seam.
     #[allow(clippy::too_many_arguments)] // Existing contexts plus explicit actual ARQ backing limits.
     pub(crate) fn new_leased_reserved_arq(
         base: delivery::Settings,
@@ -190,7 +191,31 @@ impl Owner {
             data_scope,
             now,
             expires,
-            Some(limits),
+            Storage::ReservedArq(limits),
+        )?
+        .into_leased(control_scope, data_scope)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing contexts plus complete actual message heaps.
+    pub(crate) fn new_leased_reserved_messages(
+        base: delivery::Settings,
+        selected: Settings,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        limits: [messages::storage::Limits; 3],
+    ) -> io::Result<Self> {
+        Self::construct(
+            base,
+            Some(selected),
+            binding,
+            control_scope,
+            data_scope,
+            now,
+            expires,
+            Storage::ReservedMessages(limits),
         )?
         .into_leased(control_scope, data_scope)
     }

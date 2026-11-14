@@ -20,6 +20,10 @@ use std::{
     time::Duration,
 };
 
+mod backing;
+pub mod storage;
+use backing::{Arrivals, OutboundStore};
+
 /// Opaque-source discriminator for an unchanged LXv1 fragment.
 pub const FRAGMENT_KIND: u8 = 1;
 /// Opaque-source discriminator for a whole-message acceptance receipt.
@@ -239,16 +243,17 @@ pub struct Owner {
     expires: Duration,
     failed: Option<Error>,
     last_submission: u64,
-    outbound: VecDeque<Outbound>,
+    outbound: OutboundStore,
     outbound_bytes: usize,
     fragment_bytes: usize,
     source_scratch: Vec<u8>,
     complete: Vec<u8>,
     held: Option<Held>,
-    arrivals: BTreeMap<MessageId, Duration>,
+    arrivals: Arrivals,
     phase: u8,
     confirmation_cursor: usize,
     idle_actions: usize,
+    storage_usage: Option<storage::Usage>,
 }
 
 /// ARQ-only construction failure, preserving existing whole-message errors.
@@ -269,6 +274,7 @@ impl std::error::Error for ReservedArqError {}
 struct Validated {
     fragmenter: Fragmenter,
     reassembler: Reassembler,
+    reassembly: ReassemblyConfig,
 }
 impl Settings {
     /// Allocation-free validation; this does not reserve message or ARQ backing.
@@ -344,6 +350,17 @@ fn validate_settings(
     let max_total_fragments = usize::from(settings.max_fragments)
         .checked_mul(settings.max_incomplete_messages)
         .ok_or(Error::Settings)?;
+    let reassembly = ReassemblyConfig {
+        max_message_bytes: settings.max_message_bytes,
+        max_messages: settings.max_incomplete_messages,
+        max_fragment_payload_bytes: u16::try_from(fragmenter.chunk_bytes())
+            .map_err(|_| Error::Settings)?,
+        max_fragments_per_message: settings.max_fragments,
+        max_total_fragments,
+        max_reserved_bytes: incomplete_bytes,
+        max_lifetime_ticks: lifetime,
+        replay_window: 65_536,
+    };
     let reassembler = Reassembler::new(
         context(
             binding,
@@ -352,17 +369,7 @@ fn validate_settings(
                 Role::Server => Role::Client,
             },
         ),
-        ReassemblyConfig {
-            max_message_bytes: settings.max_message_bytes,
-            max_messages: settings.max_incomplete_messages,
-            max_fragment_payload_bytes: u16::try_from(fragmenter.chunk_bytes())
-                .map_err(|_| Error::Settings)?,
-            max_fragments_per_message: settings.max_fragments,
-            max_total_fragments,
-            max_reserved_bytes: incomplete_bytes,
-            max_lifetime_ticks: lifetime,
-            replay_window: 65_536,
-        },
+        reassembly,
     )
     .map_err(Error::Fragment)?;
     settings
@@ -372,7 +379,82 @@ fn validate_settings(
     Ok(Validated {
         fragmenter,
         reassembler,
+        reassembly,
     })
+}
+
+struct Construction {
+    service: Option<delivery::Service>,
+    reassembler: Option<Reassembler>,
+    outbound: Option<OutboundStore>,
+    arrivals: Option<Arrivals>,
+    source_scratch: Vec<u8>,
+    complete: Vec<u8>,
+    #[cfg(test)]
+    trace: std::rc::Rc<std::cell::RefCell<Vec<storage::DropEvent>>>,
+}
+impl Construction {
+    fn new(_allocation: &storage::Allocation) -> Self {
+        Self {
+            service: None,
+            reassembler: None,
+            outbound: None,
+            arrivals: None,
+            source_scratch: Vec::new(),
+            complete: Vec::new(),
+            #[cfg(test)]
+            trace: std::rc::Rc::clone(&_allocation.trace),
+        }
+    }
+}
+impl Drop for Construction {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let bytes = self
+            .service
+            .as_ref()
+            .and_then(delivery::Service::arq_storage_usage)
+            .map_or(0, |usage| usage.capacity_bytes)
+            + self
+                .reassembler
+                .as_ref()
+                .and_then(Reassembler::storage_usage)
+                .map_or(0, |usage| usage.capacity_bytes)
+            + self.outbound.as_ref().map_or(0, |owner| {
+                owner
+                    .inventory()
+                    .iter()
+                    .map(|(_, count, size)| count * size)
+                    .sum::<usize>()
+            })
+            + self
+                .arrivals
+                .as_ref()
+                .and_then(Arrivals::inventory)
+                .map_or(0, |(_, count, size)| count * size)
+            + self.source_scratch.capacity()
+            + self.complete.capacity();
+        #[cfg(test)]
+        if bytes != 0 {
+            self.trace
+                .borrow_mut()
+                .push(storage::DropEvent::Before(bytes));
+        }
+        // These are the actual production failure-release statements. The local
+        // observer merely brackets their return; it is never retained by Owner.
+        drop(self.service.take());
+        drop(self.reassembler.take());
+        drop(self.outbound.take());
+        drop(self.arrivals.take());
+        drop(std::mem::take(&mut self.source_scratch));
+        drop(std::mem::take(&mut self.complete));
+        #[cfg(test)]
+        if bytes != 0 {
+            self.trace
+                .borrow_mut()
+                .push(storage::DropEvent::After(bytes));
+        }
+    }
 }
 
 impl Owner {
@@ -419,6 +501,163 @@ impl Owner {
         self.service.arq_storage_usage()
     }
 
+    /// Fully provision message, fragment, replay and ARQ backing before publication.
+    pub fn new_reserved(
+        settings: Settings,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_owner(settings, binding, now, expires)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        Self::build_reserved(
+            settings,
+            binding,
+            now,
+            expires,
+            plan,
+            limits,
+            &mut storage::Allocation::new(plan.own_bytes),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Actual checked plan and injected local allocation inventory.
+    fn build_reserved(
+        settings: Settings,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+        plan: storage::Plan,
+        limits: storage::Limits,
+        allocation: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        let validated =
+            validate_settings(settings, binding, now, expires).map_err(storage::Error::Message)?;
+        let mut construction = Construction::new(allocation);
+        construction.service = Some(
+            delivery::Service::new_reserved_arq(
+                settings.delivery,
+                binding,
+                now,
+                expires,
+                l2tunnel_recovery::storage::Limits {
+                    capacity_bytes: plan.arq_plan().capacity_bytes(),
+                },
+            )
+            .map_err(|error| match error {
+                delivery::ReservedArqError::Service(error) => {
+                    storage::Error::Message(Error::Delivery(error))
+                }
+                delivery::ReservedArqError::Storage(error) => storage::Error::Recovery(error),
+            })?,
+        );
+        construction.reassembler = Some(
+            Reassembler::new_reserved(
+                context(
+                    binding,
+                    match binding.local_role {
+                        Role::Client => Role::Server,
+                        Role::Server => Role::Client,
+                    },
+                ),
+                validated.reassembly,
+                l2tunnel_codec::fragment_storage::Limits {
+                    capacity_bytes: plan.reassembly_plan().capacity_bytes(),
+                },
+            )
+            .map_err(storage::Error::Fragment)?,
+        );
+        construction.outbound = Some(OutboundStore::reserved(&plan, allocation)?);
+        construction.arrivals = Some(Arrivals::reserved(
+            settings.max_incomplete_messages,
+            allocation,
+        )?);
+        construction.source_scratch =
+            allocation.vec(settings.delivery.recovery.max_source_bytes)?;
+        construction
+            .source_scratch
+            .resize(settings.delivery.recovery.max_source_bytes, 0);
+        construction.complete = allocation.vec(settings.max_message_bytes)?;
+        construction.complete.resize(settings.max_message_bytes, 0);
+        let arq = construction
+            .service
+            .as_ref()
+            .and_then(delivery::Service::arq_storage_usage)
+            .ok_or(storage::Error::Invariant)?;
+        let reassembly = construction
+            .reassembler
+            .as_ref()
+            .and_then(Reassembler::storage_usage)
+            .ok_or(storage::Error::Invariant)?;
+        let capacity_bytes = allocation
+            .used()
+            .checked_add(arq.capacity_bytes)
+            .and_then(|bytes| bytes.checked_add(reassembly.capacity_bytes))
+            .ok_or(storage::Error::Layout)?;
+        let allocations = allocation
+            .allocations()
+            .checked_add(arq.allocations)
+            .and_then(|count| count.checked_add(reassembly.allocations))
+            .ok_or(storage::Error::Layout)?;
+        if allocation.used() != plan.own_bytes
+            || allocation.allocations() != 5 + 3 * settings.max_outbound_messages
+            || capacity_bytes != plan.capacity_bytes()
+        {
+            return Err(storage::Error::Invariant);
+        }
+        Ok(Self {
+            settings,
+            binding,
+            service: construction
+                .service
+                .take()
+                .ok_or(storage::Error::Invariant)?,
+            fragmenter: validated.fragmenter,
+            reassembler: construction
+                .reassembler
+                .take()
+                .ok_or(storage::Error::Invariant)?,
+            origin: now,
+            last_now: now,
+            expires,
+            failed: None,
+            last_submission: 0,
+            outbound: construction
+                .outbound
+                .take()
+                .ok_or(storage::Error::Invariant)?,
+            outbound_bytes: 0,
+            fragment_bytes: 0,
+            source_scratch: std::mem::take(&mut construction.source_scratch),
+            complete: std::mem::take(&mut construction.complete),
+            held: None,
+            arrivals: construction
+                .arrivals
+                .take()
+                .ok_or(storage::Error::Invariant)?,
+            phase: 0,
+            confirmation_cursor: 0,
+            idle_actions: 0,
+            storage_usage: Some(storage::Usage {
+                limit_bytes: limits.capacity_bytes,
+                capacity_bytes,
+                allocations,
+                arq,
+                reassembly,
+            }),
+        })
+    }
+    /// Actual complete managed heap; None for legacy and ARQ-only construction.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.storage_usage
+    }
+
     fn from_validated(
         settings: Settings,
         binding: delivery::Binding,
@@ -438,16 +677,17 @@ impl Owner {
             expires,
             failed: None,
             last_submission: 0,
-            outbound: VecDeque::new(),
+            outbound: OutboundStore::Legacy(VecDeque::new()),
             outbound_bytes: 0,
             fragment_bytes: 0,
             source_scratch: vec![0; settings.delivery.recovery.max_source_bytes],
             complete: vec![0; settings.max_message_bytes],
             held: None,
-            arrivals: BTreeMap::new(),
+            arrivals: Arrivals::Legacy(BTreeMap::new()),
             phase: 0,
             confirmation_cursor: 0,
             idle_actions: 0,
+            storage_usage: None,
         }
     }
 
@@ -514,28 +754,17 @@ impl Owner {
         {
             return Err(Error::Backpressure);
         }
-        let batch = self.fragmenter.fragment(bytes).map_err(Error::Fragment)?;
-        let ticket = Ticket {
-            binding: self.binding,
-            submission: id,
-            message: batch.message.0,
-            length: bytes.len(),
+        let ticket = self.outbound.insert(
+            &mut self.fragmenter,
+            self.binding,
+            id,
+            bytes,
             digest,
-            received: false,
-        };
+            original_deadline,
+        )?;
         self.outbound_bytes += bytes.len();
         self.fragment_bytes += batch_bytes;
         self.last_submission = id.0;
-        self.outbound.push_back(Outbound {
-            ticket,
-            deadline: original_deadline,
-            bytes: bytes.to_vec(),
-            batch,
-            next_fragment: 0,
-            sources: VecDeque::new(),
-            accepted: false,
-            confirmed: false,
-        });
         self.idle_actions = 0;
         Ok(ticket)
     }
@@ -770,8 +999,8 @@ impl Owner {
             return self.fail(Error::Expired);
         }
         let ticks = self.ticks(now)?;
-        match self.reassembler.expire(ticks) {
-            Ok(expired) if expired.is_empty() => {}
+        match self.reassembler.expire_count(ticks) {
+            Ok(0) => {}
             Ok(_) => return self.fail(Error::Expired),
             Err(error) => return self.fail(Error::Fragment(error)),
         }
@@ -844,14 +1073,12 @@ impl Owner {
                         },
                     ) => return self.fail(Error::Protocol),
                     Ok(ReassemblyStatus::Pending { message, .. }) => {
-                        if let std::collections::btree_map::Entry::Vacant(entry) =
-                            self.arrivals.entry(message)
-                        {
+                        if !self.arrivals.contains(message) {
                             let Some(deadline) = now.checked_add(self.settings.message_lifetime)
                             else {
                                 return self.fail(Error::TimeOverflow);
                             };
-                            entry.insert(deadline);
+                            self.arrivals.insert(message, deadline)?;
                         }
                     }
                     Ok(ReassemblyStatus::Complete { message, length }) => {
@@ -899,7 +1126,7 @@ impl Owner {
                 if entry.ticket.length != length || entry.ticket.digest != digest {
                     return self.fail(Error::Protocol);
                 }
-                entry.accepted = true;
+                *entry.accepted = true;
                 self.finish(index);
                 Ok(true)
             }
@@ -915,6 +1142,9 @@ impl Owner {
         let Some(entry) = self.outbound.get(index) else {
             return self.fail(Error::Protocol);
         };
+        if !entry.sources.can_push() {
+            return self.fail(Error::Protocol);
+        }
         let Some(fragment) = entry.batch.fragments.get(entry.next_fragment) else {
             return self.fail(Error::Protocol);
         };
@@ -937,9 +1167,9 @@ impl Owner {
             Err(error) if capacity(error) => return Ok(false),
             Err(error) => return self.delivery_error(error),
         };
-        if let Some(entry) = self.outbound.get_mut(index) {
-            entry.next_fragment += 1;
-            entry.sources.push_back(source);
+        if let Some(mut entry) = self.outbound.get_mut(index) {
+            *entry.next_fragment += 1;
+            entry.sources.push_back(source)?;
         }
         Ok(true)
     }
@@ -958,7 +1188,7 @@ impl Owner {
         if let Some(source) = source {
             match self.service.source_confirmed(source, now) {
                 Ok(true) => {
-                    if let Some(entry) = self.outbound.get_mut(index) {
+                    if let Some(mut entry) = self.outbound.get_mut(index) {
                         entry.sources.pop_front();
                         progressed = true;
                     }
@@ -970,19 +1200,9 @@ impl Owner {
         Ok(self.finish(index) || progressed)
     }
     fn finish(&mut self, index: usize) -> bool {
-        if let Some(entry) = self.outbound.get_mut(index)
-            && !entry.confirmed
-            && entry.accepted
-            && entry.sources.is_empty()
-            && entry.next_fragment == entry.batch.fragments.len()
-        {
-            self.outbound_bytes -= entry.bytes.len();
-            self.fragment_bytes -= entry.batch.fragments.iter().map(Vec::len).sum::<usize>();
-            entry.bytes.clear();
-            entry.bytes.shrink_to_fit();
-            entry.batch.fragments.clear();
-            entry.batch.fragments.shrink_to_fit();
-            entry.confirmed = true;
+        if let Some((original, fragments)) = self.outbound.finish(index) {
+            self.outbound_bytes -= original;
+            self.fragment_bytes -= fragments;
             return true;
         }
         false
@@ -1050,3 +1270,6 @@ mod tests;
 
 #[cfg(test)]
 mod reserved_arq_tests;
+
+#[cfg(test)]
+mod storage_tests;

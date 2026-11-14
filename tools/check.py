@@ -36,6 +36,7 @@ def main() -> None:
     print(f'Validated {len(modes)} mode entries and Python tool syntax.', flush=True)
     if sys.platform == 'linux':
         run(sys.executable, 'tools/check_simulator.py', '--check-dependencies')
+        run(sys.executable, '-m', 'unittest', 'tools.test_generic_cli_native', '-v')
     run(sys.executable, 'tools/check_checklists.py')
     run(sys.executable, '-m', 'unittest', 'tools.test_record_check', '-v')
     run(sys.executable, '-m', 'unittest', 'tools.test_secure_record_perf', '-v')

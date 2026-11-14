@@ -13,9 +13,11 @@ pub mod aligned_body;
 mod fragment;
 mod frame;
 
+pub use fragment::storage as fragment_storage;
 pub use fragment::{
-    FRAGMENT_HEADER_BYTES, FragmentBatch, FragmentConfig, FragmentContext, FragmentError,
-    Fragmenter, MessageId, Reassembler, ReassemblyConfig, ReassemblyStatus, SessionId,
+    FRAGMENT_HEADER_BYTES, FragmentBatch, FragmentBatchView, FragmentConfig, FragmentContext,
+    FragmentError, FragmentLayout, Fragmenter, MessageId, Reassembler, ReassemblyConfig,
+    ReassemblyStatus, SessionId,
 };
 pub use frame::{
     CodecConfig, CodecError, Compression, FRAME_HEADER_BYTES, FrameCodec, FrameLayer,

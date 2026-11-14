@@ -108,23 +108,48 @@ struct WireFrame {
     wire_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+enum TestStorage {
+    Legacy,
+    Arq,
+    Complete,
+}
+
 impl Lab {
     fn new() -> Result<Self> {
         Self::with_settings(settings())
     }
 
     fn with_settings(selected: Settings) -> Result<Self> {
-        Self::with_construction(selected, false)
+        Self::with_construction(selected, TestStorage::Legacy)
     }
 
     fn reserved(selected: Settings) -> Result<Self> {
-        Self::with_construction(selected, true)
+        Self::with_construction(selected, TestStorage::Arq)
     }
 
-    fn with_construction(selected: Settings, reserved: bool) -> Result<Self> {
+    fn with_construction(selected: Settings, storage: TestStorage) -> Result<Self> {
         let catalog = modes();
         let make = |role| -> Result<(Owner, tx::Peer)> {
-            let owner = if reserved {
+            let owner = if matches!(storage, TestStorage::Complete) {
+                let plans = selected.message_storage_plans(
+                    binding(role),
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                )?;
+                Owner::new_leased_reserved_messages(
+                    base(),
+                    selected,
+                    binding(role),
+                    control_scope(),
+                    data_scope(1, &catalog[0])?,
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                    plans.map(|plan| messages::storage::Limits {
+                        capacity_bytes: plan.capacity_bytes(),
+                    }),
+                )?
+            } else if matches!(storage, TestStorage::Arq) {
                 let mut limits = [recovery::storage::Limits { capacity_bytes: 0 }; 3];
                 for (limit, settings) in limits.iter_mut().zip(selected.streams) {
                     limit.capacity_bytes =
@@ -661,13 +686,44 @@ fn liveness_does_not_overwrite_retained_transaction_bytes_or_force_acceptance() 
 
 const CAP_DURATION: Duration = Duration::from_millis(CAP.0);
 
-fn reserved_pressure_lab() -> Result<Lab> {
+fn reserved_pressure_lab(complete: bool) -> Result<Lab> {
     let mut selected = settings();
     for stream in &mut selected.streams {
         stream.message_lifetime = Duration::from_secs(5);
     }
-    let lab = Lab::reserved(selected)?;
+    let lab = if complete {
+        Lab::with_construction(selected, TestStorage::Complete)?
+    } else {
+        Lab::reserved(selected)?
+    };
     for owner in &lab.owners {
+        if complete {
+            let plans = selected.message_storage_plans(
+                owner.binding,
+                Duration::ZERO,
+                Duration::from_secs(10),
+            )?;
+            for (usage, plan) in owner
+                .message_storage_usage()
+                .ok_or("missing complete control storage")?
+                .into_iter()
+                .zip(plans)
+            {
+                assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+                assert_eq!(usage.limit_bytes, usage.capacity_bytes);
+                assert_eq!(
+                    usage.reassembly.capacity_bytes,
+                    plan.reassembly_plan().capacity_bytes()
+                );
+                assert_eq!(usage.arq.capacity_bytes, plan.arq_plan().capacity_bytes());
+            }
+            assert_eq!(
+                owner.wrapper_capacity_bytes()?,
+                selected.wrapper_capacity_bytes(base())?
+            );
+        } else {
+            assert!(owner.message_storage_usage().is_none());
+        }
         let usage = owner
             .arq_storage_usage()
             .ok_or("missing actual reserved stream owners")?;
@@ -682,15 +738,24 @@ fn reserved_pressure_lab() -> Result<Lab> {
     Ok(lab)
 }
 
-fn actual_pool_usage(lab: &Lab) -> Result<[[recovery::storage::Usage; 3]; 2]> {
-    Ok([
-        lab.owners[0]
-            .arq_storage_usage()
-            .ok_or("missing client pools")?,
-        lab.owners[1]
-            .arq_storage_usage()
-            .ok_or("missing server pools")?,
-    ])
+type PoolUsage = (
+    [[recovery::storage::Usage; 3]; 2],
+    [Option<[messages::storage::Usage; 3]>; 2],
+);
+fn actual_pool_usage(lab: &Lab) -> Result<PoolUsage> {
+    Ok((
+        [
+            lab.owners[0]
+                .arq_storage_usage()
+                .ok_or("missing client pools")?,
+            lab.owners[1]
+                .arq_storage_usage()
+                .ok_or("missing server pools")?,
+        ],
+        lab.owners
+            .each_ref()
+            .map(|owner| owner.message_storage_usage()),
+    ))
 }
 
 fn assert_original_held_effect(
@@ -732,189 +797,195 @@ fn held_effect_deadline(lab: &Lab) -> Result<Duration> {
 #[test]
 fn reserved_held_transaction_allows_sixteen_confirmed_ping_pong_pairs_with_shared_quota() -> Result
 {
-    let mut lab = reserved_pressure_lab()?;
-    let usage = actual_pool_usage(&lab)?;
-    let prepare = lab.prepare()?;
-    let frozen = lab.send(0, &prepare)?;
-    let deadline = frozen.deadline();
-    let effect = lab.dispatched(1)?;
-    let exact = effect.envelope().to_vec();
-    let held_deadline = held_effect_deadline(&lab)?;
-    let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
-    for nonce in 1..=16 {
-        lab.ping_pong(nonce, false)?;
-        assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
-        assert_eq!(frozen.deadline(), deadline);
-        assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
+    for complete in [false, true] {
+        let mut lab = reserved_pressure_lab(complete)?;
+        let usage = actual_pool_usage(&lab)?;
+        let prepare = lab.prepare()?;
+        let frozen = lab.send(0, &prepare)?;
+        let deadline = frozen.deadline();
+        let effect = lab.dispatched(1)?;
+        let exact = effect.envelope().to_vec();
+        let held_deadline = held_effect_deadline(&lab)?;
+        let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
+        for nonce in 1..=16 {
+            lab.ping_pong(nonce, false)?;
+            assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+            assert_eq!(frozen.deadline(), deadline);
+            assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
+            assert_eq!(actual_pool_usage(&lab)?, usage);
+            let mut called = false;
+            assert_eq!(
+                lab.owners[0].with_confirmed(
+                    frozen.token().ok_or("missing original token")?,
+                    lab.now,
+                    |_| {
+                        called = true;
+                        Ok(())
+                    },
+                )?,
+                Attempt::Blocked
+            );
+            assert!(!called);
+        }
+        assert!(lab.now < Duration::from_secs(2));
+        lab.assert_shared_wire_quota();
+        lab.accept(1, &effect, false)?;
+        lab.confirm(0, &frozen, false, true)?;
+        assert!(!lab.owners[1].has_dispatched());
         assert_eq!(actual_pool_usage(&lab)?, usage);
-        let mut called = false;
-        assert_eq!(
-            lab.owners[0].with_confirmed(
-                frozen.token().ok_or("missing original token")?,
-                lab.now,
-                |_| {
-                    called = true;
-                    Ok(())
-                },
-            )?,
-            Attempt::Blocked
-        );
-        assert!(!called);
+        lab.assert_shared_wire_quota();
     }
-    assert!(lab.now < Duration::from_secs(2));
-    lab.assert_shared_wire_quota();
-    lab.accept(1, &effect, false)?;
-    lab.confirm(0, &frozen, false, true)?;
-    assert!(!lab.owners[1].has_dispatched());
-    assert_eq!(actual_pool_usage(&lab)?, usage);
-    lab.assert_shared_wire_quota();
     Ok(())
 }
 
 #[test]
 fn reserved_saturated_transaction_preserves_effect_while_sixteen_ping_pong_pairs_settle() -> Result
 {
-    let mut lab = reserved_pressure_lab()?;
-    let usage = actual_pool_usage(&lab)?;
-    let prepare = lab.prepare()?;
-    let frozen = lab.send(0, &prepare)?;
-    let first = lab.dispatched(1)?;
-    let Backend::Streamed(streamed) = &mut lab.owners[1].backend else {
-        return Err("wrong reserved backend".into());
-    };
-    let transaction = &mut streamed.owners[index(streams::Stream::Transaction)];
-    transaction.submit(
-        messages::SubmissionId(999),
-        &[0x73; 600],
-        lab.now,
-        lab.now + Duration::from_secs(2),
-    )?;
-    for _ in 0..8 {
-        transaction.tick(lab.now)?;
-    }
-    assert_eq!(transaction.retained().recovery.send_records, 3);
-    lab.accept(1, &first, false)?;
-    let _ready = lab.peers[1].staged(tx::Fence::new(&[0, 0])?, lab.tick()?)?;
-    for _ in 0..10 {
-        lab.pump_filtered(true)?;
-    }
-    let retry = lab.peers[0]
-        .poll(lab.tick()?)?
-        .outbound
-        .ok_or("missing real PREPARE retry")?;
-    let repeated = lab.send(0, &retry)?;
-    let mut slot = None;
-    for _ in 0..100 {
-        lab.pump_filtered(true)?;
-        if lab.owners[1].dispatch_transaction(&mut lab.peers[1], lab.now, CAP, &mut slot)?
-            == DispatchProgress::Dispatched
-        {
-            break;
-        }
-    }
-    let effect = slot.ok_or("saturated Transaction did not dispatch actual retry")?;
-    let exact = effect.envelope().to_vec();
-    let held_deadline = held_effect_deadline(&lab)?;
-    let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
-    for nonce in 1..=16 {
-        let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+    for complete in [false, true] {
+        let mut lab = reserved_pressure_lab(complete)?;
+        let usage = actual_pool_usage(&lab)?;
+        let prepare = lab.prepare()?;
+        let frozen = lab.send(0, &prepare)?;
+        let first = lab.dispatched(1)?;
+        let Backend::Streamed(streamed) = &mut lab.owners[1].backend else {
             return Err("wrong reserved backend".into());
         };
-        assert_eq!(
-            streamed.owners[index(streams::Stream::Transaction)]
-                .retained()
-                .recovery
-                .send_records,
-            base().recovery.send_records
-        );
-        let mut called = false;
-        assert_eq!(
-            lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| {
-                called = true;
-                Ok(())
-            })?,
-            Attempt::Blocked
-        );
-        assert!(!called);
-        lab.ping_pong(nonce, true)?;
-        assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
-        assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
-        assert_eq!(frozen.deadline(), CAP_DURATION);
-        assert_eq!(repeated.deadline(), CAP_DURATION);
+        let transaction = &mut streamed.owners[index(streams::Stream::Transaction)];
+        transaction.submit(
+            messages::SubmissionId(999),
+            &[0x73; 600],
+            lab.now,
+            lab.now + Duration::from_secs(2),
+        )?;
+        for _ in 0..8 {
+            transaction.tick(lab.now)?;
+        }
+        assert_eq!(transaction.retained().recovery.send_records, 3);
+        lab.accept(1, &first, false)?;
+        let _ready = lab.peers[1].staged(tx::Fence::new(&[0, 0])?, lab.tick()?)?;
+        for _ in 0..10 {
+            lab.pump_filtered(true)?;
+        }
+        let retry = lab.peers[0]
+            .poll(lab.tick()?)?
+            .outbound
+            .ok_or("missing real PREPARE retry")?;
+        let repeated = lab.send(0, &retry)?;
+        let mut slot = None;
+        for _ in 0..100 {
+            lab.pump_filtered(true)?;
+            if lab.owners[1].dispatch_transaction(&mut lab.peers[1], lab.now, CAP, &mut slot)?
+                == DispatchProgress::Dispatched
+            {
+                break;
+            }
+        }
+        let effect = slot.ok_or("saturated Transaction did not dispatch actual retry")?;
+        let exact = effect.envelope().to_vec();
+        let held_deadline = held_effect_deadline(&lab)?;
+        let phases = [lab.peers[0].phase(), lab.peers[1].phase()];
+        for nonce in 1..=16 {
+            let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+                return Err("wrong reserved backend".into());
+            };
+            assert_eq!(
+                streamed.owners[index(streams::Stream::Transaction)]
+                    .retained()
+                    .recovery
+                    .send_records,
+                base().recovery.send_records
+            );
+            let mut called = false;
+            assert_eq!(
+                lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| {
+                    called = true;
+                    Ok(())
+                })?,
+                Attempt::Blocked
+            );
+            assert!(!called);
+            lab.ping_pong(nonce, true)?;
+            assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+            assert_eq!([lab.peers[0].phase(), lab.peers[1].phase()], phases);
+            assert_eq!(frozen.deadline(), CAP_DURATION);
+            assert_eq!(repeated.deadline(), CAP_DURATION);
+            assert_eq!(actual_pool_usage(&lab)?, usage);
+            let Backend::Streamed(streamed) = &lab.owners[1].backend else {
+                return Err("wrong reserved backend".into());
+            };
+            assert_eq!(
+                streamed.owners[index(streams::Stream::Transaction)]
+                    .retained()
+                    .recovery
+                    .send_records,
+                base().recovery.send_records
+            );
+        }
+        assert!(lab.now < Duration::from_secs(2));
+        lab.assert_shared_wire_quota();
+        let mut settled = false;
+        for _ in 0..100 {
+            lab.pump()?;
+            if lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| Ok(()))?
+                == Attempt::Complete(())
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled);
+        assert_eq!(effect.envelope(), exact);
+        assert!(!lab.owners[1].has_dispatched());
+        lab.confirm(0, &frozen, false, true)?;
+        lab.confirm(0, &repeated, false, true)?;
         assert_eq!(actual_pool_usage(&lab)?, usage);
-        let Backend::Streamed(streamed) = &lab.owners[1].backend else {
-            return Err("wrong reserved backend".into());
-        };
-        assert_eq!(
-            streamed.owners[index(streams::Stream::Transaction)]
-                .retained()
-                .recovery
-                .send_records,
-            base().recovery.send_records
-        );
+        lab.assert_shared_wire_quota();
     }
-    assert!(lab.now < Duration::from_secs(2));
-    lab.assert_shared_wire_quota();
-    let mut settled = false;
-    for _ in 0..100 {
-        lab.pump()?;
-        if lab.owners[1].with_accepted(effect.incoming(), lab.now, |_| Ok(()))?
-            == Attempt::Complete(())
-        {
-            settled = true;
-            break;
-        }
-    }
-    assert!(settled);
-    assert_eq!(effect.envelope(), exact);
-    assert!(!lab.owners[1].has_dispatched());
-    lab.confirm(0, &frozen, false, true)?;
-    lab.confirm(0, &repeated, false, true)?;
-    assert_eq!(actual_pool_usage(&lab)?, usage);
-    lab.assert_shared_wire_quota();
     Ok(())
 }
 
 #[test]
 fn reserved_liveness_never_renews_original_held_operation_cap() -> Result {
-    let mut lab = reserved_pressure_lab()?;
-    let usage = actual_pool_usage(&lab)?;
-    let prepare = lab.prepare()?;
-    let frozen = lab.send(0, &prepare)?;
-    let effect = lab.dispatched(1)?;
-    let exact = effect.envelope().to_vec();
-    let held_deadline = held_effect_deadline(&lab)?;
-    for nonce in 1..=16 {
-        lab.ping_pong(nonce, false)?;
+    for complete in [false, true] {
+        let mut lab = reserved_pressure_lab(complete)?;
+        let usage = actual_pool_usage(&lab)?;
+        let prepare = lab.prepare()?;
+        let frozen = lab.send(0, &prepare)?;
+        let effect = lab.dispatched(1)?;
+        let exact = effect.envelope().to_vec();
+        let held_deadline = held_effect_deadline(&lab)?;
+        for nonce in 1..=16 {
+            lab.ping_pong(nonce, false)?;
+        }
+        assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
+        assert_eq!(frozen.deadline(), CAP_DURATION);
+        assert_eq!(lab.owners[0].expiry(), CAP_DURATION);
+        lab.assert_shared_wire_quota();
+        lab.now = CAP_DURATION;
+        let mut called = false;
+        assert!(
+            lab.owners[0]
+                .with_confirmed(
+                    frozen.token().ok_or("missing original token")?,
+                    lab.now,
+                    |_| {
+                        called = true;
+                        Ok(())
+                    }
+                )
+                .is_err()
+        );
+        assert!(!called);
+        for peer in &mut lab.peers {
+            assert_eq!(peer.poll(CAP), Err(tx::Error::LeaseExpired));
+            assert_eq!(peer.phase(), tx::Phase::Failed);
+        }
+        assert_eq!(effect.envelope(), exact);
+        assert_eq!(effect.operation().expires(), CAP);
+        assert_eq!(held_effect_deadline(&lab)?, held_deadline);
+        assert!(lab.owners[1].has_dispatched());
+        assert_eq!(actual_pool_usage(&lab)?, usage);
     }
-    assert_original_held_effect(&lab, &effect, &exact, held_deadline)?;
-    assert_eq!(frozen.deadline(), CAP_DURATION);
-    assert_eq!(lab.owners[0].expiry(), CAP_DURATION);
-    lab.assert_shared_wire_quota();
-    lab.now = CAP_DURATION;
-    let mut called = false;
-    assert!(
-        lab.owners[0]
-            .with_confirmed(
-                frozen.token().ok_or("missing original token")?,
-                lab.now,
-                |_| {
-                    called = true;
-                    Ok(())
-                }
-            )
-            .is_err()
-    );
-    assert!(!called);
-    for peer in &mut lab.peers {
-        assert_eq!(peer.poll(CAP), Err(tx::Error::LeaseExpired));
-        assert_eq!(peer.phase(), tx::Phase::Failed);
-    }
-    assert_eq!(effect.envelope(), exact);
-    assert_eq!(effect.operation().expires(), CAP);
-    assert_eq!(held_effect_deadline(&lab)?, held_deadline);
-    assert!(lab.owners[1].has_dispatched());
-    assert_eq!(actual_pool_usage(&lab)?, usage);
     Ok(())
 }
 

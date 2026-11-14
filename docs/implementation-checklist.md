@@ -77,7 +77,7 @@ same-socket/device tests, two nonzero switches and native operation-cap guards.
 Explicit shared Prepared/service/APIv3 selection now passes finite paired-owner
 and IPC status/switch checks. Complete-plan CLI selection/inspection/APIv3 commands
 now have finite external-process evidence; production CLI TAP/TUN startup, the
-complete generic IPC/negative/fault matrix and full resources remain pending;
+complete generic IPC matrix, remaining runtime faults and full resources remain pending;
 [GDI-01..GDI-03](modules/generic-secure-udp.md) retain their complete scope.
 Detailed fault rows are tracked by
 [GDF-01..GDF-09](modules/generic-driver-faults.md), shared Prepared/APIv3
@@ -86,6 +86,20 @@ sole-loop input charging by [RBF-04/RBF-05](modules/generic-secure-udp.md).
 The explicit generic CLI plan, complete-C command and bounded inspection are
 tracked by [GCL-01..GCL-08](modules/generic-transaction-cli.md), retaining the
 full GCS-09 external-selection and compatibility acceptance.
+The next parallel functionality batch retains production CLI/native acceptance
+under [GCN-01..GCN-08](modules/generic-cli-native.md), actual generic service
+failure/lifecycle cases under [GSF-01..GSF-12](modules/generic-service-failure-matrix.md),
+complete control-message storage under [CMS-01..CMS-07](modules/control-message-storage.md),
+and known construction admission under [KCA-01..KCA-05](modules/runtime-construction-admission.md).
+The combined source-stable checks now pass2011 Rust cases including doctests,
+406 tooling cases and1658 simulator cases. The finite GSF service deliverable
+is qualified; native CLI acceptance and complete resource parents remain open.
+See the [current aggregate](../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json).
+The later APIv3 completion reply repair passes [77 affected service/local tests](../work/generic-functionality-20261114-batch2/completion-projection-focused-attempt-1/validation.json)
+with4 test threads and strict client-core Clippy. The unchanged full baseline is
+reused, not rerun or relabeled. The [two-lane native attempt](../work/generic-functionality-20261114-batch2/native-matrix-attempt-3/matrix-receipt.json)
+retains all four failures with verified cleanup; initial QUIC-like/TUN bytes
+passed, but complete native switching/reconnect/capture acceptance remains open.
 The [CRS-01..CRS-07 contract](modules/control-recovery-storage.md) retains actual
 fallible management ARQ backing and its now-selected three-stream consumers,
 with actual partial backing release,130 complete receive-window reuse cycles,

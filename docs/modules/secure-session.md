@@ -54,6 +54,24 @@ is a separate compatibility profile, not its replacement.
 
 ## Current source and evidence
 
+The current QUIC-like/media-like path has actual Noise/member establishment, one
+original UDP socket, the generic Swift Driver, complete-C transactions, shared
+Prepared/service/APIv3 and explicit CLI selection. The [current combined checks](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json)
+passed2011 Rust,406 tooling and1658 simulator cases before the narrow completion
+projection repair, which separately passes77 affected service/local cases. The
+combined evidence includes actual service
+failure/lifecycle and original-socket traffic fixtures. Complete control-message
+backing and known construction admission are selected; full preallocation stays
+false. Production CLI TunTap acceptance, in-session fresh-DH, retained-state
+recovery, full SW-11, remaining carriers and platform gates remain open. See
+[generic service](generic-client-service.md) and [storage](control-message-storage.md)
+for their exact finite evidence. The retained TLS/bootstrap path remains a
+separate implemented historical composition.
+
+The following table is retained as the **initial component-extraction snapshot**;
+its integration limitations are historical and are superseded by the current
+scoped statements above. It is not a current implementation inventory.
+
 | Component | Current evidence | Limit relative to this target |
 | --- | --- | --- |
 | TLS/member authentication | `l2tunnel-auth` implements verified TLS 1.3, exporter-bound Ed25519 membership and focused loopback tests. | Its generic channel interface still requires an actually verified TLS channel; it is not a standalone message-oriented key exchange. |

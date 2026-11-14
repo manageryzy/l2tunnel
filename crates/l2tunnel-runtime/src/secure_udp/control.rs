@@ -24,6 +24,44 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Exact existing streamed packet layout, without constructing an owner.
+    pub(crate) fn max_packet_bytes(self, base: delivery::Settings) -> io::Result<usize> {
+        raw_packet_bytes(base)?
+            .checked_add(streams::HEADER_BYTES)
+            .ok_or_else(|| invalid("wrapper size overflow"))
+    }
+
+    /// Persistent wrapper heap only; message heaps and bridge copies are separate.
+    pub(crate) fn wrapper_capacity_bytes(self, base: delivery::Settings) -> io::Result<usize> {
+        let maximum = self
+            .streams
+            .iter()
+            .map(|settings| settings.max_message_bytes)
+            .max()
+            .ok_or_else(|| invalid("missing control streams"))?;
+        let outgoing = self.streams.map(|settings| settings.max_outbound_messages);
+        wrapper_layout(outgoing, maximum, raw_packet_bytes(base)?)
+    }
+
+    /// Pure complete message plans under the actual independently bound streams.
+    pub(crate) fn message_storage_plans(
+        self,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+    ) -> io::Result<[messages::storage::Plan; 3]> {
+        let make = |index: usize| {
+            messages::storage::Plan::for_owner(
+                self.streams[index],
+                streams::delivery_binding(binding, streams::Stream::ALL[index]).map_err(invalid)?,
+                now,
+                expires,
+            )
+            .map_err(invalid)
+        };
+        Ok([make(0)?, make(1)?, make(2)?])
+    }
+
     /// Validate actual owners, exact wrapper overhead and complete path geometry.
     /// Message lifetimes may exceed the session; each owner clamps its expiry.
     pub fn validate(
@@ -155,6 +193,42 @@ struct Streamed {
     bytes_left: usize,
 }
 
+fn raw_packet_bytes(base: delivery::Settings) -> io::Result<usize> {
+    base.recovery
+        .max_source_bytes
+        .checked_add(recovery::DATA_HEADER_BYTES)
+        .ok_or_else(|| invalid("control packet size overflow"))
+}
+
+fn wrapper_layout(outgoing: [usize; 3], envelope: usize, raw: usize) -> io::Result<usize> {
+    let mut total = std::mem::size_of::<Streamed>();
+    for count in outgoing {
+        let bytes = std::alloc::Layout::array::<Outgoing>(count)
+            .map_err(invalid)?
+            .size();
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("control wrapper layout overflow"))?;
+    }
+    for size in [envelope, raw] {
+        let bytes = std::alloc::Layout::array::<u8>(size)
+            .map_err(invalid)?
+            .size();
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("control wrapper layout overflow"))?;
+    }
+    Ok(total)
+}
+
+#[derive(Clone, Copy)]
+enum Storage {
+    Legacy,
+    #[cfg(test)]
+    ReservedArq([recovery::storage::Limits; 3]),
+    ReservedMessages([messages::storage::Limits; 3]),
+}
+
 enum Backend {
     Legacy(Box<Legacy>),
     Streamed(Box<Streamed>),
@@ -187,16 +261,16 @@ enum StreamConstructionDrop {
 }
 
 impl StreamConstruction {
-    fn collect(
+    fn collect<L: Copy>(
         mut self,
         settings: Settings,
         binding: delivery::Binding,
-        limits: Option<[recovery::storage::Limits; 3]>,
+        limits: Option<[L; 3]>,
         mut factory: impl FnMut(
             streams::Stream,
             messages::Settings,
             delivery::Binding,
-            Option<recovery::storage::Limits>,
+            Option<L>,
         ) -> io::Result<messages::Owner>,
     ) -> io::Result<[messages::Owner; 3]> {
         for (index, (stream, settings)) in streams::Stream::ALL
@@ -281,11 +355,12 @@ impl Owner {
             data_scope,
             now,
             expires,
-            None,
+            Storage::Legacy,
         )
     }
 
-    /// Actual three-stream ARQ backing; None unless every stream is reserved.
+    /// Actual three-stream ARQ subset for compatibility and complete-owner regressions.
+    #[cfg(test)]
     pub(crate) fn arq_storage_usage(&self) -> Option<[recovery::storage::Usage; 3]> {
         let Backend::Streamed(streamed) = &self.backend else {
             return None;
@@ -297,6 +372,29 @@ impl Owner {
         ])
     }
 
+    /// Actual complete message heaps, including their ARQ/reassembly subpools once.
+    pub(crate) fn message_storage_usage(&self) -> Option<[messages::storage::Usage; 3]> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return None;
+        };
+        Some([
+            streamed.owners[0].storage_usage()?,
+            streamed.owners[1].storage_usage()?,
+            streamed.owners[2].storage_usage()?,
+        ])
+    }
+
+    pub(crate) fn wrapper_capacity_bytes(&self) -> io::Result<usize> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return Err(invalid("wrapper storage requires streamed control"));
+        };
+        wrapper_layout(
+            streamed.outgoing.each_ref().map(|values| values.capacity()),
+            streamed.envelope.capacity(),
+            streamed.raw.capacity(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)] // Existing contexts plus explicit per-stream backing limits.
     fn construct(
         base: delivery::Settings,
@@ -306,19 +404,19 @@ impl Owner {
         data_scope: sc::Scope,
         now: Duration,
         expires: Duration,
-        arq_limits: Option<[recovery::storage::Limits; 3]>,
+        storage: Storage,
     ) -> io::Result<Self> {
-        let raw = base
-            .recovery
-            .max_source_bytes
-            .checked_add(recovery::DATA_HEADER_BYTES)
-            .ok_or_else(|| invalid("control packet size overflow"))?;
+        if selected.is_none() && !matches!(storage, Storage::Legacy) {
+            return Err(invalid("reserved control requires explicit streams"));
+        }
+        let raw = raw_packet_bytes(base)?;
         let (backend, max_packet) = if let Some(settings) = selected {
             let lifetime = expires
                 .checked_sub(now)
                 .ok_or_else(|| invalid("control already expired"))?;
             settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
-            if let Some(limits) = arq_limits {
+            #[cfg(test)]
+            if let Storage::ReservedArq(limits) = storage {
                 // Preflight all three pool limits before allocating the first stream.
                 for (settings, limit) in settings.streams.into_iter().zip(limits) {
                     let plan = recovery::storage::Plan::for_arq(settings.delivery.recovery)
@@ -328,23 +426,54 @@ impl Owner {
                     }
                 }
             }
-            let owners = construct_stream_owners(
-                settings,
-                binding,
-                arq_limits,
-                |_, settings, stream_binding, limit| match limit {
-                    Some(limit) => messages::Owner::new_reserved_arq(
-                        settings,
-                        stream_binding,
-                        now,
-                        expires,
-                        limit,
-                    )
-                    .map_err(invalid),
-                    None => messages::Owner::new(settings, stream_binding, now, expires)
+            let owners = if let Storage::ReservedMessages(limits) = storage {
+                let plans = settings.message_storage_plans(binding, now, expires)?;
+                for (plan, limit) in plans.iter().zip(limits) {
+                    if plan.capacity_bytes() > limit.capacity_bytes {
+                        return Err(invalid("control complete message storage limit"));
+                    }
+                }
+                StreamConstruction::default().collect(
+                    settings,
+                    binding,
+                    Some(limits),
+                    |_, settings, stream_binding, limit| {
+                        messages::Owner::new_reserved(
+                            settings,
+                            stream_binding,
+                            now,
+                            expires,
+                            limit.ok_or_else(|| invalid("missing complete message limit"))?,
+                        )
+                        .map_err(invalid)
+                    },
+                )?
+            } else {
+                #[cfg(not(test))]
+                let arq_limits = None;
+                #[cfg(test)]
+                let arq_limits = match storage {
+                    Storage::ReservedArq(limits) => Some(limits),
+                    _ => None,
+                };
+                construct_stream_owners(
+                    settings,
+                    binding,
+                    arq_limits,
+                    |_, settings, stream_binding, limit| match limit {
+                        Some(limit) => messages::Owner::new_reserved_arq(
+                            settings,
+                            stream_binding,
+                            now,
+                            expires,
+                            limit,
+                        )
                         .map_err(invalid),
-                },
-            )?;
+                        None => messages::Owner::new(settings, stream_binding, now, expires)
+                            .map_err(invalid),
+                    },
+                )?
+            };
             let maximum = settings
                 .streams
                 .iter()
@@ -363,9 +492,7 @@ impl Owner {
                 limits: envelope_limits(maximum)?,
             })
             .map_err(invalid)?;
-            let size = raw
-                .checked_add(streams::HEADER_BYTES)
-                .ok_or_else(|| invalid("wrapper size overflow"))?;
+            let size = settings.max_packet_bytes(base)?;
             (
                 Backend::Streamed(Box::new(Streamed {
                     leased: false,

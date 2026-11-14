@@ -300,6 +300,65 @@ fn exact_pair_budget_and_one_short_actual_preparation_preserve_old_generation() 
 }
 
 #[test]
+fn initial_capacity_preflight_matches_actual_role_bank_and_rejects_checked_overflow() -> Result {
+    let values = values()?;
+    for role in [Role::Client, Role::Server] {
+        let required = Bank::required_capacity(values[0], role, EXTERNAL)?;
+        let actual = Bank::new(
+            identity(role),
+            Epoch(10),
+            values[0],
+            storage::Limits {
+                capacity_bytes: required,
+            },
+            EXTERNAL,
+        )?;
+        let usage = actual.usage();
+        assert_eq!(
+            usage.fixed_bytes + usage.external_bytes + usage.engine_bytes,
+            required
+        );
+        assert_eq!(usage.peak_bytes, required);
+        assert_eq!(usage.external_bytes, EXTERNAL);
+        assert_eq!(actual.current(), &values[0]);
+        assert_eq!(
+            width(actual.engine(Epoch(10))?, records::Direction::Send),
+            if role == Role::Client { 2 } else { 3 }
+        );
+        assert_eq!(
+            width(actual.engine(Epoch(10))?, records::Direction::Receive),
+            if role == Role::Client { 3 } else { 2 }
+        );
+        let error = Bank::new(
+            identity(role),
+            Epoch(10),
+            values[0],
+            storage::Limits {
+                capacity_bytes: required - 1,
+            },
+            EXTERNAL,
+        )
+        .err()
+        .ok_or("one-short initial Bank was admitted")?;
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<storage::Error>()),
+            Some(storage::Error::Budget)
+        ));
+        assert_eq!(
+            Bank::required_capacity(values[0], role, usize::MAX)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(actual.usage(), usage);
+    }
+    Ok(())
+}
+
+#[test]
 fn actual_intents_with_wrong_identity_old_origin_envelope_or_native_format_are_refused() -> Result {
     let values = values()?;
     let mut bank = bank(Role::Client)?;

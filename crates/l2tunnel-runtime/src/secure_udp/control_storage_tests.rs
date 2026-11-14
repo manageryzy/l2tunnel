@@ -1,4 +1,4 @@
-//! Actual selected control construction and liveness over reserved ARQ owners.
+//! Actual construction, transfer and liveness with ARQ-only and complete reserved owners.
 
 use super::*;
 use l2tunnel_core::{ConfigDigest, Epoch};
@@ -280,5 +280,115 @@ fn reserved_control_uses_actual_liveness_binding_shared_quota_and_confirmation()
     }
     assert!(accepted && confirmed);
     assert_eq!(owners[0].arq_storage_usage(), before);
+    Ok(())
+}
+
+#[test]
+fn complete_owner_constructor_boundary_failure_drops_each_earlier_actual_stream() -> Result {
+    let selected = selected();
+    let binding = binding(mg::Role::Client);
+    let plans = selected.message_storage_plans(binding, Duration::ZERO, Duration::from_secs(5))?;
+    let limits = plans.map(|plan| messages::storage::Limits {
+        capacity_bytes: plan.capacity_bytes(),
+    });
+    for failed_index in [1, 2] {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut called = Vec::new();
+        let mut completed = Vec::new();
+        let result = construction_trace(events.clone()).collect(
+            selected,
+            binding,
+            Some(limits),
+            |stream, settings, actual_binding, limit| {
+                called.push(stream);
+                if index(stream) == failed_index {
+                    return Err(io::Error::other(
+                        "injected complete stream constructor boundary",
+                    ));
+                }
+                let owner = messages::Owner::new_reserved(
+                    settings,
+                    actual_binding,
+                    Duration::ZERO,
+                    Duration::from_secs(5),
+                    limit.ok_or_else(|| invalid("missing complete stream limit"))?,
+                )
+                .map_err(invalid)?;
+                let usage = owner
+                    .storage_usage()
+                    .ok_or_else(|| protocol("missing actual complete stream"))?;
+                let plan = plans[index(stream)];
+                assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+                assert_eq!(usage.arq.capacity_bytes, plan.arq_plan().capacity_bytes());
+                assert_eq!(
+                    usage.reassembly.capacity_bytes,
+                    plan.reassembly_plan().capacity_bytes()
+                );
+                completed.push((stream, Some(usage.arq)));
+                Ok(owner)
+            },
+        );
+        let error = result
+            .err()
+            .ok_or("failed complete construction published owners")?;
+        assert_eq!(
+            error.to_string(),
+            "injected complete stream constructor boundary"
+        );
+        assert_eq!(called, streams::Stream::ALL[..=failed_index]);
+        assert_eq!(completed.len(), failed_index);
+        let expected: Vec<_> = completed
+            .into_iter()
+            .flat_map(|(stream, usage)| {
+                [
+                    StreamConstructionDrop::Before(stream, usage),
+                    StreamConstructionDrop::After(stream),
+                ]
+            })
+            .collect();
+        assert_eq!(*events.borrow(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_stream_collector_transfers_actual_full_backing_without_early_release() -> Result {
+    let selected = selected();
+    let binding = binding(mg::Role::Server);
+    let plans = selected.message_storage_plans(binding, Duration::ZERO, Duration::from_secs(5))?;
+    let limits = plans.map(|plan| messages::storage::Limits {
+        capacity_bytes: plan.capacity_bytes(),
+    });
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let owners = construction_trace(events.clone()).collect(
+        selected,
+        binding,
+        Some(limits),
+        |_, settings, actual_binding, limit| {
+            messages::Owner::new_reserved(
+                settings,
+                actual_binding,
+                Duration::ZERO,
+                Duration::from_secs(5),
+                limit.ok_or_else(|| invalid("missing complete stream limit"))?,
+            )
+            .map_err(invalid)
+        },
+    )?;
+    assert!(events.borrow().is_empty());
+    for (owner, plan) in owners.iter().zip(plans) {
+        let usage = owner
+            .storage_usage()
+            .ok_or("missing transferred full backing")?;
+        assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+        assert_eq!(usage.limit_bytes, usage.capacity_bytes);
+        assert_eq!(owner.arq_storage_usage(), Some(usage.arq));
+        assert_eq!(
+            usage.reassembly.capacity_bytes,
+            plan.reassembly_plan().capacity_bytes()
+        );
+    }
+    drop(owners);
+    assert!(events.borrow().is_empty());
     Ok(())
 }

@@ -5,8 +5,8 @@ implemented and finite local Unix integration-tested**. The existing actor runs
 the [generic selected Driver](generic-secure-udp.md) over its original authenticated
 socket. The additive complete-plan CLI now exposes this same owner, with finite
 external-process command/inspection evidence. Successful production CLI TAP/TUN
-startup, the complete generic IPC/failure matrix and broader qualification remain
-open. Version2 and CLI startup without the explicit plan retain SwiftPolicyV1.
+startup, the complete generic IPC matrix and broader qualification remain open.
+The finite actual generic service failure/lifecycle matrix now passes separately. Version2 and CLI startup without the explicit plan retain SwiftPolicyV1.
 The required source-stable aggregate passes; scoped evidence is recorded below.
 
 This is an engineering integration contract, not an owner decision or a change
@@ -336,13 +336,36 @@ implementation/evidence status.
 
 ## Verification and stable child tasks
 
+### Completion reply projection repair
+
+The first production generic TUN functional run reached real bidirectional
+UDP/ICMP traffic and then exposed a completed APIv3 switch reply whose nested
+transaction was idle at epoch2 while its outer service phase still said applying.
+The exact reply is retained in native-matrix-attempt-3/quic-like-tun/085-command.log.
+`apply_secure_udp_transaction` builds the reply before `finish` clears the
+operation and restores the actual service phase. This is a service projection
+defect, not permission to accept applying as a completed forwarding state.
+
+The narrow repair keeps the same actor, switcher, completion variants and
+authenticated runtime observations. In `finish`, settle the actual service
+operation/phase under its existing state lock, then project only APIv3
+Applied/Rejected responses from that settled snapshot before retaining/publishing
+the result. Preserve response success/code and all version1/version2 bytes,
+key replay, OutcomeUnknown and terminal behavior. Actual paired generic
+coordinator success and responder rejection tests must assert the outer phase,
+nested epoch/configuration/phase and retained-result replay. Root owns owner.rs;
+the test worker owns only secure_udp_transaction_failures.rs. Verify the affected
+service/IPC/legacy tests with bounded parallelism, not another unchanged full
+workspace/simulator run. This is an engineering defect repair within GCS-06/07;
+the full native and compatibility gates retain their definitions.
+
 - [x] [GCS-01] Freeze the exact additive plan, typed action, returned observation, APIv3 compatibility and ownership contract before production edits; keep requirements separate from engineering choices. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [x] [GCS-02] Implement explicit transaction Prepared selection and actual credential/attachment/contract validation before socket/provider effects, including exact pin/member/pattern, layer/readiness and resource/canonical negatives. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [x] [GCS-03] Consume actual factory authentication, original socket/tails, deferred attachment and run_transaction through the existing service actor; retain setup caps, per-plan server quarantine, cancellation and truthful readiness/terminal projection. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [x] [GCS-04] Implement complete-C typed commands with actual peer completion, exact key replay/conflict, unchanged operation caps, catalog refusal before effects and OutcomeUnknown on lost custody; preserve all existing action semantics. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [x] [GCS-05] Implement the separate shared frame and bounded truthful version3 status, retaining requested/current/physical distinctions, actual capacities/identities and explicit incomplete resource/lifecycle/profile capabilities. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
 - [ ] [GCS-06] Implement strict APIv3 parsing, status, complete-C switch and lifecycle routing over the existing private transport; prove exact v1/v2 bytes, wrong-version zero effects, strict limits and no downgrade/retry writes with real IPC tests.
-- [ ] [GCS-07] Exercise two actual shared service owners on both covers with nonzero asymmetric native traffic and at least 2 complete configuration switches, plus credential/setup/attachment/cancel/reconnect/owner-drop/duplicate-key/failure cases; separate typed/IPC evidence from native and GUI claims.
+- [x] [GCS-07] Exercise two actual shared service owners on both covers with nonzero asymmetric native traffic and at least 2 complete configuration switches, plus credential/setup/attachment/cancel/reconnect/owner-drop/duplicate-key/failure cases; separate typed/IPC evidence from native and GUI claims. Evidence: [source-stable combined checks](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json); finite local scope and remaining gates are described below.
 - [x] [GCS-08] Run focused failure/compatibility tests and the required source-stable aggregate on the complete selected shared path; preserve failed attempts and commit exact evidence/status without closing broader parent gates. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json); broader parent gates remain open.
 - [ ] [GCS-09] Add explicit CLI generic plan/catalog selection and version3 commands through the same shared API, preserving the current CLI path/defaults and manual own-trust credentials; validate actual external requests separately from in-process tests.
 
@@ -369,8 +392,10 @@ idle-service zero-effect version refusals and finite reply-loss/mismatch/no-retr
 cases. Its external probe runs34 CLI processes per cover with actual generic
 service owners,2 asymmetric switches and fresh authenticated reconnect.
 GCS-06 remains open for its complete authenticated-profile/max-reply/timeout/UID
-matrix. GCS-07 retains the complete generic credential/setup/device/cancellation/
-failure matrix; legacy service negatives do not replace these cases. GCS-09 is
+matrix. The [generic service failure matrix](generic-service-failure-matrix.md)
+now covers the actual generic credential/setup/device/cancellation/failure
+sequences, preserving the original two-owner/two-switch case. GCS-07 is qualified
+only for that stated local service deliverable. GCS-09 is
 implemented at the frontend and externally command-tested, but successful
 production CLI connect/serve TAP/TUN startup remains unqualified. Full requirements
 above are unchanged.
@@ -392,3 +417,11 @@ Earlier failed attempts and the exact pre-fix negative control remain preserved.
 This is local Linux validation, with no new privileged/native performance, remote
 CI, Windows/Android device or GUI qualification. Every still-open task retains
 its complete acceptance definition.
+
+The [current full baseline](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json)
+passes2011 Rust,406 tooling and1658 simulator cases. A later source-confirmed
+APIv3 completion projection repair passes the [77 affected service/local cases](../../work/generic-functionality-20261114-batch2/completion-projection-focused-attempt-1/validation.json)
+with4 test threads and strict client-core Clippy. Completed successful and
+rejected replies now project the settled service phase before being retained;
+replay remains identical, including across the tested reconnect. The native
+negative control remains preserved and is not a post-repair native pass.

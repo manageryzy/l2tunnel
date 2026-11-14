@@ -201,94 +201,90 @@ impl Driver {
             data_scope,
         )
         .map_err(invalid)?;
-        let arq_plan = |index: usize| {
-            recovery::storage::Plan::for_arq(selected.streams[index].delivery.recovery)
-                .map_err(invalid)
-        };
-        let arq_plans = [arq_plan(0)?, arq_plan(1)?, arq_plan(2)?];
-        let arq_capacity = arq_plans.iter().try_fold(0usize, |total, plan| {
-            total
-                .checked_add(plan.capacity_bytes())
-                .ok_or_else(|| invalid("reserved control recovery layout overflow"))
-        })?;
-        if arq_capacity > contract.settings().retained_bytes {
-            return Err(invalid("control recovery exceeds generic retained budget"));
-        }
-        let control = control_owner::Owner::new_leased_reserved_arq(
-            config.control,
-            selected,
-            delivery::Binding {
-                session: identity.session,
-                lane: identity.lane,
-                local_role: role,
-                control_epoch: config.control_epoch.0,
-            },
-            envelope_scope(control_scope),
-            envelope_scope(data_scope),
-            Duration::ZERO,
-            config.lifetime.lease,
-            arq_plans.map(|plan| recovery::storage::Limits {
-                capacity_bytes: plan.capacity_bytes(),
-            }),
-        )
-        .map_err(invalid)?;
-        let actual_arq = control
-            .arq_storage_usage()
-            .ok_or_else(|| protocol("generic control recovery is not reserved"))?;
-        let mut actual_arq_capacity = 0usize;
-        for (usage, plan) in actual_arq.iter().zip(arq_plans) {
-            if usage.capacity_bytes != plan.capacity_bytes() {
-                return Err(protocol("actual control recovery differs from its plan"));
-            }
-            actual_arq_capacity = actual_arq_capacity
-                .checked_add(usage.capacity_bytes)
-                .ok_or_else(|| invalid("actual control recovery layout overflow"))?;
-        }
         let capacity = records
             .capacity(config.security.max_body_bytes)
             .map_err(invalid)?;
-        let control_message = selected
-            .streams
-            .iter()
-            .map(|settings| settings.max_message_bytes)
-            .max()
-            .ok_or_else(|| invalid("generic streams have no message storage"))?;
-        let buffers = buffers::Buffers::new(
-            parts.cover.limits().max_packet_bytes,
-            capacity
-                .seal_workspace_bytes
-                .max(capacity.open_workspace_bytes),
-            config.security.max_body_bytes,
-            control.max_packet_bytes(),
-            control_message,
-            swift::control::MAX_FRAME,
+        let binding = delivery::Binding {
+            session: identity.session,
+            lane: identity.lane,
+            local_role: role,
+            control_epoch: config.control_epoch.0,
+        };
+        let plan = construction::Plan::new(
+            config,
+            parts.cover,
+            capacity,
+            binding,
+            contract.initial(),
+            role,
         )?;
-        let native = native_storage::Queue::new(
-            config.native.pending_packets,
-            config.native.pending_bytes,
-            config.receive.records.max_native,
-        )?;
-        let inputs = buffers::Inputs::new(
-            READ_BUFFER_BYTES,
-            parts
-                .cover
-                .limits()
-                .max_packet_bytes
-                .checked_add(1)
-                .ok_or_else(exhausted)?,
-        )?;
+        let required_bytes = plan.required_bytes;
+        let (control, buffers, native, inputs, external) =
+            plan.provision(contract.settings().retained_bytes, |plan| {
+                let control = control_owner::Owner::new_leased_reserved_messages(
+                    config.control,
+                    selected,
+                    binding,
+                    envelope_scope(control_scope),
+                    envelope_scope(data_scope),
+                    Duration::ZERO,
+                    config.lifetime.lease,
+                    plan.messages
+                        .map(|message| l2tunnel_management::messages::storage::Limits {
+                            capacity_bytes: message.capacity_bytes(),
+                        }),
+                )?;
+                let usage = control
+                    .message_storage_usage()
+                    .ok_or_else(|| protocol("generic complete control storage is not reserved"))?;
+                let message_capacity = usage.iter().zip(plan.messages).try_fold(
+                    0usize,
+                    |total, (usage, planned)| {
+                        if usage.capacity_bytes != planned.capacity_bytes()
+                            || usage.arq.capacity_bytes != planned.arq_plan().capacity_bytes()
+                            || usage.reassembly.capacity_bytes
+                                != planned.reassembly_plan().capacity_bytes()
+                        {
+                            return Err(protocol(
+                                "actual complete control storage differs from its plan",
+                            ));
+                        }
+                        total.checked_add(usage.capacity_bytes).ok_or_else(|| {
+                            invalid("actual complete control storage layout overflow")
+                        })
+                    },
+                )?;
+                let wrapper_capacity = control.wrapper_capacity_bytes()?;
+                if wrapper_capacity != plan.wrapper_bytes {
+                    return Err(protocol("actual control wrapper differs from its plan"));
+                }
+                let buffer_capacity = plan.buffers.capacity_bytes();
+                let input_capacity = plan.inputs.capacity_bytes();
+                let native_capacity = plan.native.capacity_bytes();
+                let buffers = buffers::Buffers::with_plan(plan.buffers)?;
+                let inputs = buffers::Inputs::with_plan(plan.inputs)?;
+                let native = native_storage::Queue::with_plan(plan.native)?;
+                if buffers.capacity_bytes() != buffer_capacity
+                    || inputs.capacity_bytes() != input_capacity
+                    || native.capacity_bytes() != native_capacity
+                {
+                    return Err(protocol("actual generic workspace differs from its plan"));
+                }
+                let external = construction::external_capacity(
+                    buffers.capacity_bytes(),
+                    inputs.capacity_bytes(),
+                    native.capacity_bytes(),
+                    message_capacity,
+                    wrapper_capacity,
+                )?;
+                if external != plan.external_bytes {
+                    return Err(protocol(
+                        "actual generic external storage differs from its plan",
+                    ));
+                }
+                Ok((control, buffers, native, inputs, external))
+            })?;
         let input_capacity = inputs.capacity_bytes();
-        // Set already charges its own embedded layout. This known subtotal does
-        // not claim complete Control/Peer/catalog preallocation.
-        let external = std::mem::size_of::<Self>()
-            .checked_add(std::mem::size_of::<transactions::State>())
-            .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<storage::Set>()))
-            .and_then(|bytes| bytes.checked_add(native.capacity_bytes()))
-            .and_then(|bytes| bytes.checked_add(buffers.capacity_bytes()))
-            .and_then(|bytes| bytes.checked_add(input_capacity))
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<buffers::Inputs>()))
-            .and_then(|bytes| bytes.checked_add(actual_arq_capacity))
-            .ok_or_else(|| invalid("known generic runtime storage layout overflow"))?;
         let bank = engines::Bank::new(
             identity,
             core::Epoch(config.data_epoch.0),
@@ -298,6 +294,12 @@ impl Driver {
             },
             external,
         )?;
+        let usage = bank.usage();
+        if usage.peak_bytes != required_bytes || usage.external_bytes != external {
+            return Err(protocol(
+                "actual generic initial bank differs from its construction plan",
+            ));
+        }
         let state = transactions::State::new(
             identity,
             core::Epoch(config.data_epoch.0),

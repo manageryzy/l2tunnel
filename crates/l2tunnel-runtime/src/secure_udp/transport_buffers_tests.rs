@@ -213,3 +213,81 @@ fn minimum_buffers_still_charge_both_security_copies_and_are_send() -> Result {
     assert_eq!(inputs.capacity_bytes(), 2);
     Ok(())
 }
+
+#[test]
+fn checked_plans_provision_actual_workspaces_and_preserve_pointers_across_reuse() -> Result {
+    let plan = Buffers::plan(11, 17, 23, 29, 31, 43)?;
+    let input_plan = Inputs::plan(47, 54)?;
+    let mut buffers = Buffers::with_plan(plan)?;
+    let mut inputs = Inputs::with_plan(input_plan)?;
+    let pointers = |buffers: &Buffers| {
+        [
+            buffers.wire.as_ptr(),
+            buffers.seal.as_ptr(),
+            buffers.open.as_ptr(),
+            buffers.plain.as_ptr(),
+            buffers.control_wire.as_ptr(),
+            buffers.control_input.as_ptr(),
+            buffers.frame.as_ptr(),
+        ]
+    };
+    let before = pointers(&buffers);
+    let input_before = [inputs.native.as_ptr(), inputs.datagram.as_ptr()];
+    assert_eq!(capacities(&buffers), SIZES);
+    assert_eq!(buffers.capacity_bytes(), plan.capacity_bytes());
+    assert_eq!(inputs.capacity_bytes(), input_plan.capacity_bytes());
+    assert_eq!(inputs.datagram.len(), 53 + 1);
+    for marker in 0..130_u16 {
+        buffers.wire.fill(marker as u8);
+        buffers.seal.fill(marker.wrapping_add(1) as u8);
+        buffers.open.fill(marker.wrapping_add(2) as u8);
+        buffers.plain.fill(marker.wrapping_add(3) as u8);
+        buffers.control_wire.fill(marker.wrapping_add(4) as u8);
+        buffers.control_input.fill(marker.wrapping_add(5) as u8);
+        buffers.frame.extend_from_slice(&[marker as u8; 43]);
+        assert_eq!(buffers.frame.len(), 43);
+        buffers.frame.clear();
+        inputs.native.fill(marker as u8);
+        inputs.datagram.fill(marker.wrapping_add(1) as u8);
+        assert_eq!(
+            inputs.datagram.last(),
+            Some(&(marker.wrapping_add(1) as u8))
+        );
+        assert_eq!(pointers(&buffers), before);
+        assert_eq!(
+            [inputs.native.as_ptr(), inputs.datagram.as_ptr()],
+            input_before
+        );
+        assert_eq!(buffers.capacity_bytes(), plan.capacity_bytes());
+        assert_eq!(inputs.capacity_bytes(), input_plan.capacity_bytes());
+    }
+    Ok(())
+}
+
+#[test]
+fn checked_plan_entry_points_refuse_zero_invalid_and_sum_overflow_without_provisioning() -> Result {
+    for bad in [0, usize::MAX, (isize::MAX as usize) + 1] {
+        for position in 0..6 {
+            let mut sizes = [11, 17, 23, 29, 31, 43];
+            sizes[position] = bad;
+            assert_eq!(
+                Buffers::plan(sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], sizes[5])
+                    .err()
+                    .map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        }
+        assert!(Inputs::plan(bad, 53).is_err());
+        assert!(Inputs::plan(47, bad).is_err());
+    }
+    let maximum = isize::MAX as usize;
+    assert!(Layout::array::<u8>(maximum).is_ok());
+    assert!(Buffers::plan(maximum, maximum, 1, 1, 1, 1).is_err());
+    // Both lengths are individually legal and their exact sum fits usize.
+    // Planning this large witness must not attempt to provision its backing.
+    assert_eq!(
+        Inputs::plan(maximum, maximum)?.capacity_bytes(),
+        usize::MAX - 1
+    );
+    Ok(())
+}

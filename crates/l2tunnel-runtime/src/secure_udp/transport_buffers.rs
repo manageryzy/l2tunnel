@@ -2,6 +2,25 @@
 
 use std::{alloc::Layout, io};
 
+/// Checked exact byte layouts; only this module can construct a plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Plan<const N: usize> {
+    sizes: [usize; N],
+    capacity_bytes: usize,
+}
+impl<const N: usize> Plan<N> {
+    fn new(sizes: [usize; N]) -> io::Result<Self> {
+        let capacity_bytes = layout_bytes(&sizes)?;
+        Ok(Self {
+            sizes,
+            capacity_bytes,
+        })
+    }
+    pub(super) fn capacity_bytes(self) -> usize {
+        self.capacity_bytes
+    }
+}
+
 /// Actual reusable driver workspaces; callers must preserve the admitted capacities.
 pub(super) struct Buffers {
     pub(super) wire: Vec<u8>,
@@ -21,21 +40,42 @@ impl Buffers {
         control_message: usize,
         frame: usize,
     ) -> io::Result<Self> {
-        Self::build(
-            [
-                wire,
-                secure_packet,
-                secure_packet,
-                plain,
-                control_packet,
-                control_message,
-                frame,
-            ],
-            &mut Allocation::new(),
-        )
+        Self::with_plan(Self::plan(
+            wire,
+            secure_packet,
+            plain,
+            control_packet,
+            control_message,
+            frame,
+        )?)
     }
+    pub(super) fn plan(
+        wire: usize,
+        secure_packet: usize,
+        plain: usize,
+        control_packet: usize,
+        control_message: usize,
+        frame: usize,
+    ) -> io::Result<Plan<7>> {
+        Plan::new([
+            wire,
+            secure_packet,
+            secure_packet,
+            plain,
+            control_packet,
+            control_message,
+            frame,
+        ])
+    }
+    pub(super) fn with_plan(plan: Plan<7>) -> io::Result<Self> {
+        Self::build_plan(plan, &mut Allocation::new())
+    }
+    #[cfg(test)]
     fn build(sizes: [usize; 7], allocation: &mut Allocation) -> io::Result<Self> {
-        layout_bytes(&sizes)?;
+        Self::build_plan(Plan::new(sizes)?, allocation)
+    }
+    fn build_plan(plan: Plan<7>, allocation: &mut Allocation) -> io::Result<Self> {
+        let sizes = plan.sizes;
         // Each local owns its allocation immediately; any later failure drops all locals.
         let wire = allocation.bytes(sizes[0], true)?;
         let seal = allocation.bytes(sizes[1], true)?;
@@ -74,10 +114,20 @@ pub(super) struct Inputs {
 }
 impl Inputs {
     pub(super) fn new(native: usize, datagram: usize) -> io::Result<Self> {
-        Self::build([native, datagram], &mut Allocation::new())
+        Self::with_plan(Self::plan(native, datagram)?)
     }
+    pub(super) fn plan(native: usize, datagram: usize) -> io::Result<Plan<2>> {
+        Plan::new([native, datagram])
+    }
+    pub(super) fn with_plan(plan: Plan<2>) -> io::Result<Self> {
+        Self::build_plan(plan, &mut Allocation::new())
+    }
+    #[cfg(test)]
     fn build(sizes: [usize; 2], allocation: &mut Allocation) -> io::Result<Self> {
-        layout_bytes(&sizes)?;
+        Self::build_plan(Plan::new(sizes)?, allocation)
+    }
+    fn build_plan(plan: Plan<2>, allocation: &mut Allocation) -> io::Result<Self> {
+        let sizes = plan.sizes;
         let native = allocation.bytes(sizes[0], true)?;
         let datagram = allocation.bytes(sizes[1], true)?;
         Ok(Self { native, datagram })

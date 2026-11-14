@@ -118,6 +118,19 @@ pub(super) struct Bank {
     storage: storage::Set,
 }
 impl Bank {
+    /// Exact known initial Set/engine/external sum without constructing an owner.
+    pub(super) fn required_capacity(
+        initial: C,
+        role: Role,
+        external_bytes: usize,
+    ) -> io::Result<usize> {
+        let plan = plan(initial, role)?;
+        std::mem::size_of::<storage::Set>()
+            .checked_add(external_bytes)
+            .and_then(|bytes| bytes.checked_add(plan.capacity_bytes()))
+            .ok_or_else(|| invalid("known initial engine storage layout overflow"))
+    }
+
     pub(super) fn new(
         identity: tx::Identity,
         epoch: Epoch,

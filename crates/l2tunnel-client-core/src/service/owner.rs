@@ -19,17 +19,6 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
     let failed = matches!(result, Completed::Failed(_))
         || (state.backend.is_none()
             && matches!(state.snapshot.terminal, Some(Terminal::Failed(_))));
-    if let Some(entry) = state
-        .entries
-        .iter_mut()
-        .find(|e| e.accepted.operation == id)
-    {
-        #[cfg(unix)]
-        if let Some(record) = &mut entry.setup {
-            record.complete(&result, entry.accepted, Instant::now());
-        }
-        entry.result = Some(result);
-    }
     state.snapshot.operation = None;
     if state.backend.is_none() {
         state.snapshot.listening = None;
@@ -41,6 +30,31 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
     } else {
         Phase::Disconnected
     };
+    #[cfg(unix)]
+    let mut result = result;
+    #[cfg(unix)]
+    if let Completed::Applied(response) | Completed::Rejected(response) = &mut result
+        && response.version == local::TRANSACTION_VERSION
+    {
+        // Retain the completed reply from the same settled lifecycle snapshot.
+        // Legacy replies preserve their existing projection and wire bytes.
+        *response = Handle::transaction_status_from(
+            Handle::snapshot_locked(&state),
+            response.ok,
+            &response.code,
+        );
+    }
+    if let Some(entry) = state
+        .entries
+        .iter_mut()
+        .find(|e| e.accepted.operation == id)
+    {
+        #[cfg(unix)]
+        if let Some(record) = &mut entry.setup {
+            record.complete(&result, entry.accepted, Instant::now());
+        }
+        entry.result = Some(result);
+    }
     drop(state);
     shared.changed();
 }

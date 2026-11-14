@@ -10,6 +10,37 @@ use l2tunnel::swift_configuration::{Catalog, Configuration, Descriptor};
 use l2tunnel_management::{control_streams, delivery, messages, transaction};
 use l2tunnel_runtime::secure_udp::transport;
 
+#[path = "secure_udp_transaction_failures.rs"]
+mod command_failures;
+#[path = "secure_udp_transaction_lifecycle.rs"]
+mod lifecycle_failures;
+#[path = "secure_udp_transaction_setup.rs"]
+mod setup_failures;
+#[path = "secure_udp_transaction_support.rs"]
+mod support;
+
+#[derive(Clone, Copy)]
+struct TransactionFixtureOptions {
+    setup_timeout: Duration,
+    noise_profile: hs::Profile,
+    psk: [Option<[u8; 32]>; 2],
+    admission: [[u8; 32]; 2],
+    retained_bytes: usize,
+    report_interval: Option<Duration>,
+}
+impl TransactionFixtureOptions {
+    fn baseline() -> Self {
+        Self {
+            setup_timeout: Duration::from_secs(3),
+            noise_profile: hs::Profile::Ik,
+            psk: [None, None],
+            admission: [[44; 32]; 2],
+            retained_bytes: 16 * 1024 * 1024,
+            report_interval: None,
+        }
+    }
+}
+
 struct TransactionPlans {
     plans: [Prepared; 2],
     addresses: [std::net::SocketAddr; 2],
@@ -47,6 +78,14 @@ fn transaction_plans(
     appearance: l2tunnel_cover::Appearance,
     hosts: &[Arc<Host>; 2],
 ) -> Result<TransactionPlans> {
+    transaction_plans_with(appearance, hosts, TransactionFixtureOptions::baseline())
+}
+
+fn transaction_plans_with(
+    appearance: l2tunnel_cover::Appearance,
+    hosts: &[Arc<Host>; 2],
+    options: TransactionFixtureOptions,
+) -> Result<TransactionPlans> {
     let held = [
         crate::test_ports::reserve(false)?,
         crate::test_ports::reserve(false)?,
@@ -64,8 +103,13 @@ fn transaction_plans(
     )?;
     let mut settings = legacy.settings();
     settings.application = l2tunnel_core::ConfigDigest([31; 32]);
+    settings.profile = options.noise_profile;
+    let mut connection = legacy.connection();
+    connection.handshake_timeout = options.setup_timeout;
     let mut initiator = streamed(legacy.runtime(Role::Initiator));
     let mut responder = streamed(legacy.runtime(Role::Responder));
+    initiator.report_interval = options.report_interval;
+    responder.report_interval = options.report_interval;
     let mut forward = initiator.send;
     let mut reverse = initiator.receive;
     // Finite integration geometry, separate from the CLI's production capacity.
@@ -110,7 +154,7 @@ fn transaction_plans(
     responder.send = initial_descriptor.reverse();
     responder.receive = initial_descriptor.forward();
     let profile = transaction_profile::Profile::new(
-        legacy.connection(),
+        connection,
         settings,
         peers,
         initiator,
@@ -123,39 +167,36 @@ fn transaction_plans(
                 reconcile_timeout_ms: 1000,
             },
             max_operation_ms: 1500,
-            retained_bytes: 16 * 1024 * 1024,
+            retained_bytes: options.retained_bytes,
         },
     )?;
     let initial = profile.initial();
     let target = Configuration::new(profile.envelope(), target_descriptor)?;
     let outside = Configuration::new(profile.envelope(), outside_descriptor)?;
     for role in [Role::Initiator, Role::Responder] {
-        assert!(
-            profile
-                .runtime_contract(role)?
-                .config()
-                .report_interval
-                .is_none()
+        assert_eq!(
+            profile.runtime_contract(role)?.config().report_interval,
+            options.report_interval
         );
     }
     let client_noise = credentials::NoiseIdentity::new(
         Zeroizing::new([11; 32]),
         peers.responder,
-        hs::Profile::Ik,
-        None,
+        options.noise_profile,
+        options.psk[0].map(Zeroizing::new),
     )?;
     let server_noise = credentials::NoiseIdentity::new(
         Zeroizing::new([22; 32]),
         peers.initiator,
-        hs::Profile::Ik,
-        None,
+        options.noise_profile,
+        options.psk[1].map(Zeroizing::new),
     )?;
     let client = Prepared::secure_udp_transaction_client(
         profile.clone(),
         credentials::Client::new(
             client_noise,
             member,
-            credentials::Secret32::new(Zeroizing::new([44; 32]))?,
+            credentials::Secret32::new(Zeroizing::new(options.admission[0]))?,
         )?,
         hosts[0].attachment(),
     )?;
@@ -163,7 +204,7 @@ fn transaction_plans(
         profile.clone(),
         credentials::Server::new(
             server_noise,
-            credentials::Secret32::new(Zeroizing::new([44; 32]))?,
+            credentials::Secret32::new(Zeroizing::new(options.admission[1]))?,
             credentials::Secret32::new(Zeroizing::new([55; 32]))?,
         )?,
         hosts[1].attachment(),

@@ -38,6 +38,20 @@ pub(super) struct Queue<T> {
     capacity_bytes: usize,
 }
 
+/// Exact validated queue layouts tied to the real packet metadata type.
+pub(super) struct Plan<T> {
+    packets: usize,
+    limit: usize,
+    maximum: usize,
+    capacity_bytes: usize,
+    metadata: std::marker::PhantomData<fn() -> T>,
+}
+impl<T> Plan<T> {
+    pub(super) fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+}
+
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidInput.into()
 }
@@ -102,15 +116,9 @@ impl Allocation {
 impl<T> Queue<T> {
     /// Fully reserve every header and payload before publishing this owner.
     pub(super) fn new(packets: usize, bytes: usize, max_native: usize) -> io::Result<Self> {
-        Self::allocate(packets, bytes, max_native, &mut Allocation::default())
+        Self::with_plan(Self::plan(packets, bytes, max_native)?)
     }
-
-    fn allocate(
-        packets: usize,
-        bytes: usize,
-        max_native: usize,
-        allocation: &mut Allocation,
-    ) -> io::Result<Self> {
+    pub(super) fn plan(packets: usize, bytes: usize, max_native: usize) -> io::Result<Plan<T>> {
         if packets == 0 || max_native == 0 || bytes < max_native {
             return Err(invalid());
         }
@@ -121,17 +129,48 @@ impl<T> Queue<T> {
             .checked_add(layout::<Vec<u8>>(packets)?)
             .and_then(|headers| headers.checked_add(payload_bytes))
             .ok_or_else(invalid)?;
+        Ok(Plan {
+            packets,
+            limit: bytes,
+            maximum: max_native,
+            capacity_bytes,
+            metadata: std::marker::PhantomData,
+        })
+    }
+
+    pub(super) fn with_plan(plan: Plan<T>) -> io::Result<Self> {
+        Self::allocate_plan(plan, &mut Allocation::default())
+    }
+
+    #[cfg(test)]
+    fn allocate(
+        packets: usize,
+        bytes: usize,
+        max_native: usize,
+        allocation: &mut Allocation,
+    ) -> io::Result<Self> {
+        Self::allocate_plan(Self::plan(packets, bytes, max_native)?, allocation)
+    }
+
+    fn allocate_plan(plan: Plan<T>, allocation: &mut Allocation) -> io::Result<Self> {
+        let Plan {
+            packets,
+            limit,
+            maximum,
+            capacity_bytes,
+            metadata: _,
+        } = plan;
         let ready = allocation.deque(packets)?;
         let mut free = allocation.vector(packets)?;
         for _ in 0..packets {
-            free.push(allocation.vector(max_native)?);
+            free.push(allocation.vector(maximum)?);
         }
         Ok(Self {
             ready,
             free,
             packets,
-            limit: bytes,
-            maximum: max_native,
+            limit,
+            maximum,
             bytes: 0,
             capacity_bytes,
         })

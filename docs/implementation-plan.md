@@ -190,6 +190,48 @@ or platform handles in public pure APIs. Add `testkit/` golden fixtures and a Ru
 in-memory integration driver at M2; add `bench/` baseline adapters at M5. These
 additional projects are planned, not empty claims of functionality.
 
+## Approved parallel execution order
+
+On 2026-11-15 (Asia/Tokyo), the owner approved the following execution order.
+Run three implementation lanes with one integrator; independent work may overlap
+batches after its shared interfaces are frozen. Preserve the existing milestones,
+stable task IDs and complete acceptance definitions below.
+
+1. Finish the current GCN/GSF/CMS/KCA functionality batch: actual production CLI,
+   service failures/lifecycle, complete control-message storage and known
+   construction admission. Integrate before combined checks and the four
+   quic-like/media-like TAP/TUN functional cases.
+2. Extend the common session foundation and lifecycle in parallel: reusable
+   record-profile interfaces/configuration, authenticated fresh-DH exchange and
+   bounded retained-state recovery, and remaining control/resource/fault work.
+3. Integrate existing reliable/aligned/packed/rolling/RLNC/parity components and
+   the generic engine lifecycle. Complete actual Swift-to-other-profile switching
+   under the full SW-11 definition, including typed feedback and native fences.
+4. Complete production recovery/record families alongside TUN active credit,
+   QoS, explicitly selected TCP proxy and VXLAN isolation/attachment.
+5. Compose the common session through the remaining carriers. Preserve the
+   original OpenVPN wire-handshake and HTTPS TCP/TLS-to-ACK-independent packet
+   requirements, with feasibility, ownership and failure gates before exposure.
+6. Deliver shared CLI/GUI and Linux/Windows/Android integration after schema/API
+   stability. Retain the existing toolkit decision and actual-device evidence
+   gates; public protocol libraries remain independent of runtimes and OS handles.
+7. Complete all47 P-* parity gates, including the15 causal research families.
+   Their independent work may start once interfaces stabilize rather than waiting
+   for platform work. Existing primitives are reused after source/evidence audit.
+8. After functionality, concentrate native performance, kernel profiling, original
+   80Mbit/s acceptance and controlled real-path carrier/QoS comparisons in matched,
+   immutable campaigns. Preserve negative results and historical receipts.
+
+Each coherent source batch receives cross-review and affected regression checks.
+Combine the full frozen-source aggregate and required native acceptance at stage
+boundaries. Repair failures with focused dependency-aware checks; do not repeat
+unaffected suites after each leaf. Run independent functional tests with bounded
+parallelism, retaining shared-resource isolation and explicit reused evidence.
+Performance campaigns remain deferred and controlled. This scheduling approval does not change
+any mode requirement or select unresolved wire formats, timeout values, a desktop
+toolkit, package publication or a project license. Engineering interface choices
+remain distinct from owner decisions.
+
 ## Ordered milestones and exit gates
 
 ### M0: contracts, inventory and tooling

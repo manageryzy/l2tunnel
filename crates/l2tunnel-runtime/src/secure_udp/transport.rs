@@ -48,6 +48,8 @@ mod transactions;
 mod transaction_contract;
 pub use performance::Performance;
 pub use transaction_contract::TransactionContract;
+#[path = "transport_construction.rs"]
+mod construction;
 #[path = "transport_generic.rs"]
 mod generic;
 #[path = "transport_generic_actions.rs"]

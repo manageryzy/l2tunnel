@@ -231,7 +231,10 @@ fn fifo_owns_exact_metadata_bytes_and_original_age_until_completion() -> TestRes
 
 #[test]
 fn repeated_fifo_wrap_and_recycling_preserve_every_payload_allocation() -> TestResult {
-    let mut queue = Queue::<Metadata>::new(4, 68, 17)?;
+    let plan = Queue::<Metadata>::plan(4, 68, 17)?;
+    let expected_capacity = plan.capacity_bytes();
+    let mut queue = Queue::<Metadata>::with_plan(plan)?;
+    assert_eq!(queue.capacity_bytes(), expected_capacity);
     let original = storage(&queue);
     let mut record = 0;
     for round in 0..128u64 {
@@ -255,6 +258,50 @@ fn repeated_fifo_wrap_and_recycling_preserve_every_payload_allocation() -> TestR
         }
         assert_eq!(queue.bytes(), 0);
     }
+    Ok(())
+}
+
+#[test]
+fn typed_plan_provisions_real_metadata_owners_and_drops_each_exactly_once() -> TestResult {
+    use std::{cell::Cell, rc::Rc};
+    struct OwnedMetadata(Rc<Cell<usize>>);
+    impl Drop for OwnedMetadata {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let drops = Rc::new(Cell::new(0));
+    let plan = Queue::<OwnedMetadata>::plan(2, 8, 4)?;
+    let planned = plan.capacity_bytes();
+    let mut queue = Queue::with_plan(plan)?;
+    let original = storage(&queue);
+    assert_eq!(queue.capacity_bytes(), planned);
+    let actual_layout = queue.ready.capacity() * size_of::<Packet<OwnedMetadata>>()
+        + queue.free.capacity() * size_of::<Vec<u8>>()
+        + queue.free.iter().map(Vec::capacity).sum::<usize>();
+    assert_eq!(planned, actual_layout);
+    enqueue(&mut queue, OwnedMetadata(drops.clone()), 1, &[1; 4])?;
+    enqueue(&mut queue, OwnedMetadata(drops.clone()), 2, &[2; 4])?;
+    assert_eq!(drops.get(), 0);
+    queue.complete_front()?;
+    assert_eq!(drops.get(), 1);
+    assert_eq!(
+        queue
+            .acquire()
+            .ok_or("missing returned actual slot")?
+            .copy(OwnedMetadata(drops.clone()), 3, &[3; 5])
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(drops.get(), 2);
+    assert_eq!(storage(&queue), original);
+    assert_eq!(
+        queue.front().ok_or("refusal lost earlier packet")?.bytes(),
+        &[2; 4]
+    );
+    drop(queue);
+    assert_eq!(drops.get(), 3);
     Ok(())
 }
 

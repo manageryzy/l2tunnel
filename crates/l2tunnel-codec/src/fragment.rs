@@ -3,6 +3,10 @@ use l2tunnel_core::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod backing;
+pub mod storage;
+use backing::{PendingStore, RetiredStore};
+
 /// Fixed overhead of one draft session-scoped fragment.
 pub const FRAGMENT_HEADER_BYTES: usize = 40;
 
@@ -119,6 +123,78 @@ pub struct FragmentBatch {
     pub fragments: Vec<Vec<u8>>,
 }
 
+/// Checked canonical flat-batch geometry; not authentication or delivery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentLayout {
+    message: MessageId,
+    length: usize,
+    count: u16,
+    chunk: u16,
+    encoded: usize,
+}
+impl FragmentLayout {
+    /// Full nonwrapping identity assigned by the actual Fragmenter.
+    pub fn message(&self) -> MessageId {
+        self.message
+    }
+    /// Number of complete canonical fragments.
+    pub fn fragments(&self) -> usize {
+        usize::from(self.count)
+    }
+    /// Initialized flat-batch prefix length.
+    pub fn encoded_bytes(&self) -> usize {
+        self.encoded
+    }
+    /// Exact header-and-body range of one index, without allocating.
+    pub fn fragment_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        if index >= self.fragments() {
+            return None;
+        }
+        let chunk = usize::from(self.chunk);
+        let body = self
+            .length
+            .checked_sub(index.checked_mul(chunk)?)?
+            .min(chunk);
+        let begin = index.checked_mul(FRAGMENT_HEADER_BYTES.checked_add(chunk)?)?;
+        let end = begin
+            .checked_add(FRAGMENT_HEADER_BYTES)?
+            .checked_add(body)?;
+        (end <= self.encoded).then_some(begin..end)
+    }
+}
+
+/// Borrowed exact initialized batch prefix produced into caller storage.
+pub struct FragmentBatchView<'out> {
+    layout: FragmentLayout,
+    encoded: &'out [u8],
+}
+impl<'out> FragmentBatchView<'out> {
+    /// Full allocated message identity.
+    pub fn message(&self) -> MessageId {
+        self.layout.message
+    }
+    /// Number of initialized fragments.
+    pub fn len(&self) -> usize {
+        self.layout.fragments()
+    }
+    /// Successful batches are never empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Exact initialized bytes, excluding unused caller capacity.
+    pub fn encoded(&self) -> &'out [u8] {
+        self.encoded
+    }
+    /// Borrow one complete header/body by canonical index.
+    pub fn fragment(&self, index: usize) -> Option<&'out [u8]> {
+        self.encoded.get(self.layout.fragment_range(index)?)
+    }
+    /// Retain checked geometry after ending this temporary buffer borrow.
+    pub fn layout(&self) -> FragmentLayout {
+        self.layout
+    }
+}
+
 /// Monotonic message-ID owner for one direction/session/epoch.
 pub struct Fragmenter {
     context: FragmentContext,
@@ -164,7 +240,7 @@ impl Fragmenter {
     }
 
     /// Fragment a bounded record; failed calls consume no message ID.
-    pub fn fragment(&mut self, record: &[u8]) -> Result<FragmentBatch, FragmentError> {
+    fn prepare(&self, record: &[u8]) -> Result<FragmentLayout, FragmentError> {
         if record.is_empty() {
             return Err(FragmentError::EmptyMessage);
         }
@@ -177,32 +253,98 @@ impl Fragmenter {
             return Err(FragmentError::TooManyFragments);
         }
         let message = self.next_message.ok_or(FragmentError::Exhausted)?;
-        let total = u32::try_from(record.len()).map_err(|_| FragmentError::Arithmetic)?;
+        u32::try_from(record.len()).map_err(|_| FragmentError::Arithmetic)?;
         let chunk = u16::try_from(self.chunk_bytes).map_err(|_| FragmentError::Arithmetic)?;
-        let mut fragments = Vec::with_capacity(usize::from(count));
+        let encoded = usize::from(count)
+            .checked_mul(FRAGMENT_HEADER_BYTES)
+            .and_then(|headers| headers.checked_add(record.len()))
+            .ok_or(FragmentError::Arithmetic)?;
+        Ok(FragmentLayout {
+            message,
+            length: record.len(),
+            count,
+            chunk,
+            encoded,
+        })
+    }
+
+    /// Fragment a bounded record; failed calls consume no message ID.
+    pub fn fragment(&mut self, record: &[u8]) -> Result<FragmentBatch, FragmentError> {
+        let layout = self.prepare(record)?;
+        let mut fragments = Vec::with_capacity(layout.fragments());
         for (index, body) in record.chunks(self.chunk_bytes).enumerate() {
-            let index = u16::try_from(index).map_err(|_| FragmentError::Arithmetic)?;
-            let length = u16::try_from(body.len()).map_err(|_| FragmentError::Arithmetic)?;
             let capacity = FRAGMENT_HEADER_BYTES
                 .checked_add(body.len())
                 .ok_or(FragmentError::Arithmetic)?;
-            let mut bytes = Vec::with_capacity(capacity);
-            bytes.extend_from_slice(b"LX");
-            bytes.extend_from_slice(&[1, 0]);
-            bytes.extend_from_slice(&self.context.session.0.to_be_bytes());
-            bytes.extend_from_slice(&self.context.epoch.0.to_be_bytes());
-            bytes.extend_from_slice(&message.0.to_be_bytes());
-            bytes.extend_from_slice(&total.to_be_bytes());
-            bytes.extend_from_slice(&index.to_be_bytes());
-            bytes.extend_from_slice(&count.to_be_bytes());
-            bytes.extend_from_slice(&chunk.to_be_bytes());
-            bytes.extend_from_slice(&length.to_be_bytes());
-            bytes.extend_from_slice(body);
+            let mut bytes = vec![0; capacity];
+            encode_fragment(self.context, layout, index, body, &mut bytes)?;
             fragments.push(bytes);
         }
-        self.next_message = message.0.checked_add(1).map(MessageId);
-        Ok(FragmentBatch { message, fragments })
+        self.next_message = layout.message.0.checked_add(1).map(MessageId);
+        Ok(FragmentBatch {
+            message: layout.message,
+            fragments,
+        })
     }
+
+    /// Encode a complete canonical batch without allocation or a partial ID handoff.
+    pub fn fragment_into<'out>(
+        &mut self,
+        record: &[u8],
+        encoded: &'out mut [u8],
+    ) -> Result<FragmentBatchView<'out>, FragmentError> {
+        let layout = self.prepare(record)?;
+        let output = encoded
+            .get_mut(..layout.encoded)
+            .ok_or(FragmentError::OutputTooSmall)?;
+        for (index, body) in record.chunks(self.chunk_bytes).enumerate() {
+            let range = layout
+                .fragment_range(index)
+                .ok_or(FragmentError::Arithmetic)?;
+            encode_fragment(
+                self.context,
+                layout,
+                index,
+                body,
+                output.get_mut(range).ok_or(FragmentError::Arithmetic)?,
+            )?;
+        }
+        self.next_message = layout.message.0.checked_add(1).map(MessageId);
+        Ok(FragmentBatchView {
+            layout,
+            encoded: output,
+        })
+    }
+}
+
+fn encode_fragment(
+    context: FragmentContext,
+    layout: FragmentLayout,
+    index: usize,
+    body: &[u8],
+    output: &mut [u8],
+) -> Result<(), FragmentError> {
+    let index = u16::try_from(index).map_err(|_| FragmentError::Arithmetic)?;
+    let length = u16::try_from(body.len()).map_err(|_| FragmentError::Arithmetic)?;
+    let total = u32::try_from(layout.length).map_err(|_| FragmentError::Arithmetic)?;
+    let needed = FRAGMENT_HEADER_BYTES
+        .checked_add(body.len())
+        .ok_or(FragmentError::Arithmetic)?;
+    let output = output
+        .get_mut(..needed)
+        .ok_or(FragmentError::OutputTooSmall)?;
+    output[..2].copy_from_slice(b"LX");
+    output[2..4].copy_from_slice(&[1, 0]);
+    output[4..12].copy_from_slice(&context.session.0.to_be_bytes());
+    output[12..20].copy_from_slice(&context.epoch.0.to_be_bytes());
+    output[20..28].copy_from_slice(&layout.message.0.to_be_bytes());
+    output[28..32].copy_from_slice(&total.to_be_bytes());
+    output[32..34].copy_from_slice(&index.to_be_bytes());
+    output[34..36].copy_from_slice(&layout.count.to_be_bytes());
+    output[36..38].copy_from_slice(&layout.chunk.to_be_bytes());
+    output[38..40].copy_from_slice(&length.to_be_bytes());
+    output[40..].copy_from_slice(body);
+    Ok(())
 }
 
 /// Result of authenticated fragment admission; only completion writes output.
@@ -235,7 +377,7 @@ struct Pending {
     chunk: u16,
     count: u16,
     received: u16,
-    present: Vec<bool>,
+    present: Vec<u8>,
     buffer: Vec<u8>,
     deadline: u64,
 }
@@ -257,39 +399,98 @@ struct ParsedFragment<'a> {
 pub struct Reassembler {
     context: FragmentContext,
     config: ReassemblyConfig,
-    pending: BTreeMap<MessageId, Pending>,
-    retired: BTreeSet<MessageId>,
+    pending: PendingStore,
+    retired: RetiredStore,
     highest: Option<MessageId>,
     last_time: Option<u64>,
     reserved_bytes: usize,
     reserved_fragments: usize,
+    storage_usage: Option<storage::Usage>,
+    expired_scratch: Vec<MessageId>,
+}
+
+fn validate_reassembly(config: ReassemblyConfig) -> Result<(), FragmentError> {
+    if !(1..=MAX_RECORD_BYTES).contains(&config.max_message_bytes)
+        || config.max_messages == 0
+        || config.max_fragment_payload_bytes == 0
+        || config.max_fragments_per_message == 0
+        || config.max_total_fragments < usize::from(config.max_fragments_per_message)
+        || config.max_reserved_bytes < config.max_message_bytes
+        || config.max_lifetime_ticks == 0
+        || !(1..=65_536).contains(&config.replay_window)
+        || config.max_messages > config.replay_window
+    {
+        return Err(FragmentError::InvalidConfig);
+    }
+    Ok(())
 }
 
 impl Reassembler {
     /// Validate receiver limits without allocating peer-selected message storage.
     pub fn new(context: FragmentContext, config: ReassemblyConfig) -> Result<Self, FragmentError> {
-        if !(1..=MAX_RECORD_BYTES).contains(&config.max_message_bytes)
-            || config.max_messages == 0
-            || config.max_fragment_payload_bytes == 0
-            || config.max_fragments_per_message == 0
-            || config.max_total_fragments < usize::from(config.max_fragments_per_message)
-            || config.max_reserved_bytes < config.max_message_bytes
-            || config.max_lifetime_ticks == 0
-            || !(1..=65_536).contains(&config.replay_window)
-            || config.max_messages > config.replay_window
-        {
-            return Err(FragmentError::InvalidConfig);
-        }
+        validate_reassembly(config)?;
         Ok(Self {
             context,
             config,
-            pending: BTreeMap::new(),
-            retired: BTreeSet::new(),
+            pending: PendingStore::Legacy(BTreeMap::new()),
+            retired: RetiredStore::Legacy(BTreeSet::new()),
             highest: None,
             last_time: None,
             reserved_bytes: 0,
             reserved_fragments: 0,
+            storage_usage: None,
+            expired_scratch: Vec::new(),
         })
+    }
+
+    /// Provision every pending/replay/scratch buffer before publication.
+    pub fn new_reserved(
+        context: FragmentContext,
+        config: ReassemblyConfig,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_reassembly(config)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        Self::build_reserved(
+            context,
+            config,
+            &mut storage::Allocation::new(limits.capacity_bytes),
+        )
+    }
+    fn build_reserved(
+        context: FragmentContext,
+        config: ReassemblyConfig,
+        allocation: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_reassembly(config)?;
+        let (pending, retired, expired_scratch) = backing::reserved(config, allocation)?;
+        let usage = allocation.usage();
+        if usage.capacity_bytes != plan.capacity_bytes()
+            || usage.allocations != 3 + 2 * config.max_messages
+        {
+            return Err(storage::Error::Invariant);
+        }
+        Ok(Self {
+            context,
+            config,
+            pending,
+            retired,
+            highest: None,
+            last_time: None,
+            reserved_bytes: 0,
+            reserved_fragments: 0,
+            storage_usage: Some(usage),
+            expired_scratch,
+        })
+    }
+    /// Actual retained heap including every idle buffer; None for legacy storage.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.storage_usage
     }
 
     /// Accept one authenticated fragment using injected monotonic ticks.
@@ -306,7 +507,7 @@ impl Reassembler {
         output: &mut [u8],
     ) -> Result<ReassemblyStatus, FragmentError> {
         let parsed = self.parse(fragment)?;
-        self.expire(now_ticks)?;
+        self.expire_count(now_ticks)?;
         let high = self
             .highest
             .map_or(parsed.message, |current| current.max(parsed.message));
@@ -346,24 +547,15 @@ impl Reassembler {
                 .get_mut(..parsed.length)
                 .ok_or(FragmentError::OutputTooSmall)?;
             self.advance_window(high);
-            self.retired.insert(parsed.message);
+            self.retired.insert(parsed.message)?;
             destination.copy_from_slice(parsed.body);
             return Ok(ReassemblyStatus::Complete {
                 message: parsed.message,
                 length: parsed.length,
             });
         }
-        let mut pending = Pending {
-            chunk: parsed.chunk,
-            count: parsed.count,
-            received: 1,
-            present: vec![false; usize::from(parsed.count)],
-            buffer: vec![0; parsed.length],
-            deadline,
-        };
-        write_fragment(&mut pending, &parsed)?;
+        self.pending.insert(&parsed, deadline)?;
         self.advance_window(high);
-        self.pending.insert(parsed.message, pending);
         self.reserved_bytes = reserved_bytes;
         self.reserved_fragments = reserved_fragments;
         Ok(ReassemblyStatus::Pending {
@@ -381,17 +573,83 @@ impl Reassembler {
         if self.last_time.is_some_and(|previous| now_ticks < previous) {
             return Err(FragmentError::TimeWentBackwards);
         }
-        let expired: Vec<_> = self
+        let mut expired: Vec<_> = self
             .pending
             .iter()
             .filter_map(|(message, entry)| (now_ticks >= entry.deadline).then_some(*message))
             .collect();
+        expired.sort_unstable();
         for message in &expired {
-            self.release_pending(*message)?;
-            self.retired.insert(*message);
+            self.release_pending(*message, None)?;
+            self.retired.insert(*message)?;
         }
         self.last_time = Some(now_ticks);
         Ok(expired)
+    }
+
+    /// Apply original expiry without allocating an owned ID result.
+    pub fn expire_count(&mut self, now_ticks: u64) -> Result<usize, FragmentError> {
+        if self.storage_usage.is_none() {
+            return self.expire(now_ticks).map(|ids| ids.len());
+        }
+        self.collect_expired(now_ticks)?;
+        let count = self.expired_scratch.len();
+        for index in 0..count {
+            let message = self.expired_scratch[index];
+            self.release_pending(message, None)?;
+            self.retired.insert(message)?;
+        }
+        self.expired_scratch.clear();
+        self.last_time = Some(now_ticks);
+        Ok(count)
+    }
+
+    /// Emit ascending expired IDs into bounded caller storage; short output is atomic.
+    pub fn expire_into(
+        &mut self,
+        now_ticks: u64,
+        expired: &mut [MessageId],
+    ) -> Result<usize, FragmentError> {
+        if self.last_time.is_some_and(|last| now_ticks < last) {
+            return Err(FragmentError::TimeWentBackwards);
+        }
+        let count = self
+            .pending
+            .values()
+            .filter(|entry| now_ticks >= entry.deadline)
+            .count();
+        if expired.len() < count {
+            return Err(FragmentError::OutputTooSmall);
+        }
+        if self.storage_usage.is_none() {
+            let values = self.expire(now_ticks)?;
+            expired[..count].copy_from_slice(&values);
+            return Ok(count);
+        }
+        self.collect_expired(now_ticks)?;
+        expired[..count].copy_from_slice(&self.expired_scratch);
+        self.expire_count(now_ticks)
+    }
+    fn collect_expired(&mut self, now_ticks: u64) -> Result<(), FragmentError> {
+        if self.last_time.is_some_and(|last| now_ticks < last) {
+            return Err(FragmentError::TimeWentBackwards);
+        }
+        let count = self
+            .pending
+            .values()
+            .filter(|entry| now_ticks >= entry.deadline)
+            .count();
+        if count > self.expired_scratch.capacity() {
+            return Err(FragmentError::Arithmetic);
+        }
+        self.expired_scratch.clear();
+        self.expired_scratch.extend(
+            self.pending
+                .iter()
+                .filter_map(|(id, entry)| (now_ticks >= entry.deadline).then_some(*id)),
+        );
+        self.expired_scratch.sort_unstable();
+        Ok(())
     }
 
     /// Earliest original incomplete-message expiry, without advancing time or state.
@@ -442,6 +700,7 @@ impl Reassembler {
             .present
             .get(usize::from(parsed.index))
             .ok_or(FragmentError::InvalidGeometry)?
+            != 0
         {
             if pending.buffer.get(parsed.offset..end) != Some(parsed.body) {
                 return Err(FragmentError::Conflict);
@@ -467,32 +726,38 @@ impl Reassembler {
                 total: parsed.count,
             });
         }
-        let completed = self.release_pending(parsed.message)?;
-        self.retired.insert(parsed.message);
         let destination = output
             .get_mut(..parsed.length)
             .ok_or(FragmentError::OutputTooSmall)?;
-        destination.copy_from_slice(&completed.buffer);
+        self.release_pending(parsed.message, Some(destination))?;
+        self.retired.insert(parsed.message)?;
         Ok(ReassemblyStatus::Complete {
             message: parsed.message,
             length: parsed.length,
         })
     }
 
-    fn release_pending(&mut self, message: MessageId) -> Result<Pending, FragmentError> {
+    fn release_pending(
+        &mut self,
+        message: MessageId,
+        output: Option<&mut [u8]>,
+    ) -> Result<(), FragmentError> {
         let pending = self
             .pending
-            .remove(&message)
+            .get(&message)
             .ok_or(FragmentError::Arithmetic)?;
-        self.reserved_bytes = self
+        let reserved_bytes = self
             .reserved_bytes
             .checked_sub(pending.buffer.len())
             .ok_or(FragmentError::Arithmetic)?;
-        self.reserved_fragments = self
+        let reserved_fragments = self
             .reserved_fragments
             .checked_sub(usize::from(pending.count))
             .ok_or(FragmentError::Arithmetic)?;
-        Ok(pending)
+        self.pending.release(message, output)?;
+        self.reserved_bytes = reserved_bytes;
+        self.reserved_fragments = reserved_fragments;
+        Ok(())
     }
 
     fn window_floor(&self, highest: MessageId) -> u64 {
@@ -504,7 +769,7 @@ impl Reassembler {
 
     fn advance_window(&mut self, high: MessageId) {
         let floor = self.window_floor(high);
-        self.retired.retain(|message| message.0 >= floor);
+        self.retired.retain_floor(floor);
         self.highest = Some(high);
     }
 
@@ -579,7 +844,7 @@ fn write_fragment(pending: &mut Pending, parsed: &ParsedFragment<'_>) -> Result<
         .get_mut(usize::from(parsed.index))
         .ok_or(FragmentError::InvalidGeometry)?;
     destination.copy_from_slice(parsed.body);
-    *present = true;
+    *present = 1;
     Ok(())
 }
 
@@ -602,3 +867,6 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, FragmentError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod storage_tests;

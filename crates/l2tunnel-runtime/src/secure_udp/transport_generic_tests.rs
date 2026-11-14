@@ -3,6 +3,8 @@
 //! Driver-method cases inject finite protocol time after real Noise/member setup;
 //! they do not claim privileged TAP/netem qualification or other record profiles.
 
+#[path = "transport_construction_tests.rs"]
+mod construction_admission;
 #[path = "transport_generic_fault_tests.rs"]
 mod faults;
 #[path = "transport_input_charge_tests.rs"]
