@@ -152,6 +152,10 @@ impl Receiver {
         // Bounded by the flow window, which fits 16 bits.
         (self.end - self.base) as u32
     }
+    /// No unadvanced source debt or undelivered native bytes remain.
+    pub(crate) fn drained(&self) -> bool {
+        self.base == self.end && self.stream.is_empty()
+    }
     fn slot(&self, sequence: u64) -> Option<&Vec<u8>> {
         let index = usize::try_from(sequence.checked_sub(self.floor)?).ok()?;
         self.slots.get(index)?.as_ref()

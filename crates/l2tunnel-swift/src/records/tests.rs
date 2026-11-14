@@ -1,5 +1,6 @@
 use super::*;
 
+mod partial_drain;
 mod receive_service;
 
 fn config(channels: usize) -> Config {

@@ -110,8 +110,8 @@ Returned native bytes remain valid until the next mutable call.
 ## Drain and policy changes
 
 `send_drained` means all packing queues are empty and every retained source is
-confirmed. `receive_drained` means no possibly deliverable packet and no pending
-recovery state remain. Replacements require the corresponding drained state,
+confirmed. `receive_drained` means no ready native packet, incomplete native
+bytes or unadvanced source debt remain. Replacements require the corresponding drained state,
 accumulate old algorithm/header counters, reset only that direction's channel
 and header contexts, and install the caller's authenticated number floor. Late
 old sources increment the existing duplicate observation; old feedback cannot
@@ -226,7 +226,7 @@ SW-11, all 47 P-* modes and carrier/lifecycle/platform work remain open.
 - [x] [SWR-10] Reproduce low-channel starvation with actual public record APIs against the old selector; preserve a source-bound negative receipt and pass deterministic cyclic/sparse/partial/order/reset regressions after correction. Evidence: [old-selector failures with final fixtures](../../work/swift-receive-fairness-20261114/old-selector-attempt-2/validation.json) and [source-stable focused pass with unchanged assertions](../../work/swift-receive-fairness-20261114/focused-attempt-2/validation.json).
 - [x] [SWR-11] Implement bounded receive round robin in the shared pure engine and verify actual both-cover protected-driver delivery with bounded output, retaining original control/backpressure/deadline/cancellation checks and separate performance claims. Evidence: [shared pure engine](../../crates/l2tunnel-swift/src/records.rs), [actual protected UDP and one-packet physical handoff fixture](../../crates/l2tunnel-runtime/src/secure_udp/transport_receive_service_tests.rs), and [source-stable focused pass](../../work/swift-receive-fairness-20261114/focused-attempt-2/validation.json).
 - [ ] [SWR-12] Pass source-stable focused and required workspace checks, record immutable native functional/performance observations with original targets, reconcile evidence and save an actual local checkpoint before closing this correction.
-- [ ] [SWR-13] Reject receive-direction replacement while any partial native length prefix or payload remains, even when all received sources have advanced and pending-source count is zero. Preserve exact suffix recovery, header contexts, history/feedback semantics and authenticated drain barriers; verify partial-prefix/payload/gap and replacement refusal without treating source receipt as native completion.
+- [x] [SWR-13] Reject receive-direction replacement while any partial native length prefix or payload remains, even when all received sources have advanced and pending-source count is zero. Preserve exact suffix recovery, header contexts, history/feedback semantics and authenticated drain barriers; verify partial-prefix/payload/gap and replacement refusal without treating source receipt as native completion. Evidence: [six independent old-source failures](../../work/swift-partial-drain-20261114/old-source-attempt-1/validation.json), [unchanged record/policy/runtime regressions](../../work/swift-partial-drain-20261114/focused-attempt-1/validation.json) and [required frozen-source workspace pass](../../work/swift-partial-drain-20261114/aggregate-attempt-1/validation.json). This closes the scoped pure receive-custody correction, not native performance, SWR-12 or full SW-11.
 
 The [old-selector run](../../work/swift-receive-fairness-20261114/old-selector-attempt-1/validation.json)
 reproduces both intended assertion failures with stable inputs and the production
@@ -326,10 +326,99 @@ not observed TAP overlaps, delivered duplicates, Swift recovery bytes or an exac
 counters or causal before/after conclusion is valid. The current matrix's failed
 capture and performance verdicts remain unchanged.
 
-Independent source review also found a distinct incomplete-stream drain concern:
+The preceding independent source review found a distinct incomplete-stream drain concern:
 `Receiver::pending` counts source debt, while a partial native record can remain
-in its stream after source advancement. The present engine drain predicate does
-not inspect those bytes. SWR-13 tracks that separate correctness work; no native
-corruption or policy-switch failure is inferred without its own regression.
+in its stream after source advancement. The former engine drain predicate did
+not inspect those bytes. SWR-13 below corrects that separate custody defect;
+the earlier review did not establish a native corruption or honest policy-switch failure.
 
 The parent acceptance gates are not completed by these scoped results.
+
+## Partial native receive custody
+
+Status: **implemented, contract-tested and workspace-checked** for SWR-13.
+The following contract was recorded before
+production edits in the [saved design](../../work/swift-partial-drain-20261114/design-v0.md). Source review
+confirms that `Receiver::advance` transfers contiguous source bytes into its
+ordered stream and advances `base`. `pending()` intentionally counts only
+`end - base` source debt. A partial native length prefix or payload can remain
+after that count reaches zero. Once `Engine::pop` clears the incomplete channel's
+ready hint, the previous drain predicate can incorrectly allow replacement to
+discard those bytes. This is distinct from receive-channel scheduling and is
+not evidence of a native corruption or honest policy-switch failure.
+
+Add an immutable, allocation-free internal receiver query requiring both no
+unadvanced source debt and an empty ordered byte stream. The shared record
+engine must require that query for every receiver in addition to its existing
+cleared ready hints. Keep public `pending()` semantics and observation units
+unchanged. A source gap, partial prefix, partial payload or unconsumed complete
+native packet prevents receive replacement. Rejection must preserve packet
+custody, configuration, number floors, receive cursor, header contexts and
+counters; a later valid suffix must recover the exact original bytes once.
+
+Retained history below `base`, reusable storage and ordinary owed/repeated
+feedback do not alone prevent replacement after native delivery. Preserve
+duplicate/history/feedback behavior, full record numbers and the existing
+reset accounting. No clock, queue, key, wire format, timer, deadline or policy
+state is added or reset by this correction.
+
+Before editing production, preserve independent old-source failures for the
+partial-prefix and partial-payload drain query and replacement refusal using
+actual offer/poll/accept/pop APIs. A genuine split-prefix witness packs a
+244-byte literal packet, its one-byte literal tag and two-byte length prefix
+into 247 bytes of a 248-byte source, leaving one byte of the following record's
+length prefix. A 400-byte literal packet provides the partial-payload witness.
+Also verify exact suffix recovery after refused replacement, real source-gap
+debt, header state, retained history, ordinary feedback and successful reset
+only after consumption. No test injects private stream/source/ready state.
+
+A correct sender must drain both queued bytes and unconfirmed sources before
+its authenticated barrier. Unemitted or unconfirmed suffix bytes therefore
+prevent its completed drain. An inconsistent authenticated barrier is an
+adversarial protocol-contract case, not a normal sender outcome. Preserve the
+coordinator's existing protocol rejection when receive flushing has neither a
+deliverable packet nor a drained direction; it must not reset reception or emit
+BarrierAck in that case. Existing valid two-peer policy transitions must still
+complete within their original deadlines. No new wait/retry state is proposed.
+
+Root owns production, this ledger, formatting, all tests/builds/native commands
+and Git. A worker owns only the new pure regression module and its declaration;
+other workers review policy hooks and capture diagnostics without repository
+edits. Freeze sources during recorded old/focused/full checks. Run the required
+workspace check after focused recovery/record/policy/runtime regressions. Native
+performance, capture gaps, SWR-12, 80 Mbit/s, full SW-11, all 47 catalog gates
+and carrier/lifecycle/platform requirements retain their original scope.
+
+The [old-source negative receipt](../../work/swift-partial-drain-20261114/old-source-attempt-1/validation.json)
+reproduces six independent intended assertions with unchanged committed
+production and stable inputs: prefix/payload drain query, replacement refusal
+and actual Coordinator/record-engine policy hooks. In the latter two cases the
+old implementation returns success after resetting reception and queuing
+BarrierAck for deliberately inconsistent peer control. This is not an observed
+honest-sender or native failure.
+
+The [source-stable focused pass](../../work/swift-partial-drain-20261114/focused-attempt-1/validation.json)
+passes all 67 Swift library tests, 102 secure-UDP runtime tests, 16 retained
+Swift runtime tests, 233 shared client-core unit tests and 19 public API tests,
+strict Clippy and warning-denied rustdoc. The only non-document differences
+since those old-source failures are the receiver custody query and shared
+record-engine drain predicate; all regression assertions/timeouts are unchanged.
+The 12 new [record](../../crates/l2tunnel-swift/src/records/tests/partial_drain.rs)
+and [real policy-hook](../../crates/l2tunnel-swift/src/policy/tests/partial_drain.rs)
+tests verify partial prefix/payload, exact suffix/header recovery, source ACK
+versus native completion, source gaps, opposite-direction preservation, history,
+feedback and replacement state. Policy tests call the logical authenticated
+message boundary directly; they are not new encrypted socket or native evidence.
+After a protocol fault they inspect the retained engine directly, without
+asserting that a runtime may continue the failed session. Existing real two-peer
+loss/barrier and protected runtime tests also pass.
+
+The [required frozen-source workspace check](../../work/swift-partial-drain-20261114/aggregate-attempt-1/validation.json)
+passes 1,671 Rust cases including doctests, 349 Python tooling cases and 1,658
+simulator cases, plus formatting, strict Clippy, rustdoc and CLI checks. All
+recorded inputs remain unchanged during that check. This is local Linux
+verification; no new immutable release/native/performance measurement,
+Windows/Android build, remote CI or real-device/ISP result is asserted. The
+preceding binary's native/perf receipts remain tied to that binary. SWR-12 and
+all original parent performance, carrier, lifecycle, full SW-11 and catalog
+requirements remain open.

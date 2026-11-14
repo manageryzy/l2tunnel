@@ -176,6 +176,18 @@ observed system CPU and context switching while measured goodput remains
 78.182/78.216 Mbit/s; both original targets still fail. Host I/O is unattributed
 and the instrumented observations do not establish a unique bottleneck or default.
 
+The separate [partial native receive-custody correction](modules/swift-record-engine.md#partial-native-receive-custody)
+now preserves incomplete prefix/payload bytes across refused directional reset.
+Six [old-source assertions](../work/swift-partial-drain-20261114/old-source-attempt-1/validation.json)
+reproduce the defect; [focused pure/policy/runtime/service checks](../work/swift-partial-drain-20261114/focused-attempt-1/validation.json)
+pass with the same assertions after the two production predicates change.
+The [required frozen-source workspace pass](../work/swift-partial-drain-20261114/aggregate-attempt-1/validation.json)
+records 1671 Rust, 349 tooling and 1658 simulator cases. SWR-13's scoped custody
+deliverable is complete. This finite correctness result neither closes
+SWR-12/capture gaps nor claims a native performance gain or full
+SW-11/profile/platform completion; preceding native/perf receipts retain their
+original binary identities and verdicts.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |

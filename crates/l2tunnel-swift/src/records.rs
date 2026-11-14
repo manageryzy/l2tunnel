@@ -410,11 +410,7 @@ impl Engine {
     }
     /// No deliverable or pending receive state remains before a reset.
     pub fn receive_drained(&self) -> bool {
-        self.ready == 0
-            && self
-                .receivers
-                .iter()
-                .all(|receiver| receiver.pending() == 0)
+        self.ready == 0 && self.receivers.iter().all(Receiver::drained)
     }
     /// First source/repair number allowed in the current receive epoch.
     pub fn source_floor(&self) -> RecordNumber {

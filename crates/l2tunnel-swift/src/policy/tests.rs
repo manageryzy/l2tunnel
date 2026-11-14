@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 
+mod partial_drain;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn config(channels: usize) -> records::Config {
