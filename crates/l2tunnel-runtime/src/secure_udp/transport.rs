@@ -243,15 +243,7 @@ where
         Start::Transaction(contract) => Driver::new_transaction(parts, contract, origin)?,
     };
     let mut device = AsyncFd::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
-    let mut inputs = buffers::Inputs::new(
-        READ_BUFFER_BYTES,
-        driver
-            .cover
-            .limits()
-            .max_packet_bytes
-            .checked_add(1)
-            .ok_or_else(exhausted)?,
-    )?;
+    let mut inputs = driver.take_inputs()?;
     driver.counters.loop_input_capacity_bytes = inputs.capacity_bytes();
     let ready = sample();
     if ready >= setup_deadline {
@@ -262,6 +254,7 @@ where
     }
     tokio::pin!(shutdown);
     observe(&driver, clock(origin, ready)?, true)?;
+    let mut observed_transaction = driver.transaction_observation()?;
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
@@ -269,12 +262,30 @@ where
                 if !driver.check_expiry(clock(origin,sample())?)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
                 driver.admit_transaction(||clock(origin,sample()).map(duration))?;
             }
-            let instant=sample();let now=clock(origin,instant)?;
+            let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.collect_native(now)?;
             driver.progress(now)?;
+            let completed=driver.report_transaction_completion(
+                ||clock(origin,sample()),
+                |driver,at|observe(driver,at,true),
+            )?;
+            let actual=driver.transaction_observation()?;
+            let mut semantic_observed=false;
+            if driver.terminal.is_none() && !completed && (actual!=observed_transaction || driver.generic.as_ref().is_some_and(|runtime|runtime.observation_dirty)) {
+                let reported=clock(origin,sample())?;
+                if !driver.check_expiry(reported)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+                observe(&driver,reported,true)?;
+                semantic_observed=true;
+            }
+            observed_transaction=actual;
+            if let Some(runtime)=&mut driver.generic {runtime.observation_dirty=false;}
             if let Some(reason)=driver.terminal {break Ok(reason);}
+            if driver.generic.is_some() && (completed || semantic_observed) {
+                instant=sample();now=clock(origin,instant)?;
+                if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+            }
             driver.service_selected_control(now,resolve.as_ref())?;
             driver.submit_control(now)?;
             driver.send(&socket,now,instant)?;
@@ -374,6 +385,11 @@ where
         && let Some(request) = generic.request.take()
     {
         let _ = request.reply.send(Err(SwitchError::Closed));
+    }
+    if let Some(generic) = &mut driver.generic
+        && let Some((reply, _)) = generic.completion.take()
+    {
+        let _ = reply.send(Err(SwitchError::Closed));
     }
     observe(&driver, now, false)?;
     result.and_then(|reason| {
@@ -1357,6 +1373,7 @@ struct Driver {
     control_work: bool,
     waiting: Option<Reply>,
     buffers: buffers::Buffers,
+    inputs: Option<buffers::Inputs>,
     envelope_rx: u64,
     native: native_storage::Queue<Native>,
     written: NativeWritten,
@@ -1620,6 +1637,7 @@ impl Driver {
                     control_message,
                     swift::control::MAX_FRAME,
                 )?,
+                inputs: None,
                 envelope_rx: 1,
                 native: native_storage::Queue::new(
                     config.native.pending_packets,
@@ -1654,6 +1672,21 @@ impl Driver {
             },
         ))
     }
+    fn take_inputs(&mut self) -> io::Result<buffers::Inputs> {
+        match self.inputs.take() {
+            Some(inputs) => Ok(inputs),
+            None if self.generic.is_some() => Err(protocol("generic loop input owner is absent")),
+            None => buffers::Inputs::new(
+                READ_BUFFER_BYTES,
+                self.cover
+                    .limits()
+                    .max_packet_bytes
+                    .checked_add(1)
+                    .ok_or_else(exhausted)?,
+            ),
+        }
+    }
+
     fn role(&self) -> mg::Role {
         if self.info.role == security::Role::Initiator {
             mg::Role::Client

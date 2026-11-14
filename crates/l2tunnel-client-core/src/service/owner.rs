@@ -125,6 +125,23 @@ pub(super) async fn establish(
             check(deadline)?;
             return result;
         }
+        #[cfg(unix)]
+        Transport::SecureUdpTransaction(profile) => {
+            let result = tokio::time::timeout_at(
+                deadline,
+                establish_secure_udp_transaction(
+                    &shared,
+                    &plan,
+                    accepted,
+                    deadline,
+                    profile.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| expired())?;
+            check(deadline)?;
+            return result;
+        }
     };
     let setup = async {
         let (link, role) = match &plan.data.endpoint {
@@ -418,18 +435,17 @@ async fn establish_swift(
         generation: accepted.operation,
     })
 }
-/// Same accepted setup operation, with one fixed original UDP owner and gate.
+/// Shared original-socket authentication; the selected profile owns all settings.
 #[cfg(unix)]
-async fn establish_secure_udp(
+async fn authenticate_secure_udp(
     shared: &Arc<Shared>,
     plan: &Prepared,
     accepted: Accepted,
     deadline: Instant,
-    profile: crate::secure_udp::profile::Profile,
-) -> io::Result<Active> {
-    use l2tunnel_runtime::secure_udp::{establish, transport};
+    selected: crate::secure_udp::Settings,
+) -> io::Result<crate::secure_udp::Session> {
+    use l2tunnel_runtime::secure_udp::establish;
     use l2tunnel_security::Role;
-    let selected = profile.settings();
     let role = match &plan.data.endpoint {
         Endpoint::SecureClient(_) => Role::Initiator,
         Endpoint::SecureServer(_) => Role::Responder,
@@ -512,9 +528,24 @@ async fn establish_secure_udp(
         }
     };
     check(deadline)?;
+    Ok(session)
+}
+/// Same accepted setup operation, with one fixed original UDP owner and gate.
+#[cfg(unix)]
+async fn establish_secure_udp(
+    shared: &Arc<Shared>,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    profile: crate::secure_udp::profile::Profile,
+) -> io::Result<Active> {
+    use l2tunnel_runtime::secure_udp::transport;
+    let session =
+        authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
     let info = session.info();
     setup::stage(shared, accepted.operation, SetupStage::Configuration);
     let configuration = profile.configuration(info.peers)?;
+    let role = info.role;
     let parts = session.into_parts();
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
     let device = plan.open_readable().inspect_err(|_| {
@@ -596,6 +627,152 @@ async fn establish_secure_udp(
         generation: accepted.operation,
     })
 }
+/// Select the generic runtime through the same authenticated setup and service actor.
+#[cfg(unix)]
+async fn establish_secure_udp_transaction(
+    shared: &Arc<Shared>,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    profile: Arc<crate::secure_udp::transaction_profile::Profile>,
+) -> io::Result<Active> {
+    use l2tunnel_runtime::secure_udp::transport;
+    let session =
+        authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
+    let info = session.info();
+    setup::stage(shared, accepted.operation, SetupStage::Configuration);
+    let contract = profile.runtime_contract(info.role)?;
+    if info.peers != profile.peers()
+        || info.authenticated.configuration != contract.expected_configuration().0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "actual authentication differs from the complete transaction plan",
+        ));
+    }
+    let parts = session.into_parts();
+    setup::stage(shared, accepted.operation, SetupStage::Attachment);
+    let device = plan.open_readable().inspect_err(|_| {
+        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+    })?;
+    check(deadline)?;
+    let (switcher, requests) = transport::transaction_channel();
+    let backend = Arc::new(SecureUdpTransactionBackend {
+        requested: profile,
+        info,
+        counters: Mutex::new(None),
+        switcher,
+        generation: accepted.operation.value(),
+    });
+    let sink = backend.clone();
+    let changed = shared.clone();
+    let mut runtime: RunFuture = Box::pin(async move {
+        let stopped = transport::run_transaction(
+            device,
+            parts,
+            contract,
+            Some(requests),
+            std::future::pending::<()>(),
+            move |snapshot| {
+                *sink
+                    .counters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+                changed.changed();
+            },
+        )
+        .await?;
+        Err(secure_udp_termination(stopped.reason))
+    });
+    setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
+    std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "generic secure UDP runtime ended during readiness",
+        ))),
+        Poll::Pending
+            if backend
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.running) =>
+        {
+            Poll::Ready(Ok(()))
+        }
+        Poll::Pending => Poll::Pending,
+    })
+    .await
+    .inspect_err(|_| {
+        setup::reason(
+            shared,
+            accepted.operation,
+            SetupFailureReason::ReadinessEnded,
+        );
+    })?;
+    check(deadline)?;
+    Ok(Active {
+        runtime,
+        backend: ObservedBackend::SecureUdpTransaction(backend),
+        generation: accepted.operation,
+    })
+}
+
+#[cfg(unix)]
+fn secure_udp_termination(
+    reason: l2tunnel_runtime::secure_udp::transport::StopReason,
+) -> io::Error {
+    use l2tunnel_runtime::secure_udp::transport::StopReason;
+    let kind = match reason {
+        StopReason::Cancelled => io::ErrorKind::Interrupted,
+        StopReason::LeaseExpired
+        | StopReason::PeerTimeout
+        | StopReason::NativeStall
+        | StopReason::PolicyTimeout => io::ErrorKind::TimedOut,
+        StopReason::Io(kind) => kind,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, "secure UDP runtime terminated")
+}
+
+#[cfg(unix)]
+async fn apply_secure_udp_transaction(
+    shared: &Arc<Shared>,
+    backend: &SecureUdpTransactionBackend,
+    configuration: l2tunnel::swift_configuration::Configuration,
+) -> Completed {
+    use l2tunnel_runtime::secure_udp::transport::SwitchError;
+    let handle = Handle(shared.clone());
+    match backend.switcher.switch(configuration).await {
+        Ok(epoch) => {
+            let actual = backend
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if actual
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.epoch != epoch || snapshot.current != configuration)
+            {
+                return Completed::OutcomeUnknown;
+            }
+            drop(actual);
+            Completed::Applied(handle.transaction_status(true, "ok"))
+        }
+        Err(SwitchError::Busy) => Completed::Rejected(handle.transaction_status(false, "busy")),
+        Err(SwitchError::NotCoordinator) => {
+            Completed::Rejected(handle.transaction_status(false, "not_coordinator"))
+        }
+        Err(SwitchError::Rejected) => {
+            Completed::Rejected(handle.transaction_status(false, "rejected"))
+        }
+        Err(SwitchError::Invalid) => {
+            Completed::Rejected(handle.transaction_status(false, "invalid_configuration"))
+        }
+        Err(SwitchError::Closed) => Completed::OutcomeUnknown,
+    }
+}
+
 /// Negotiate the requested swift values over the live session. The reply is
 /// built only after the runtime reported the committed epoch or a refusal.
 #[cfg(unix)]
@@ -841,6 +1018,31 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                 Command::Disconnect => {
                     stopped(&shared, &mut active, Terminal::Aborted);
                     finish(&shared, accepted.operation, Completed::Aborted);
+                }
+                #[cfg(unix)]
+                Command::Transaction(configuration) => {
+                    let Some(session) = active.as_mut() else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let ObservedBackend::SecureUdpTransaction(backend) = &session.backend else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let backend = backend.clone();
+                    let apply = apply_secure_udp_transaction(&shared, &backend, configuration);
+                    tokio::pin!(apply);
+                    let result = tokio::select! {
+                        result = &mut apply => result,
+                        result = &mut session.runtime => {
+                            let failure = Failure {
+                                kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()),
+                            };
+                            stopped(&shared, &mut active, Terminal::Failed(failure));
+                            Completed::OutcomeUnknown
+                        }
+                    };
+                    finish(&shared, accepted.operation, result);
                 }
                 Command::Connect(plan) | Command::Reconnect(plan) => {
                     // An expired queued reconnect must not abort the still-live

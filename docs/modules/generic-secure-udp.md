@@ -1,7 +1,7 @@
 # Generic transactions on the selected secure UDP transport
 
-Status: **generic Swift transactions implemented and finite local Unix Driver
-integration-tested; shared service/frontend selection and complete resource,
+Status: **generic Swift transactions and explicit shared service/APIv3 selection
+implemented and finite local Unix integration-tested; CLI and complete resource,
 fault, profile, native and platform qualification remain open**. This
 workstream connects the existing generic leased management peer to actual
 record engines, common protected records, stable control and physical native
@@ -20,7 +20,14 @@ before implementation. A design or public enum does not implement a mode.
 
 ## Current explicit runtime checkpoint
 
-The [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json) passes
+The current [source-stable functionality check](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json)
+passes the new shared service/strict status/atomic-admission tests, all eleven
+selected Generic cases,42 control cases, both legacy fairness cases,25 recovery
+and126 management cases, with strict all-target/all-feature Clippy. The module
+ledgers below distinguish full completed leaves from partial fault/resource
+requirements. Required aggregate verification passes with the scoped evidence below.
+
+The preceding runtime-library [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json) passes
 119 selected transport/component cases, 16 client handoff cases and 121 management
 cases, with strict all-target/all-feature Clippy. Its separately reported six
 Generic and two legacy fairness cases are subsets of the 119, not extra cases.
@@ -51,8 +58,10 @@ never approved a scope reduction. Generic-only State backing is now fallibly
 reserved; the sole async loop returns final snapshots rather than Driver through
 nested wrappers. Legacy fairness passes without larger stacks or changed limits.
 
-This is an explicit runtime-library entry point. CLI/service generic selection,
-strict shared API v3, Driver loss/reorder/final-proof-pressure qualification,
+This has explicit runtime-library and shared Prepared/service/APIv3 entry points.
+The [service ledger](generic-client-service.md) records actual paired-owner and
+IPC status/switch evidence plus remaining full IPC/failure cases. CLI generic
+selection, complete Driver loss/reorder/final-proof-pressure qualification,
 complete management/Peer reservation, other record profiles/full SW-11,
 OpenVPN/raw-HTTPS migration, recovery/fresh-DH, Windows/Android and all47 complete
 parity gates remain open. No current-source native/performance run is inferred;
@@ -443,8 +452,9 @@ a selected implementation or owner decision.
 The shared settings relocation retains the existing Parameters alias, exact
 field order and validation. Root focused attempt3 passes all14 authenticated
 plan cases including existing digest/field-mutation and actual-factory tests.
-The selected driver, full shared resources and exact version3 status are still
-required; GST-01 is not a backend or GUI completion claim.
+The selected Driver and separate version3 status now have scoped evidence above.
+Full shared resources and frontend/platform acceptance are still required;
+GST-01 alone is not a backend or GUI completion claim.
 
 ## Explicit runtime handoff contract v0
 
@@ -519,6 +529,33 @@ Strict client status v1/v2 layouts remain unchanged.
 - [x] [RBF-01] Implement real fallible seven-workspace/two-input allocation and exact requested layout accounting; cover all constructor failure positions. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
 - [x] [RBF-02] Consume the actual owners in the existing I/O loop before its final readiness clock sample, preserving all bytes, quotas and original deadlines. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
 - [ ] [RBF-03] Validate exact combined-owner accounting in the selected generic driver; retain complete GSU-05/SRS-07 and every native/performance gate.
+
+### Actual sole-loop input charge v0
+
+The generic constructor now allocates the real
+two-buffer `Inputs` owner before constructing its Bank. Include its observed
+capacity in the existing known external subtotal alongside the actual Driver,
+State (subtracting Set's already charged inline layout), native pool and seven
+workspaces. Retain `Option<Inputs>` in Driver until the sole I/O loop takes that
+same owner; a generic missing owner is an explicit invariant error, with no fresh
+allocation fallback. The legacy constructor retains its existing later allocation
+and ordering. The actual counter is populated from the retained owner, and the
+loop transfers it before its original final readiness deadline sample.
+Charge the moved live-loop `Inputs` header separately as well: Driver retains
+its now-empty Option slot after that move. Other loop/future/stack headers are
+not yet a complete reserved-owner qualification.
+
+This closes only a known omitted input charge. It does not reserve management
+message/reassembly/Peer/catalog/tail/report resources, claim RSS accounting, or
+change `resource_preallocation_complete = false`. Test actual constructor budget
+acceptance/refusal and capacity/ownership conservation; preserve every RBF-03,
+GSU-05/SRS-07 and native/performance definition.
+External owners are still allocated before the final combined Bank admission;
+the sound final subtotal is not pre-allocation enforcement of the complete
+construction peak. That broader admission requirement remains open.
+
+- [x] [RBF-04] Preallocate and charge the actual generic sole-loop Inputs in the Bank's known subtotal, moving the same owner into the original loop without reallocating or changing legacy behavior. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json); broader parent gates remain open.
+- [x] [RBF-05] Verify exact actual constructor budget boundaries, moved input ownership/capacity and unchanged original readiness/deadline behavior under focused and required workspace checks. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json); broader parent gates remain open.
 
 ## Single data/control owner in the existing loop v0
 
@@ -637,3 +674,24 @@ new native admission is stopped. Original local request caps survive retries.
 - [x] [GDI-01] Construct and explicitly select the real generic owner in the same I/O loop, retaining exact legacy behavior and separate honest status. Evidence: [source-stable focused check](../../work/generic-driver-20261114/integrated-focused-attempt-6/validation.json). Full parent qualification remains open.
 - [ ] [GDI-02] Apply actual lifecycle actions with independent physical native fences, old/new reader routing and fixed original caps; exercise failure and pressure paths.
 - [ ] [GDI-03] Verify actual same-socket sessions, loss/reorder recovery, liveness during switch and at least two nonzero switches; preserve all broader functionality/resource/performance gates.
+
+The [fault contract and GDF-01..GDF-09](generic-driver-faults.md) retain six
+distinct actual-driver fault rows and public-loop qualification. The
+[shared client/service contract and GCS-01..GCS-09](generic-client-service.md)
+track implemented explicit Prepared/APIv3 selection through the existing actor
+and its remaining IPC/failure/frontend gates. The
+[reserved management recovery ledger](control-recovery-storage.md) tracks actual
+three-stream backing and its incomplete resource proof. These engineering
+contracts and scoped implementations record no owner scope decision and reduce
+no parent requirement.
+
+## Functionality checkpoint validation
+
+The [required source-stable aggregate](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json) passes1919 Rust
+cases including doctests,376 tooling cases and1658 simulator cases, with workspace
+formatting, strict Clippy and strict rustdoc. Its inputs remained unchanged during
+the check. Final documentation edits record only evidence and scoped task status.
+Earlier failed attempts and the exact pre-fix negative control remain preserved.
+This is local Linux validation, with no new privileged/native performance, remote
+CI, Windows/Android device or GUI qualification. Every still-open task retains
+its complete acceptance definition.

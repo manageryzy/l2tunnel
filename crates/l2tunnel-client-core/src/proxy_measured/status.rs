@@ -307,6 +307,7 @@ mod tests {
                 swift: None,
                 #[cfg(unix)]
                 secure_udp: None,
+                transaction: None,
                 proxy: Some(crate::local::ProxySnapshot {
                     digest: "ff".repeat(32),
                     drain_accepted: true,

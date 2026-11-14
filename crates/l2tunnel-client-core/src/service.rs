@@ -28,6 +28,9 @@ mod owner;
 mod setup;
 #[cfg(unix)]
 pub use setup::{SetupFailure, SetupFailureReason, SetupObservation, SetupOutcome, SetupStage};
+#[cfg(all(test, unix))]
+#[path = "service/tests/atomic_local.rs"]
+mod atomic_local_tests;
 #[cfg(test)]
 mod tests;
 const RETAINED: usize = 32;
@@ -204,6 +207,38 @@ impl SecureUdpFrame {
         Ok(status)
     }
 }
+/// Explicit complete-configuration backend with its actual selected-runtime report.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct SecureUdpTransactionFrame {
+    /// Exact immutable startup plan and complete finite catalog.
+    pub requested: Arc<crate::secure_udp::transaction_profile::Profile>,
+    /// Public authentication evidence from the original socket.
+    pub info: l2tunnel_runtime::secure_udp::member::Info,
+    /// Absent until the actual runtime publishes readiness.
+    pub runtime: Option<l2tunnel_runtime::secure_udp::transport::TransactionSnapshot>,
+    /// Exact service generation.
+    pub generation: u64,
+    /// Service release, distinct from the runtime's last terminal observation.
+    pub service_terminal: Option<Terminal>,
+}
+#[cfg(unix)]
+impl SecureUdpTransactionFrame {
+    /// Bounded complete-configuration observation without credentials or payloads.
+    pub fn status(&self) -> io::Result<crate::secure_udp::transaction_status::Status> {
+        let mut status = crate::secure_udp::transaction_status::Status::observe(
+            &self.requested,
+            self.info,
+            self.generation,
+            self.runtime.as_ref(),
+        )?;
+        status.service_terminal = self.service_terminal.map(|value| format!("{value:?}"));
+        if self.service_terminal.is_some() {
+            status.running = false;
+        }
+        Ok(status)
+    }
+}
 #[cfg(unix)]
 impl SwiftFrame {
     /// Flat non-secret status for the local API.
@@ -241,12 +276,17 @@ pub enum Observation {
     /// Explicit same-connected-UDP common-session transport.
     #[cfg(unix)]
     SecureUdp(Box<SecureUdpFrame>),
+    /// Explicit generic transaction owner, separate from SwiftPolicyV1.
+    #[cfg(unix)]
+    SecureUdpTransaction(Box<SecureUdpTransactionFrame>),
 }
 impl Observation {
     #[cfg(unix)]
     fn record_service_terminal(&mut self, terminal: Terminal) {
-        if let Self::SecureUdp(frame) = self {
-            frame.service_terminal = Some(terminal);
+        match self {
+            Self::SecureUdp(frame) => frame.service_terminal = Some(terminal),
+            Self::SecureUdpTransaction(frame) => frame.service_terminal = Some(terminal),
+            _ => {}
         }
     }
     /// Managed status, absent for every other backend.
@@ -279,6 +319,14 @@ impl Observation {
             _ => None,
         }
     }
+    /// Actual generic transaction observation, absent for every other backend.
+    #[cfg(unix)]
+    pub fn secure_udp_transaction(&self) -> Option<&SecureUdpTransactionFrame> {
+        match self {
+            Self::SecureUdpTransaction(frame) => Some(frame),
+            _ => None,
+        }
+    }
 }
 /// Authoritative handles of the live backend. Its presence is the live-session
 /// predicate; it is not a capability flag or a second lifecycle state machine.
@@ -293,6 +341,16 @@ enum ObservedBackend {
     Swift(Arc<SwiftBackend>),
     #[cfg(unix)]
     SecureUdp(Arc<SecureUdpBackend>),
+    #[cfg(unix)]
+    SecureUdpTransaction(Arc<SecureUdpTransactionBackend>),
+}
+#[cfg(unix)]
+struct SecureUdpTransactionBackend {
+    requested: Arc<crate::secure_udp::transaction_profile::Profile>,
+    info: l2tunnel_runtime::secure_udp::member::Info,
+    counters: Mutex<Option<l2tunnel_runtime::secure_udp::transport::TransactionSnapshot>>,
+    switcher: l2tunnel_runtime::secure_udp::transport::TransactionControlHandle,
+    generation: u64,
 }
 #[cfg(unix)]
 struct SecureUdpBackend {
@@ -370,6 +428,20 @@ impl ObservedBackend {
                 generation: secure.generation,
                 service_terminal: None,
             }))),
+            #[cfg(unix)]
+            Self::SecureUdpTransaction(secure) => Some(Observation::SecureUdpTransaction(
+                Box::new(SecureUdpTransactionFrame {
+                    requested: secure.requested.clone(),
+                    info: secure.info,
+                    runtime: secure
+                        .counters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                    generation: secure.generation,
+                    service_terminal: None,
+                }),
+            )),
         }
     }
     fn managed(&self) -> Option<&managed::ControlHandle> {
@@ -412,6 +484,8 @@ pub enum SubmitError {
     State,
     /// Profile/method/version is unsupported and nothing was submitted.
     Unsupported,
+    /// A complete canonical value is outside this selected envelope/catalog.
+    InvalidConfiguration,
 }
 #[derive(Clone)]
 enum Fingerprint {
@@ -419,8 +493,18 @@ enum Fingerprint {
     Reconnect(Arc<()>),
     Disconnect,
     Apply(local::Request),
+    #[cfg(unix)]
+    Transaction(l2tunnel::swift_configuration::Configuration),
 }
 impl Fingerprint {
+    fn is_apply(&self) -> bool {
+        match self {
+            Self::Apply(_) => true,
+            #[cfg(unix)]
+            Self::Transaction(_) => true,
+            _ => false,
+        }
+    }
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Connect(a), Self::Connect(b)) | (Self::Reconnect(a), Self::Reconnect(b)) => {
@@ -428,6 +512,8 @@ impl Fingerprint {
             }
             (Self::Disconnect, Self::Disconnect) => true,
             (Self::Apply(a), Self::Apply(b)) => a == b,
+            #[cfg(unix)]
+            (Self::Transaction(a), Self::Transaction(b)) => a == b,
             _ => false,
         }
     }
@@ -445,6 +531,8 @@ enum Command {
     Reconnect(Prepared),
     Disconnect,
     Apply(local::Request),
+    #[cfg(unix)]
+    Transaction(l2tunnel::swift_configuration::Configuration),
 }
 struct Job {
     accepted: Accepted,
@@ -461,6 +549,15 @@ struct State {
     terminals: VecDeque<(OperationId, Terminal)>,
     last_key: u64,
     retired_through: u64,
+}
+struct LocalView {
+    version: u16,
+    snapshot: Snapshot,
+    backend: Option<ObservedBackend>,
+}
+enum LocalAdmissionError {
+    Version(Box<local::Response>),
+    Submit(SubmitError),
 }
 struct Shared {
     state: Mutex<State>,
@@ -503,6 +600,9 @@ impl Handle {
     /// Latest local lifecycle and the maintained runtime's current status.
     pub fn snapshot(&self) -> Snapshot {
         let state = self.0.lock();
+        Self::snapshot_locked(&state)
+    }
+    fn snapshot_locked(state: &State) -> Snapshot {
         let mut snapshot = state.snapshot.clone();
         snapshot.runtime = state
             .backend
@@ -606,13 +706,35 @@ impl Handle {
             key,
         )
     }
+    /// Submit one complete value to the live explicit transaction backend.
+    /// An identical retained key replays its acceptance before fresh validation.
+    #[cfg(unix)]
+    pub fn apply_transaction(
+        &self,
+        configuration: l2tunnel::swift_configuration::Configuration,
+        key: RequestKey,
+    ) -> Result<Accepted, SubmitError> {
+        self.submit(
+            Fingerprint::Transaction(configuration),
+            Command::Transaction(configuration),
+            key,
+        )
+    }
     fn submit(
         &self,
         fingerprint: Fingerprint,
         command: Command,
         key: RequestKey,
     ) -> Result<Accepted, SubmitError> {
-        let mut state = self.0.lock();
+        self.submit_locked(self.0.lock(), fingerprint, command, key)
+    }
+    fn submit_locked(
+        &self,
+        mut state: std::sync::MutexGuard<'_, State>,
+        fingerprint: Fingerprint,
+        command: Command,
+        key: RequestKey,
+    ) -> Result<Accepted, SubmitError> {
         if state.snapshot.phase == Phase::Closed {
             return Err(SubmitError::Closed);
         }
@@ -638,6 +760,21 @@ impl Handle {
             return Err(SubmitError::Busy);
         }
         let connected = state.backend.is_some();
+        #[cfg(unix)]
+        if let Command::Transaction(configuration) = &command {
+            let Some(ObservedBackend::SecureUdpTransaction(backend)) = &state.backend else {
+                return Err(if connected {
+                    SubmitError::Unsupported
+                } else {
+                    SubmitError::State
+                });
+            };
+            backend
+                .requested
+                .runtime_contract(backend.info.role)
+                .and_then(|contract| contract.resolve(*configuration))
+                .map_err(|_| SubmitError::InvalidConfiguration)?;
+        }
         // Each apply action belongs to one backend; any other pairing is
         // refused without consuming the key or sending anything.
         if let Command::Apply(request) = &command
@@ -709,6 +846,8 @@ impl Handle {
         state.snapshot.phase = match command {
             Command::Connect(_) => Phase::Preparing,
             Command::Apply(_) => Phase::Applying,
+            #[cfg(unix)]
+            Command::Transaction(_) => Phase::Applying,
             _ => Phase::Stopping,
         };
         state.queued = Some(Job { accepted, command });
@@ -824,6 +963,9 @@ impl Handle {
     }
     /// Adapt the existing authorized local API without creating a new local wire.
     pub async fn request(&self, request: local::Request) -> local::Response {
+        if matches!(request.action, local::Action::Status {}) {
+            return self.request_status(request, false).await;
+        }
         if let Some(response) = self.api_version(&request) {
             return response;
         }
@@ -833,31 +975,18 @@ impl Handle {
             response.version = version;
             response
         };
-        if matches!(request.action, local::Action::Status {}) {
-            let backend = self.0.lock().backend.clone();
-            return match backend {
-                Some(ObservedBackend::Managed { control, .. }) => {
-                    crate::session_control::Control::managed(control)
-                        .request(request)
-                        .await
-                }
-                // The local v1 status schema describes managed sessions only.
-                // Typed in-process status is Handle::snapshot, not a new IPC wire.
-                Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
-                #[cfg(unix)]
-                Some(ObservedBackend::Swift(_)) => self.swift_status(true, "ok"),
-                #[cfg(unix)]
-                Some(ObservedBackend::SecureUdp(_)) => self.secure_udp_status(true, "ok"),
-                #[cfg(unix)]
-                None if version == local::SECURE_UDP_VERSION => {
-                    self.secure_udp_status(false, "closed")
-                }
-                None => refusal("closed"),
-            };
-        }
         // Local-v1 has no idempotency field. Serialize key allocation+submission
         // under retry-free admission; a concurrent submit returns Busy/Conflict.
-        let accepted = self.next_key().and_then(|key| self.apply(request, key));
+        let accepted = self.next_key().and_then(|key| {
+            #[cfg(unix)]
+            if let local::Action::SwitchSwiftConfiguration { configuration } = &request.action {
+                return configuration
+                    .configuration()
+                    .map_err(|_| SubmitError::InvalidConfiguration)
+                    .and_then(|configuration| self.apply_transaction(configuration, key));
+            }
+            self.apply(request, key)
+        });
         match accepted {
             Ok(accepted) => match self.wait(accepted.operation).await {
                 Ok(Completed::Applied(result) | Completed::Rejected(result)) => result,
@@ -865,40 +994,158 @@ impl Handle {
                 _ => refusal("closed"),
             },
             Err(SubmitError::Unsupported) => refusal("unsupported"),
+            Err(SubmitError::InvalidConfiguration) => refusal("invalid_configuration"),
             Err(SubmitError::Busy | SubmitError::Conflict) => refusal("busy"),
             Err(_) => refusal("closed"),
         }
     }
 }
 impl Handle {
-    fn api_version(&self, request: &local::Request) -> Option<local::Response> {
+    fn selected_version(&self) -> u16 {
+        Self::selected_version_locked(&self.0.lock())
+    }
+    fn selected_version_locked(state: &State) -> u16 {
         #[cfg(unix)]
-        let secure = {
-            let state = self.0.lock();
-            state.plan.as_ref().is_some_and(Prepared::secure_udp)
-                || matches!(&state.backend, Some(ObservedBackend::SecureUdp(_)))
-        };
-        #[cfg(not(unix))]
-        let secure = false;
-        let code = if secure && request.version == local::VERSION {
-            Some("requires_version_2")
-        } else if request.version
-            != if secure {
-                local::SECURE_UDP_VERSION
-            } else {
-                local::VERSION
-            }
         {
+            match &state.backend {
+                Some(ObservedBackend::SecureUdpTransaction(_)) => local::TRANSACTION_VERSION,
+                Some(ObservedBackend::SecureUdp(_)) => local::SECURE_UDP_VERSION,
+                Some(_) => local::VERSION,
+                None => match &state.plan {
+                    Some(plan) if plan.secure_udp_transaction() => local::TRANSACTION_VERSION,
+                    Some(plan) if plan.secure_udp() => local::SECURE_UDP_VERSION,
+                    _ => local::VERSION,
+                },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = state;
+            local::VERSION
+        }
+    }
+    fn api_version(&self, request: &local::Request) -> Option<local::Response> {
+        Self::version_refusal(request.version, self.selected_version())
+    }
+    fn version_refusal(version: u16, selected: u16) -> Option<local::Response> {
+        let code = if selected == local::TRANSACTION_VERSION
+            && matches!(version, local::VERSION | local::SECURE_UDP_VERSION)
+        {
+            Some("requires_version_3")
+        } else if selected == local::SECURE_UDP_VERSION && version == local::VERSION {
+            Some("requires_version_2")
+        } else if version != selected {
             Some("unsupported_version")
         } else {
             None
         };
         code.map(|code| local::Response {
-            version: request.version,
+            version,
             ok: false,
             code: code.into(),
             state: None,
         })
+    }
+    fn local_view_locked(state: &State) -> LocalView {
+        LocalView {
+            version: Self::selected_version_locked(state),
+            snapshot: Self::snapshot_locked(state),
+            backend: state.backend.clone(),
+        }
+    }
+    fn local_view(&self, version: u16) -> Result<LocalView, Box<local::Response>> {
+        let state = self.0.lock();
+        if let Some(response) =
+            Self::version_refusal(version, Self::selected_version_locked(&state))
+        {
+            return Err(Box::new(response));
+        }
+        Ok(Self::local_view_locked(&state))
+    }
+    async fn request_status(&self, request: local::Request, idle_ok: bool) -> local::Response {
+        let view = match self.local_view(request.version) {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
+        Self::status_from_view(view, request, idle_ok).await
+    }
+    async fn status_from_view(
+        view: LocalView,
+        request: local::Request,
+        idle_ok: bool,
+    ) -> local::Response {
+        match view.backend {
+            Some(ObservedBackend::Managed { control, .. }) => {
+                crate::session_control::Control::managed(control)
+                    .request(request)
+                    .await
+            }
+            // Existing base UDP has no local-v1 managed status projection.
+            Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
+            #[cfg(unix)]
+            Some(ObservedBackend::Swift(_)) => Self::swift_status_from(view.snapshot, true, "ok"),
+            #[cfg(unix)]
+            Some(ObservedBackend::SecureUdp(_)) => {
+                Self::secure_udp_status_from(view.snapshot, true, true, "ok")
+            }
+            #[cfg(unix)]
+            Some(ObservedBackend::SecureUdpTransaction(_)) => {
+                Self::transaction_status_from(view.snapshot, true, "ok")
+            }
+            None if idle_ok => {
+                Self::lifecycle_reply_from(view.version, view.snapshot, false, true, "ok")
+            }
+            #[cfg(unix)]
+            None if view.version == local::TRANSACTION_VERSION => {
+                Self::transaction_status_from(view.snapshot, false, "closed")
+            }
+            #[cfg(unix)]
+            None if view.version == local::SECURE_UDP_VERSION => {
+                Self::secure_udp_status_from(view.snapshot, false, false, "closed")
+            }
+            None => local::Response {
+                version: view.version,
+                ..response("closed")
+            },
+        }
+    }
+    fn submit_local_lifecycle(
+        &self,
+        version: u16,
+        reconnect: bool,
+    ) -> Result<Accepted, LocalAdmissionError> {
+        let state = self.0.lock();
+        if let Some(response) =
+            Self::version_refusal(version, Self::selected_version_locked(&state))
+        {
+            return Err(LocalAdmissionError::Version(Box::new(response)));
+        }
+        let key = state
+            .last_key
+            .checked_add(1)
+            .and_then(RequestKey::new)
+            .ok_or(LocalAdmissionError::Submit(SubmitError::Closed))?;
+        let (fingerprint, command) = if reconnect {
+            let plan = state
+                .plan
+                .clone()
+                .ok_or(LocalAdmissionError::Submit(SubmitError::Closed))?;
+            if state.backend.is_some() {
+                (
+                    Fingerprint::Reconnect(plan.identity.clone()),
+                    Command::Reconnect(plan),
+                )
+            } else {
+                (
+                    Fingerprint::Connect(plan.identity.clone()),
+                    Command::Connect(plan),
+                )
+            }
+        } else {
+            (Fingerprint::Disconnect, Command::Disconnect)
+        };
+        self.submit_locked(state, fingerprint, command, key)
+            .map_err(LocalAdmissionError::Submit)
     }
     /// Local API including lifecycle commands: `disconnect` aborts the live
     /// generation and leaves the service idle; `reconnect` replaces it, or
@@ -907,62 +1154,82 @@ impl Handle {
     /// request is answered exactly as [`Self::request`] does. A frontend that
     /// exits when its generation stops should keep using `request`.
     pub async fn lifecycle_request(&self, request: local::Request) -> local::Response {
-        if let Some(response) = self.api_version(&request) {
-            return response;
-        }
-        let accepted = match request.action {
-            local::Action::Disconnect {} => self.next_key().and_then(|key| self.disconnect(key)),
-            local::Action::Reconnect {} => {
-                let (plan, connected) = {
-                    let state = self.0.lock();
-                    (state.plan.clone(), state.backend.is_some())
-                };
-                let Some(plan) = plan else {
-                    return self.lifecycle_reply(false, "closed");
-                };
-                self.next_key().and_then(|key| {
-                    if connected {
-                        self.reconnect(plan, key)
-                    } else {
-                        self.connect(plan, key)
-                    }
-                })
-            }
-            local::Action::Status {} if self.0.lock().backend.is_none() => {
-                return self.lifecycle_reply(true, "ok");
-            }
+        let version = request.version;
+        let reconnect = match request.action {
+            local::Action::Disconnect {} => false,
+            local::Action::Reconnect {} => true,
+            local::Action::Status {} => return self.request_status(request, true).await,
             _ => return self.request(request).await,
         };
+        let accepted = self.submit_local_lifecycle(version, reconnect);
         match accepted {
             Ok(accepted) => match self.wait(accepted.operation).await {
                 Ok(Completed::Connected { .. } | Completed::Aborted) => {
-                    self.lifecycle_reply(true, "ok")
+                    self.lifecycle_reply(version, true, "ok", true)
                 }
-                Ok(Completed::Cancelled) => self.lifecycle_reply(false, "cancelled"),
-                Ok(Completed::Failed(_)) => self.lifecycle_reply(false, "failed"),
-                _ => self.lifecycle_reply(false, "closed"),
+                Ok(Completed::Cancelled) => self.lifecycle_reply(version, false, "cancelled", true),
+                Ok(Completed::Failed(_)) => self.lifecycle_reply(version, false, "failed", true),
+                _ => self.lifecycle_reply(version, false, "closed", true),
             },
-            Err(SubmitError::Busy | SubmitError::Conflict) => self.lifecycle_reply(false, "busy"),
-            Err(SubmitError::State) => self.lifecycle_reply(false, "state"),
-            Err(_) => self.lifecycle_reply(false, "closed"),
+            Err(LocalAdmissionError::Version(response)) => *response,
+            Err(LocalAdmissionError::Submit(SubmitError::Busy | SubmitError::Conflict)) => {
+                self.lifecycle_reply(version, false, "busy", false)
+            }
+            Err(LocalAdmissionError::Submit(SubmitError::State)) => {
+                self.lifecycle_reply(version, false, "state", false)
+            }
+            Err(_) => self.lifecycle_reply(version, false, "closed", false),
         }
     }
-    fn lifecycle_reply(&self, ok: bool, code: &str) -> local::Response {
+    fn lifecycle_reply(
+        &self,
+        version: u16,
+        ok: bool,
+        code: &str,
+        accepted: bool,
+    ) -> local::Response {
+        let view = Self::local_view_locked(&self.0.lock());
+        if let Some(refusal) = Self::version_refusal(version, view.version) {
+            return if accepted {
+                local::Response {
+                    version,
+                    ..response("outcome_unknown")
+                }
+            } else {
+                refusal
+            };
+        }
+        Self::lifecycle_reply_from(
+            view.version,
+            view.snapshot,
+            view.backend.is_some(),
+            ok,
+            code,
+        )
+    }
+    fn lifecycle_reply_from(
+        version: u16,
+        snapshot: Snapshot,
+        connected: bool,
+        ok: bool,
+        code: &str,
+    ) -> local::Response {
         #[cfg(unix)]
-        if self
-            .0
-            .lock()
-            .plan
-            .as_ref()
-            .is_some_and(Prepared::secure_udp)
-        {
-            return self.secure_udp_status(ok, code);
+        match version {
+            local::TRANSACTION_VERSION => return Self::transaction_status_from(snapshot, ok, code),
+            local::SECURE_UDP_VERSION => {
+                return Self::secure_udp_status_from(snapshot, connected, ok, code);
+            }
+            _ => {}
         }
         #[cfg(unix)]
-        if matches!(self.snapshot().runtime, Some(Observation::Swift(_)) | None) {
-            return self.swift_status(ok, code);
+        if matches!(&snapshot.runtime, Some(Observation::Swift(_)) | None) {
+            return Self::swift_status_from(snapshot, ok, code);
         }
+        #[cfg(not(unix))]
+        let _ = (snapshot, connected);
         local::Response {
+            version,
             ok,
             ..response(code)
         }
@@ -970,7 +1237,10 @@ impl Handle {
     /// Lifecycle phase and, when a swift generation exists, its last counters.
     #[cfg(unix)]
     fn swift_status(&self, ok: bool, code: &str) -> local::Response {
-        let snapshot = self.snapshot();
+        Self::swift_status_from(self.snapshot(), ok, code)
+    }
+    #[cfg(unix)]
+    fn swift_status_from(snapshot: Snapshot, ok: bool, code: &str) -> local::Response {
         let phase = match snapshot.phase {
             Phase::Connected => "forwarding",
             Phase::Disconnected => "disconnected",
@@ -1003,12 +1273,71 @@ impl Handle {
                     .and_then(Observation::swift)
                     .map(SwiftFrame::status),
                 secure_udp: None,
+                transaction: None,
+            }),
+        }
+    }
+    #[cfg(unix)]
+    fn transaction_status(&self, ok: bool, code: &str) -> local::Response {
+        Self::transaction_status_from(self.snapshot(), ok, code)
+    }
+    #[cfg(unix)]
+    fn transaction_status_from(snapshot: Snapshot, ok: bool, code: &str) -> local::Response {
+        let frame = snapshot
+            .runtime
+            .as_ref()
+            .and_then(Observation::secure_udp_transaction);
+        let status = match frame.map(SecureUdpTransactionFrame::status).transpose() {
+            Ok(status) => status,
+            Err(_) => {
+                return local::Response {
+                    version: local::TRANSACTION_VERSION,
+                    ok: false,
+                    code: "status_unavailable".into(),
+                    state: None,
+                };
+            }
+        };
+        let phase = match snapshot.phase {
+            Phase::Connected => "forwarding",
+            Phase::Disconnected => "disconnected",
+            Phase::Preparing | Phase::Authenticating => "connecting",
+            Phase::Applying => "applying",
+            Phase::Stopping => "stopping",
+            Phase::Failed => "failed",
+            Phase::Closed => "closed",
+        };
+        local::Response {
+            version: local::TRANSACTION_VERSION,
+            ok,
+            code: code.into(),
+            state: Some(local::Snapshot {
+                epoch: status.as_ref().and_then(|status| status.epoch).unwrap_or(0),
+                phase: phase.into(),
+                compression: local::Compression::Off,
+                active: None,
+                proxy: None,
+                openvpn_drain: None,
+                raw_packet: None,
+                rolling: None,
+                swift: None,
+                secure_udp: None,
+                transaction: status,
             }),
         }
     }
     #[cfg(unix)]
     fn secure_udp_status(&self, ok: bool, code: &str) -> local::Response {
-        let snapshot = self.snapshot();
+        let view = Self::local_view_locked(&self.0.lock());
+        Self::secure_udp_status_from(view.snapshot, view.backend.is_some(), ok, code)
+    }
+    #[cfg(unix)]
+    fn secure_udp_status_from(
+        snapshot: Snapshot,
+        connected: bool,
+        ok: bool,
+        code: &str,
+    ) -> local::Response {
         let frame = snapshot.runtime.as_ref().and_then(Observation::secure_udp);
         let mut status = match frame.map(SecureUdpFrame::status).transpose() {
             Ok(status) => status,
@@ -1022,7 +1351,7 @@ impl Handle {
             }
         };
         if let Some(status) = &mut status
-            && self.0.lock().backend.is_none()
+            && !connected
         {
             status.running = false;
             status.terminal = snapshot.terminal.map(|terminal| format!("{terminal:?}"));
@@ -1051,6 +1380,7 @@ impl Handle {
                 rolling: None,
                 swift: None,
                 secure_udp: status,
+                transaction: None,
             }),
         }
     }
@@ -1102,7 +1432,7 @@ impl Drop for Completion {
                 if let Some(record) = &mut entry.setup {
                     record.owner_closed(Instant::now());
                 }
-                entry.result = Some(if matches!(entry.fingerprint, Fingerprint::Apply(_)) {
+                entry.result = Some(if entry.fingerprint.is_apply() {
                     Completed::OutcomeUnknown
                 } else {
                     Completed::Cancelled

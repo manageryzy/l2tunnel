@@ -2,6 +2,8 @@
 use super::*;
 #[path = "secure_udp_setup.rs"]
 mod setup_diagnostics;
+#[path = "secure_udp_transaction.rs"]
+mod transaction;
 use crate::{cli::secure_udp_frontend::Selection, secure_udp::credentials};
 use l2tunnel_handshake as hs;
 use l2tunnel_identity as identity;

@@ -41,6 +41,7 @@ fn response() -> Response {
             swift: None,
             #[cfg(unix)]
             secure_udp: None,
+            transaction: None,
         }),
     }
 }

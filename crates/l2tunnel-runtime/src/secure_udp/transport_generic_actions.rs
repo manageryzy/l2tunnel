@@ -194,6 +194,7 @@ impl Driver {
             cap: transaction::Tick(cap),
             reply,
         });
+        runtime.observation_dirty = true;
         Ok(())
     }
 
@@ -394,8 +395,9 @@ impl Driver {
                 Some(actual) if actual == operation => {}
                 Some(_) => return Err(protocol("held outcome overlaps another actual operation")),
                 None => {
-                    runtime.outcome = None;
-                    if let Some(request) = runtime.request.take() {
+                    if runtime.completion.is_none()
+                        && let Some(request) = runtime.request.take()
+                    {
                         let result = match outcome {
                             transactions::Outcome::Retired { .. } => {
                                 let epoch = self.transaction_state()?.epoch();
@@ -408,12 +410,47 @@ impl Driver {
                             }
                             transactions::Outcome::Aborted { .. } => Err(SwitchError::Rejected),
                         };
-                        let _ = request.reply.send(result);
+                        runtime.completion = Some((request.reply, result));
+                    } else if runtime.completion.is_none() {
+                        runtime.outcome = None;
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    pub(super) fn report_transaction_completion(
+        &mut self,
+        mut sample: impl FnMut() -> io::Result<u64>,
+        observe: impl FnOnce(&Self, u64) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        if self
+            .generic
+            .as_ref()
+            .is_none_or(|runtime| runtime.completion.is_none())
+        {
+            return Ok(false);
+        }
+        let now = sample()?;
+        if !self.check_expiry(now)? {
+            return Ok(false);
+        }
+        observe(self, now)?;
+        if !self.check_expiry(sample()?)? {
+            return Ok(false);
+        }
+        let runtime = self
+            .generic
+            .as_mut()
+            .ok_or_else(|| protocol("completion lost generic owner"))?;
+        let (reply, result) = runtime
+            .completion
+            .take()
+            .ok_or_else(|| protocol("observed completion lost reply"))?;
+        runtime.outcome = None;
+        let _ = reply.send(result);
+        Ok(true)
     }
 
     fn progress_transaction_action(

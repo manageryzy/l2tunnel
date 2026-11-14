@@ -5,6 +5,13 @@ use super::*;
 use l2tunnel::swift_configuration::Configuration as C;
 use l2tunnel_swift::storage;
 
+type StateObservation = (
+    core::Epoch,
+    transaction::Phase,
+    Option<transaction::Operation>,
+    Scope,
+);
+
 /// Actual generic transaction state, separate from legacy Swift policy status.
 #[derive(Clone, Debug)]
 pub struct TransactionSnapshot {
@@ -107,9 +114,23 @@ pub(super) struct Runtime {
     pub(super) request: Option<PendingRequest>,
     pub(super) cursor: bool,
     pub(super) outcome: Option<transactions::Outcome>,
+    pub(super) completion: Option<(TransactionReply, Result<core::Epoch, SwitchError>)>,
+    pub(super) observation_dirty: bool,
 }
 
 impl Driver {
+    pub(super) fn transaction_observation(&self) -> io::Result<Option<StateObservation>> {
+        let owner::DataOwner::Generic(state) = &self.owner else {
+            return Ok(None);
+        };
+        Ok(Some((
+            state.epoch(),
+            state.peer().phase(),
+            state.peer().operation(),
+            self.feedback_scope,
+        )))
+    }
+
     pub(super) fn new_transaction(
         parts: member::Parts,
         contract: TransactionContract,
@@ -180,7 +201,20 @@ impl Driver {
             data_scope,
         )
         .map_err(invalid)?;
-        let control = control_owner::Owner::new_leased(
+        let arq_plan = |index: usize| {
+            recovery::storage::Plan::for_arq(selected.streams[index].delivery.recovery)
+                .map_err(invalid)
+        };
+        let arq_plans = [arq_plan(0)?, arq_plan(1)?, arq_plan(2)?];
+        let arq_capacity = arq_plans.iter().try_fold(0usize, |total, plan| {
+            total
+                .checked_add(plan.capacity_bytes())
+                .ok_or_else(|| invalid("reserved control recovery layout overflow"))
+        })?;
+        if arq_capacity > contract.settings().retained_bytes {
+            return Err(invalid("control recovery exceeds generic retained budget"));
+        }
+        let control = control_owner::Owner::new_leased_reserved_arq(
             config.control,
             selected,
             delivery::Binding {
@@ -193,8 +227,23 @@ impl Driver {
             envelope_scope(data_scope),
             Duration::ZERO,
             config.lifetime.lease,
+            arq_plans.map(|plan| recovery::storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            }),
         )
         .map_err(invalid)?;
+        let actual_arq = control
+            .arq_storage_usage()
+            .ok_or_else(|| protocol("generic control recovery is not reserved"))?;
+        let mut actual_arq_capacity = 0usize;
+        for (usage, plan) in actual_arq.iter().zip(arq_plans) {
+            if usage.capacity_bytes != plan.capacity_bytes() {
+                return Err(protocol("actual control recovery differs from its plan"));
+            }
+            actual_arq_capacity = actual_arq_capacity
+                .checked_add(usage.capacity_bytes)
+                .ok_or_else(|| invalid("actual control recovery layout overflow"))?;
+        }
         let capacity = records
             .capacity(config.security.max_body_bytes)
             .map_err(invalid)?;
@@ -219,13 +268,26 @@ impl Driver {
             config.native.pending_bytes,
             config.receive.records.max_native,
         )?;
+        let inputs = buffers::Inputs::new(
+            READ_BUFFER_BYTES,
+            parts
+                .cover
+                .limits()
+                .max_packet_bytes
+                .checked_add(1)
+                .ok_or_else(exhausted)?,
+        )?;
+        let input_capacity = inputs.capacity_bytes();
         // Set already charges its own embedded layout. This known subtotal does
-        // not claim Control/Peer/catalog or later sole-loop input preallocation.
+        // not claim complete Control/Peer/catalog preallocation.
         let external = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<transactions::State>())
             .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<storage::Set>()))
             .and_then(|bytes| bytes.checked_add(native.capacity_bytes()))
             .and_then(|bytes| bytes.checked_add(buffers.capacity_bytes()))
+            .and_then(|bytes| bytes.checked_add(input_capacity))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<buffers::Inputs>()))
+            .and_then(|bytes| bytes.checked_add(actual_arq_capacity))
             .ok_or_else(|| invalid("known generic runtime storage layout overflow"))?;
         let bank = engines::Bank::new(
             identity,
@@ -284,6 +346,8 @@ impl Driver {
                     request: None,
                     cursor: false,
                     outcome: None,
+                    completion: None,
+                    observation_dirty: false,
                 }),
                 send: config.send,
                 receive: config.receive,
@@ -299,6 +363,7 @@ impl Driver {
                 control_work: false,
                 waiting: None,
                 buffers,
+                inputs: Some(inputs),
                 envelope_rx: 1,
                 native,
                 written: NativeWritten::new(
@@ -314,7 +379,10 @@ impl Driver {
                     left: config.work.receive_packets,
                     refill: add(0, config.work.receive_interval)?,
                 },
-                counters: Counters::default(),
+                counters: Counters {
+                    loop_input_capacity_bytes: input_capacity,
+                    ..Counters::default()
+                },
                 performance: performance::State::default(),
                 live: Liveness::default(),
                 challenge: None,

@@ -7,7 +7,19 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The current [Swift bulk-prefix checkpoint](modules/swift-bulk-copy.md) implements
+The current functionality wave implements explicit generic Swift shared-service
+and APIv3 selection, real three-stream reserved ARQ consumers and actual sole-loop
+input charging. The [source-stable focused check](../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json)
+passes both-cover paired service/two-switch/reconnect tests and selected
+legacy/component regressions with strict Clippy. The
+[service](modules/generic-client-service.md), [fault](modules/generic-driver-faults.md)
+and [storage](modules/control-recovery-storage.md) ledgers retain their remaining
+complete gates. The [required source-stable aggregate](../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json)
+passes1919 Rust cases including doctests,376 tooling cases and1658 simulator
+cases, including formatting, strict workspace Clippy and rustdoc. Native and kernel
+performance reruns are deferred while functionality is prioritized.
+
+The preceding [Swift bulk-prefix checkpoint](modules/swift-bulk-copy.md) implements
 checked at-most-two-slice deque extraction at the existing sender/receiver sites.
 Exact bytes/recovery tests and immutable CPU ABBA give baseline/candidate elapsed
 ratios of 4.34–4.55 in the finite library workloads. Native impaired QUIC/media-like remain
@@ -83,15 +95,20 @@ open. Runtime Snapshot custody observations do not change strict local API bytes
 
 
 The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
-now has an explicitly selected runtime-library API in that same sole I/O loop.
-Finite Unix tests use actual original UDP sockets, maintained authentication,
-canonical H0/D0 scopes, two reserved engines and physical native writes through
-two nonzero asymmetric switches. Whole-message proofs retain the original cap;
-separate status exposes requested/current configuration and incomplete resource
-preallocation. Shared CLI/service/API selection, Driver impairment/pressure
-qualification, complete reservation, cross-profile SW-11 and broader
-carrier/lifecycle/platform/performance acceptance remain open. Existing defaults
-and strict v1/v2 bytes are preserved. No new native throughput result is claimed.
+now has explicit runtime-library and shared Prepared/service/APIv3 selection in
+that same sole I/O loop. Finite Unix tests use actual original UDP sockets,
+maintained authentication, canonical H0/D0 scopes, reserved engines and physical
+native writes through two nonzero asymmetric switches. The actual shared service
+also passes both-cover traffic, complete-C/key operations, IPC v3 status/switch,
+liveness and fresh-session reconnect with periodic reporting disabled. Actual
+observations precede successful completion; requested/current/physical values
+and incomplete resources remain distinct. All three generic control streams
+now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
+CLI selection, the complete generic IPC/negative-service/fault matrix, full
+reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
+acceptance remain open. Existing defaults and strict v1/v2 schemas are preserved;
+exact generic IPC compatibility cases remain tracked separately. No native or
+performance run was added during this functionality wave.
 
 The [source-stable focused integration receipt](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
 passed 17 driver tests, 21 secure-UDP/client tests, retained service/local API

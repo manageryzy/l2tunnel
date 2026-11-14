@@ -72,6 +72,7 @@ async fn local_action(
             }),
         Action::SwitchActivePolicy { .. }
         | Action::SetSwiftPolicy { .. }
+        | Action::SwitchSwiftConfiguration { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}
@@ -94,6 +95,7 @@ async fn local_action(
         swift: None,
         #[cfg(unix)]
         secure_udp: None,
+        transaction: None,
     });
     Response {
         version: VERSION,
@@ -115,6 +117,7 @@ async fn active_local_action(
         Action::Status {} => Ok(()),
         Action::SwitchCompression { .. }
         | Action::SetSwiftPolicy { .. }
+        | Action::SwitchSwiftConfiguration { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}
@@ -160,6 +163,7 @@ async fn active_local_action(
         swift: None,
         #[cfg(unix)]
         secure_udp: None,
+        transaction: None,
     });
     Response {
         version: VERSION,

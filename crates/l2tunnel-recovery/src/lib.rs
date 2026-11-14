@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 mod arq;
+pub mod storage;
 pub use arq::{
     ACK_PACKET_BYTES, ArqConfig, BufferSide, CarrierOnly, DATA_HEADER_BYTES, EndpointRole,
     PacketView, RecoveryContext, RecoveryError, Retained, SelectiveRepeat, SourceId, Statistics,

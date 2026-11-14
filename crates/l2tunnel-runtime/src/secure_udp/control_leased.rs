@@ -148,6 +148,7 @@ impl FrozenOutput {
 
 impl Owner {
     /// Explicit selection; old constructors, grammars and sequences are unchanged.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_leased(
         base: delivery::Settings,
@@ -158,7 +159,7 @@ impl Owner {
         now: Duration,
         expires: Duration,
     ) -> io::Result<Self> {
-        let mut owner = Self::new(
+        Self::new(
             base,
             Some(selected),
             binding,
@@ -166,16 +167,44 @@ impl Owner {
             data_scope,
             now,
             expires,
-        )?;
-        let Backend::Streamed(streamed) = &mut owner.backend else {
+        )?
+        .into_leased(control_scope, data_scope)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing contexts plus explicit actual ARQ backing limits.
+    pub(crate) fn new_leased_reserved_arq(
+        base: delivery::Settings,
+        selected: Settings,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        limits: [recovery::storage::Limits; 3],
+    ) -> io::Result<Self> {
+        Self::construct(
+            base,
+            Some(selected),
+            binding,
+            control_scope,
+            data_scope,
+            now,
+            expires,
+            Some(limits),
+        )?
+        .into_leased(control_scope, data_scope)
+    }
+
+    fn into_leased(mut self, control_scope: sc::Scope, data_scope: sc::Scope) -> io::Result<Self> {
+        let Backend::Streamed(streamed) = &mut self.backend else {
             return Err(invalid("leased Control requires streamed owners"));
         };
         streamed.gate = streams::gate::Gate::new_transaction_bound(streams::gate::GateSettings {
             binding: sc::PeerBinding {
-                session: binding.session,
-                remote_role: opposite(binding.local_role),
-                control_lane: binding.lane,
-                data_lanes: [Some(binding.lane), None],
+                session: self.binding.session,
+                remote_role: opposite(self.binding.local_role),
+                control_lane: self.binding.lane,
+                data_lanes: [Some(self.binding.lane), None],
             },
             control: control_scope,
             active: policy(data_scope),
@@ -183,7 +212,7 @@ impl Owner {
         })
         .map_err(invalid)?;
         streamed.leased = true;
-        Ok(owner)
+        Ok(self)
     }
 
     pub(crate) fn transaction_binding(&self) -> io::Result<delivery::Binding> {

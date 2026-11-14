@@ -748,6 +748,58 @@ impl State {
     pub(super) fn peer(&self) -> &tx::Peer<C> {
         &self.peer
     }
+    #[cfg(test)]
+    pub(super) fn output_custody_for_test(
+        &self,
+    ) -> [Option<(mg::messages::SubmissionId, Duration, bool, bool)>; 3] {
+        std::array::from_fn(|index| {
+            self.outputs[index].as_ref().map(|output| {
+                (
+                    output.frozen.submission(),
+                    output.frozen.deadline(),
+                    output.confirmed,
+                    output.frozen.context().is_final_reply(),
+                )
+            })
+        })
+    }
+    /// Generate an independent real logical retry for a final-custody test.
+    /// Ordinary State service intentionally leaves retransmission to FrozenOutput.
+    #[cfg(test)]
+    pub(super) fn independent_final_retry_for_test(
+        &mut self,
+        now: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let operation = self
+            .peer
+            .operation()
+            .ok_or_else(|| invalid("test retry requires an actual retained operation"))?;
+        if self.contract.identity.role != mg::Role::Client
+            || self.peer.phase() != tx::Phase::AwaitRetireAck
+            || self.operation != Some(operation)
+            || now < self.now
+            || now >= self.contract.session_expires
+            || tick(now)? >= operation.expires()
+        {
+            return Err(invalid("test retry is outside original final custody"));
+        }
+        let effects = self.peer.poll(tick(now)?).map_err(protocol)?;
+        if effects.event.is_some() || self.peer.operation() != Some(operation) {
+            return Err(protocol("test retry reached a real lifecycle boundary"));
+        }
+        let command = effects
+            .outbound
+            .ok_or_else(|| invalid("actual final retry is not due"))?;
+        if mg::Frame::decode(&command, mg::Limits::default())
+            .map_err(protocol)?
+            .header
+            .kind
+            != mg::MessageKind::Retire
+        {
+            return Err(protocol("actual final retry is not Retire"));
+        }
+        Ok(command)
+    }
     pub(super) fn take_outcome(&mut self) -> Option<Outcome> {
         self.outcome.take()
     }

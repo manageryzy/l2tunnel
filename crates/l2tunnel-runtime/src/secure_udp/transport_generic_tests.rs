@@ -3,6 +3,13 @@
 //! Driver-method cases inject finite protocol time after real Noise/member setup;
 //! they do not claim privileged TAP/netem qualification or other record profiles.
 
+#[path = "transport_generic_fault_tests.rs"]
+mod faults;
+#[path = "transport_input_charge_tests.rs"]
+mod input_charge;
+#[path = "transport_observation_deadline_tests.rs"]
+mod observation_deadline;
+
 use super::*;
 use l2tunnel::swift_configuration::{Catalog, Configuration as C, Descriptor, EnvelopeDigest};
 use l2tunnel_management::{messages, transaction};
@@ -123,7 +130,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(kind: cover::Appearance) -> Result<Self> {
-        let [client, server] = contracts(kind)?;
+        Self::from_contracts(kind, contracts(kind)?).await
+    }
+
+    async fn from_contracts(
+        kind: cover::Appearance,
+        contracts: [TransactionContract; 2],
+    ) -> Result<Self> {
+        let [client, server] = contracts;
         let (a, b) = parts_pair(kind).await?;
         let setup_end = a.deadline.max(b.deadline);
         let origin = Instant::now();
@@ -191,6 +205,13 @@ impl Fixture {
             endpoint.driver.admit_transaction(|| Ok(duration(now)))?;
             endpoint.driver.collect_native(now)?;
             endpoint.driver.progress_transaction(now)?;
+            endpoint.driver.report_transaction_completion(
+                || Ok(now),
+                |driver, at| {
+                    driver.snapshot_transaction(at, true)?;
+                    Ok(())
+                },
+            )?;
             endpoint.driver.service_selected_control(now, None)?;
             endpoint.driver.submit_control(now)?;
             let before = endpoint.driver.counters.socket_accepted_packets;

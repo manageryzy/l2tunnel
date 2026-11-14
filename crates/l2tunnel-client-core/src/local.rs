@@ -1,6 +1,6 @@
 //! Portable strict local API schema and separately gated Unix transport.
 //!
-//! Request/response serde bytes and the local protocol version are unchanged.
+//! Existing version 1/2 serde bytes are preserved; explicit transactions add version 3.
 //! Sharing these types does not provide Windows IPC or a platform device adapter.
 mod schema;
 pub use schema::*;

@@ -83,6 +83,88 @@ impl From<RecoveryError> for Error {
     }
 }
 
+/// Reserved ARQ construction failure, without changing existing service errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservedArqError {
+    /// Existing service validation rejected the contract.
+    Service(Error),
+    /// Actual recovery backing could not be planned or provisioned.
+    Storage(l2tunnel_recovery::storage::Error),
+}
+impl fmt::Display for ReservedArqError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(output, "reserved control ARQ error: {self:?}")
+    }
+}
+impl std::error::Error for ReservedArqError {}
+
+struct Validated {
+    context: RecoveryContext,
+    refill_at: Duration,
+    max_packet: usize,
+    max_charge: usize,
+    ack_charge: usize,
+}
+
+impl Settings {
+    /// Allocation-free validation of the exact existing service contract.
+    pub fn validate(self, binding: Binding, now: Duration, expires: Duration) -> Result<(), Error> {
+        validate_settings(self, binding, now, expires).map(|_| ())
+    }
+}
+
+fn validate_settings(
+    settings: Settings,
+    binding: Binding,
+    now: Duration,
+    expires: Duration,
+) -> Result<Validated, Error> {
+    if settings.interval.is_zero()
+        || settings.interval > Duration::from_secs(1)
+        || !(2..=4096).contains(&settings.packets_per_interval)
+        || settings.bytes_per_interval > 16 * 1024 * 1024
+        || settings.recovery.send_bytes > 16 * 1024 * 1024
+        || settings.recovery.receive_bytes > 16 * 1024 * 1024
+        || settings.recovery.max_retries > 1024
+        || binding.session.0 == [0; 16]
+        || binding.control_epoch == 0
+        || now >= expires
+    {
+        return Err(Error::Settings);
+    }
+    let refill_at = now.checked_add(settings.interval).ok_or(Error::Settings)?;
+    settings.recovery.validate()?;
+    let max_packet = (l2tunnel_recovery::DATA_HEADER_BYTES + settings.recovery.max_source_bytes)
+        .max(ACK_PACKET_BYTES);
+    let max_charge = max_packet
+        .checked_add(settings.wire_overhead)
+        .ok_or(Error::Settings)?;
+    let ack_charge = ACK_PACKET_BYTES
+        .checked_add(settings.wire_overhead)
+        .ok_or(Error::Settings)?;
+    if max_charge > 65_535
+        || max_charge
+            .checked_add(ack_charge)
+            .is_none_or(|minimum| minimum > settings.bytes_per_interval)
+    {
+        return Err(Error::Settings);
+    }
+    Ok(Validated {
+        context: RecoveryContext {
+            session: u128::from_be_bytes(binding.session.0),
+            epoch: binding.control_epoch,
+            role: match binding.local_role {
+                Role::Client => EndpointRole::Initiator,
+                Role::Server => EndpointRole::Responder,
+            },
+        },
+        refill_at,
+        max_packet,
+        max_charge,
+        ack_charge,
+    })
+}
+
 /// Bounded reliable opaque control sources over already authenticated packets.
 ///
 /// The caller preserves emitted attempts until carrier handoff or explicit
@@ -114,62 +196,65 @@ impl Service {
         now: Duration,
         expires: Duration,
     ) -> Result<Self, Error> {
-        if settings.interval.is_zero()
-            || settings.interval > Duration::from_secs(1)
-            || !(2..=4096).contains(&settings.packets_per_interval)
-            || settings.bytes_per_interval > 16 * 1024 * 1024
-            || settings.recovery.send_bytes > 16 * 1024 * 1024
-            || settings.recovery.receive_bytes > 16 * 1024 * 1024
-            || settings.recovery.max_retries > 1024
-            || binding.session.0 == [0; 16]
-            || binding.control_epoch == 0
-            || now >= expires
-        {
-            return Err(Error::Settings);
-        }
-        let refill_at = now.checked_add(settings.interval).ok_or(Error::Settings)?;
-        let recovery = SelectiveRepeat::new(
-            settings.recovery,
-            RecoveryContext {
-                session: u128::from_be_bytes(binding.session.0),
-                epoch: binding.control_epoch,
-                role: match binding.local_role {
-                    Role::Client => EndpointRole::Initiator,
-                    Role::Server => EndpointRole::Responder,
-                },
-            },
-        )?;
-        let max_packet = recovery.max_packet_bytes();
-        let max_charge = max_packet
-            .checked_add(settings.wire_overhead)
-            .ok_or(Error::Settings)?;
-        let ack_charge = ACK_PACKET_BYTES
-            .checked_add(settings.wire_overhead)
-            .ok_or(Error::Settings)?;
-        if max_charge > 65_535
-            || max_charge
-                .checked_add(ack_charge)
-                .is_none_or(|minimum| minimum > settings.bytes_per_interval)
-        {
-            return Err(Error::Settings);
-        }
-        Ok(Self {
+        let validated = validate_settings(settings, binding, now, expires)?;
+        let recovery = SelectiveRepeat::new(settings.recovery, validated.context)?;
+        Ok(Self::from_validated(
+            settings, binding, now, expires, validated, recovery,
+        ))
+    }
+
+    /// Reserve every ARQ payload and metadata slot; other owners remain separate.
+    pub fn new_reserved_arq(
+        settings: Settings,
+        binding: Binding,
+        now: Duration,
+        expires: Duration,
+        limits: l2tunnel_recovery::storage::Limits,
+    ) -> Result<Self, ReservedArqError> {
+        let validated = validate_settings(settings, binding, now, expires)
+            .map_err(ReservedArqError::Service)?;
+        let recovery = SelectiveRepeat::new_reserved(settings.recovery, validated.context, limits)
+            .map_err(|error| match error {
+                l2tunnel_recovery::storage::Error::Recovery(error) => {
+                    ReservedArqError::Service(Error::Recovery(error))
+                }
+                error => ReservedArqError::Storage(error),
+            })?;
+        Ok(Self::from_validated(
+            settings, binding, now, expires, validated, recovery,
+        ))
+    }
+
+    /// Actual persistent ARQ backing, including empty slots; None for legacy.
+    pub fn arq_storage_usage(&self) -> Option<l2tunnel_recovery::storage::Usage> {
+        self.recovery.storage_usage()
+    }
+
+    fn from_validated(
+        settings: Settings,
+        binding: Binding,
+        now: Duration,
+        expires: Duration,
+        validated: Validated,
+        recovery: SelectiveRepeat,
+    ) -> Self {
+        Self {
             settings,
             binding,
             recovery,
-            max_packet,
-            max_charge,
-            ack_charge,
+            max_packet: validated.max_packet,
+            max_charge: validated.max_charge,
+            ack_charge: validated.ack_charge,
             expires,
             last_now: now,
-            refill_at: refill_at.min(expires),
+            refill_at: validated.refill_at.min(expires),
             packets_left: settings.packets_per_interval,
             bytes_left: settings.bytes_per_interval,
             source_emitted: false,
             feedback_emitted: false,
             shared_allowance: usize::MAX,
             statistics: Statistics::default(),
-        })
+        }
     }
 
     fn check(&self, now: Duration) -> Result<(), Error> {
@@ -386,3 +471,6 @@ impl Service {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reserved_arq_tests;

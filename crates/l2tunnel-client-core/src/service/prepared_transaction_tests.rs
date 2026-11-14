@@ -1,0 +1,370 @@
+//! Pure plan validation and owner custody; no authenticated runtime is constructed.
+
+use super::*;
+use crate::secure_udp::{credentials, transaction_profile};
+use l2tunnel::swift_configuration::{Catalog, Descriptor};
+use l2tunnel_cover::Appearance;
+use l2tunnel_handshake as hs;
+use l2tunnel_identity::IdentityKey;
+use l2tunnel_management::{control_streams, delivery, messages, transaction};
+use l2tunnel_runtime::secure_udp::transport;
+use l2tunnel_security::Role;
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use zeroize::Zeroizing;
+
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
+    if text.len() != N * 2 {
+        return Err("invalid public test vector length".into());
+    }
+    let mut bytes = [0; N];
+    for (destination, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        *destination = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    Ok(bytes)
+}
+
+fn member(other: bool) -> Result<IdentityKey> {
+    // Public RFC8032 section7.1 vectors, never provisioning examples.
+    let (seed, public) = if other {
+        (
+            unhex::<32>("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")?,
+            unhex::<32>("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")?,
+        )
+    } else {
+        (
+            unhex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")?,
+            unhex::<32>("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")?,
+        )
+    };
+    let mut encoded = unhex::<16>("3051020101300506032b657004220420")?.to_vec();
+    encoded.extend_from_slice(&seed);
+    encoded.extend_from_slice(&[0x81, 0x21, 0]);
+    encoded.extend_from_slice(&public);
+    Ok(IdentityKey::from_pkcs8(&encoded)?)
+}
+
+fn noise(local: u8, remote: u8, pattern: hs::Profile) -> io::Result<credentials::NoiseIdentity> {
+    credentials::NoiseIdentity::new(
+        Zeroizing::new([local; 32]),
+        hs::LocalSecret::new(Zeroizing::new([remote; 32])).public_key(),
+        pattern,
+        matches!(pattern, hs::Profile::IkPsk2).then(|| Zeroizing::new([66; 32])),
+    )
+}
+fn client(
+    other_member: bool,
+    local: u8,
+    remote: u8,
+    pattern: hs::Profile,
+) -> Result<credentials::Client> {
+    Ok(credentials::Client::new(
+        noise(local, remote, pattern)?,
+        member(other_member)?,
+        credentials::Secret32::new(Zeroizing::new([44; 32]))?,
+    )?)
+}
+fn server(local: u8, remote: u8, pattern: hs::Profile) -> io::Result<credentials::Server> {
+    credentials::Server::new(
+        noise(local, remote, pattern)?,
+        credentials::Secret32::new(Zeroizing::new([44; 32]))?,
+        credentials::Secret32::new(Zeroizing::new([55; 32]))?,
+    )
+}
+
+fn streamed(mut value: transport::Config) -> transport::Config {
+    let entry = messages::Settings {
+        delivery: delivery::Settings {
+            wire_overhead: value.control.wire_overhead + control_streams::HEADER_BYTES,
+            ..value.control
+        },
+        path_mtu: value.path_mtu,
+        max_message_bytes: 4096,
+        max_outbound_messages: 4,
+        max_outbound_bytes: 131_072,
+        max_fragments: 32,
+        max_reassembly_bytes: 16_384,
+        max_incomplete_messages: 2,
+        message_lifetime: Duration::from_secs(5),
+        work_per_call: 8,
+    };
+    value.streams = Some(l2tunnel_runtime::secure_udp::control::Settings {
+        streams: [entry; 3],
+    });
+    value
+}
+
+struct Plans {
+    generic: transaction_profile::Profile,
+    legacy: crate::secure_udp::profile::Profile,
+    // Holding both endpoints makes an accidental bind inside Prepared observable.
+    _ports: [UdpSocket; 2],
+}
+fn plans(appearance: Appearance) -> Result<Plans> {
+    let client = crate::test_ports::reserve(false)?;
+    let server = crate::test_ports::reserve(false)?;
+    let (legacy, peers) = crate::secure_udp::profile::tests::fixture(
+        l2tunnel_udp_control::Path {
+            client: client.local_addr()?,
+            server: server.local_addr()?,
+        },
+        appearance,
+        member(false)?.public_key(),
+    )?;
+    let mut settings = legacy.settings();
+    settings.application = l2tunnel_core::ConfigDigest([31; 32]);
+    let mut initiator = streamed(legacy.runtime(Role::Initiator));
+    let mut responder = streamed(legacy.runtime(Role::Responder));
+    let mut forward = initiator.send;
+    let mut reverse = initiator.receive;
+    forward.records.channels = 2;
+    reverse.records.channels = 3;
+    forward.bytes_per_second = 1_250_001;
+    reverse.bytes_per_second = 625_013;
+    forward.records.codec.window = 7;
+    reverse.records.codec.window = 11;
+    forward.records.codec.repair_numerator = 1;
+    forward.records.codec.repair_denominator = 3;
+    reverse.records.codec.repair_numerator = 2;
+    reverse.records.codec.repair_denominator = 7;
+    forward.records.codec.datagram_bytes = 1200;
+    reverse.records.codec.datagram_bytes = 1024;
+    let initial = Descriptor::new(1500, forward, reverse)?;
+    forward.records.channels = 4;
+    reverse.records.channels = 1;
+    let target = Descriptor::new(1500, forward, reverse)?;
+    initiator.send = initial.forward();
+    initiator.receive = initial.reverse();
+    responder.send = initial.reverse();
+    responder.receive = initial.forward();
+    let generic = transaction_profile::Profile::new(
+        legacy.connection(),
+        settings,
+        peers,
+        initiator,
+        responder,
+        Catalog::new(initial, &[target, initial])?,
+        transaction_profile::Parameters {
+            protocol: transaction::Settings {
+                retry_ms: 10,
+                phase_timeout_ms: 500,
+                reconcile_timeout_ms: 1000,
+            },
+            max_operation_ms: 1500,
+            retained_bytes: 16 * 1024 * 1024,
+        },
+    )?;
+    Ok(Plans {
+        generic,
+        legacy,
+        _ports: [client, server],
+    })
+}
+
+fn attachment(opened: &Arc<AtomicUsize>, layer: PacketLayer, readable: bool) -> Attachment {
+    let opened = opened.clone();
+    if readable {
+        Attachment::readable(layer, move || {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("test attachment invoked"))
+        })
+    } else {
+        Attachment::new(layer, move || {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("test attachment invoked"))
+        })
+    }
+}
+
+fn refused(result: io::Result<Prepared>, expected: io::ErrorKind) -> Result {
+    let error = result.err().ok_or("invalid transaction plan accepted")?;
+    assert_eq!(error.kind(), expected);
+    Ok(())
+}
+
+#[test]
+fn explicit_transaction_plans_preserve_complete_contract_before_any_io() -> Result {
+    for appearance in [Appearance::QuicLike, Appearance::MediaLike] {
+        let plans = plans(appearance)?;
+        let opened = Arc::new(AtomicUsize::new(0));
+        for role in [Role::Initiator, Role::Responder] {
+            let prepared = match role {
+                Role::Initiator => Prepared::secure_udp_transaction_client(
+                    plans.generic.clone(),
+                    client(false, 11, 22, hs::Profile::Ik)?,
+                    attachment(&opened, PacketLayer::Ip, true),
+                )?,
+                Role::Responder => Prepared::secure_udp_transaction_server(
+                    plans.generic.clone(),
+                    server(22, 11, hs::Profile::Ik)?,
+                    attachment(&opened, PacketLayer::Ip, true),
+                )?,
+            };
+            assert!(prepared.secure_udp());
+            assert!(prepared.secure_udp_transaction());
+            assert_eq!(
+                prepared.setup_timeout(),
+                plans.generic.connection().handshake_timeout
+            );
+            let Transport::SecureUdpTransaction(profile) = &prepared.data.transport else {
+                return Err("transaction constructor selected another backend".into());
+            };
+            assert_eq!(profile.configuration()?, plans.generic.configuration()?);
+            assert_eq!(profile.initial(), plans.generic.initial());
+            assert_eq!(profile.peers(), plans.generic.peers());
+            assert_eq!(profile.catalog().root(), plans.generic.catalog().root());
+            let contract = profile.runtime_contract(role)?;
+            assert_eq!(contract.role(), role);
+            assert_eq!(contract.expected_configuration(), profile.configuration()?);
+            assert_eq!(contract.initial(), profile.initial());
+            assert_eq!(
+                contract.config(),
+                profile.runtime_for(profile.initial(), role)?
+            );
+            assert_eq!(opened.load(Ordering::SeqCst), 0);
+            let cloned = prepared.clone();
+            assert!(Arc::ptr_eq(&prepared.identity, &cloned.identity));
+            assert!(Arc::ptr_eq(&prepared.data, &cloned.data));
+            assert!(cloned.open_readable().is_err());
+            assert_eq!(opened.fetch_sub(1, Ordering::SeqCst), 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn original_secure_swift_constructors_remain_a_distinct_selection() -> Result {
+    let plans = plans(Appearance::QuicLike)?;
+    let opened = Arc::new(AtomicUsize::new(0));
+    let client = Prepared::secure_udp_client(
+        plans.legacy,
+        client(false, 11, 22, hs::Profile::Ik)?,
+        attachment(&opened, PacketLayer::Ip, true),
+    )?;
+    let server = Prepared::secure_udp_server(
+        plans.legacy,
+        server(22, 11, hs::Profile::Ik)?,
+        attachment(&opened, PacketLayer::Ip, true),
+    )?;
+    for prepared in [client, server] {
+        assert!(prepared.secure_udp());
+        assert!(!prepared.secure_udp_transaction());
+        assert!(matches!(
+            &prepared.data.transport,
+            Transport::SecureUdpSwift(_)
+        ));
+    }
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn transaction_member_and_actual_ordered_pins_are_checked_before_provider() -> Result {
+    for appearance in [Appearance::QuicLike, Appearance::MediaLike] {
+        let plans = plans(appearance)?;
+        let opened = Arc::new(AtomicUsize::new(0));
+        refused(
+            Prepared::secure_udp_transaction_client(
+                plans.generic.clone(),
+                client(true, 11, 22, hs::Profile::Ik)?,
+                attachment(&opened, PacketLayer::Ip, true),
+            ),
+            io::ErrorKind::PermissionDenied,
+        )?;
+        // Own key, remote pin, and reversed role ordering are independently invalid.
+        for (local, remote) in [(33, 22), (11, 33), (22, 11)] {
+            refused(
+                Prepared::secure_udp_transaction_client(
+                    plans.generic.clone(),
+                    client(false, local, remote, hs::Profile::Ik)?,
+                    attachment(&opened, PacketLayer::Ip, true),
+                ),
+                io::ErrorKind::PermissionDenied,
+            )?;
+        }
+        for (local, remote) in [(33, 11), (22, 33), (11, 22)] {
+            refused(
+                Prepared::secure_udp_transaction_server(
+                    plans.generic.clone(),
+                    server(local, remote, hs::Profile::Ik)?,
+                    attachment(&opened, PacketLayer::Ip, true),
+                ),
+                io::ErrorKind::PermissionDenied,
+            )?;
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_pattern_layer_and_readiness_refusals_do_not_open_attachment() -> Result {
+    for appearance in [Appearance::QuicLike, Appearance::MediaLike] {
+        let plans = plans(appearance)?;
+        let opened = Arc::new(AtomicUsize::new(0));
+        for role in [Role::Initiator, Role::Responder] {
+            for (pattern, layer, readable) in [
+                (hs::Profile::IkPsk2, PacketLayer::Ip, true),
+                (hs::Profile::Ik, PacketLayer::Ethernet, true),
+                (hs::Profile::Ik, PacketLayer::Ip, false),
+            ] {
+                let result = match role {
+                    Role::Initiator => Prepared::secure_udp_transaction_client(
+                        plans.generic.clone(),
+                        client(false, 11, 22, pattern)?,
+                        attachment(&opened, layer, readable),
+                    ),
+                    Role::Responder => Prepared::secure_udp_transaction_server(
+                        plans.generic.clone(),
+                        server(22, 11, pattern)?,
+                        attachment(&opened, layer, readable),
+                    ),
+                };
+                refused(result, io::ErrorKind::InvalidInput)?;
+            }
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_server_clone_retains_one_real_admission_owner_and_new_plan_does_not() -> Result {
+    let plans = plans(Appearance::MediaLike)?;
+    let opened = Arc::new(AtomicUsize::new(0));
+    let prepared = Prepared::secure_udp_transaction_server(
+        plans.generic.clone(),
+        server(22, 11, hs::Profile::Ik)?,
+        attachment(&opened, PacketLayer::Ip, true),
+    )?;
+    let Endpoint::SecureServer(original) = &prepared.data.endpoint else {
+        return Err("missing server credentials".into());
+    };
+    *original.admission.try_lock()? = Some(crate::secure_udp::Server::new(
+        plans.generic.settings(),
+        plans.generic.peers(),
+        original.credentials.admission(),
+        original.credentials.cookie(),
+        tokio::time::Instant::now(),
+    )?);
+    let cloned = prepared.clone();
+    let Endpoint::SecureServer(retained) = &cloned.data.endpoint else {
+        return Err("clone changed server endpoint".into());
+    };
+    assert!(std::ptr::eq(original.as_ref(), retained.as_ref()));
+    assert!(retained.admission.try_lock()?.is_some());
+    let fresh = Prepared::secure_udp_transaction_server(
+        plans.generic,
+        server(22, 11, hs::Profile::Ik)?,
+        attachment(&opened, PacketLayer::Ip, true),
+    )?;
+    assert!(!Arc::ptr_eq(&prepared.identity, &fresh.identity));
+    let Endpoint::SecureServer(fresh) = &fresh.data.endpoint else {
+        return Err("new plan changed server endpoint".into());
+    };
+    assert!(fresh.admission.try_lock()?.is_none());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    Ok(())
+}

@@ -151,15 +151,20 @@ generic Management/DataFeedback, full SW-11 and native saturation remain open.
 
 
 The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
-now has an explicitly selected runtime-library API in that same sole I/O loop.
-Finite Unix tests use actual original UDP sockets, maintained authentication,
-canonical H0/D0 scopes, two reserved engines and physical native writes through
-two nonzero asymmetric switches. Whole-message proofs retain the original cap;
-separate status exposes requested/current configuration and incomplete resource
-preallocation. Shared CLI/service/API selection, Driver impairment/pressure
-qualification, complete reservation, cross-profile SW-11 and broader
-carrier/lifecycle/platform/performance acceptance remain open. Existing defaults
-and strict v1/v2 bytes are preserved. No new native throughput result is claimed.
+now has explicit runtime-library and shared Prepared/service/APIv3 selection in
+that same sole I/O loop. Finite Unix tests use actual original UDP sockets,
+maintained authentication, canonical H0/D0 scopes, reserved engines and physical
+native writes through two nonzero asymmetric switches. The actual shared service
+also passes both-cover traffic, complete-C/key operations, IPC v3 status/switch,
+liveness and fresh-session reconnect with periodic reporting disabled. Actual
+observations precede successful completion; requested/current/physical values
+and incomplete resources remain distinct. All three generic control streams
+now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
+CLI selection, the complete generic IPC/negative-service/fault matrix, full
+reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
+acceptance remain open. Existing defaults and strict v1/v2 schemas are preserved;
+exact generic IPC compatibility cases remain tracked separately. No native or
+performance run was added during this functionality wave.
 
 ## Library boundary and layering
 

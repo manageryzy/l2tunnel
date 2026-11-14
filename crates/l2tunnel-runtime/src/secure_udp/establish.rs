@@ -53,6 +53,17 @@ pub struct Config {
     /// Maximum received datagrams processed per gate interval, in 1..=4096.
     pub receive_packets_per_interval: u32,
 }
+impl Config {
+    /// Derive the expected public prologue for the exact selected session.
+    /// This performs no I/O and proves neither Noise nor member possession.
+    pub fn expected_binding(
+        self,
+        peers: Peers,
+        session: hs::SessionId,
+    ) -> Result<hs::Binding, Error> {
+        session_binding(setup(self, peers)?, session.0)
+    }
+}
 
 /// Owned pinned Noise credentials, independent of admission and member credentials.
 pub struct Identity {
@@ -874,14 +885,7 @@ impl Exchange {
             hs::Role::Responder
         };
         let session = self.ticket.session();
-        let outer = outer_binding(self.setup, session)?;
-        let authenticated = hs::Binding {
-            session: hs::SessionId(session),
-            configuration: self.setup.config.binding.configuration,
-            carrier: self.setup.config.binding.carrier,
-            outer,
-            member: self.setup.config.binding.member,
-        };
+        let authenticated = session_binding(self.setup, session)?;
         let mut core = Core::new(
             self.setup,
             self.ticket,
@@ -1175,6 +1179,15 @@ fn setup(config: Config, peers: Peers) -> Result<Setup, Error> {
         config,
         gate,
         max_wire,
+    })
+}
+fn session_binding(setup: Setup, session: [u8; 16]) -> Result<hs::Binding, Error> {
+    Ok(hs::Binding {
+        session: hs::SessionId(session),
+        configuration: setup.config.binding.configuration,
+        carrier: setup.config.binding.carrier,
+        outer: outer_binding(setup, session)?,
+        member: setup.config.binding.member,
     })
 }
 fn outer_binding(setup: Setup, session: [u8; 16]) -> Result<[u8; 32], Error> {

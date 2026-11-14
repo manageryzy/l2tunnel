@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
+mod backing;
+pub(crate) use backing::{ReceiveSlot, SendSlot};
+use backing::{Received, Sent};
+
 /// Bytes preceding one source payload in the draft authenticated inner encoding.
 pub const DATA_HEADER_BYTES: usize = 44;
 /// Exact byte size of the bounded cumulative/bitmap ACK packet.
@@ -83,7 +87,9 @@ impl Default for ArqConfig {
 }
 
 impl ArqConfig {
-    fn validate(self) -> Result<(), RecoveryError> {
+    /// Validate existing payload, retention, sequence-window and timing bounds.
+    /// This pure check reserves no backing and grants no authentication authority.
+    pub fn validate(self) -> Result<(), RecoveryError> {
         if !(1..=65_535).contains(&self.max_source_bytes)
             || self.send_bytes < self.max_source_bytes
             || self.receive_bytes < self.max_source_bytes
@@ -210,7 +216,7 @@ impl Profile {
 
 #[derive(Debug)]
 struct Flight {
-    payload: Box<[u8]>,
+    payload: Vec<u8>,
     attempts: u32,
     retry_at: Option<Duration>,
     rto: Duration,
@@ -221,8 +227,9 @@ struct Engine {
     config: ArqConfig,
     context: RecoveryContext,
     profile: Profile,
-    sent: BTreeMap<SourceId, Flight>,
-    received: BTreeMap<SourceId, Box<[u8]>>,
+    sent: Sent,
+    received: Received,
+    storage_usage: Option<crate::storage::Usage>,
     next_source: u64,
     receive_prefix: u64,
     deliver_next: u64,
@@ -310,6 +317,33 @@ pub fn inspect_packet(
 }
 
 impl SelectiveRepeat {
+    /// Construct the same ARQ engine with every metadata/payload buffer provisioned.
+    /// The heap-only limit includes idle buffers and excludes the inline engine.
+    pub fn new_reserved(
+        config: ArqConfig,
+        context: RecoveryContext,
+        limits: crate::storage::Limits,
+    ) -> Result<Self, crate::storage::Error> {
+        let plan = crate::storage::Plan::for_arq(config)?;
+        if plan.capacity_bytes() > limits.capacity_bytes {
+            return Err(crate::storage::Error::Limit {
+                required: plan.capacity_bytes(),
+                limit: limits.capacity_bytes,
+            });
+        }
+        let mut allocation = crate::storage::Allocation::new(limits.capacity_bytes);
+        Ok(Self(Engine::new_reserved(
+            config,
+            context,
+            &mut allocation,
+        )?))
+    }
+
+    /// Actual persistent heap capacity, or None for legacy dynamic backing.
+    pub fn storage_usage(&self) -> Option<crate::storage::Usage> {
+        self.0.storage_usage
+    }
+
     /// Whether an allocated source was removed by a validated peer receipt.
     /// Unallocated and retained sources return false; polling is not receipt.
     /// Sticky recovery failure remains an error rather than proving completion.
@@ -436,18 +470,79 @@ engine_api!(SelectiveRepeat, Profile::Selective);
 engine_api!(CarrierOnly, Profile::CarrierOnly);
 
 impl Engine {
+    fn new_reserved(
+        config: ArqConfig,
+        context: RecoveryContext,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, crate::storage::Error> {
+        let plan = crate::storage::Plan::for_arq(config)?;
+        let mut sent = allocation.vec::<SendSlot>(config.send_records)?;
+        let mut received = allocation.vec::<ReceiveSlot>(config.receive_records)?;
+        for _ in 0..config.send_records {
+            let payload = allocation.vec::<u8>(config.max_source_bytes)?;
+            sent.push(SendSlot {
+                source: None,
+                flight: Flight {
+                    payload,
+                    attempts: 0,
+                    retry_at: None,
+                    rto: config.initial_rto,
+                },
+            });
+        }
+        for _ in 0..config.receive_records {
+            received.push(ReceiveSlot {
+                source: None,
+                payload: allocation.vec::<u8>(config.max_source_bytes)?,
+            });
+        }
+        let usage = allocation.usage();
+        if usage.capacity_bytes != plan.capacity_bytes()
+            || usage.allocations != 2 + config.send_records + config.receive_records
+        {
+            return Err(crate::storage::Error::Invariant);
+        }
+        Ok(Self::from_backing(
+            config,
+            context,
+            Profile::Selective,
+            Sent::Reserved(sent),
+            Received::Reserved(received),
+            Some(usage),
+        ))
+    }
+
     fn new(
         config: ArqConfig,
         context: RecoveryContext,
         profile: Profile,
     ) -> Result<Self, RecoveryError> {
         config.validate()?;
-        Ok(Self {
+        Ok(Self::from_backing(
             config,
             context,
             profile,
-            sent: BTreeMap::new(),
-            received: BTreeMap::new(),
+            Sent::Legacy(BTreeMap::new()),
+            Received::Legacy(BTreeMap::new()),
+            None,
+        ))
+    }
+
+    fn from_backing(
+        config: ArqConfig,
+        context: RecoveryContext,
+        profile: Profile,
+        sent: Sent,
+        received: Received,
+        storage_usage: Option<crate::storage::Usage>,
+    ) -> Self {
+        Self {
+            config,
+            context,
+            profile,
+            sent,
+            received,
+            storage_usage,
             next_source: 0,
             receive_prefix: 0,
             deliver_next: 0,
@@ -458,7 +553,7 @@ impl Engine {
             last_now: Duration::ZERO,
             failure: None,
             statistics: Statistics::default(),
-        })
+        }
     }
 
     fn running(&self) -> Result<(), RecoveryError> {
@@ -498,15 +593,8 @@ impl Engine {
             .checked_add(1)
             .ok_or(RecoveryError::CounterExhausted)?;
         let source_id = self.next_source;
-        self.sent.insert(
-            SourceId(source_id),
-            Flight {
-                payload: source.to_vec().into_boxed_slice(),
-                attempts: 0,
-                retry_at: None,
-                rto: self.config.initial_rto,
-            },
-        );
+        self.sent
+            .insert_payload(SourceId(source_id), source, self.config.initial_rto)?;
         self.next_source = next;
         self.send_bytes = bytes;
         self.last_now = now;
@@ -545,7 +633,7 @@ impl Engine {
             None
         };
         if let Some(previous) = self.received.get(&source) {
-            if previous.as_ref() != payload {
+            if previous.as_slice() != payload {
                 return Err(RecoveryError::ConflictingDuplicate);
             }
             self.schedule_ack(ack_at);
@@ -570,8 +658,7 @@ impl Engine {
         if self.received.len() >= self.config.receive_records || bytes > self.config.receive_bytes {
             return Err(RecoveryError::Capacity(BufferSide::Receive));
         }
-        self.received
-            .insert(source, payload.to_vec().into_boxed_slice());
+        self.received.insert_payload(source, payload)?;
         self.receive_bytes = bytes;
         while self.received.contains_key(&SourceId(self.receive_prefix)) {
             // Source u64::MAX is rejected by the codec, so advancing is safe.
@@ -640,8 +727,9 @@ impl Engine {
             .or_else(|| {
                 self.sent
                     .iter()
-                    .find(|(_, flight)| flight.attempts == 0)
+                    .filter(|(_, flight)| flight.attempts == 0)
                     .map(|(source, _)| *source)
+                    .min()
             })
     }
 
@@ -871,5 +959,7 @@ fn parse(
     }
 }
 
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 mod tests;

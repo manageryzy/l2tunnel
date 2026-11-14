@@ -118,6 +118,8 @@ pub(super) enum Transport {
     Swift(crate::swift::Settings),
     #[cfg(unix)]
     SecureUdpSwift(Arc<crate::secure_udp::profile::Profile>),
+    #[cfg(unix)]
+    SecureUdpTransaction(Arc<crate::secure_udp::transaction_profile::Profile>),
 }
 /// Longest time a swift acceptor keeps its listener open for a peer. Each
 /// accepted TCP connection is still bound by the original handshake timeout.
@@ -168,9 +170,47 @@ impl Prepared {
             Transport::SecureUdpSwift(Arc::new(profile)),
         )
     }
+    /// Explicit complete-configuration transaction client, with deferred device work.
+    #[cfg(unix)]
+    pub fn secure_udp_transaction_client(
+        profile: crate::secure_udp::transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureClient(credentials),
+            attachment,
+            Transport::SecureUdpTransaction(Arc::new(profile)),
+        )
+    }
+    /// Explicit transaction acceptor retaining one admission owner across attempts.
+    #[cfg(unix)]
+    pub fn secure_udp_transaction_server(
+        profile: crate::secure_udp::transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureServer(Box::new(SecureServer {
+                credentials,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::SecureUdpTransaction(Arc::new(profile)),
+        )
+    }
     #[cfg(unix)]
     pub(super) fn secure_udp(&self) -> bool {
-        matches!(&self.data.transport, Transport::SecureUdpSwift(_))
+        matches!(
+            &self.data.transport,
+            Transport::SecureUdpSwift(_) | Transport::SecureUdpTransaction(_)
+        )
+    }
+    #[cfg(unix)]
+    pub(super) fn secure_udp_transaction(&self) -> bool {
+        matches!(&self.data.transport, Transport::SecureUdpTransaction(_))
     }
     /// Pure validation; credentials are already parsed and no provider is invoked.
     pub fn client(
@@ -365,6 +405,45 @@ impl Prepared {
                 profile.configuration(noise.peers(role))?;
                 None
             }
+            #[cfg(unix)]
+            Transport::SecureUdpTransaction(profile) => {
+                let session = profile.settings();
+                let (noise, role) = match &endpoint {
+                    Endpoint::SecureClient(credentials) => {
+                        if credentials.member_key() != session.member {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "configured member differs from actual credential",
+                            ));
+                        }
+                        (credentials.noise(), l2tunnel_security::Role::Initiator)
+                    }
+                    Endpoint::SecureServer(server) => (
+                        server.credentials.noise(),
+                        l2tunnel_security::Role::Responder,
+                    ),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "secure UDP requires distinct Noise credentials",
+                        ));
+                    }
+                };
+                if noise.profile() != session.profile || !attachment.readable_kind() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "secure UDP profile/credentials or readable attachment differ",
+                    ));
+                }
+                if noise.peers(role) != profile.peers() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "actual Noise credentials differ from transaction plan pins",
+                    ));
+                }
+                profile.runtime_contract(role)?;
+                None
+            }
         };
         if attachment.layer != connection.layer
             || profile_interval
@@ -407,3 +486,7 @@ impl Prepared {
         Ok(device)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "prepared_transaction_tests.rs"]
+mod transaction_tests;

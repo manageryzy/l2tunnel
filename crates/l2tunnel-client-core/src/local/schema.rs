@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 pub const VERSION: u16 = 1;
 /// Explicit new-profile observations/actions; never an automatic v1 downgrade.
 pub const SECURE_UDP_VERSION: u16 = 2;
+/// Explicit complete-configuration backend; never an automatic v1/v2 downgrade.
+pub const TRANSACTION_VERSION: u16 = 3;
 /// Versions understood by the bounded local transport; backends gate actions.
 pub fn supported_version(version: u16) -> bool {
-    matches!(version, VERSION | SECURE_UDP_VERSION)
+    matches!(version, VERSION | SECURE_UDP_VERSION | TRANSACTION_VERSION)
 }
 /// Supported local policy changes; peer authorization still applies separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,6 +46,11 @@ pub enum Action {
     SetSwiftPolicy {
         /// Requested values.
         policy: SwiftChange,
+    },
+    /// Negotiate one complete canonical value from the selected transaction catalog.
+    SwitchSwiftConfiguration {
+        /// Exact checked canonical bytes, without a partial-policy conversion.
+        configuration: crate::secure_udp::transaction_status::CanonicalConfiguration,
     },
     /// Request an exact policy from the session's authenticated active catalog.
     SwitchActivePolicy {
@@ -116,6 +123,9 @@ pub struct Snapshot {
     #[cfg(unix)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secure_udp: Option<crate::secure_udp::status::Status>,
+    /// Present only for explicit version3 complete-configuration observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<crate::secure_udp::transaction_status::Status>,
 }
 /// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

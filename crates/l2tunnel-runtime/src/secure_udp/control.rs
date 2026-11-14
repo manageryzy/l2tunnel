@@ -72,13 +72,13 @@ impl Settings {
                     "fragment bound cannot carry the declared whole-message ceiling",
                 ));
             }
-            messages::Owner::new(
-                settings,
-                streams::delivery_binding(binding, stream).map_err(invalid)?,
-                Duration::ZERO,
-                lifetime,
-            )
-            .map_err(invalid)?;
+            settings
+                .validate(
+                    streams::delivery_binding(binding, stream).map_err(invalid)?,
+                    Duration::ZERO,
+                    lifetime,
+                )
+                .map_err(invalid)?;
         }
         Ok(())
     }
@@ -181,6 +181,41 @@ impl Owner {
         now: Duration,
         expires: Duration,
     ) -> io::Result<Self> {
+        Self::construct(
+            base,
+            selected,
+            binding,
+            control_scope,
+            data_scope,
+            now,
+            expires,
+            None,
+        )
+    }
+
+    /// Actual three-stream ARQ backing; None unless every stream is reserved.
+    pub(crate) fn arq_storage_usage(&self) -> Option<[recovery::storage::Usage; 3]> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return None;
+        };
+        Some([
+            streamed.owners[0].arq_storage_usage()?,
+            streamed.owners[1].arq_storage_usage()?,
+            streamed.owners[2].arq_storage_usage()?,
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing contexts plus explicit per-stream backing limits.
+    fn construct(
+        base: delivery::Settings,
+        selected: Option<Settings>,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        arq_limits: Option<[recovery::storage::Limits; 3]>,
+    ) -> io::Result<Self> {
         let raw = base
             .recovery
             .max_source_bytes
@@ -191,17 +226,35 @@ impl Owner {
                 .checked_sub(now)
                 .ok_or_else(|| invalid("control already expired"))?;
             settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
+            if let Some(limits) = arq_limits {
+                // Preflight all three pool limits before allocating the first stream.
+                for (settings, limit) in settings.streams.into_iter().zip(limits) {
+                    let plan = recovery::storage::Plan::for_arq(settings.delivery.recovery)
+                        .map_err(invalid)?;
+                    if plan.capacity_bytes() > limit.capacity_bytes {
+                        return Err(invalid("control ARQ storage limit"));
+                    }
+                }
+            }
             let owners = streams::Stream::ALL
                 .into_iter()
                 .zip(settings.streams)
-                .map(|(stream, settings)| {
-                    messages::Owner::new(
-                        settings,
-                        streams::delivery_binding(binding, stream).map_err(invalid)?,
-                        now,
-                        expires,
-                    )
-                    .map_err(invalid)
+                .enumerate()
+                .map(|(index, (stream, settings))| {
+                    let stream_binding =
+                        streams::delivery_binding(binding, stream).map_err(invalid)?;
+                    match arq_limits {
+                        Some(limits) => messages::Owner::new_reserved_arq(
+                            settings,
+                            stream_binding,
+                            now,
+                            expires,
+                            limits[index],
+                        )
+                        .map_err(invalid),
+                        None => messages::Owner::new(settings, stream_binding, now, expires)
+                            .map_err(invalid),
+                    }
                 })
                 .collect::<io::Result<Vec<_>>>()?;
             let owners: [messages::Owner; 3] = owners
@@ -1039,3 +1092,7 @@ mod tests;
 #[cfg(test)]
 #[path = "control_leased_tests.rs"]
 mod leased_tests;
+
+#[cfg(test)]
+#[path = "control_storage_tests.rs"]
+mod storage_tests;

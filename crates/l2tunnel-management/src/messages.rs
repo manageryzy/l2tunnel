@@ -251,6 +251,130 @@ pub struct Owner {
     idle_actions: usize,
 }
 
+/// ARQ-only construction failure, preserving existing whole-message errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservedArqError {
+    /// Existing message, fragment or delivery validation failed.
+    Message(Error),
+    /// Actual recovery backing could not be planned or provisioned.
+    Storage(l2tunnel_recovery::storage::Error),
+}
+impl fmt::Display for ReservedArqError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(output, "reserved message ARQ error: {self:?}")
+    }
+}
+impl std::error::Error for ReservedArqError {}
+
+struct Validated {
+    fragmenter: Fragmenter,
+    reassembler: Reassembler,
+}
+impl Settings {
+    /// Allocation-free validation; this does not reserve message or ARQ backing.
+    pub fn validate(
+        self,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+    ) -> Result<(), Error> {
+        validate_settings(self, binding, now, expires).map(|_| ())
+    }
+}
+fn validate_settings(
+    settings: Settings,
+    binding: delivery::Binding,
+    now: Duration,
+    expires: Duration,
+) -> Result<Validated, Error> {
+    let maximum = settings.delivery.recovery.max_source_bytes;
+    let source_charge = DATA_HEADER_BYTES
+        .checked_add(maximum)
+        .and_then(|size| size.checked_add(settings.delivery.wire_overhead))
+        .ok_or(Error::Settings)?;
+    let ack_charge = ACK_PACKET_BYTES
+        .checked_add(settings.delivery.wire_overhead)
+        .ok_or(Error::Settings)?;
+    let incomplete_bytes = settings
+        .max_reassembly_bytes
+        .checked_sub(settings.max_message_bytes)
+        .ok_or(Error::Settings)?;
+    let lifetime =
+        u64::try_from(settings.message_lifetime.as_nanos()).map_err(|_| Error::Settings)?;
+    if !(1..=65_536).contains(&settings.max_message_bytes)
+        || !(1..=64).contains(&settings.max_outbound_messages)
+        || !(1..=64).contains(&settings.max_incomplete_messages)
+        || !(1..=4096).contains(&settings.work_per_call)
+        || settings.max_outbound_bytes == 0
+        || settings.max_outbound_bytes > 16 * 1024 * 1024
+        || settings.max_reassembly_bytes > 16 * 1024 * 1024
+        || incomplete_bytes < settings.max_message_bytes
+        || settings.max_fragments == 0
+        || lifetime == 0
+        || maximum < ACCEPTED_BYTES
+        || settings.delivery.recovery.send_records < 2
+        || settings.delivery.recovery.send_bytes
+            < maximum.checked_add(ACCEPTED_BYTES).ok_or(Error::Settings)?
+        || settings.path_mtu > 65_535
+        || source_charge > settings.path_mtu
+        || ack_charge > settings.path_mtu
+    {
+        return Err(Error::Settings);
+    }
+    now.checked_add(settings.message_lifetime)
+        .ok_or(Error::Settings)?;
+    let outer = settings
+        .delivery
+        .wire_overhead
+        .checked_add(DATA_HEADER_BYTES)
+        .and_then(|size| size.checked_add(1))
+        .ok_or(Error::Settings)?;
+    // The configured source cap, rather than spare path MTU, fixes chunk size.
+    let fragmenter = Fragmenter::new(
+        context(binding, binding.local_role),
+        FragmentConfig {
+            path_mtu: source_charge,
+            outer_overhead_bytes: outer,
+            max_message_bytes: settings.max_message_bytes,
+            max_fragments: settings.max_fragments,
+        },
+        MessageId(1),
+    )
+    .map_err(Error::Fragment)?;
+    let max_total_fragments = usize::from(settings.max_fragments)
+        .checked_mul(settings.max_incomplete_messages)
+        .ok_or(Error::Settings)?;
+    let reassembler = Reassembler::new(
+        context(
+            binding,
+            match binding.local_role {
+                Role::Client => Role::Server,
+                Role::Server => Role::Client,
+            },
+        ),
+        ReassemblyConfig {
+            max_message_bytes: settings.max_message_bytes,
+            max_messages: settings.max_incomplete_messages,
+            max_fragment_payload_bytes: u16::try_from(fragmenter.chunk_bytes())
+                .map_err(|_| Error::Settings)?,
+            max_fragments_per_message: settings.max_fragments,
+            max_total_fragments,
+            max_reserved_bytes: incomplete_bytes,
+            max_lifetime_ticks: lifetime,
+            replay_window: 65_536,
+        },
+    )
+    .map_err(Error::Fragment)?;
+    settings
+        .delivery
+        .validate(binding, now, expires)
+        .map_err(Error::Delivery)?;
+    Ok(Validated {
+        fragmenter,
+        reassembler,
+    })
+}
+
 impl Owner {
     /// Validate all immutable physical, memory, window and exact time bounds.
     pub fn new(
@@ -259,92 +383,56 @@ impl Owner {
         now: Duration,
         expires: Duration,
     ) -> Result<Self, Error> {
-        let maximum = settings.delivery.recovery.max_source_bytes;
-        let source_charge = DATA_HEADER_BYTES
-            .checked_add(maximum)
-            .and_then(|size| size.checked_add(settings.delivery.wire_overhead))
-            .ok_or(Error::Settings)?;
-        let ack_charge = ACK_PACKET_BYTES
-            .checked_add(settings.delivery.wire_overhead)
-            .ok_or(Error::Settings)?;
-        let incomplete_bytes = settings
-            .max_reassembly_bytes
-            .checked_sub(settings.max_message_bytes)
-            .ok_or(Error::Settings)?;
-        let lifetime =
-            u64::try_from(settings.message_lifetime.as_nanos()).map_err(|_| Error::Settings)?;
-        if !(1..=65_536).contains(&settings.max_message_bytes)
-            || !(1..=64).contains(&settings.max_outbound_messages)
-            || !(1..=64).contains(&settings.max_incomplete_messages)
-            || !(1..=4096).contains(&settings.work_per_call)
-            || settings.max_outbound_bytes == 0
-            || settings.max_outbound_bytes > 16 * 1024 * 1024
-            || settings.max_reassembly_bytes > 16 * 1024 * 1024
-            || incomplete_bytes < settings.max_message_bytes
-            || settings.max_fragments == 0
-            || lifetime == 0
-            || maximum < ACCEPTED_BYTES
-            || settings.delivery.recovery.send_records < 2
-            || settings.delivery.recovery.send_bytes
-                < maximum.checked_add(ACCEPTED_BYTES).ok_or(Error::Settings)?
-            || settings.path_mtu > 65_535
-            || source_charge > settings.path_mtu
-            || ack_charge > settings.path_mtu
-        {
-            return Err(Error::Settings);
-        }
-        now.checked_add(settings.message_lifetime)
-            .ok_or(Error::Settings)?;
-        let outer = settings
-            .delivery
-            .wire_overhead
-            .checked_add(DATA_HEADER_BYTES)
-            .and_then(|size| size.checked_add(1))
-            .ok_or(Error::Settings)?;
-        // The configured source cap, rather than spare path MTU, fixes chunk size.
-        let fragmenter = Fragmenter::new(
-            context(binding, binding.local_role),
-            FragmentConfig {
-                path_mtu: source_charge,
-                outer_overhead_bytes: outer,
-                max_message_bytes: settings.max_message_bytes,
-                max_fragments: settings.max_fragments,
-            },
-            MessageId(1),
-        )
-        .map_err(Error::Fragment)?;
-        let max_total_fragments = usize::from(settings.max_fragments)
-            .checked_mul(settings.max_incomplete_messages)
-            .ok_or(Error::Settings)?;
-        let reassembler = Reassembler::new(
-            context(
-                binding,
-                match binding.local_role {
-                    Role::Client => Role::Server,
-                    Role::Server => Role::Client,
-                },
-            ),
-            ReassemblyConfig {
-                max_message_bytes: settings.max_message_bytes,
-                max_messages: settings.max_incomplete_messages,
-                max_fragment_payload_bytes: u16::try_from(fragmenter.chunk_bytes())
-                    .map_err(|_| Error::Settings)?,
-                max_fragments_per_message: settings.max_fragments,
-                max_total_fragments,
-                max_reserved_bytes: incomplete_bytes,
-                max_lifetime_ticks: lifetime,
-                replay_window: 65_536,
-            },
-        )
-        .map_err(Error::Fragment)?;
+        let validated = validate_settings(settings, binding, now, expires)?;
         let service = delivery::Service::new(settings.delivery, binding, now, expires)
             .map_err(Error::Delivery)?;
-        Ok(Self {
+        Ok(Self::from_validated(
+            settings, binding, now, expires, validated, service,
+        ))
+    }
+
+    /// Reserve actual ARQ backing only; message/fragment storage remains separate.
+    pub fn new_reserved_arq(
+        settings: Settings,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+        limits: l2tunnel_recovery::storage::Limits,
+    ) -> Result<Self, ReservedArqError> {
+        let validated = validate_settings(settings, binding, now, expires)
+            .map_err(ReservedArqError::Message)?;
+        let service =
+            delivery::Service::new_reserved_arq(settings.delivery, binding, now, expires, limits)
+                .map_err(|error| match error {
+                delivery::ReservedArqError::Service(error) => {
+                    ReservedArqError::Message(Error::Delivery(error))
+                }
+                delivery::ReservedArqError::Storage(error) => ReservedArqError::Storage(error),
+            })?;
+        Ok(Self::from_validated(
+            settings, binding, now, expires, validated, service,
+        ))
+    }
+
+    /// Actual retained recovery backing; not a complete message-owner budget.
+    pub fn arq_storage_usage(&self) -> Option<l2tunnel_recovery::storage::Usage> {
+        self.service.arq_storage_usage()
+    }
+
+    fn from_validated(
+        settings: Settings,
+        binding: delivery::Binding,
+        now: Duration,
+        expires: Duration,
+        validated: Validated,
+        service: delivery::Service,
+    ) -> Self {
+        Self {
             settings,
             binding,
             service,
-            fragmenter,
-            reassembler,
+            fragmenter: validated.fragmenter,
+            reassembler: validated.reassembler,
             origin: now,
             last_now: now,
             expires,
@@ -353,14 +441,14 @@ impl Owner {
             outbound: VecDeque::new(),
             outbound_bytes: 0,
             fragment_bytes: 0,
-            source_scratch: vec![0; maximum],
+            source_scratch: vec![0; settings.delivery.recovery.max_source_bytes],
             complete: vec![0; settings.max_message_bytes],
             held: None,
             arrivals: BTreeMap::new(),
             phase: 0,
             confirmation_cursor: 0,
             idle_actions: 0,
-        })
+        }
     }
 
     /// Retain exact bytes before assigning a wire ID; identical live retries reuse it.
@@ -959,3 +1047,6 @@ fn accepted(ticket: Ticket) -> Result<[u8; ACCEPTED_BYTES], Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reserved_arq_tests;

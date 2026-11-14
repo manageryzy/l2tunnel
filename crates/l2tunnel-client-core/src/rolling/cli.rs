@@ -174,6 +174,7 @@ pub(crate) fn response(
             swift: None,
             #[cfg(unix)]
             secure_udp: None,
+            transaction: None,
         }),
     }
 }

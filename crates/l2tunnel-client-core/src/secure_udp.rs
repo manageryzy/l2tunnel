@@ -17,6 +17,8 @@ pub mod status;
 /// Explicit complete canonical transaction plan; actual driver readiness is separate.
 #[cfg(unix)]
 pub mod transaction_profile;
+/// Portable complete canonical values and truthful explicit version3 observations.
+pub mod transaction_status;
 
 use l2tunnel_core::ConfigDigest;
 use l2tunnel_cover as cover;
@@ -257,7 +259,7 @@ impl Settings {
         Ok(security::ConfigDigest(finish(hash)))
     }
 
-    fn runtime(
+    pub(crate) fn runtime(
         self,
         role: security::Role,
         peers: establish::Peers,

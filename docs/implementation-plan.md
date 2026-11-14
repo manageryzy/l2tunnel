@@ -86,7 +86,7 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
 | `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; new same-socket secure-UDP Swift/control driver has finite Unix socket/device tests |
 | `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; new explicit QUIC-header/media-like Swift selection has version2 status/control and paired-service fixtures; native qualification, other profile lifecycles, default state-retaining recovery and GUI remain open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; QUIC-header/media-like Swift has version2 status/control, and explicit generic Prepared selection adds complete-C APIv3 with paired-service fixtures; generic CLI and complete failure/resource matrices, native qualification, other profile lifecycles, default state-retaining recovery and GUI remain open |
 | `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
 | `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Status/help CLI; runtime returns nonzero |
 | `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |
@@ -148,15 +148,20 @@ and requires separate validation of any future framing/rate proposal.
 
 
 The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
-now has an explicitly selected runtime-library API in that same sole I/O loop.
-Finite Unix tests use actual original UDP sockets, maintained authentication,
-canonical H0/D0 scopes, two reserved engines and physical native writes through
-two nonzero asymmetric switches. Whole-message proofs retain the original cap;
-separate status exposes requested/current configuration and incomplete resource
-preallocation. Shared CLI/service/API selection, Driver impairment/pressure
-qualification, complete reservation, cross-profile SW-11 and broader
-carrier/lifecycle/platform/performance acceptance remain open. Existing defaults
-and strict v1/v2 bytes are preserved. No new native throughput result is claimed.
+now has explicit runtime-library and shared Prepared/service/APIv3 selection in
+that same sole I/O loop. Finite Unix tests use actual original UDP sockets,
+maintained authentication, canonical H0/D0 scopes, reserved engines and physical
+native writes through two nonzero asymmetric switches. The actual shared service
+also passes both-cover traffic, complete-C/key operations, IPC v3 status/switch,
+liveness and fresh-session reconnect with periodic reporting disabled. Actual
+observations precede successful completion; requested/current/physical values
+and incomplete resources remain distinct. All three generic control streams
+now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
+CLI selection, the complete generic IPC/negative-service/fault matrix, full
+reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
+acceptance remain open. Existing defaults and strict v1/v2 schemas are preserved;
+exact generic IPC compatibility cases remain tracked separately. No native or
+performance run was added during this functionality wave.
 
 Additional unfinished source and integration boundaries:
 

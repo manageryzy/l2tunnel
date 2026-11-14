@@ -201,6 +201,7 @@ mod service {
                 swift: None,
                 #[cfg(unix)]
                 secure_udp: None,
+                transaction: None,
                 proxy: Some(ProxySnapshot {
                     digest: self.digest.clone(),
                     drain_accepted: self.accepted,
@@ -227,6 +228,7 @@ mod service {
                 Action::SwitchCompression { .. }
                 | Action::SwitchActivePolicy { .. }
                 | Action::SetSwiftPolicy { .. }
+                | Action::SwitchSwiftConfiguration { .. }
                 | Action::Disconnect {}
                 | Action::Reconnect {}
                 | Action::DrainOpenVpn {} => Err("unsupported"),
