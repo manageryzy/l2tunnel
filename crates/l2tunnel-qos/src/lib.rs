@@ -247,6 +247,15 @@ impl fmt::Display for ScheduleError {
 
 impl std::error::Error for ScheduleError {}
 
+/// Selected-head refusal before service, preserving scheduler error categories.
+#[derive(Debug, Eq, PartialEq)]
+pub enum OfferError<E> {
+    /// Defensive scheduling or checked-arithmetic failure before admission.
+    Schedule(ScheduleError),
+    /// Downstream admission error; the selected payload remains retained.
+    Downstream(E),
+}
+
 /// One selected packet; selection is not a grant of path congestion allowance.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ScheduledPacket {
@@ -472,15 +481,86 @@ impl Scheduler {
     /// A failed external credit commit can leave the selection and payload intact.
     /// Successful queue/flow mutation requires a fresh peek before calling again.
     pub fn dequeue_peeked(&mut self) -> Result<Option<ScheduledPacket>, ScheduleError> {
+        match self.offer_selected(|_, _| Ok::<_, std::convert::Infallible>(Some(()))) {
+            Ok(packet) => Ok(packet.map(|(packet, ())| packet)),
+            Err(OfferError::Schedule(error)) => Err(error),
+            Err(OfferError::Downstream(never)) => match never {},
+        }
+    }
+
+    /// Offer the actual selected bytes without another eligibility scan or debit.
+    ///
+    /// Selection retains the existing DRR traversal/credit semantics. `None` or
+    /// an error from downstream keeps that selection and original FIFO allocation;
+    /// only `Some` spends the preflighted service charge and transfers ownership.
+    pub fn offer_selected<T, E>(
+        &mut self,
+        offer: impl FnOnce(PacketHead, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<(ScheduledPacket, T)>, OfferError<E>> {
+        let schedule = OfferError::Schedule;
         let Some(selected) = self.selected else {
             return Ok(None);
         };
-        if self.peek_visit()? != Some(selected) {
-            return Err(ScheduleError::Invariant);
+        if self.peek_visit().map_err(schedule)? != Some(selected) {
+            return Err(schedule(ScheduleError::Invariant));
         }
-        let packet = self.serve_visit()?.ok_or(ScheduleError::Invariant)?;
+        let flow = self
+            .flows
+            .get_mut(&selected.flow)
+            .ok_or_else(|| schedule(ScheduleError::Invariant))?;
+        let length = selected.packet_bytes;
+        if length == 0 {
+            return Err(schedule(ScheduleError::Invariant));
+        }
+        let charge = u64::try_from(length).map_err(|_| schedule(ScheduleError::Arithmetic))?;
+        let deficit = flow
+            .deficit
+            .checked_sub(charge)
+            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+        let flow_bytes = flow
+            .bytes
+            .checked_sub(length)
+            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+        let queued_bytes = self
+            .queued_bytes
+            .checked_sub(length)
+            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+        let queued_packets = self
+            .queued_packets
+            .checked_sub(1)
+            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+        let last = flow.packets.len() == 1;
+        if last != (flow_bytes == 0) || (queued_packets == 0) != (queued_bytes == 0) {
+            return Err(schedule(ScheduleError::Invariant));
+        }
+        let front = flow
+            .packets
+            .front_mut()
+            .ok_or_else(|| schedule(ScheduleError::Invariant))?;
+        let Some(token) = offer(selected, front).map_err(OfferError::Downstream)? else {
+            return Ok(None);
+        };
+        let payload = std::mem::take(front);
+        flow.packets.pop_front();
+        flow.deficit = deficit;
+        flow.bytes = flow_bytes;
+        self.queued_bytes = queued_bytes;
+        self.queued_packets = queued_packets;
+        if last {
+            flow.deficit = 0;
+            flow.packets = VecDeque::new();
+            self.active.pop_front();
+            self.in_visit = false;
+        }
         self.selected = None;
-        Ok(Some(packet))
+        Ok(Some((
+            ScheduledPacket {
+                flow: selected.flow,
+                class: selected.class,
+                payload: payload.into_vec(),
+            },
+            token,
+        )))
     }
 
     /// Payload bytes retained inside this scheduler, excluding downstream queues.
@@ -579,44 +659,6 @@ impl Scheduler {
         )
     }
 
-    fn serve_visit(&mut self) -> Result<Option<ScheduledPacket>, ScheduleError> {
-        let id = *self.active.front().ok_or(ScheduleError::Invariant)?;
-        let flow = self.flows.get_mut(&id).ok_or(ScheduleError::Invariant)?;
-        let length = flow.packets.front().ok_or(ScheduleError::Invariant)?.len();
-        let charge = u64::try_from(length).map_err(|_| ScheduleError::Arithmetic)?;
-        if charge > flow.deficit {
-            return Ok(None);
-        }
-        let payload = flow.packets.pop_front().ok_or(ScheduleError::Invariant)?;
-        flow.deficit = flow
-            .deficit
-            .checked_sub(charge)
-            .ok_or(ScheduleError::Arithmetic)?;
-        flow.bytes = flow
-            .bytes
-            .checked_sub(length)
-            .ok_or(ScheduleError::Arithmetic)?;
-        self.queued_bytes = self
-            .queued_bytes
-            .checked_sub(length)
-            .ok_or(ScheduleError::Arithmetic)?;
-        self.queued_packets = self
-            .queued_packets
-            .checked_sub(1)
-            .ok_or(ScheduleError::Arithmetic)?;
-        if flow.packets.is_empty() {
-            flow.deficit = 0;
-            flow.packets = VecDeque::new();
-            self.active.pop_front();
-            self.in_visit = false;
-        }
-        Ok(Some(ScheduledPacket {
-            flow: id,
-            class: flow.class,
-            payload: payload.into_vec(),
-        }))
-    }
-
     fn skip_empty_rounds(&mut self) -> Result<(), ScheduleError> {
         let mut next_round = u64::MAX;
         for id in &self.active {
@@ -661,6 +703,9 @@ fn weighted_quantum(config: SchedulerConfig, class_weight: u32, flow_weight: u32
 
 #[cfg(test)]
 mod validation_tests;
+
+#[cfg(test)]
+mod handoff_tests;
 
 #[cfg(test)]
 mod tests {

@@ -31,6 +31,7 @@ The next common-session foundation is tracked by
 [fallible control wrapper storage](modules/control-wrapper-storage.md),
 [complete configuration encoding](modules/transaction-configuration-encoding.md),
 [common configuration](modules/record-configuration.md),
+[transactional queue handoff](modules/record-admission-handoff.md),
 [common engine prerequisites](modules/common-record-engine.md) and
 [in-session fresh-DH](modules/session-refresh.md).
 Their leaf evidence does not close full SW-11, complete resource admission or
@@ -303,6 +304,7 @@ does not qualify generic switching, other record profiles or full SW-11.
 | Complete configuration wire bounds | TCE-01..TCE-05 | [Explicit encoding](modules/transaction-configuration-encoding.md) | actual typed limits/Peer/lease; selected runtime/resource/API integration remains open |
 | Complete directional record policies | RCF-01..RCF-06 | [Canonical record configuration](modules/record-configuration.md) | complete field-preserving values/catalogs; representation does not install a runtime capability |
 | Common record engine composition | CRE-01..CRE-08 | [Actual-owner adapter](modules/common-record-engine.md) | shared scalar prerequisite tested; actual engines/MUX/fences/storage/Driver composition remains open |
+| Actual transactional queue admission | RAH-01..RAH-06 | [MUX/DRR/Pipeline handoff](modules/record-admission-handoff.md) | actual shared queues pass49 local protocol tests; real-profile Engine, complete resources and runtime/native integration remain open |
 | Authenticated fresh-DH lifecycle | SREF-01..SREF-08 | [Session refresh](modules/session-refresh.md) | real selected initial/refresh authority, continuing counters/replay; runtime and retained recovery remain separate |
 | TUN active flow control and QoS | FC-01..FC-25 | [Flow control](flow-control.md) | bounded records, authenticated feedback; TCP proxy needs owned TCP legs |
 | Internal L2 management/reload | MG-01..MG-08 | [Management protocol](overlay-and-carriers.md) | authenticated session; stable control framing before hot data modes |

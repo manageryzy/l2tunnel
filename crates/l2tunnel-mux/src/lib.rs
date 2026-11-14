@@ -1,6 +1,7 @@
 //! Bounded FIFO-per-channel admission with round-robin service.
 //! Frame classification and negotiated connection mapping remain planned.
 use std::collections::VecDeque;
+use std::convert::Infallible;
 
 /// Admission failure returns ownership of the rejected frame.
 #[derive(Debug, Eq, PartialEq)]
@@ -10,6 +11,24 @@ pub enum AdmissionError {
     /// Shared byte/count budget exhausted or empty frame.
     Budget(Vec<u8>),
 }
+
+/// Refusal before ownership transfer, or the downstream admission error.
+#[derive(Debug, Eq, PartialEq)]
+pub enum OfferError<E> {
+    /// Channel outside the configured pool.
+    Channel,
+    /// Empty frame or the configured byte/count bound cannot admit it.
+    Budget,
+    /// Borrowed transit requires an entirely empty MUX owner.
+    Busy,
+    /// Defensive internal queue/accounting inconsistency.
+    Invariant,
+    /// Downstream refused without transferring this queue's ownership.
+    Downstream(E),
+}
+
+/// One original queued frame and the downstream's actual admission token.
+pub type Offered<T> = (u16, Vec<u8>, T);
 
 /// One direction's shared queue for all user frames, including measurements.
 pub struct Mux {
@@ -54,23 +73,106 @@ impl Mux {
     }
     /// Release one frame when downstream capacity is available.
     pub fn pop(&mut self) -> Option<(u16, Vec<u8>)> {
-        for _ in 0..self.lanes.len() {
-            let index = self.next;
-            self.next = (self.next + 1) % self.lanes.len();
-            if let Some(frame) = self.lanes[index].pop_front() {
-                self.queued_bytes -= frame.len();
-                self.queued_frames -= 1;
-                // Constructor bounds index to 0..256.
-                return Some((index as u16, frame.into_vec()));
-            }
+        match self.offer_front(|_, _| Ok::<_, Infallible>(Some(()))) {
+            Ok(packet) => packet.map(|(channel, bytes, ())| (channel, bytes)),
+            Err(OfferError::Downstream(never)) => match never {},
+            Err(_) => None,
         }
-        None
+    }
+
+    /// Offer the actual RR head, retaining its allocation and cursor on refusal.
+    ///
+    /// `Some` commits exactly one original frame. The callback must return `None`
+    /// only if it admitted nothing; arbitrary downstream side effects cannot be undone.
+    pub fn offer_front<T, E>(
+        &mut self,
+        offer: impl FnOnce(u16, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<Offered<T>>, OfferError<E>> {
+        if self.lanes.is_empty() || self.lanes.len() > 256 || self.next >= self.lanes.len() {
+            return Err(OfferError::Invariant);
+        }
+        let mut index = self.next;
+        for _ in 0..self.lanes.len() {
+            let next = (index + 1) % self.lanes.len();
+            if let Some(frame) = self.lanes[index].front_mut() {
+                if frame.is_empty()
+                    || self.queued_bytes > self.byte_limit
+                    || self.queued_frames > self.frame_limit
+                {
+                    return Err(OfferError::Invariant);
+                }
+                let bytes = self
+                    .queued_bytes
+                    .checked_sub(frame.len())
+                    .ok_or(OfferError::Invariant)?;
+                let frames = self
+                    .queued_frames
+                    .checked_sub(1)
+                    .ok_or(OfferError::Invariant)?;
+                if (frames == 0) != (bytes == 0) {
+                    return Err(OfferError::Invariant);
+                }
+                // Constructor and the layout check bound the exact channel to u16.
+                let channel = index as u16;
+                let Some(token) = offer(channel, frame).map_err(OfferError::Downstream)? else {
+                    return Ok(None);
+                };
+                let payload = std::mem::take(frame);
+                self.lanes[index].pop_front();
+                self.queued_bytes = bytes;
+                self.queued_frames = frames;
+                self.next = next;
+                return Ok(Some((channel, payload.into_vec(), token)));
+            }
+            index = next;
+        }
+        if self.queued_bytes != 0 || self.queued_frames != 0 {
+            return Err(OfferError::Invariant);
+        }
+        Ok(None)
+    }
+
+    /// Offer bytes retained by the upstream owner through this empty MUX policy.
+    ///
+    /// No queue or payload allocation is made. Success leaves the same empty
+    /// counters and eventual RR cursor as immediate push/pop of this channel.
+    pub fn offer_selected<T, E>(
+        &mut self,
+        channel: u16,
+        bytes: &[u8],
+        offer: impl FnOnce(u16, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, OfferError<E>> {
+        let index = usize::from(channel);
+        if index >= self.lanes.len() {
+            return Err(OfferError::Channel);
+        }
+        if self.lanes.len() > 256 || self.next >= self.lanes.len() {
+            return Err(OfferError::Invariant);
+        }
+        if bytes.is_empty() || bytes.len() > self.byte_limit || self.frame_limit == 0 {
+            return Err(OfferError::Budget);
+        }
+        if self.queued_bytes != 0
+            || self.queued_frames != 0
+            || self.lanes.iter().any(|lane| !lane.is_empty())
+        {
+            return Err(OfferError::Busy);
+        }
+        let next = (index + 1) % self.lanes.len();
+        let token = offer(channel, bytes).map_err(OfferError::Downstream)?;
+        if token.is_some() {
+            self.next = next;
+        }
+        Ok(token)
     }
     /// Payload bytes retained in the shared queue.
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
 }
+
+#[cfg(test)]
+mod handoff_tests;
 
 #[cfg(test)]
 mod tests {

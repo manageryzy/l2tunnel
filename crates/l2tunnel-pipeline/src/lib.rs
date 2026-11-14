@@ -469,28 +469,11 @@ impl Pipeline {
     ///
     /// TUN selects all flows as eligible; use `dequeue_with` for external credit.
     pub fn dequeue(&mut self) -> Result<Option<Packet>, PipelineError> {
-        if self.qos.is_some() {
-            return match self.dequeue_with(|_| true, |_| Ok::<(), Infallible>(())) {
-                Ok(value) => Ok(value.map(|admitted| admitted.packet)),
-                Err(DequeueError::Pipeline(error)) => Err(error),
-                Err(DequeueError::Commit(never)) => match never {},
-            };
+        match self.offer_front(|_, _| Ok::<_, Infallible>(Some(()))) {
+            Ok(value) => Ok(value.map(|admitted| admitted.packet)),
+            Err(DequeueError::Pipeline(error)) => Err(error),
+            Err(DequeueError::Commit(never)) => match never {},
         }
-        let Some((channel, payload)) = self.mux.pop() else {
-            return if self.usage.packets == 0 {
-                Ok(None)
-            } else {
-                Err(PipelineError::Invariant)
-            };
-        };
-        let metadata = self.channel_metadata[usize::from(channel)]
-            .pop_front()
-            .ok_or(PipelineError::Invariant)?;
-        if self.channel_metadata[usize::from(channel)].is_empty() {
-            self.channel_metadata[usize::from(channel)] = VecDeque::new();
-        }
-        self.finish(metadata.classification.key, payload.len())?;
-        Ok(Some(Packet { payload, metadata }))
     }
 
     /// Skip credit-blocked TUN heads, then commit only the selected packet.
@@ -502,13 +485,95 @@ impl Pipeline {
     /// rejects this operation so custom per-flow policy is never silently enabled.
     pub fn dequeue_with<T, E, F, C>(
         &mut self,
-        mut eligible: F,
+        eligible: F,
         commit: C,
     ) -> Result<Option<Admitted<T>>, DequeueError<E>>
     where
         F: FnMut(Candidate) -> bool,
         C: FnOnce(Candidate) -> Result<T, E>,
     {
+        self.offer_with(eligible, |metadata, bytes| {
+            commit(Candidate {
+                key: metadata.classification.key,
+                binding: metadata.binding,
+                packet_bytes: bytes.len(),
+            })
+            .map(Some)
+        })
+    }
+
+    /// Offer exact retained bytes and metadata, using TAP RR or all-eligible TUN.
+    ///
+    /// `None` or a downstream error retains the actual allocation and accounting.
+    /// `Some` transfers the original packet and the returned admission token once.
+    pub fn offer_front<T, E>(
+        &mut self,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<Admitted<T>>, DequeueError<E>> {
+        if self.qos.is_some() {
+            return self.offer_with(|_| true, offer);
+        }
+        let states = &mut self.states;
+        let by_id = &self.by_id;
+        let channel_metadata = &mut self.channel_metadata;
+        let usage = &mut self.usage;
+        let mut entered = false;
+        let selected = self
+            .mux
+            .offer_front(|channel, bytes| {
+                entered = true;
+                let error = || DequeueError::Pipeline(PipelineError::Invariant);
+                let metadata_queue = channel_metadata
+                    .get_mut(usize::from(channel))
+                    .ok_or_else(error)?;
+                let metadata = *metadata_queue.front().ok_or_else(error)?;
+                let key = metadata.classification.key;
+                let state = states.get_mut(&key).ok_or_else(error)?;
+                if metadata.binding.channel != channel
+                    || state.snapshot.binding != metadata.binding
+                    || by_id.get(&metadata.binding.id) != Some(&key)
+                    || metadata.classification.observed_bytes != bytes.len()
+                {
+                    return Err(error());
+                }
+                let flow_usage = subtract_usage(state.snapshot.queued, bytes.len())
+                    .map_err(DequeueError::Pipeline)?;
+                let total_usage =
+                    subtract_usage(*usage, bytes.len()).map_err(DequeueError::Pipeline)?;
+                let Some(token) = offer(metadata, bytes).map_err(DequeueError::Commit)? else {
+                    return Ok(None);
+                };
+                metadata_queue.pop_front();
+                if metadata_queue.is_empty() {
+                    *metadata_queue = VecDeque::new();
+                }
+                state.snapshot.queued = flow_usage;
+                *usage = total_usage;
+                Ok(Some((metadata, token)))
+            })
+            .map_err(mux_offer_error)?;
+        match selected {
+            Some((_, payload, (metadata, permit))) => Ok(Some(Admitted {
+                packet: Packet { payload, metadata },
+                permit,
+            })),
+            None if !entered && self.usage != QueueUsage::default() => {
+                Err(DequeueError::Pipeline(PipelineError::Invariant))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Select an eligible TUN head, then offer its exact retained bytes once.
+    ///
+    /// Eligibility retains existing DRR traversal semantics. Downstream refusal
+    /// spends no service debit and does not move bytes through a second queue.
+    /// TAP rejects this per-flow policy before either callback is entered.
+    pub fn offer_with<T, E>(
+        &mut self,
+        mut eligible: impl FnMut(Candidate) -> bool,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<Admitted<T>>, DequeueError<E>> {
         let error = DequeueError::Pipeline;
         let qos = self
             .qos
@@ -546,55 +611,59 @@ impl Pipeline {
             .ok_or_else(|| error(PipelineError::Invariant))?;
         let state = self
             .states
-            .get(&key)
+            .get_mut(&key)
             .ok_or_else(|| error(PipelineError::Invariant))?;
         let classification = *state
             .metadata
             .front()
             .ok_or_else(|| error(PipelineError::Invariant))?;
-        let candidate = Candidate {
-            key,
+        let metadata = PacketMetadata {
+            classification,
             binding: state.snapshot.binding,
-            packet_bytes: head.packet_bytes,
         };
-        if classification.observed_bytes != head.packet_bytes
-            || state.snapshot.queued.bytes < head.packet_bytes
-            || state.snapshot.queued.packets == 0
-            || self.usage.bytes < head.packet_bytes
-            || self.usage.packets == 0
-            || self.mux.queued_bytes() != 0
+        if classification.key != key
+            || classification.observed_bytes != head.packet_bytes
+            || metadata.binding.id != FlowId(head.flow.value())
+            || self.by_id.get(&metadata.binding.id) != Some(&key)
+            || state.metadata.len() != state.snapshot.queued.packets
         {
             return Err(error(PipelineError::Invariant));
         }
-        let permit = commit(candidate).map_err(DequeueError::Commit)?;
-        // All handoff operations were prevalidated; this actor owns every component.
+        let flow_usage = subtract_usage(state.snapshot.queued, head.packet_bytes).map_err(error)?;
+        let total_usage = subtract_usage(self.usage, head.packet_bytes).map_err(error)?;
+        let mux = &mut self.mux;
+        let usage = &mut self.usage;
         let selected = qos
-            .dequeue_peeked()
-            .map_err(|source| error(PipelineError::Schedule(source)))?
-            .ok_or_else(|| error(PipelineError::Invariant))?;
-        self.mux
-            .push(candidate.binding.channel, selected.payload)
-            .map_err(|_| error(PipelineError::Invariant))?;
-        let (channel, payload) = self
-            .mux
-            .pop()
-            .ok_or_else(|| error(PipelineError::Invariant))?;
-        if channel != candidate.binding.channel {
-            return Err(error(PipelineError::Invariant));
-        }
-        self.states
-            .get_mut(&key)
-            .ok_or_else(|| error(PipelineError::Invariant))?
-            .metadata
-            .pop_front();
-        self.finish(key, payload.len()).map_err(error)?;
-        Ok(Some(Admitted {
+            .offer_selected(|actual, bytes| {
+                if actual != head {
+                    return Err(error(PipelineError::Invariant));
+                }
+                let admitted = mux
+                    .offer_selected(metadata.binding.channel, bytes, |_, bytes| {
+                        offer(metadata, bytes).map_err(DequeueError::Commit)
+                    })
+                    .map_err(mux_offer_error)?;
+                let Some(token) = admitted else {
+                    return Ok(None);
+                };
+                state.metadata.pop_front();
+                if state.metadata.is_empty() {
+                    state.metadata = VecDeque::new();
+                }
+                state.snapshot.queued = flow_usage;
+                *usage = total_usage;
+                Ok(Some(token))
+            })
+            .map_err(|source| match source {
+                l2tunnel_qos::OfferError::Schedule(source) => {
+                    error(PipelineError::Schedule(source))
+                }
+                l2tunnel_qos::OfferError::Downstream(source) => source,
+            })?;
+        Ok(selected.map(|(selected, permit)| Admitted {
             packet: Packet {
-                payload,
-                metadata: PacketMetadata {
-                    classification,
-                    binding: candidate.binding,
-                },
+                payload: selected.payload,
+                metadata,
             },
             permit,
         }))
@@ -807,36 +876,30 @@ impl Pipeline {
         };
         Ok((total, per_flow))
     }
+}
 
-    fn finish(&mut self, key: FlowKey, length: usize) -> Result<(), PipelineError> {
-        let state = self.states.get_mut(&key).ok_or(PipelineError::Invariant)?;
-        state.snapshot.queued.bytes = state
-            .snapshot
-            .queued
-            .bytes
-            .checked_sub(length)
-            .ok_or(PipelineError::Invariant)?;
-        state.snapshot.queued.packets = state
-            .snapshot
-            .queued
-            .packets
-            .checked_sub(1)
-            .ok_or(PipelineError::Invariant)?;
-        self.usage.bytes = self
-            .usage
-            .bytes
-            .checked_sub(length)
-            .ok_or(PipelineError::Invariant)?;
-        self.usage.packets = self
-            .usage
-            .packets
-            .checked_sub(1)
-            .ok_or(PipelineError::Invariant)?;
-        if state.metadata.is_empty() {
-            state.metadata = VecDeque::new();
-        }
-        Ok(())
+fn mux_offer_error<E>(source: l2tunnel_mux::OfferError<DequeueError<E>>) -> DequeueError<E> {
+    match source {
+        l2tunnel_mux::OfferError::Downstream(error) => error,
+        _ => DequeueError::Pipeline(PipelineError::Invariant),
     }
+}
+
+fn subtract_usage(old: QueueUsage, length: usize) -> Result<QueueUsage, PipelineError> {
+    if length == 0 {
+        return Err(PipelineError::Invariant);
+    }
+    let remaining = QueueUsage {
+        bytes: old
+            .bytes
+            .checked_sub(length)
+            .ok_or(PipelineError::Invariant)?,
+        packets: old.packets.checked_sub(1).ok_or(PipelineError::Invariant)?,
+    };
+    if (remaining.packets == 0) != (remaining.bytes == 0) {
+        return Err(PipelineError::Invariant);
+    }
+    Ok(remaining)
 }
 
 const TUN_CLASSES: [ClassConfig; 1] = [ClassConfig {
@@ -890,3 +953,6 @@ mod tests;
 
 #[cfg(test)]
 mod validation_tests;
+
+#[cfg(test)]
+mod handoff_tests;
