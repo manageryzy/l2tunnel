@@ -221,7 +221,7 @@ impl Driver {
         let required_bytes = plan.required_bytes;
         let (control, buffers, native, inputs, external) =
             plan.provision(contract.settings().retained_bytes, |plan| {
-                let control = control_owner::Owner::new_leased_reserved_messages(
+                let control = control_owner::Owner::new_leased_reserved_messages_with_wrapper_plan(
                     config.control,
                     selected,
                     binding,
@@ -233,6 +233,10 @@ impl Driver {
                         .map(|message| l2tunnel_management::messages::storage::Limits {
                             capacity_bytes: message.capacity_bytes(),
                         }),
+                    plan.wrapper,
+                    control_owner::wrapper_storage::Limits {
+                        capacity_bytes: plan.wrapper.capacity_bytes(),
+                    },
                 )?;
                 let usage = control
                     .message_storage_usage()
@@ -254,8 +258,15 @@ impl Driver {
                         })
                     },
                 )?;
-                let wrapper_capacity = control.wrapper_capacity_bytes()?;
-                if wrapper_capacity != plan.wrapper_bytes {
+                let wrapper_usage = control
+                    .wrapper_storage_usage()?
+                    .ok_or_else(|| protocol("generic control wrapper storage is not reserved"))?;
+                let wrapper_capacity = wrapper_usage.capacity_bytes;
+                if wrapper_capacity != plan.wrapper.capacity_bytes()
+                    || wrapper_usage.limit_bytes != plan.wrapper.capacity_bytes()
+                    || wrapper_usage.allocations != 6
+                    || control.wrapper_capacity_bytes()? != wrapper_capacity
+                {
                     return Err(protocol("actual control wrapper differs from its plan"));
                 }
                 let buffer_capacity = plan.buffers.capacity_bytes();

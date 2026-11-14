@@ -225,6 +225,7 @@ struct Flight {
 #[derive(Debug)]
 struct Engine {
     config: ArqConfig,
+    receive_config: ArqConfig,
     context: RecoveryContext,
     profile: Profile,
     sent: Sent,
@@ -324,7 +325,17 @@ impl SelectiveRepeat {
         context: RecoveryContext,
         limits: crate::storage::Limits,
     ) -> Result<Self, crate::storage::Error> {
-        let plan = crate::storage::Plan::for_arq(config)?;
+        Self::new_duplex_reserved(config, config, context, limits)
+    }
+
+    /// Reserve one actual owner using complete independent data-direction policies.
+    pub fn new_duplex_reserved(
+        send: ArqConfig,
+        receive: ArqConfig,
+        context: RecoveryContext,
+        limits: crate::storage::Limits,
+    ) -> Result<Self, crate::storage::Error> {
+        let plan = crate::storage::DuplexPlan::for_arq(send, receive)?;
         if plan.capacity_bytes() > limits.capacity_bytes {
             return Err(crate::storage::Error::Limit {
                 required: plan.capacity_bytes(),
@@ -332,8 +343,9 @@ impl SelectiveRepeat {
             });
         }
         let mut allocation = crate::storage::Allocation::new(limits.capacity_bytes);
-        Ok(Self(Engine::new_reserved(
-            config,
+        Ok(Self(Engine::new_duplex_reserved(
+            send,
+            receive,
             context,
             &mut allocation,
         )?))
@@ -391,7 +403,16 @@ macro_rules! engine_api {
         impl $engine {
             /// Construct an empty engine with independent bounded direction state.
             pub fn new(config: ArqConfig, context: RecoveryContext) -> Result<Self, RecoveryError> {
-                Ok(Self(Engine::new(config, context, $profile)?))
+                Self::new_duplex(config, config, context)
+            }
+
+            /// Use complete send and receive data-direction policies in one owner.
+            pub fn new_duplex(
+                send: ArqConfig,
+                receive: ArqConfig,
+                context: RecoveryContext,
+            ) -> Result<Self, RecoveryError> {
+                Ok(Self(Engine::new_duplex(send, receive, context, $profile)?))
             }
 
             /// Snapshot of the sole source allocator, valid until the next successful submit.
@@ -407,7 +428,18 @@ macro_rules! engine_api {
 
             /// Largest packet the caller must be able to hold for this instance.
             pub fn max_packet_bytes(&self) -> usize {
+                self.send_max_packet_bytes()
+                    .max(self.receive_max_packet_bytes())
+            }
+
+            /// Exact local output buffer ceiling, including fixed feedback.
+            pub fn send_max_packet_bytes(&self) -> usize {
                 (DATA_HEADER_BYTES + self.0.config.max_source_bytes).max(ACK_PACKET_BYTES)
+            }
+
+            /// Exact peer packet ceiling; never replaced by the send maximum.
+            pub fn receive_max_packet_bytes(&self) -> usize {
+                (DATA_HEADER_BYTES + self.0.receive_config.max_source_bytes).max(ACK_PACKET_BYTES)
             }
 
             /// Saturating diagnostic counters for emitted/received/delivered work.
@@ -611,12 +643,22 @@ impl Drop for Construction {
 }
 
 impl Engine {
+    #[cfg(test)]
     fn new_reserved(
         config: ArqConfig,
         context: RecoveryContext,
         allocation: &mut crate::storage::Allocation,
     ) -> Result<Self, crate::storage::Error> {
-        let plan = crate::storage::Plan::for_arq(config)?;
+        Self::new_duplex_reserved(config, config, context, allocation)
+    }
+
+    fn new_duplex_reserved(
+        config: ArqConfig,
+        receive: ArqConfig,
+        context: RecoveryContext,
+        allocation: &mut crate::storage::Allocation,
+    ) -> Result<Self, crate::storage::Error> {
+        let plan = crate::storage::DuplexPlan::for_arq(config, receive)?;
         let mut construction = Construction::new(allocation);
         construction.sent = allocation.vec::<SendSlot>(config.send_records)?;
         #[cfg(test)]
@@ -628,7 +670,7 @@ impl Engine {
                 &construction.sent,
             );
         }
-        construction.received = allocation.vec::<ReceiveSlot>(config.receive_records)?;
+        construction.received = allocation.vec::<ReceiveSlot>(receive.receive_records)?;
         #[cfg(test)]
         {
             construction.metadata[1] = Some(allocation.usage().allocations);
@@ -660,10 +702,10 @@ impl Engine {
                 );
             }
         }
-        for _ in 0..config.receive_records {
+        for _ in 0..receive.receive_records {
             construction.received.push(ReceiveSlot {
                 source: None,
-                payload: allocation.vec::<u8>(config.max_source_bytes)?,
+                payload: allocation.vec::<u8>(receive.max_source_bytes)?,
             });
             #[cfg(test)]
             {
@@ -678,13 +720,13 @@ impl Engine {
         }
         let usage = allocation.usage();
         if usage.capacity_bytes != plan.capacity_bytes()
-            || usage.allocations != 2 + config.send_records + config.receive_records
+            || usage.allocations != 2 + config.send_records + receive.receive_records
         {
             return Err(crate::storage::Error::Invariant);
         }
         let (sent, received) = construction.publish();
         Ok(Self::from_backing(
-            config,
+            (config, receive),
             context,
             Profile::Selective,
             sent,
@@ -693,14 +735,16 @@ impl Engine {
         ))
     }
 
-    fn new(
+    fn new_duplex(
         config: ArqConfig,
+        receive: ArqConfig,
         context: RecoveryContext,
         profile: Profile,
     ) -> Result<Self, RecoveryError> {
         config.validate()?;
+        receive.validate()?;
         Ok(Self::from_backing(
-            config,
+            (config, receive),
             context,
             profile,
             Sent::Legacy(BTreeMap::new()),
@@ -710,15 +754,17 @@ impl Engine {
     }
 
     fn from_backing(
-        config: ArqConfig,
+        configs: (ArqConfig, ArqConfig),
         context: RecoveryContext,
         profile: Profile,
         sent: Sent,
         received: Received,
         storage_usage: Option<crate::storage::Usage>,
     ) -> Self {
+        let (config, receive_config) = configs;
         Self {
             config,
+            receive_config,
             context,
             profile,
             sent,
@@ -789,7 +835,7 @@ impl Engine {
             packet,
             self.context,
             self.profile,
-            self.config.max_source_bytes,
+            self.receive_config.max_source_bytes,
         )?;
         match parsed {
             PacketView::Data { source, payload } => self.receive_source(source, payload, now)?,
@@ -807,7 +853,7 @@ impl Engine {
     ) -> Result<(), RecoveryError> {
         let ack_at = if self.profile == Profile::Selective {
             Some(
-                now.checked_add(self.config.ack_delay)
+                now.checked_add(self.receive_config.ack_delay)
                     .ok_or(RecoveryError::TimeOverflow)?,
             )
         } else {
@@ -829,14 +875,16 @@ impl Engine {
         if self.profile == Profile::CarrierOnly && source.0 != self.receive_prefix {
             return Err(RecoveryError::UnexpectedSequence);
         }
-        if source.0 - self.deliver_next >= self.config.receive_records as u64 {
+        if source.0 - self.deliver_next >= self.receive_config.receive_records as u64 {
             return Err(RecoveryError::SequenceWindow);
         }
         let bytes = self
             .receive_bytes
             .checked_add(payload.len())
             .ok_or(RecoveryError::CounterExhausted)?;
-        if self.received.len() >= self.config.receive_records || bytes > self.config.receive_bytes {
+        if self.received.len() >= self.receive_config.receive_records
+            || bytes > self.receive_config.receive_bytes
+        {
             return Err(RecoveryError::Capacity(BufferSide::Receive));
         }
         self.received.insert_payload(source, payload)?;
@@ -1140,6 +1188,8 @@ fn parse(
     }
 }
 
+#[cfg(test)]
+mod directional_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

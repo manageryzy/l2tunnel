@@ -103,6 +103,19 @@ fn capacities(engine: &Engine) -> [usize; 8] {
     ]
 }
 
+fn pointers(engine: &Engine) -> [usize; 8] {
+    [
+        engine.senders.as_ptr() as usize,
+        engine.receivers.as_ptr() as usize,
+        engine.compressors.as_ptr() as usize,
+        engine.decompressors.as_ptr() as usize,
+        engine.body.as_ptr() as usize,
+        engine.block.as_ptr() as usize,
+        engine.native.as_ptr() as usize,
+        engine.record.as_ptr() as usize,
+    ]
+}
+
 fn extracted(engine: &mut Engine) -> Result<Option<(NativeIdentity, Vec<u8>)>, Error> {
     Ok(engine
         .pop_identified()?
@@ -119,6 +132,7 @@ fn actual_duplex_engines_match_legacy_bytes_identities_and_counters_under_loss()
     old[1].replace_receive(forward, RecordNumber(0))?;
     let mut new = [reserved(forward, reverse)?, reserved(reverse, forward)?];
     let original_capacities = [capacities(&new[0]), capacities(&new[1])];
+    let original_pointers = [pointers(&new[0]), pointers(&new[1])];
     let packets = [
         (0..120).map(|i| native(i, false)).collect::<Vec<_>>(),
         (0..90).map(|i| native(i, true)).collect::<Vec<_>>(),
@@ -137,7 +151,12 @@ fn actual_duplex_engines_match_legacy_bytes_identities_and_counters_under_loss()
         for side in 0..2 {
             if let Some(packet) = packets[side].get(admitted[side]) {
                 let a = old[side].offer_identified(now, packet)?;
-                let b = new[side].offer_identified(now, packet)?;
+                let channel = ChannelId::new(crate::flow::classify_ip(
+                    packet,
+                    new[side].send_config().channels,
+                ))
+                .ok_or(Error::Configuration)?;
+                let b = new[side].offer_on_channel_identified(now, channel, packet)?;
                 assert_eq!(a, b);
                 if let IdentifiedAdmission::Accepted(identity) = a {
                     assert!(
@@ -151,9 +170,17 @@ fn actual_duplex_engines_match_legacy_bytes_identities_and_counters_under_loss()
                     admitted[side] += 1;
                 }
             }
-            let number = RecordNumber(tick * 2 + side as u64);
+            let number = RecordNumber((1 << 40) + tick * 2 + side as u64);
             let a = old[side].poll(now, number, true)?.map(<[u8]>::to_vec);
-            let b = new[side].poll(now, number, true)?.map(<[u8]>::to_vec);
+            let b = new[side].poll_emission(now, number, true)?.map(|emission| {
+                let expected_kind = match emission.kind() {
+                    EmissionKind::Source => crate::KIND_SOURCE,
+                    EmissionKind::Repair => crate::KIND_REPAIR,
+                    EmissionKind::Feedback => crate::KIND_FEEDBACK,
+                };
+                assert_eq!(emission.body()[0] & crate::KIND_MASK, expected_kind);
+                emission.body().to_vec()
+            });
             assert_eq!(a, b);
             if let Some(body) = a
                 && number.0 % 17 != 5
@@ -192,6 +219,7 @@ fn actual_duplex_engines_match_legacy_bytes_identities_and_counters_under_loss()
             assert_eq!(old[side].data_deadline(), new[side].data_deadline());
             assert_eq!(old[side].feedback_deadline(), new[side].feedback_deadline());
             assert_eq!(capacities(&new[side]), original_capacities[side]);
+            assert_eq!(pointers(&new[side]), original_pointers[side]);
         }
         if delivered == [120, 90]
             && pending.is_empty()

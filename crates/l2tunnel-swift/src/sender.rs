@@ -5,6 +5,13 @@ use super::{
 };
 use std::collections::VecDeque;
 
+/// Kind selected at the actual sender emission branch.
+#[derive(Clone, Copy)]
+pub(crate) enum DataKind {
+    Source,
+    Repair,
+}
+
 struct Source {
     payload: Vec<u8>,
     first_sent: u64,
@@ -307,6 +314,16 @@ impl Sender {
     /// Order: explicitly requested retransmissions, repairs already earned,
     /// new sources, then idle tail repairs.
     pub fn poll(&mut self, now: u64, seed: u64, output: &mut Vec<u8>) -> Result<bool, Error> {
+        Ok(self.poll_kind(now, seed, output)?.is_some())
+    }
+
+    /// Preserve the selected emission branch without inspecting its encoded body.
+    pub(crate) fn poll_kind(
+        &mut self,
+        now: u64,
+        seed: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<Option<DataKind>, Error> {
         self.check_storage()?;
         if self.reserved && output.capacity() < self.config.datagram_bytes {
             return Err(Error::Storage);
@@ -334,7 +351,7 @@ impl Sender {
             output.extend_from_slice(&(sequence as u32).to_be_bytes());
             output.extend_from_slice(&source.payload);
             self.stats.retransmits = retransmits;
-            return Ok(true);
+            return Ok(Some(DataKind::Source));
         }
         if self.repairs_due > 0 {
             let repairs = if self.sources.is_empty() {
@@ -345,7 +362,7 @@ impl Sender {
             self.repairs_due -= 1;
             if self.repair(seed, output) {
                 self.stats.repairs = repairs;
-                return Ok(true);
+                return Ok(Some(DataKind::Repair));
             }
         }
         if self.can_send_source(now) {
@@ -403,12 +420,12 @@ impl Sender {
             self.credit = credit % self.config.repair_denominator;
             self.rearm_probe(now);
             self.probe_burst = 0;
-            return Ok(true);
+            return Ok(Some(DataKind::Source));
         }
         if self.sources.is_empty() {
             self.probe_at = None;
             self.probe_burst = 0;
-            return Ok(false);
+            return Ok(None);
         }
         let tail_repairs = if self.probe_burst > 0 || self.probe_at.is_some_and(|at| now >= at) {
             self.stats
@@ -438,10 +455,10 @@ impl Sender {
             self.probe_burst -= 1;
             if self.repair(seed, output) {
                 self.stats.tail_repairs = tail_repairs;
-                return Ok(true);
+                return Ok(Some(DataKind::Repair));
             }
         }
-        Ok(false)
+        Ok(None)
     }
     /// One equation over the newest unconfirmed sources, at most one window.
     fn repair(&mut self, seed: u64, output: &mut Vec<u8>) -> bool {

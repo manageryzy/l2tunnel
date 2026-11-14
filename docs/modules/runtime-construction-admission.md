@@ -61,13 +61,15 @@ the selected path must account for each complete actual message owner once,
 including ARQ exactly once. The implementation cannot keep an ARQ-only charge
 while selecting the larger complete owner. All supported catalog entries remain.
 
-The same known subtotal includes the existing Streamed wrapper's actual boxed
-header, three outgoing metadata Vec capacities and envelope/raw byte arrays.
-An allocation-free checked helper computes their requested layouts; the real
-Owner supplies actual capacities for comparison. Message Owner headers embedded
-in Streamed are charged there once and excluded from message heap Plans. This
-does not reserve the later cloned bridge/frozen envelopes or make the existing
-Box allocation fallible; those remain explicitly unfinished owner obligations.
+The same known subtotal includes the actual Streamed header, three outgoing
+metadata Vec capacities and envelope/raw byte arrays. The separately tracked
+[wrapper storage](control-wrapper-storage.md) now supplies a typed immutable Plan
+to the actual selected constructor. Its six fallible reservations back the real
+singleton Streamed cell, outgoing queues and scratch; actual Usage must match the
+same plan before readiness. Message Owner headers embedded in Streamed are charged
+there once and excluded from message heap Plans. Later cloned bridge/frozen
+envelopes remain unfinished owner obligations. The original allocating path
+retains its boxed header and wire behavior.
 The new complete-message constructor uses the existing collector and gate via
 an explicit private Legacy/ReservedArq/ReservedMessages backing choice. Existing
 public protocol constructors retain their selection and wire behavior. The prior

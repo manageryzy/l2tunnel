@@ -232,6 +232,17 @@ any mode requirement or select unresolved wire formats, timeout values, a deskto
 toolkit, package publication or a project license. Engineering interface choices
 remain distinct from owner decisions.
 
+The [current scoped foundation](../work/common-foundation-20261114/scoped-checkpoint-validation.json)
+provides the [directional record owners](modules/directional-record-endpoints.md),
+[Swift adapter](modules/swift-record-adapter.md) and actual
+[control wrapper backing](modules/control-wrapper-storage.md). It retains full
+stage acceptance and common cross-profile composition as open work. Complete
+directional Aligned/Packed encoding exceeds the current512-byte transaction
+configuration bound; the next composition must version the full configuration
+and all dependent bounds, preserving every field and independent direction.
+The [fresh-DH proposal](modules/session-refresh.md) remains design-only, including
+the unresolved managed Joining handoff and required runtime/lifecycle follow-ons.
+
 ## Ordered milestones and exit gates
 
 ### M0: contracts, inventory and tooling

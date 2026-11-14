@@ -133,6 +133,34 @@ pub enum Admission {
     PacketSize,
 }
 
+/// Actual algorithm branch that produced a numbered body; not authentication authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmissionKind {
+    /// Original or explicitly retransmitted source bytes.
+    Source,
+    /// A proportional or tail repair equation.
+    Repair,
+    /// Receiver feedback, possibly containing several channel blocks.
+    Feedback,
+}
+
+/// Exact borrowed engine output and its actual producing branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Emission<'a> {
+    kind: EmissionKind,
+    body: &'a [u8],
+}
+impl<'a> Emission<'a> {
+    /// Actual source, repair or feedback classification.
+    pub const fn kind(self) -> EmissionKind {
+        self.kind
+    }
+    /// Unchanged wire body, valid until the next mutable engine operation.
+    pub const fn body(self) -> &'a [u8] {
+        self.body
+    }
+}
+
 /// Explicit configuration, protocol, drain or invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -431,6 +459,34 @@ impl Engine {
         now: u64,
         packet: &[u8],
     ) -> Result<IdentifiedAdmission, Error> {
+        if let Some(rejected) = self.admission_refusal(packet)? {
+            return Ok(rejected);
+        }
+        let channel = match self.send.layer {
+            Layer::Ethernet => flow::classify_ethernet(packet, self.send.channels),
+            Layer::Ip => flow::classify_ip(packet, self.send.channels),
+        };
+        self.retain_identified(now, channel, packet)
+    }
+
+    /// Admit onto the caller's selected channel through the same shared budget.
+    /// An absent send channel changes no statistics, identity, context or queue.
+    pub fn offer_on_channel_identified(
+        &mut self,
+        now: u64,
+        channel: ChannelId,
+        packet: &[u8],
+    ) -> Result<IdentifiedAdmission, Error> {
+        if channel.index() >= self.send.channels {
+            return Err(Error::Configuration);
+        }
+        if let Some(rejected) = self.admission_refusal(packet)? {
+            return Ok(rejected);
+        }
+        self.retain_identified(now, channel.index(), packet)
+    }
+
+    fn admission_refusal(&mut self, packet: &[u8]) -> Result<Option<IdentifiedAdmission>, Error> {
         let rejected = if packet.is_empty() || packet.len() > self.send.max_native {
             Some(IdentifiedAdmission::PacketSize)
         } else if !self.has_room() {
@@ -444,12 +500,17 @@ impl Engine {
                 .native_dropped
                 .checked_add(1)
                 .ok_or(Error::CounterExhausted)?;
-            return Ok(rejected);
+            return Ok(Some(rejected));
         }
-        let channel = match self.send.layer {
-            Layer::Ethernet => flow::classify_ethernet(packet, self.send.channels),
-            Layer::Ip => flow::classify_ip(packet, self.send.channels),
-        };
+        Ok(None)
+    }
+
+    fn retain_identified(
+        &mut self,
+        now: u64,
+        channel: usize,
+        packet: &[u8],
+    ) -> Result<IdentifiedAdmission, Error> {
         let native_read = self
             .base
             .native_read
@@ -504,7 +565,7 @@ impl Engine {
         !self.body.is_empty()
     }
 
-    fn data(&mut self, now: u64, number: RecordNumber) -> Result<bool, Error> {
+    fn data(&mut self, now: u64, number: RecordNumber) -> Result<Option<EmissionKind>, Error> {
         let channels = self.send.channels;
         let urgent = (0..channels)
             .map(|step| (self.turn + step) % channels)
@@ -513,15 +574,18 @@ impl Engine {
             .into_iter()
             .chain((0..channels).map(|step| (self.turn + step) % channels));
         for channel in order {
-            if self.senders[channel].poll(now, number.0, &mut self.body)? {
+            if let Some(kind) = self.senders[channel].poll_kind(now, number.0, &mut self.body)? {
                 self.body[0] = tagged(self.body[0], channel);
                 if urgent != Some(channel) {
                     self.turn = (channel + 1) % channels;
                 }
-                return Ok(true);
+                return Ok(Some(match kind {
+                    crate::sender::DataKind::Source => EmissionKind::Source,
+                    crate::sender::DataKind::Repair => EmissionKind::Repair,
+                }));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Produce the exact next body for the caller's unchanged security number.
@@ -532,11 +596,30 @@ impl Engine {
         number: RecordNumber,
         allow_data: bool,
     ) -> Result<Option<&[u8]>, Error> {
-        if self.feedback(now) || (allow_data && self.data(now, number)?) {
-            Ok(Some(&self.body))
+        Ok(self
+            .poll_emission(now, number, allow_data)?
+            .map(Emission::body))
+    }
+
+    /// Produce the exact next body with metadata from its actual algorithm branch.
+    /// Feedback retains priority and is available even when data is disabled.
+    pub fn poll_emission(
+        &mut self,
+        now: u64,
+        number: RecordNumber,
+        allow_data: bool,
+    ) -> Result<Option<Emission<'_>>, Error> {
+        let kind = if self.feedback(now) {
+            Some(EmissionKind::Feedback)
+        } else if allow_data {
+            self.data(now, number)?
         } else {
-            Ok(None)
-        }
+            None
+        };
+        Ok(kind.map(|kind| Emission {
+            kind,
+            body: &self.body,
+        }))
     }
 
     /// Apply an already authenticated, replay-checked User record in workspace.

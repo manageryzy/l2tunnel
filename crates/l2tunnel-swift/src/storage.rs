@@ -431,6 +431,27 @@ impl Entry<'_> {
         self.engine.offer_identified(now, packet)
     }
 
+    /// Retain a packet on a checked selected channel using the actual shared budget.
+    pub fn offer_on_channel_identified(
+        &mut self,
+        now: u64,
+        channel: records::ChannelId,
+        packet: &[u8],
+    ) -> Result<records::IdentifiedAdmission, records::Error> {
+        self.engine
+            .offer_on_channel_identified(now, channel, packet)
+    }
+
+    /// Produce the exact borrowed body and actual algorithm branch without an ownership escape.
+    pub fn poll_emission(
+        &mut self,
+        now: u64,
+        number: records::RecordNumber,
+        allow_data: bool,
+    ) -> Result<Option<records::Emission<'_>>, records::Error> {
+        self.engine.poll_emission(now, number, allow_data)
+    }
+
     /// Produce an existing numbered body without allocation or ownership escape.
     pub fn poll(
         &mut self,

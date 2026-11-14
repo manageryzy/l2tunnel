@@ -89,16 +89,7 @@ impl Config {
         if maximum > self.max_recovery_packet_bytes {
             return Err(Error::Configuration);
         }
-        // The authoritative engine validates all own invariants before allocation use.
-        Reliable::new(
-            self.recovery,
-            RecoveryContext {
-                session: 1,
-                epoch: 0,
-                role: EndpointRole::Initiator,
-            },
-        )
-        .map_err(Error::Recovery)?;
+        self.recovery.validate().map_err(Error::Recovery)?;
         Ok(())
     }
     /// Maximum configured retry timer sum plus partial-block flush duration.
@@ -277,10 +268,12 @@ pub struct Status {
 /// Pure exclusive owner of codec/recovery/native handoffs for both directions.
 pub struct Endpoint {
     config: Config,
+    receive_config: Config,
     receive_scope: receiver::Scope,
     send_scope: receiver::Scope,
     sender: packed::SenderOwner,
     packing: Option<packed::Options>,
+    receive_packing: Option<packed::Options>,
     packed_symbols: Vec<u8>,
     recovery: Reliable,
     receiver: receiver::Receiver,
@@ -295,14 +288,35 @@ impl Endpoint {
     pub fn new(config: Config, context: RecoveryContext) -> Result<Self, Error> {
         Self::new_profile(config, context, None)
     }
+    /// Construct one actual owner from complete independent data-direction policies.
+    pub fn new_duplex(
+        send: Config,
+        receive: Config,
+        context: RecoveryContext,
+    ) -> Result<Self, Error> {
+        Self::new_duplex_profile(send, receive, context, None, None)
+    }
     fn new_profile(
         config: Config,
         context: RecoveryContext,
         packing: Option<packed::Options>,
     ) -> Result<Self, Error> {
+        Self::new_duplex_profile(config, config, context, packing, packing)
+    }
+    fn new_duplex_profile(
+        config: Config,
+        receive_config: Config,
+        context: RecoveryContext,
+        packing: Option<packed::Options>,
+        receive_packing: Option<packed::Options>,
+    ) -> Result<Self, Error> {
         match packing {
             Some(p) => p.config(config).validate()?,
             None => config.validate()?,
+        }
+        match receive_packing {
+            Some(p) => p.config(receive_config).validate()?,
+            None => receive_config.validate()?,
         }
         if context.session == 0 {
             return Err(Error::Configuration);
@@ -324,9 +338,9 @@ impl Endpoint {
             direction: receive_direction,
             ..send_scope
         };
-        let bytes = config.recovery.arq.max_source_bytes;
         Ok(Self {
             config,
+            receive_config,
             receive_scope,
             send_scope,
             sender: match packing {
@@ -343,16 +357,18 @@ impl Endpoint {
                 )),
             },
             packing,
+            receive_packing,
             packed_symbols: vec![
                 0;
-                packing.map_or(0, |p| usize::from(p.max_units)
-                    * config.receiver.body.symbol_bytes)
+                receive_packing.map_or(0, |p| usize::from(p.max_units)
+                    * receive_config.receiver.body.symbol_bytes)
             ],
-            recovery: Reliable::new(config.recovery, context).map_err(Error::Recovery)?,
-            receiver: receiver::Receiver::new(receive_scope, config.receiver)
+            recovery: Reliable::new_duplex(config.recovery, receive_config.recovery, context)
+                .map_err(Error::Recovery)?,
+            receiver: receiver::Receiver::new(receive_scope, receive_config.receiver)
                 .map_err(Error::Receiver)?,
-            send_buffer: vec![0; bytes],
-            receive_buffer: vec![0; bytes],
+            send_buffer: vec![0; config.recovery.arq.max_source_bytes],
+            receive_buffer: vec![0; receive_config.recovery.arq.max_source_bytes],
             handoff: None,
             now: Duration::ZERO,
             failure: None,
@@ -446,7 +462,7 @@ impl Endpoint {
                 return Err(Error::Configuration);
             }
             for (index, unit) in packed.units().map_err(Error::PackedEnvelope)?.enumerate() {
-                let symbol = &mut self.packed_symbols[..self.config.receiver.body.symbol_bytes];
+                let symbol = &mut self.send_buffer[..self.config.receiver.body.symbol_bytes];
                 symbol.fill(0);
                 symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
                 output[index] = receiver::unit_witness(unit.identity, symbol, self.config.receiver)
@@ -601,6 +617,14 @@ impl Endpoint {
     pub fn max_packet_bytes(&self) -> usize {
         self.recovery.max_packet_bytes()
     }
+    /// Exact local recovery emission ceiling before external overhead.
+    pub fn send_max_packet_bytes(&self) -> usize {
+        self.recovery.send_max_packet_bytes()
+    }
+    /// Exact peer recovery packet ceiling used by authenticated ingress.
+    pub fn receive_max_packet_bytes(&self) -> usize {
+        self.recovery.receive_max_packet_bytes()
+    }
     /// Existing engine's classification for routing data/feedback after authentication.
     pub fn inspect_peer(&self, packet: &[u8]) -> Result<l2tunnel_reliable::RecordKind, Error> {
         self.recovery.inspect_peer(packet).map_err(Error::Recovery)
@@ -703,7 +727,7 @@ impl Endpoint {
         }
     }
     fn pump_receive(&mut self) -> Result<(), Error> {
-        for _ in 0..self.config.recovery.arq.receive_records {
+        for _ in 0..self.receive_config.recovery.arq.receive_records {
             if self.handoff.is_none() {
                 let result = self
                     .recovery
@@ -714,14 +738,16 @@ impl Endpoint {
                 };
                 let deadline = self
                     .now
-                    .checked_add(Duration::from_millis(self.config.receiver.lifetime_ticks))
+                    .checked_add(Duration::from_millis(
+                        self.receive_config.receiver.lifetime_ticks,
+                    ))
                     .ok_or(Error::Time)?;
                 self.handoff = Some((id, length, deadline));
             }
             let Some((id, length, _)) = self.handoff else {
                 break;
             };
-            if let Some(options) = self.packing {
+            if let Some(options) = self.receive_packing {
                 match self.admit_packed(options, id, length) {
                     Ok(()) => {
                         self.handoff = None;
@@ -735,8 +761,8 @@ impl Endpoint {
             }
             let view = match envelope::decode(
                 self.receive_scope,
-                self.config.receiver.body.symbol_bytes,
-                self.config.receiver.channels,
+                self.receive_config.receiver.body.symbol_bytes,
+                self.receive_config.receiver.channels,
                 &self.receive_buffer[..length],
             ) {
                 Ok(view) => view,
@@ -745,7 +771,7 @@ impl Endpoint {
             if view.identity.source.0 != id {
                 return self.fail(Error::Identity);
             }
-            if self.config.native_policy == NativePolicy::RawIp {
+            if self.receive_config.native_policy == NativePolicy::RawIp {
                 let symbol = view.symbol;
                 let raw = symbol[3] == 2;
                 let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
@@ -772,7 +798,7 @@ impl Endpoint {
         length: usize,
     ) -> Result<(), Error> {
         let view = l2tunnel_codec::packed_envelope::decode(
-            options.config(self.config).envelope(),
+            options.config(self.receive_config).envelope(),
             self.receive_scope,
             &self.receive_buffer[..length],
         )
@@ -782,14 +808,14 @@ impl Endpoint {
         {
             return Err(Error::Identity);
         }
-        let width = self.config.receiver.body.symbol_bytes;
+        let width = self.receive_config.receiver.body.symbol_bytes;
         let units = view.units().map_err(Error::PackedEnvelope)?;
         let count = units.len();
         let mut inputs = Vec::with_capacity(count);
         for (unit, symbol) in units.zip(self.packed_symbols.chunks_exact_mut(width)) {
             symbol.fill(0);
             symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
-            if self.config.native_policy == NativePolicy::RawIp {
+            if self.receive_config.native_policy == NativePolicy::RawIp {
                 let raw = symbol[3] == 2;
                 let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
                 if !raw && !fragment {
@@ -862,6 +888,8 @@ fn duration(output: &mut Vec<u8>, value: Duration) {
     number(output, u64::from(value.subsec_nanos()));
 }
 
+#[cfg(test)]
+mod directional_tests;
 #[cfg(test)]
 mod packed_tests;
 #[cfg(test)]

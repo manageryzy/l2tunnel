@@ -2899,8 +2899,8 @@ impl Driver {
             }
             let number = self.records.next_number(Class::User);
             let mut entry = self.owner.entry(core::Epoch(self.source_scope.epoch.0))?;
-            let Some(body) = entry
-                .poll(now, records::RecordNumber(number.0), true)
+            let Some(emission) = entry
+                .poll_emission(now, records::RecordNumber(number.0), true)
                 .map_err(protocol)?
             else {
                 self.performance.counters.user_not_ready_polls = self
@@ -2910,9 +2910,8 @@ impl Driver {
                     .saturating_add(1);
                 break;
             };
-            let feedback = body
-                .first()
-                .is_some_and(|lead| lead & swift::KIND_MASK == swift::KIND_FEEDBACK);
+            let feedback = emission.kind() == records::EmissionKind::Feedback;
+            let body = emission.body();
             let scope = if feedback {
                 self.feedback_scope
             } else {
@@ -3011,15 +3010,14 @@ impl Driver {
             }
             let number = self.records.next_number(Class::User);
             let mut entry = self.owner.entry(epoch)?;
-            let Some(body) = entry
-                .poll(now, records::RecordNumber(number.0), allow_data)
+            let Some(emission) = entry
+                .poll_emission(now, records::RecordNumber(number.0), allow_data)
                 .map_err(protocol)?
             else {
                 continue;
             };
-            let feedback = body
-                .first()
-                .is_some_and(|lead| lead & swift::KIND_MASK == swift::KIND_FEEDBACK);
+            let feedback = emission.kind() == records::EmissionKind::Feedback;
+            let body = emission.body();
             let sealed = self
                 .records
                 .seal_user_in(

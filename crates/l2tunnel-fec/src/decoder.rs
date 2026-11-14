@@ -29,7 +29,8 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
-    fn validate(self) -> Result<(), Error> {
+    /// Validate the existing scalar decoder contract without constructing state.
+    pub fn validate(self) -> Result<(), Error> {
         self.block.validate()?;
         if !(1..=MAX_GENERATIONS).contains(&self.max_generations)
             || !(self.block.max_sources..=MAX_SYMBOLS_PER_GENERATION)

@@ -23,19 +23,7 @@ pub struct Plan {
 impl Plan {
     /// Validate the existing ARQ contract and calculate every backing layout.
     pub fn for_arq(config: ArqConfig) -> Result<Self, Error> {
-        config.validate().map_err(Error::Recovery)?;
-        let capacity_bytes = array_bytes::<crate::arq::SendSlot>(config.send_records)?
-            .checked_add(array_bytes::<crate::arq::ReceiveSlot>(
-                config.receive_records,
-            )?)
-            .and_then(|metadata| {
-                config
-                    .send_records
-                    .checked_add(config.receive_records)
-                    .and_then(|count| count.checked_mul(config.max_source_bytes))
-                    .and_then(|payload| metadata.checked_add(payload))
-            })
-            .ok_or(Error::Layout)?;
+        let capacity_bytes = DuplexPlan::for_arq(config, config)?.capacity_bytes();
         Ok(Self {
             config,
             capacity_bytes,
@@ -45,6 +33,58 @@ impl Plan {
     /// Exact immutable protocol settings used by this plan.
     pub fn config(&self) -> ArqConfig {
         self.config
+    }
+
+    /// Complete heap-only requested layout, including currently empty slots.
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+}
+
+/// Allocation-free inventory for one owner with independent directional policies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DuplexPlan {
+    send: ArqConfig,
+    receive: ArqConfig,
+    capacity_bytes: usize,
+}
+
+impl DuplexPlan {
+    /// Validate complete send then receive policy before calculating actual layouts.
+    pub fn for_arq(send: ArqConfig, receive: ArqConfig) -> Result<Self, Error> {
+        send.validate().map_err(Error::Recovery)?;
+        receive.validate().map_err(Error::Recovery)?;
+        let capacity_bytes = array_bytes::<crate::arq::SendSlot>(send.send_records)?
+            .checked_add(array_bytes::<crate::arq::ReceiveSlot>(
+                receive.receive_records,
+            )?)
+            .and_then(|metadata| {
+                send.send_records
+                    .checked_mul(send.max_source_bytes)
+                    .and_then(|send_bytes| {
+                        receive
+                            .receive_records
+                            .checked_mul(receive.max_source_bytes)
+                            .and_then(|receive_bytes| send_bytes.checked_add(receive_bytes))
+                    })
+                    .and_then(|payload| metadata.checked_add(payload))
+            })
+            .ok_or(Error::Layout)?;
+        Ok(Self {
+            send,
+            receive,
+            capacity_bytes,
+        })
+    }
+
+    /// Complete immutable send data-direction policy.
+    pub fn send_config(&self) -> ArqConfig {
+        self.send
+    }
+
+    /// Complete immutable receive data-direction policy.
+    pub fn receive_config(&self) -> ArqConfig {
+        self.receive
     }
 
     /// Complete heap-only requested layout, including currently empty slots.

@@ -25,6 +25,15 @@ add child IDs. Update this ledger and the detailed checklists with every change.
 Follow the [parallel development workflow](development-workflow.md) for module
 design, interface agreement, concurrent implementation and integration.
 
+The next common-session foundation is tracked by
+[directional Aligned/Packed owners](modules/directional-record-endpoints.md),
+[Swift admission/emission adapters](modules/swift-record-adapter.md),
+[fallible control wrapper storage](modules/control-wrapper-storage.md) and the
+design-only [in-session fresh-DH proposal](modules/session-refresh.md).
+Their leaf evidence does not close full SW-11, complete resource admission or
+retained-state recovery. Existing mode, native, platform and performance gates
+retain their full definitions.
+
 ## Blocking behavior corrections — execute before new feature work
 
 These are the highest-priority implementation TODOs from the behavior and layering audits.

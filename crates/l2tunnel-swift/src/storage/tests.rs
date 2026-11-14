@@ -395,13 +395,25 @@ fn restricted_entries_carry_real_asymmetric_bodies_identities_and_feedback() -> 
     let left_id = left.prepare(forward)?;
     let right_id = right.prepare(reverse)?;
     let native = [0xab; 53];
-    let accepted = match left.entry(left_id)?.offer_identified(0, &native)? {
+    let selected = records::ChannelId::new(1).ok_or(records::Error::Configuration)?;
+    let accepted = match left
+        .entry(left_id)?
+        .offer_on_channel_identified(0, selected, &native)?
+    {
         IdentifiedAdmission::Accepted(identity) => identity,
         _ => return Err(Box::new(records::Error::Admission)),
     };
+    assert_eq!(accepted.channel, selected);
     let left_usage = left.usage();
     let right_usage = right.usage();
-    let mut wire = emitted(&mut left.entry(left_id)?, 0, 1 << 42, true)?;
+    let mut wire = {
+        let mut entry = left.entry(left_id)?;
+        let emission = entry
+            .poll_emission(0, RecordNumber(1 << 42), true)?
+            .ok_or(records::Error::Admission)?;
+        assert_eq!(emission.kind(), records::EmissionKind::Source);
+        emission.body().to_vec()
+    };
     right
         .entry(right_id)?
         .accept(1, RecordNumber(1 << 42), &mut wire)?;
@@ -412,7 +424,14 @@ fn restricted_entries_carry_real_asymmetric_bodies_identities_and_feedback() -> 
         assert_eq!(received.bytes, native);
     }
     assert!(right.entry(right_id)?.pop()?.is_none());
-    let mut feedback = emitted(&mut right.entry(right_id)?, 100, 1 << 48, false)?;
+    let mut feedback = {
+        let mut entry = right.entry(right_id)?;
+        let emission = entry
+            .poll_emission(100, RecordNumber(1 << 48), false)?
+            .ok_or(records::Error::Admission)?;
+        assert_eq!(emission.kind(), records::EmissionKind::Feedback);
+        emission.body().to_vec()
+    };
     assert_eq!(feedback[0] & crate::KIND_MASK, crate::KIND_FEEDBACK);
     left.entry(left_id)?
         .accept(100, RecordNumber(1 << 48), &mut feedback)?;

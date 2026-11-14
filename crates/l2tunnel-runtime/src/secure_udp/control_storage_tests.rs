@@ -4,6 +4,9 @@ use super::*;
 use l2tunnel_core::{ConfigDigest, Epoch};
 use std::{cell::RefCell, rc::Rc};
 
+#[path = "control_wrapper_storage_tests.rs"]
+mod wrapper_storage_tests;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn base() -> delivery::Settings {
     delivery::Settings {

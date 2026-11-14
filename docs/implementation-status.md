@@ -7,7 +7,17 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The current functionality wave implements explicit generic Swift shared-service
+The latest [scoped foundation checkpoint](../work/common-foundation-20261114/scoped-checkpoint-validation.json)
+adds pure directional ARQ/Reliable/Aligned/Packed owners, checked Swift channel
+admission and typed output, and actual fallible generic control-wrapper storage.
+It composes586 affected passing cases with explicit unchanged evidence reuse;
+strict affected Clippy/rustdoc/format checks pass. Its initial runtime stack
+failure and focused correction are preserved. This is not a new full workspace
+or native pass. Required stage acceptance, cross-profile Driver/Bank integration,
+full resources and retained-state recovery remain open. The
+[fresh-DH refresh contract](modules/session-refresh.md) is design-only.
+
+The preceding functionality wave implements explicit generic Swift shared-service
 and APIv3 selection, real three-stream reserved ARQ consumers and actual sole-loop
 input charging. The [source-stable focused check](../work/generic-driver-20261114/functionality-focused-attempt-9/validation.json)
 passes both-cover paired service/two-switch/reconnect tests and selected

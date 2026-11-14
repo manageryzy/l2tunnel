@@ -197,6 +197,7 @@ impl Owner {
     }
 
     #[allow(clippy::too_many_arguments)] // Existing contexts plus complete actual message heaps.
+    #[cfg(test)] // Preserve the prior private constructor while production consumes its checked Plan.
     pub(crate) fn new_leased_reserved_messages(
         base: delivery::Settings,
         selected: Settings,
@@ -207,6 +208,36 @@ impl Owner {
         expires: Duration,
         limits: [messages::storage::Limits; 3],
     ) -> io::Result<Self> {
+        let wrapper = wrapper_storage::Plan::new(selected, base)?;
+        Self::new_leased_reserved_messages_with_wrapper_plan(
+            base,
+            selected,
+            binding,
+            control_scope,
+            data_scope,
+            now,
+            expires,
+            limits,
+            wrapper,
+            wrapper_storage::Limits {
+                capacity_bytes: wrapper.capacity_bytes(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Exact original contexts and independently bounded wrapper backing.
+    pub(crate) fn new_leased_reserved_messages_with_wrapper_plan(
+        base: delivery::Settings,
+        selected: Settings,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        limits: [messages::storage::Limits; 3],
+        wrapper: wrapper_storage::Plan,
+        wrapper_limit: wrapper_storage::Limits,
+    ) -> io::Result<Self> {
         Self::construct(
             base,
             Some(selected),
@@ -215,7 +246,11 @@ impl Owner {
             data_scope,
             now,
             expires,
-            Storage::ReservedMessages(limits),
+            Storage::ReservedMessages {
+                messages: limits,
+                wrapper: &wrapper,
+                wrapper_limit,
+            },
         )?
         .into_leased(control_scope, data_scope)
     }

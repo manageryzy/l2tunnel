@@ -212,6 +212,21 @@ impl Endpoint {
     pub fn new(config: Config, context: RecoveryContext) -> Result<Self, Error> {
         super::Endpoint::new_profile(config.base, context, Some(config.options())).map(Self)
     }
+    /// Construct the shared owner with complete independent packed direction policies.
+    pub fn new_duplex(
+        send: Config,
+        receive: Config,
+        context: RecoveryContext,
+    ) -> Result<Self, Error> {
+        super::Endpoint::new_duplex_profile(
+            send.base,
+            receive.base,
+            context,
+            Some(send.options()),
+            Some(receive.options()),
+        )
+        .map(Self)
+    }
     /// Retain one frame already selected by common MUX/QoS; no peer credit is implied.
     pub fn enqueue_admitted(
         &mut self,
@@ -311,6 +326,14 @@ impl Endpoint {
     /// Complete recovery output ceiling before carrier overhead.
     pub fn max_packet_bytes(&self) -> usize {
         self.0.max_packet_bytes()
+    }
+    /// Exact local recovery emission ceiling before external overhead.
+    pub fn send_max_packet_bytes(&self) -> usize {
+        self.0.send_max_packet_bytes()
+    }
+    /// Exact peer recovery packet ceiling used by authenticated ingress.
+    pub fn receive_max_packet_bytes(&self) -> usize {
+        self.0.receive_max_packet_bytes()
     }
     /// Authoritative classification of one authenticated peer recovery record.
     pub fn inspect_peer(&self, packet: &[u8]) -> Result<l2tunnel_reliable::RecordKind, Error> {

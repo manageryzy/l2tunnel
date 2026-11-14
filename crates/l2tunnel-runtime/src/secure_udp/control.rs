@@ -12,6 +12,8 @@ use std::{io, time::Duration};
 
 #[path = "control_leased.rs"]
 mod leased;
+#[path = "control_wrapper_storage.rs"]
+pub(crate) mod wrapper_storage;
 #[cfg(test)]
 pub(crate) use leased::PendingEffect;
 pub(crate) use leased::{Attempt, DispatchProgress, FrozenOutput};
@@ -32,15 +34,9 @@ impl Settings {
     }
 
     /// Persistent wrapper heap only; message heaps and bridge copies are separate.
+    #[cfg(test)] // Compatibility view; production consumes the exact typed wrapper Plan.
     pub(crate) fn wrapper_capacity_bytes(self, base: delivery::Settings) -> io::Result<usize> {
-        let maximum = self
-            .streams
-            .iter()
-            .map(|settings| settings.max_message_bytes)
-            .max()
-            .ok_or_else(|| invalid("missing control streams"))?;
-        let outgoing = self.streams.map(|settings| settings.max_outbound_messages);
-        wrapper_layout(outgoing, maximum, raw_packet_bytes(base)?)
+        Ok(wrapper_storage::Plan::new(self, base)?.capacity_bytes())
     }
 
     /// Pure complete message plans under the actual independently bound streams.
@@ -222,16 +218,20 @@ fn wrapper_layout(outgoing: [usize; 3], envelope: usize, raw: usize) -> io::Resu
 }
 
 #[derive(Clone, Copy)]
-enum Storage {
+enum Storage<'a> {
     Legacy,
     #[cfg(test)]
     ReservedArq([recovery::storage::Limits; 3]),
-    ReservedMessages([messages::storage::Limits; 3]),
+    ReservedMessages {
+        messages: [messages::storage::Limits; 3],
+        wrapper: &'a wrapper_storage::Plan,
+        wrapper_limit: wrapper_storage::Limits,
+    },
 }
 
 enum Backend {
     Legacy(Box<Legacy>),
-    Streamed(Box<Streamed>),
+    Streamed(wrapper_storage::StreamedStorage),
 }
 
 /// Selected bounded control transport; all actual I/O remains with its caller.
@@ -289,6 +289,26 @@ impl StreamConstruction {
                 )?,
             ));
         }
+        self.finish()
+    }
+
+    fn from_owners(
+        owners: [messages::Owner; 3],
+        _allocation: &mut wrapper_storage::Allocation,
+    ) -> Self {
+        let [transaction, liveness, feedback] = owners;
+        Self {
+            owners: [
+                Some((streams::Stream::Transaction, transaction)),
+                Some((streams::Stream::Liveness, liveness)),
+                Some((streams::Stream::DataFeedback, feedback)),
+            ],
+            #[cfg(test)]
+            observer: _allocation.owner_observer.take(),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<[messages::Owner; 3]> {
         let [
             Some((_, transaction)),
             Some((_, liveness)),
@@ -395,6 +415,14 @@ impl Owner {
         )
     }
 
+    /// Actual fallibly provisioned wrapper backing, separate from message heaps.
+    pub(crate) fn wrapper_storage_usage(&self) -> io::Result<Option<wrapper_storage::Usage>> {
+        match &self.backend {
+            Backend::Legacy(_) => Ok(None),
+            Backend::Streamed(streamed) => streamed.usage(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // Existing contexts plus explicit per-stream backing limits.
     fn construct(
         base: delivery::Settings,
@@ -404,122 +432,50 @@ impl Owner {
         data_scope: sc::Scope,
         now: Duration,
         expires: Duration,
-        storage: Storage,
+        storage: Storage<'_>,
+    ) -> io::Result<Self> {
+        Self::construct_with_wrapper_allocation(
+            base,
+            selected,
+            binding,
+            control_scope,
+            data_scope,
+            now,
+            expires,
+            storage,
+            &mut wrapper_storage::Allocation::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing construction plus one local reservation context.
+    fn construct_with_wrapper_allocation(
+        base: delivery::Settings,
+        selected: Option<Settings>,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        storage: Storage<'_>,
+        allocation: &mut wrapper_storage::Allocation,
     ) -> io::Result<Self> {
         if selected.is_none() && !matches!(storage, Storage::Legacy) {
             return Err(invalid("reserved control requires explicit streams"));
         }
         let raw = raw_packet_bytes(base)?;
         let (backend, max_packet) = if let Some(settings) = selected {
-            let lifetime = expires
-                .checked_sub(now)
-                .ok_or_else(|| invalid("control already expired"))?;
-            settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
-            #[cfg(test)]
-            if let Storage::ReservedArq(limits) = storage {
-                // Preflight all three pool limits before allocating the first stream.
-                for (settings, limit) in settings.streams.into_iter().zip(limits) {
-                    let plan = recovery::storage::Plan::for_arq(settings.delivery.recovery)
-                        .map_err(invalid)?;
-                    if plan.capacity_bytes() > limit.capacity_bytes {
-                        return Err(invalid("control ARQ storage limit"));
-                    }
-                }
-            }
-            let owners = if let Storage::ReservedMessages(limits) = storage {
-                let plans = settings.message_storage_plans(binding, now, expires)?;
-                for (plan, limit) in plans.iter().zip(limits) {
-                    if plan.capacity_bytes() > limit.capacity_bytes {
-                        return Err(invalid("control complete message storage limit"));
-                    }
-                }
-                StreamConstruction::default().collect(
-                    settings,
-                    binding,
-                    Some(limits),
-                    |_, settings, stream_binding, limit| {
-                        messages::Owner::new_reserved(
-                            settings,
-                            stream_binding,
-                            now,
-                            expires,
-                            limit.ok_or_else(|| invalid("missing complete message limit"))?,
-                        )
-                        .map_err(invalid)
-                    },
-                )?
-            } else {
-                #[cfg(not(test))]
-                let arq_limits = None;
-                #[cfg(test)]
-                let arq_limits = match storage {
-                    Storage::ReservedArq(limits) => Some(limits),
-                    _ => None,
-                };
-                construct_stream_owners(
-                    settings,
-                    binding,
-                    arq_limits,
-                    |_, settings, stream_binding, limit| match limit {
-                        Some(limit) => messages::Owner::new_reserved_arq(
-                            settings,
-                            stream_binding,
-                            now,
-                            expires,
-                            limit,
-                        )
-                        .map_err(invalid),
-                        None => messages::Owner::new(settings, stream_binding, now, expires)
-                            .map_err(invalid),
-                    },
-                )?
-            };
-            let maximum = settings
-                .streams
-                .iter()
-                .map(|settings| settings.max_message_bytes)
-                .max()
-                .ok_or_else(|| invalid("missing control streams"))?;
-            let gate = streams::gate::Gate::new(streams::gate::GateSettings {
-                binding: sc::PeerBinding {
-                    session: binding.session,
-                    remote_role: opposite(binding.local_role),
-                    control_lane: binding.lane,
-                    data_lanes: [Some(binding.lane), None],
-                },
-                control: control_scope,
-                active: policy(data_scope),
-                limits: envelope_limits(maximum)?,
-            })
-            .map_err(invalid)?;
-            let size = settings.max_packet_bytes(base)?;
-            (
-                Backend::Streamed(Box::new(Streamed {
-                    leased: false,
-                    reservation: None,
-                    owners,
-                    gate,
-                    settings,
-                    next: [1; 3],
-                    outgoing: std::array::from_fn(|i| {
-                        Vec::with_capacity(settings.streams[i].max_outbound_messages)
-                    }),
-                    held: [None; 3],
-                    control_scope,
-                    active: data_scope,
-                    draining: None,
-                    envelope: vec![0; maximum],
-                    raw: vec![0; raw],
-                    poll_cursor: 0,
-                    receive_cursor: 0,
-                    auto_cursor: 0,
-                    quota: base,
-                    refill: now,
-                    packets_left: 0,
-                    bytes_left: 0,
-                })),
-                size,
-            )
+            Self::construct_streamed(
+                base,
+                settings,
+                binding,
+                control_scope,
+                data_scope,
+                now,
+                expires,
+                raw,
+                storage,
+                allocation,
+            )?
         } else {
             let limits = sc::Limits {
                 max_frame_bytes: base.recovery.max_source_bytes,
@@ -546,6 +502,165 @@ impl Owner {
             max_packet,
             failed: false,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Selected synchronous provisioning stays off the legacy constructor stack.
+    fn construct_streamed(
+        base: delivery::Settings,
+        settings: Settings,
+        binding: delivery::Binding,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+        now: Duration,
+        expires: Duration,
+        raw: usize,
+        storage: Storage<'_>,
+        allocation: &mut wrapper_storage::Allocation,
+    ) -> io::Result<(Backend, usize)> {
+        let lifetime = expires
+            .checked_sub(now)
+            .ok_or_else(|| invalid("control already expired"))?;
+        settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
+        if let Storage::ReservedMessages {
+            wrapper,
+            wrapper_limit,
+            ..
+        } = storage
+        {
+            wrapper.check(&settings, &base, wrapper_limit)?;
+        }
+        let maximum = settings
+            .streams
+            .iter()
+            .map(|settings| settings.max_message_bytes)
+            .max()
+            .ok_or_else(|| invalid("missing control streams"))?;
+        let make_gate = || {
+            streams::gate::Gate::new(streams::gate::GateSettings {
+                binding: sc::PeerBinding {
+                    session: binding.session,
+                    remote_role: opposite(binding.local_role),
+                    control_lane: binding.lane,
+                    data_lanes: [Some(binding.lane), None],
+                },
+                control: control_scope,
+                active: policy(data_scope),
+                limits: envelope_limits(maximum)?,
+            })
+            .map_err(invalid)
+        };
+        let reserved_gate = if matches!(storage, Storage::ReservedMessages { .. }) {
+            Some(make_gate()?)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Storage::ReservedArq(limits) = storage {
+            // Preflight all three pool limits before allocating the first stream.
+            for (settings, limit) in settings.streams.into_iter().zip(limits) {
+                let plan = recovery::storage::Plan::for_arq(settings.delivery.recovery)
+                    .map_err(invalid)?;
+                if plan.capacity_bytes() > limit.capacity_bytes {
+                    return Err(invalid("control ARQ storage limit"));
+                }
+            }
+        }
+        let owners = if let Storage::ReservedMessages {
+            messages: limits, ..
+        } = storage
+        {
+            let plans = settings.message_storage_plans(binding, now, expires)?;
+            for (plan, limit) in plans.iter().zip(limits) {
+                if plan.capacity_bytes() > limit.capacity_bytes {
+                    return Err(invalid("control complete message storage limit"));
+                }
+            }
+            StreamConstruction::default().collect(
+                settings,
+                binding,
+                Some(limits),
+                |_, settings, stream_binding, limit| {
+                    messages::Owner::new_reserved(
+                        settings,
+                        stream_binding,
+                        now,
+                        expires,
+                        limit.ok_or_else(|| invalid("missing complete message limit"))?,
+                    )
+                    .map_err(invalid)
+                },
+            )?
+        } else {
+            #[cfg(not(test))]
+            let arq_limits = None;
+            #[cfg(test)]
+            let arq_limits = match storage {
+                Storage::ReservedArq(limits) => Some(limits),
+                _ => None,
+            };
+            construct_stream_owners(
+                settings,
+                binding,
+                arq_limits,
+                |_, settings, stream_binding, limit| match limit {
+                    Some(limit) => messages::Owner::new_reserved_arq(
+                        settings,
+                        stream_binding,
+                        now,
+                        expires,
+                        limit,
+                    )
+                    .map_err(invalid),
+                    None => messages::Owner::new(settings, stream_binding, now, expires)
+                        .map_err(invalid),
+                },
+            )?
+        };
+        let gate = match reserved_gate {
+            Some(gate) => gate,
+            None => make_gate()?,
+        };
+        let size = settings.max_packet_bytes(base)?;
+        let owners = StreamConstruction::from_owners(owners, allocation);
+        let build = move |outgoing, envelope, raw| {
+            Ok(Streamed {
+                leased: false,
+                reservation: None,
+                owners: owners.finish()?,
+                gate,
+                settings,
+                next: [1; 3],
+                outgoing,
+                held: [None; 3],
+                control_scope,
+                active: data_scope,
+                draining: None,
+                envelope,
+                raw,
+                poll_cursor: 0,
+                receive_cursor: 0,
+                auto_cursor: 0,
+                quota: base,
+                refill: now,
+                packets_left: 0,
+                bytes_left: 0,
+            })
+        };
+        let streamed = match storage {
+            Storage::ReservedMessages {
+                wrapper,
+                wrapper_limit,
+                ..
+            } => wrapper.provision(wrapper_limit, allocation, build)?,
+            _ => wrapper_storage::StreamedStorage::Legacy(Box::new(build(
+                std::array::from_fn(|i| {
+                    Vec::with_capacity(settings.streams[i].max_outbound_messages)
+                }),
+                vec![0; maximum],
+                vec![0; raw],
+            )?)),
+        };
+        Ok((Backend::Streamed(streamed), size))
     }
 
     pub(crate) fn max_packet_bytes(&self) -> usize {
@@ -590,6 +705,7 @@ impl Owner {
                 }
             }
             Backend::Streamed(streamed) => {
+                let streamed = &mut **streamed;
                 let stream = outgoing_stream(body)?;
                 if streamed.leased && stream == streams::Stream::Transaction {
                     return Err(invalid("leased Management requires frozen Peer output"));
@@ -671,6 +787,7 @@ impl Owner {
         match (&mut self.backend, token.kind) {
             (Backend::Legacy(_), TokenKind::Legacy(_)) => Ok(()),
             (Backend::Streamed(streamed), TokenKind::Streamed { stream, ticket }) => {
+                let streamed = &mut **streamed;
                 let i = index(stream);
                 streamed.owners[i].retire(ticket, now).map_err(protocol)?;
                 streamed.outgoing[i].retain(|entry| entry.token != token);
@@ -871,6 +988,7 @@ impl Owner {
         match (&mut self.backend, incoming.token.kind) {
             (Backend::Legacy(_), TokenKind::Legacy(_)) => Ok(()),
             (Backend::Streamed(streamed), TokenKind::Streamed { stream, ticket }) => {
+                let streamed = &mut **streamed;
                 let i = index(stream);
                 let held = streamed.held[i]
                     .as_mut()
@@ -912,6 +1030,7 @@ impl Owner {
                 .poll(now, allowance, output)
                 .map_err(protocol),
             Backend::Streamed(streamed) => {
+                let streamed = &mut **streamed;
                 if now >= streamed.refill {
                     streamed.refill = now
                         .checked_add(streamed.quota.interval)
@@ -1092,6 +1211,7 @@ impl Owner {
 
     pub(crate) fn advance_scope(&mut self, scope: sc::Scope) -> io::Result<()> {
         if let Backend::Streamed(streamed) = &mut self.backend {
+            let streamed = &mut **streamed;
             if scope == streamed.active {
                 return Ok(());
             }
@@ -1107,6 +1227,7 @@ impl Owner {
 
     pub(crate) fn retire_draining(&mut self, scope: sc::Scope) -> io::Result<()> {
         if let Backend::Streamed(streamed) = &mut self.backend {
+            let streamed = &mut **streamed;
             let i = index(streams::Stream::Transaction);
             let pending_old = if let Some(delivery) = streamed.owners[i].pending() {
                 sc::Envelope::decode(
@@ -1174,6 +1295,7 @@ impl Owner {
             ));
         }
         if let Backend::Streamed(streamed) = &mut self.backend {
+            let streamed = &mut **streamed;
             if streamed
                 .reservation
                 .as_ref()

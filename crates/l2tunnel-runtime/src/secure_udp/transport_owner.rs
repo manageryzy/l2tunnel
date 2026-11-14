@@ -94,15 +94,15 @@ impl Entry<'_> {
         }
     }
 
-    pub(super) fn poll(
+    pub(super) fn poll_emission(
         &mut self,
         now: u64,
         number: records::RecordNumber,
         allow_data: bool,
-    ) -> Result<Option<&[u8]>, records::Error> {
+    ) -> Result<Option<records::Emission<'_>>, records::Error> {
         match self {
-            Self::Legacy(engine) => engine.poll(now, number, allow_data),
-            Self::Reserved(entry) => entry.poll(now, number, allow_data),
+            Self::Legacy(engine) => engine.poll_emission(now, number, allow_data),
+            Self::Reserved(entry) => entry.poll_emission(now, number, allow_data),
         }
     }
 

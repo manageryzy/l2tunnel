@@ -85,7 +85,7 @@ fn provision(
 ) -> io::Result<Known> {
     let config = contract.config();
     plan.provision(limit, |plan| {
-        let control = control_owner::Owner::new_leased_reserved_messages(
+        let control = control_owner::Owner::new_leased_reserved_messages_with_wrapper_plan(
             config.control,
             config.streams.ok_or_else(|| invalid("fixture streams"))?,
             binding(contract),
@@ -102,6 +102,10 @@ fn provision(
             plan.messages.map(|message| messages::storage::Limits {
                 capacity_bytes: message.capacity_bytes(),
             }),
+            plan.wrapper,
+            control_owner::wrapper_storage::Limits {
+                capacity_bytes: plan.wrapper.capacity_bytes(),
+            },
         )?;
         let usage = control
             .message_storage_usage()
@@ -133,7 +137,13 @@ fn provision(
         assert_eq!(inputs.capacity_bytes(), expected_inputs);
         assert_eq!(native.capacity_bytes(), expected_native);
         let wrapper = control.wrapper_capacity_bytes()?;
-        assert_eq!(wrapper, plan.wrapper_bytes);
+        let wrapper_usage = control
+            .wrapper_storage_usage()?
+            .ok_or_else(|| protocol("missing actual wrapper storage"))?;
+        assert_eq!(wrapper_usage.capacity_bytes, plan.wrapper.capacity_bytes());
+        assert_eq!(wrapper_usage.limit_bytes, plan.wrapper.capacity_bytes());
+        assert_eq!(wrapper_usage.allocations, 6);
+        assert_eq!(wrapper, wrapper_usage.capacity_bytes);
         let messages = usage.iter().map(|actual| actual.capacity_bytes).sum();
         let external = construction::external_capacity(
             buffers.capacity_bytes(),

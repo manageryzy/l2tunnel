@@ -278,6 +278,7 @@ struct Restored {
 /// One independently owned reliable block endpoint with no socket or system clock.
 pub struct Reliable {
     config: ReliableConfig,
+    receive_config: ReliableConfig,
     context: RecoveryContext,
     arq: SelectiveRepeat,
     decoder: fec::Decoder,
@@ -293,16 +294,22 @@ pub struct Reliable {
     fec_deadlines: BTreeMap<fec::GenerationId, u64>,
     scratch: Vec<u8>,
     maximum_packet: usize,
+    receive_maximum_packet: usize,
     prefer_feedback: bool,
     now: Duration,
     failure: Option<Error>,
     statistics: Statistics,
 }
 
-impl Reliable {
-    /// Validate canonical cross-module limits before constructing bounded state.
-    pub fn new(config: ReliableConfig, context: RecoveryContext) -> Result<Self, Error> {
-        let arq = SelectiveRepeat::new(config.arq, context)?;
+impl ReliableConfig {
+    /// Validate complete geometry and limits without constructing any engine.
+    pub fn validate(self) -> Result<(), Error> {
+        self.maximum_packet().map(|_| ())
+    }
+
+    fn maximum_packet(self) -> Result<usize, Error> {
+        let config = self;
+        config.arq.validate()?;
         let count = config.fec.block.max_sources;
         let source_bytes = DATA_HEADER_BYTES
             .checked_add(config.arq.max_source_bytes)
@@ -360,12 +367,37 @@ impl Reliable {
         {
             return Err(Error::InvalidConfig);
         }
+        config.fec.validate()?;
+        Ok(maximum_packet)
+    }
+}
+
+impl Reliable {
+    /// Validate canonical cross-module limits before constructing bounded state.
+    pub fn new(config: ReliableConfig, context: RecoveryContext) -> Result<Self, Error> {
+        Self::new_duplex(config, config, context)
+    }
+
+    /// Construct one actual owner with complete independent data-direction policies.
+    pub fn new_duplex(
+        config: ReliableConfig,
+        receive_config: ReliableConfig,
+        context: RecoveryContext,
+    ) -> Result<Self, Error> {
+        let maximum_packet = config.maximum_packet()?;
+        let receive_maximum_packet = receive_config.maximum_packet()?;
+        let count = config.fec.block.max_sources;
+        let symbols = count
+            .checked_add(config.repair_symbols)
+            .ok_or(Error::InvalidConfig)?;
+        let arq = SelectiveRepeat::new_duplex(config.arq, receive_config.arq, context)?;
         let send_fec = fec_context(context, false);
         let receive_fec = fec_context(context, true);
-        let decoder = fec::Decoder::new(receive_fec, config.fec)?;
-        let scratch = vec![0; arq.max_packet_bytes()];
+        let decoder = fec::Decoder::new(receive_fec, receive_config.fec)?;
+        let scratch = vec![0; arq.send_max_packet_bytes()];
         Ok(Self {
             config,
+            receive_config,
             context,
             arq,
             decoder,
@@ -381,6 +413,7 @@ impl Reliable {
             fec_deadlines: BTreeMap::new(),
             scratch,
             maximum_packet,
+            receive_maximum_packet,
             prefer_feedback: true,
             now: Duration::ZERO,
             failure: None,
@@ -413,7 +446,7 @@ impl Reliable {
     /// Resource pressure is retryable; malformed authenticated protocol input fails closed.
     pub fn receive(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
         self.check_time(now)?;
-        let (kind, inner) = match envelope(packet, self.maximum_packet) {
+        let (kind, inner) = match envelope(packet, self.receive_maximum_packet) {
             Ok(view) => view,
             Err(error) => return self.fail(error),
         };
@@ -479,7 +512,13 @@ impl Reliable {
     /// This checks local sending role/session/epoch and all encoding bounds; it
     /// neither authenticates bytes nor advances sender/receiver state.
     pub fn inspect_output(&self, packet: &[u8]) -> Result<RecordKind, Error> {
-        self.inspect_record(packet, opposite_context(self.context), self.send_fec)
+        self.inspect_record(
+            packet,
+            opposite_context(self.context),
+            self.send_fec,
+            self.config,
+            self.maximum_packet,
+        )
     }
 
     /// Classify one authenticated peer record without mutating recovery state.
@@ -487,7 +526,13 @@ impl Reliable {
     /// allowing callers to reject feedback on data lanes or data on control lanes.
     /// Lower-layer integrity/replay verification must precede this operation.
     pub fn inspect_peer(&self, packet: &[u8]) -> Result<RecordKind, Error> {
-        self.inspect_record(packet, self.context, self.receive_fec)
+        self.inspect_record(
+            packet,
+            self.context,
+            self.receive_fec,
+            self.receive_config,
+            self.receive_maximum_packet,
+        )
     }
 
     fn inspect_record(
@@ -495,12 +540,14 @@ impl Reliable {
         packet: &[u8],
         arq_context: RecoveryContext,
         fec_context: fec::FecContext,
+        config: ReliableConfig,
+        maximum_packet: usize,
     ) -> Result<RecordKind, Error> {
         Ok(inspect_record_view(
             packet,
-            self.maximum_packet,
-            self.config.arq.max_source_bytes,
-            self.config.fec.block,
+            maximum_packet,
+            config.arq.max_source_bytes,
+            config.fec.block,
             arq_context,
             fec_context,
         )?
@@ -627,7 +674,15 @@ impl Reliable {
     }
     /// Maximum complete returned packet, excluding configured outer overhead.
     pub fn max_packet_bytes(&self) -> usize {
+        self.maximum_packet.max(self.receive_maximum_packet)
+    }
+    /// Exact local complete emission ceiling, excluding external overhead.
+    pub fn send_max_packet_bytes(&self) -> usize {
         self.maximum_packet
+    }
+    /// Exact peer complete packet ceiling used by authenticated ingress.
+    pub fn receive_max_packet_bytes(&self) -> usize {
+        self.receive_maximum_packet
     }
     /// Actual wrapper-level transmission/recovery observations.
     pub fn statistics(&self) -> Statistics {
@@ -656,7 +711,7 @@ impl Reliable {
     }
 
     fn receive_fec(&mut self, inner: &[u8], now: Duration) -> Result<(), Error> {
-        let view = fec::inspect(inner, self.receive_fec, self.config.fec.block)
+        let view = fec::inspect(inner, self.receive_fec, self.receive_config.fec.block)
             .or_else(|error| self.fail(error.into()))?;
         let systematic = if view.kind == fec::SymbolKind::Systematic {
             let length = usize::from(u16::from_be_bytes(
@@ -712,7 +767,7 @@ impl Reliable {
             Ok(_) => {
                 self.fec_deadlines.entry(view.generation).or_insert(
                     ticks
-                        .checked_add(self.config.fec.max_lifetime_ticks)
+                        .checked_add(self.receive_config.fec.max_lifetime_ticks)
                         .ok_or(Error::TimeOverflow)?,
                 );
                 if let Some(source) = systematic {
@@ -864,12 +919,12 @@ impl Reliable {
             .len()
             .checked_add(packets)
             .ok_or(Error::Exhausted)?
-            > self.config.max_restored_packets
+            > self.receive_config.max_restored_packets
             || self
                 .restored_bytes
                 .checked_add(bytes)
                 .ok_or(Error::Exhausted)?
-                > self.config.max_restored_bytes
+                > self.receive_config.max_restored_bytes
         {
             return Err(Error::RestoredCapacity);
         }
@@ -877,7 +932,11 @@ impl Reliable {
     }
 
     fn source_id(&self, bytes: &[u8]) -> Result<u64, Error> {
-        match inspect_packet(bytes, self.context, self.config.arq.max_source_bytes)? {
+        match inspect_packet(
+            bytes,
+            self.context,
+            self.receive_config.arq.max_source_bytes,
+        )? {
             PacketView::Data { source, .. } => Ok(source.0),
             _ => Err(Error::Malformed),
         }
@@ -910,7 +969,7 @@ impl Reliable {
     }
 
     fn pump(&mut self) -> Result<(), Error> {
-        for _ in 0..self.config.max_restored_packets {
+        for _ in 0..self.receive_config.max_restored_packets {
             let Some((&identity, record)) = self.restored.first_key_value() else {
                 break;
             };
@@ -952,7 +1011,7 @@ impl Reliable {
         now.checked_add(self.config.flush_after)
             .ok_or(Error::TimeOverflow)?;
         milliseconds(now)?
-            .checked_add(self.config.fec.max_lifetime_ticks)
+            .checked_add(self.receive_config.fec.max_lifetime_ticks)
             .ok_or(Error::TimeOverflow)?;
         Ok(())
     }
@@ -1015,3 +1074,6 @@ fn envelope(packet: &[u8], maximum: usize) -> Result<(u8, &[u8]), Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod directional_tests;

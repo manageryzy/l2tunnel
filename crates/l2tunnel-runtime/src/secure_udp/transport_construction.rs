@@ -9,7 +9,7 @@ pub(super) struct Plan {
     pub(super) buffers: buffers::Plan<7>,
     pub(super) inputs: buffers::Plan<2>,
     pub(super) native: native_storage::Plan<Native>,
-    pub(super) wrapper_bytes: usize,
+    pub(super) wrapper: control_owner::wrapper_storage::Plan,
     pub(super) external_bytes: usize,
     pub(super) required_bytes: usize,
 }
@@ -28,7 +28,7 @@ impl Plan {
             .ok_or_else(|| invalid("generic construction requires selected streams"))?;
         let messages =
             selected.message_storage_plans(binding, Duration::ZERO, config.lifetime.lease)?;
-        let wrapper_bytes = selected.wrapper_capacity_bytes(config.control)?;
+        let wrapper = control_owner::wrapper_storage::Plan::new(selected, config.control)?;
         let message_bytes = messages.iter().try_fold(0usize, |total, plan| {
             total
                 .checked_add(plan.capacity_bytes())
@@ -68,7 +68,7 @@ impl Plan {
             inputs.capacity_bytes(),
             native.capacity_bytes(),
             message_bytes,
-            wrapper_bytes,
+            wrapper.capacity_bytes(),
         )?;
         let required_bytes = engines::Bank::required_capacity(initial, role, external_bytes)?;
         Ok(Self {
@@ -76,7 +76,7 @@ impl Plan {
             buffers,
             inputs,
             native,
-            wrapper_bytes,
+            wrapper,
             external_bytes,
             required_bytes,
         })

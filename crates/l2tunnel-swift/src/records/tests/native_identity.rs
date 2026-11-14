@@ -80,7 +80,7 @@ fn deliver(receiver: &mut Engine, now: u64, wire: &[(u64, Vec<u8>)]) -> Result<(
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Snapshot {
+pub(super) struct Snapshot {
     send: Config,
     receive: Config,
     stats: Stats,
@@ -95,7 +95,7 @@ struct Snapshot {
     deliverable: bool,
 }
 
-fn snapshot(engine: &Engine) -> Result<Snapshot, Error> {
+pub(super) fn snapshot(engine: &Engine) -> Result<Snapshot, Error> {
     let mut admitted = Vec::new();
     let mut extracted = Vec::new();
     for index in 0..crate::MAX_CHANNELS {
