@@ -626,3 +626,5 @@ fn generic_type_size_rejected_before_allocation_or_encode() {
         Err(Error::Configuration(_))
     ));
 }
+
+pub(super) mod directional;

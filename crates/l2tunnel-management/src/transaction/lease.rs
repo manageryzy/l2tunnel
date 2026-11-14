@@ -121,6 +121,23 @@ pub(super) struct State {
     expired: bool,
 }
 
+fn validate_lease(
+    identity: Identity,
+    epoch: Epoch,
+    lease: LeaseSettings,
+    now: Tick,
+) -> Result<(), Error> {
+    if lease.session_expires <= now
+        || lease.max_operation_ms == 0
+        || lease.transaction_epoch == 0
+        || identity.session.0 == [0; 16]
+        || epoch.0 == 0
+    {
+        return Err(Error::Configuration("invalid operation lease"));
+    }
+    Ok(())
+}
+
 impl<C: Configuration> Peer<C> {
     /// Select the additive leased contract without changing any legacy wire bytes.
     pub fn new_leased(
@@ -132,25 +149,39 @@ impl<C: Configuration> Peer<C> {
         lease: LeaseSettings,
         now: Tick,
     ) -> Result<Self, Error> {
-        if lease.session_expires <= now
-            || lease.max_operation_ms == 0
-            || lease.transaction_epoch == 0
-            || identity.session.0 == [0; 16]
-            || epoch.0 == 0
-        {
-            return Err(Error::Configuration("invalid operation lease"));
-        }
-        let mut peer = Self::new(identity, epoch, initial, supported, settings, now)?;
-        peer.lease = Some(State {
+        validate_lease(identity, epoch, lease, now)?;
+        let peer = Self::new(identity, epoch, initial, supported, settings, now)?;
+        Ok(peer.with_lease(lease))
+    }
+
+    /// Require immutable operation leases and explicit global-sender fence widths.
+    /// The selected configuration encodes both global widths; no wire field or
+    /// default migration is inferred from selecting this constructor.
+    pub fn new_leased_directional(
+        identity: Identity,
+        epoch: Epoch,
+        initial: C,
+        supported: &[C],
+        settings: super::Settings,
+        lease: LeaseSettings,
+        now: Tick,
+    ) -> Result<Self, Error> {
+        validate_lease(identity, epoch, lease, now)?;
+        let peer = Self::new_directional(identity, epoch, initial, supported, settings, now)?;
+        Ok(peer.with_lease(lease))
+    }
+
+    fn with_lease(mut self, lease: LeaseSettings) -> Self {
+        self.lease = Some(State {
             settings: lease,
             operation: None,
             candidate: None,
             final_incoming: None,
             expired: false,
         });
-        peer.deadline = peer.clamp_lease(peer.deadline);
-        peer.next_retry = peer.clamp_lease(peer.next_retry);
-        Ok(peer)
+        self.deadline = self.clamp_lease(self.deadline);
+        self.next_retry = self.clamp_lease(self.next_retry);
+        self
     }
 
     /// Whether this peer explicitly requires original operation leases.
@@ -649,7 +680,7 @@ impl<C: Configuration> Peer<C> {
                 }
                 super::Fence::decode(
                     frame.body.get(end..).ok_or(Error::Malformed)?,
-                    self.active.channels(),
+                    self.sender_channels(opposite(self.identity.role)),
                 )?;
                 Ok(())
             }

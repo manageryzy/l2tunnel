@@ -110,6 +110,15 @@ async fn service_early(parts: &mut member::Parts) -> Result {
 
 #[tokio::test]
 async fn real_factories_authenticate_selected_stream_contract_on_both_original_pairs() -> Result {
+    authenticate_profiles(false).await
+}
+
+#[tokio::test]
+async fn real_factories_authenticate_complete_generic_catalog_and_distinct_user_digest() -> Result {
+    authenticate_profiles(true).await
+}
+
+async fn authenticate_profiles(generic: bool) -> Result {
     for appearance in [
         l2tunnel_cover::Appearance::QuicLike,
         l2tunnel_cover::Appearance::MediaLike,
@@ -121,8 +130,55 @@ async fn real_factories_authenticate_selected_stream_contract_on_both_original_p
         ];
         let member = member_key()?;
         let (profile, peers) = selected_profile(appearance, &sockets, member.public_key())?;
-        let requested = profile.settings();
-        let expected = profile.configuration(peers)?;
+        let transaction = if generic {
+            use crate::secure_udp::transaction_profile::{
+                Parameters, Profile as TransactionProfile,
+            };
+            use l2tunnel::swift_configuration::{Catalog, Descriptor};
+            let mut initiator = profile.runtime(security::Role::Initiator);
+            let mut responder = profile.runtime(security::Role::Responder);
+            initiator.send.records.channels = 2;
+            initiator.receive.records.channels = 3;
+            initiator.send.bytes_per_second += 1;
+            initiator.receive.records.codec.window += 1;
+            responder.send = initiator.receive;
+            responder.receive = initiator.send;
+            let initial = Descriptor::new(initiator.path_mtu, initiator.send, initiator.receive)?;
+            let mut forward = initiator.send;
+            let mut reverse = initiator.receive;
+            forward.records.channels = 4;
+            reverse.records.channels = 1;
+            let target = Descriptor::new(initiator.path_mtu, forward, reverse)?;
+            Some(TransactionProfile::new(
+                profile.connection(),
+                profile.session_with_seed(),
+                peers,
+                initiator,
+                responder,
+                Catalog::new(initial, &[initial, target])?,
+                Parameters {
+                    protocol: l2tunnel_management::transaction::Settings::default(),
+                    max_operation_ms: 5000,
+                    retained_bytes: 256 << 20,
+                },
+            )?)
+        } else {
+            None
+        };
+        let requested = transaction
+            .as_ref()
+            .map_or(profile.settings(), |value| value.settings());
+        let expected = match &transaction {
+            Some(value) => value.configuration()?,
+            None => profile.configuration(peers)?,
+        };
+        if let Some(value) = &transaction {
+            assert_ne!(value.data_digest().0, expected.0);
+            assert_eq!(
+                value.data_digest(),
+                l2tunnel_management::transaction::configuration_digest(&value.initial())?
+            );
+        }
         let [client_socket, server_socket] = sockets;
         let [client_identity, server_identity] = identities();
         let origin = Instant::now();
@@ -196,7 +252,11 @@ async fn real_factories_authenticate_selected_stream_contract_on_both_original_p
                 originals[side]
             );
             assert_eq!(parts.deadline, deadline);
-            assert!(profile.runtime(role).streams.is_some());
+            let runtime = match &transaction {
+                Some(value) => value.runtime_for(value.initial(), role)?,
+                None => profile.runtime(role),
+            };
+            assert!(runtime.streams.is_some());
         }
     }
     Ok(())

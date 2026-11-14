@@ -2017,3 +2017,5 @@ async fn earned_repair_wakes_when_wire_credit_returns_before_the_idle_probe() ->
     }
     Ok(())
 }
+#[path = "transport_envelope_tests.rs"]
+mod envelope;

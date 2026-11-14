@@ -67,6 +67,14 @@ The actual runtime/service integration additionally tracks
 [directional scopes and typed control](modules/directional-control.md),
 [one reusable Swift policy coordinator](modules/swift-policy-coordinator.md) and
 [shared secure-UDP service integration](modules/secure-udp-service.md).
+[Generic selected-UDP transactions](modules/generic-secure-udp.md) now track
+GSU-01..GSU-10: asymmetric sender fences, complete canonical configuration,
+borrowed control proofs, actual engine/device custody and selected runtime/API
+integration. Explicit directional peers and complete canonical values now have
+focused protocol evidence; the authenticated client construction has real
+factory tests. Selected generic driver/device/resource integration remains
+pending. Full SW-11, other profiles and every original
+mode/native/platform/performance gate retain their complete definitions.
 The [original-socket native driver](modules/secure-udp-runtime.md) has its own
 bounded transport and runtime validation gates. The
 [source-pinned native lab](modules/secure-udp-native.md) separately tracks actual

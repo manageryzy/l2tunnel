@@ -14,6 +14,9 @@ pub mod profile;
 /// Non-secret versioned observations for the selected shared UDP profile.
 #[cfg(unix)]
 pub mod status;
+/// Explicit complete canonical transaction plan; actual driver readiness is separate.
+#[cfg(unix)]
+pub mod transaction_profile;
 
 use l2tunnel_core::ConfigDigest;
 use l2tunnel_cover as cover;

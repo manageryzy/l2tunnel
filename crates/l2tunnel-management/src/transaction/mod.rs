@@ -255,9 +255,30 @@ struct Pending<C: Configuration> {
     peer_barrier: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FenceContract {
+    Legacy,
+    GlobalSender,
+}
+impl FenceContract {
+    fn validate<C: Configuration>(self, config: &C) -> Result<(), Error> {
+        match self {
+            Self::Legacy => Ok(()),
+            Self::GlobalSender => config::validate_sender_channels(config),
+        }
+    }
+    fn channels<C: Configuration>(self, config: &C, sender: Role) -> u16 {
+        match self {
+            Self::Legacy => config.channels(),
+            Self::GlobalSender => config.sender_channels(sender),
+        }
+    }
+}
+
 /// Bounded distributed transaction state for one existing authenticated peer session.
 pub struct Peer<C: Configuration = ModeConfig> {
     lease: Option<lease::State>,
+    fence_contract: FenceContract,
     identity: Identity,
     settings: Settings,
     supported: Vec<ConfigDigest>,
@@ -289,6 +310,48 @@ impl<C: Configuration> Peer<C> {
         settings: Settings,
         now: Tick,
     ) -> Result<Self, Error> {
+        Self::new_with_contract(
+            identity,
+            epoch,
+            initial,
+            supported,
+            settings,
+            now,
+            FenceContract::Legacy,
+        )
+    }
+
+    /// Select global-sender old-policy fence widths on both endpoints explicitly.
+    /// Client and Server name the same global senders at each endpoint; this is
+    /// independent of local send/receive halves and preserves the existing wire.
+    pub fn new_directional(
+        identity: Identity,
+        epoch: Epoch,
+        initial: C,
+        supported: &[C],
+        settings: Settings,
+        now: Tick,
+    ) -> Result<Self, Error> {
+        Self::new_with_contract(
+            identity,
+            epoch,
+            initial,
+            supported,
+            settings,
+            now,
+            FenceContract::GlobalSender,
+        )
+    }
+
+    fn new_with_contract(
+        identity: Identity,
+        epoch: Epoch,
+        initial: C,
+        supported: &[C],
+        settings: Settings,
+        now: Tick,
+        fence_contract: FenceContract,
+    ) -> Result<Self, Error> {
         settings.validate()?;
         if supported.is_empty() || supported.len() > 64 || identity.local == identity.remote {
             return Err(Error::Configuration(
@@ -296,10 +359,15 @@ impl<C: Configuration> Peer<C> {
             ));
         }
         let digest = configuration_digest(&initial)?;
+        fence_contract.validate(&initial)?;
         let supported = supported
             .iter()
-            .map(configuration_digest)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|config| {
+                let digest = configuration_digest(config)?;
+                fence_contract.validate(config)?;
+                Ok(digest)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         if !supported.contains(&digest) {
             return Err(Error::Unsupported);
         }
@@ -312,6 +380,7 @@ impl<C: Configuration> Peer<C> {
         let deadline = add(now, settings.reconcile_timeout_ms)?;
         Ok(Self {
             lease: None,
+            fence_contract,
             identity,
             settings,
             supported,
@@ -344,6 +413,14 @@ impl<C: Configuration> Peer<C> {
     /// Locally committed active mode.
     pub fn active_config(&self) -> &C {
         &self.active
+    }
+    /// Active old-policy width under this peer's explicitly selected contract.
+    /// Legacy peers return `channels()` for either authenticated global sender.
+    pub fn sender_channels(&self, sender: Role) -> u16 {
+        self.sender_channels_for(&self.active, sender)
+    }
+    fn sender_channels_for(&self, config: &C, sender: Role) -> u16 {
+        self.fence_contract.channels(config, sender)
     }
     /// Locally committed data epoch.
     pub fn active_epoch(&self) -> Epoch {
@@ -446,7 +523,7 @@ impl<C: Configuration> Peer<C> {
         if !matches!(self.phase, Phase::Staging | Phase::FollowerStaging) {
             return Err(Error::Unexpected);
         }
-        if local.0.len() != usize::from(self.active.channels()) {
+        if local.0.len() != usize::from(self.sender_channels(self.identity.role)) {
             return Err(Error::IncompleteDrain);
         }
         let pending = self.pending.as_mut().ok_or(Error::Unexpected)?;
@@ -656,6 +733,7 @@ impl<C: Configuration> Peer<C> {
     }
     fn validate_mode(&self, mode: &C) -> Result<ConfigDigest, Error> {
         let digest = configuration_digest(mode)?;
+        self.fence_contract.validate(mode)?;
         if !self.supported.contains(&digest) || mode.duplex() != self.active.duplex() {
             return Err(Error::Unsupported);
         }
@@ -698,8 +776,10 @@ impl<C: Configuration> Peer<C> {
                 if self.validate_mode(&next)? != h.ticket.digest {
                     return Err(Error::Unexpected);
                 }
-                let peer =
-                    Fence::decode(&frame.body[8 + C::ENCODED_LEN..], self.active.channels())?;
+                let peer = Fence::decode(
+                    &frame.body[8 + C::ENCODED_LEN..],
+                    self.sender_channels(opposite(self.identity.role)),
+                )?;
                 self.guard.prepare(h.ticket).map_err(Error::Guard)?;
                 self.guard.peer_ready(h.ticket).map_err(Error::Guard)?;
                 self.begin_operation(h.ticket)?;
@@ -831,7 +911,10 @@ impl<C: Configuration> Peer<C> {
                 if self.phase != Phase::AwaitReady {
                     return Err(Error::Unexpected);
                 }
-                let peer = Fence::decode(&frame.body[8..], self.active.channels())?;
+                let peer = Fence::decode(
+                    &frame.body[8..],
+                    self.sender_channels(opposite(self.identity.role)),
+                )?;
                 let pending = self.pending.as_mut().ok_or(Error::Unexpected)?;
                 pending.peer = Some(peer.clone());
                 let local = pending.local.clone().ok_or(Error::Unexpected)?;

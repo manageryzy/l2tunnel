@@ -539,45 +539,62 @@ impl Config {
     }
     /// Canonical local contract; the parent combines both roles in global order.
     pub fn canonical_digest(&self) -> io::Result<core::ConfigDigest> {
+        self.contract_digest(false)
+    }
+    /// Fixed runtime inventory independent of explicitly mutable data policy.
+    /// Native layer/packet limits remain bound. The caller must also bind the
+    /// actual carrier, trust, catalog and preparation resources in its envelope.
+    /// This local digest alone is not authenticated peer or staging authority.
+    pub fn immutable_contract_digest(&self) -> io::Result<core::ConfigDigest> {
+        self.contract_digest(true)
+    }
+    fn contract_digest(&self, normalized: bool) -> io::Result<core::ConfigDigest> {
         self.validate()?;
         let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(if self.streams.is_some() {
-            b"l2tunnel/secure-udp-native-contract/streamed-v1\0"
-        } else {
-            b"l2tunnel/secure-udp-native-contract/v1\0"
-        });
+        let domain: &[u8] = match (normalized, self.streams.is_some()) {
+            (false, false) => b"l2tunnel/secure-udp-native-contract/v1\0",
+            (false, true) => b"l2tunnel/secure-udp-native-contract/streamed-v1\0",
+            (true, false) => b"l2tunnel/secure-udp-native-envelope/v1\0",
+            (true, true) => b"l2tunnel/secure-udp-native-envelope/streamed-v1\0",
+        };
+        hash.update(domain);
         let mut number = |value: u64| hash.update(&value.to_be_bytes());
         for direction in [self.send, self.receive] {
             let r = direction.records;
             let c = r.codec;
-            for value in [
-                r.channels as u64,
-                if r.layer == records::Layer::Ethernet {
-                    1
-                } else {
-                    2
-                },
-                r.max_native as u64,
-                direction.bytes_per_second,
-                c.datagram_bytes as u64,
-                c.window as u64,
-                c.repair_numerator as u64,
-                c.repair_denominator as u64,
-                c.flow_sources as u64,
-                c.queue_bytes as u64,
-                c.max_packet as u64,
-                c.flush_micros,
-                c.feedback_micros,
-                c.tail_micros,
-                c.min_rto_micros,
-                c.max_rto_micros,
+            // One inventory preserves legacy bytes and explicitly classifies
+            // every field for the separate fixed-envelope digest.
+            for (value, mutable) in [
+                (r.channels as u64, true),
+                (
+                    if r.layer == records::Layer::Ethernet {
+                        1
+                    } else {
+                        2
+                    },
+                    false,
+                ),
+                (r.max_native as u64, false),
+                (direction.bytes_per_second, true),
+                (c.datagram_bytes as u64, true),
+                (c.window as u64, true),
+                (u64::from(c.repair_numerator), true),
+                (u64::from(c.repair_denominator), true),
+                (c.flow_sources as u64, true),
+                (c.queue_bytes as u64, true),
+                (c.max_packet as u64, false),
+                (c.flush_micros, true),
+                (c.feedback_micros, true),
+                (c.tail_micros, true),
+                (c.min_rto_micros, true),
+                (c.max_rto_micros, true),
             ] {
-                number(value);
+                number(if normalized && mutable { 0 } else { value });
             }
         }
         let a = self.control.recovery;
         for value in [
-            self.path_mtu as u64,
+            if normalized { 0 } else { self.path_mtu as u64 },
             self.policy.transaction_micros,
             self.policy.max_outbound as u64,
             self.security.max_body_bytes as u64,
@@ -638,7 +655,7 @@ impl Config {
                 // this exact wrapper charge; validate rejects any divergence.
                 for value in [
                     entry.delivery.wire_overhead as u64,
-                    entry.path_mtu as u64,
+                    if normalized { 0 } else { entry.path_mtu as u64 },
                     entry.max_message_bytes as u64,
                     entry.max_outbound_messages as u64,
                     entry.max_outbound_bytes as u64,

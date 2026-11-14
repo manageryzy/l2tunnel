@@ -23,6 +23,12 @@ pub trait Configuration: Clone + Eq {
     fn decode(input: &[u8]) -> Result<Self, Error>;
     /// Old-policy channel count for per-channel drain fences, in 1..=256.
     fn channels(&self) -> u16;
+    /// Old-policy width for an authenticated global data sender, in 1..=256.
+    /// Explicit directional peers use this query; legacy peers keep `channels()`.
+    /// Both widths must be derived from the policy's canonical encoded value.
+    fn sender_channels(&self, _sender: crate::Role) -> u16 {
+        self.channels()
+    }
     /// Physical lane arrangement; transactions cannot change it.
     fn duplex(&self) -> Duplex;
 }
@@ -43,6 +49,17 @@ pub(super) fn encode_configuration<C: Configuration>(config: &C) -> Result<Vec<u
     let mut bytes = vec![0; C::ENCODED_LEN];
     config.encode_into(&mut bytes)?;
     Ok(bytes)
+}
+
+pub(super) fn validate_sender_channels<C: Configuration>(config: &C) -> Result<(), Error> {
+    for sender in [crate::Role::Client, crate::Role::Server] {
+        if !(1..=256).contains(&config.sender_channels(sender)) {
+            return Err(Error::Configuration(
+                "canonical policy sender channel count",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn decode_configuration<C: Configuration>(input: &[u8]) -> Result<C, Error> {

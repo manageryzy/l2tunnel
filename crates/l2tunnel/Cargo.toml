@@ -37,6 +37,7 @@ l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
 l2tunnel-tcp-proxy = { path = "../l2tunnel-tcp-proxy" }
 l2tunnel-aligned = { path = "../l2tunnel-aligned" }
 l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
+ring = "=0.17.14"
 
 [dev-dependencies]
 zeroize = "=1.9.0"
