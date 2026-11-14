@@ -124,6 +124,7 @@ pub struct Engine {
     compressors: Vec<header::Compressor>,
     decompressors: Vec<header::Decompressor>,
     turn: usize,
+    receive_turn: usize,
     feedback_at: u64,
     feedback_turn: usize,
     ready: u64,
@@ -164,6 +165,7 @@ impl Engine {
             compressors,
             decompressors,
             turn: 0,
+            receive_turn: 0,
             feedback_at: 0,
             feedback_turn: 0,
             ready: 0,
@@ -372,19 +374,27 @@ impl Engine {
     pub fn deliverable(&self) -> bool {
         self.ready != 0
     }
-    /// Return one exact recovered native packet from the next ready channel.
+    /// Return one exact recovered native packet in bounded receive-channel rotation.
     pub fn pop(&mut self) -> Result<Option<&[u8]>, Error> {
-        while self.ready != 0 {
-            let channel = self.ready.trailing_zeros() as usize;
+        if self.ready == 0 {
+            return Ok(None);
+        }
+        let channels = self.receive.channels;
+        for step in 0..channels {
+            let channel = (self.receive_turn + step) % channels;
+            if self.ready & (1_u64 << channel) == 0 {
+                continue;
+            }
             if self.receivers[channel].pop_packet(&mut self.record)? {
                 self.decompressors[channel].decompress(
                     &self.record,
                     self.send.max_native,
                     &mut self.native,
                 )?;
+                self.receive_turn = (channel + 1) % channels;
                 return Ok(Some(&self.native));
             }
-            self.ready &= !(1 << channel);
+            self.ready &= !(1_u64 << channel);
         }
         Ok(None)
     }
@@ -473,6 +483,7 @@ impl Engine {
                 .push(header::Decompressor::new(config.layer == Layer::Ethernet));
         }
         self.limit = self.limit.max(config.codec.datagram_bytes);
+        self.receive_turn = 0;
         self.feedback_turn = 0;
         self.ready = 0;
         self.receive = config;

@@ -156,6 +156,26 @@ observes lower scheduling cost with current-thread and no throughput gain. Its
 partial multithread switch-pairing evidence and all historical failures remain
 explicit. Full SW-11, all 47 modes and the parent performance/platform gates remain open.
 
+The [Swift receive-service correction](modules/swift-record-engine.md#bounded-cross-channel-receive-service)
+now tracks SWR-09..SWR-12 separately from send-side scheduling and SUR-11 descriptor
+fairness. Source-stable pure and real protected-UDP/native-output regressions
+reproduce the old lowest-channel selector starving a complete higher channel.
+The corrected shared selector passes the focused pure/runtime/service checks
+with unchanged assertions, preserving per-channel order, wire bytes and bounds;
+its [required frozen-source workspace check](../work/swift-receive-fairness-20261114/aggregate-attempt-1/validation.json)
+passes 1659 Rust, 349 tooling and 1658 simulator cases. The
+[fresh 16-case native analysis](../work/swift-receive-fairness-20261114/native-analysis-attempt-1/validation.json)
+verifies all payload/control/policy/manual-reconnect/thread/cleanup observations,
+but retains two capture gaps and an overall failed/incomplete verdict: 14 cases
+have complete evidence, and all eight impaired 80 Mbit/s targets fail at
+76.627–78.681 Mbit/s. Native throughput benefit remains unproved and SWR-12
+remains open. The distinct partial-native-stream drain concern remains open under
+SWR-13. The separate [current-binary kernel comparison](../work/swift-receive-fairness-20261114/kernel-summary-attempt-1/analysis.md)
+passes both full perf validators with zero lost events. Current-thread reduces
+observed system CPU and context switching while measured goodput remains
+78.182/78.216 Mbit/s; both original targets still fail. Host I/O is unattributed
+and the instrumented observations do not establish a unique bottleneck or default.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |

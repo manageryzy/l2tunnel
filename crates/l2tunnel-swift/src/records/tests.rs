@@ -1,5 +1,7 @@
 use super::*;
 
+mod receive_service;
+
 fn config(channels: usize) -> Config {
     Config {
         codec: crate::Config {

@@ -178,4 +178,158 @@ classification and performance qualification.
 - [x] [SWR-07] Record source-stable focused tests, formatting, warning-denied workspace checks and the required aggregate result; distinguish finite library/runtime fixtures from native and platform validation. Evidence: the earlier [pure/runtime focus](../../work/swift-record-engine-20261113/focused-validation.json) and [source-stable full aggregate](../../work/shared-session-client-20261113/validation.json) and [focused commands](../../work/shared-session-client-focused-20261113/attempt-5/validation.json) passed with explicit source identities. Native devices, network performance and Windows/Android execution remain separate.
 - [x] [SWR-08] Expose bounded, nonmutating per-channel packing/recovery observations, including current RTT/RTO, retransmission and retained-source debt; preserve exact wire bytes, directional replacement and separate retired aggregate statistics. Validate asymmetric channel counts and all64 channel indices before reporting this child complete. Evidence: [Sender observations](../../crates/l2tunnel-swift/src/sender.rs), [current-channel API](../../crates/l2tunnel-swift/src/records.rs) and12 passing [record tests](../../crates/l2tunnel-swift/src/records/tests.rs) in the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json). Tests prove observed/unobserved exact wire equivalence, asymmetric1/64 directions, out-of-range rejection, replacement/current-versus-retired statistics and retained retransmission custody.
 
+## Bounded cross-channel receive service
+
+Status: **implemented and contract-tested**, with finite protected-UDP/native-
+descriptor integration tests. Immutable TAP observations are recorded below;
+their full capture qualification remains incomplete and all eight impaired
+performance observations fail the original 80 Mbit/s target.
+The contract was recorded before its production edits. This is an
+engineering contract for a discovered scheduling defect, not an owner decision
+or a claim that it causes the remaining native throughput shortfall. The previous
+`pop` always selects the lowest ready channel and leaves that channel marked
+ready after success. Continuously replenishing it can postpone another complete
+channel indefinitely, despite independent ordered recovery and bounded outer
+native work. The existing send-side round robin and SUR-11 descriptor fairness
+do not establish receive-channel fairness.
+
+Add one bounded receive cursor, independent of send and feedback cursors. Start
+the ready-bit search at that cursor and wrap once; a successful complete native
+packet advances to the following receive channel. A channel without a complete
+packet loses its ready hint for this call; subsequent accepted data can mark it
+again. With C configured receive channels and successful `pop` calls continuing,
+a continuously complete channel must be selected within C successful returns,
+even if a lower channel is replenished between every call. Empty hints or an
+incomplete record must not block another complete channel. Each call inspects
+at most C ready hints; no additional queue, allocation, clock or I/O is introduced.
+
+Preserve exact per-channel packet order, header contexts, compressed/source/
+repair/feedback bytes and full record-number semantics. Cross-channel dequeue
+order is intentionally fairer; there is no global native order across channels.
+Reset this cursor only at construction or an already-drained `replace_receive`;
+`replace_send` must not change receive position. Preserve all queue/work/credit
+limits, native completion, authenticated barriers, floors and original deadlines.
+Both retained-v2 and common-session consumers use the same pure engine.
+
+First execute a deterministic public-API regression against the old selector:
+actual classified low/high flows become ready through `offer`/`poll`/`accept`,
+with a new low packet before each later dequeue. Preserve its negative receipt.
+Then cover cyclic service across all 64 channels, sparse/partial ready channels,
+per-channel exact order and asymmetric/drained directional replacement. Exercise
+the actual protected UDP driver under both covers with bounded native output,
+including blocked output and existing expiry/control/cancellation tests. Tests
+prove the scheduling contract; only separate immutable native observations can
+support a throughput claim. The original 80 Mbit/s target, SNL-11/FIX-04, full
+SW-11, all 47 P-* modes and carrier/lifecycle/platform work remain open.
+
+- [x] [SWR-09] Record/review the additive receive-service bound and unchanged protocol, per-channel ordering, ownership, reset and performance boundaries before production edits. Evidence: [pre-edit contract](../../work/swift-receive-fairness-20261114/design-v0.md) and [source-stable old-selector regressions](../../work/swift-receive-fairness-20261114/old-selector-attempt-1/validation.json).
+- [x] [SWR-10] Reproduce low-channel starvation with actual public record APIs against the old selector; preserve a source-bound negative receipt and pass deterministic cyclic/sparse/partial/order/reset regressions after correction. Evidence: [old-selector failures with final fixtures](../../work/swift-receive-fairness-20261114/old-selector-attempt-2/validation.json) and [source-stable focused pass with unchanged assertions](../../work/swift-receive-fairness-20261114/focused-attempt-2/validation.json).
+- [x] [SWR-11] Implement bounded receive round robin in the shared pure engine and verify actual both-cover protected-driver delivery with bounded output, retaining original control/backpressure/deadline/cancellation checks and separate performance claims. Evidence: [shared pure engine](../../crates/l2tunnel-swift/src/records.rs), [actual protected UDP and one-packet physical handoff fixture](../../crates/l2tunnel-runtime/src/secure_udp/transport_receive_service_tests.rs), and [source-stable focused pass](../../work/swift-receive-fairness-20261114/focused-attempt-2/validation.json).
+- [ ] [SWR-12] Pass source-stable focused and required workspace checks, record immutable native functional/performance observations with original targets, reconcile evidence and save an actual local checkpoint before closing this correction.
+- [ ] [SWR-13] Reject receive-direction replacement while any partial native length prefix or payload remains, even when all received sources have advanced and pending-source count is zero. Preserve exact suffix recovery, header contexts, history/feedback semantics and authenticated drain barriers; verify partial-prefix/payload/gap and replacement refusal without treating source receipt as native completion.
+
+The [old-selector run](../../work/swift-receive-fairness-20261114/old-selector-attempt-1/validation.json)
+reproduces both intended assertion failures with stable inputs and the production
+engine byte-identical to the preceding commit. The pure public-API test returns
+another low packet rather than the complete high packet; the actual protected
+UDP/one-packet native-output fixture likewise observes the wrong second physical
+handoff. This is a correctness/fair-service defect, not a measured explanation
+of the historical throughput gap. No prior test assertion or deadline changed.
+
+The first corrected-source focused attempt exposed a new fixture readiness
+defect after the pure regressions passed: simulated WouldBlock clears reactor
+readiness without making the underlying socket unwritable. The fixture now
+re-registers that same owned device on unblocking, retaining all assertions and
+timeouts. A [second old-selector run](../../work/swift-receive-fairness-20261114/old-selector-attempt-2/validation.json)
+again reproduces both original fairness assertions with those exact corrected
+fixtures. Both earlier negative runs and the failed focused attempt are retained.
+
+The [second focused attempt](../../work/swift-receive-fairness-20261114/focused-attempt-2/validation.json)
+passes all 55 Swift library tests, 102 secure-UDP runtime tests, retained Swift
+runtime tests, the complete shared client-core/API suite, strict Clippy and
+warning-denied rustdoc. Compared with the second old-selector run, its only
+non-document input difference is the production record selector. All regression
+assertions and timeouts are byte-identical. This verifies the scheduling
+correction and finite descriptor custody, separately from native performance.
+
+The [required frozen-source workspace check](../../work/swift-receive-fairness-20261114/aggregate-attempt-1/validation.json)
+passes 1,659 Rust cases including doctests, 349 Python tooling cases and 1,658
+simulator cases, plus formatting, strict Clippy, rustdoc and CLI checks. Its
+non-document inputs match the [immutable optimized build](../../work/swift-receive-fairness-20261114/native-build-attempt-1/build-receipt.json),
+binary `f4a55068de79621b44737b33c26c4648042fd4e66b34e70a2074d406cc4f56ba`.
+These are local Linux checks, not remote CI, Windows/Android or real-device tests.
+
+The [fresh independent native analysis](../../work/swift-receive-fairness-20261114/native-analysis-attempt-1/validation.json)
+retains all 16 observations on that binary. Exact useful bytes/hash/EOF,
+authenticated control, policy, manual reconnect, thread observations and owned
+cleanup verify in every case. Full case/capture evidence verifies in 14 cases;
+the overall analysis remains **failed/incomplete**. Case02, multithread media-like
+clean, retains `tool_failure`: its WAN-a, WAN-b and native-a tcpdump logs report
+24,979, 22,768 and 12,017 packets dropped by the kernel. A complete 24-key probe
+drain does not waive those losses. Case03, multithread QUIC-like impaired, retains
+a native ICMP-validator rejection in both drain and final audit; zero reported
+kernel drops do not establish capture completeness. Neither failure is discarded
+or reclassified as a qualified native pass.
+
+Seven cases pass native acceptance, eight fail and one is a tool failure. All
+eight impaired goodput observations fail 80 Mbit/s, at 76.627–78.681 Mbit/s; the
+76.627 observation also retains its capture failure. All clean payload observations
+exceed 80, while case02 still lacks capture qualification. The
+[byte-exact archive](../../work/swift-receive-fairness-20261114/native-observations-attempt-1/archive-validation.json)
+preserves 3,338,119,834 bytes across 761 files. Runtime A-B-B-A observations on
+one binary are separate from a matched, interleaved comparison of old and new
+selectors. No causal fairness speedup or default change follows. SWR-12 remains
+open with its original deliverable; these gaps do not reduce its acceptance scope.
+
+The owner's requested [fresh kernel perf comparison](../../work/swift-receive-fairness-20261114/kernel-summary-attempt-1/analysis.md)
+uses two separate impaired QUIC-like runs on the same current binary. Both full
+raw validators and root-resolved symbol reports pass, with zero lost perf events;
+both native runs preserve their sole failed 80 Mbit/s target, exact payloads and
+owned cleanup. These instrumented observations are separate from the matrix:
+
+| Runtime | Goodput Mbit/s | Kernel cycle-period weight | System mean cores | Matched-thread switches/s |
+| --- | ---: | ---: | ---: | ---: |
+| Multithread | 78.182 | 69.970% | 0.6812 | 18,348.5 |
+| Current-thread | 78.216 | 61.800% | 0.3298 | 6,911.9 |
+
+Resolved inclusive kernel contexts include scheduler, epoll, TAP write and UDP
+send/receive; their percentages overlap. Lower observed scheduling cost does not
+produce a material throughput difference in this finite pair. The owned daemons
+record zero storage read bytes and 385,024/356,352 written bytes in their
+respective counter brackets. Host I/O activity and pressure remain unattributed;
+these counters neither establish a storage bottleneck nor exclude buffered I/O
+or indirect contention. Actual event spans (14.775/15.298 s), process-counter
+brackets (16.971/16.466 s) and the 20 s useful-byte denominator are separate.
+Profiler overhead is unquantified; this is not a causal bottleneck proof, a new
+default or ISP/platform qualification. The previous binary's partial multithread
+SWITCH-pairing failure remains unchanged in its historical receipt.
+
+The separate [source-bound accounting report](../../work/swift-receive-fairness-20261114/source-accounting-attempt-1/validation.json)
+reconciles all 16 preceding cases' two-sided telemetry within each side's own
+elapsed interval. Impaired forward source fill is 99.16–99.38%; feedback/control
+bytes and capped credit have explicit costs. For example, case03 has 125,887
+sources, 22,424 retransmissions and 104 tail repairs, exactly its 148,415 User
+attempts. Its 33,538,822-byte combined recovery residual cannot distinguish
+retransmission from repair byte costs. These are not exact 20-second application
+or post-qdisc capture cohorts. The positive `header_bytes_saved` delta counter
+does not subtract literal-record tags, so it alone cannot reconstruct exact
+admitted native bytes. No loss multiplier or throughput acceptance changes.
+
+The [offline sender TCP_INFO comparison](../../work/swift-receive-fairness-20261114/tcp-info-comparison-attempt-1/validation.json)
+independently decodes the saved 248-byte Linux counter values for all eight
+impaired cells in each of the previous and current matrices. Each socket's
+first/last read bracket is contained in its original measurement; sums retain
+those distinct intervals. Current-case retransmitted-byte sums range from
+3,281,168 to 4,740,752 bytes across 16 sockets. They are sender-kernel counters,
+not observed TAP overlaps, delivered duplicates, Swift recovery bytes or an exact
+20-second aggregate. No subtraction from differently timed wire/application
+counters or causal before/after conclusion is valid. The current matrix's failed
+capture and performance verdicts remain unchanged.
+
+Independent source review also found a distinct incomplete-stream drain concern:
+`Receiver::pending` counts source debt, while a partial native record can remain
+in its stream after source advancement. The present engine drain predicate does
+not inspect those bytes. SWR-13 tracks that separate correctness work; no native
+corruption or policy-switch failure is inferred without its own regression.
+
 The parent acceptance gates are not completed by these scoped results.
