@@ -24,6 +24,10 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
         .iter_mut()
         .find(|e| e.accepted.operation == id)
     {
+        #[cfg(unix)]
+        if let Some(record) = &mut entry.setup {
+            record.complete(&result, entry.accepted, Instant::now());
+        }
         entry.result = Some(result);
     }
     state.snapshot.operation = None;
@@ -441,8 +445,14 @@ async fn establish_secure_udp(
         Role::Responder => (selected.gate.path.server, selected.gate.path.client),
     };
     check(deadline)?;
-    let socket = tokio::net::UdpSocket::bind(local).await?;
-    socket.connect(peer).await?;
+    setup::stage(shared, accepted.operation, SetupStage::SocketBind);
+    let socket = tokio::net::UdpSocket::bind(local).await.inspect_err(|_| {
+        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+    })?;
+    setup::stage(shared, accepted.operation, SetupStage::SocketConnect);
+    socket.connect(peer).await.inspect_err(|_| {
+        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+    })?;
     check(deadline)?;
     if role == Role::Responder {
         shared.lock().snapshot.listening = Some(Listening {
@@ -452,9 +462,10 @@ async fn establish_secure_udp(
         shared.changed();
     }
     let mut entropy = establish::RuntimeEntropy::new();
+    let mut observe = |value| setup::runtime(shared, accepted.operation, value);
     let session = match &plan.data.endpoint {
         Endpoint::SecureClient(credentials) => {
-            crate::secure_udp::connect(
+            crate::secure_udp::connect_observed(
                 socket,
                 selected,
                 credentials.noise().attempt(),
@@ -462,14 +473,17 @@ async fn establish_secure_udp(
                 credentials.admission(),
                 deadline,
                 &mut entropy,
+                &mut observe,
             )
             .await?
         }
         Endpoint::SecureServer(server) => {
             // This owner survives cancellation and every reconnect of this plan.
+            setup::stage(shared, accepted.operation, SetupStage::AdmissionOwner);
             let mut admission = server.admission.lock().await;
             check(deadline)?;
             if admission.is_none() {
+                setup::stage(shared, accepted.operation, SetupStage::Configuration);
                 *admission = Some(crate::secure_udp::Server::new(
                     selected,
                     server.credentials.noise().peers(role),
@@ -481,11 +495,12 @@ async fn establish_secure_udp(
             admission
                 .as_mut()
                 .ok_or_else(|| io::Error::other("missing retained admission owner"))?
-                .accept(
+                .accept_observed(
                     socket,
                     server.credentials.noise().attempt(),
                     deadline,
                     &mut entropy,
+                    &mut observe,
                 )
                 .await?
         }
@@ -498,9 +513,13 @@ async fn establish_secure_udp(
     };
     check(deadline)?;
     let info = session.info();
+    setup::stage(shared, accepted.operation, SetupStage::Configuration);
     let configuration = profile.configuration(info.peers)?;
     let parts = session.into_parts();
-    let device = plan.open_readable()?;
+    setup::stage(shared, accepted.operation, SetupStage::Attachment);
+    let device = plan.open_readable().inspect_err(|_| {
+        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+    })?;
     check(deadline)?;
     let (switcher, requests) = transport::channel();
     let backend = Arc::new(SecureUdpBackend {
@@ -543,6 +562,7 @@ async fn establish_secure_udp(
         };
         Err(io::Error::new(kind, "secure UDP runtime terminated"))
     });
+    setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
     std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
         Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
@@ -561,7 +581,14 @@ async fn establish_secure_udp(
         }
         Poll::Pending => Poll::Pending,
     })
-    .await?;
+    .await
+    .inspect_err(|_| {
+        setup::reason(
+            shared,
+            accepted.operation,
+            SetupFailureReason::ReadinessEnded,
+        );
+    })?;
     check(deadline)?;
     Ok(Active {
         runtime,
@@ -771,9 +798,14 @@ pub(super) fn publish_ready(
         .iter_mut()
         .find(|entry| entry.accepted.operation == accepted.operation)
     {
-        entry.result = Some(Completed::Connected {
+        let result = Completed::Connected {
             generation: accepted.operation,
-        });
+        };
+        #[cfg(unix)]
+        if let Some(record) = &mut entry.setup {
+            record.complete(&result, entry.accepted, Instant::now());
+        }
+        entry.result = Some(result);
     }
     drop(state);
     shared.changed();

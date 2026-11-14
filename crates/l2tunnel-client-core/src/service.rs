@@ -24,6 +24,10 @@ mod prepared;
 pub use prepared::SWIFT_LISTEN;
 pub use prepared::{Attachment, Client, Options, Prepared, Server};
 mod owner;
+#[cfg(unix)]
+mod setup;
+#[cfg(unix)]
+pub use setup::{SetupFailure, SetupFailureReason, SetupObservation, SetupOutcome, SetupStage};
 #[cfg(test)]
 mod tests;
 const RETAINED: usize = 32;
@@ -433,6 +437,8 @@ struct Entry {
     fingerprint: Fingerprint,
     result: Option<Completed>,
     cancel: bool,
+    #[cfg(unix)]
+    setup: Option<setup::Record>,
 }
 enum Command {
     Connect(Prepared),
@@ -504,6 +510,29 @@ impl Handle {
             .and_then(ObservedBackend::observe)
             .or(snapshot.runtime);
         snapshot
+    }
+    /// Latest fixed-size evidence for exactly one retained accepted setup.
+    /// Reading never refreshes time, performs I/O or adopts another generation.
+    #[cfg(unix)]
+    pub fn setup_observation(
+        &self,
+        id: OperationId,
+    ) -> Result<Option<SetupObservation>, SubmitError> {
+        let state = self.0.lock();
+        if let Some(entry) = state
+            .entries
+            .iter()
+            .find(|entry| entry.accepted.operation == id)
+        {
+            return Ok(entry.setup.as_ref().map(|record| record.observation));
+        }
+        Err(if id.0 <= state.retired_through {
+            SubmitError::Expired
+        } else if id.0 > state.last_key {
+            SubmitError::FutureKey
+        } else {
+            SubmitError::State
+        })
     }
     /// Actual profiler for exactly this current/last generation. A different
     /// generation never exposes its clock or counters through this lookup.
@@ -640,9 +669,10 @@ impl Handle {
         }
         // No credential/provider/device work occurs here. Acceptance starts the
         // one absolute bound, including any scheduling delay before first poll.
+        let accepted_at = Instant::now();
         let deadline = match &command {
             Command::Connect(p) | Command::Reconnect(p) => Some(
-                Instant::now()
+                accepted_at
                     .checked_add(p.setup_timeout())
                     .ok_or(SubmitError::Closed)?,
             ),
@@ -660,11 +690,20 @@ impl Handle {
             state.retired_through = retired.accepted.operation.0;
         }
         state.last_key = key.0;
+        #[cfg(unix)]
+        let setup = match &command {
+            Command::Connect(plan) | Command::Reconnect(plan) if plan.secure_udp() => Some(
+                setup::Record::new(accepted.operation, accepted_at, plan.setup_timeout()),
+            ),
+            _ => None,
+        };
         state.entries.push_back(Entry {
             accepted,
             fingerprint,
             result: None,
             cancel: false,
+            #[cfg(unix)]
+            setup,
         });
         state.snapshot.operation = Some(accepted.operation);
         state.snapshot.phase = match command {
@@ -1059,6 +1098,10 @@ impl Drop for Completion {
         }
         for entry in &mut state.entries {
             if entry.result.is_none() {
+                #[cfg(unix)]
+                if let Some(record) = &mut entry.setup {
+                    record.owner_closed(Instant::now());
+                }
                 entry.result = Some(if matches!(entry.fingerprint, Fingerprint::Apply(_)) {
                     Completed::OutcomeUnknown
                 } else {

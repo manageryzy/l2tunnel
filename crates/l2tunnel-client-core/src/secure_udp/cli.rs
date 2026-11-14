@@ -6,6 +6,8 @@ use l2tunnel_runtime::secure_udp::{establish, transport};
 use l2tunnel_security as security;
 use l2tunnel_swift::{policy, records};
 use l2tunnel_udp_control as gate;
+#[path = "setup_output.rs"]
+mod setup_output;
 
 pub(super) const OPTIONS: &[&str] = &[
     "--noise-profile",
@@ -501,7 +503,14 @@ pub(super) async fn execute(
                             }
                             emit_performance(frame, &mut last_performance, &mut output);
                         }
-                        Completed::Failed(failure) => return Err(io::Error::new(failure.kind, "secure UDP setup failed")),
+                        Completed::Failed(failure) => {
+                            let mut diagnostic = output::Sink::stderr();
+                            match life.setup_observation(operation) {
+                                Ok(Some(observation)) => setup_output::failed(observation, &mut diagnostic),
+                                _ => diagnostic.projection_error(),
+                            }
+                            return Err(io::Error::new(failure.kind, "secure UDP setup failed"));
+                        },
                         Completed::Cancelled => return Err(io::Error::new(io::ErrorKind::Interrupted, "secure UDP setup cancelled")),
                         Completed::Aborted => live = None,
                         Completed::Applied(_) | Completed::Rejected(_) | Completed::OutcomeUnknown => {}
@@ -590,6 +599,19 @@ mod output {
     impl Sink {
         pub(super) fn stdout() -> Self {
             Self::from_stdio(std::io::stdout().as_fd()).unwrap_or_else(|_| Self {
+                file: None,
+                pending: VecDeque::new(),
+                offset: 0,
+                bytes: 0,
+                health: Health {
+                    disabled: true,
+                    write_errors: 1,
+                    ..Health::default()
+                },
+            })
+        }
+        pub(super) fn stderr() -> Self {
+            Self::from_stdio(std::io::stderr().as_fd()).unwrap_or_else(|_| Self {
                 file: None,
                 pending: VecDeque::new(),
                 offset: 0,

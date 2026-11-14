@@ -19,7 +19,7 @@ use l2tunnel_core::ConfigDigest;
 use l2tunnel_cover as cover;
 use l2tunnel_handshake as hs;
 use l2tunnel_identity as identity;
-use l2tunnel_runtime::secure_udp::{establish, member};
+use l2tunnel_runtime::secure_udp::{diagnostics, establish, member};
 use l2tunnel_security as security;
 use l2tunnel_udp_control as gate;
 use ring::digest;
@@ -318,7 +318,36 @@ pub async fn connect(
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
 ) -> io::Result<Session> {
+    connect_observed(
+        socket,
+        settings,
+        identity,
+        member,
+        admission,
+        deadline,
+        entropy,
+        &mut |_| {},
+    )
+    .await
+}
+
+/// Authenticate with shared bounded setup observations, preserving the original result.
+#[allow(clippy::too_many_arguments)] // Preserve the established shared factory inputs with an additive observer.
+pub async fn connect_observed(
+    socket: UdpSocket,
+    settings: Settings,
+    identity: establish::Identity,
+    member: &identity::IdentityKey,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+) -> io::Result<Session> {
+    observe(diagnostics::Observation::new(
+        diagnostics::Stage::Configuration,
+    ));
     if member.public_key() != settings.member {
+        configuration_failure(observe);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "configured member differs from the supplied credential",
@@ -328,13 +357,22 @@ pub async fn connect(
         initiator: identity.local.public_key(),
         responder: identity.peer,
     };
-    let effective = settings.runtime(security::Role::Initiator, peers)?;
-    let established = establish::connect(socket, effective, identity, admission, deadline, entropy)
-        .await
-        .map_err(runtime_error)?;
+    let effective = settings
+        .runtime(security::Role::Initiator, peers)
+        .inspect_err(|_| configuration_failure(observe))?;
+    let established = establish::connect_observed(
+        socket, effective, identity, admission, deadline, entropy, observe,
+    )
+    .await
+    .map_err(runtime_error)?;
     let context = proof_context(&established);
-    let authenticated =
-        member::connect(established, member, settings.membership.runtime(context)).await?;
+    let authenticated = member::connect_observed(
+        established,
+        member,
+        settings.membership.runtime(context),
+        observe,
+    )
+    .await?;
     Ok(Session {
         requested: settings,
         effective,
@@ -379,23 +417,61 @@ impl Server {
         deadline: Instant,
         entropy: &mut (impl hs::Entropy + Send),
     ) -> io::Result<Session> {
+        self.accept_observed(socket, identity, deadline, entropy, &mut |_| {})
+            .await
+    }
+
+    /// Accept with shared stage observations and cumulative retained gate accounting.
+    pub async fn accept_observed(
+        &mut self,
+        socket: UdpSocket,
+        identity: establish::Identity,
+        deadline: Instant,
+        entropy: &mut (impl hs::Entropy + Send),
+        observe: &mut diagnostics::Observer<'_>,
+    ) -> io::Result<Session> {
+        observe(diagnostics::Observation::new(
+            diagnostics::Stage::Configuration,
+        ));
         if identity.local.public_key() != self.peers.responder
             || identity.peer != self.peers.initiator
         {
+            configuration_failure(observe);
             return Err(invalid(
                 "server Noise credentials differ from configured pins",
             ));
         }
-        let established =
-            establish::accept(socket, identity, &mut self.admission, deadline, entropy)
-                .await
-                .map_err(runtime_error)?;
+        let mut last_server_gate = None;
+        let mut forward = |mut observation: diagnostics::Observation| {
+            if observation.server_gate.is_some() {
+                last_server_gate = observation.server_gate;
+            } else {
+                observation.server_gate = last_server_gate;
+            }
+            observe(observation);
+        };
+        let established = establish::accept_observed(
+            socket,
+            identity,
+            &mut self.admission,
+            deadline,
+            entropy,
+            &mut forward,
+        )
+        .await
+        .map_err(runtime_error)?;
         let context = proof_context(&established);
-        let members = identity::Allowlist::new(&[self.settings.member]).map_err(invalid)?;
-        let authenticated = member::accept(
+        let members = identity::Allowlist::new(&[self.settings.member]).map_err(|error| {
+            let mut observation = diagnostics::Observation::new(diagnostics::Stage::Membership);
+            observation.reason = Some(diagnostics::Reason::Configuration);
+            forward(observation);
+            invalid(error)
+        })?;
+        let authenticated = member::accept_observed(
             established,
             members,
             self.settings.membership.runtime(context),
+            &mut forward,
         )
         .await?;
         Ok(Session {
@@ -404,6 +480,12 @@ impl Server {
             authenticated,
         })
     }
+}
+
+fn configuration_failure(observe: &mut diagnostics::Observer<'_>) {
+    let mut observation = diagnostics::Observation::new(diagnostics::Stage::Configuration);
+    observation.reason = Some(diagnostics::Reason::Configuration);
+    observe(observation);
 }
 
 fn proof_context(established: &establish::Established) -> identity::Context {

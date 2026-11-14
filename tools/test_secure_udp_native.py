@@ -1481,6 +1481,226 @@ def final_native_capture_audit(path, phases):
     return audit, matched
 
 
+class Ipv4OptionsContracts(unittest.TestCase):
+    # Byte-exact first Ethernet record from HRT attempt1 case02/native-a.pcap.
+    # This is retained packet structure, not an IGMP implementation or replay.
+    saved_router_alert = bytes.fromhex(
+        '01005e00001676c4ffeac0e70800'
+        '46c0002800004000010203fa00000000e000001694040000'
+        '2200f9930000000104000000e000006a')
+
+    def with_options(self, raw, options):
+        self.assertEqual(len(options) % 4, 0)
+        self.assertLessEqual(len(options), 40)
+        self.assertEqual(raw[14], 0x45)
+        header = bytearray(raw[14:34])
+        header[0] = 0x40 | ((20 + len(options)) // 4)
+        header[2:4] = (int.from_bytes(header[2:4], 'big') + len(options)).to_bytes(2, 'big')
+        header[10:12] = bytes(2)
+        header += options
+        header[10:12] = h.bounded.checksum(header).to_bytes(2, 'big')
+        return raw[:14] + bytes(header) + raw[34:]
+
+    def background(self, options):
+        return self.with_options(frame(b'\x22' + bytes(15), protocol=2,
+            source='0.0.0.0', destination='224.0.0.22'), options)
+
+    def changed_header(self, raw, offset, replacement):
+        result = bytearray(raw)
+        ihl = (result[14] & 15) * 4
+        result[14 + offset:14 + offset + len(replacement)] = replacement
+        result[24:26] = bytes(2)
+        result[24:26] = h.bounded.checksum(result[14:14 + ihl]).to_bytes(2, 'big')
+        return bytes(result)
+
+    def test_saved_router_alert_and_twenty_four_keys_keep_exact_twenty_five_record_authority(self):
+        saved = self.saved_router_alert
+        self.assertEqual(len(saved), 54)
+        ip, total = h._captured_ipv4(saved, len(saved))
+        self.assertEqual((ip[0], ip[9], total, ip[20:24]), (0x46, 2, 40, b'\x94\x04\x00\x00'))
+        self.assertIsNone(h._native_icmp_sample(ip, total))
+        phases, frames, original = capture_tail_fixture()
+        complete = pcap([saved, *frames])
+        self.assertEqual(len(complete), len(original) + 16 + 54)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native.pcap'; path.write_bytes(complete)
+            cursor = h._NativeCaptureCursor(path)
+            try:
+                polled = cursor.poll(terminal=True)
+                self.assertEqual(polled, {'records_read': 25, 'at_end': True, 'incomplete': False})
+                self.assertEqual((cursor.packets, cursor.offset), (25, len(complete)))
+                self.assertEqual((cursor.native_icmp['requests'], cursor.native_icmp['replies']), (12, 12))
+                self.assertEqual(len(cursor.native_icmp['samples']), 24)
+            finally:
+                cursor.close()
+            clock, process = TailClock(), TailCapture()
+            with patch.object(h, 'audit_capture', side_effect=AssertionError('no terminal audit while capture is live')):
+                drained = h.drain_native_capture(process, path, phases, 10.25, clock=clock, sleeper=clock.sleep)
+            self.assertEqual((drained['status'], drained['expected_keys'], drained['matched_keys']), ('passed', 24, 24))
+            self.assertEqual((drained['packets'], drained['offset']), (25, len(complete)))
+            self.assertEqual(drained['missing'], [])
+            self.assertIsNone(process.returncode)
+            audit, matched = final_native_capture_audit(path, phases)
+            self.assertEqual(audit['packets'], 25)
+            self.assertEqual((audit['native_icmp']['requests'], audit['native_icmp']['replies']), (12, 12))
+            self.assertEqual(len(audit['native_icmp']['samples']), 24)
+            self.assertEqual(len(matched['probes']), 4)
+            log = Path(directory) / 'tcpdump.log'
+            log.write_text('25 packets captured\n25 packets received by filter\n0 packets dropped by kernel\n')
+            with patch.object(h.bounded, 'stop'):
+                counters = h.capture_counts(log, Mock(returncode=0))
+            self.assertEqual(counters, {'captured': 25, 'received': 25, 'kernel_dropped': 0})
+            h.capture_complete(audit, counters)
+            for wrong in (24, 26):
+                with self.subTest(captured=wrong), self.assertRaises(ValueError):
+                    h.capture_complete(audit, {**counters, 'captured': wrong})
+
+    def test_eol_zero_nop_router_alert_and_sixty_byte_headers_are_counted_background(self):
+        options = [bytes(4), bytes([1]) * 4, b'\x01\x01\x00\x00', b'\x94\x04\x00\x00',
+            bytes(40), bytes([1]) * 40, b'\x94\x04\x00\x00' + bytes([1]) * 36,
+            bytes([1]) * 36 + b'\x94\x04\x00\x00']
+        frames = [self.background(value) for value in options]
+        for raw, value in zip(frames, options):
+            with self.subTest(options=value):
+                ip, total = h._captured_ipv4(raw, len(raw))
+                self.assertEqual((ip[0] & 15) * 4, 20 + len(value))
+                self.assertEqual(total, len(raw) - 14)
+                self.assertEqual(h.bounded.checksum(ip[:20 + len(value)]), 0)
+                self.assertIsNone(h._native_icmp_sample(ip, total))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'background.pcap'; path.write_bytes(pcap(frames))
+            cursor = h._NativeCaptureCursor(path)
+            try:
+                for index in range(len(frames)):
+                    self.assertEqual(cursor.poll(terminal=True, max_records=1)['records_read'], 1)
+                    self.assertEqual(cursor.packets, index + 1)
+                self.assertEqual(cursor.native_icmp, {'requests': 0, 'replies': 0, 'samples': []})
+            finally:
+                cursor.close()
+            audit = h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
+            self.assertEqual(audit['packets'], len(frames))
+            self.assertEqual(audit['native_icmp'], {'requests': 0, 'replies': 0, 'samples': []})
+            h.capture_complete(audit, {'captured': len(frames)})
+
+    def test_wrong_version_small_ihl_and_incompletely_captured_declared_headers_fail(self):
+        valid = self.background(b'\x94\x04\x00\x00')
+        maximum = self.background(bytes([1]) * 40)
+        invalid = [(self.changed_header(valid, 0, b'\x66'), len(valid), 'version'),
+            (valid[:14 + 19], len(valid), 'truncated header'),
+            (self.changed_header(valid, 0, b'\x44'), len(valid), 'header length'),
+            (self.changed_header(valid, 0, b'\x40'), len(valid), 'header length'),
+            (self.changed_header(valid, 0, b'\x4f'), len(valid), 'header length'),
+            (maximum[:14 + 59], len(maximum), 'header length')]
+        for raw, original, reason in invalid:
+            with self.subTest(reason=reason, first=raw[14:15]), self.assertRaisesRegex(ValueError, reason):
+                h._captured_ipv4(raw, original)
+
+    def test_total_extent_padding_and_checksum_cover_the_entire_declared_header(self):
+        raw = self.background(bytes([1]) * 4)
+        ip, total = h._captured_ipv4(raw, len(raw))
+        self.assertEqual(h.bounded.checksum(ip[:24]), 0)
+        self.assertNotEqual(h.bounded.checksum(ip[:20]), 0)
+        # A NOP becomes an EOL at the last byte: both option layouts are valid,
+        # but retaining the old checksum must fail over all24 header bytes.
+        damaged = bytearray(raw); damaged[14 + 23] = 0
+        with self.assertRaisesRegex(ValueError, 'checksum'):
+            h._captured_ipv4(bytes(damaged), len(damaged))
+        short_total = self.changed_header(raw, 2, (23).to_bytes(2, 'big'))
+        with self.assertRaisesRegex(ValueError, 'extent'):
+            h._captured_ipv4(short_total, 60)
+        for original in (len(raw) - 1, len(raw) + 1, 61):
+            with self.subTest(original=original), self.assertRaisesRegex(ValueError, 'extent'):
+                h._captured_ipv4(raw, original)
+        padded = raw + bytes(60 - len(raw))
+        self.assertEqual(h._captured_ipv4(padded, 60)[1], total)
+
+    def test_malformed_or_unsupported_options_fail_shared_cursor_and_final_parser(self):
+        invalid = [(b'\x01\x01\x01\x94', 'truncated IPv4 option length'),
+            (b'\x94\x00\x00\x00', 'option length/extent'),
+            (b'\x94\x01\x00\x00', 'option length/extent'),
+            (b'\x94\x05\x00\x00', 'option length/extent'),
+            (b'\x01\x01\x94\x04', 'option length/extent'),
+            (b'\x94\x02\x00\x00', 'option semantics'),
+            (b'\x94\x03\x00\x00', 'option semantics'),
+            (b'\x94\x08\x00\x00' + bytes(4), 'option semantics'),
+            (b'\x94\x04\x00\x01', 'option semantics'),
+            (b'\x94\x04\x01\x00', 'option semantics'),
+            (b'\x00\x01\x00\x00', 'option padding'),
+            (b'\x01\x00\x00\x01', 'option padding'),
+            (b'\x82\x04\x00\x00', 'option semantics'),
+            (b'\x07\x04\x00\x00', 'option semantics'),
+            (bytes([1]) * 39 + b'\x94', 'truncated IPv4 option length')]
+        for options, reason in invalid:
+            raw = self.background(options)
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, reason):
+                    h._captured_ipv4(raw, len(raw))
+                path = Path(directory) / 'malformed.pcap'; path.write_bytes(pcap([raw]))
+                cursor = h._NativeCaptureCursor(path)
+                try:
+                    with self.assertRaisesRegex(ValueError, reason): cursor.poll(terminal=True)
+                    self.assertEqual((cursor.packets, cursor.offset), (0, 24))
+                    self.assertEqual(cursor.native_icmp['samples'], [])
+                finally:
+                    cursor.close()
+                with self.assertRaisesRegex(ValueError, reason):
+                    h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
+
+    def test_malformed_background_is_terminal_and_cannot_erase_prior_probe_progress(self):
+        _, frames, _ = capture_tail_fixture()
+        bad = self.background(b'\x94\x04\x00\x01')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native.pcap'; path.write_bytes(pcap([*frames[:12], bad, *frames[12:]]))
+            cursor = h._NativeCaptureCursor(path)
+            try:
+                with self.assertRaisesRegex(ValueError, 'option semantics'): cursor.poll(terminal=True)
+                self.assertEqual((cursor.packets, cursor.offset), (12, 24 + 12 * 176))
+                self.assertEqual(len(cursor.native_icmp['samples']), 12)
+            finally:
+                cursor.close()
+            with self.assertRaisesRegex(ValueError, 'option semantics'):
+                h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
+
+    def test_valid_options_on_protected_udp_refuse_before_fixed_offsets_or_cover_parsing(self):
+        for appearance in ('quic-like', 'media-like'):
+            for phase in ('handshake', 'established'):
+                for options in (b'\x94\x04\x00\x00', bytes([1]) * 40):
+                    raw = self.with_options(frame(cover_body(appearance, phase)), options)
+                    with self.subTest(cover=appearance, phase=phase, options=options), tempfile.TemporaryDirectory() as directory:
+                        h._captured_ipv4(raw, len(raw))
+                        path = Path(directory) / 'wan.pcap'; path.write_bytes(pcap([raw]))
+                        with patch.object(h.socket, 'inet_ntoa', side_effect=AssertionError('fixed offsets reached')), \
+                                patch.object(h, 'covered_payload') as cover, patch.object(h, 'protected_shape') as protected:
+                            with self.assertRaisesRegex(ValueError, 'unsupported protected WAN IPv4 options'):
+                                h.audit_capture(path, case(appearance), 'a', [{'offset_ns': 0, 'uncertainty_ns': 0}])
+                        cover.assert_not_called(); protected.assert_not_called()
+
+    def test_valid_options_on_native_echo_refuse_before_fixed_type_identifier_and_prefix_offsets(self):
+        _, frames, _ = capture_tail_fixture()
+        for original in frames[:2]:
+            raw = self.with_options(original, b'\x94\x04\x00\x00')
+            ip, total = h._captured_ipv4(raw, len(raw))
+            with self.subTest(echo_type=original[34]), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'native.pcap'; path.write_bytes(pcap([raw]))
+                with patch.object(h.socket, 'inet_ntoa', side_effect=AssertionError('fixed ICMP offsets reached')):
+                    with self.assertRaisesRegex(ValueError, 'unsupported native ICMP IPv4 options'):
+                        h._native_icmp_sample(ip, total)
+                    with self.assertRaisesRegex(ValueError, 'unsupported native ICMP IPv4 options'):
+                        h.audit_capture(path, case(), None, [{'offset_ns': 0, 'uncertainty_ns': 0}])
+
+    def test_valid_options_on_icmp_error_refuse_before_fixed_quote_offsets(self):
+        quote = frame(cover_body('quic-like'))[14:42]
+        body = bytearray(b'\x03\x03' + bytes(6) + quote)
+        body[2:4] = h.bounded.checksum(body).to_bytes(2, 'big')
+        raw = self.with_options(frame(body, direction='b', protocol=1), b'\x94\x04\x00\x00')
+        h._captured_ipv4(raw, len(raw))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wan.pcap'; path.write_bytes(pcap([raw]))
+            with patch.object(h.socket, 'inet_ntoa', side_effect=AssertionError('fixed quote offsets reached')):
+                with self.assertRaisesRegex(ValueError, 'unsupported protected WAN IPv4 options'):
+                    h.audit_capture(path, case(), 'a', [{'offset_ns': 0, 'uncertainty_ns': 0}])
+
+
 class CaptureTailContracts(unittest.TestCase):
     def drain(self, process, path, phases, clock, deadline):
         return h.drain_native_capture(process, path, phases, deadline,

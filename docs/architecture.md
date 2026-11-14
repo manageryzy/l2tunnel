@@ -108,6 +108,17 @@ The scheduler checkpoint has a separate [source-stable required pass](../work/se
 with 1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases. Its conditional framing-capacity calculation
 is an engineering assumption check, not a waiver of the80Mbit/s target.
 
+The subsequent [bounded capture and setup diagnostics](modules/secure-udp-diagnostics.md)
+correct IPv4 option validation and retain actual typed setup stages/counters
+through the shared client/service API without changing protocol or retry behavior.
+Their required source-stable workspace check passes. A fresh complete 16-case
+Linux ABBA matrix verifies bytes/control/policy/manual reconnect/capture/cleanup;
+all eight impaired cases still fail 80 Mbit/s at about 78 Mbit/s. Separate
+same-binary kernel perf observes reduced system CPU and context switches with
+current-thread, without a throughput gain. These are finite observations with
+explicit profiler and shared-host limitations, not a default-runtime decision,
+complete lifecycle/platform acceptance or evidence of ISP classification.
+
 The next reusable dependency now has a [whole-message custody ledger](modules/control-messages.md)
 and an [explicit control-stream ledger](modules/control-streams.md). Existing LX
 fragmentation and SelectiveRepeat carry genuine 354/2762-byte PREPARE envelopes

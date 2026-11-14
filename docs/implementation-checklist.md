@@ -145,6 +145,17 @@ Python tooling cases and1658 simulator cases, plus formatting, strict Clippy,
 rustdoc and CLI checks. The interrupted first check and native performance
 failures retain their original outcomes; final reconciliation/checkpoint are separate.
 
+The later [capture/setup diagnostics](modules/secure-udp-diagnostics.md) retain
+bounded operation-specific failure observations through the shared service API.
+Their [required frozen-source check](../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/validation.json)
+passes 1650 Rust cases including doctests, 349 tooling cases and 1658 simulator
+cases. The [fresh 16-case matrix](../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json)
+has complete evidence: eight clean cases pass; eight impaired cases fail only
+80 Mbit/s. The separate [kernel comparison](../work/secure-udp-diagnostics-20261114/kernel-summary-attempt-1/analysis.md)
+observes lower scheduling cost with current-thread and no throughput gain. Its
+partial multithread switch-pairing evidence and all historical failures remain
+explicit. Full SW-11, all 47 modes and the parent performance/platform gates remain open.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |
@@ -156,7 +167,8 @@ failures retain their original outcomes; final reconciliation/checkpoint are sep
 | Streamed Swift runtime control | SUC-01..SUC-08 | [Selected runtime custody](modules/streamed-swift-control.md) | authenticated explicit backend, original caps and semantic custody; generic switching remains open |
 | Swift byte-transfer correction | SBC-01..SBC-06 | [Bounded bulk transfer](modules/swift-bulk-copy.md) | source-bound perf evidence, exact ownership/bytes and immutable pre/post measurements |
 | Native capture tail | NCD-01..NCD-06 | [Bounded capture witness](modules/native-capture-drain.md) | exact final probe fingerprints before capture stop; original final audits and performance gates retained |
-| Host-runtime comparison | HRT-01..HRT-07 | [Explicit process host](modules/host-runtime.md) | scoped selector tested;16-case ABBA recorded with setup/capture gaps;80 target and parent gates remain open |
+| Host-runtime comparison | HRT-01..HRT-07 | [Explicit process host](modules/host-runtime.md) | scoped selector tested; fresh complete evidence-verified 16-case ABBA; eight impaired 80 targets and parent gates remain open |
+| Secure UDP diagnostics | SGD-01..SGD-08 | [Capture and setup evidence](modules/secure-udp-diagnostics.md) | implemented bounded IPv4 options and shared setup observations; finite native/kernel evidence retains failed 80 targets |
 | VXLAN | VX-01..VX-09 | [Overlay design](overlay-and-carriers.md) | L2 frame validation, tenancy and MTU accounting |
 | UDP covers | UDP-01..UDP-16 | [Carrier design](overlay-and-carriers.md) | selected authenticated bootstrap; UDP-only is its own gate |
 | CLI/GUI/native clients | CL-01..CL-39 | [Client plan](client-design.md) | shared client-core/local API; native adapters independently qualified |

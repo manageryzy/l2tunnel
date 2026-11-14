@@ -1,7 +1,9 @@
 # Explicit host-runtime comparison
 
-Status: **implemented and contract-tested** for the scoped host adapter; a finite native
-comparison has been recorded, with qualification gaps retained. The draft below was recorded before production edits. This is a scoped
+Status: **implemented, contract-tested and finitely Linux integration-tested**
+for the scoped host adapter. A fresh complete native matrix follows the original
+attempt with qualification gaps; all eight fresh impaired cases still fail 80 Mbit/s.
+The draft below was recorded before production edits. This is a scoped
 SNL-11/FIX-04 performance investigation, not a new carrier, control backend,
 negotiated peer setting, default migration or owner decision. All 47 P-* modes,
 full SW-11, other record profiles/carriers, recovery and platform gates retain
@@ -117,7 +119,7 @@ Freeze all recorded inputs during focused/aggregate/build/native snapshots.
 - [x] [HRT-02] Implement strict scoped host selection and actual runtime observations without changing default, local API bytes, root-future placement or protocol configuration; pass meaningful parser/builder regressions. Evidence: [seven host-selector/parser/builder tests and strict checks](../../work/host-runtime-20261114/focused-attempt-1/validation.json).
 - [x] [HRT-03] Run the actual shared-service lifecycle fixture under both runtime flavors, preserving both-cover bytes/control/policy/version/reconnect/deadline assertions and existing backpressure/liveness checks. Evidence: [both-flavor lifecycle and original runtime tests](../../work/host-runtime-20261114/focused-attempt-1/validation.json).
 - [x] [HRT-04] Implement/test source-pinned native selector forwarding, startup-event matching and bounded actual thread observations, retaining old omitted-selector behavior and all prior acceptance checks. Evidence: [95 native harness regression tests](../../work/host-runtime-20261114/focused-attempt-1/validation.json).
-- [ ] [HRT-05] Record the 16-case source-stable ABBA matrix with original integrity/control/capture/cleanup/80 verdicts and bounded CPU/switch/thread/wire/pressure evidence; preserve negative and tool-failure outcomes.
+- [x] [HRT-05] Record the 16-case source-stable ABBA matrix with original integrity/control/capture/cleanup/80 verdicts and bounded CPU/switch/thread/wire/pressure evidence; preserve negative and tool-failure outcomes. Evidence: [fresh complete evidence-verified matrix](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json) and [preserved original failed qualification](../../work/host-runtime-20261114/native-analysis-attempt-2/validation.json); all eight fresh impaired 80 targets remain failed.
 - [x] [HRT-06] Evaluate scheduling efficiency versus useful throughput, wire/pacing/recovery constraints and semantic failures; retain honest limitations and all parent performance/mode/lifecycle/platform gates. Evidence: [negative outcomes and finite comparisons](../../work/host-runtime-20261114/native-analysis-attempt-2/validation.json); overall qualification remains failed.
 - [x] [HRT-07] Pass focused tests, strict Clippy/rustdoc, required frozen-source checks and evidence-only reconciliation; save an actual coherent local checkpoint before closing this item. Evidence: [required check](../../work/host-runtime-20261114/aggregate-attempt-2/validation.json), [reconciliation](../../work/host-runtime-20261114/aggregate-attempt-2/postcheck/ledger-2/validation.json), and [actual source checkpoint](../../work/host-runtime-20261114/commit-binding-attempt-1/validation.json).
 
@@ -195,7 +197,7 @@ shared and does not prove disk waiting caused or could not affect a result.
 Cases 02/09/15 retain their capture-drain and final-audit failures: the shared
 parser rejects a native background IPv4 packet with a 24-byte header and Router
 Alert option. The exact 54-byte frame is preserved. It was not skipped, filtered
-out or retrospectively passed. A future bounded IHL/option repair must preserve
+out or retrospectively passed. At that checkpoint, a bounded IHL/option repair needed to preserve
 all full-MTU echo keys and fixed-layout protected WAN checks.
 
 Case 03 retains setup-not-ready with no reference/task endpoints. Both daemon
@@ -209,7 +211,7 @@ MAC/Noise/AEAD verification or proof of peer rejection/loss/cookie expiry.
 Proposed follow-up is bounded nonsecret stage/reason/counter evidence before
 changing retry or expiry behavior.
 
-HRT-05 stays open: the recorded16-case attempt contains missing qualification
+At that checkpoint HRT-05 stayed open: the recorded16-case attempt contained missing qualification
 and measurement evidence. HRT-06 records the evaluation of those outcomes, not
 a performance pass. HRT-07 records the required frozen-source check, evidence reconciliation and
 actual local source checkpoint below; it does not close HRT-05. SNL-08/09/11, FIX-04,
@@ -239,5 +241,41 @@ The [actual source-checkpoint receipt](../../work/host-runtime-20261114/commit-b
 records local commit `e1d93f3496e9f27579b58b51d36e8651bbb5cc4c`, its parent/tree,
 all seven committed file hashes, matching aggregate/reconciliation identities and
 a clean worktree at that point. HRT-07 is closed using this existing receipt;
-HRT-05 and every failed/unverified native and parent gate remain open. This
+HRT-05 was still open at that checkpoint, along with every failed/unverified native and parent gate. That
 follow-up changes ledger evidence only. Nothing was pushed or published.
+
+## Fresh complete comparison
+
+The subsequent [capture/setup diagnostics correction](secure-udp-diagnostics.md)
+preserves the original results above. Its
+[source-stable required check](../../work/secure-udp-diagnostics-20261114/aggregate-attempt-1/validation.json)
+and [immutable build](../../work/secure-udp-diagnostics-20261114/native-build-attempt-1/build-receipt.json)
+bind the fresh 16-case A-B-B-A attempt. The
+[independent analysis](../../work/secure-udp-diagnostics-20261114/native-analysis-attempt-1/validation.json)
+verifies every case's exact payload, control/policy, manual reconnect, capture,
+bounded task observations and cleanup. Eight clean native cases pass; eight
+impaired cases fail only the unchanged 80 Mbit/s requirement. Evidence completeness
+is separate from that performance verdict.
+
+| Condition | Multithread mean Mbit/s | Current-thread mean Mbit/s |
+| --- | ---: | ---: |
+| QUIC-like clean | 92.047 | 92.199 |
+| Media-like clean | 92.149 | 92.300 |
+| QUIC-like impaired | 78.009 | 77.836 |
+| Media-like impaired | 77.707 | 78.128 |
+
+All cases retain the original impairment, policy, flow count, warmup, measurement
+and acceptance bounds. Both processes report the actual selected runtime, with
+254 workers/255 OS threads for multithread and 1 worker/1 OS thread for
+current-thread. The [separate kernel comparison](../../work/secure-udp-diagnostics-20261114/kernel-summary-attempt-1/analysis.md)
+observes lower system CPU and switch cost without a useful-throughput gain;
+one multithread SWITCH timestamp inversion limits inferred switch durations and
+does not invalidate the separately validated cycle samples/process counters.
+No profiler ran during this uninstrumented matrix. Shared host activity,
+uncontrolled loss draws and finite sampling still limit causal precision.
+
+HRT-05 now records its complete matrix deliverable. It does not close SNL-08/09/11,
+FIX-04, full SW-11, any other mode/platform/lifecycle gate or the impaired 80 target.
+It does not diagnose the original pre-ready failure. The omitted default and
+protocol semantics remain unchanged; no owner decision for runtime migration is
+inferred from these measurements.

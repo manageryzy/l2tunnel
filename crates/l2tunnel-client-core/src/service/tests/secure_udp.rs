@@ -1,5 +1,7 @@
 //! Actual service/PacketDevice owners; no fabricated root or native qualification.
 use super::*;
+#[path = "secure_udp_setup.rs"]
+mod setup_diagnostics;
 use crate::{cli::secure_udp_frontend::Selection, secure_udp::credentials};
 use l2tunnel_handshake as hs;
 use l2tunnel_identity as identity;

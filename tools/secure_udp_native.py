@@ -585,17 +585,42 @@ def _pcap_record(header: bytes, endian: str, precision: int, snaplen: int) -> tu
 
 def _captured_ipv4(frame: bytes, original: int) -> tuple[bytes, int]:
     ip = frame[14:]
-    if len(ip) < 20 or ip[0] != 0x45:
-        raise ValueError('unsupported IPv4 options/truncated header')
+    if len(ip) < 20 or ip[0] >> 4 != 4:
+        raise ValueError('unsupported IPv4 version/truncated header')
+    header_bytes = (ip[0] & 15) * 4
+    if not 20 <= header_bytes <= 60 or len(ip) < header_bytes:
+        raise ValueError('invalid captured IPv4 header length')
     total = int.from_bytes(ip[2:4], 'big')
-    if total < 20 or original not in (max(14 + total, 60), 14 + total) or bounded.checksum(ip[:20]):
+    if (total < header_bytes or original not in (max(14 + total, 60), 14 + total)
+            or bounded.checksum(ip[:header_bytes])):
         raise ValueError('invalid captured original IP extent/checksum')
+    offset = 20
+    while offset < header_bytes:
+        kind = ip[offset]
+        if kind == 0:
+            if any(ip[offset + 1:header_bytes]):
+                raise ValueError('nonzero IPv4 option padding')
+            break
+        if kind == 1:
+            offset += 1
+            continue
+        if offset + 1 >= header_bytes:
+            raise ValueError('truncated IPv4 option length')
+        length = ip[offset + 1]
+        if length < 2 or offset + length > header_bytes:
+            raise ValueError('invalid IPv4 option length/extent')
+        # This capture validator supports Router Alert, not other option semantics.
+        if kind != 0x94 or length != 4 or ip[offset + 2:offset + length] != bytes(2):
+            raise ValueError('unsupported IPv4 option semantics')
+        offset += length
     return ip, total
 
 
 def _native_icmp_sample(ip: bytes, total: int) -> dict | None:
     if ip[9] != 1:
         return None
+    if ip[0] != 0x45:
+        raise ValueError('unsupported native ICMP IPv4 options')
     source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
     fragment = int.from_bytes(ip[6:8], 'big')
     if (total != 1500 or len(ip) < 44 or {source, destination} != set(HOST.values())
@@ -891,6 +916,8 @@ def audit_capture(path: Path, case: dict, local_side: str | None, anchors: list[
                     observed['requests' if sample['type'] == 8 else 'replies'] += 1
                     observed['samples'].append(sample)
                 continue
+            if ip[0] != 0x45:
+                raise ValueError('unsupported protected WAN IPv4 options')
             if total > case['path_mtu'] or int.from_bytes(ip[6:8], 'big') & 0x3fff:
                 raise ValueError('outer MTU breach or fragmentation')
             source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])

@@ -3,6 +3,7 @@
 //! This runtime does not establish existing member identity or release user data.
 //! The returned bootstrap tail must share the sole session socket reader.
 
+use super::diagnostics::{self, Reporter, Stage};
 use l2tunnel_cover as cover;
 use l2tunnel_handshake as hs;
 use l2tunnel_security as security;
@@ -482,6 +483,13 @@ impl BootstrapTail {
     pub const fn statistics(&self) -> Statistics {
         self.core.statistics
     }
+    /// Current retained bootstrap-control gauges, absent after custody retirement.
+    pub fn control_statistics(&self) -> Option<gate::ControlStatistics> {
+        self.core
+            .control
+            .as_ref()
+            .map(gate::ControlEngine::statistics)
+    }
     /// Complete caller-output requirement, excluding IP/UDP.
     pub const fn max_packet_bytes(&self) -> usize {
         self.core.setup.max_wire
@@ -596,6 +604,57 @@ pub async fn connect(
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
 ) -> Result<Established, Error> {
+    connect_observed(
+        socket,
+        config,
+        identity,
+        admission,
+        deadline,
+        entropy,
+        &mut |_| {},
+    )
+    .await
+}
+
+/// Establish with fixed-size stage/counter observations; no protocol choices change.
+#[allow(clippy::too_many_arguments)] // Additive observation preserves the existing setup parameters.
+pub async fn connect_observed(
+    socket: UdpSocket,
+    config: Config,
+    identity: Identity,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+) -> Result<Established, Error> {
+    let mut report = Reporter::new(observe);
+    // One setup allocation keeps instrumentation from multiplying caller stack storage.
+    let result = Box::pin(connect_inner(
+        socket,
+        config,
+        identity,
+        admission,
+        deadline,
+        entropy,
+        &mut report,
+    ))
+    .await;
+    if let Err(error) = &result {
+        report.fail(diagnostics::establishment_reason(error));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Same bounded setup inputs plus a borrowed observation sink.
+async fn connect_inner(
+    socket: UdpSocket,
+    config: Config,
+    identity: Identity,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    report: &mut Reporter<'_, '_>,
+) -> Result<Established, Error> {
     let peers = Peers {
         initiator: identity.local.public_key(),
         responder: identity.peer,
@@ -606,20 +665,25 @@ pub async fn connect(
     before(origin, deadline)?;
     let mut client = gate::ClientGate::new(setup.gate, admission, nonce(entropy)?, Duration::ZERO)?;
     let mut statistics = Statistics::default();
+    report.stage(Stage::Admission);
+    report.bootstrap(statistics, None);
     let mut next_outer = 0;
     let mut quota = Quota::new(config, origin)?;
     let mut input = vec![0; config.cover.limits().max_packet_bytes + 1];
     let mut output = vec![0; config.cover.limits().max_packet_bytes];
     let ticket = loop {
+        report.bootstrap(statistics, None);
         let now = Instant::now();
         before(now, deadline)?;
         if let Some(frame) = client.poll(elapsed(origin, now)?)? {
             let length = gate_packet(setup, &frame, next_outer, &mut output)?;
+            report.bootstrap(statistics, None);
             let accepted = send(&socket, &output[..length], deadline).await?;
             sent(&mut statistics, length, accepted);
             advance(&mut next_outer)?;
             emitted(&mut statistics, length);
         }
+        report.bootstrap(statistics, None);
         let ready = quota.ready(now)?;
         let wake = now
             .checked_add(setup.gate.interval)
@@ -631,6 +695,7 @@ pub async fn connect(
                 quota.charge();
                 let Some(length) = received_length(received, &mut statistics)? else { continue; };
                 statistics.received_datagrams = statistics.received_datagrams.saturating_add(1);
+                report.bootstrap(statistics, None);
                 let Some(frame) = gate_body(setup, &input[..length]) else { ignored(&mut statistics); continue; };
                 if let Some(ticket) = client.receive_retry(setup.gate.path.server, frame, elapsed(origin, Instant::now())?)? { break ticket; }
                 ignored(&mut statistics);
@@ -650,7 +715,7 @@ pub async fn connect(
         next_outer,
         client: Some(client),
     }
-    .run(entropy, None)
+    .run(entropy, None, report)
     .await
 }
 
@@ -662,6 +727,44 @@ pub async fn accept(
     admission: &mut ServerAdmission,
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
+) -> Result<Established, Error> {
+    accept_observed(socket, identity, admission, deadline, entropy, &mut |_| {}).await
+}
+
+/// Accept with actual bounded observations; the admission owner remains retained.
+pub async fn accept_observed(
+    socket: UdpSocket,
+    identity: Identity,
+    admission: &mut ServerAdmission,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+) -> Result<Established, Error> {
+    let mut report = Reporter::new(observe);
+    report.server(admission.statistics());
+    let result = Box::pin(accept_inner(
+        socket,
+        identity,
+        admission,
+        deadline,
+        entropy,
+        &mut report,
+    ))
+    .await;
+    report.server(admission.statistics());
+    if let Err(error) = &result {
+        report.fail(diagnostics::establishment_reason(error));
+    }
+    result
+}
+
+async fn accept_inner(
+    socket: UdpSocket,
+    identity: Identity,
+    admission: &mut ServerAdmission,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    report: &mut Reporter<'_, '_>,
 ) -> Result<Established, Error> {
     let peers = Peers {
         initiator: identity.peer,
@@ -677,14 +780,18 @@ pub async fn accept(
     before(now, deadline)?;
     elapsed(origin, now)?;
     let mut statistics = Statistics::default();
+    report.stage(Stage::Admission);
+    report.bootstrap(statistics, None);
     let mut next_outer = 0;
     let mut quota = Quota::new(setup.config, now)?;
     let mut input = vec![0; setup.config.cover.limits().max_packet_bytes + 1];
     let mut output = vec![0; setup.config.cover.limits().max_packet_bytes];
     let mut server_nonce = nonce(entropy)?;
     let ticket = loop {
+        report.bootstrap(statistics, None);
         let now = Instant::now();
         before(now, deadline)?;
+        report.bootstrap(statistics, None);
         let ready = quota.ready(now)?;
         let wake = if ready {
             deadline
@@ -697,15 +804,20 @@ pub async fn accept(
                 quota.charge();
                 let Some(length) = received_length(received, &mut statistics)? else { continue; };
                 statistics.received_datagrams = statistics.received_datagrams.saturating_add(1);
+                report.bootstrap(statistics, None);
                 let Some(frame) = gate_body(setup, &input[..length]) else { ignored(&mut statistics); continue; };
-                match admission.gate.receive(setup.gate.path.client, frame, server_nonce, elapsed(origin, Instant::now())?)? {
+                let event = admission.gate.receive(setup.gate.path.client, frame, server_nonce, elapsed(origin, Instant::now())?)?;
+                report.server(admission.statistics());
+                match event {
                     gate::GateEvent::Retry(retry) => {
                         let length = gate_packet(setup, &retry, next_outer, &mut output)?;
-                        let accepted = send(&socket, &output[..length], deadline).await?;
+                        report.bootstrap(statistics, None);
+            let accepted = send(&socket, &output[..length], deadline).await?;
                         sent(&mut statistics, length, accepted);
                         advance(&mut next_outer)?;
                         emitted(&mut statistics, length);
                         statistics.gate_retries = statistics.gate_retries.saturating_add(1);
+                        report.bootstrap(statistics, None);
                         server_nonce = nonce(entropy)?;
                     }
                     gate::GateEvent::Accepted(ticket) => break ticket,
@@ -728,7 +840,7 @@ pub async fn accept(
         next_outer,
         client: None,
     }
-    .run(entropy, Some(admission))
+    .run(entropy, Some(admission), report)
     .await;
     admission
         .gate
@@ -753,7 +865,9 @@ impl Exchange {
         mut self,
         entropy: &mut (impl hs::Entropy + Send),
         mut server: Option<&mut ServerAdmission>,
+        report: &mut Reporter<'_, '_>,
     ) -> Result<Established, Error> {
+        report.stage(Stage::Noise);
         let role = if self.client.is_some() {
             hs::Role::Initiator
         } else {
@@ -775,6 +889,10 @@ impl Exchange {
             self.deadline,
             self.statistics,
         )?;
+        report.bootstrap(
+            core.statistics,
+            core.control.as_ref().map(gate::ControlEngine::statistics),
+        );
         let mut handshake = hs::Handshake::new(
             hs::Config {
                 role,
@@ -801,6 +919,13 @@ impl Exchange {
             None
         };
         loop {
+            report.bootstrap(
+                core.statistics,
+                core.control.as_ref().map(gate::ControlEngine::statistics),
+            );
+            if let Some(server) = server.as_deref() {
+                report.server(server.statistics());
+            }
             let now = Instant::now();
             before(now, core.end)?;
             loop {
@@ -817,6 +942,10 @@ impl Exchange {
                     ]);
                     pending_len = 4 + flight.bytes;
                     core.statistics.noise_flights = core.statistics.noise_flights.saturating_add(1);
+                    report.bootstrap(
+                        core.statistics,
+                        core.control.as_ref().map(gate::ControlEngine::statistics),
+                    );
                 }
                 let written = core
                     .control
@@ -835,6 +964,10 @@ impl Exchange {
                 && let Some(frame) = client.poll(elapsed(self.origin, now)?)?
             {
                 let length = gate_packet(self.setup, &frame, self.next_outer, &mut output)?;
+                report.bootstrap(
+                    core.statistics,
+                    core.control.as_ref().map(gate::ControlEngine::statistics),
+                );
                 let accepted = send(&self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
@@ -843,6 +976,10 @@ impl Exchange {
             while let Some(length) =
                 core.poll(Instant::now(), metadata(self.next_outer), &mut output)?
             {
+                report.bootstrap(
+                    core.statistics,
+                    core.control.as_ref().map(gate::ControlEngine::statistics),
+                );
                 let accepted = send(&self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
@@ -853,6 +990,10 @@ impl Exchange {
                     handshake.finish_with_confirmation(hs_time(self.origin, Instant::now())?)?;
                 let binding = confirmed.root.binding();
                 let statistics = core.statistics;
+                report.bootstrap(
+                    statistics,
+                    core.control.as_ref().map(gate::ControlEngine::statistics),
+                );
                 let peer = peer(self.setup.gate.path, role);
                 let tail = BootstrapTail {
                     core,
@@ -892,6 +1033,13 @@ impl Exchange {
                     .ok_or(Error::Deadline)?
                     .min(core.end);
             }
+            report.bootstrap(
+                core.statistics,
+                core.control.as_ref().map(gate::ControlEngine::statistics),
+            );
+            if let Some(server) = server.as_deref() {
+                report.server(server.statistics());
+            }
             tokio::select! {
                 received = self.socket.recv(&mut input), if ready => {
                     let now = Instant::now();
@@ -899,6 +1047,7 @@ impl Exchange {
                     quota.charge();
                     let Some(length) = received_length(received, &mut core.statistics)? else { continue; };
                     core.statistics.received_datagrams = core.statistics.received_datagrams.saturating_add(1);
+                    report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
                     let decoded = match self.setup.config.cover.decode(&input[..length]) {
                         Ok(decoded) if decoded.phase == cover::Phase::Handshake => decoded,
                         _ => { ignored(&mut core.statistics); continue; }
@@ -910,7 +1059,8 @@ impl Exchange {
                                 match server.gate.receive(self.setup.gate.path.client, &decoded.protected[1..], fresh_nonce, elapsed(self.origin, now)?)? {
                                     gate::GateEvent::Retry(frame) => {
                                         let length = gate_packet(self.setup, &frame, self.next_outer, &mut output)?;
-                                        let accepted = send(&self.socket, &output[..length], core.end).await?;
+                                        report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
+                let accepted = send(&self.socket, &output[..length], core.end).await?;
                                         sent(&mut core.statistics, length, accepted);
                                         advance(&mut self.next_outer)?;
                                         emitted(&mut core.statistics, length);
@@ -929,7 +1079,9 @@ impl Exchange {
                         && let Some(client) = &mut self.client {
                         client.confirm_peer_control(elapsed(self.origin, now)?)?;
                     }
+                    report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
                     while let Some(frame) = parser.read(core.control.as_mut().ok_or(Error::Protocol)?, elapsed(self.origin, now)?)? {
+                        report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
                         let outcome = handshake.read(hs_time(self.origin, now)?, frame.kind, &frame.bytes[..frame.length])?;
                         if frame.kind == hs::FlightKind::Confirmation { peer_confirmation.copy_from_slice(&frame.bytes[..frame.length]); }
                         if outcome == hs::ReadOutcome::Duplicate { core.statistics.noise_duplicates = core.statistics.noise_duplicates.saturating_add(1); }
