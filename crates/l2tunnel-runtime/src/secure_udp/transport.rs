@@ -858,6 +858,12 @@ fn record_error(error: record::Error) -> io::Error {
         _ => protocol(error),
     }
 }
+fn native_record_error(error: records::Error) -> io::Error {
+    match error {
+        records::Error::CounterExhausted => exhausted(),
+        _ => protocol(error),
+    }
+}
 fn clock(origin: Instant, now: Instant) -> io::Result<u64> {
     u64::try_from(
         now.checked_duration_since(origin)
@@ -938,7 +944,153 @@ struct IngressBudget {
     left: u32,
     refill: u64,
 }
+/// Original authenticated User generation, independent of any native flow hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeOrigin {
+    binding: security::SessionBinding,
+    lane: security::LaneId,
+    direction: security::Direction,
+    scope: Scope,
+}
+impl NativeOrigin {
+    fn new(info: &member::Info, scope: Scope, half: records::Direction) -> Self {
+        let direction = match (info.role, half) {
+            (security::Role::Initiator, records::Direction::Send)
+            | (security::Role::Responder, records::Direction::Receive) => {
+                security::Direction::InitiatorToResponder
+            }
+            (security::Role::Responder, records::Direction::Send)
+            | (security::Role::Initiator, records::Direction::Receive) => {
+                security::Direction::ResponderToInitiator
+            }
+        };
+        Self {
+            binding: info.binding,
+            lane: security::LaneId(LANE),
+            direction,
+            scope,
+        }
+    }
+}
+
+/// Local native count witness, never proof of a peer's physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeBoundary {
+    origin: NativeOrigin,
+    direction: records::Direction,
+    channels: usize,
+    counts: [u64; swift::MAX_CHANNELS],
+}
+impl NativeBoundary {
+    fn capture(
+        engine: &records::Engine,
+        origin: NativeOrigin,
+        direction: records::Direction,
+    ) -> io::Result<Self> {
+        let channels = match direction {
+            records::Direction::Send => engine.send_config().channels,
+            records::Direction::Receive => engine.receive_config().channels,
+        };
+        if !(1..=swift::MAX_CHANNELS).contains(&channels) {
+            return Err(protocol("native boundary channel width"));
+        }
+        let mut counts = [0; swift::MAX_CHANNELS];
+        for (index, count) in counts.iter_mut().take(channels).enumerate() {
+            let channel = records::ChannelId::new(index)
+                .ok_or_else(|| protocol("native boundary channel"))?;
+            *count = engine
+                .boundary(direction, channel)
+                .ok_or_else(|| protocol("native boundary absent channel"))?
+                .count
+                .0;
+        }
+        Ok(Self {
+            origin,
+            direction,
+            channels,
+            counts,
+        })
+    }
+    fn canonical_for(
+        &self,
+        expected_origin: NativeOrigin,
+        local_direction: records::Direction,
+    ) -> bool {
+        self.origin == expected_origin
+            && self.direction == local_direction
+            && (1..=swift::MAX_CHANNELS).contains(&self.channels)
+            && self
+                .counts
+                .get(self.channels..)
+                .is_some_and(|tail| tail.iter().all(|count| *count == 0))
+    }
+}
+
+/// Physical complete-device writes, separate from admitted/extracted records.
+struct NativeWritten {
+    origin: NativeOrigin,
+    channels: usize,
+    counts: [u64; swift::MAX_CHANNELS],
+}
+struct NativeCompletion {
+    channel: usize,
+    count: u64,
+}
+impl NativeWritten {
+    fn new(origin: NativeOrigin, channels: usize) -> io::Result<Self> {
+        if !(1..=swift::MAX_CHANNELS).contains(&channels) {
+            return Err(protocol("native completion channel width"));
+        }
+        Ok(Self {
+            origin,
+            channels,
+            counts: [0; swift::MAX_CHANNELS],
+        })
+    }
+    fn same_generation(&self, engine: &records::Engine, origin: NativeOrigin) -> bool {
+        self.origin == origin && self.channels == engine.receive_config().channels
+    }
+    fn matches_extracted(&self, engine: &records::Engine, origin: NativeOrigin) -> bool {
+        self.same_generation(engine, origin)
+            && (0..self.channels).all(|index| {
+                records::ChannelId::new(index)
+                    .and_then(|channel| engine.boundary(records::Direction::Receive, channel))
+                    .is_some_and(|boundary| boundary.count.0 == self.counts[index])
+            })
+    }
+    fn boundary(&self) -> NativeBoundary {
+        NativeBoundary {
+            origin: self.origin,
+            direction: records::Direction::Receive,
+            channels: self.channels,
+            counts: self.counts,
+        }
+    }
+    fn preflight(
+        &self,
+        origin: NativeOrigin,
+        identity: records::NativeIdentity,
+    ) -> io::Result<NativeCompletion> {
+        let channel = identity.channel.index();
+        if self.origin != origin
+            || channel >= self.channels
+            || self.counts[channel] != identity.record.0
+        {
+            return Err(protocol("native completion origin or ordered identity"));
+        }
+        let count = self.counts[channel].checked_add(1).ok_or_else(exhausted)?;
+        Ok(NativeCompletion { channel, count })
+    }
+    fn complete(&mut self, completion: NativeCompletion) {
+        // Only preflight constructs this bounded token, and this sole owner
+        // performs no state transition while the synchronous device call runs.
+        self.counts[completion.channel] = completion.count;
+    }
+}
+
 struct Native {
+    origin: NativeOrigin,
+    identity: records::NativeIdentity,
     bytes: Vec<u8>,
     since: u64,
 }
@@ -985,6 +1137,9 @@ struct Driver {
     envelope_rx: u64,
     native: VecDeque<Native>,
     native_bytes: usize,
+    written: NativeWritten,
+    retired_send: Option<NativeBoundary>,
+    retired_receive: Option<NativeBoundary>,
     bucket: Bucket,
     reserve: usize,
     ip: usize,
@@ -1004,7 +1159,11 @@ struct Driver {
 }
 
 struct Hooks<'a> {
+    info: &'a member::Info,
     engine: &'a mut records::Engine,
+    written: &'a mut NativeWritten,
+    retired_send: &'a mut Option<NativeBoundary>,
+    retired_receive: &'a mut Option<NativeBoundary>,
     send: &'a mut policy::Direction,
     receive: &'a mut policy::Direction,
     source: &'a mut Scope,
@@ -1020,7 +1179,12 @@ impl policy::Hooks for Hooks<'_> {
         policy::Status {
             send_drained: self.engine.send_drained(),
             receive_deliverable: self.engine.deliverable() || self.native_pending,
-            receive_drained: self.engine.receive_drained() && !self.native_pending,
+            receive_drained: self.engine.receive_drained()
+                && !self.native_pending
+                && self.written.matches_extracted(
+                    self.engine,
+                    NativeOrigin::new(self.info, *self.feedback, records::Direction::Receive),
+                ),
             next_number: self.next,
         }
     }
@@ -1033,9 +1197,18 @@ impl policy::Hooks for Hooks<'_> {
         let target = self
             .target
             .ok_or_else(|| protocol("missing staged source policy scope"))?;
+        if self.retired_send.is_some() {
+            return Err(protocol("previous native send boundary still retained"));
+        }
+        let boundary = NativeBoundary::capture(
+            self.engine,
+            NativeOrigin::new(self.info, *self.source, records::Direction::Send),
+            records::Direction::Send,
+        )?;
         self.engine
             .replace_send(direction.records, feedback_from)
             .map_err(protocol)?;
+        *self.retired_send = Some(boundary);
         self.bucket.refill(now.0)?;
         self.bucket.rate = direction.bytes_per_second;
         *self.send = direction;
@@ -1050,9 +1223,26 @@ impl policy::Hooks for Hooks<'_> {
         let target = self
             .target
             .ok_or_else(|| protocol("missing staged feedback policy scope"))?;
+        let origin = NativeOrigin::new(self.info, *self.feedback, records::Direction::Receive);
+        if self.native_pending
+            || !self.engine.receive_drained()
+            || !self.written.matches_extracted(self.engine, origin)
+        {
+            return Err(protocol("native receive completion has not drained"));
+        }
+        if self.retired_receive.is_some() {
+            return Err(protocol("previous native receive boundary still retained"));
+        }
+        let boundary = self.written.boundary();
+        let written = NativeWritten::new(
+            NativeOrigin::new(self.info, target, records::Direction::Receive),
+            direction.records.channels,
+        )?;
         self.engine
             .replace_receive(direction.records, source_from)
             .map_err(protocol)?;
+        *self.retired_receive = Some(boundary);
+        *self.written = written;
         *self.receive = direction;
         *self.feedback = target;
         Ok(())
@@ -1205,6 +1395,12 @@ impl Driver {
                 envelope_rx: 1,
                 native: VecDeque::with_capacity(config.native.pending_packets),
                 native_bytes: 0,
+                written: NativeWritten::new(
+                    NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
+                    config.receive.records.channels,
+                )?,
+                retired_send: None,
+                retired_receive: None,
                 bucket: Bucket::new(config.send.bytes_per_second, config.wire.burst_bytes),
                 reserve,
                 ip,
@@ -1351,6 +1547,19 @@ impl Driver {
         if let Some(target) = self.target {
             if self.source_scope == target && self.feedback_scope == target {
                 let old = self.records.active_data();
+                if self.retired_send.as_ref().is_none_or(|boundary| {
+                    !boundary.canonical_for(
+                        NativeOrigin::new(&self.info, old, records::Direction::Send),
+                        records::Direction::Send,
+                    )
+                }) || self.retired_receive.as_ref().is_none_or(|boundary| {
+                    !boundary.canonical_for(
+                        NativeOrigin::new(&self.info, old, records::Direction::Receive),
+                        records::Direction::Receive,
+                    )
+                }) {
+                    return Err(protocol("settled policy lacks original native boundaries"));
+                }
                 self.control.advance_scope(envelope_scope(target))?;
                 match self.control.retire_draining(envelope_scope(old)) {
                     Ok(()) => {}
@@ -1359,9 +1568,14 @@ impl Driver {
                 }
                 self.records.activate_data(target).map_err(protocol)?;
                 self.records.retire_data(old).map_err(protocol)?;
+                self.retired_send = None;
+                self.retired_receive = None;
             } else if self.source_scope == self.records.active_data()
                 && self.feedback_scope == self.records.active_data()
             {
+                if self.retired_send.is_some() || self.retired_receive.is_some() {
+                    return Err(protocol("rejected policy retains native boundary changes"));
+                }
                 self.records.cancel_staged_data(target).map_err(protocol)?;
             } else {
                 return Err(protocol(
@@ -1378,6 +1592,13 @@ impl Driver {
     // This guard has no delivery, policy-completion or refill side effects.
     // Event branches must check fresh time before removing any original expiry.
     fn check_expiry(&mut self, now: u64) -> io::Result<bool> {
+        self.check_expiry_with_native(now, self.native.front().map(|packet| packet.since))
+    }
+    fn check_expiry_with_native(
+        &mut self,
+        now: u64,
+        native_since: Option<u64>,
+    ) -> io::Result<bool> {
         if self.terminal.is_some() {
             return Ok(false);
         }
@@ -1396,8 +1617,8 @@ impl Driver {
                 "authenticated liveness challenge expired",
             ));
         }
-        if self.native.front().is_some_and(|packet| {
-            add(packet.since, self.config.native.stall_timeout).is_ok_and(|end| now >= end)
+        if native_since.is_some_and(|since| {
+            add(since, self.config.native.stall_timeout).is_ok_and(|end| now >= end)
         }) {
             self.terminal = Some(StopReason::NativeStall);
             return Err(io::Error::new(
@@ -1441,6 +1662,10 @@ impl Driver {
         let next = records::RecordNumber(self.records.next_number(Class::User).0);
         let native_pending = !self.native.is_empty();
         let mut hooks = Hooks {
+            info: &self.info,
+            written: &mut self.written,
+            retired_send: &mut self.retired_send,
+            retired_receive: &mut self.retired_receive,
             engine: &mut self.swift,
             send: &mut self.send,
             receive: &mut self.receive,
@@ -1668,6 +1893,10 @@ impl Driver {
             None
         };
         let mut hooks = Hooks {
+            info: &self.info,
+            written: &mut self.written,
+            retired_send: &mut self.retired_send,
+            retired_receive: &mut self.retired_receive,
             next: records::RecordNumber(self.records.next_number(Class::User).0),
             engine: &mut self.swift,
             send: &mut self.send,
@@ -1889,6 +2118,14 @@ impl Driver {
                         self.counters.native_backpressure_drops.saturating_add(1);
                     return Ok(());
                 }
+                if !feedback
+                    && !self.written.same_generation(
+                        &self.swift,
+                        NativeOrigin::new(&self.info, opened.scope, records::Direction::Receive),
+                    )
+                {
+                    return Err(protocol("authenticated native receive generation mismatch"));
+                }
                 self.swift
                     .accept(
                         now,
@@ -1908,6 +2145,14 @@ impl Driver {
                 .is_some_and(|bytes| bytes <= self.config.native.pending_bytes)
     }
     fn collect_native(&mut self, now: u64) -> io::Result<()> {
+        // Every source/repair admitted to this installed receive engine passed
+        // the exact opened.scope == feedback_scope check. Its scope cannot move
+        // until that engine and the complete native FIFO have physically drained.
+        let origin =
+            NativeOrigin::new(&self.info, self.feedback_scope, records::Direction::Receive);
+        if !self.written.same_generation(&self.swift, origin) {
+            return Err(protocol("native collection generation mismatch"));
+        }
         for _ in 0..self.config.work.native_write_batch {
             if !self.native_room() {
                 self.performance.counters.native_output_full_polls = self
@@ -1917,15 +2162,17 @@ impl Driver {
                     .saturating_add(1);
                 break;
             }
-            let Some(packet) = self.swift.pop().map_err(protocol)? else {
+            let Some(packet) = self.swift.pop_identified().map_err(native_record_error)? else {
                 break;
             };
             self.native_bytes = self
                 .native_bytes
-                .checked_add(packet.len())
+                .checked_add(packet.bytes.len())
                 .ok_or_else(|| protocol("native queue bytes overflow"))?;
             self.native.push_back(Native {
-                bytes: packet.to_vec(),
+                origin,
+                identity: packet.identity,
+                bytes: packet.bytes.to_vec(),
                 since: now,
             });
             self.performance.counters.native_pending_packets_high = self
@@ -1982,14 +2229,18 @@ impl Driver {
             self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
             return Ok(true);
         }
-        match self.swift.offer(now, &output[..length]).map_err(protocol)? {
-            records::Admission::Accepted => {
+        match self
+            .swift
+            .offer_identified(now, &output[..length])
+            .map_err(native_record_error)?
+        {
+            records::IdentifiedAdmission::Accepted(_) => {
                 self.counters.native_read = self.counters.native_read.saturating_add(1);
             }
-            records::Admission::PacketSize => {
+            records::IdentifiedAdmission::PacketSize => {
                 self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
             }
-            records::Admission::Full => {
+            records::IdentifiedAdmission::Full => {
                 return Err(protocol("Swift admission changed without another producer"));
             }
         }
@@ -2060,13 +2311,27 @@ impl Driver {
         let Some(packet) = self.native.front() else {
             return Ok(false);
         };
+        let completion = self.written.preflight(packet.origin, packet.identity)?;
+        let packet_bytes = packet.bytes.len();
+        let packet_since = packet.since;
+        if packet_bytes > self.native_bytes {
+            return Err(protocol("native output byte ownership mismatch"));
+        }
         let result = try_native_write(ready, &packet.bytes);
         if matches!(&result, Ok(true)) {
+            // Commit irreversible complete-device acceptance before sampling a
+            // fresh clock or returning any later expiry/invariant failure.
+            self.written.complete(completion);
+            self.native_bytes -= packet_bytes;
+            self.counters.native_written = self.counters.native_written.saturating_add(1);
             self.performance.counters.native_write_batch_packets = self
                 .performance
                 .counters
                 .native_write_batch_packets
                 .saturating_add(1);
+            self.native
+                .pop_front()
+                .ok_or_else(|| protocol("native output ownership disappeared"))?;
         }
         if matches!(&result, Ok(false)) {
             self.performance.counters.native_write_would_block = self
@@ -2075,18 +2340,9 @@ impl Driver {
                 .native_write_would_block
                 .saturating_add(1);
         }
-        // Keep the front packet and its original deadline through the fresh
-        // completion check. A successful physical handoff cannot be rolled back,
-        // including when sampling/checking time itself fails after that handoff.
-        let expiry = now().and_then(|now| self.check_expiry(now));
-        if matches!(&result, Ok(true)) {
-            let packet = self
-                .native
-                .pop_front()
-                .ok_or_else(|| protocol("native output ownership disappeared"))?;
-            self.native_bytes -= packet.bytes.len();
-            self.counters.native_written = self.counters.native_written.saturating_add(1);
-        }
+        // Preserve the original front age for the completion check even after
+        // a successful write removes the FIFO entry; it cannot erase its expiry.
+        let expiry = now().and_then(|now| self.check_expiry_with_native(now, Some(packet_since)));
         if !expiry? {
             return Ok(false);
         }

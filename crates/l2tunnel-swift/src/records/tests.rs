@@ -1,5 +1,6 @@
 use super::*;
 
+mod native_identity;
 mod partial_drain;
 mod receive_service;
 

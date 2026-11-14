@@ -428,19 +428,23 @@ impl Receiver {
         }
         Ok(())
     }
-    /// Copy the next complete native packet into `output` (cleared first).
-    pub fn pop_packet(&mut self, output: &mut Vec<u8>) -> Result<bool, Error> {
-        output.clear();
+    /// Inspect a complete native record without consuming bytes or feedback state.
+    pub(crate) fn next_packet_len(&self) -> Result<Option<usize>, Error> {
         let (Some(high), Some(low)) = (self.stream.front(), self.stream.get(1)) else {
-            return Ok(false);
+            return Ok(None);
         };
         let length = usize::from(u16::from_be_bytes([*high, *low]));
         if length == 0 || length > self.config.max_packet {
             return Err(Error::Malformed);
         }
-        if self.stream.len() < FRAME_PREFIX + length {
+        Ok((self.stream.len() >= FRAME_PREFIX + length).then_some(length))
+    }
+    /// Copy the next complete native packet into `output` (cleared first).
+    pub fn pop_packet(&mut self, output: &mut Vec<u8>) -> Result<bool, Error> {
+        output.clear();
+        let Some(length) = self.next_packet_len()? else {
             return Ok(false);
-        }
+        };
         self.stream.drain(..FRAME_PREFIX);
         crate::byte_queue::append_prefix(&mut self.stream, length, output)?;
         self.stats.packets += 1;

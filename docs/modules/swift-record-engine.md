@@ -53,7 +53,7 @@ RecordNumber(pub u64)
 Admission::{Accepted, Full, PacketSize}
 Stats { sender: swift::SenderStats, receiver: swift::ReceiverStats,
         native_read: u64, native_dropped: u64, header_bytes_saved: u64 }
-Error::{Configuration, Codec(swift::Error), NotDrained, Admission}
+Error::{Configuration, CounterExhausted, Codec(swift::Error), NotDrained, Admission}
 
 Engine::new(config: Config) -> Result<Engine, Error>
 Engine::{send_config, receive_config}(&self) -> Config
@@ -76,6 +76,20 @@ Engine::replace_receive(&mut self, config: Config, source_from: RecordNumber)
     -> Result<(), Error>
 Engine::stats(&self) -> Stats
 Engine::channel_stats(&self, index: usize) -> Option<ChannelStats>
+Direction::{Send, Receive}
+ChannelId::new(index: usize) -> Option<ChannelId>
+ChannelId::index(self) -> usize
+NativeRecordId(pub u64)
+NativeCount(pub u64)
+NativeIdentity { channel: ChannelId, record: NativeRecordId }
+NativePacket<'a> { identity: NativeIdentity, bytes: &'a [u8] }
+ChannelBoundary { direction: Direction, channel: ChannelId, count: NativeCount }
+IdentifiedAdmission::{Accepted(NativeIdentity), Full, PacketSize}
+Engine::offer_identified(&mut self, now: u64, packet: &[u8])
+    -> Result<IdentifiedAdmission, Error>
+Engine::pop_identified(&mut self) -> Result<Option<NativePacket<'_>>, Error>
+Engine::boundary(&self, direction: Direction, channel: ChannelId)
+    -> Option<ChannelBoundary>
 ```
 
 `channel_stats` observes only current directional engines without allocation,
@@ -441,3 +455,119 @@ causal throughput gain or default change. The
 [actual source checkpoint5df423ae05e0cb1e84dbbc6cef971b0c5851bf7e](../../work/native-capture-observations-20261114/checkpoint-attempt-1/validation.json)
 completes SWR-12's scoped reconciliation/observation/checkpoint deliverable.
 Parent80, full SW-11,47-mode and carrier/lifecycle/platform gates remain open.
+
+## Native record identity and physical custody
+
+Status: **implemented, protocol/runtime-fixture-tested and workspace-checked**
+for the scoped SWR-15/SWR-16/SWR-18A precursor; actual local checkpoint
+reconciliation remains pending. Full SWR-18 remains open. The contract preceded production edits. This is
+an engineering prerequisite of full SW-11 and generic authenticated transaction
+fences. It selects no carrier, wire format, default or reduced parent scope.
+
+Add checked local `ChannelId`, `NativeRecordId`, exclusive `NativeCount`,
+`NativeIdentity` and borrowed `NativePacket` types. `Direction::{Send, Receive}`
+names local engine halves; the runtime must separately retain the authentic
+origin scope and endpoint direction. A new `ChannelBoundary` observes one
+current direction/channel count. An absent asymmetric channel returns `None`.
+These counts are native records, never recovery sources, security numbers,
+cover numbers or proof of a device write.
+
+`offer_identified` assigns one zero-based per-channel identity only after the
+original packet is admitted. Size/full/exhausted-counter refusal changes no
+header context and burns no identity. Preflight the exclusive count and the
+native admission/refusal and current packet-stat successors before mutation.
+`pop_identified` assigns an identity only after complete ordered extraction and
+successful decompression, using the accepted source channel. Inspect framing
+before checking count exhaustion; partial prefix/payload returns no packet and
+consumes no identity, even at the last boundary. A complete exhausted record is
+retained unchanged. Malformed authenticated compression remains terminal, with
+the existing lack of rollback unchanged.
+
+Keep `offer` and `pop` as delegates to those same paths, sharing counters and
+exact existing wire bodies, feedback, full security-number/GF seeds, header
+contexts and bounded channel rotation. Two fixed64-entry arrays bound metadata.
+The last emittable native ID is `u64::MAX - 1`, with exclusive count `u64::MAX`;
+checked exhaustion is explicit. Reset only the successfully drained direction's
+counts after the existing reset guards; preserve the opposite direction, its
+cursor, contexts, queues and count. Other legacy statistics are not asserted to
+be globally overflow-hardened by this change.
+
+Runtime integration must retain `{origin scope, endpoint direction, identity,
+bytes, original age/deadline}` through bounded native FIFO ownership, WouldBlock
+and actual complete device writes. Extraction is not physical completion.
+Advance the separate completion vector only after a full write; retain failure
+and late-write facts without granting a successful expired operation. A complete
+authenticated peer configuration, exact fences and accepted/confirmed control
+proofs remain separate generic-transaction prerequisites. These APIs alone
+cannot install a profile or satisfy full SW-11.
+
+The pre-edit contract is preserved in the [saved design](../../work/swift-native-identities-20261114/design-v0.md).
+The source-reviewed candidate and focused public-API regressions were applied
+in an isolated worktree while the original source-pinned native matrix ran.
+After that measurement and its checkpoint, exact owned source edits were
+transferred to the canonical checkout; this transfer is not verification.
+No Cargo, formatting, tests or build overlapped that measurement. Root owns
+application, formatting, checks and Git. Keep all existing tests and original
+80 Mbit/s, carrier, platform, lifecycle and47-mode gates unchanged.
+
+- [x] [SWR-14] Freeze the checked native identity/count and scope/custody contract before applying production changes, without recording engineering proposals as owner decisions. Evidence: [pre-edit design](../../work/swift-native-identities-20261114/design-v0.md) and [source binding](../../work/swift-native-identities-20261114/design-binding.json).
+- [x] [SWR-15] Implement additive identified admission/extraction and read-only directional boundaries through the same legacy wire paths, checked counters and existing drain guards. Evidence: [shared pure implementation](../../crates/l2tunnel-swift/src/records.rs), [focused pass](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json).
+- [x] [SWR-16] Pass focused regressions for exact wire parity, packing/compression, loss/retransmission, original channel provenance, refusals, exhaustion, incomplete records and asymmetric reset custody. Evidence: [15 public-flow regressions](../../crates/l2tunnel-swift/src/records/tests/native_identity.rs), [focused pass](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json).
+- [ ] [SWR-17] Pass formatting, strict Clippy, rustdoc, relevant consumer regressions and required source-stable workspace checks; save a scoped local checkpoint with actual evidence.
+- [x] [SWR-18A] Implement the selected Swift runtime local-custody precursor: retain the actual incoming scope/binding/lane/endpoint direction and native identity through bounded FIFO and full device completion, checked local completion vectors, refused reset and irreversible late-write failure tests. This neither supplies authenticated peer count fences nor closes SWR-18. Evidence: [actual runtime custody](../../crates/l2tunnel-runtime/src/secure_udp/transport.rs), [six real-UDP/device hook regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_native_custody_tests.rs) and [required frozen-source pass](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json). Direct policy-message completion is hook evidence, not reliable generic-transaction proof.
+- [ ] [SWR-18] Retain actual authenticated origin and endpoint direction through physical native completion in the selected runtime, and verify bounded pressure/failure/deadline and negotiated barrier integration; pure extraction counts alone cannot close this gate.
+
+The SWR-18A local precursor uses the current authenticated `feedback_scope` for
+incoming native records; `Records::active_data()` can name a different direction
+during a policy crossing. Keep admission and extraction queries in the pure
+engine and add only physical completion accounting at the runtime boundary.
+Require the exact current origin, channel width, empty FIFO, drained engine and
+physical/extracted count equality before receive reset. A write that succeeds
+before a fresh clock/deadline failure is irreversible: record completion and
+remove that FIFO entry before reporting failure. WouldBlock preserves every
+retained identity, origin, byte and original age. Existing SwiftPolicyV1
+barriers carry security-number floors, not authenticated native count vectors;
+full peer-fence, configuration and control-custody integration remains SWR-18.
+
+The [first focused attempt](../../work/swift-native-identities-20261114/focused-attempt-1/validation.json)
+passes82 Swift library tests,108 secure-UDP runtime tests,17 retained Swift
+runtime tests and233 client-core unit plus19 public-API tests. It then fails
+strict Clippy on three iterator loops in the new pure tests; rustdoc was not
+reached. The [focused follow-up](../../work/swift-native-identities-20261114/focused-attempt-2/validation.json)
+passes82 Swift tests, strict all-target/all-feature Clippy for the affected
+libraries and warning-denied rustdoc. Its only source change since the first
+attempt is equivalent iteration in that test module; the production and
+runtime/consumer assertions remain unchanged. Both attempts have stable inputs.
+The original lint failure is retained rather than described as a full passing
+first attempt.
+
+The15 new [pure regressions](../../crates/l2tunnel-swift/src/records/tests/native_identity.rs)
+use actual offer/poll/accept/pop APIs for exact wire parity, packed compression,
+source loss/retransmission/duplicates, channel provenance, refused admission,
+last/exhausted identities, partial prefix/payload and asymmetric drained resets.
+Only unreachable counter extrema use private test seams. A malformed compressed
+record allocates no extracted identity; terminal decoding rollback or continued
+failed-session use is not promised. Existing legacy statistics are not all
+overflow-hardened by this change.
+
+The six [runtime regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_native_custody_tests.rs)
+cover both appearances with actual established member roots, original UDP pairs,
+common protected records and complete writes to Unix datagram packet devices.
+They distinguish extracted from physically written counts, retain metadata and
+age through WouldBlock, reject mismatched generation/counts before reset, use
+the real coordinator/hooks across directional scope/width changes and retain
+irreversible successful writes when the fresh clock or original deadline fails.
+Malformed local retained-vector shape fails before reader retirement. Direct
+delivery/completion of actual coordinator messages tests hooks, not reliable
+control completion or generic peer-fence negotiation. This is finite Linux
+runtime-fixture evidence, not a fresh TAP/native-performance or platform result.
+All preceding native/kernel numbers remain bound to binary `cbcabdf`, which
+predates these changes. No parent gate is closed by these focused checks.
+
+The [required frozen-source workspace check](../../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json)
+subsequently passes1,692 Rust cases including doctests,376 tooling cases and
+1,658 simulator cases, formatting, strict Clippy, rustdoc and CLI checks. Its
+recorded inputs remain stable. This is local Linux verification without a new
+immutable daemon/native/performance observation, Windows/Android build, remote
+CI or ISP result. Evidence reconciliation and an actual scoped local checkpoint
+are still pending; SWR-18 and every original parent gate remain open.

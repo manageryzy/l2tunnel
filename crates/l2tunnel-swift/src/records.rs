@@ -46,6 +46,82 @@ impl Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordNumber(pub u64);
 
+/// Local engine half; not an authenticated endpoint direction or epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    /// Locally admitted outgoing native records.
+    Send,
+    /// Locally extracted incoming native records, before device completion.
+    Receive,
+}
+
+/// Checked Swift channel index, independent of an installed direction's width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelId(u8);
+impl ChannelId {
+    /// Construct an index in 0..64; an installed direction may have fewer channels.
+    pub fn new(index: usize) -> Option<Self> {
+        if index >= crate::MAX_CHANNELS {
+            return None;
+        }
+        u8::try_from(index).ok().map(Self)
+    }
+    /// Exact zero-based channel index.
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+/// Zero-based native identity within one channel of one direction's epoch.
+/// This is not a source, repair, security or cover packet number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeRecordId(pub u64);
+
+/// Exclusive native-record count; u64::MAX is the last representable boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCount(pub u64);
+
+/// Original channel and native record, without session or epoch authority.
+/// The runtime must retain the actual origin scope and global direction with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeIdentity {
+    /// Channel selected by the original admission or ordered receive owner.
+    pub channel: ChannelId,
+    /// Native record identity; the last emittable identity is u64::MAX - 1.
+    pub record: NativeRecordId,
+}
+
+/// One exact native packet and its receive identity, before physical handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativePacket<'a> {
+    /// Identity allocated only after complete extraction and decompression.
+    pub identity: NativeIdentity,
+    /// Borrowed bytes, valid until the next mutable engine call.
+    pub bytes: &'a [u8],
+}
+
+/// One current-direction exclusive count, never proof of native device delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelBoundary {
+    /// Local engine half whose count is observed.
+    pub direction: Direction,
+    /// Channel inside that installed direction.
+    pub channel: ChannelId,
+    /// Accepted send records or successfully extracted receive records.
+    pub count: NativeCount,
+}
+
+/// Identified admission, with no identity allocated by a refused packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentifiedAdmission {
+    /// Exact retained native packet and its original admission identity.
+    Accepted(NativeIdentity),
+    /// The common packing-byte budget cannot admit another maximum record.
+    Full,
+    /// Empty or larger than the fixed native packet bound.
+    PacketSize,
+}
+
 /// Native admission result, decided before changing header contexts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
@@ -62,6 +138,9 @@ pub enum Admission {
 pub enum Error {
     /// Invalid channels, native bound or changed physical packet format.
     Configuration,
+    /// A native identity/count or admission/packet statistic cannot advance.
+    /// Refusal occurs before the new packet changes contexts or consumes bytes.
+    CounterExhausted,
     /// Existing Swift grammar or recovery failure.
     Codec(crate::Error),
     /// Directional replacement requires completed delivery/confirmation.
@@ -73,6 +152,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration => output.write_str("invalid Swift record configuration"),
+            Self::CounterExhausted => output.write_str("Swift native record counter exhausted"),
             Self::Codec(error) => std::fmt::Display::fmt(error, output),
             Self::NotDrained => output.write_str("Swift record direction has not drained"),
             Self::Admission => output.write_str("Swift packing queue refused an admitted record"),
@@ -119,6 +199,8 @@ pub struct Engine {
     limit: usize,
     source_floor: RecordNumber,
     feedback_floor: RecordNumber,
+    admitted: [u64; crate::MAX_CHANNELS],
+    extracted: [u64; crate::MAX_CHANNELS],
     senders: Vec<Sender>,
     receivers: Vec<Receiver>,
     compressors: Vec<header::Compressor>,
@@ -160,6 +242,8 @@ impl Engine {
             limit: config.codec.datagram_bytes,
             source_floor: RecordNumber(0),
             feedback_floor: RecordNumber(0),
+            admitted: [0; crate::MAX_CHANNELS],
+            extracted: [0; crate::MAX_CHANNELS],
             senders,
             receivers,
             compressors,
@@ -185,6 +269,21 @@ impl Engine {
     pub fn receive_config(&self) -> Config {
         self.receive
     }
+    /// Observe one current native boundary without polling or granting delivery.
+    /// A channel absent in the selected asymmetric direction returns None.
+    pub fn boundary(&self, direction: Direction, channel: ChannelId) -> Option<ChannelBoundary> {
+        let index = channel.index();
+        let count = match direction {
+            Direction::Send if index < self.send.channels => self.admitted[index],
+            Direction::Receive if index < self.receive.channels => self.extracted[index],
+            _ => return None,
+        };
+        Some(ChannelBoundary {
+            direction,
+            channel,
+            count: NativeCount(count),
+        })
+    }
     /// Observe one channel without polling, allocating or changing protocol state.
     /// Indices beyond both current directions return None; at most 64 exist.
     pub fn channel_stats(&self, index: usize) -> Option<ChannelStats> {
@@ -208,29 +307,64 @@ impl Engine {
         let queued: usize = self.senders.iter().map(Sender::queued).sum();
         queued + self.send.codec.max_packet + crate::FRAME_PREFIX <= self.send.codec.queue_bytes
     }
-    /// Admit before compression so rejected packets cannot desynchronize contexts.
+    /// Admit through the identified path while preserving the legacy result.
     pub fn offer(&mut self, now: u64, packet: &[u8]) -> Result<Admission, Error> {
+        Ok(match self.offer_identified(now, packet)? {
+            IdentifiedAdmission::Accepted(_) => Admission::Accepted,
+            IdentifiedAdmission::Full => Admission::Full,
+            IdentifiedAdmission::PacketSize => Admission::PacketSize,
+        })
+    }
+    /// Admit before compression and allocate one checked original native identity.
+    /// Size, queue or exhausted-counter refusal burns no identity or header state.
+    pub fn offer_identified(
+        &mut self,
+        now: u64,
+        packet: &[u8],
+    ) -> Result<IdentifiedAdmission, Error> {
         let rejected = if packet.is_empty() || packet.len() > self.send.max_native {
-            Some(Admission::PacketSize)
+            Some(IdentifiedAdmission::PacketSize)
         } else if !self.has_room() {
-            Some(Admission::Full)
+            Some(IdentifiedAdmission::Full)
         } else {
             None
         };
         if let Some(rejected) = rejected {
-            self.base.native_dropped += 1;
+            self.base.native_dropped = self
+                .base
+                .native_dropped
+                .checked_add(1)
+                .ok_or(Error::CounterExhausted)?;
             return Ok(rejected);
         }
         let channel = match self.send.layer {
             Layer::Ethernet => flow::classify_ethernet(packet, self.send.channels),
             Layer::Ip => flow::classify_ip(packet, self.send.channels),
         };
+        let native_read = self
+            .base
+            .native_read
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        let admitted = self.admitted[channel]
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        self.senders[channel]
+            .stats()
+            .packets
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        let identity = NativeIdentity {
+            channel: ChannelId::new(channel).ok_or(Error::Configuration)?,
+            record: NativeRecordId(self.admitted[channel]),
+        };
         self.compressors[channel].compress(packet, &mut self.record);
         if !self.senders[channel].push_packet(now, &self.record)? {
             return Err(Error::Admission);
         }
-        self.base.native_read += 1;
-        Ok(Admission::Accepted)
+        self.admitted[channel] = admitted;
+        self.base.native_read = native_read;
+        Ok(IdentifiedAdmission::Accepted(identity))
     }
 
     fn feedback(&mut self, now: u64) -> bool {
@@ -374,8 +508,13 @@ impl Engine {
     pub fn deliverable(&self) -> bool {
         self.ready != 0
     }
-    /// Return one exact recovered native packet in bounded receive-channel rotation.
+    /// Return bytes through the same identified bounded receive-channel rotation.
     pub fn pop(&mut self) -> Result<Option<&[u8]>, Error> {
+        Ok(self.pop_identified()?.map(|packet| packet.bytes))
+    }
+    /// Extract one complete native packet with its original ordered channel identity.
+    /// Partial records consume no identity. This is not physical device completion.
+    pub fn pop_identified(&mut self) -> Result<Option<NativePacket<'_>>, Error> {
         if self.ready == 0 {
             return Ok(None);
         }
@@ -385,16 +524,37 @@ impl Engine {
             if self.ready & (1_u64 << channel) == 0 {
                 continue;
             }
-            if self.receivers[channel].pop_packet(&mut self.record)? {
-                self.decompressors[channel].decompress(
-                    &self.record,
-                    self.send.max_native,
-                    &mut self.native,
-                )?;
-                self.receive_turn = (channel + 1) % channels;
-                return Ok(Some(&self.native));
+            if self.receivers[channel].next_packet_len()?.is_none() {
+                self.record.clear();
+                self.ready &= !(1_u64 << channel);
+                continue;
             }
-            self.ready &= !(1_u64 << channel);
+            let extracted = self.extracted[channel]
+                .checked_add(1)
+                .ok_or(Error::CounterExhausted)?;
+            self.receivers[channel]
+                .stats()
+                .packets
+                .checked_add(1)
+                .ok_or(Error::CounterExhausted)?;
+            let identity = NativeIdentity {
+                channel: ChannelId::new(channel).ok_or(Error::Configuration)?,
+                record: NativeRecordId(self.extracted[channel]),
+            };
+            if !self.receivers[channel].pop_packet(&mut self.record)? {
+                return Err(crate::Error::Malformed.into());
+            }
+            self.decompressors[channel].decompress(
+                &self.record,
+                self.send.max_native,
+                &mut self.native,
+            )?;
+            self.extracted[channel] = extracted;
+            self.receive_turn = (channel + 1) % channels;
+            return Ok(Some(NativePacket {
+                identity,
+                bytes: &self.native,
+            }));
         }
         Ok(None)
     }
@@ -454,6 +614,7 @@ impl Engine {
         }
         self.limit = self.limit.max(config.codec.datagram_bytes);
         self.turn = 0;
+        self.admitted = [0; crate::MAX_CHANNELS];
         self.send = config;
         self.feedback_floor = feedback_from;
         Ok(())
@@ -482,6 +643,7 @@ impl Engine {
         self.receive_turn = 0;
         self.feedback_turn = 0;
         self.ready = 0;
+        self.extracted = [0; crate::MAX_CHANNELS];
         self.receive = config;
         self.source_floor = source_from;
         Ok(())

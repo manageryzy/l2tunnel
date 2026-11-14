@@ -210,6 +210,20 @@ saves the reconciled correction and evidence. SGD-14 and the scoped SWR-12
 observation/checkpoint deliverable are complete; parent performance, full
 SW-11,47-mode and carrier/lifecycle/platform gates remain open.
 
+The next [native record identity prerequisite](modules/swift-record-engine.md#native-record-identity-and-physical-custody)
+tracks SWR-14..SWR-18 separately: checked per-channel admission/extraction
+identities precede actual authenticated-scope and physical-device completion
+fences. Exact owned edits were transferred from the isolated worktree after the
+native checkpoint. [Focused pure/runtime/consumer commands](../work/swift-native-identities-20261114/focused-attempt-1/validation.json)
+pass before a retained test-iterator lint failure; the
+[test-only cleanup follow-up](../work/swift-native-identities-20261114/focused-attempt-2/validation.json)
+passes Swift tests, strict Clippy and rustdoc. The
+[required frozen-source pass](../work/swift-native-identities-20261114/aggregate-attempt-1/validation.json)
+records1,692 Rust,376 tooling and1,658 simulator cases. SWR-15/SWR-16/SWR-18A's
+pure API and selected local-custody precursor are verified to their stated
+scope; actual scoped checkpoint reconciliation remains pending. This
+does not qualify generic switching, other record profiles or full SW-11.
+
 | Workstream | Detailed checkbox IDs | Specification | Depends on |
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |

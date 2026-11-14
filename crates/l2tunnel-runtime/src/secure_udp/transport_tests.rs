@@ -8,6 +8,8 @@ mod fairness;
 mod loss;
 #[path = "transport_metrics_tests.rs"]
 mod metrics;
+#[path = "transport_native_custody_tests.rs"]
+mod native_custody;
 #[path = "transport_receive_service_tests.rs"]
 mod receive_service;
 #[path = "transport_stream_tests.rs"]
