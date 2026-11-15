@@ -189,7 +189,7 @@ fn exact_and_plus_one_wrapper_limits_construct_actual_asymmetric_backing_once() 
             assert!(streamed.leased);
             assert_eq!(
                 streamed.outgoing.each_ref().map(|values| values.capacity()),
-                [2, 3, 4]
+                [2, 3, 4, 0]
             );
             assert!(streamed.outgoing.iter().all(Vec::is_empty));
             assert_eq!(streamed.envelope.len(), 2048);

@@ -594,6 +594,12 @@ impl Engine {
         })
     }
 
+    /// Actual resumable rolling computation, separate from immutable I/O output.
+    pub fn work_pending(&self) -> Result<bool, Error> {
+        self.healthy()?;
+        Ok(matches!(&self.owner, Owner::Rolling(endpoint) if endpoint.work_pending()))
+    }
+
     /// Earliest actual owner or retained native deadline, without reading a clock.
     pub fn deadline(&self) -> Result<Option<Tick>, Error> {
         self.healthy()?;

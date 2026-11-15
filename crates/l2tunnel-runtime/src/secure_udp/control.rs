@@ -10,6 +10,10 @@ use l2tunnel_management::{
 use l2tunnel_recovery as recovery;
 use std::{io, time::Duration};
 
+#[path = "control_v2.rs"]
+mod v2;
+pub use v2::SettingsV2;
+
 #[path = "control_leased.rs"]
 mod leased;
 #[path = "control_wrapper_storage.rs"]
@@ -169,12 +173,13 @@ struct Held {
 struct Streamed {
     leased: bool,
     reservation: Option<leased::Reservation>,
-    owners: [messages::Owner; 3],
+    owners: StreamOwners,
     gate: streams::gate::Gate,
     settings: Settings,
-    next: [u64; 3],
-    outgoing: [Vec<Outgoing>; 3],
-    held: [Option<Held>; 3],
+    lifecycle: Option<messages::Settings>,
+    next: [u64; 4],
+    outgoing: [Vec<Outgoing>; 4],
+    held: [Option<Held>; 4],
     control_scope: sc::Scope,
     active: sc::Scope,
     draining: Option<sc::Scope>,
@@ -189,6 +194,82 @@ struct Streamed {
     bytes_left: usize,
 }
 
+// Keep the legacy three inline headers; only v2 reserves an actual fourth owner
+// set. The enum's retained inline layout is charged in the actual Streamed cell.
+#[allow(clippy::large_enum_variant)]
+enum StreamOwners {
+    Three([messages::Owner; 3]),
+    Four(Vec<messages::Owner>),
+}
+impl std::ops::Deref for StreamOwners {
+    type Target = [messages::Owner];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Three(owners) => owners,
+            Self::Four(owners) => owners,
+        }
+    }
+}
+impl std::ops::DerefMut for StreamOwners {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Three(owners) => owners,
+            Self::Four(owners) => owners,
+        }
+    }
+}
+impl StreamOwners {
+    fn heap_capacity(&self) -> usize {
+        match self {
+            Self::Three(_) => 0,
+            Self::Four(owners) => owners.capacity(),
+        }
+    }
+}
+impl Streamed {
+    fn version(&self) -> u8 {
+        if self.lifecycle.is_some() {
+            streams::v2::VERSION
+        } else {
+            streams::VERSION
+        }
+    }
+    fn stream(&self, i: usize) -> io::Result<streams::Stream> {
+        let all: &[streams::Stream] = if self.lifecycle.is_some() {
+            &streams::v2::ALL
+        } else {
+            &streams::Stream::ALL
+        };
+        all.get(i)
+            .copied()
+            .ok_or_else(|| invalid("unselected control stream"))
+    }
+    fn settings_at(&self, i: usize) -> io::Result<messages::Settings> {
+        if i == 3 {
+            self.lifecycle
+                .ok_or_else(|| invalid("Lifecycle requires explicit v2"))
+        } else {
+            self.settings
+                .streams
+                .get(i)
+                .copied()
+                .ok_or_else(|| invalid("unknown control stream"))
+        }
+    }
+}
+
+fn stream_binding(
+    binding: delivery::Binding,
+    stream: streams::Stream,
+    version: u8,
+) -> io::Result<delivery::Binding> {
+    match version {
+        streams::VERSION => streams::delivery_binding(binding, stream).map_err(invalid),
+        streams::v2::VERSION => streams::v2::delivery_binding(binding, stream).map_err(invalid),
+        _ => Err(invalid("unselected control version")),
+    }
+}
+
 fn raw_packet_bytes(base: delivery::Settings) -> io::Result<usize> {
     base.recovery
         .max_source_bytes
@@ -196,8 +277,20 @@ fn raw_packet_bytes(base: delivery::Settings) -> io::Result<usize> {
         .ok_or_else(|| invalid("control packet size overflow"))
 }
 
-fn wrapper_layout(outgoing: [usize; 3], envelope: usize, raw: usize) -> io::Result<usize> {
+fn wrapper_layout(
+    outgoing: [usize; 4],
+    envelope: usize,
+    raw: usize,
+    owner_headers: usize,
+) -> io::Result<usize> {
     let mut total = std::mem::size_of::<Streamed>();
+    total = total
+        .checked_add(
+            std::alloc::Layout::array::<messages::Owner>(owner_headers)
+                .map_err(invalid)?
+                .size(),
+        )
+        .ok_or_else(|| invalid("control owner header layout overflow"))?;
     for count in outgoing {
         let bytes = std::alloc::Layout::array::<Outgoing>(count)
             .map_err(invalid)?
@@ -227,6 +320,27 @@ enum Storage<'a> {
         wrapper: &'a wrapper_storage::Plan,
         wrapper_limit: wrapper_storage::Limits,
     },
+    ReservedMessagesV2 {
+        messages: [messages::storage::Limits; 4],
+        wrapper: &'a wrapper_storage::Plan,
+        wrapper_limit: wrapper_storage::Limits,
+    },
+}
+
+impl Storage<'_> {
+    fn complete(&self) -> bool {
+        matches!(
+            self,
+            Self::ReservedMessages { .. } | Self::ReservedMessagesV2 { .. }
+        )
+    }
+    fn message_limit(&self, i: usize) -> Option<messages::storage::Limits> {
+        match self {
+            Self::ReservedMessages { messages, .. } => messages.get(i).copied(),
+            Self::ReservedMessagesV2 { messages, .. } => messages.get(i).copied(),
+            _ => None,
+        }
+    }
 }
 
 enum Backend {
@@ -262,10 +376,26 @@ enum StreamConstructionDrop {
 
 impl StreamConstruction {
     fn collect<L: Copy>(
+        self,
+        settings: Settings,
+        binding: delivery::Binding,
+        limits: Option<[L; 3]>,
+        factory: impl FnMut(
+            streams::Stream,
+            messages::Settings,
+            delivery::Binding,
+            Option<L>,
+        ) -> io::Result<messages::Owner>,
+    ) -> io::Result<[messages::Owner; 3]> {
+        self.collect_version(settings, binding, limits, streams::VERSION, factory)
+    }
+
+    fn collect_version<L: Copy>(
         mut self,
         settings: Settings,
         binding: delivery::Binding,
         limits: Option<[L; 3]>,
+        version: u8,
         mut factory: impl FnMut(
             streams::Stream,
             messages::Settings,
@@ -278,7 +408,7 @@ impl StreamConstruction {
             .zip(settings.streams)
             .enumerate()
         {
-            let binding = streams::delivery_binding(binding, stream).map_err(invalid)?;
+            let binding = stream_binding(binding, stream, version)?;
             self.owners[index] = Some((
                 stream,
                 factory(
@@ -385,6 +515,9 @@ impl Owner {
         let Backend::Streamed(streamed) = &self.backend else {
             return None;
         };
+        if streamed.lifecycle.is_some() {
+            return None;
+        }
         Some([
             streamed.owners[0].arq_storage_usage()?,
             streamed.owners[1].arq_storage_usage()?,
@@ -397,6 +530,9 @@ impl Owner {
         let Backend::Streamed(streamed) = &self.backend else {
             return None;
         };
+        if streamed.lifecycle.is_some() {
+            return None;
+        }
         Some([
             streamed.owners[0].storage_usage()?,
             streamed.owners[1].storage_usage()?,
@@ -412,6 +548,7 @@ impl Owner {
             streamed.outgoing.each_ref().map(|values| values.capacity()),
             streamed.envelope.capacity(),
             streamed.raw.capacity(),
+            streamed.owners.heap_capacity(),
         )
     }
 
@@ -475,6 +612,7 @@ impl Owner {
                 raw,
                 storage,
                 allocation,
+                None,
             )?
         } else {
             let limits = sc::Limits {
@@ -516,27 +654,51 @@ impl Owner {
         raw: usize,
         storage: Storage<'_>,
         allocation: &mut wrapper_storage::Allocation,
+        lifecycle: Option<messages::Settings>,
     ) -> io::Result<(Backend, usize)> {
         let lifetime = expires
             .checked_sub(now)
             .ok_or_else(|| invalid("control already expired"))?;
-        settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
+        if let Some(lifecycle) = lifecycle {
+            SettingsV2::from_parts(settings, lifecycle).validate(
+                base,
+                settings.streams[0].path_mtu,
+                lifetime,
+            )?;
+        } else {
+            settings.validate(base, settings.streams[0].path_mtu, lifetime)?;
+        }
+        let version = if lifecycle.is_some() {
+            streams::v2::VERSION
+        } else {
+            streams::VERSION
+        };
         if let Storage::ReservedMessages {
+            wrapper,
+            wrapper_limit,
+            ..
+        }
+        | Storage::ReservedMessagesV2 {
             wrapper,
             wrapper_limit,
             ..
         } = storage
         {
-            wrapper.check(&settings, &base, wrapper_limit)?;
+            if lifecycle.is_some() {
+                wrapper.check_selection(&settings, lifecycle, &base, wrapper_limit)?;
+            } else {
+                wrapper.check(&settings, &base, wrapper_limit)?;
+            }
         }
         let maximum = settings
             .streams
             .iter()
+            .chain(lifecycle.iter())
             .map(|settings| settings.max_message_bytes)
             .max()
             .ok_or_else(|| invalid("missing control streams"))?;
         let make_gate = || {
-            streams::gate::Gate::new(streams::gate::GateSettings {
+            let gate_settings = streams::gate::GateSettings {
                 binding: sc::PeerBinding {
                     session: binding.session,
                     remote_role: opposite(binding.local_role),
@@ -546,10 +708,15 @@ impl Owner {
                 control: control_scope,
                 active: policy(data_scope),
                 limits: envelope_limits(maximum)?,
-            })
+            };
+            if lifecycle.is_some() {
+                streams::gate::Gate::new_v2(gate_settings)
+            } else {
+                streams::gate::Gate::new(gate_settings)
+            }
             .map_err(invalid)
         };
-        let reserved_gate = if matches!(storage, Storage::ReservedMessages { .. }) {
+        let reserved_gate = if storage.complete() {
             Some(make_gate()?)
         } else {
             None
@@ -565,20 +732,42 @@ impl Owner {
                 }
             }
         }
-        let owners = if let Storage::ReservedMessages {
-            messages: limits, ..
-        } = storage
-        {
-            let plans = settings.message_storage_plans(binding, now, expires)?;
-            for (plan, limit) in plans.iter().zip(limits) {
+        let owners = if storage.complete() {
+            for (i, settings) in settings
+                .streams
+                .iter()
+                .chain(lifecycle.iter())
+                .copied()
+                .enumerate()
+            {
+                let stream = streams::v2::ALL[i];
+                let plan = messages::storage::Plan::for_owner(
+                    settings,
+                    stream_binding(binding, stream, version)?,
+                    now,
+                    expires,
+                )
+                .map_err(invalid)?;
+                let limit = storage
+                    .message_limit(i)
+                    .ok_or_else(|| invalid("missing complete message limit"))?;
                 if plan.capacity_bytes() > limit.capacity_bytes {
                     return Err(invalid("control complete message storage limit"));
                 }
             }
-            StreamConstruction::default().collect(
+            let limits = [
+                storage.message_limit(0),
+                storage.message_limit(1),
+                storage.message_limit(2),
+            ];
+            let [Some(a), Some(b), Some(c)] = limits else {
+                return Err(invalid("missing first three stream limits"));
+            };
+            StreamConstruction::default().collect_version(
                 settings,
                 binding,
-                Some(limits),
+                Some([a, b, c]),
+                version,
                 |_, settings, stream_binding, limit| {
                     messages::Owner::new_reserved(
                         settings,
@@ -616,22 +805,53 @@ impl Owner {
                 },
             )?
         };
+        let lifecycle_owner = if let Some(settings) = lifecycle {
+            Some(
+                messages::Owner::new_reserved(
+                    settings,
+                    stream_binding(binding, streams::Stream::Lifecycle, version)?,
+                    now,
+                    expires,
+                    storage
+                        .message_limit(3)
+                        .ok_or_else(|| invalid("Lifecycle requires complete reserved messages"))?,
+                )
+                .map_err(invalid)?,
+            )
+        } else {
+            None
+        };
         let gate = match reserved_gate {
             Some(gate) => gate,
             None => make_gate()?,
         };
         let size = settings.max_packet_bytes(base)?;
         let owners = StreamConstruction::from_owners(owners, allocation);
+        let mut owner_headers = if lifecycle.is_some() {
+            Some(allocation.vec(wrapper_storage::Slot::Owners, 4)?)
+        } else {
+            None
+        };
         let build = move |outgoing, envelope, raw| {
+            let actual = owners.finish()?;
+            let owners = if let Some(mut headers) = owner_headers.take() {
+                headers.extend(actual);
+                headers
+                    .push(lifecycle_owner.ok_or_else(|| invalid("missing fourth actual owner"))?);
+                StreamOwners::Four(headers)
+            } else {
+                StreamOwners::Three(actual)
+            };
             Ok(Streamed {
                 leased: false,
                 reservation: None,
-                owners: owners.finish()?,
+                owners,
                 gate,
                 settings,
-                next: [1; 3],
+                lifecycle,
+                next: [1; 4],
                 outgoing,
-                held: [None; 3],
+                held: [None; 4],
                 control_scope,
                 active: data_scope,
                 draining: None,
@@ -651,10 +871,20 @@ impl Owner {
                 wrapper,
                 wrapper_limit,
                 ..
+            }
+            | Storage::ReservedMessagesV2 {
+                wrapper,
+                wrapper_limit,
+                ..
             } => wrapper.provision(wrapper_limit, allocation, build)?,
             _ => wrapper_storage::StreamedStorage::Legacy(Box::new(build(
                 std::array::from_fn(|i| {
-                    Vec::with_capacity(settings.streams[i].max_outbound_messages)
+                    Vec::with_capacity(
+                        settings
+                            .streams
+                            .get(i)
+                            .map_or(0, |settings| settings.max_outbound_messages),
+                    )
                 }),
                 vec![0; maximum],
                 vec![0; raw],
@@ -679,6 +909,16 @@ impl Owner {
         original_deadline: Duration,
         auto_retire: bool,
     ) -> io::Result<Option<Token>> {
+        if matches!(
+            body,
+            sc::Body::ProfileControl {
+                tag: sc::ProfileTag::SessionRefreshV1,
+                ..
+            }
+        ) && !matches!(&self.backend, Backend::Streamed(streamed) if streamed.lifecycle.is_some())
+        {
+            return Err(invalid("Lifecycle requires explicit v2 Control"));
+        }
         self.observe(now)?;
         match &mut self.backend {
             Backend::Legacy(legacy) => {
@@ -711,10 +951,17 @@ impl Owner {
                     return Err(invalid("leased Management requires frozen Peer output"));
                 }
                 let i = index(stream);
+                let settings = streamed.settings_at(i)?;
+                if i >= streamed.owners.len() {
+                    return Err(invalid("control stream not selected"));
+                }
                 if auto_retire && stream != streams::Stream::Liveness {
                     return Err(invalid("profile tokens require explicit completion"));
                 }
-                if (stream == streams::Stream::Liveness && scope != streamed.control_scope)
+                if (matches!(
+                    stream,
+                    streams::Stream::Liveness | streams::Stream::Lifecycle
+                ) && scope != streamed.control_scope)
                     || (stream == streams::Stream::Transaction
                         && scope != streamed.active
                         && Some(scope) != streamed.draining)
@@ -723,7 +970,7 @@ impl Owner {
                 }
                 let next = streamed.next[i].checked_add(1).ok_or_else(exhausted)?;
                 let deadline = now
-                    .checked_add(streamed.settings.streams[i].message_lifetime)
+                    .checked_add(settings.message_lifetime)
                     .ok_or_else(exhausted)?
                     .min(original_deadline)
                     .min(self.expires);
@@ -734,7 +981,7 @@ impl Owner {
                 let length = envelope
                     .encode(
                         &mut streamed.envelope,
-                        envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                        envelope_limits(settings.max_message_bytes)?,
                     )
                     .map_err(protocol)?;
                 match streamed.owners[i].submit(
@@ -811,15 +1058,18 @@ impl Owner {
                 .receive(verified, bytes, now)
                 .map_err(protocol),
             Backend::Streamed(streamed) => {
-                let frame = streams::Frame::decode(
-                    bytes,
-                    streams::Limits {
-                        max_packet_bytes: self.max_packet - streams::HEADER_BYTES,
-                    },
-                )
-                .map_err(protocol)?;
-                streamed.owners[index(frame.stream)]
-                    .receive(verified, frame.packet, now)
+                let limits = streams::Limits {
+                    max_packet_bytes: self.max_packet - streams::HEADER_BYTES,
+                };
+                let (stream, packet) = if streamed.lifecycle.is_some() {
+                    let frame = streams::v2::Frame::decode(bytes, limits).map_err(protocol)?;
+                    (frame.stream, frame.packet)
+                } else {
+                    let frame = streams::Frame::decode(bytes, limits).map_err(protocol)?;
+                    (frame.stream, frame.packet)
+                };
+                streamed.owners[index(stream)]
+                    .receive(verified, packet, now)
                     .map_err(protocol)
             }
         }
@@ -858,18 +1108,18 @@ impl Owner {
                     stream: None,
                 })),
             Backend::Streamed(streamed) => {
-                for offset in 0..3 {
-                    let i = (streamed.receive_cursor + offset) % 3;
+                for offset in 0..streamed.owners.len() {
+                    let i = (streamed.receive_cursor + offset) % streamed.owners.len();
                     if streamed.held[i].is_some() {
                         continue;
                     }
                     let Some(delivery) = streamed.owners[i].pending() else {
                         continue;
                     };
-                    let stream = streams::Stream::ALL[i];
+                    let stream = streamed.stream(i)?;
                     let envelope = sc::Envelope::decode(
                         delivery.bytes(),
-                        envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                        envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
                     )
                     .map_err(protocol)?;
                     if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
@@ -916,7 +1166,7 @@ impl Owner {
                         dispatched: false,
                         leased: false,
                     });
-                    streamed.receive_cursor = (i + 1) % 3;
+                    streamed.receive_cursor = (i + 1) % streamed.owners.len();
                     return Ok(Some(incoming));
                 }
                 Ok(None)
@@ -931,7 +1181,8 @@ impl Owner {
         let Backend::Streamed(streamed) = &self.backend else {
             return Ok(false);
         };
-        for (i, stream) in streams::Stream::ALL.into_iter().enumerate() {
+        for i in 0..streamed.owners.len() {
+            let stream = streamed.stream(i)?;
             if streamed.held[i].is_some() {
                 continue;
             }
@@ -940,7 +1191,7 @@ impl Owner {
             };
             let envelope = sc::Envelope::decode(
                 delivery.bytes(),
-                envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
             )
             .map_err(protocol)?;
             if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
@@ -960,8 +1211,8 @@ impl Owner {
         let Backend::Streamed(streamed) = &self.backend else {
             return Ok(false);
         };
-        for stream in [streams::Stream::Liveness, streams::Stream::DataFeedback] {
-            let i = index(stream);
+        for i in 1..streamed.owners.len() {
+            let stream = streamed.stream(i)?;
             if streamed.held[i].is_some() {
                 continue;
             }
@@ -970,7 +1221,7 @@ impl Owner {
             };
             let envelope = sc::Envelope::decode(
                 delivery.bytes(),
-                envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
             )
             .map_err(protocol)?;
             if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
@@ -1043,27 +1294,26 @@ impl Owner {
                 if streamed.packets_left == 0 {
                     return Ok(None);
                 }
-                for offset in 0..3 {
-                    let i = (streamed.poll_cursor + offset) % 3;
+                for offset in 0..streamed.owners.len() {
+                    let i = (streamed.poll_cursor + offset) % streamed.owners.len();
                     if let Some(emission) = streamed.owners[i]
                         .poll(now, available, &mut streamed.raw)
                         .map_err(protocol)?
                     {
-                        let stream = streams::Stream::ALL[i];
-                        let bytes = streams::Frame {
-                            stream,
-                            packet: &streamed.raw[..emission.bytes],
+                        let stream = streamed.stream(i)?;
+                        let limits = streams::Limits {
+                            max_packet_bytes: streamed.raw.len(),
+                        };
+                        let packet = &streamed.raw[..emission.bytes];
+                        let bytes = if streamed.lifecycle.is_some() {
+                            streams::v2::Frame { stream, packet }.encode(output, limits)
+                        } else {
+                            streams::Frame { stream, packet }.encode(output, limits)
                         }
-                        .encode(
-                            output,
-                            streams::Limits {
-                                max_packet_bytes: streamed.raw.len(),
-                            },
-                        )
                         .map_err(protocol)?;
                         streamed.packets_left -= 1;
                         streamed.bytes_left -= emission.wire_bytes;
-                        streamed.poll_cursor = (i + 1) % 3;
+                        streamed.poll_cursor = (i + 1) % streamed.owners.len();
                         return Ok(Some(delivery::Emission {
                             bytes,
                             wire_bytes: emission.wire_bytes,
@@ -1278,6 +1528,14 @@ impl Owner {
         if token.binding != self.binding {
             return Err(invalid("control token belongs to another session"));
         }
+        if let TokenKind::Streamed { stream, .. } = token.kind {
+            let Backend::Streamed(streamed) = &self.backend else {
+                return Err(invalid("streamed token on legacy owner"));
+            };
+            if index(stream) >= streamed.owners.len() {
+                return Err(invalid("token stream is not selected"));
+            }
+        }
         Ok(())
     }
 
@@ -1306,7 +1564,7 @@ impl Owner {
                     "original frozen control message deadline",
                 ));
             }
-            for i in 0..3 {
+            for i in 0..streamed.owners.len() {
                 streamed.owners[i].tick(now).map_err(protocol)?;
                 if let Some(held) = streamed.held[i].filter(|held| held.dispatched && !held.leased)
                     && let TokenKind::Streamed { ticket, .. } = held.incoming.token.kind
@@ -1369,6 +1627,13 @@ fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
             tag: sc::ProfileTag::SwiftPolicyV1,
             ..
         } => Ok(streams::Stream::Transaction),
+        sc::Body::ProfileControl {
+            tag: sc::ProfileTag::SessionRefreshV1,
+            bytes,
+        } => {
+            streams::v2::Lifecycle::decode(bytes, sc::MAX_LIFECYCLE_BYTES).map_err(protocol)?;
+            Ok(streams::Stream::Lifecycle)
+        }
         _ => Err(protocol(
             "selected Swift control backend does not dispatch this body",
         )),

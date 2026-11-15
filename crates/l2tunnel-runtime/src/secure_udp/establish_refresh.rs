@@ -120,7 +120,7 @@ pub async fn connect_observed(
 ) -> Result<Established, Error> {
     let mut report = Reporter::new(observe);
     let result = Box::pin(super::connect_inner(
-        socket,
+        SocketBacking::Udp(socket),
         config,
         identity,
         admission,
@@ -159,7 +159,7 @@ pub async fn accept_observed(
     let mut report = Reporter::new(observe);
     report.server(admission.statistics());
     let result = Box::pin(super::accept_inner(
-        socket,
+        SocketBacking::Udp(socket),
         identity,
         &mut admission.inner,
         deadline,

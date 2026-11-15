@@ -19,9 +19,22 @@ pub struct CommonTransactionContract {
 }
 
 impl Config {
+    pub(super) fn validate_rolling_work(&self) -> io::Result<()> {
+        if self.rolling_work.is_some_and(|work| {
+            [work.field, work.copies, work.metadata]
+                .into_iter()
+                .any(|value| !(1..=l2tunnel_fec::rolling::MAX_STEP_WORK).contains(&value))
+        }) {
+            return Err(invalid(
+                "rolling work requires positive bounded component caps",
+            ));
+        }
+        Ok(())
+    }
     /// Validate actual shared owners without consulting inactive Swift policies.
     /// Common C supplies native geometry, rates, burst, queues and record policy.
     pub fn validate_common_resources(&self, max_native: usize) -> io::Result<()> {
+        self.validate_rolling_work()?;
         if !(1..=65_535).contains(&max_native)
             || !(256..=65_535).contains(&self.path_mtu)
             || self.control_epoch.0 == 0
@@ -173,6 +186,14 @@ impl Config {
                 u64::from(entry.message_lifetime.subsec_nanos()),
             ] {
                 number(value);
+            }
+        }
+        // Absence preserves every existing resource digest byte. Explicit rolling
+        // service adds an authenticated extension including its scheduling geometry.
+        if let Some(work) = self.rolling_work {
+            hash.update(b"l2tunnel/common-resources/rolling-work/v1\0");
+            for value in [work.field, work.copies, work.metadata, 2, 2] {
+                hash.update(&(value as u64).to_be_bytes());
             }
         }
         let mut bytes = [0; 32];
@@ -335,6 +356,14 @@ impl CommonTransactionContract {
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);
             let view = value.descriptor().direction(sender);
+            if matches!(view.profile(), common::DirectionProfile::Rolling { .. })
+                && self.resources.rolling_work.is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "rolling catalog requires explicit bounded scheduler work",
+                ));
+            }
             if view.max_native() != old.max_native()
                 || view.common().traffic().layer != old.common().traffic().layer
             {
@@ -457,9 +486,9 @@ pub(super) fn maximum_body(view: common::DirectionView<'_>) -> io::Result<usize>
         common::DirectionProfile::Packed(config) => {
             config.base.recovery.maximum_packet_bytes().map_err(invalid)
         }
-        common::DirectionProfile::Rolling { .. } => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "rolling runtime requires explicit bounded GF service and carrier-output confirmation",
-        )),
+        common::DirectionProfile::Rolling { config, .. } => Ok(config
+            .maximum_packet_bytes()
+            .map_err(invalid)?
+            .max(l2tunnel_fec::rolling::scheduler::FEEDBACK_BYTES)),
     }
 }

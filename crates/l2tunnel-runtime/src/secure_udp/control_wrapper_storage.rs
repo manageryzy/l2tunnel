@@ -1,6 +1,9 @@
 //! Checked provisioning of the actual Streamed cell, metadata and scratch.
 
-use super::{Outgoing, Settings, Streamed, delivery, io, raw_packet_bytes, wrapper_layout};
+use super::{
+    Outgoing, Settings, SettingsV2, Streamed, delivery, io, messages, raw_packet_bytes,
+    wrapper_layout,
+};
 use std::{
     alloc::Layout,
     fmt,
@@ -18,6 +21,7 @@ pub(crate) struct Limits {
 /// Exact immutable wrapper geometry, without authentication or allocated backing.
 pub(crate) struct Plan {
     selected: Settings,
+    lifecycle: Option<messages::Settings>,
     base: delivery::Settings,
     envelope: usize,
     raw: usize,
@@ -69,24 +73,44 @@ impl From<Error> for io::Error {
 impl Plan {
     /// Compute every wrapper layout without constructing a control/message owner.
     pub(crate) fn new(selected: Settings, base: delivery::Settings) -> io::Result<Self> {
+        Self::for_selection(selected, None, base)
+    }
+
+    /// Include all four actual owners and outgoing metadata for explicit v2.
+    #[allow(dead_code)] // Actual v2 provisioning is protocol-tested; selected fresh-DH Driver follows separately.
+    pub(crate) fn new_v2(selected: SettingsV2, base: delivery::Settings) -> io::Result<Self> {
+        Self::for_selection(selected.first_three(), Some(selected.streams[3]), base)
+    }
+
+    fn for_selection(
+        selected: Settings,
+        lifecycle: Option<messages::Settings>,
+        base: delivery::Settings,
+    ) -> io::Result<Self> {
         let envelope = selected
             .streams
             .iter()
+            .chain(lifecycle.iter())
             .map(|settings| settings.max_message_bytes)
             .max()
             .ok_or(Error::Layout)?;
         let raw = raw_packet_bytes(base).map_err(|_| Error::Layout)?;
         Layout::array::<Streamed>(1).map_err(|_| Error::Layout)?;
         let capacity_bytes = wrapper_layout(
-            selected
-                .streams
-                .map(|settings| settings.max_outbound_messages),
+            [
+                selected.streams[0].max_outbound_messages,
+                selected.streams[1].max_outbound_messages,
+                selected.streams[2].max_outbound_messages,
+                lifecycle.map_or(0, |settings| settings.max_outbound_messages),
+            ],
             envelope,
             raw,
+            if lifecycle.is_some() { 4 } else { 0 },
         )
         .map_err(|_| Error::Layout)?;
         Ok(Self {
             selected,
+            lifecycle,
             base,
             envelope,
             raw,
@@ -105,7 +129,17 @@ impl Plan {
         base: &delivery::Settings,
         limits: Limits,
     ) -> io::Result<()> {
-        if self.selected != *selected || self.base != *base {
+        self.check_selection(selected, None, base, limits)
+    }
+
+    pub(super) fn check_selection(
+        &self,
+        selected: &Settings,
+        lifecycle: Option<messages::Settings>,
+        base: &delivery::Settings,
+        limits: Limits,
+    ) -> io::Result<()> {
+        if self.selected != *selected || self.lifecycle != lifecycle || self.base != *base {
             return Err(Error::PlanMismatch.into());
         }
         if self.capacity_bytes > limits.capacity_bytes {
@@ -122,14 +156,18 @@ impl Plan {
         &self,
         limits: Limits,
         allocation: &mut Allocation,
-        build: impl FnOnce([Vec<Outgoing>; 3], Vec<u8>, Vec<u8>) -> io::Result<Streamed>,
+        build: impl FnOnce([Vec<Outgoing>; 4], Vec<u8>, Vec<u8>) -> io::Result<Streamed>,
     ) -> io::Result<StreamedStorage> {
-        self.check(&self.selected, &self.base, limits)?;
+        self.check_selection(&self.selected, self.lifecycle, &self.base, limits)?;
         let mut construction = Construction::new(allocation);
         construction.cell = allocation.vec(Slot::Cell, 1)?;
         for (i, settings) in self.selected.streams.iter().enumerate() {
             construction.outgoing[i] =
                 allocation.vec(Slot::Outgoing(i), settings.max_outbound_messages)?;
+        }
+        if let Some(settings) = self.lifecycle {
+            construction.outgoing[3] =
+                allocation.vec(Slot::Outgoing(3), settings.max_outbound_messages)?;
         }
         construction.envelope = allocation.vec(Slot::Envelope, self.envelope)?;
         construction.envelope.resize(self.envelope, 0);
@@ -157,7 +195,15 @@ impl Plan {
                 Slot::Cell,
                 &reserved.values,
             ));
+            if let super::StreamOwners::Four(owners) = &value.owners {
+                trace
+                    .borrow_mut()
+                    .record(Event::for_vec(Kind::Published, Slot::Owners, owners));
+            }
             for (i, values) in value.outgoing.iter().enumerate() {
+                if values.capacity() == 0 {
+                    continue;
+                }
                 trace.borrow_mut().record(Event::for_vec(
                     Kind::Published,
                     Slot::Outgoing(i),
@@ -196,9 +242,11 @@ impl Reserved {
             value.outgoing.each_ref().map(|values| values.capacity()),
             value.envelope.capacity(),
             value.raw.capacity(),
+            value.owners.heap_capacity(),
         )
         .map_err(|_| Error::Layout)?;
         let allocations = 1
+            + usize::from(value.owners.heap_capacity() != 0)
             + value
                 .outgoing
                 .iter()
@@ -243,6 +291,7 @@ impl DerefMut for StreamedStorage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Slot {
     Cell,
+    Owners,
     Outgoing(usize),
     Envelope,
     Raw,
@@ -260,7 +309,7 @@ pub(super) struct Allocation {
     pub(super) owner_observer: Option<Box<dyn FnMut(super::StreamConstructionDrop)>>,
 }
 impl Allocation {
-    fn vec<T>(&mut self, _slot: Slot, count: usize) -> io::Result<Vec<T>> {
+    pub(super) fn vec<T>(&mut self, _slot: Slot, count: usize) -> io::Result<Vec<T>> {
         Layout::array::<T>(count).map_err(|_| Error::Layout)?;
         #[cfg(test)]
         {
@@ -301,7 +350,7 @@ impl Allocation {
 
 struct Construction {
     cell: Vec<Streamed>,
-    outgoing: [Vec<Outgoing>; 3],
+    outgoing: [Vec<Outgoing>; 4],
     envelope: Vec<u8>,
     raw: Vec<u8>,
     #[cfg(test)]

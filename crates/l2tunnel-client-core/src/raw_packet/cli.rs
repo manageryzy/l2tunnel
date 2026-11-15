@@ -152,6 +152,7 @@ pub(crate) fn response(
             #[cfg(unix)]
             secure_udp: None,
             transaction: None,
+            common: None,
         }),
     }
 }

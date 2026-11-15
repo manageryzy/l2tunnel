@@ -335,6 +335,7 @@ where
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.collect_native(now)?;
             driver.progress(now)?;
+            driver.service_common_rolling(now)?;
             let completed=driver.report_transaction_completion(
                 ||clock(origin,sample()),
                 |driver,at|observe(driver,at,true),
@@ -661,6 +662,10 @@ pub struct Config {
     pub wire: WireBudget,
     /// Socket/native work bounds.
     pub work: WorkBudget,
+    /// Explicit per-directional-scheduler rolling work cap per sole-loop turn.
+    /// Two retained generations can service at most four directional schedulers.
+    /// None preserves legacy policy and cannot select a rolling record catalog.
+    pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
     /// Independent retained native output bounds.
     pub native: NativeBudget,
     /// Explicit active lease and authenticated round-trip timers.
@@ -671,6 +676,12 @@ pub struct Config {
 impl Config {
     /// Validate finite scalar/algorithm bounds without network, keys or clocks.
     pub fn validate(&self) -> io::Result<()> {
+        self.validate_rolling_work()?;
+        if self.rolling_work.is_some() {
+            return Err(invalid(
+                "rolling work is selected only by the common record contract",
+            ));
+        }
         self.send.validate().map_err(invalid)?;
         self.receive.validate().map_err(invalid)?;
         if !(256..=65_535).contains(&self.path_mtu)
@@ -2022,7 +2033,7 @@ impl Driver {
                 .chain(
                     self.common
                         .as_ref()
-                        .and_then(|r| r.sealed)
+                        .and_then(|r| r.sealed.as_ref())
                         .map(|pending| duration(pending.deadline)),
                 )
                 .min(),

@@ -48,6 +48,7 @@ fn legacy_request_and_optional_free_response_bytes_remain_literal() -> Result<()
             #[cfg(unix)]
             secure_udp: None,
             transaction: None,
+            common: None,
         }),
     };
     let expected = r#"{"version":1,"ok":true,"code":"ok","state":{"epoch":2,"phase":"idle","compression":"lz4"}}"#;
@@ -223,6 +224,7 @@ fn complete_version_two_secure_udp_reply_bytes_remain_literal() -> Result<(), se
             swift: None,
             secure_udp: Some(status),
             transaction: None,
+            common: None,
         }),
     };
     let expected = r#"{"version":2,"ok":true,"code":"ok","state":{"epoch":9,"phase":"forwarding","compression":"off","secure_udp":{"generation":7,"carrier":"quic-like","algorithm":"swift","protection":"chacha20-poly1305","requested":{"path_mtu":1500,"forward_kbit":8000,"reverse_kbit":4000,"channels":2,"window":7,"repair_permille":125},"effective":{"path_mtu":1600,"forward_kbit":9000,"reverse_kbit":3000,"channels":3,"window":11,"repair_permille":250},"maximum_path_mtu":9000,"running":true,"session":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"transcript":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"configuration":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"outer":[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],"member":[5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5],"initiator_noise":[6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"responder_noise":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"local":"127.0.0.1:41321","peer":"127.0.0.1:41322","policy_epoch":9,"pending_epoch":10,"elapsed_micros":12345,"wire_packets":11,"wire_bytes":1200,"socket_accepted_packets":10,"socket_accepted_ip_bytes":1100,"socket_drops":1,"socket_receive_errors":2,"received_packets":12,"rejected_packets":3,"replay_rejections":4,"native_read":13,"native_written":14,"native_oversize":5,"native_backpressure_drops":6,"native_pending_packets":2,"native_pending_bytes":1024,"swift_unconfirmed":7,"control_send_records":3,"control_send_bytes":768,"control_receive_records":2,"control_receive_bytes":512,"ping":27,"ping_deadline_micros":20000,"last_verified_micros":12000,"last_pong_micros":11000,"user_number":31,"control_number":32,"user_generation":1,"control_generation":2,"terminal":null,"policy_change":true,"reconnect":true,"retained_state_recovery":false,"cross_profile_switching":false,"fresh_rekey":false}}}"#;

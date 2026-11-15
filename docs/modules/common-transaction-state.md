@@ -167,9 +167,10 @@ scope, generation, packet number, original cap and one wire debit across socket
 WouldBlock, independently of existing fixed Control output.
 
 Existing Swift64 record DTOs and strict local APIv3 remain Swift typed. No Common
-1304-byte value is truncated into their304-byte schema. Existing local IPC/CLI
-explicitly refuses the Common backend as `unsupported_backend`; full portable
-Common status/commands and CLI selection remain required work. Complete resource
+1304-byte value is truncated into their304-byte schema. The subsequent [Common APIv4](common-client-api.md) carries complete status,
+catalog and keyed operations through the same actual Handle/Run, with finite
+original-UDP/local-socket cross-profile evidence. CLI selection uses the same
+Prepared factories; external CLI/device qualification remains open. Complete resource
 preallocation is observable as false: actual Bank/native/control reservations and
 the external scalar subtotal do not prove universal nested allocator admission.
 Fresh-DH runtime integration, retained-state recovery, other carriers and full

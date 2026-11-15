@@ -11,6 +11,14 @@ use tokio::net::{UnixListener, UnixStream};
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 8192;
+const COMMON_RESPONSE_LIMIT: usize = 32768;
+fn response_limit(version: u16) -> usize {
+    if version == COMMON_VERSION {
+        COMMON_RESPONSE_LIMIT
+    } else {
+        RESPONSE_LIMIT
+    }
+}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -97,11 +105,12 @@ impl Server {
                 Ok(Ok(request)) if supported_version(request.version) => request,
                 _ => continue,
             };
+            let limit = response_limit(request.version);
             let response = handler(request).await;
             // A disconnected or non-reading client cannot terminate/block the API.
             let _reply = tokio::time::timeout(
                 Duration::from_secs(5),
-                write_json(&mut stream, &response, RESPONSE_LIMIT),
+                write_json(&mut stream, &response, limit),
             )
             .await;
         }
@@ -133,7 +142,7 @@ pub async fn request(path: impl AsRef<Path>, request: &Request) -> io::Result<Re
             ));
         }
         write_json(&mut stream, request, REQUEST_LIMIT).await?;
-        let response: Response = read_json(&mut stream, RESPONSE_LIMIT).await?;
+        let response: Response = read_json(&mut stream, response_limit(request.version)).await?;
         if response.version != request.version {
             return Err(invalid("unsupported local API response version"));
         }

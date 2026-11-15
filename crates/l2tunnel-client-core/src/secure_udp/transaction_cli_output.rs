@@ -30,7 +30,7 @@ impl Write for Count {
         Ok(())
     }
 }
-fn bounded(value: Value) -> io::Result<Value> {
+pub(super) fn bounded(value: Value) -> io::Result<Value> {
     serde_json::to_writer(&mut Count(0), &value)
         .map_err(|_| invalid("generic CLI output exceeds its value bound"))?;
     Ok(value)

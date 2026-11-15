@@ -7,9 +7,14 @@ pub const VERSION: u16 = 1;
 pub const SECURE_UDP_VERSION: u16 = 2;
 /// Explicit complete-configuration backend; never an automatic v1/v2 downgrade.
 pub const TRANSACTION_VERSION: u16 = 3;
+/// Explicit full Common configurations, with independently bounded catalog pages.
+pub const COMMON_VERSION: u16 = 4;
 /// Versions understood by the bounded local transport; backends gate actions.
 pub fn supported_version(version: u16) -> bool {
-    matches!(version, VERSION | SECURE_UDP_VERSION | TRANSACTION_VERSION)
+    matches!(
+        version,
+        VERSION | SECURE_UDP_VERSION | TRANSACTION_VERSION | COMMON_VERSION
+    )
 }
 /// Supported local policy changes; peer authorization still applies separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,6 +57,24 @@ pub enum Action {
         /// Exact checked canonical bytes, without a partial-policy conversion.
         configuration: crate::secure_udp::transaction_status::CanonicalConfiguration,
     },
+    /// Negotiate one full Common configuration through the existing service actor.
+    SwitchCommonConfiguration {
+        /// Exact complete anchored canonical bytes.
+        configuration: crate::secure_udp::common_status::CanonicalConfiguration,
+        /// Explicit nonzero service idempotency key, retained across retries.
+        request_key: u64,
+    },
+    /// Read one bounded page without consuming a service operation key.
+    CommonCatalog {
+        /// Exact service generation, preventing cross-reconnect page mixing.
+        generation: u64,
+        /// Exact authenticated complete catalog root.
+        catalog: [u8; 32],
+        /// First canonical catalog index.
+        offset: u16,
+        /// Number of members, from one through four.
+        limit: u16,
+    },
     /// Request an exact policy from the session's authenticated active catalog.
     SwitchActivePolicy {
         /// Complete channel/weight policy; partial local mutations are not supported.
@@ -83,12 +106,34 @@ pub struct SwiftChange {
 }
 /// One finite, versioned local request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RequestWire")]
 pub struct Request {
     /// Must equal [`VERSION`].
     pub version: u16,
     /// Requested operation.
     pub action: Action,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestWire {
+    version: u16,
+    action: Action,
+}
+impl TryFrom<RequestWire> for Request {
+    type Error = &'static str;
+    fn try_from(value: RequestWire) -> Result<Self, Self::Error> {
+        if matches!(
+            value.action,
+            Action::SwitchCommonConfiguration { .. } | Action::CommonCatalog { .. }
+        ) && value.version != COMMON_VERSION
+        {
+            return Err("Common actions require explicit API version4");
+        }
+        Ok(Self {
+            version: value.version,
+            action: value.action,
+        })
+    }
 }
 /// Non-secret service state shared by CLI and future GUI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +171,20 @@ pub struct Snapshot {
     /// Present only for explicit version3 complete-configuration observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction: Option<crate::secure_udp::transaction_status::Status>,
+    /// Present only for explicit APIv4 complete mixed-profile observations.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_common"
+    )]
+    pub common: Option<crate::secure_udp::common_status::Status>,
+}
+fn deserialize_common<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::Status>, D::Error> {
+    // A present Common field is a real observation. Reject null, so older
+    // version parsers do not silently accept a formerly unknown field.
+    crate::secure_udp::common_status::Status::deserialize(deserializer).map(Some)
 }
 /// Immutable authenticated proxy configuration and observed local lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -217,7 +276,7 @@ pub struct ActiveSnapshot {
 }
 /// Structured response, including the actual observed state on rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ResponseWire")]
 pub struct Response {
     /// Response schema version.
     pub version: u16,
@@ -227,6 +286,54 @@ pub struct Response {
     pub code: String,
     /// Current observed state, when available.
     pub state: Option<Snapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseWire {
+    version: u16,
+    ok: bool,
+    code: String,
+    state: Option<Snapshot>,
+}
+impl TryFrom<ResponseWire> for Response {
+    type Error = &'static str;
+    fn try_from(value: ResponseWire) -> Result<Self, Self::Error> {
+        if value.version != COMMON_VERSION
+            && value
+                .state
+                .as_ref()
+                .is_some_and(|state| state.common.is_some())
+        {
+            return Err("Common observations require explicit API version4");
+        }
+        if value.version == COMMON_VERSION
+            && value.state.as_ref().is_some_and(|state| {
+                let old = state.active.is_some()
+                    || state.proxy.is_some()
+                    || state.openvpn_drain.is_some()
+                    || state.raw_packet.is_some()
+                    || state.rolling.is_some()
+                    || state.transaction.is_some();
+                #[cfg(unix)]
+                {
+                    old || state.swift.is_some() || state.secure_udp.is_some()
+                }
+                #[cfg(not(unix))]
+                {
+                    old
+                }
+            })
+        {
+            return Err("APIv4 cannot project a legacy backend");
+        }
+        Ok(Self {
+            version: value.version,
+            ok: value.ok,
+            code: value.code,
+            state: value.state,
+        })
+    }
 }
 
 #[cfg(test)]

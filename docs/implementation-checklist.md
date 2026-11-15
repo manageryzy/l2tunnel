@@ -67,6 +67,18 @@ packages. The failed batch remains failed. Actual Common rolling work/completion
 timed-v2/fresh-DH Lifecycle installation and OpenVPN complete bootstrap/Parts/
 Driver/service selection remain required, as do all unchanged full parent gates.
 
+The next parallel implementation adds the
+[selected Common rolling service](modules/common-rolling-runtime.md),
+[actual OpenVPN complete inner factory](modules/openvpn-common-factory.md),
+[explicit Lifecycle control](modules/lifecycle-control.md) and
+[Common v4 shared local API/CLI](modules/common-client-api.md). The
+[scoped checkpoint](../work/parallel-features-20261115/parallel-wave3-scoped-validation.json)
+records60 distinct positive cases and four-package strict checks, retaining the
+failed51/55 batch and its exact narrow repair. Actual selected-backend setup
+dispatch removes unused backend poll scratch while reusing the existing one
+setup box; standard-stack service and APIv4 cases pass. These leaves do not close full lifecycle,
+carrier Driver/service, complete resources, mode parity or native/platform gates.
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),

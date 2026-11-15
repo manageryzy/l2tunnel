@@ -42,6 +42,7 @@ fn response() -> Response {
             #[cfg(unix)]
             secure_udp: None,
             transaction: None,
+            common: None,
         }),
     }
 }
@@ -193,7 +194,7 @@ async fn strict_v3_real_socket_frames_have_zero_handler_effects_and_keep_listene
         br#"{"version":3,"action":{"command":"switch_swift_configuration","configuration":""}}"#.to_vec(),
         br#"{"version":3,"action":{"command":"switch_swift_configuration","configuration":"bad","extra":true}}"#.to_vec(),
         br#"{"version":3,"action":{"command":"status"}}{}"#.to_vec(),
-        br#"{"version":4,"action":{"command":"reconnect"}}"#.to_vec(),
+        br#"{"version":5,"action":{"command":"reconnect"}}"#.to_vec(),
         vec![0xff],
     ];
     malformed.push(format!(r#"{{"version":3,"action":{{"command":"switch_swift_configuration","configuration":"{}","configuration":"{}"}}}}"#,

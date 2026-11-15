@@ -170,6 +170,7 @@ impl Endpoint {
         if let Err(error) = self.records.commit_delivery(receiver_tick(now)) {
             return self.fail(Error::Receiver(error));
         }
+        self.receive_progress = true;
         Ok(())
     }
 }

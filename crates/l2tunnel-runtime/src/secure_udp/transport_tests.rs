@@ -149,6 +149,7 @@ fn config(kind: cover::Appearance) -> Config {
             native_read_batch: 16,
             native_write_batch: 16,
         },
+        rolling_work: None,
         native: NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,

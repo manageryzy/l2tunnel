@@ -255,11 +255,15 @@ impl Owner {
         .into_leased(control_scope, data_scope)
     }
 
-    fn into_leased(mut self, control_scope: sc::Scope, data_scope: sc::Scope) -> io::Result<Self> {
+    pub(super) fn into_leased(
+        mut self,
+        control_scope: sc::Scope,
+        data_scope: sc::Scope,
+    ) -> io::Result<Self> {
         let Backend::Streamed(streamed) = &mut self.backend else {
             return Err(invalid("leased Control requires streamed owners"));
         };
-        streamed.gate = streams::gate::Gate::new_transaction_bound(streams::gate::GateSettings {
+        let settings = streams::gate::GateSettings {
             binding: sc::PeerBinding {
                 session: self.binding.session,
                 remote_role: opposite(self.binding.local_role),
@@ -269,15 +273,24 @@ impl Owner {
             control: control_scope,
             active: policy(data_scope),
             limits: envelope_limits(streamed.envelope.len())?,
-        })
+        };
+        streamed.gate = if streamed.lifecycle.is_some() {
+            streams::gate::Gate::new_v2_transaction_bound(settings)
+        } else {
+            streams::gate::Gate::new_transaction_bound(settings)
+        }
         .map_err(invalid)?;
         streamed.leased = true;
         Ok(self)
     }
 
     pub(crate) fn transaction_binding(&self) -> io::Result<delivery::Binding> {
-        self.leased()?;
-        streams::delivery_binding(self.binding, streams::Stream::Transaction).map_err(invalid)
+        let streamed = self.leased()?;
+        stream_binding(
+            self.binding,
+            streams::Stream::Transaction,
+            streamed.version(),
+        )
     }
 
     /// Preview actual pending bytes without observing time or consuming custody.
@@ -311,7 +324,7 @@ impl Owner {
                 "original frozen control message deadline",
             ));
         }
-        for owner in &streamed.owners {
+        for owner in streamed.owners.iter() {
             owner.check_time(now).map_err(protocol)?;
         }
         let i = index(streams::Stream::Transaction);
@@ -707,7 +720,10 @@ impl Owner {
 pub(super) fn incoming_stream(body: sc::Body<'_>, leased: bool) -> io::Result<streams::Stream> {
     match body {
         sc::Body::Management(_) if leased => Ok(streams::Stream::Transaction),
-        sc::Body::ProfileControl { .. } if leased => Err(protocol(
+        sc::Body::ProfileControl {
+            tag: sc::ProfileTag::SwiftPolicyV1,
+            ..
+        } if leased => Err(protocol(
             "SwiftPolicyV1 is not the leased Management contract",
         )),
         _ => outgoing_stream(body),

@@ -10,7 +10,8 @@ use std::fmt;
 
 use super::Stream;
 use crate::session_control::{
-    Body, Envelope, Limits, NativeReceipt, PeerBinding, ReceiptPolicy, RecoveryTag, Scope,
+    Body, Envelope, Limits, NativeReceipt, PeerBinding, ProfileTag, ReceiptPolicy, RecoveryTag,
+    Scope,
 };
 use crate::transaction as tx;
 use crate::{Ingress, PacketNumber, ReplayWindow};
@@ -74,8 +75,9 @@ pub struct Gate {
     settings: GateSettings,
     active: DataPolicy,
     draining: Option<DataPolicy>,
-    replay: [ReplayWindow; 3],
+    replay: [ReplayWindow; 4],
     transaction_bound: bool,
+    lifecycle: bool,
 }
 
 impl Gate {
@@ -98,8 +100,9 @@ impl Gate {
             active: settings.active,
             settings,
             draining: None,
-            replay: [ReplayWindow::default(); 3],
+            replay: [ReplayWindow::default(); 4],
             transaction_bound: false,
+            lifecycle: false,
         })
     }
 
@@ -111,8 +114,25 @@ impl Gate {
         Ok(gate)
     }
 
+    /// Select the authenticated v2 four-stream contract; never inferred from input.
+    pub fn new_v2(settings: GateSettings) -> Result<Self, Error> {
+        let mut gate = Self::new(settings)?;
+        gate.lifecycle = true;
+        Ok(gate)
+    }
+
+    /// Select v2 Lifecycle alongside the unchanged leased transaction bridge.
+    pub fn new_v2_transaction_bound(settings: GateSettings) -> Result<Self, Error> {
+        let mut gate = Self::new_v2(settings)?;
+        gate.transaction_bound = true;
+        Ok(gate)
+    }
+
     /// Highest admitted envelope identity in this stream only.
     pub fn highest_packet(&self, stream: Stream) -> Option<PacketNumber> {
+        if stream == Stream::Lifecycle && !self.lifecycle {
+            return None;
+        }
         self.replay[stream.index()].highest
     }
 
@@ -163,8 +183,28 @@ impl Gate {
                     return Err(Error::Scope);
                 }
             }
-            (Stream::Transaction, Body::Management(_) | Body::ProfileControl { .. }) => {
+            (
+                Stream::Transaction,
+                Body::Management(_)
+                | Body::ProfileControl {
+                    tag: ProfileTag::SwiftPolicyV1,
+                    ..
+                },
+            ) => {
                 self.policy(actual.scope)?;
+            }
+            (
+                Stream::Lifecycle,
+                Body::ProfileControl {
+                    tag: ProfileTag::SessionRefreshV1,
+                    bytes,
+                },
+            ) if self.lifecycle => {
+                if actual.scope != self.settings.control {
+                    return Err(Error::Scope);
+                }
+                super::v2::Lifecycle::decode(bytes, crate::session_control::MAX_LIFECYCLE_BYTES)
+                    .map_err(|_| Error::Kind)?;
             }
             (Stream::DataFeedback, Body::RecoveryFeedback { lane, tag, bytes }) => {
                 let policy = self.policy(actual.scope)?;
@@ -308,6 +348,9 @@ impl Gate {
         stream: Stream,
         packet: PacketNumber,
     ) -> Result<ReplayWindow, Error> {
+        if stream == Stream::Lifecycle && !self.lifecycle {
+            return Err(Error::Kind);
+        }
         let replay = self.replay[stream.index()];
         let expected = replay
             .highest

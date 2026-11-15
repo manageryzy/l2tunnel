@@ -59,7 +59,16 @@ fn contracts_with_catalog(
     catalog: Catalog,
     work: usize,
 ) -> Result<[CommonTransactionContract; 2]> {
+    contracts_with_catalog_and_work(kind, catalog, work, None)
+}
+fn contracts_with_catalog_and_work(
+    kind: cover::Appearance,
+    catalog: Catalog,
+    work: usize,
+    rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+) -> Result<[CommonTransactionContract; 2]> {
     let mut base = config(kind);
+    base.rolling_work = rolling_work;
     base.work.native_write_batch = work;
     base.report_interval = None;
     base.lifetime.lease = Duration::from_secs(60);
@@ -223,6 +232,7 @@ impl Fixture {
             endpoint.driver.admit_common(|| Ok(duration(now)))?;
             endpoint.driver.collect_native(now)?;
             endpoint.driver.progress_common(now)?;
+            endpoint.driver.service_common_rolling(now)?;
             endpoint.driver.report_transaction_completion(
                 || Ok(now),
                 |driver, at| {
@@ -574,7 +584,18 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                     .common
                     .as_ref()
                     .ok_or("common runtime missing")?;
-                let pending = runtime.sealed.ok_or("real Common seal not retained")?;
+                let retained = runtime
+                    .sealed
+                    .as_ref()
+                    .ok_or("real Common seal not retained")?;
+                assert!(retained.carrier.is_none());
+                let pending = common::PendingWire {
+                    scope: retained.scope,
+                    sealed: retained.sealed,
+                    cost: retained.cost,
+                    deadline: retained.deadline,
+                    carrier: None,
+                };
                 let bytes = runtime.wire[..pending.sealed.bytes].to_vec();
                 let next = endpoint.driver.records.next_number(Class::User);
                 assert_eq!(
@@ -624,8 +645,9 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                         .common
                         .as_ref()
                         .ok_or("common missing")?
-                        .sealed,
-                    Some(pending)
+                        .sealed
+                        .as_ref(),
+                    Some(&pending)
                 );
                 assert_eq!(
                     &endpoint
@@ -917,3 +939,6 @@ fn common_original_operation_cap_guards_physical_write_and_preserves_late_succes
 
 #[path = "transport_common_feedback_tests.rs"]
 mod feedback;
+
+#[path = "transport_common_rolling_tests.rs"]
+mod rolling;

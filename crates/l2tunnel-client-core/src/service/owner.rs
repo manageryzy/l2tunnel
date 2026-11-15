@@ -101,75 +101,71 @@ fn check(deadline: Instant) -> io::Result<()> {
         Ok(())
     }
 }
-pub(super) async fn establish(
+// Keep the existing one setup allocation at the selected backend boundary.
+// A single async dispatch union otherwise retains the largest unused backend's
+// poll scratch while Common eagerly constructs its actual reserved Driver.
+type SetupFuture = Pin<Box<dyn Future<Output = io::Result<Active>> + Send>>;
+
+fn begin_setup(shared: &Shared, accepted: Accepted) -> io::Result<Instant> {
+    let deadline = accepted.deadline.ok_or_else(expired)?;
+    check(deadline)?;
+    shared.lock().snapshot.phase = Phase::Authenticating;
+    shared.changed();
+    Ok(deadline)
+}
+
+pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted) -> SetupFuture {
+    // Every selected future performs its original cap/phase transition on first
+    // poll. Selection itself starts no I/O, attachment or authentication work.
+    macro_rules! selected {
+        ($deadline:ident, $setup:expr) => {
+            Box::pin(async move {
+                let $deadline = begin_setup(&shared, accepted)?;
+                let result = tokio::time::timeout_at($deadline, $setup)
+                    .await
+                    .map_err(|_| expired())?;
+                check($deadline)?;
+                result
+            }) as SetupFuture
+        };
+    }
+    match plan.data.transport.clone() {
+        Transport::Managed(options) => Box::pin(establish_managed(shared, plan, accepted, options)),
+        Transport::UdpFrame { settings, delivery } => selected!(
+            deadline,
+            establish_udp(&shared, &plan, accepted, deadline, settings, delivery)
+        ),
+        #[cfg(unix)]
+        Transport::Swift(settings) => selected!(
+            deadline,
+            establish_swift(&shared, &plan, accepted, deadline, settings)
+        ),
+        #[cfg(unix)]
+        Transport::SecureUdpSwift(profile) => selected!(
+            deadline,
+            establish_secure_udp(&shared, &plan, accepted, deadline, *profile)
+        ),
+        #[cfg(unix)]
+        Transport::SecureUdpTransaction(profile) => selected!(
+            deadline,
+            establish_secure_udp_transaction(&shared, &plan, accepted, deadline, profile)
+        ),
+        #[cfg(unix)]
+        Transport::SecureUdpCommon(profile) => selected!(
+            deadline,
+            common::establish(&shared, &plan, accepted, deadline, profile)
+        ),
+    }
+}
+
+async fn establish_managed(
     shared: Arc<Shared>,
     plan: Prepared,
     accepted: Accepted,
+    options: Options,
 ) -> io::Result<Active> {
-    let deadline = accepted.deadline.ok_or_else(expired)?;
-    check(deadline)?;
+    let deadline = begin_setup(&shared, accepted)?;
     let config = plan.data.connection;
-    shared.lock().snapshot.phase = Phase::Authenticating;
-    shared.changed();
-    let options = match &plan.data.transport {
-        Transport::Managed(options) => *options,
-        Transport::UdpFrame { settings, delivery } => {
-            let setup = establish_udp(&shared, &plan, accepted, deadline, *settings, *delivery);
-            let result = tokio::time::timeout_at(deadline, setup)
-                .await
-                .map_err(|_| expired())?;
-            check(deadline)?;
-            return result;
-        }
-        #[cfg(unix)]
-        Transport::Swift(settings) => {
-            let setup = establish_swift(&shared, &plan, accepted, deadline, *settings);
-            let result = tokio::time::timeout_at(deadline, setup)
-                .await
-                .map_err(|_| expired())?;
-            check(deadline)?;
-            return result;
-        }
-        #[cfg(unix)]
-        Transport::SecureUdpSwift(profile) => {
-            let result = tokio::time::timeout_at(
-                deadline,
-                establish_secure_udp(&shared, &plan, accepted, deadline, **profile),
-            )
-            .await
-            .map_err(|_| expired())?;
-            check(deadline)?;
-            return result;
-        }
-        #[cfg(unix)]
-        Transport::SecureUdpTransaction(profile) => {
-            let result = tokio::time::timeout_at(
-                deadline,
-                establish_secure_udp_transaction(
-                    &shared,
-                    &plan,
-                    accepted,
-                    deadline,
-                    profile.clone(),
-                ),
-            )
-            .await
-            .map_err(|_| expired())?;
-            check(deadline)?;
-            return result;
-        }
-        #[cfg(unix)]
-        Transport::SecureUdpCommon(profile) => {
-            let result = tokio::time::timeout_at(
-                deadline,
-                common::establish(&shared, &plan, accepted, deadline, profile.clone()),
-            )
-            .await
-            .map_err(|_| expired())?;
-            check(deadline)?;
-            return result;
-        }
-    };
     let setup = async {
         let (link, role) = match &plan.data.endpoint {
             Endpoint::Client(c) => {
@@ -1110,7 +1106,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     if active.is_some() {
                         stopped(&shared, &mut active, Terminal::Aborted);
                     }
-                    let mut setup = Box::pin(establish(shared.clone(), plan, accepted));
+                    let mut setup = establish(shared.clone(), plan, accepted);
                     let result = loop {
                         if cancelled(&shared, accepted.operation) {
                             break None;

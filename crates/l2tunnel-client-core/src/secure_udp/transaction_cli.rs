@@ -25,30 +25,7 @@ pub(super) struct Plan {
 
 impl Plan {
     pub(super) fn read(path: &Path) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-            )
-            .open(path)
-            .map_err(|error| io::Error::new(error.kind(), "cannot open transaction plan"))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| io::Error::new(error.kind(), "cannot inspect transaction plan"))?;
-        if !metadata.is_file() {
-            return Err(invalid("transaction plan must be a regular file"));
-        }
-        if metadata.len() > 256 * 1024 {
-            return Err(invalid("transaction plan exceeds file bound"));
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(MAX_PLAN_BYTES + 1)
-            .map_err(|_| invalid("transaction plan buffer allocation failed"))?;
-        file.take(256 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| io::Error::new(error.kind(), "cannot read transaction plan"))?;
-        Self::decode(&bytes)
+        Self::decode(&read_document(path)?)
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Self> {
@@ -115,6 +92,32 @@ impl Plan {
         )
         .map_err(|_| invalid("transaction plan does not match runtime or trust contract"))
     }
+}
+
+/// Read the same finite regular-file plan input without following symlinks.
+pub(super) fn read_document(path: &Path) -> io::Result<Vec<u8>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)
+        .map_err(|error| io::Error::new(error.kind(), "cannot open transaction plan"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io::Error::new(error.kind(), "cannot inspect transaction plan"))?;
+    if !metadata.is_file() {
+        return Err(invalid("transaction plan must be a regular file"));
+    }
+    if metadata.len() > 256 * 1024 {
+        return Err(invalid("transaction plan exceeds file bound"));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(MAX_PLAN_BYTES + 1)
+        .map_err(|_| invalid("transaction plan buffer allocation failed"))?;
+    file.take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io::Error::new(error.kind(), "cannot read transaction plan"))?;
+    Ok(bytes)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -258,7 +261,7 @@ impl DirectionDto {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransactionDto {
+pub(super) struct TransactionDto {
     retry_ms: u64,
     phase_timeout_ms: u64,
     reconcile_timeout_ms: u64,
@@ -266,7 +269,7 @@ struct TransactionDto {
     retained_bytes: Size,
 }
 impl TransactionDto {
-    fn build(self) -> Parameters {
+    pub(super) fn build(self) -> Parameters {
         Parameters {
             protocol: transaction::Settings {
                 retry_ms: self.retry_ms,
@@ -281,7 +284,7 @@ impl TransactionDto {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeDto {
+pub(super) struct RuntimeDto {
     control_epoch: u64,
     data_epoch: u64,
     legacy_policy: LegacyPolicyDto,
@@ -301,6 +304,25 @@ impl RuntimeDto {
         maximum_body: usize,
         wire_overhead: usize,
     ) -> io::Result<[transport::Config; 2]> {
+        self.templates_for(
+            initial.path_mtu(),
+            initial.forward(),
+            initial.reverse(),
+            maximum_body,
+            wire_overhead,
+        )
+    }
+    pub(super) fn report_interval(self) -> Option<Duration> {
+        self.report_interval_micros.0.map(Duration::from_micros)
+    }
+    pub(super) fn templates_for(
+        self,
+        path_mtu: usize,
+        send: policy::Direction,
+        receive: policy::Direction,
+        maximum_body: usize,
+        wire_overhead: usize,
+    ) -> io::Result<[transport::Config; 2]> {
         let control = self.control.build(wire_overhead);
         let wrapped = delivery::Settings {
             wire_overhead: wire_overhead
@@ -308,11 +330,11 @@ impl RuntimeDto {
                 .ok_or_else(|| invalid("transaction stream overhead overflow"))?,
             ..control
         };
-        let entry = |value: MessageDto| value.build(wrapped, initial.path_mtu());
+        let entry = |value: MessageDto| value.build(wrapped, path_mtu);
         let initiator = transport::Config {
-            path_mtu: initial.path_mtu(),
-            send: initial.forward(),
-            receive: initial.reverse(),
+            path_mtu,
+            send,
+            receive,
             policy: policy::Settings {
                 transaction_micros: self.legacy_policy.transaction_micros,
                 max_outbound: self.legacy_policy.max_outbound.0,
@@ -353,6 +375,7 @@ impl RuntimeDto {
                 ping_interval: Duration::from_micros(self.lifetime.ping_interval_micros),
                 pong_timeout: Duration::from_micros(self.lifetime.pong_timeout_micros),
             },
+            rolling_work: None,
             report_interval: self.report_interval_micros.0.map(Duration::from_micros),
         };
         Ok([

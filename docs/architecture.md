@@ -26,24 +26,30 @@ following are evidence boundaries, not a declaration that the target is running:
 
 | Area | Current evidence | Target gap |
 | --- | --- | --- |
-| Pure protocol libraries | Typed bounded engines with injected time/I/O; actual reserved Swift/Aligned/Packed/Rolling owners, Pipeline/MUX, two-slot Bank and shared native storage/counts. Rolling has complete tag4 configuration and exact actual nested heap plans. | Complete nested/external allocator qualification, rolling runtime installation and full selected-runtime acceptance; preserve pure boundaries through common security/carriers. |
+| Pure protocol libraries | Typed bounded engines with injected time/I/O; actual reserved Swift/Aligned/Packed/Rolling owners, Pipeline/MUX, two-slot Bank and shared native storage/counts. Rolling has complete tag4 configuration and exact actual nested heap plans. | Complete nested/external allocator qualification and full selected-runtime acceptance; preserve pure boundaries through common security/carriers. |
 | Swift | Historical TLS/separate-UDP receipts remain preserved. The explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures and finite Linux CLI/TAP baselines now exist. | The full native matrix and impaired 80 Mbit/s target, complete session lifecycle, every other carrier and full SW-11. |
-| Common record runtime | Explicit Common Driver and shared typed service use the actual reserved mixed Bank on the original authenticated UDP pair. Finite Unix packet-device tests pass Swift→Aligned→Packed→Swift, liveness and original native/control custody. | Complete resource/fault/lifecycle matrices, fresh-DH installation, portable Common IPC/CLI, rolling installation and full SW-11 remain open; these are not TAP/TUN or platform/performance results. |
+| Common record runtime | Explicit Common Driver uses the actual reserved four-family Bank on the original authenticated UDP pair. Finite Unix packet-device cases pass nonempty Swift/Rolling/Aligned/Packed switching, explicit GF work, real repair and physical custody. Shared typed service and APIv4 have finite actual local-socket/cross-profile evidence. | Complete resource/fault/lifecycle matrices, fresh-DH installation, external Common CLI/device qualification and full SW-11 remain open; these are not TAP/TUN or platform/performance results. |
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
-| OpenVPN-like UDP | Preserved custom-gate native slices; additive pure OpenVPN outer-wire/control codec and actual same-socket TLS/member carrier. Explicit opaque data can carry the existing inner Noise/security records without exporter resealing. | Complete shared-session Driver/service selection, standard-dissector capture and native/platform/ISP qualification remain open. The historical custom 144-byte gate is a separate path. |
+| OpenVPN-like UDP | Preserved custom-gate native slices; additive outer-wire/control codec and actual same-socket TLS/member carrier. Actual cookie/selected Noise/managed member factory yields opaque original-carrier Parts and exchanges inner User/Control records without exporter resealing. | Complete shared-session Driver/service selection, factory blocked/late-send matrices, standard-dissector capture and native/platform/ISP qualification remain open. The historical custom 144-byte gate is a separate path. |
 | HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
 | Platforms | Linux has named, finite native compositions. Windows is a status/help scaffold; Android has no JNI/VpnService. | New common-session support, Windows and Android execution are unqualified. |
 
 The [fourth record-family checkpoint](modules/rolling-common-records.md) is an
 actual pure Engine/Bank composition with explicit rolling work and move-only
 carrier output confirmation. Existing v2 bytes for tags1..3 remain unchanged;
-older readers reject the additive tag4. Selected runtime installation still needs
-those actual work/completion paths and currently refuses the combination.
+older readers reject the additive tag4. The subsequent
+[selected rolling runtime](modules/common-rolling-runtime.md) installs actual
+bounded work and physical confirmation; absent explicit work still refuses it.
 The [managed initial handoff](modules/managed-initial-handoff.md) proves the real
 selected Noise/Joining/member authority chain on the original UDP socket, while
 [original datagram custody](modules/original-datagram-custody.md) supplies actual
-whole-write tickets for UDP/OpenVPN. These finite prerequisites do not install
-Common runtime fresh-DH or OpenVPN bootstrap/Parts/Driver/service selection.
+whole-write tickets for UDP/OpenVPN. The
+[actual carrier factory](modules/openvpn-common-factory.md) now retains real
+outer proof, selected Noise/member authority and original Parts. The
+[four-stream Lifecycle owner](modules/lifecycle-control.md) has finite protocol
+evidence, while [Common APIv4](modules/common-client-api.md) has finite actual
+local service evidence. Common runtime fresh-DH and OpenVPN Driver/service
+selection remain open.
 
 The owner relaxed QUIC-like to header appearance without native QUIC data ACK or
 congestion semantics, and added minimal audio/video media appearance rather than

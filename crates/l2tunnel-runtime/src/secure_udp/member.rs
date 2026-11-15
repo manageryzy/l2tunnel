@@ -22,6 +22,10 @@ use zeroize::Zeroizing;
 #[path = "member_refresh.rs"]
 pub mod refresh;
 
+/// Actual member acceptance with the original authenticated outer carrier owner.
+#[path = "member_carrier.rs"]
+pub mod carrier;
+
 const ROUTE: u8 = 3;
 const ACCEPT_BYTES: usize = 34;
 const PROOF_WIRE: usize = 1 + 26 + identity::MEMBER_PROOF_BYTES;
@@ -102,7 +106,7 @@ pub struct Parts {
 }
 
 struct MemberState {
-    socket: UdpSocket,
+    socket: establish::SocketBacking,
     material: establish::InitialMaterial,
     cover: cover::Config,
     bootstrap: establish::BootstrapTail,
@@ -118,7 +122,7 @@ impl MemberState {
             return Err(invalid("selected member custody is not a legacy root"));
         };
         Ok(Authenticated(Parts {
-            socket: self.socket,
+            socket: self.socket.into_udp()?,
             root,
             cover: self.cover,
             bootstrap: self.bootstrap,
@@ -500,7 +504,7 @@ async fn drive(
         .inspect_err(|_| report.fail(Reason::Configuration))?;
     report.stage(Stage::Membership);
     let establish::EstablishedState {
-        socket,
+        mut socket,
         material,
         binding,
         authenticated,
@@ -608,14 +612,7 @@ async fn drive(
         }
     }
     let mut quota = Quota::new(settings, now)?;
-    let mut input = vec![
-        0;
-        cover
-            .limits()
-            .max_packet_bytes
-            .checked_add(1)
-            .ok_or_else(|| invalid("receive bound overflow"))?
-    ];
+    let mut input = vec![0; socket.receive_capacity(cover.limits().max_packet_bytes)?];
     let mut output = vec![0; cover.limits().max_packet_bytes];
     let mut workspace = [0; identity::MEMBER_PROOF_BYTES + 16];
     let mut attempts = 0u32;
@@ -640,7 +637,12 @@ async fn drive(
         {
             advance(&mut next_outer)?;
             report.bootstrap(tail.statistics(), tail.control_statistics());
-            handoff_observed(joining_deadline, send(&socket, &output[..length]), report).await?;
+            handoff_observed(
+                joining_deadline,
+                send_backing(&socket, &output[..length], joining_deadline),
+                report,
+            )
+            .await?;
         }
         let now = Instant::now();
         observed_before(report, now, deadline)?;
@@ -663,7 +665,12 @@ async fn drive(
             attempts += 1;
             report.member(attempts);
             report.bootstrap(tail.statistics(), tail.control_statistics());
-            handoff_observed(joining_deadline, send(&socket, &output[..length]), report).await?;
+            handoff_observed(
+                joining_deadline,
+                send_backing(&socket, &output[..length], joining_deadline),
+                report,
+            )
+            .await?;
             retry = Instant::now()
                 .checked_add(settings.retry_interval)
                 .ok_or_else(|| invalid("Joining retry overflow"))?;
@@ -692,7 +699,7 @@ async fn drive(
         report.bootstrap(tail.statistics(), tail.control_statistics());
         tokio::select! {
             _ = sleep_until(wake) => {}
-            received = receive(&socket, &mut input), if ready => {
+            received = receive_backing(&mut socket, &mut input), if ready => {
                 let now = Instant::now();
                 observed_before(report, now, deadline)?;
                 observed_before(report, now, joining_deadline)?;
@@ -747,7 +754,7 @@ async fn drive(
                 advance(&mut next_outer)?;
                 report.member(1);
                 report.bootstrap(tail.statistics(), tail.control_statistics());
-                handoff_observed(joining_deadline, send_acceptance(&socket, &output[..length]), report).await?;
+                handoff_observed(joining_deadline, send_acceptance_backing(&socket, &output[..length], joining_deadline), report).await?;
                 let now = Instant::now();
                 observed_before(report, now, deadline)?;
                 let material = crypto.finish(root, origin, now, report)?;
@@ -777,8 +784,29 @@ fn validate(
         &mut report,
     )
 }
+enum SocketView<'a> {
+    #[cfg(test)]
+    Udp(&'a UdpSocket),
+    Backing(&'a establish::SocketBacking),
+}
+impl SocketView<'_> {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            #[cfg(test)]
+            Self::Udp(socket) => socket.local_addr(),
+            Self::Backing(socket) => socket.local_addr(),
+        }
+    }
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            #[cfg(test)]
+            Self::Udp(socket) => socket.peer_addr(),
+            Self::Backing(socket) => socket.peer_addr(),
+        }
+    }
+}
 struct EstablishedView<'a> {
-    socket: &'a UdpSocket,
+    socket: SocketView<'a>,
     actual_binding: security::SessionBinding,
     role: security::Role,
     binding: security::SessionBinding,
@@ -791,7 +819,7 @@ struct EstablishedView<'a> {
 impl<'a> From<&'a establish::Established> for EstablishedView<'a> {
     fn from(value: &'a establish::Established) -> Self {
         Self {
-            socket: &value.socket,
+            socket: SocketView::Udp(&value.socket),
             actual_binding: value.root.binding(),
             role: value.root.role(),
             binding: value.binding,
@@ -805,7 +833,7 @@ impl<'a> From<&'a establish::Established> for EstablishedView<'a> {
 impl<'a> From<&'a establish::EstablishedState> for EstablishedView<'a> {
     fn from(value: &'a establish::EstablishedState) -> Self {
         Self {
-            socket: &value.socket,
+            socket: SocketView::Backing(&value.socket),
             actual_binding: value.material.binding(),
             role: value.material.role(),
             binding: value.binding,
@@ -995,6 +1023,35 @@ async fn handoff_observed<T>(
     Ok(result)
 }
 
+async fn send_backing(
+    socket: &establish::SocketBacking,
+    packet: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    match socket {
+        establish::SocketBacking::Udp(socket) => send(socket, packet).await,
+        establish::SocketBacking::Carrier(_) => socket.send_control(packet, deadline).await,
+    }
+}
+async fn receive_backing(
+    socket: &mut establish::SocketBacking,
+    output: &mut [u8],
+) -> io::Result<usize> {
+    match socket {
+        establish::SocketBacking::Udp(socket) => receive(socket, output).await,
+        establish::SocketBacking::Carrier(_) => socket.recv(output).await,
+    }
+}
+async fn send_acceptance_backing(
+    socket: &establish::SocketBacking,
+    packet: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    match socket {
+        establish::SocketBacking::Udp(socket) => send_acceptance(socket, packet).await,
+        establish::SocketBacking::Carrier(_) => socket.send_control(packet, deadline).await,
+    }
+}
 async fn send(socket: &UdpSocket, packet: &[u8]) -> io::Result<()> {
     #[cfg(test)]
     let injected = SEND_PATH_ERRORS

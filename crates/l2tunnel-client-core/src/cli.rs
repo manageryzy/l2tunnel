@@ -53,10 +53,15 @@ fn options(args: &[String], allowed: &[&str]) -> io::Result<BTreeMap<String, Str
         if pair.len() != 2 || !allowed.contains(&pair[0].as_str()) || pair[1].starts_with("--") {
             return Err(input("unknown option or missing option value; use --help"));
         }
-        if pair[0] == "--configuration"
-            && pair[1].len() > crate::secure_udp::transaction_status::CANONICAL_CHARACTERS
-        {
-            return Err(input("complete configuration exceeds608 characters"));
+        let maximum = if allowed.contains(&"--request-key") {
+            crate::secure_udp::common_status::CANONICAL_CHARACTERS
+        } else {
+            crate::secure_udp::transaction_status::CANONICAL_CHARACTERS
+        };
+        if pair[0] == "--configuration" && pair[1].len() > maximum {
+            return Err(input(format!(
+                "complete configuration exceeds{maximum} characters"
+            )));
         }
         if parsed.insert(pair[0].clone(), pair[1].clone()).is_some() {
             return Err(input("duplicate option"));
@@ -1172,6 +1177,61 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
                     )?)?,
             }
         }
+        "switch-common-configuration" => {
+            if number(options, "--api-version", VERSION)? != local::COMMON_VERSION {
+                return Err(input(
+                    "complete Common configuration requires explicit --api-version 4",
+                ));
+            }
+            let request_key = required(options, "--request-key")?
+                .parse::<u64>()
+                .map_err(|_| input("invalid request key"))?;
+            if request_key == 0 {
+                return Err(input("request key must be nonzero"));
+            }
+            Action::SwitchCommonConfiguration {
+                configuration: crate::secure_udp::common_status::CanonicalConfiguration::parse(
+                    required(options, "--configuration")?,
+                )?,
+                request_key,
+            }
+        }
+        "common-catalog" => {
+            if number(options, "--api-version", VERSION)? != local::COMMON_VERSION {
+                return Err(input("Common catalog requires explicit --api-version 4"));
+            }
+            let text = required(options, "--catalog")?;
+            if text.len() != 64
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(input("catalog must be exact64 lowercase hex"));
+            }
+            let mut catalog = [0; 32];
+            let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+            for (byte, pair) in catalog.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+                *byte = nibble(pair[0]) * 16 + nibble(pair[1]);
+            }
+            let generation = required(options, "--generation")?
+                .parse()
+                .map_err(|_| input("invalid generation"))?;
+            let offset = required(options, "--offset")?
+                .parse()
+                .map_err(|_| input("invalid offset"))?;
+            let limit = required(options, "--limit")?
+                .parse()
+                .map_err(|_| input("invalid page limit"))?;
+            if !(1..=crate::secure_udp::common_status::CATALOG_PAGE_LIMIT).contains(&limit) {
+                return Err(input("page limit must be1..4"));
+            }
+            Action::CommonCatalog {
+                generation,
+                catalog,
+                offset,
+                limit,
+            }
+        }
         "set-swift" => {
             let value = |key: &str| {
                 options
@@ -1218,7 +1278,7 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
     };
     let version = number(options, "--api-version", VERSION)?;
     if !local::supported_version(version) {
-        return Err(input("api-version must be explicitly 1, 2 or 3"));
+        return Err(input("api-version must be explicitly 1, 2, 3 or 4"));
     }
     let response = local::request(
         required(options, "--control-socket")?,
@@ -1288,7 +1348,17 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
         "set-compression" => vec!["--control-socket", "--compression"],
         "switch-swift-configuration" => vec!["--control-socket", "--configuration"],
-        "inspect-swift-transaction-plan" => vec![
+        "switch-common-configuration" => {
+            vec!["--control-socket", "--configuration", "--request-key"]
+        }
+        "common-catalog" => vec![
+            "--control-socket",
+            "--generation",
+            "--catalog",
+            "--offset",
+            "--limit",
+        ],
+        "inspect-swift-transaction-plan" | "inspect-common-transaction-plan" => vec![
             "--role",
             "--carrier",
             "--record-profile",
@@ -1300,6 +1370,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--udp-peer",
             "--max-path-mtu",
             "--swift-transaction-plan",
+            "--common-transaction-plan",
             "--noise-profile",
             "--noise-private-key-file",
             "--noise-peer-key-file",
@@ -1379,6 +1450,8 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             | "reconnect"
             | "set-swift"
             | "switch-swift-configuration"
+            | "switch-common-configuration"
+            | "common-catalog"
             | "set-compression"
             | "set-active-policy"
             | "drain-proxy"
@@ -1394,7 +1467,17 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         if command == "openvpn-keygen" {
             return standalone::generate(&options);
         }
-        if command == "inspect-swift-transaction-plan" {
+        if matches!(
+            command.as_str(),
+            "inspect-swift-transaction-plan" | "inspect-common-transaction-plan"
+        ) {
+            if (command == "inspect-common-transaction-plan")
+                != options.contains_key("--common-transaction-plan")
+            {
+                return Err(input(
+                    "inspection command must match the explicit plan backend",
+                ));
+            }
             #[cfg(unix)]
             return secure_udp_frontend::inspect(&options);
             #[cfg(not(unix))]

@@ -267,6 +267,7 @@ fn complete_v3_request_and_maximum_response_fit_existing_transport_bounds() -> R
             #[cfg(unix)]
             secure_udp: None,
             transaction: Some(maximum_status()?),
+            common: None,
         }),
     };
     let bytes = serde_json::to_vec(&response)?;

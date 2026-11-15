@@ -2,12 +2,16 @@
 
 Status: **implemented; earlier six pure wire/control cases and the latest ten
 carrier plus three original-datagram adapter cases passed in their finite scopes**.
-The latest affected batch remains **failed: 26 of 27 cases passed**; the failing
+The custody affected batch remains **failed: 26 of 27 cases passed**; the failing
 case was a rolling literal fixture. The new six-package strict checks passed;
 the [named custody receipt](../../work/parallel-features-20261115/parallel-wave2-datagram-custody-scoped-validation.json)
 preserves the failed enclosing batch and its individual positive evidence.
-The raw substrate retains real TLS/member control without exporter data resealing;
-it is not yet the selected common Noise/member/runtime handoff.
+The raw substrate retains real TLS/member control without exporter data resealing.
+The additive [Common factory/member handoff](openvpn-common-factory.md) is now
+implemented with three actual factory and four affected managed-initial passes.
+Their [enclosing aggregate](../../work/parallel-features-20261115/parallel-wave3-cases-attempt-1/validation.json)
+remains **failed, 51/55 passed**, and their [strict affected checks](../../work/parallel-features-20261115/parallel-wave3-strict-attempt-2/validation.json) passed.
+Actual Driver/shared-service installation remains open.
 The original custom-gate implementation and its native, outage and drain receipts
 remain unchanged. This additive module is a prerequisite for the original
 OpenVPN wire-handshake requirement, not completion of CONN-10,
@@ -147,9 +151,11 @@ data through that owner; wrapping already sealed common records through this
 particular API would retain the extra protection layer. The distinct
 `wire_carrier::common::Carrier` instead activates the actor's raw variant after
 actual TLS/member authentication and carries unchanged caller records. It avoids
-that data double protection, but neither API creates the existing common
-bootstrap/Joining handoff, admission proof, `member::Parts` or selected
-common-security runtime owner. The raw test's actual Noise and Data/Management
+that data double protection. The new runtime
+[carrier factory](openvpn-common-factory.md) composes this actual owner through
+the existing selected admission/Noise/Joining loops into opaque carrier `Parts`;
+three actual factory cases passed, while its Driver/service consumer remains open.
+The earlier raw test's actual Noise and Data/Management
 primitives use test-injected bindings; they do not establish that integration.
 
 Conversely, the existing common Noise/member `member::Parts` and
@@ -157,12 +163,12 @@ Conversely, the existing common Noise/member `member::Parts` and
 configuration/counter, session root and retained bootstrap/Joining tails. It does
 not install this OpenVPN actor/TLS-control owner. The registered
 [OriginalDatagram custody adapter](original-datagram-custody.md) now owns real UDP
-or raw OpenVPN I/O, but actual bootstrap/member/Parts/Driver/service installation
-still needs the explicit handoff that retains the original socket and genuine
-TLS control, preserves original setup/final-flight deadlines and exact full-wire
-pacing, and gives the actual common security/management loop one authoritative
-owner. The new outer contract, authenticated binding, handshake placement and
-credential migration must be specified before claiming that composition. These
+or raw OpenVPN I/O. The new factory implements genuine post-TLS outer binding,
+selected bootstrap/member custody and original deadlines in additive carrier
+`Parts`, with finite factory/handoff validation now recorded. Driver/service installation must retain
+that owner and genuine TLS control, preserve exact full-wire pacing, and give the
+actual common security/management loop one authoritative owner. The post-TLS
+canonical client settings and consumer integration remain required. These
 are engineering gaps, not recorded owner decisions or permission to duplicate
 crypto, recovery, native custody or transaction state machines. OWC-04 retains
 all common session, profile, service/CLI and native requirements.
@@ -303,6 +309,7 @@ The same receipt records the three registered runtime adapter passes described i
 binds the authored custody slice; root additionally registered the runtime module
 and added its checked pending-total overflow guard. New six-package strict
 Clippy/rustdoc/format validation [passed separately](../../work/parallel-features-20261115/parallel-wave2-strict-attempt-1/validation.json),
-not by inheritance from the earlier checkpoint. Actual common admission/member binding, bootstrap/Parts/Driver/shared
-service installation, all management/liveness/rekey/SW-11 requirements and the
+not by inheritance from the earlier checkpoint. The later finite factory/Parts
+passes are recorded separately above. Complete Common Driver/shared-service
+installation, all management/liveness/rekey/SW-11 requirements and the
 complete OWC-04..06 definitions remain open.

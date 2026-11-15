@@ -143,6 +143,7 @@ fn inputs(kind: cover::Appearance, role: security::Role, ipv6: bool) -> Result<I
             native_read_batch: 16,
             native_write_batch: 16,
         },
+        rolling_work: None,
         native: super::super::NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,

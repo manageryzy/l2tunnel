@@ -42,6 +42,12 @@ pub struct CommonSnapshot {
     pub send_channels: u16,
     /// Actual local receiving width.
     pub receive_channels: u16,
+    /// Actual independent directional work cap, at most four schedulers per turn.
+    pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    /// Actual sending and receiving rolling scheduler steps since construction.
+    pub rolling_scheduler_steps: u64,
+    /// Actual cumulative GF, copy and metadata work, respectively.
+    pub rolling_work_used: [u64; 3],
     /// Sole-loop scheduling, wire credit and native-pressure observations.
     pub performance: Performance,
     /// Actual fixed Control retained custody.
@@ -98,12 +104,13 @@ pub(super) struct PendingRequest {
     pub(super) reply: TransactionReply,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct PendingWire {
     pub(super) scope: Scope,
     pub(super) sealed: record::Sealed,
     pub(super) cost: usize,
     pub(super) deadline: u64,
+    pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
 }
 pub(super) struct Runtime {
     pub(super) contract: CommonTransactionContract,
@@ -119,6 +126,8 @@ pub(super) struct Runtime {
     pub(super) witnesses: Vec<l2tunnel_codec::aligned_receiver::UnitWitness>,
     pub(super) sent: Option<super::common_actions::Boundary>,
     pub(super) delivered: Option<super::common_actions::Boundary>,
+    pub(super) rolling_scheduler_steps: u64,
+    pub(super) rolling_work_used: [u64; 3],
 }
 
 /// Run actual common record generations on the original authenticated UDP socket.
@@ -519,6 +528,8 @@ impl Driver {
                     witnesses,
                     sent: None,
                     delivered: None,
+                    rolling_scheduler_steps: 0,
+                    rolling_work_used: [0; 3],
                 }),
                 send: config.send,
                 receive: config.receive,
@@ -608,6 +619,9 @@ impl Driver {
             receive_rate: local.receive().common().bytes_per_second(),
             send_channels: local.send().channels(),
             receive_channels: local.receive().channels(),
+            rolling_work: self.config.rolling_work,
+            rolling_scheduler_steps: runtime.rolling_scheduler_steps,
+            rolling_work_used: runtime.rolling_work_used,
             performance: self.performance.snapshot(now, &self.bucket),
             control: self.control.retained(),
             counters,

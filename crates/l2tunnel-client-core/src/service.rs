@@ -23,6 +23,8 @@ mod prepared;
 #[cfg(unix)]
 pub use prepared::SWIFT_LISTEN;
 pub use prepared::{Attachment, Client, Options, Prepared, Server};
+#[cfg(unix)]
+mod common_local;
 mod owner;
 #[cfg(unix)]
 mod setup;
@@ -232,7 +234,7 @@ pub struct SecureUdpTransactionFrame {
     pub service_terminal: Option<Terminal>,
 }
 /// Actual selected mixed-profile runtime observation for shared embedding clients.
-/// This typed view does not claim CLI or local-IPC Common-profile support.
+/// Local APIv4 and shared frontends project this same retained view.
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct SecureUdpCommonFrame {
@@ -252,6 +254,23 @@ impl SecureUdpTransactionFrame {
     /// Bounded complete-configuration observation without credentials or payloads.
     pub fn status(&self) -> io::Result<crate::secure_udp::transaction_status::Status> {
         let mut status = crate::secure_udp::transaction_status::Status::observe(
+            &self.requested,
+            self.info,
+            self.generation,
+            self.runtime.as_ref(),
+        )?;
+        status.service_terminal = self.service_terminal.map(|value| format!("{value:?}"));
+        if self.service_terminal.is_some() {
+            status.running = false;
+        }
+        Ok(status)
+    }
+}
+#[cfg(unix)]
+impl SecureUdpCommonFrame {
+    /// Bounded complete-configuration observation without credentials or payloads.
+    pub fn status(&self) -> io::Result<crate::secure_udp::common_status::Status> {
+        let mut status = crate::secure_udp::common_status::Status::observe(
             &self.requested,
             self.info,
             self.generation,
@@ -1074,6 +1093,15 @@ impl Handle {
         if let Some(response) = self.api_version(&request) {
             return response;
         }
+        #[cfg(unix)]
+        if matches!(
+            &request.action,
+            local::Action::SwitchCommonConfiguration { .. } | local::Action::CommonCatalog { .. }
+        ) {
+            let mut response = self.common_request(request).await;
+            self.common_reply_key(&mut response);
+            return response;
+        }
         let version = request.version;
         let refusal = |code| {
             let mut response = response(code);
@@ -1113,13 +1141,12 @@ impl Handle {
         #[cfg(unix)]
         {
             match &state.backend {
-                // Internal unavailable sentinel, never a new local wire version.
-                Some(ObservedBackend::SecureUdpCommon(_)) => 0,
+                Some(ObservedBackend::SecureUdpCommon(_)) => local::COMMON_VERSION,
                 Some(ObservedBackend::SecureUdpTransaction(_)) => local::TRANSACTION_VERSION,
                 Some(ObservedBackend::SecureUdp(_)) => local::SECURE_UDP_VERSION,
                 Some(_) => local::VERSION,
                 None => match &state.plan {
-                    Some(plan) if plan.secure_udp_common() => 0,
+                    Some(plan) if plan.secure_udp_common() => local::COMMON_VERSION,
                     Some(plan) if plan.secure_udp_transaction() => local::TRANSACTION_VERSION,
                     Some(plan) if plan.secure_udp() => local::SECURE_UDP_VERSION,
                     _ => local::VERSION,
@@ -1136,8 +1163,12 @@ impl Handle {
         Self::version_refusal(request.version, self.selected_version())
     }
     fn version_refusal(version: u16, selected: u16) -> Option<local::Response> {
-        let code = if selected == 0 {
-            Some("unsupported_backend")
+        let code = if selected == local::COMMON_VERSION
+            && matches!(
+                version,
+                local::VERSION | local::SECURE_UDP_VERSION | local::TRANSACTION_VERSION
+            ) {
+            Some("requires_version_4")
         } else if selected == local::TRANSACTION_VERSION
             && matches!(version, local::VERSION | local::SECURE_UDP_VERSION)
         {
@@ -1177,7 +1208,14 @@ impl Handle {
             Ok(view) => view,
             Err(response) => return *response,
         };
-        Self::status_from_view(view, request, idle_ok).await
+        let response = Self::status_from_view(view, request, idle_ok).await;
+        #[cfg(unix)]
+        let response = {
+            let mut response = response;
+            self.common_reply_key(&mut response);
+            response
+        };
+        response
     }
     async fn status_from_view(
         view: LocalView,
@@ -1203,14 +1241,15 @@ impl Handle {
                 Self::transaction_status_from(view.snapshot, true, "ok")
             }
             #[cfg(unix)]
-            Some(ObservedBackend::SecureUdpCommon(_)) => local::Response {
-                version: request.version,
-                ok: false,
-                code: "unsupported_backend".into(),
-                state: None,
-            },
+            Some(ObservedBackend::SecureUdpCommon(_)) => {
+                Self::common_status_from(view.snapshot, true, "ok")
+            }
             None if idle_ok => {
                 Self::lifecycle_reply_from(view.version, view.snapshot, false, true, "ok")
+            }
+            #[cfg(unix)]
+            None if view.version == local::COMMON_VERSION => {
+                Self::common_status_from(view.snapshot, false, "closed")
             }
             #[cfg(unix)]
             None if view.version == local::TRANSACTION_VERSION => {
@@ -1316,13 +1355,20 @@ impl Handle {
                 refusal
             };
         }
-        Self::lifecycle_reply_from(
+        let response = Self::lifecycle_reply_from(
             view.version,
             view.snapshot,
             view.backend.is_some(),
             ok,
             code,
-        )
+        );
+        #[cfg(unix)]
+        let response = {
+            let mut response = response;
+            self.common_reply_key(&mut response);
+            response
+        };
+        response
     }
     fn lifecycle_reply_from(
         version: u16,
@@ -1333,6 +1379,7 @@ impl Handle {
     ) -> local::Response {
         #[cfg(unix)]
         match version {
+            local::COMMON_VERSION => return Self::common_status_from(snapshot, ok, code),
             local::TRANSACTION_VERSION => return Self::transaction_status_from(snapshot, ok, code),
             local::SECURE_UDP_VERSION => {
                 return Self::secure_udp_status_from(snapshot, connected, ok, code);
@@ -1391,6 +1438,7 @@ impl Handle {
                     .map(SwiftFrame::status),
                 secure_udp: None,
                 transaction: None,
+                common: None,
             }),
         }
     }
@@ -1440,6 +1488,7 @@ impl Handle {
                 swift: None,
                 secure_udp: None,
                 transaction: status,
+                common: None,
             }),
         }
     }
@@ -1498,6 +1547,7 @@ impl Handle {
                 swift: None,
                 secure_udp: status,
                 transaction: None,
+                common: None,
             }),
         }
     }

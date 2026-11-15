@@ -13,6 +13,9 @@ pub const HEADER_BYTES: usize = 8;
 /// Draft wrapper version, explicitly bound by the authenticated configuration.
 pub const VERSION: u8 = 1;
 
+/// Explicit four-stream framing; never selected by inspecting peer input.
+pub mod v2;
+
 /// Fixed logical service domains sharing one physical lane and security owner.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -23,6 +26,8 @@ pub enum Stream {
     Liveness = 2,
     /// Actual scoped recovery feedback and native completion receipts.
     DataFeedback = 3,
+    /// Refresh lifecycle custody, supported only by explicitly selected v2.
+    Lifecycle = 4,
 }
 
 impl Stream {
@@ -72,7 +77,19 @@ pub struct Frame<'a> {
 impl<'a> Frame<'a> {
     /// Encode atomically after all configured size and output checks succeed.
     pub fn encode(self, output: &mut [u8], limits: Limits) -> Result<usize, Error> {
+        self.encode_version(output, limits, VERSION)
+    }
+
+    fn encode_version(
+        self,
+        output: &mut [u8],
+        limits: Limits,
+        version: u8,
+    ) -> Result<usize, Error> {
         limits.validate()?;
+        if self.stream == Stream::Lifecycle && version != v2::VERSION {
+            return Err(Error::Stream);
+        }
         if !(DATA_HEADER_BYTES..=limits.max_packet_bytes).contains(&self.packet.len()) {
             return Err(Error::Length);
         }
@@ -81,7 +98,7 @@ impl<'a> Frame<'a> {
             .ok_or(Error::Length)?;
         let output = output.get_mut(..bytes).ok_or(Error::Output)?;
         output[..4].copy_from_slice(b"L2CF");
-        output[4] = VERSION;
+        output[4] = version;
         output[5] = self.stream as u8;
         output[6..8].fill(0);
         output[HEADER_BYTES..].copy_from_slice(self.packet);
@@ -90,20 +107,28 @@ impl<'a> Frame<'a> {
 
     /// Parse a bounded exact wrapper without allocation or granting authority.
     pub fn decode(input: &'a [u8], limits: Limits) -> Result<Self, Error> {
+        Self::decode_version(input, limits, VERSION)
+    }
+
+    fn decode_version(input: &'a [u8], limits: Limits, version: u8) -> Result<Self, Error> {
         limits.validate()?;
         let header = input.get(..HEADER_BYTES).ok_or(Error::Length)?;
         let packet = &input[HEADER_BYTES..];
         if !(DATA_HEADER_BYTES..=limits.max_packet_bytes).contains(&packet.len()) {
             return Err(Error::Length);
         }
-        if &header[..4] != b"L2CF" || header[4] != VERSION {
+        if &header[..4] != b"L2CF" || header[4] != version {
             return Err(Error::Version);
         }
         if header[6..8] != [0, 0] {
             return Err(Error::Reserved);
         }
         Ok(Self {
-            stream: Stream::decode(header[5])?,
+            stream: if header[5] == Stream::Lifecycle as u8 && version == v2::VERSION {
+                Stream::Lifecycle
+            } else {
+                Stream::decode(header[5])?
+            },
             packet,
         })
     }
@@ -117,6 +142,9 @@ pub fn delivery_binding(
     binding: delivery::Binding,
     stream: Stream,
 ) -> Result<delivery::Binding, Error> {
+    if stream == Stream::Lifecycle {
+        return Err(Error::Stream);
+    }
     if binding.control_epoch == 0 {
         return Err(Error::Context);
     }

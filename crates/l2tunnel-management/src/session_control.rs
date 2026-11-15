@@ -10,17 +10,23 @@ pub const HEADER_BYTES: usize = 80;
 pub const VERSION: u8 = 1;
 /// Largest supported exact framed profile-control body, excluding its tag.
 pub const MAX_PROFILE_CONTROL_BYTES: usize = 43;
+/// Complete selected Lifecycle payload, including its typed prefix. Swift's
+/// existing maximum remains unchanged; the full envelope still fits 65536 bytes.
+pub const MAX_LIFECYCLE_BYTES: usize = 65_536 - HEADER_BYTES - 4;
 /// Explicit profile-specific command grammar, independent of recovery feedback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum ProfileTag {
     /// Existing framed Swift proposal and directional-barrier grammar version 1.
     SwiftPolicyV1 = 1,
+    /// Explicit v2 Lifecycle grammar; legacy and v1 stream gates reject it.
+    SessionRefreshV1 = 2,
 }
 impl ProfileTag {
     fn decode(value: u16) -> Result<Self, Error> {
         match value {
             1 => Ok(Self::SwiftPolicyV1),
+            2 => Ok(Self::SessionRefreshV1),
             _ => Err(Error::ProfileTag),
         }
     }
@@ -278,7 +284,12 @@ impl<'a> Envelope<'a> {
                 }
             }
             6 => {
-                if bytes.len() <= 4 || bytes.len() > 4 + MAX_PROFILE_CONTROL_BYTES {
+                let maximum = if bytes.get(..2) == Some(&[0, 2]) {
+                    MAX_LIFECYCLE_BYTES
+                } else {
+                    MAX_PROFILE_CONTROL_BYTES
+                };
+                if bytes.len() <= 4 || bytes.len() > 4 + maximum {
                     return Err(Error::Length);
                 }
                 if bytes[2..4] != [0; 2] {
@@ -320,8 +331,13 @@ impl<'a> Envelope<'a> {
             {
                 return Err(Error::Length);
             }
-            Body::ProfileControl { bytes, .. }
-                if bytes.is_empty() || bytes.len() > MAX_PROFILE_CONTROL_BYTES =>
+            Body::ProfileControl { tag, bytes }
+                if bytes.is_empty()
+                    || bytes.len()
+                        > match tag {
+                            ProfileTag::SwiftPolicyV1 => MAX_PROFILE_CONTROL_BYTES,
+                            ProfileTag::SessionRefreshV1 => MAX_LIFECYCLE_BYTES,
+                        } =>
             {
                 return Err(Error::Length);
             }
@@ -517,6 +533,15 @@ impl Gate {
         let b = envelope.binding;
         if b.session != session || b.sender != sender || b.lane != lane {
             return Err(Error::Binding);
+        }
+        if matches!(
+            envelope.body,
+            Body::ProfileControl {
+                tag: ProfileTag::SessionRefreshV1,
+                ..
+            }
+        ) {
+            return Err(Error::Kind);
         }
         let (policy, slot) = if b.scope == self.active.scope {
             (self.active, ScopeSlot::Active)

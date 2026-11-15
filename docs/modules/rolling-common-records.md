@@ -117,8 +117,10 @@ No receipt is relabeled as an aggregate pass. These pure exchanges simulate
 trusted whole carrier/native acknowledgments; they perform no physical device
 write or selected rolling runtime installation.
 
-Selected runtime must refuse unsupported rolling installation until it services
-bounded work and post-carrier confirmation. Kernel TAP/TUN, namespace/device,
+The subsequent [selected Common rolling runtime](common-rolling-runtime.md)
+implements explicit bounded work and post-carrier confirmation, with finite
+original-UDP/Unix packet-device cases and strict affected checks passed. A catalog without explicit admitted work still refuses
+rolling. This authoring checkpoint does not close RCE-04. Kernel TAP/TUN, namespace/device,
 standard dissector, Windows/Android, performance and ISP/QoS are outside this pure
 slice. This author executed no Cargo/tests/format/check or workloads and changed
 no historical receipt.

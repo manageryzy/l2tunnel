@@ -4,6 +4,51 @@ use l2tunnel::{record_bank, record_configuration as configuration, record_engine
 use l2tunnel_reliable::{OutboundBudget, RecordKind};
 
 impl Driver {
+    /// Called once per sole-loop turn, never from per-packet progress callbacks.
+    pub(super) fn service_common_rolling(&mut self, now: u64) -> io::Result<()> {
+        let Some(work) = self.config.rolling_work else {
+            return Ok(());
+        };
+        if self.common.is_none() || !self.check_expiry(now)? {
+            return Ok(());
+        }
+        for epoch in self.common_epochs().into_iter().flatten() {
+            let step = self
+                .common_state_mut()?
+                .entry(epoch)?
+                .step(engine::Tick(now), work)
+                .map_err(protocol)?;
+            if let Some(step) = step {
+                let width = usize::from(
+                    self.common_state()?
+                        .engine(epoch)?
+                        .configuration()
+                        .descriptor()
+                        .local(common_contract::mg_role(self.info.role))
+                        .receive()
+                        .channels(),
+                );
+                let runtime = self
+                    .common
+                    .as_mut()
+                    .ok_or_else(|| protocol("rolling service owner"))?;
+                runtime.rolling_scheduler_steps = runtime.rolling_scheduler_steps.saturating_add(2);
+                for (total, (sent, received)) in runtime.rolling_work_used.iter_mut().zip([
+                    (step.send.field, step.receive.work.field),
+                    (step.send.copies, step.receive.work.copies),
+                    (step.send.metadata, step.receive.work.metadata),
+                ]) {
+                    *total = total
+                        .saturating_add(sent as u64)
+                        .saturating_add(received as u64);
+                }
+                if step.source_handed {
+                    runtime.native_work[(epoch.0 % 2) as usize] = width;
+                }
+            }
+        }
+        Ok(())
+    }
     pub(super) fn has_transactions(&self) -> bool {
         self.generic.is_some() || self.common.is_some()
     }
@@ -348,19 +393,33 @@ impl Driver {
         socket: &tokio::net::UdpSocket,
         now: u64,
     ) -> io::Result<bool> {
-        self.send_common_user_with(now, |bytes| socket.try_send(bytes))
+        let origin = self.origin;
+        self.send_common_user_sampled(
+            now,
+            |bytes| socket.try_send(bytes),
+            || clock(origin, Instant::now()).map(|time| time.max(now)),
+        )
     }
+    #[cfg(test)]
     pub(super) fn send_common_user_with(
         &mut self,
         now: u64,
+        send: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<bool> {
+        self.send_common_user_sampled(now, send, || Ok(now))
+    }
+    pub(super) fn send_common_user_sampled(
+        &mut self,
+        now: u64,
         mut send: impl FnMut(&[u8]) -> io::Result<usize>,
+        mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
         if self
             .common
             .as_ref()
             .is_some_and(|runtime| runtime.sealed.is_some())
         {
-            return self.flush_common_wire_with(now, &mut send);
+            return self.flush_common_wire_sampled(now, &mut send, &mut sample);
         }
         let epochs = self.common_epochs();
         let runtime = self
@@ -427,6 +486,15 @@ impl Driver {
             else {
                 continue;
             };
+            let carrier = state.entry(epoch)?.pending_carrier_output();
+            if carrier
+                .as_ref()
+                .is_some_and(|token| token.emission() != emission)
+            {
+                return Err(protocol(
+                    "common carrier witness differs from actual emission",
+                ));
+            }
             let sealed = self
                 .records
                 .seal_user_in(
@@ -444,13 +512,22 @@ impl Driver {
             }
             self.counters.user_number = Some(sealed.number);
             self.counters.user_generation = Some(sealed.generation);
-            let deadline = self
+            let mut deadline = self
                 .common_state()?
                 .operation_deadline()
                 .map(|d| u64::try_from(d.as_micros()).map_err(invalid))
                 .transpose()?
                 .unwrap_or(self.lease)
                 .min(self.lease);
+            if carrier.is_some()
+                && let Some(original) = self
+                    .common_state()?
+                    .engine(epoch)?
+                    .deadline()
+                    .map_err(protocol)?
+            {
+                deadline = deadline.min(original.0);
+            }
             let cost = sealed.bytes.checked_add(self.ip).ok_or_else(exhausted)?;
             self.bucket.charge(cost)?;
             self.performance.sent(
@@ -478,8 +555,9 @@ impl Driver {
                 sealed,
                 cost,
                 deadline,
+                carrier,
             });
-            return self.flush_common_wire_with(now, &mut send);
+            return self.flush_common_wire_sampled(now, &mut send, &mut sample);
         }
         self.performance.counters.user_not_ready_polls = self
             .performance
@@ -488,10 +566,19 @@ impl Driver {
             .saturating_add(1);
         Ok(false)
     }
+    #[cfg(test)]
     pub(super) fn flush_common_wire_with(
         &mut self,
         now: u64,
+        send: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<bool> {
+        self.flush_common_wire_sampled(now, send, || Ok(now))
+    }
+    fn flush_common_wire_sampled(
+        &mut self,
+        now: u64,
         mut send: impl FnMut(&[u8]) -> io::Result<usize>,
+        mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
         if !self.check_expiry(now)? {
             return Ok(false);
@@ -501,11 +588,18 @@ impl Driver {
             .as_ref()
             .ok_or_else(|| protocol("common sealed owner"))?
             .sealed
+            .as_ref()
         else {
             return Ok(false);
         };
-        if !self.scope_registered(pending.scope)
-            || self.records.next_number(Class::User).0 <= pending.sealed.number.0
+        let (scope, sealed, cost, deadline) = (
+            pending.scope,
+            pending.sealed,
+            pending.cost,
+            pending.deadline,
+        );
+        if !self.scope_registered(scope)
+            || self.records.next_number(Class::User).0 <= sealed.number.0
         {
             return Err(protocol(
                 "retained Common wire lost its original security scope/number",
@@ -515,22 +609,45 @@ impl Driver {
             .common
             .as_mut()
             .ok_or_else(|| protocol("common sealed owner"))?;
-        if now >= pending.deadline {
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original Common sealed output cap",
             ));
         }
-        match send(&runtime.wire[..pending.sealed.bytes]) {
-            Ok(bytes) if bytes == pending.sealed.bytes => {
+        match send(&runtime.wire[..sealed.bytes]) {
+            Ok(bytes) if bytes == sealed.bytes => {
                 self.counters.socket_accepted_packets =
                     self.counters.socket_accepted_packets.saturating_add(1);
                 self.counters.socket_accepted_ip_bytes = self
                     .counters
                     .socket_accepted_ip_bytes
-                    .saturating_add(pending.cost as u64);
-                runtime.sealed = None;
-                Ok(true)
+                    .saturating_add(cost as u64);
+                let pending = runtime
+                    .sealed
+                    .take()
+                    .ok_or_else(|| protocol("whole write lost Common custody"))?;
+                let sampled = sample();
+                let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
+                let confirmation = if let Some(token) = pending.carrier {
+                    self.common_state_mut()?
+                        .entry(core::Epoch(pending.scope.epoch.0))?
+                        .confirm_carrier_output(engine::Tick(completed), token)
+                        .map_err(protocol)
+                } else {
+                    Ok(())
+                };
+                // Whole physical ownership is permanent even if the post-write
+                // sample or original cap makes the connection terminal.
+                sampled?;
+                confirmation?;
+                if completed >= pending.deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "whole Common write crossed its original cap",
+                    ));
+                }
+                self.check_expiry(completed)
             }
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -577,11 +694,33 @@ impl Driver {
             configuration::DirectionProfile::Packed(config) => {
                 classify(body, config.base.recovery, self.info.role)?
             }
-            configuration::DirectionProfile::Rolling { .. } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "rolling runtime work and carrier-output custody are not installed",
-                ));
+            configuration::DirectionProfile::Rolling { config, .. } => {
+                let recovery = config.scheduler.recovery;
+                let configuration::DirectionProfile::Rolling { config: send, .. } =
+                    local.send().profile()
+                else {
+                    return Err(protocol("rolling directional family mismatch"));
+                };
+                if l2tunnel_fec::rolling::scheduler::decode_feedback(send.scheduler.recovery, body)
+                    .is_ok()
+                {
+                    engine::EmissionKind::Feedback
+                } else {
+                    match l2tunnel_fec::rolling::wire::inspect_with(
+                        recovery,
+                        config.scheduler.source_wire,
+                        body,
+                    )
+                    .map_err(protocol)?
+                    {
+                        l2tunnel_fec::rolling::wire::View::Source { .. } => {
+                            engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
+                        }
+                        l2tunnel_fec::rolling::wire::View::Repair(_) => {
+                            engine::EmissionKind::Repair
+                        }
+                    }
+                }
             }
         };
         if reader.disposition == transaction::ReadDisposition::Staged
@@ -613,12 +752,23 @@ impl Driver {
                     self.counters.native_backpressure_drops.saturating_add(1);
                 Ok(())
             }
+            Err(record_bank::Error::Engine(engine::Error::Rolling(error)))
+                if error.is_backpressure() =>
+            {
+                self.counters.native_backpressure_drops =
+                    self.counters.native_backpressure_drops.saturating_add(1);
+                Ok(())
+            }
             Err(error) => Err(protocol(error)),
         }
     }
     pub(super) fn wake_common(&self, now: u64) -> io::Result<Instant> {
         let mut wake = self.lease;
-        if let Some(pending) = self.common.as_ref().and_then(|runtime| runtime.sealed) {
+        if let Some(pending) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.sealed.as_ref())
+        {
             wake = wake.min(now).min(pending.deadline);
         }
         if self.control_work || self.control.ready_nontransaction()? {
@@ -660,6 +810,9 @@ impl Driver {
         );
         for epoch in self.common_epochs().into_iter().flatten() {
             let engine = self.common_state()?.engine(epoch)?;
+            if engine.work_pending().map_err(protocol)? {
+                wake = wake.min(now);
+            }
             let local = engine
                 .configuration()
                 .descriptor()
@@ -694,7 +847,7 @@ impl Driver {
             if engine.queue_usage().packets > 0 {
                 wake = wake.min(ready);
             }
-            if let Some(at) = engine.deadline().map_err(protocol)? {
+            if let Some(at) = engine.wake_at().map_err(protocol)? {
                 wake = wake.min(at.0.max(ready));
             }
         }

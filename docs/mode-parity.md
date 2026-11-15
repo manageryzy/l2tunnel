@@ -59,14 +59,17 @@ not qualify full SW-11. The subsequent
 [compact rolling records](modules/rolling-records.md) have finite protocol evidence.
 Unpacked Aligned independent-short delivery is implemented across an older gap;
 Packed/rolling early-short and their full matrices remain separate requirements.
-Complete resources, rolling runtime installation and all47 catalog gates retain
+Complete resources, full rolling runtime qualification and all47 catalog gates retain
 their original definitions and remain open.
 
 The [fourth pure rolling family](modules/rolling-common-records.md) now has complete
 tag4 bytes, actual reserved Engine/Bank custody and real repair/feedback-loss
 fixtures for both native interpretations and source-wire versions. Older readers
 reject tag4; the three existing profile byte formats remain unchanged. Explicit
-GF work and post-carrier confirmation still require selected runtime installation.
+GF work and post-carrier confirmation now have
+[selected original-UDP runtime evidence](modules/common-rolling-runtime.md),
+including all four real families, both appearances/source formats, real repair
+and physical custody. Their full resource/fault/native acceptance remains open.
 The [managed initial](modules/managed-initial-handoff.md) and
 [physical send](modules/original-datagram-custody.md) prerequisites do not qualify
 another whole carrier or recovery mode. All47 complete definitions remain open.
@@ -76,8 +79,11 @@ installs the real reserved Bank and passes finite authenticated original-UDP
 Swift→Aligned→Packed→Swift with actual Unix packet-device writes, liveness and
 typed complete-configuration operations. This is partial SW-11 implementation,
 not full parity or a new carrier/default. The full loss/fault/resource/lifecycle,
-rolling, native and platform matrices remain required. Portable Common IPC/CLI
-is not installed; existing Swift-only APIv3 is not a complete Common schema.
+rolling, native and platform matrices remain required.
+[Common APIv4](modules/common-client-api.md) now has complete configuration,
+catalog and keyed operations with finite actual local-socket service evidence;
+its external CLI/device qualification is separate. Existing Swift-only APIv3
+retains its original bytes and is not relabeled as a complete Common schema.
 
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s

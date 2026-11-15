@@ -79,6 +79,7 @@ pub struct Endpoint {
     pub(super) prepared_native: Option<PreparedNative>,
     pub(super) next_native: u64,
     pub(super) next_channel: u16,
+    pub(super) receive_progress: bool,
     pub(super) usage: Option<storage::Usage>,
 }
 impl Endpoint {
@@ -237,6 +238,7 @@ impl Endpoint {
             prepared_native: None,
             next_native: 1,
             next_channel: 0,
+            receive_progress: false,
             usage: None,
         })
     }
@@ -413,6 +415,7 @@ impl Endpoint {
             .step(rolling_tick(now), work)
             .map_err(Error::Rolling)?;
         let source_handed = self.pump_receive(now)?;
+        self.receive_progress = source_handed;
         Ok(Step {
             send,
             receive,
@@ -658,6 +661,17 @@ impl Endpoint {
             .chain(self.incoming.wake_at().map(|t| Tick(t.0)))
             .chain(self.packing.deadline_micros().map(Tick))
             .min()
+    }
+    /// Actual resumable computation, excluding immutable output waiting for I/O.
+    pub fn work_pending(&self) -> bool {
+        let send = self.sender.status();
+        let receive = self.incoming.status();
+        (!send.output_ready
+            && (send.encoder.pending_repair || send.regular_due > 0 || send.tail_remaining > 0))
+            || receive.decoder.pending_job
+            || receive.feedback_building
+            || (self.receive_progress
+                && receive.decoder.decoded_prefix > receive.decoder.handoff_prefix)
     }
     /// Service original hard bounds without performing hidden GF work.
     pub fn tick(&mut self, now: Tick) -> Result<(), Error> {

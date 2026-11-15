@@ -399,6 +399,7 @@ mod probe {
                 native_read_batch: 64,
                 native_write_batch: 64,
             },
+            rolling_work: None,
             native: transport::NativeBudget {
                 pending_packets: 64,
                 pending_bytes: 102_400,

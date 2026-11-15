@@ -23,6 +23,129 @@ use zeroize::Zeroize;
 #[path = "establish_refresh.rs"]
 pub mod refresh;
 
+/// Explicit same-owner outer carrier admission and selected Noise custody.
+#[path = "establish_carrier.rs"]
+pub mod carrier;
+
+// Only the carrier branch needs retained send tickets. The UDP branch keeps its
+// original borrowed I/O and test hooks, without a per-packet allocation.
+#[allow(clippy::large_enum_variant)]
+pub(in crate::secure_udp) enum SocketBacking {
+    Udp(UdpSocket),
+    Carrier(super::original_datagram::OriginalDatagram),
+}
+impl SocketBacking {
+    pub(in crate::secure_udp) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(socket) => socket.local_addr(),
+            Self::Carrier(socket) => Ok(socket.addresses().0),
+        }
+    }
+    pub(in crate::secure_udp) fn peer_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(socket) => socket.peer_addr(),
+            Self::Carrier(socket) => Ok(socket.addresses().1),
+        }
+    }
+    fn extra_wire_bytes(&self) -> usize {
+        match self {
+            Self::Udp(_) => 0,
+            Self::Carrier(socket) => socket.geometry().extra_wire_bytes,
+        }
+    }
+    pub(in crate::secure_udp) fn receive_capacity(&self, maximum: usize) -> io::Result<usize> {
+        let maximum = match self {
+            Self::Udp(_) => maximum,
+            Self::Carrier(socket) => maximum.max(socket.geometry().max_datagram_bytes),
+        };
+        maximum
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("receive bound overflow"))
+    }
+    pub(in crate::secure_udp) fn into_udp(self) -> io::Result<UdpSocket> {
+        match self {
+            Self::Udp(socket) => Ok(socket),
+            Self::Carrier(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "carrier custody is not a UDP handoff",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) fn into_carrier(
+        self,
+    ) -> io::Result<super::original_datagram::OriginalDatagram> {
+        match self {
+            Self::Carrier(socket) => Ok(socket),
+            Self::Udp(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP custody is not a carrier handoff",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) async fn recv(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.recv(output).await,
+            Self::Carrier(socket) => {
+                std::future::poll_fn(|cx| socket.poll_receive(cx, output)).await
+            }
+        }
+    }
+    pub(in crate::secure_udp) async fn send_control(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let Self::Carrier(socket) = self else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "carrier send requires carrier custody",
+            ));
+        };
+        let mut ticket = loop {
+            before(Instant::now(), deadline)
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            match socket.begin_send(
+                super::original_datagram::SendClass::Control,
+                bytes,
+                deadline,
+            ) {
+                Ok(ticket) => break ticket,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let wake = Instant::now()
+                        .checked_add(Duration::from_millis(1))
+                        .ok_or_else(|| io::Error::other("carrier wake overflow"))?
+                        .min(deadline);
+                    sleep_until(wake).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let cap = ticket.deadline();
+        let receipt = socket
+            .wait_send(&mut ticket)
+            .await
+            .map_err(|error| match error {
+                super::original_datagram::SendFailure::Expired { accepted } => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    super::original_datagram::SendFailure::Expired { accepted },
+                ),
+                super::original_datagram::SendFailure::Io(error) => error,
+                super::original_datagram::SendFailure::Ticket => {
+                    io::Error::other(super::original_datagram::SendFailure::Ticket)
+                }
+            })?;
+        if Instant::now() >= cap {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                super::original_datagram::SendFailure::Expired {
+                    accepted: Some(receipt),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Handshake-cover tag around an exact legacy admission record.
 pub const GATE_TAG: u8 = 0x80;
 /// Handshake-cover tag around a complete authenticated bootstrap ARQ packet.
@@ -217,7 +340,17 @@ impl ServerAdmission {
         cookie: gate::Secret,
         origin: Instant,
     ) -> Result<Self, Error> {
-        let setup = setup(config, peers)?;
+        Self::with_extra(config, peers, admission, cookie, origin, 0)
+    }
+    fn with_extra(
+        config: Config,
+        peers: Peers,
+        admission: gate::Secret,
+        cookie: gate::Secret,
+        origin: Instant,
+        extra: usize,
+    ) -> Result<Self, Error> {
+        let setup = setup_with_extra(config, peers, extra)?;
         let gate = gate::ServerGate::new(setup.gate, admission, cookie, Duration::ZERO)?;
         Ok(Self {
             setup,
@@ -287,7 +420,7 @@ impl InitialMaterial {
 }
 
 pub(in crate::secure_udp) struct EstablishedState {
-    pub(in crate::secure_udp) socket: UdpSocket,
+    pub(in crate::secure_udp) socket: SocketBacking,
     pub(in crate::secure_udp) material: InitialMaterial,
     pub(in crate::secure_udp) binding: security::SessionBinding,
     pub(in crate::secure_udp) authenticated: hs::Binding,
@@ -306,7 +439,7 @@ impl EstablishedState {
             return Err(Error::Protocol);
         };
         Ok(Established {
-            socket: self.socket,
+            socket: self.socket.into_udp()?,
             root,
             binding: self.binding,
             authenticated: self.authenticated,
@@ -322,7 +455,7 @@ impl EstablishedState {
 impl From<Established> for EstablishedState {
     fn from(value: Established) -> Self {
         Self {
-            socket: value.socket,
+            socket: SocketBacking::Udp(value.socket),
             material: InitialMaterial::Legacy(value.root),
             binding: value.binding,
             authenticated: value.authenticated,
@@ -726,7 +859,7 @@ pub async fn connect_observed(
     let mut report = Reporter::new(observe);
     // One setup allocation keeps instrumentation from multiplying caller stack storage.
     let result = Box::pin(connect_inner(
-        socket,
+        SocketBacking::Udp(socket),
         config,
         identity,
         admission,
@@ -744,7 +877,7 @@ pub async fn connect_observed(
 
 #[allow(clippy::too_many_arguments)] // Same bounded setup inputs plus a borrowed observation sink.
 async fn connect_inner(
-    socket: UdpSocket,
+    mut socket: SocketBacking,
     config: Config,
     identity: Identity,
     admission: gate::Secret,
@@ -757,7 +890,7 @@ async fn connect_inner(
         initiator: identity.local.public_key(),
         responder: identity.peer,
     };
-    let setup = setup(config, peers)?;
+    let setup = setup_with_extra(config, peers, socket.extra_wire_bytes())?;
     socket_path(&socket, setup.gate.path, hs::Role::Initiator)?;
     let origin = Instant::now();
     before(origin, deadline)?;
@@ -767,7 +900,7 @@ async fn connect_inner(
     report.bootstrap(statistics, None);
     let mut next_outer = 0;
     let mut quota = Quota::new(config, origin)?;
-    let mut input = vec![0; config.cover.limits().max_packet_bytes + 1];
+    let mut input = vec![0; socket.receive_capacity(config.cover.limits().max_packet_bytes)?];
     let mut output = vec![0; config.cover.limits().max_packet_bytes];
     let ticket = loop {
         report.bootstrap(statistics, None);
@@ -776,7 +909,7 @@ async fn connect_inner(
         if let Some(frame) = client.poll(elapsed(origin, now)?)? {
             let length = gate_packet(setup, &frame, next_outer, &mut output)?;
             report.bootstrap(statistics, None);
-            let accepted = send(&socket, &output[..length], deadline).await?;
+            let accepted = send_backing(&socket, &output[..length], deadline).await?;
             sent(&mut statistics, length, accepted);
             advance(&mut next_outer)?;
             emitted(&mut statistics, length);
@@ -841,7 +974,7 @@ pub async fn accept_observed(
     let mut report = Reporter::new(observe);
     report.server(admission.statistics());
     let result = Box::pin(accept_inner(
-        socket,
+        SocketBacking::Udp(socket),
         identity,
         admission,
         deadline,
@@ -858,7 +991,7 @@ pub async fn accept_observed(
 }
 
 async fn accept_inner(
-    socket: UdpSocket,
+    mut socket: SocketBacking,
     identity: Identity,
     admission: &mut ServerAdmission,
     deadline: Instant,
@@ -884,7 +1017,12 @@ async fn accept_inner(
     report.bootstrap(statistics, None);
     let mut next_outer = 0;
     let mut quota = Quota::new(setup.config, now)?;
-    let mut input = vec![0; setup.config.cover.limits().max_packet_bytes + 1];
+    if setup_with_extra(setup.config, admission.peers, socket.extra_wire_bytes())?.gate
+        != setup.gate
+    {
+        return Err(Error::Configuration("actual carrier bootstrap geometry"));
+    }
+    let mut input = vec![0; socket.receive_capacity(setup.config.cover.limits().max_packet_bytes)?];
     let mut output = vec![0; setup.config.cover.limits().max_packet_bytes];
     let mut server_nonce = nonce(entropy)?;
     let ticket = loop {
@@ -912,7 +1050,7 @@ async fn accept_inner(
                     gate::GateEvent::Retry(retry) => {
                         let length = gate_packet(setup, &retry, next_outer, &mut output)?;
                         report.bootstrap(statistics, None);
-            let accepted = send(&socket, &output[..length], deadline).await?;
+            let accepted = send_backing(&socket, &output[..length], deadline).await?;
                         sent(&mut statistics, length, accepted);
                         advance(&mut next_outer)?;
                         emitted(&mut statistics, length);
@@ -949,7 +1087,7 @@ async fn accept_inner(
 }
 
 struct Exchange {
-    socket: UdpSocket,
+    socket: SocketBacking,
     setup: Setup,
     identity: Identity,
     peers: Peers,
@@ -1018,7 +1156,12 @@ impl Exchange {
         let mut pending_len = 0;
         let mut peer_confirmation = [0; CONFIRM_BYTES];
         let mut quota = Quota::new(self.setup.config, Instant::now())?;
-        let mut input = vec![0; self.setup.config.cover.limits().max_packet_bytes + 1];
+        let mut input = vec![
+            0;
+            self.socket.receive_capacity(
+                self.setup.config.cover.limits().max_packet_bytes
+            )?
+        ];
         let mut output = vec![0; self.setup.config.cover.limits().max_packet_bytes];
         let mut server_nonce = if server.is_some() {
             Some(nonce(entropy)?)
@@ -1075,7 +1218,7 @@ impl Exchange {
                     core.statistics,
                     core.control.as_ref().map(gate::ControlEngine::statistics),
                 );
-                let accepted = send(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
                 emitted(&mut core.statistics, length);
@@ -1087,7 +1230,7 @@ impl Exchange {
                     core.statistics,
                     core.control.as_ref().map(gate::ControlEngine::statistics),
                 );
-                let accepted = send(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
             }
@@ -1180,7 +1323,7 @@ impl Exchange {
                                     gate::GateEvent::Retry(frame) => {
                                         let length = gate_packet(self.setup, &frame, self.next_outer, &mut output)?;
                                         report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
-                let accepted = send(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
                                         sent(&mut core.statistics, length, accepted);
                                         advance(&mut self.next_outer)?;
                                         emitted(&mut core.statistics, length);
@@ -1214,6 +1357,12 @@ impl Exchange {
 }
 
 fn setup(config: Config, peers: Peers) -> Result<Setup, Error> {
+    setup_with_extra(config, peers, 0)
+}
+fn setup_with_extra(config: Config, peers: Peers, extra: usize) -> Result<Setup, Error> {
+    if extra > 1 {
+        return Err(Error::Configuration("unsupported carrier overhead"));
+    }
     if !(1..=4096).contains(&config.receive_packets_per_interval)
         || !(FRAME_BYTES..=4096).contains(&config.gate.arq.max_source_bytes)
         || peers.initiator == peers.responder
@@ -1239,7 +1388,7 @@ fn setup(config: Config, peers: Peers) -> Result<Setup, Error> {
     let max_wire = protected
         .checked_add(actual_overhead)
         .ok_or(Error::Configuration("covered lengths"))?;
-    if config.gate.outer_overhead != ip + 1 + cover_bytes
+    if config.gate.outer_overhead != ip + extra + 1 + cover_bytes
         || actual_overhead != cover_bytes
         || config
             .cover
@@ -1247,7 +1396,7 @@ fn setup(config: Config, peers: Peers) -> Result<Setup, Error> {
             != cover_bytes
         || max_wire > config.cover.limits().max_packet_bytes
         || max_wire
-            .checked_add(ip)
+            .checked_add(ip + extra)
             .is_none_or(|bytes| bytes > config.gate.path_mtu)
     {
         return Err(Error::Configuration("exact bootstrap cover/MTU accounting"));
@@ -1316,7 +1465,7 @@ fn outer_binding(setup: Setup, session: [u8; 16]) -> Result<[u8; 32], Error> {
     result.copy_from_slice(context.finish().as_ref());
     Ok(result)
 }
-fn socket_path(socket: &UdpSocket, path: gate::Path, role: hs::Role) -> Result<(), Error> {
+fn socket_path(socket: &SocketBacking, path: gate::Path, role: hs::Role) -> Result<(), Error> {
     let (local, remote) = match role {
         hs::Role::Initiator => (path.client, path.server),
         hs::Role::Responder => (path.server, path.client),
@@ -1437,6 +1586,19 @@ fn gate_body(setup: Setup, packet: &[u8]) -> Option<&[u8]> {
         && decoded.protected.len() == gate::GATE_BYTES + 1
         && decoded.protected[0] == GATE_TAG)
         .then_some(&decoded.protected[1..])
+}
+async fn send_backing(
+    socket: &SocketBacking,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<bool, Error> {
+    match socket {
+        SocketBacking::Udp(socket) => send(socket, bytes, deadline).await,
+        SocketBacking::Carrier(_) => {
+            socket.send_control(bytes, deadline).await?;
+            Ok(true)
+        }
+    }
 }
 async fn send(socket: &UdpSocket, bytes: &[u8], deadline: Instant) -> Result<bool, Error> {
     #[cfg(test)]

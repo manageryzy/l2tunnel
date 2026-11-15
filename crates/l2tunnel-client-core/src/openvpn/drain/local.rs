@@ -18,6 +18,8 @@ pub(super) fn action(
         local::Action::DrainProxy {}
         | local::Action::SetSwiftPolicy { .. }
         | local::Action::SwitchSwiftConfiguration { .. }
+        | local::Action::SwitchCommonConfiguration { .. }
+        | local::Action::CommonCatalog { .. }
         | local::Action::Disconnect {}
         | local::Action::Reconnect {}
         | local::Action::SwitchCompression { .. }
@@ -49,6 +51,7 @@ pub(super) fn action(
                 #[cfg(unix)]
                 secure_udp: None,
                 transaction: None,
+                common: None,
                 active: None,
                 proxy: None,
                 openvpn_drain: Some(state),

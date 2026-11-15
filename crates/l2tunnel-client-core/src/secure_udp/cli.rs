@@ -6,6 +6,10 @@ use l2tunnel_runtime::secure_udp::{establish, transport};
 use l2tunnel_security as security;
 use l2tunnel_swift::{policy, records};
 use l2tunnel_udp_control as gate;
+#[path = "common_cli.rs"]
+mod common_cli;
+#[path = "common_cli_output.rs"]
+mod common_cli_output;
 #[path = "setup_output.rs"]
 mod setup_output;
 #[path = "transaction_cli.rs"]
@@ -22,8 +26,9 @@ pub(super) const OPTIONS: &[&str] = &[
     "--session-cookie-key-file",
     "--max-path-mtu",
     "--swift-transaction-plan",
+    "--common-transaction-plan",
 ];
-pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open.";
+pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate.";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
@@ -62,25 +67,28 @@ pub(super) struct Selected(Choice);
 enum Choice {
     Legacy(Selection),
     Transaction(Common, Box<transaction_cli::Plan>),
+    Records(Common, Box<common_cli::Plan>),
 }
 enum Built {
     Legacy(Box<Profile>),
     Transaction(Box<secure_udp::transaction_profile::Profile>),
+    Records(Box<secure_udp::common_transaction_profile::Profile>),
 }
 impl Selected {
     fn common(&self) -> Common {
         match &self.0 {
             Choice::Legacy(value) => (*value).into(),
-            Choice::Transaction(common, _) => *common,
+            Choice::Transaction(common, _) | Choice::Records(common, _) => *common,
         }
     }
     fn transaction(&self) -> bool {
-        matches!(self.0, Choice::Transaction(_, _))
+        matches!(self.0, Choice::Transaction(_, _) | Choice::Records(_, _))
     }
     fn report_interval(&self) -> Option<Duration> {
         match &self.0 {
             Choice::Legacy(value) => Some(value.report.unwrap_or(Duration::from_secs(1))),
             Choice::Transaction(_, plan) => plan.report_interval(),
+            Choice::Records(_, plan) => plan.report_interval(),
         }
     }
     fn build(
@@ -105,6 +113,18 @@ impl Selected {
                 plan.build(connection, raw, peers, maximum_body, overhead)
                     .map(Box::new)
                     .map(Built::Transaction)
+            }
+            Choice::Records(common, plan) => {
+                let (overhead, maximum_body) = common.geometry()?;
+                let raw = common.raw(
+                    plan.initial().path_mtu(),
+                    connection.handshake_timeout,
+                    peers,
+                    member,
+                )?;
+                plan.build(connection, raw, peers, maximum_body, overhead)
+                    .map(Box::new)
+                    .map(Built::Records)
             }
         }
     }
@@ -156,7 +176,14 @@ fn selection_for(
         "--swift-repair-permille",
         "--swift-report-ms",
     ];
-    if options.get("--record-profile").map(String::as_str) != Some("swift")
+    let records_plan = options.contains_key("--common-transaction-plan");
+    if records_plan && options.contains_key("--swift-transaction-plan") {
+        return Err(input(
+            "Common and Swift transaction plans are mutually exclusive",
+        ));
+    }
+    if options.get("--record-profile").map(String::as_str)
+        != Some(if records_plan { "common" } else { "swift" })
         || config.duplex != Duplex::Full
         || config.compression != Compression::None
         || options.keys().any(|key| {
@@ -170,7 +197,7 @@ fn selection_for(
         ));
     }
     if inspection {
-        if !options.contains_key("--swift-transaction-plan")
+        if !(options.contains_key("--swift-transaction-plan") || records_plan)
             || [
                 "--device",
                 "--control-socket",
@@ -237,6 +264,40 @@ fn selection_for(
         ));
     }
     let maximum_mtu = number(options, "--max-path-mtu", 9000)?;
+    if let Some(path) = options.get("--common-transaction-plan") {
+        if [
+            "--path-mtu",
+            "--swift-forward-kbit",
+            "--swift-reverse-kbit",
+            "--swift-channels",
+            "--swift-window",
+            "--swift-repair-permille",
+            "--swift-report-ms",
+        ]
+        .iter()
+        .any(|key| options.contains_key(*key))
+        {
+            return Err(input(
+                "transaction plan conflicts with legacy Swift mutable/report options",
+            ));
+        }
+        let plan = common_cli::Plan::read(std::path::Path::new(path))?;
+        let initial = plan.initial().path_mtu();
+        if !(576..=9000).contains(&maximum_mtu) || !(576..=maximum_mtu).contains(&initial) {
+            return Err(input("transaction initial MTU/capacity is out of range"));
+        }
+        return Ok(Some(Selected(Choice::Records(
+            Common {
+                appearance,
+                role,
+                local,
+                peer,
+                maximum_mtu,
+                profile,
+            },
+            Box::new(plan),
+        ))));
+    }
     if let Some(path) = options.get("--swift-transaction-plan") {
         if [
             "--path-mtu",
@@ -565,6 +626,7 @@ impl Selection {
                 ping_interval: Duration::from_secs(1),
                 pong_timeout: Duration::from_secs(5),
             },
+            rolling_work: None,
             report_interval: Some(self.report.unwrap_or(Duration::from_secs(1))),
         };
         let responder = transport::Config {
@@ -610,13 +672,18 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
             required(options, "--allow-key")?,
         ))?)
     };
-    let Built::Transaction(profile) = selected.build(connection, peers, member)? else {
-        return Err(input("inspection requires explicit transaction plan"));
+    let values = match selected.build(connection, peers, member)? {
+        Built::Transaction(profile) => {
+            vec![transaction_cli_output::inspection(&profile, common.role)?]
+        }
+        Built::Records(profile) => common_cli_output::inspection(&profile, common.role)?,
+        Built::Legacy(_) => return Err(input("inspection requires explicit transaction plan")),
     };
-    let value = transaction_cli_output::inspection(&profile, common.role)?;
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &value).map_err(io::Error::other)?;
-    writeln!(stdout)?;
+    for value in values {
+        serde_json::to_writer(&mut stdout, &value).map_err(io::Error::other)?;
+        writeln!(stdout)?;
+    }
     Ok(())
 }
 
@@ -669,6 +736,9 @@ pub(super) async fn execute(
                     credentials,
                     attachment,
                 )?,
+                Built::Records(profile) => {
+                    service::Prepared::secure_udp_common_client(*profile, credentials, attachment)?
+                }
             }
         }
         "serve" => {
@@ -689,6 +759,9 @@ pub(super) async fn execute(
                     credentials,
                     attachment,
                 )?,
+                Built::Records(profile) => {
+                    service::Prepared::secure_udp_common_server(*profile, credentials, attachment)?
+                }
             }
         }
         _ => return Err(input("unsupported secure UDP command")),
@@ -813,6 +886,25 @@ fn emit_transaction(
     event: TransactionEvent,
     output: &mut output::Sink,
 ) {
+    if observation
+        .and_then(crate::service::Observation::secure_udp_common)
+        .is_some()
+    {
+        let value = match (
+            observation.and_then(crate::service::Observation::secure_udp_common),
+            generation,
+        ) {
+            (Some(frame), Some(generation)) => {
+                common_cli_output::event(frame, generation.value(), event)
+            }
+            _ => Err(input("missing matching Common observation")),
+        };
+        match value {
+            Ok(value) => output.emit(value),
+            Err(_) => output.projection_error(),
+        }
+        return;
+    }
     let value = match (
         observation.and_then(crate::service::Observation::secure_udp_transaction),
         generation,

@@ -50,12 +50,16 @@ receipt; no passing aggregate is inferred:
 | `secure_udp::original_datagram::tests::original_udp_expiry_and_unpolled_drop_release_custody_without_any_send` | Expired/unpolled UDP custody releases without a write; later actual send succeeds. |
 | `secure_udp::original_datagram::tests::actual_openvpn_ticket_retains_tls_original_tuple_and_extra_opcode_geometry` | Real TLS/member carrier, unchanged tuple, exact opaque bytes, extra-one-byte accounting and later TLS service. |
 
-The same receipt revalidated the seven earlier protected/raw carrier cases. The
-opaque fixture is not production common admission/member binding. Actual
-bootstrap/Joining/`Parts`, Common Driver and shared Prepared/service installation
-must still retain this owner and complete physical tickets before advancing
-accepted/drain proofs. Exact outer policy/proof binding into H0 and extra-opcode
-geometry through that complete path remain required.
+The same receipt revalidated the seven earlier protected/raw carrier cases. That
+opaque fixture is not production common admission/member binding. The later
+[Common factory/member handoff](openvpn-common-factory.md) now retains this owner
+through actual cookie/selected Noise/managed Joining into opaque carrier `Parts`;
+three actual factory and four managed-initial cases passed in their finite scope.
+Its enclosing aggregate remains failed and [strict affected checks](../../work/parallel-features-20261115/parallel-wave3-strict-attempt-2/validation.json) passed.
+The factory blocked/late-send matrix, Common Driver and shared Prepared/service
+installation remain open. Those consumers must retain the same owner and complete
+physical tickets before advancing accepted/drain proofs, with exact post-TLS
+effective binding and extra-opcode geometry throughout.
 
 Full authenticated management, liveness, fresh rekey, SW-11 switching, every
 requested profile/mode and all existing resource/native/platform/performance

@@ -55,7 +55,7 @@ impl MemberState {
             ));
         };
         Ok(Authenticated(Parts {
-            socket: self.socket,
+            socket: self.socket.into_udp()?,
             initial,
             cover: self.cover,
             bootstrap: self.bootstrap,

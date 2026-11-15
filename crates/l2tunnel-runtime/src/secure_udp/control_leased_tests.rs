@@ -4,6 +4,9 @@ use super::*;
 use l2tunnel_core::{ConfigDigest, Epoch, ModeConfig};
 use l2tunnel_management::transaction as tx;
 
+#[path = "control_v2_tests.rs"]
+mod v2_tests;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const CAP: tx::Tick = tx::Tick(4_000);
@@ -234,12 +237,20 @@ impl Lab {
             let mut packet = [0; 512];
             while let Some(emission) = source.poll(self.now, allowance, &mut packet)? {
                 allowance -= emission.wire_bytes;
-                let frame = streams::Frame::decode(
-                    &packet[..emission.bytes],
-                    streams::Limits {
-                        max_packet_bytes: 236,
-                    },
-                )?;
+                let limits = streams::Limits {
+                    max_packet_bytes: 236,
+                };
+                let selected_v2 = matches!(&source.backend,
+                    Backend::Streamed(streamed) if streamed.lifecycle.is_some());
+                let frame = if selected_v2 {
+                    let actual = streams::v2::Frame::decode(&packet[..emission.bytes], limits)?;
+                    streams::Frame {
+                        stream: actual.stream,
+                        packet: actual.packet,
+                    }
+                } else {
+                    streams::Frame::decode(&packet[..emission.bytes], limits)?
+                };
                 let Backend::Streamed(streamed) = &source.backend else {
                     return Err("leased pump requires streamed owner".into());
                 };
@@ -375,7 +386,14 @@ impl Lab {
     fn assert_shared_wire_quota(&self) {
         let mut windows = std::collections::BTreeMap::new();
         for frame in &self.emitted {
-            assert!(streams::Stream::ALL.contains(&frame.stream));
+            let selected_v2 = matches!(&self.owners[frame.side].backend,
+                Backend::Streamed(streamed) if streamed.lifecycle.is_some());
+            let all: &[streams::Stream] = if selected_v2 {
+                &streams::v2::ALL
+            } else {
+                &streams::Stream::ALL
+            };
+            assert!(all.contains(&frame.stream));
             assert!(frame.at >= frame.refill_start);
             assert!(frame.at < frame.refill_start + base().interval);
             let totals = windows
@@ -1298,10 +1316,10 @@ fn real_final_proofs_release_both_peers_after_data_scope_retirement() -> Result 
 struct PreviewState {
     owner_now: Duration,
     owner_failed: bool,
-    next: [u64; 3],
+    next: [u64; 4],
     highest: [Option<mg::PacketNumber>; 3],
     retained: [messages::Retained; 3],
-    held: [Option<Incoming>; 3],
+    held: [Option<Incoming>; 4],
     pending: Option<(messages::Ticket, Duration, Vec<u8>, usize)>,
     phase: tx::Phase,
     operation: Option<tx::Operation>,
