@@ -50,6 +50,8 @@ impl Engine {
             .committed
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
+        self.native_counts
+            .preflight_prepare(self.receive_channels)?;
         let channel =
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Invariant)?);
         let next_channel = if self.next_channel + 1 == self.receive_channels {
@@ -89,6 +91,9 @@ impl Engine {
                     early,
                     deadline,
                 };
+                if let Err(error) = self.native_counts.prepare(identity, self.receive_channels) {
+                    return self.fail(error);
+                }
                 self.statistics.prepared = serial;
                 self.pending = Some(prepared);
                 Ok(NativePreparation::Ready(prepared))
@@ -114,10 +119,15 @@ impl Engine {
             .committed
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
+        let pending = self.pending.ok_or(Error::Token)?;
+        let (channel, committed) = self
+            .native_counts
+            .next_commit(pending.token.identity, self.receive_channels)?;
         let timing = self.advance(now);
         // The caller has already observed a complete physical write. Record
         // that receipt once even if subsequent authoritative cleanup is fatal.
         self.statistics.committed = next;
+        self.native_counts.commit(channel, committed);
         self.pending = None;
         timing?;
         match self.owner.commit(now) {

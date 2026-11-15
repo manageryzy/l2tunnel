@@ -313,11 +313,16 @@ fn late_actual_physical_receipt_counts_once_but_never_completes_expired_owner() 
             deadline: Tick(10),
         });
         engine.statistics.prepared = 1;
+        engine
+            .native_counts
+            .prepare(token.identity, engine.receive_channels)?;
         if prior_failure {
             assert_eq!(engine.tick(Tick(10)), Err(Error::Expired));
         }
         assert_eq!(engine.commit_native(Tick(10), token), Err(Error::Expired));
         assert_eq!(engine.statistics().committed, 1);
+        assert_eq!(engine.native_counts()?.prepared[0], 1);
+        assert_eq!(engine.native_counts()?.committed[0], 1);
         assert_eq!(engine.pending_native(), None);
         assert_eq!(engine.commit_native(Tick(10), token), Err(Error::Token));
         assert_eq!(engine.statistics().committed, 1);

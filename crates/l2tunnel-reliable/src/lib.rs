@@ -803,6 +803,28 @@ impl Reliable {
         Ok(self.arq.poll_delivered(output)?)
     }
 
+    /// Borrow validated retained source payloads without consuming ordered custody.
+    ///
+    /// Direct and FEC-restored sources share the actual bounded ARQ owner.
+    /// Observation changes neither ACK state nor the delivery cursor; early
+    /// consumers must keep original identities and deduplicate ordered replay.
+    pub fn received_sources(&self) -> Result<impl Iterator<Item = (u64, &[u8])>, Error> {
+        self.running()?;
+        Ok(self
+            .arq
+            .received_sources()?
+            .map(|(source, bytes)| (source.0, bytes)))
+    }
+
+    /// Actual next ARQ feedback deadline, independently of data/coding work.
+    pub fn feedback_deadline(&self) -> Option<Duration> {
+        if self.failure().is_some() {
+            None
+        } else {
+            self.arq.feedback_deadline()
+        }
+    }
+
     /// Earliest ARQ, partial-block or coding expiry service deadline.
     pub fn deadline(&self) -> Option<Duration> {
         if self.failure().is_some() {

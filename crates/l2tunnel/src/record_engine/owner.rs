@@ -124,19 +124,26 @@ impl Owner {
                 if out.len() < maximum {
                     return Err(Error::Output { required: maximum });
                 }
-                let maximum_wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
-                if budget.packets == 0 || budget.wire_bytes < maximum_wire {
+                let Some(body_limit) = budget.wire_bytes.checked_sub(overhead) else {
+                    return Ok(None);
+                };
+                if budget.packets == 0 {
                     return Ok(None);
                 }
                 let mut entry = owned.entry();
                 let Some(emission) = entry
-                    .poll_emission(now.0, records::RecordNumber(number), allow_data)
+                    .poll_emission_bounded(
+                        now.0,
+                        records::RecordNumber(number),
+                        allow_data,
+                        body_limit,
+                    )
                     .map_err(Error::Swift)?
                 else {
                     return Ok(None);
                 };
                 let bytes = emission.body().len();
-                if bytes > maximum {
+                if bytes > maximum || bytes > body_limit {
                     return Err(Error::Invariant);
                 }
                 let kind = match emission.kind() {
@@ -144,7 +151,8 @@ impl Owner {
                     records::EmissionKind::Repair => EmissionKind::Repair,
                     records::EmissionKind::Feedback => EmissionKind::Feedback,
                 };
-                // The checked worst-case allowance precedes actual engine consumption.
+                // The actual complete body fit was checked before feedback or
+                // sender state committed, using the one shared wire allowance.
                 let wire_bytes = bytes + overhead;
                 out[..bytes].copy_from_slice(emission.body());
                 budget.packets -= 1;
@@ -293,6 +301,31 @@ impl Owner {
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Packed(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
         }
+    }
+
+    pub(super) fn feedback_opportunity(&self) -> Result<Option<(Tick, usize)>, Error> {
+        let (at, bytes) = match self {
+            Self::Swift(owned) => {
+                return Ok(owned
+                    .engine()
+                    .feedback_opportunity()
+                    .map(|(at, bytes)| (Tick(at), bytes)));
+            }
+            Self::Aligned(endpoint) => (
+                endpoint.feedback_deadline(),
+                l2tunnel_reliable::ENVELOPE_BYTES + l2tunnel_recovery::ACK_PACKET_BYTES,
+            ),
+            Self::Packed(endpoint) => (
+                endpoint.feedback_deadline(),
+                l2tunnel_reliable::ENVELOPE_BYTES + l2tunnel_recovery::ACK_PACKET_BYTES,
+            ),
+        };
+        at.map(|at| {
+            u64::try_from(at.as_micros())
+                .map(|at| (Tick(at), bytes))
+                .map_err(|_| Error::Arithmetic)
+        })
+        .transpose()
     }
 
     pub(super) fn deadline(&self) -> Result<Option<Tick>, Error> {

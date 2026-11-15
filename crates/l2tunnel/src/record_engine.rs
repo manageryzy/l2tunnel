@@ -20,6 +20,8 @@ mod errors_tests;
 pub mod storage;
 
 mod native;
+mod native_counts;
+pub use native_counts::NativeCounts;
 mod owner;
 #[cfg(test)]
 mod storage_tests;
@@ -293,6 +295,7 @@ pub struct Engine {
     last: Option<Tick>,
     failure: Option<Error>,
     usage: Option<storage::Usage>,
+    native_counts: native_counts::Counts,
 }
 
 impl Engine {
@@ -365,6 +368,7 @@ impl Engine {
             last: None,
             failure: None,
             usage,
+            native_counts: native_counts::Counts::default(),
         }
     }
 
@@ -401,10 +405,16 @@ impl Engine {
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
         let owner = &mut self.owner;
-        match self
-            .pipeline
-            .offer_front(|metadata, bytes| owner.offer(now, metadata.binding.channel, bytes))
-        {
+        let counts = &mut self.native_counts;
+        let width = self
+            .configuration
+            .descriptor()
+            .local(self.context.role)
+            .send()
+            .channels();
+        match self.pipeline.offer_front(|metadata, bytes| {
+            native_counts::offer(owner, counts, now, metadata.binding.channel, width, bytes)
+        }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
                 Ok(Some(admitted))
@@ -442,8 +452,15 @@ impl Engine {
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
         let owner = &mut self.owner;
+        let counts = &mut self.native_counts;
+        let width = self
+            .configuration
+            .descriptor()
+            .local(self.context.role)
+            .send()
+            .channels();
         match self.pipeline.offer_front_borrowed(|metadata, bytes| {
-            owner.offer(now, metadata.binding.channel, bytes)
+            native_counts::offer(owner, counts, now, metadata.binding.channel, width, bytes)
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
@@ -542,6 +559,14 @@ impl Engine {
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
             .min())
+    }
+
+    /// Earliest genuine feedback deadline and complete inner body requirement.
+    /// The caller adds its configured full-wire overhead and shares its existing
+    /// allowance; this view grants no packet number or authentication authority.
+    pub fn feedback_opportunity(&self) -> Result<Option<(Tick, usize)>, Error> {
+        self.healthy()?;
+        self.owner.feedback_opportunity()
     }
 
     /// True only when actual queue, profile and native custody all drain.
@@ -693,3 +718,6 @@ fn dimensions(
         ),
     })
 }
+
+#[cfg(test)]
+mod bounded_feedback_tests;

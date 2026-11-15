@@ -8,6 +8,31 @@ use std::collections::VecDeque;
 
 type Term = (u64, u8);
 
+// Stack-only canonical description shared by preview, sizing and legacy output.
+struct Feedback {
+    base: u32,
+    end: u32,
+    recent: u16,
+    offsets: [u16; MAX_REQUESTS],
+    requests: usize,
+}
+impl Feedback {
+    fn bytes(&self) -> usize {
+        FEEDBACK_HEADER + 2 * self.requests
+    }
+    fn write(&self, output: &mut Vec<u8>) {
+        output.clear();
+        output.push(KIND_FEEDBACK);
+        output.extend_from_slice(&self.base.to_be_bytes());
+        output.extend_from_slice(&self.end.to_be_bytes());
+        output.extend_from_slice(&self.recent.to_be_bytes());
+        output.push(self.requests as u8);
+        for offset in &self.offsets[..self.requests] {
+            output.extend_from_slice(&offset.to_be_bytes());
+        }
+    }
+}
+
 /// One pending equation: `sum(coefficient * vector(sequence)) = data`, where a
 /// source vector is its 16-bit length followed by its bytes, zero extended.
 struct Row {
@@ -736,26 +761,7 @@ impl Receiver {
                 .saturating_add(self.config.feedback_micros)
         })
     }
-    /// Write a feedback datagram body into `output` when one is due.
-    ///
-    /// It carries the in-order prefix, the highest known sequence, how many
-    /// sources inside the newest window are still missing, and explicit
-    /// requests for missing sources that no held equation already determines:
-    /// those older than the coding window, and all of them once no new source
-    /// has arrived since the previous feedback.
-    pub fn feedback(&mut self, now: u64, output: &mut Vec<u8>) -> bool {
-        if !(self.dirty || self.repeats > 0)
-            || now
-                < self
-                    .last_feedback
-                    .saturating_add(self.config.feedback_micros)
-        {
-            return false;
-        }
-        output.clear();
-        output.push(KIND_FEEDBACK);
-        output.extend_from_slice(&(self.base as u32).to_be_bytes());
-        output.extend_from_slice(&(self.end as u32).to_be_bytes());
+    fn feedback_shape(&self) -> Feedback {
         let coded_from = self
             .end
             .saturating_sub(self.config.window as u64)
@@ -766,8 +772,6 @@ impl Receiver {
                 recent = recent.saturating_add(1);
             }
         }
-        output.extend_from_slice(&recent.to_be_bytes());
-        output.push(0);
         // While new sources keep arriving, a gap is left alone until coding
         // can no longer cover it, or, without proportional repairs, until a
         // few later sources show it is not mere reordering. Once sources stop
@@ -784,7 +788,7 @@ impl Receiver {
         } else {
             settled
         };
-        self.reported_end = self.end;
+        let mut offsets = [0; MAX_REQUESTS];
         let mut requests = 0;
         for sequence in self.base..request_to {
             if requests == MAX_REQUESTS {
@@ -802,11 +806,35 @@ impl Receiver {
                     .iter()
                     .any(|row| row.terms.first().is_some_and(|term| term.0 == sequence))
             {
-                output.extend_from_slice(&(offset as u16).to_be_bytes());
+                offsets[requests] = offset as u16;
                 requests += 1;
             }
         }
-        output[FEEDBACK_HEADER - 1] = requests as u8;
+
+        Feedback {
+            base: self.base as u32,
+            end: self.end as u32,
+            recent,
+            offsets,
+            requests,
+        }
+    }
+    /// Earliest genuine feedback opportunity and its complete canonical length.
+    pub(crate) fn feedback_opportunity(&self) -> Option<(u64, usize)> {
+        self.deadline()
+            .map(|at| (at, self.feedback_shape().bytes()))
+    }
+    /// Render without consuming any feedback debt, time or repeat state.
+    pub(crate) fn preview_feedback(&self, now: u64, output: &mut Vec<u8>) -> bool {
+        if self.deadline().is_none_or(|at| now < at) {
+            return false;
+        }
+        self.feedback_shape().write(output);
+        true
+    }
+    /// Commit only after the sole packer accepted the complete rendered block.
+    pub(crate) fn commit_feedback(&mut self, now: u64) {
+        self.reported_end = self.end;
         self.repeats = if self.dirty {
             FEEDBACK_REPEATS
         } else {
@@ -815,6 +843,13 @@ impl Receiver {
         self.dirty = false;
         self.last_feedback = now;
         self.stats.feedback += 1;
+    }
+    /// Write a complete canonical feedback block when due, preserving legacy bytes.
+    pub fn feedback(&mut self, now: u64, output: &mut Vec<u8>) -> bool {
+        if !self.preview_feedback(now, output) {
+            return false;
+        }
+        self.commit_feedback(now);
         true
     }
 }

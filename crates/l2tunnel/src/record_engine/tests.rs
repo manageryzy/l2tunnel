@@ -502,7 +502,9 @@ fn roundtrip(
         );
         let before = sender.queue_usage();
         for _ in 0..3 {
+            let native_before = sender.native_counts()?.admitted.to_vec();
             assert!(sender.admit_one(next(&mut clock))?.is_none());
+            assert_eq!(sender.native_counts()?.admitted, native_before);
             assert_eq!(sender.queue_usage(), before);
             assert_eq!(sender.statistics().admitted, 1);
             assert_eq!(sender.failure(), None);
@@ -525,11 +527,21 @@ fn roundtrip(
         for _ in 0..16 {
             let prepared_at = next(&mut clock);
             let original_cap = Tick(prepared_at.0 + 10_000);
+            let before_prepared = receiver.native_counts()?.prepared.to_vec();
             let NativePreparation::Ready(prepared) =
                 receiver.prepare_native(prepared_at, 8, original_cap, &mut native)?
             else {
+                assert_eq!(receiver.native_counts()?.prepared, before_prepared);
                 continue;
             };
+            assert_eq!(
+                receiver.native_counts()?.prepared.iter().sum::<u64>(),
+                delivered.len() as u64 + 1
+            );
+            assert_eq!(
+                receiver.native_counts()?.committed.iter().sum::<u64>(),
+                delivered.len() as u64
+            );
             let bytes = native[..prepared.bytes()].to_vec();
             assert!(
                 accepted
@@ -540,12 +552,14 @@ fn roundtrip(
             assert!(!delivered.contains(&prepared.identity()));
             assert_eq!(prepared.deadline(), original_cap);
             assert_eq!(receiver.pending_native(), Some(prepared));
+            let counts_before_retry = receiver.native_counts()?.prepared.to_vec();
             let mut other_output = [0xa5; 17];
             assert_eq!(
                 receiver.prepare_native(next(&mut clock), 0, Tick(u64::MAX), &mut other_output)?,
                 NativePreparation::AlreadyPending(prepared)
             );
             assert_eq!(other_output, [0xa5; 17]);
+            assert_eq!(receiver.native_counts()?.prepared, counts_before_retry);
             assert_eq!(&native[..prepared.bytes()], bytes);
             receiver.commit_native(next(&mut clock), prepared.token())?;
             let committed = receiver.statistics().committed;
@@ -574,6 +588,21 @@ fn roundtrip(
     assert_eq!(accepted.len(), originals.len());
     assert!(data.sources > 0 && feedback.feedback > 0);
     assert_eq!(sender.statistics().admitted, 3);
+    let width = usize::from(configuration.descriptor().direction(role).channels());
+    let mut expected = vec![0; width];
+    expected[0] = 2;
+    expected[1] = 1;
+    let sent_counts = sender.native_counts()?;
+    let received_counts = receiver.native_counts()?;
+    assert_eq!(sent_counts.context, context(role));
+    assert_eq!(received_counts.context, context(peer));
+    assert_eq!(sent_counts.digest, received_counts.digest);
+    assert_eq!(sent_counts.admitted, expected);
+    assert_eq!(received_counts.prepared, expected);
+    assert_eq!(received_counts.committed, expected);
+    assert!(sent_counts.prepared.iter().all(|count| *count == 0));
+    assert!(sent_counts.committed.iter().all(|count| *count == 0));
+    assert!(received_counts.admitted.iter().all(|count| *count == 0));
     assert_eq!(
         (
             receiver.statistics().prepared,

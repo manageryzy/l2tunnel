@@ -139,7 +139,7 @@ pub(super) enum Received {
     Reserved(Vec<ReceiveSlot>),
 }
 impl Received {
-    fn iter(&self) -> impl Iterator<Item = (&SourceId, &Vec<u8>)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&SourceId, &Vec<u8>)> {
         let (map, slots) = match self {
             Self::Legacy(map) => (Some(map), None),
             Self::Reserved(slots) => (None, Some(slots)),

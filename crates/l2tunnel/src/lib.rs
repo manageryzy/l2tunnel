@@ -40,6 +40,15 @@ pub mod record_configuration;
 /// Actual shared-queue composition of existing Swift, Aligned and Packed owners.
 pub mod record_engine;
 
+/// Actual two-slot reserved record storage, separate from negotiated switch authority.
+pub mod record_bank;
+
+/// Reusable fixed native-output custody; physical device completion stays external.
+pub mod native_storage;
+
+/// Actual compact record units over the existing local/global rolling scheduler.
+pub mod rolling_records;
+
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;
 /// Authenticated aligned-symbol composition; clocks and native I/O stay external.

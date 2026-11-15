@@ -3,7 +3,8 @@
 //! All ingress recovery packets require prior carrier integrity/replay validation.
 //! Enqueue accepts only frames already admitted by the common MUX/QoS policy.
 //! This crate opens no device/socket and supplies no authentication or congestion
-//! controller. Global ordered recovery does not provide early-short gap bypass.
+//! controller. Explicit unpacked independent-short delivery observes retained
+//! sources while preserving the original ordered recovery and native gap state.
 
 use l2tunnel_codec::{
     aligned_envelope as envelope, aligned_receiver as receiver, aligned_sender as sender,
@@ -781,6 +782,15 @@ impl Endpoint {
         }
         self.pump_receive()
     }
+    /// Actual next recovery ACK deadline, excluding data and native work.
+    pub fn feedback_deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            None
+        } else {
+            self.recovery.feedback_deadline()
+        }
+    }
+
     /// Next recovery, receiver or retained-handoff deadline; poll it even while idle.
     pub fn deadline(&self) -> Option<Duration> {
         if self.failure.is_some() {
@@ -928,6 +938,7 @@ impl Endpoint {
         }
     }
     fn pump_receive(&mut self) -> Result<(), Error> {
+        self.preview_receive()?;
         for _ in 0..self.receive_config.recovery.arq.receive_records {
             if self.handoff.is_none() {
                 let result = self
@@ -985,12 +996,78 @@ impl Endpoint {
                 .admit_authenticated(view.identity, view.symbol, ticks(self.now)?)
             {
                 Ok(receiver::Admission::Accepted) => self.handoff = None,
+                Ok(receiver::Admission::Duplicate | receiver::Admission::StaleSource)
+                    if self
+                        .receive_config
+                        .receiver
+                        .body
+                        .independent_short_frame_bytes
+                        != 0 =>
+                {
+                    // The same real source may already have been observed
+                    // before ordered recovery reached it. Receiver tombstones
+                    // retain conflict evidence until contiguous retirement.
+                    self.handoff = None;
+                }
                 Ok(_) => return self.fail(Error::Identity),
                 Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
                 Err(error) => return self.fail(Error::Receiver(error)),
             }
         }
         Ok(())
+    }
+
+    fn preview_receive(&mut self) -> Result<(), Error> {
+        if self.receive_packing.is_some()
+            || self
+                .receive_config
+                .receiver
+                .body
+                .independent_short_frame_bytes
+                == 0
+        {
+            return Ok(());
+        }
+        let now = ticks(self.now)?;
+        let result = (|| {
+            for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+                let view = envelope::decode(
+                    self.receive_scope,
+                    self.receive_config.receiver.body.symbol_bytes,
+                    self.receive_config.receiver.channels,
+                    payload,
+                )
+                .map_err(Error::Envelope)?;
+                if view.identity.source.0 != id {
+                    return Err(Error::Identity);
+                }
+                if self.receive_config.native_policy == NativePolicy::RawIp {
+                    let symbol = view.symbol;
+                    let raw = symbol[3] == 2;
+                    let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
+                    if !raw && !fragment {
+                        return Err(Error::Policy);
+                    }
+                }
+                match self
+                    .receiver
+                    .admit_authenticated(view.identity, view.symbol, now)
+                {
+                    Ok(
+                        receiver::Admission::Accepted
+                        | receiver::Admission::Duplicate
+                        | receiver::Admission::StaleSource,
+                    ) => {}
+                    // Actual ARQ ownership is retained for ordered retry. No
+                    // source or native completion is fabricated on pressure.
+                    Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                    Ok(_) => return Err(Error::Identity),
+                    Err(error) => return Err(Error::Receiver(error)),
+                }
+            }
+            Ok(())
+        })();
+        self.terminal_result(result)
     }
     fn admit_packed(
         &mut self,

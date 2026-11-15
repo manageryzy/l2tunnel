@@ -35,6 +35,16 @@ standard dissectors, native devices, ISP treatment or any full carrier/mode gate
 The [scoped receipt](../work/parallel-features-20261115/openvpn-scoped-checkpoint-validation.json)
 preserves failed unrelated aggregate attempts and exact finite evidence reuse.
 
+The [pure mixed-record checkpoint](../work/parallel-features-20261115/pure-scoped-checkpoint-validation.json)
+implements the actual reserved mixed-profile Bank, shared native pool and real
+per-channel native event counts. Compact records now compose the actual rolling
+recovery owner; explicit unpacked independent-short records can complete across
+an older gap. Bounded Swift feedback retains complete canonical blocks under a
+smaller allowance without consuming unsent debt. Focused protocol evidence is
+reused by actual inputs and semantic deltas; five changed pure packages pass
+strict formatting, Clippy and rustdoc. This is not full rolling installation,
+complete resource admission, full SW-11 or native/platform/performance acceptance.
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),
@@ -50,15 +60,19 @@ The next common-session foundation is tracked by
 [reserved Pipeline](modules/pipeline-storage.md),
 [reserved common Engine](modules/common-engine-storage.md) and
 [in-session fresh-DH](modules/session-refresh.md).
+The subsequent [mixed Bank](modules/common-record-bank.md),
+[native counts](modules/common-native-counts.md),
+[shared native storage](modules/shared-native-storage.md) and
+[compact rolling records](modules/rolling-records.md) have their own finite ledgers.
 Their leaf evidence does not close full SW-11, complete resource admission or
 retained-state recovery. Existing mode, native, platform and performance gates
 retain their full definitions.
 
-The actual shared queues, reserved FEC/Reliable/Aligned/Packed libraries and
+The preceding actual shared queues, reserved FEC/Reliable/Aligned/Packed libraries and
 explicit functional common Engine now have
 [affected local evidence](../work/common-record-engine-20261114/scoped-checkpoint-validation.json).
-The Engine composes real profiles and queues; it is not installed in a selected
-runtime or a reserved mixed-generation Bank. Complete resources, pacing/credit/
+At that checkpoint the Engine composed real profiles and queues without a selected
+runtime or reserved mixed-generation Bank. Complete resources, pacing/credit/
 proxy owners, full SW-11 and required stage/native/platform/performance gates
 remain open. Unchanged suites are reused explicitly; passing individual tests
 do not relabel a failed aggregate.
@@ -66,10 +80,10 @@ do not relabel a failed aggregate.
 The [reserved common Engine checkpoint](../work/common-reserved-records-20261115/scoped-checkpoint-validation.json)
 adds actual fixed FlowTable/MUX/Scheduler/Pipeline backing and one movable Swift
 owner, then composes the selected real reserved Swift/Aligned/Packed owner.
-It passes142 distinct affected cases, including32 new cases, with four bounded
+It passed142 distinct affected cases, including32 new cases, with four bounded
 parallel test processes and exact single-test repairs. Current/prepared/draining
-mixed Bank, complete external/nested allocation admission, selected reserved
-runtime and the required full-stage gate remain open. No unaffected simulator,
+mixed Bank was not yet installed. Complete external/nested allocation admission,
+selected reserved runtime acceptance and the required full-stage gate remain open. No unaffected simulator,
 platform, native or performance campaign was repeated at this checkpoint.
 
 The [preceding448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)

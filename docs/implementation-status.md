@@ -18,7 +18,19 @@ full management/rekey/profile-switch acceptance, standard-dissector verification
 native/platform/performance or ISP qualification. Historical custom-gate receipts
 and every original gate remain intact; no unaffected suite was repeated.
 
-The current [affected checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
+The [pure mixed-record checkpoint](../work/parallel-features-20261115/pure-scoped-checkpoint-validation.json)
+adds the actual reserved two-slot mixed-profile Bank, reusable bounded native
+pool and real per-channel admitted/prepared/committed counts. Compact records
+use the actual rolling recovery owner, and explicit unpacked Aligned short
+records can complete across an older source gap with deduplication preserved.
+Swift has additive bounded canonical feedback without changing its legacy
+rendering; unsent feedback debt remains retained. Focused source-bound cases
+are reused explicitly, and strict formatting/Clippy/rustdoc pass for all five
+changed pure packages. Full nested/external resource admission, rolling runtime/
+catalog integration, complete early-short matrices, full SW-11 and native/
+platform/performance gates remain open. No unrelated test suite was repeated.
+
+The preceding [affected checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
 adds transactional admission through the actual MUX/DRR/Pipeline, actual reserved
 FEC/Reliable/Aligned/Packed backing and an explicit functional common Engine.
 It combines317 distinct passing cases plus92 codec executions with LZ4 disabled;
@@ -27,9 +39,9 @@ All283 recorded simulator/tooling/config/vendor/CI inputs remain unchanged and
 those suites were not repeated.
 The Engine uses the real queues and one real duplex profile, preserving unequal
 directions, actual identities/typed output, shared wire allowance and immutable
-native pending/completion semantics. This pure library composition is
-protocol-tested; it is not installed into the current selected runtime. Complete
-reserved Pipeline/mixed-generation Bank, external configured pacing/credit/proxy
+native pending/completion semantics. That pure library composition was
+protocol-tested without selected-runtime installation at that checkpoint. Complete
+external configured pacing/credit/proxy
 owners, full SW-11, nested allocator/inventory acceptance and full stage/native/
 platform/performance qualification remain open. The receipt separates compiler,
 test and strict-check time and records exact unchanged-input evidence reuse.

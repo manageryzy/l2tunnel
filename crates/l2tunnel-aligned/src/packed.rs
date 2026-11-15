@@ -372,6 +372,11 @@ impl Endpoint {
     pub fn tick(&mut self, now: Duration) -> Result<(), Error> {
         self.0.tick(now)
     }
+    /// Actual next recovery ACK deadline, excluding data and native work.
+    pub fn feedback_deadline(&self) -> Option<Duration> {
+        self.0.feedback_deadline()
+    }
+
     /// Earliest original packing/recovery/receiver/source-handoff deadline.
     pub fn deadline(&self) -> Option<Duration> {
         self.0.deadline()

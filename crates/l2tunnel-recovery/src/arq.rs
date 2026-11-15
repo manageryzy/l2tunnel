@@ -377,6 +377,23 @@ impl SelectiveRepeat {
         self.0.ack_at
     }
 
+    /// Borrow retained authenticated sources, including those beyond an older gap.
+    ///
+    /// Iteration is bounded by the receive-record limit and has no ordering
+    /// promise. Observation does not consume sources, advance the ordered
+    /// delivery cursor or establish application/physical completion. A consumer
+    /// using these bytes early must retain its own deduplication and gap state.
+    pub fn received_sources(
+        &self,
+    ) -> Result<impl Iterator<Item = (SourceId, &[u8])>, RecoveryError> {
+        self.0.running()?;
+        Ok(self
+            .0
+            .received
+            .iter()
+            .map(|(source, bytes)| (*source, bytes.as_slice())))
+    }
+
     /// Emit due feedback only, without advancing source attempts or source timers.
     /// Caller must charge this output to the same wire budget as data/repair copies.
     pub fn poll_feedback(

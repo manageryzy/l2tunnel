@@ -49,11 +49,18 @@ the complete generic IPC/failure/fault/resource matrix and full cross-profile
 SW-11 remain open. Every complete catalog gate below retains its original
 definition and remains open.
 
-The [actual reserved common Engine checkpoint](modules/common-engine-storage.md)
+The preceding [actual reserved common Engine checkpoint](modules/common-engine-storage.md)
 protocol-tests real Swift/Aligned/Packed owners over the same actual reserved
 Pipeline/MUX/DRR. Paired pure tests and selected existing caller regressions do
-not install that owner in a carrier/runtime or qualify full SW-11. Mixed Bank,
-complete resources and all47 catalog gates retain their original definitions.
+not qualify full SW-11. The subsequent
+[mixed Bank](modules/common-record-bank.md),
+[shared native storage](modules/shared-native-storage.md),
+[native event counts](modules/common-native-counts.md) and
+[compact rolling records](modules/rolling-records.md) have finite protocol evidence.
+Unpacked Aligned independent-short delivery is implemented across an older gap;
+Packed/rolling early-short and their full matrices remain separate requirements.
+Complete resources, rolling runtime installation and all47 catalog gates retain
+their original definitions and remain open.
 
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s

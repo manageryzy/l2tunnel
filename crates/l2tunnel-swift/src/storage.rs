@@ -520,6 +520,18 @@ impl Entry<'_> {
         self.engine.poll_emission(now, number, allow_data)
     }
 
+    /// Produce whole feedback blocks under the caller's exact remaining allowance.
+    pub fn poll_emission_bounded(
+        &mut self,
+        now: u64,
+        number: records::RecordNumber,
+        allow_data: bool,
+        body_limit: usize,
+    ) -> Result<Option<records::Emission<'_>>, records::Error> {
+        self.engine
+            .poll_emission_bounded(now, number, allow_data, body_limit)
+    }
+
     /// Produce an existing numbered body without allocation or ownership escape.
     pub fn poll(
         &mut self,

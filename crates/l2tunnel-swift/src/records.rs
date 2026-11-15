@@ -565,6 +565,39 @@ impl Engine {
         !self.body.is_empty()
     }
 
+    fn feedback_bounded(&mut self, now: u64, limit: usize) -> bool {
+        if now < self.feedback_at || limit < crate::FEEDBACK_HEADER {
+            return false;
+        }
+        self.body.clear();
+        let first = self.feedback_turn;
+        let mut deferred = None;
+        for step in 0..self.receive.channels {
+            let channel = (first + step) % self.receive.channels;
+            if !self.receivers[channel].preview_feedback(now, &mut self.block) {
+                continue;
+            }
+            if self.body.len() + self.block.len() > limit {
+                if deferred.is_none() {
+                    deferred = Some(channel);
+                }
+                continue;
+            }
+            self.block[0] = tagged(crate::KIND_FEEDBACK, channel);
+            self.body.extend_from_slice(&self.block);
+            self.receivers[channel].commit_feedback(now);
+        }
+        if self.body.is_empty() {
+            return false;
+        }
+        if let Some(channel) = deferred {
+            self.feedback_turn = channel;
+        } else {
+            self.feedback_at = now.saturating_add(self.send.codec.feedback_micros);
+        }
+        true
+    }
+
     fn data(&mut self, now: u64, number: RecordNumber) -> Result<Option<EmissionKind>, Error> {
         let channels = self.send.channels;
         let urgent = (0..channels)
@@ -620,6 +653,42 @@ impl Engine {
             kind,
             body: &self.body,
         }))
+    }
+
+    /// Emit under an explicit body allowance without changing the legacy poll.
+    /// Feedback consists of complete unchanged per-channel blocks. A block that
+    /// does not fit retains its debt, timers and repeats. Data is polled only
+    /// when its full configured maximum fits; no source identity is consumed on
+    /// a credit refusal. The caller still owns the full security number.
+    pub fn poll_emission_bounded(
+        &mut self,
+        now: u64,
+        number: RecordNumber,
+        allow_data: bool,
+        body_limit: usize,
+    ) -> Result<Option<Emission<'_>>, Error> {
+        let limit = body_limit.min(self.send.codec.datagram_bytes);
+        let kind = if self.feedback_bounded(now, limit) {
+            Some(EmissionKind::Feedback)
+        } else if allow_data && limit == self.send.codec.datagram_bytes {
+            self.data(now, number)?
+        } else {
+            None
+        };
+        Ok(kind.map(|kind| Emission {
+            kind,
+            body: &self.body,
+        }))
+    }
+
+    /// Earliest actual feedback time and one complete block's byte requirement.
+    /// This observation never consumes receiver state or changes channel service.
+    pub fn feedback_opportunity(&self) -> Option<(u64, usize)> {
+        self.receivers
+            .iter()
+            .filter_map(Receiver::feedback_opportunity)
+            .map(|(at, bytes)| (at.max(self.feedback_at), bytes))
+            .min()
     }
 
     /// Apply an already authenticated, replay-checked User record in workspace.
@@ -862,3 +931,7 @@ impl Engine {
 mod storage_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "records/bounded_feedback_tests.rs"]
+mod bounded_feedback_tests;
