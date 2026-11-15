@@ -577,6 +577,12 @@ impl Driver {
             configuration::DirectionProfile::Packed(config) => {
                 classify(body, config.base.recovery, self.info.role)?
             }
+            configuration::DirectionProfile::Rolling { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "rolling runtime work and carrier-output custody are not installed",
+                ));
+            }
         };
         if reader.disposition == transaction::ReadDisposition::Staged
             && kind != engine::EmissionKind::Feedback

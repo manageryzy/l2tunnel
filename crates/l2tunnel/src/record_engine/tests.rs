@@ -224,9 +224,9 @@ fn next(clock: &mut u64) -> Tick {
 pub(super) fn identity_channel(identity: ProfileIdentity) -> u16 {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index() as u16,
-        ProfileIdentity::Aligned(identity) | ProfileIdentity::Packed(identity) => {
-            u16::from(identity.channel.0)
-        }
+        ProfileIdentity::Aligned(identity)
+        | ProfileIdentity::Packed(identity)
+        | ProfileIdentity::Rolling(identity) => u16::from(identity.channel.0),
     }
 }
 
@@ -282,6 +282,11 @@ impl Link {
             configuration::DirectionProfile::Packed(config) => (
                 config.base.max_recovery_packet_bytes,
                 usize::from(config.max_units),
+                false,
+            ),
+            configuration::DirectionProfile::Rolling { config, .. } => (
+                configuration.descriptor().path_mtu(),
+                usize::from(config.packing.max_units),
                 false,
             ),
         };
@@ -615,7 +620,9 @@ fn roundtrip(
     for (identity, _) in accepted {
         match identity {
             ProfileIdentity::Swift(_) => assert!(data.units.is_empty()),
-            ProfileIdentity::Aligned(identity) | ProfileIdentity::Packed(identity) => {
+            ProfileIdentity::Aligned(identity)
+            | ProfileIdentity::Packed(identity)
+            | ProfileIdentity::Rolling(identity) => {
                 assert!(data.units.contains(&identity))
             }
         }
@@ -759,7 +766,9 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 forward.base.max_recovery_packet_bytes = 60_000;
                 reverse.base.max_recovery_packet_bytes = 60_000;
             }
-            configuration::Profile::Swift { .. } => return Err("aligned-family fixture".into()),
+            configuration::Profile::Swift { .. } | configuration::Profile::Rolling { .. } => {
+                return Err("aligned-family fixture".into());
+            }
         }
         let configuration = configuration::Configuration::new(
             original.envelope(),
@@ -780,7 +789,8 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 configuration::DirectionProfile::Packed(config) => {
                     (config.base.recovery, config.base.max_recovery_packet_bytes)
                 }
-                configuration::DirectionProfile::Swift(_) => {
+                configuration::DirectionProfile::Swift(_)
+                | configuration::DirectionProfile::Rolling { .. } => {
                     return Err("aligned-family direction".into());
                 }
             };
@@ -922,7 +932,8 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
         let lifetime = match configuration.descriptor().direction(Role::Client).profile() {
             configuration::DirectionProfile::Aligned(config) => config.receiver.lifetime_ticks,
             configuration::DirectionProfile::Packed(config) => config.base.receiver.lifetime_ticks,
-            configuration::DirectionProfile::Swift(_) => {
+            configuration::DirectionProfile::Swift(_)
+            | configuration::DirectionProfile::Rolling { .. } => {
                 return Err("aligned-family lifetime".into());
             }
         };

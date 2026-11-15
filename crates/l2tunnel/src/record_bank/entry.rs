@@ -3,6 +3,31 @@ use l2tunnel_codec::aligned_receiver::UnitWitness;
 use l2tunnel_pipeline::{Admission, PacketMetadata};
 use l2tunnel_reliable::OutboundBudget;
 
+/// Move-only actual pending carrier witness bound to its issuing Bank generation.
+/// This token does not prove physical completion; the caller must observe it.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CarrierOutputToken {
+    generation: GenerationId,
+    token: engine::CarrierOutputToken,
+}
+
+impl CarrierOutputToken {
+    /// Exact issuing Bank, slot and nonreusable generation.
+    pub const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
+    /// Actual record emission whose whole carrier ownership is still pending.
+    pub fn emission(&self) -> engine::Emission {
+        self.token.emission()
+    }
+
+    /// Original exact Engine context; this public label is not authentication.
+    pub fn context(&self) -> engine::Context {
+        self.token.context()
+    }
+}
+
 /// Exact local generation plus the original actual Engine completion token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeToken {
@@ -115,6 +140,42 @@ impl<'a> Entry<'a> {
     /// Service actual injected deadlines without reading a real clock.
     pub fn tick(&mut self, now: engine::Tick) -> Result<(), Error> {
         self.engine.tick(now).map_err(Error::Engine)
+    }
+    /// Observe the actual pending carrier handoff without confirming encoded bytes.
+    pub fn pending_carrier_output(&self) -> Option<CarrierOutputToken> {
+        self.engine
+            .pending_carrier_output()
+            .map(|token| CarrierOutputToken {
+                generation: self.generation,
+                token,
+            })
+    }
+    /// Confirm only a whole observed carrier handoff by the exact issuing owner.
+    /// A foreign/recycled generation refuses before advancing the actual Engine time.
+    pub fn confirm_carrier_output(
+        &mut self,
+        now: engine::Tick,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
+        if token.generation != self.generation {
+            return Err(Error::Stale);
+        }
+        self.engine
+            .confirm_carrier_output(now, token.token)
+            .map_err(Error::Engine)
+    }
+    /// Advance actual rolling work only within the caller's explicit GF/copy/visit caps.
+    /// Other profile families return no rolling result and retain their own service.
+    pub fn step(
+        &mut self,
+        now: engine::Tick,
+        work: l2tunnel_fec::rolling::WorkBudget,
+    ) -> Result<Option<crate::rolling_records::Step>, Error> {
+        self.engine.step(now, work).map_err(Error::Engine)
+    }
+    /// Actual packing/tail/feedback trigger, independent of an original expiry cap.
+    pub fn wake_at(&self) -> Result<Option<engine::Tick>, Error> {
+        self.engine.wake_at().map_err(Error::Engine)
     }
     /// Prepare into the caller's real free slot while retaining original age and identity.
     pub fn prepare_native(

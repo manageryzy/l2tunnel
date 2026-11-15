@@ -328,7 +328,7 @@ fn exact_lengths_tags_booleans_durations_and_narrow_integers_fail_closed() -> Re
     let mut extra = original.to_vec();
     extra.push(0);
     assert_eq!(Configuration::decode(&extra), Err(Error::Length));
-    for (offset, byte) in [(0, 0), (4, 1), (5, 0), (5, 4), (6, 0), (6, 3), (7, 1)] {
+    for (offset, byte) in [(0, 0), (4, 1), (5, 0), (5, 5), (6, 0), (6, 3), (7, 1)] {
         let mut changed = original;
         changed[offset] = byte;
         assert_eq!(Configuration::decode(&changed), Err(Error::Prefix));

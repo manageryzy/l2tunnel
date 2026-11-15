@@ -50,9 +50,9 @@ pub struct Step {
 }
 /// One actual directional sender, receiver, compact record stage and record ledger.
 ///
-/// Codec owners use their real reserved backing. Rolling owners retain their
-/// existing fallible conservative memory contracts; this is not a complete
-/// reserved common Engine/Bank or an authenticated runtime selection.
+/// Functional construction preserves the existing conservative contracts.
+/// Explicit reserved construction admits and observes the same actual nested
+/// codec/scheduler/scratch backing. Runtime and full shared resources stay separate.
 pub struct Endpoint {
     pub(super) instance: u64,
     pub(super) config: Config,
@@ -79,11 +79,21 @@ pub struct Endpoint {
     pub(super) prepared_native: Option<PreparedNative>,
     pub(super) next_native: u64,
     pub(super) next_channel: u16,
+    pub(super) usage: Option<storage::Usage>,
 }
 impl Endpoint {
     /// Construct real codec and rolling owners after complete scalar validation.
     /// Every tick in this composition is one injected microsecond.
     pub fn new(config: Config, context: Context, stream: u32, now: Tick) -> Result<Self, Error> {
+        Self::construct(config, context, stream, now, None)
+    }
+    pub(super) fn construct(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        reserved: Option<storage::Plan>,
+    ) -> Result<Self, Error> {
         config.validate()?;
         let digest = config.binding_digest(stream)?;
         if context.session == 0 || context.epoch == 0 {
@@ -165,18 +175,42 @@ impl Endpoint {
             },
         )
         .map_err(Error::Storage)?;
-        let sender = scheduler::Sender::new(
-            send_config.scheduler,
-            rolling_scope(send_direction),
-            rolling_tick(now),
-        )
-        .map_err(Error::Rolling)?;
-        let incoming = scheduler::Receiver::new(
-            receive_config.scheduler,
-            rolling_scope(receive_direction),
-            rolling_tick(now),
-        )
-        .map_err(Error::Rolling)?;
+        let sender = if let Some(plan) = reserved {
+            scheduler::Sender::new_reserved(
+                send_config.scheduler,
+                rolling_scope(send_direction),
+                rolling_tick(now),
+                rolling::storage::Limits {
+                    capacity_bytes: plan.sender.capacity_bytes(),
+                },
+            )
+            .map_err(Error::RollingStorage)?
+        } else {
+            scheduler::Sender::new(
+                send_config.scheduler,
+                rolling_scope(send_direction),
+                rolling_tick(now),
+            )
+            .map_err(Error::Rolling)?
+        };
+        let incoming = if let Some(plan) = reserved {
+            scheduler::Receiver::new_reserved(
+                receive_config.scheduler,
+                rolling_scope(receive_direction),
+                rolling_tick(now),
+                rolling::storage::Limits {
+                    capacity_bytes: plan.incoming.capacity_bytes(),
+                },
+            )
+            .map_err(Error::RollingStorage)?
+        } else {
+            scheduler::Receiver::new(
+                receive_config.scheduler,
+                rolling_scope(receive_direction),
+                rolling_tick(now),
+            )
+            .map_err(Error::Rolling)?
+        };
         Ok(Self {
             instance: allocate_instance()?,
             config,
@@ -203,6 +237,7 @@ impl Endpoint {
             prepared_native: None,
             next_native: 1,
             next_channel: 0,
+            usage: None,
         })
     }
     pub(super) fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
@@ -623,6 +658,21 @@ impl Endpoint {
             .chain(self.incoming.wake_at().map(|t| Tick(t.0)))
             .chain(self.packing.deadline_micros().map(Tick))
             .min()
+    }
+    /// Service original hard bounds without performing hidden GF work.
+    pub fn tick(&mut self, now: Tick) -> Result<(), Error> {
+        self.advance(now)
+    }
+    /// Genuine pending/first-event feedback service requirement, not native delivery.
+    pub fn feedback_opportunity(&self) -> Option<(Tick, usize)> {
+        let status = self.incoming.status();
+        if status.feedback_ready || status.feedback_building {
+            Some((self.now, scheduler::FEEDBACK_BYTES))
+        } else {
+            status
+                .feedback_due
+                .map(|at| (Tick(at.0), scheduler::FEEDBACK_BYTES))
+        }
     }
     /// Actual retained directional scheduler state, without inferred capability.
     pub fn sender_status(&self) -> scheduler::SenderStatus {

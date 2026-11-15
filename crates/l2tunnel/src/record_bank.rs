@@ -12,9 +12,11 @@ use std::{
 mod entry;
 /// Complete actual retained layout and typed construction/custody refusals.
 pub mod storage;
-pub use entry::{Entry, NativePreparation, NativeToken, PreparedNative};
+pub use entry::{CarrierOutputToken, Entry, NativePreparation, NativeToken, PreparedNative};
 pub use storage::Error;
 
+#[cfg(test)]
+mod carrier_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

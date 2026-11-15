@@ -27,6 +27,13 @@ fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
                 reverse.base.recovery.outer_overhead_bytes = overhead;
                 c::Profile::Packed { forward, reverse }
             }
+            c::Profile::Rolling { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "three-family runtime fixture does not install rolling work or carrier custody",
+                )
+                .into());
+            }
         };
         *output = C::new(
             value.envelope(),

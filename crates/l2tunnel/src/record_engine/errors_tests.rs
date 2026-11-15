@@ -301,6 +301,7 @@ fn late_actual_physical_receipt_counts_once_but_never_completes_expired_owner() 
             context: engine.context,
             digest: engine.digest,
             serial: 1,
+            rolling: None,
             identity: ProfileIdentity::Swift(swift::records::NativeIdentity {
                 channel,
                 record: swift::records::NativeRecordId(0),

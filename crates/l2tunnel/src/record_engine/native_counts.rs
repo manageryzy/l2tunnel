@@ -102,9 +102,9 @@ impl Counts {
 fn identity_channel(identity: ProfileIdentity) -> usize {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index(),
-        ProfileIdentity::Aligned(identity) | ProfileIdentity::Packed(identity) => {
-            usize::from(identity.channel.0)
-        }
+        ProfileIdentity::Aligned(identity)
+        | ProfileIdentity::Packed(identity)
+        | ProfileIdentity::Rolling(identity) => usize::from(identity.channel.0),
     }
 }
 

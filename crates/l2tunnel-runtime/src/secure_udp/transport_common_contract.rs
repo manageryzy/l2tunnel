@@ -457,5 +457,9 @@ pub(super) fn maximum_body(view: common::DirectionView<'_>) -> io::Result<usize>
         common::DirectionProfile::Packed(config) => {
             config.base.recovery.maximum_packet_bytes().map_err(invalid)
         }
+        common::DirectionProfile::Rolling { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rolling runtime requires explicit bounded GF service and carrier-output confirmation",
+        )),
     }
 }

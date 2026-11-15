@@ -2,7 +2,7 @@
 //!
 //! Callers retain authentication, replay, shared pacing, carrier handoff and
 //! physical native completion authority. No runtime, socket or clock is created.
-//! This is functional composition; complete mixed-Bank resources remain separate.
+//! Actual functional/reserved composition stays separate from full mixed-Bank resources.
 
 use crate::{codec, fec::rolling, record_engine};
 use codec::{aligned_receiver as receiver, packed_envelope, packed_sender};
@@ -23,6 +23,8 @@ fn allocate_instance() -> Result<u64, Error> {
 mod config;
 mod endpoint;
 mod native;
+/// Exact backing of the actual codec, rolling schedulers and scratch owners.
+pub mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -72,6 +74,17 @@ pub enum Error {
     Envelope(packed_envelope::Error),
     /// Actual fallible codec backing returned this failure.
     Storage(codec::aligned_storage::Error),
+    /// Exact actual rolling scheduler backing refused construction or observation.
+    RollingStorage(rolling::storage::Error),
+    /// Complete retained heap exceeds its original explicit allowance.
+    Capacity {
+        /// Complete actual requested heap capacity.
+        required: usize,
+        /// Original supplied allowance.
+        limit: usize,
+    },
+    /// Actual nested/scratch capacities differ from the admitted complete plan.
+    StorageInvariant,
     /// A real scratch reservation failed.
     Allocation,
 }

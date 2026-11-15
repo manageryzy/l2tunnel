@@ -37,6 +37,8 @@ pub enum Error {
     Swift(swift::storage::Error),
     /// Actual Aligned/Packed backing failed.
     Aligned(aligned::storage::Error),
+    /// Actual complete codec/rolling/scratch backing refused.
+    Rolling(rolling_records::Error),
     /// A complete layout or allocation count cannot be represented.
     Layout,
     /// Complete actual owner exceeds its explicit allowance.
@@ -62,9 +64,20 @@ enum RecordPlan {
     Swift(swift::storage::Plan),
     Aligned(aligned::storage::Plan),
     Packed(aligned::storage::Plan),
+    Rolling(rolling_records::storage::Plan),
 }
 impl RecordPlan {
     fn for_engine(config: &configuration::Configuration, context: Context) -> Result<Self, Error> {
+        if let configuration::Profile::Rolling { config, stream } = config.descriptor().profile() {
+            return rolling_records::storage::Plan::for_endpoint(
+                *config,
+                context,
+                *stream,
+                Tick(0),
+            )
+            .map(Self::Rolling)
+            .map_err(Error::Rolling);
+        }
         let local = config.descriptor().local(context.role);
         match (local.send().profile(), local.receive().profile()) {
             (
@@ -92,6 +105,7 @@ impl RecordPlan {
         match self {
             Self::Swift(plan) => plan.capacity_bytes(),
             Self::Aligned(plan) | Self::Packed(plan) => plan.capacity_bytes(),
+            Self::Rolling(plan) => plan.capacity_bytes(),
         }
     }
     fn construct(self, context: Context) -> Result<Owner, Error> {
@@ -125,6 +139,14 @@ impl RecordPlan {
             )
             .map(Owner::Packed)
             .map_err(Error::Aligned),
+            Self::Rolling(plan) => rolling_records::Endpoint::new_reserved(
+                plan,
+                rolling_records::storage::Limits {
+                    capacity_bytes: plan.capacity_bytes(),
+                },
+            )
+            .map(Owner::Rolling)
+            .map_err(Error::Rolling),
         }
     }
 }

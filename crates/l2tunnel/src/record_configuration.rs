@@ -4,6 +4,7 @@
 //! opens no device, authenticates no label, reserves no engine and does not
 //! install Active, native-credit or TCP-proxy protocols by naming their policy.
 
+use crate::rolling_records;
 use l2tunnel_aligned as aligned;
 use l2tunnel_codec::{aligned_body, aligned_receiver};
 use l2tunnel_core::{ConfigDigest, Duplex, Mapping, traffic};
@@ -16,6 +17,8 @@ use l2tunnel_reliable::ReliableConfig;
 use l2tunnel_swift::{self as swift, records};
 use ring::digest;
 use std::{fmt, time::Duration};
+
+mod rolling;
 
 /// Fixed magic/version/profile/duplex/reserved/MTU header size.
 pub const HEADER_BYTES: usize = 16;
@@ -59,7 +62,7 @@ pub enum Error {
     Rate,
     /// Native delivery-window scalar validation refused the value.
     Window,
-    /// Complete Swift, Aligned or Packed scalar validation refused the value.
+    /// Complete actual record-family scalar validation refused the value.
     Profile,
     /// Channel, native-format or native-window bounds disagree across policies.
     Relation,
@@ -213,6 +216,13 @@ pub enum Profile {
         /// Complete global reverse packed direction.
         reverse: aligned::packed::Config,
     },
+    /// Actual compact records over causal local/global rolling recovery.
+    Rolling {
+        /// Both complete directions, exact wire geometry and original native cap.
+        config: rolling_records::Config,
+        /// Exact authenticated coding stream, independent of native record IDs.
+        stream: u32,
+    },
 }
 /// Borrowed exact directional record policy; no engine or admission authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +233,17 @@ pub enum DirectionProfile<'a> {
     Aligned(&'a aligned::Config),
     /// Complete existing Packed data-direction policy.
     Packed(&'a aligned::packed::Config),
+    /// Complete actual rolling direction and its authenticated shared binding.
+    Rolling {
+        /// Actual codec, recovery, scheduling and native policy.
+        config: &'a rolling_records::DirectionConfig,
+        /// Exact full-wire charge outside this directional record.
+        overhead_bytes: usize,
+        /// Original native custody cap, shared by both directions.
+        native_stall_micros: u64,
+        /// Exact coding stream, shared by both directions.
+        stream: u32,
+    },
 }
 impl DirectionProfile<'_> {
     /// Exact installed width; no modulo or opposite-direction substitution.
@@ -231,6 +252,7 @@ impl DirectionProfile<'_> {
             Self::Swift(config) => config.channels,
             Self::Aligned(config) => usize::from(config.receiver.channels),
             Self::Packed(config) => usize::from(config.base.receiver.channels),
+            Self::Rolling { config, .. } => usize::from(config.receiver.channels),
         }
     }
     /// Original native maximum, separate from source and output packet maxima.
@@ -239,6 +261,7 @@ impl DirectionProfile<'_> {
             Self::Swift(config) => config.max_native,
             Self::Aligned(config) => config.receiver.body.max_frame_bytes,
             Self::Packed(config) => config.base.receiver.body.max_frame_bytes,
+            Self::Rolling { config, .. } => config.receiver.body.max_frame_bytes,
         }
     }
     fn layer(self) -> traffic::NetworkLayer {
@@ -249,6 +272,7 @@ impl DirectionProfile<'_> {
             },
             Self::Aligned(config) => native_layer(config.native_policy),
             Self::Packed(config) => native_layer(config.base.native_policy),
+            Self::Rolling { config, .. } => native_layer(config.native_policy),
         }
     }
     fn validate(self) -> Result<(), Error> {
@@ -256,6 +280,7 @@ impl DirectionProfile<'_> {
             Self::Swift(config) => config.validate().map_err(|_| Error::Profile),
             Self::Aligned(config) => config.validate().map_err(|_| Error::Profile),
             Self::Packed(config) => config.validate().map_err(|_| Error::Profile),
+            Self::Rolling { config, .. } => config.validate().map_err(|_| Error::Profile),
         }
     }
 }
@@ -364,6 +389,20 @@ impl Descriptor {
                 forward: a,
                 reverse: b,
             } => DirectionProfile::Packed(if forward { a } else { b }),
+            Profile::Rolling { config, stream } => DirectionProfile::Rolling {
+                config: if forward {
+                    &config.forward
+                } else {
+                    &config.reverse
+                },
+                overhead_bytes: if forward {
+                    config.geometry.forward_overhead_bytes
+                } else {
+                    config.geometry.reverse_overhead_bytes
+                },
+                native_stall_micros: config.native_stall_micros,
+                stream: *stream,
+            },
         };
         DirectionView {
             common: if forward {
@@ -400,6 +439,9 @@ impl Descriptor {
         let reverse = self.direction(Role::Server);
         forward.profile.validate()?;
         reverse.profile.validate()?;
+        if let Profile::Rolling { config, .. } = self.profile {
+            config.validate().map_err(|_| Error::Profile)?;
+        }
         if let Profile::Swift { forward, reverse } = self.profile
             && (forward.layer != reverse.layer
                 || forward.max_native == 0
@@ -467,7 +509,7 @@ impl Descriptor {
             return Err(Error::Prefix);
         }
         let tag = reader.byte()?;
-        if !(1..=3).contains(&tag) {
+        if !(1..=4).contains(&tag) {
             return Err(Error::Prefix);
         }
         let duplex = match reader.byte()? {
@@ -491,6 +533,7 @@ impl Descriptor {
             match tag {
                 1 => padding(&slot[SWIFT_BYTES..])?,
                 2 => padding(&slot[ALIGNED_BYTES..])?,
+                4 => padding(&slot[rolling::ACTIVE_BYTES..])?,
                 _ => {}
             }
         }
@@ -510,6 +553,7 @@ impl Descriptor {
                 forward: decode_packed(a)?,
                 reverse: decode_packed(b)?,
             },
+            4 => rolling::decode_pair(a, b)?,
             _ => return Err(Error::Prefix),
         };
         let value = Self::new(path_mtu, duplex, forward, reverse, profile)?;
@@ -524,6 +568,7 @@ fn profile_tag(profile: Profile) -> u8 {
         Profile::Swift { .. } => 1,
         Profile::Aligned { .. } => 2,
         Profile::Packed { .. } => 3,
+        Profile::Rolling { .. } => 4,
     }
 }
 
@@ -1020,6 +1065,12 @@ fn encode_profile(profile: DirectionProfile<'_>, output: &mut [u8]) -> Result<()
             writer.size(config.work_limit)?;
             writer.finish()
         }
+        DirectionProfile::Rolling {
+            config,
+            overhead_bytes,
+            native_stall_micros,
+            stream,
+        } => rolling::encode(*config, overhead_bytes, native_stall_micros, stream, output),
     }
 }
 fn encode_swift(config: records::Config, output: &mut [u8]) -> Result<(), Error> {
@@ -1249,5 +1300,7 @@ fn decode_packed(input: &[u8]) -> Result<aligned::packed::Config, Error> {
     Ok(value)
 }
 
+#[cfg(test)]
+mod rolling_tests;
 #[cfg(test)]
 mod tests;

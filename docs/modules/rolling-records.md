@@ -1,7 +1,13 @@
 # Compact records over actual rolling recovery
 
 Status: **implemented pure composition; four focused protocol tests and named
-pure checkpoint checks passed**.
+pure checkpoint checks passed on their recorded inputs**. The subsequent
+[actual common-family configuration/Engine/storage slice](rolling-common-records.md)
+has two real Engine cases, a real Bank carrier-token case, tag4 negatives and
+legacy vectors passing in the [failed26/27 combined receipt](../../work/parallel-features-20261115/parallel-wave2-cases-attempt-1/validation.json).
+Its repaired tag4 literal fixture and six-package strict checks subsequently
+[passed in their named scopes](../../work/parallel-features-20261115/parallel-wave2-rolling-scoped-validation.json);
+these are not selected-runtime evidence.
 The saved Linux checks establish actual byte/identity/custody behavior below, not
 a selected runtime or a physical native-device path.
 This additive lane addresses the missing compact-record-to-rolling composition in
@@ -45,10 +51,11 @@ reported as exact complete common Engine/Bank Usage or full allocator proof.
 `binding_digest(stream)` additionally binds the exact coding stream under its own
 version-one domain. The selected carrier/session must authenticate that actual
 binding and its session/epoch/role before installing the endpoint. These helpers
-confer no authentication authority. Existing Swift/Mode/CompleteV2 encodings and
-legacy rolling-session digests remain unchanged; CompleteV2 currently has no
-installed rolling variant. Full common configuration/catalog/Bank negotiation is
-an explicit integration prerequisite, not inferred from this standalone API.
+confer no authentication authority. Existing Swift/Mode, CompleteV2 tags1..3 and legacy rolling-session encodings
+and digests remain unchanged. The subsequent common-family slice adds explicit
+tag4 inside the existing CompleteV2 slot, binding all rolling fields and stream.
+Full selected common-session/runtime installation remains separate from this
+standalone API and the new pure configuration/Engine/Bank integration.
 
 ## Exact functional adapter
 
@@ -135,26 +142,25 @@ authenticated peer identity or a physical fence.
 
 ## Source-bound common-session integration gaps
 
-These are remaining engineering dependencies, not new owner decisions.
-`record_configuration::Profile` and its CompleteV2 canonical encoding currently
-install Swift, Aligned and Packed, with no rolling descriptor. A rolling addition
-must retain every `DirectionConfig` field, the independent outer overheads,
-`native_stall_micros` and explicit stream binding, and preserve existing canonical
-bytes/digests. Representation alone cannot install rolling in the catalog, Engine
-or two-generation Bank; the encoding/version and migration contract still need
-an explicit integration contract.
-
-`Endpoint` already supplies actual borrowed Pipeline admission, output identity,
-unit witnesses, authenticated-input parsing and retained native tokens. It does
-not yet supply the common Engine's authoritative per-channel sent/prepared/
-committed native-count and fence interface. Its aggregate `Statistics` cannot be
-substituted for those per-channel proofs, and rolling source/repair IDs cannot
-serve as native counts. Complete real backing Plan/Usage and retirement/error
-accounting also remain prerequisites for a reserved mixed-Bank selection.
+These are engineering dependencies, not new owner decisions. The subsequent
+[common-family slice](rolling-common-records.md) implements CompleteV2 tag4 with
+all directional fields, outer overheads, native stall and explicit stream, plus
+actual Engine construction, complete heap-only Plan/Usage, per-channel event
+observations and retained carrier/native tokens. Two actual Engine cases, one
+Bank case, strict tag4 negatives and legacy byte/digest vectors passed in the
+[failed26/27 aggregate](../../work/parallel-features-20261115/parallel-wave2-cases-attempt-1/validation.json).
+The one literal failure was an omitted expected reverse packing-symbol word17
+override192→224; that fixture-only correction passed its exact rerun, and
+six-package strict checks passed in the
+[named receipt](../../work/parallel-features-20261115/parallel-wave2-rolling-scoped-validation.json).
+The original standalone aggregate Statistics never substitutes for
+those per-channel observations or authenticated physical fences. Root's Bank
+adds issuing-generation custody; this is not selected runtime installation.
 
 The current common Noise/member path hands `member::Parts` to
-`transport::run_common`, whose contract/catalog and Bank select the existing three
-record families. It must explicitly authenticate the complete rolling binding,
+`transport::run_common`, whose selected runtime contract currently installs the original three
+record families. The additive rolling pure Engine/Bank slice does not install
+that runtime path. It must explicitly authenticate the complete rolling binding,
 service its actual feedback/debt/retained output through the same selected carrier,
 and route native completion to the issuing generation. No new authentication,
 transport or transaction state machine is supplied by this pure endpoint. Shared
@@ -219,11 +225,11 @@ rustdoc generation. Commands, exact filters, binary/input hashes and logs remain
 in those receipts; no receipt is rewritten or promoted to a full workspace check.
 
 The [named pure checkpoint](../../work/parallel-features-20261115/pure-scoped-checkpoint-validation.json)
-consolidates these four cases within 49 distinct saved pure passes. All five
-rolling files and the actual packed/record-receiver/rolling-FEC dependency inputs
-remain unchanged from their passing source-bound execution. New Swift feedback
-and read-only Reliable/Aligned feedback-deadline APIs do not alter this path.
-All 30 named pure inputs match the strict-check snapshots. The
+consolidated these four cases within49 distinct saved pure passes at its recorded
+freeze. The five rolling files and actual packed/record-receiver/rolling-FEC
+inputs then matched their source-bound executions, as did all30 named pure
+inputs and strict-check snapshots. The subsequent common-family changes are
+new inputs and are not qualified by that historical hash comparison. The
 [five-package strict receipt](../../work/parallel-features-20261115/pure-checkpoint-checks-attempt-1/validation.json)
 passes format checking, strict all-target/all-feature Clippy and rustdoc in
 25.255 seconds. No functional tests were added or rerun for this checkpoint.

@@ -59,7 +59,7 @@ impl Engine {
         } else {
             self.next_channel + 1
         };
-        let step = match self.owner.extract(now, channel, work, output) {
+        let step = match self.owner.extract(now, channel, work, deadline, output) {
             Ok(step) => step,
             Err(error) => return self.fail(error),
         };
@@ -86,6 +86,12 @@ impl Engine {
                         digest: self.digest,
                         serial,
                         identity,
+                        rolling: match &self.owner {
+                            Owner::Rolling(endpoint) => {
+                                Some(endpoint.pending_native().ok_or(Error::Invariant)?.token())
+                            }
+                            _ => None,
+                        },
                     },
                     bytes,
                     early,
@@ -129,6 +135,14 @@ impl Engine {
         self.statistics.committed = next;
         self.native_counts.commit(channel, committed);
         self.pending = None;
+        if matches!(&self.owner, Owner::Rolling(_)) {
+            let result = self.owner.commit(now);
+            timing?;
+            return match result {
+                Ok(()) => Ok(()),
+                Err(error) => self.fail(error),
+            };
+        }
         timing?;
         match self.owner.commit(now) {
             Ok(()) => Ok(()),

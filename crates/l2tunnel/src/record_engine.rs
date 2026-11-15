@@ -5,6 +5,7 @@
 //! neither is a mixed-generation runtime bank. No carrier or clock is selected.
 
 use crate::record_configuration as configuration;
+use crate::rolling_records;
 use l2tunnel_aligned as aligned;
 use l2tunnel_codec::aligned_receiver as receiver;
 use l2tunnel_core::{ConfigDigest, traffic::TcpControl};
@@ -19,10 +20,14 @@ mod errors_tests;
 /// Complete actual reserved backing of one common record Engine.
 pub mod storage;
 
+mod carrier;
 mod native;
+pub use carrier::CarrierOutputToken;
 mod native_counts;
 pub use native_counts::NativeCounts;
 mod owner;
+#[cfg(test)]
+pub(crate) mod rolling_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]
@@ -69,6 +74,8 @@ pub enum ProfileIdentity {
     Aligned(receiver::RecordIdentity),
     /// Packed body identity, retaining its original ordered channel.
     Packed(receiver::RecordIdentity),
+    /// Compact rolling body identity, separate from recovery source/repair IDs.
+    Rolling(receiver::RecordIdentity),
 }
 
 /// Actual source-producing branch, without authentication authority.
@@ -164,6 +171,8 @@ pub enum Error {
     Storage(swift::storage::Error),
     /// Actual Aligned/Packed record failure.
     Aligned(aligned::Error),
+    /// Actual compact-record/rolling composition or backing failure.
+    Rolling(rolling_records::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -211,14 +220,15 @@ pub struct Statistics {
 
 /// Local, non-authenticating token for one immutable prepared native packet.
 ///
-/// It is meaningful only with its issuing Engine. A future generation bank must
-/// additionally bind its own unique set/generation identity.
+/// It is meaningful only with its issuing Engine. A generation Bank additionally
+/// binds its own unique instance/slot/generation identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeToken {
     context: Context,
     digest: ConfigDigest,
     serial: u64,
     identity: ProfileIdentity,
+    rolling: Option<rolling_records::NativeToken>,
 }
 
 /// Immutable metadata for the caller-owned output slot retained through I/O.
@@ -486,6 +496,12 @@ impl Engine {
         unit_witnesses: &mut [receiver::UnitWitness],
     ) -> Result<Option<Emission>, Error> {
         self.advance(now)?;
+        if let Some(pending) = self.pending_carrier_output() {
+            if let Err(error) = self.owner.tick(now) {
+                return self.fail(error);
+            }
+            return Ok(Some(pending.emission()));
+        }
         if output.len() < self.send_max {
             return Err(Error::Output {
                 required: self.send_max,
@@ -537,6 +553,7 @@ impl Engine {
         match self.owner.accept(now, security_number, kind, body) {
             Ok(()) => Ok(()),
             Err(Error::Aligned(error)) if error.is_backpressure() => Err(Error::Aligned(error)),
+            Err(Error::Rolling(error)) if error.is_backpressure() => Err(Error::Rolling(error)),
             Err(error) => self.fail(error),
         }
     }
@@ -548,6 +565,33 @@ impl Engine {
             Ok(()) => Ok(()),
             Err(error) => self.fail(error),
         }
+    }
+
+    /// Service actual rolling GF/copy/metadata work under explicit component caps.
+    /// Other actual families retain their existing tick behavior and return None.
+    pub fn step(
+        &mut self,
+        now: Tick,
+        work: crate::fec::rolling::WorkBudget,
+    ) -> Result<Option<rolling_records::Step>, Error> {
+        self.advance(now)?;
+        let result = match &mut self.owner {
+            Owner::Rolling(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
+            owner => owner.tick(now).map(|()| None),
+        };
+        match result {
+            Ok(step) => Ok(step),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Earliest original expiry or actual rolling packing/tail/feedback trigger.
+    pub fn wake_at(&self) -> Result<Option<Tick>, Error> {
+        let deadline = self.deadline()?;
+        Ok(match &self.owner {
+            Owner::Rolling(endpoint) => deadline.into_iter().chain(endpoint.wake_at()).min(),
+            _ => deadline,
+        })
     }
 
     /// Earliest actual owner or retained native deadline, without reading a clock.
@@ -642,6 +686,11 @@ fn parameters(
         return Err(Error::Configuration);
     }
     let descriptor = configuration.descriptor();
+    if let configuration::Profile::Rolling { config, .. } = descriptor.profile()
+        && (config.geometry != geometry || config.native_stall_micros != native_limits.stall_micros)
+    {
+        return Err(Error::Geometry);
+    }
     for (role, overhead) in [
         (Role::Client, geometry.forward_overhead_bytes),
         (Role::Server, geometry.reverse_overhead_bytes),
@@ -715,6 +764,18 @@ fn dimensions(
                 .map_err(|_| Error::Configuration)?,
             usize::from(config.max_units),
             Some(config.base.recovery.outer_overhead_bytes),
+        ),
+        configuration::DirectionProfile::Rolling {
+            config,
+            overhead_bytes,
+            ..
+        } => (
+            config
+                .maximum_packet_bytes()
+                .map_err(Error::Rolling)?
+                .max(crate::fec::rolling::scheduler::FEEDBACK_BYTES),
+            usize::from(config.packing.max_units),
+            Some(overhead_bytes),
         ),
     })
 }

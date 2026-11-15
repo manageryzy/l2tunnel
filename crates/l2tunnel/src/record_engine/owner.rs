@@ -2,6 +2,7 @@ use super::{
     Context, Emission, EmissionKind, Error, NativeStep, ProfileIdentity, SourceForm, Tick, aligned,
     configuration, duration, receiver, swift,
 };
+use crate::rolling_records;
 use l2tunnel_recovery::{EndpointRole, RecoveryContext};
 use l2tunnel_reliable::{OutboundBudget, RecordKind};
 use swift::records;
@@ -11,6 +12,7 @@ pub(super) enum Owner {
     Swift(swift::storage::Owned),
     Aligned(aligned::Endpoint),
     Packed(aligned::packed::Endpoint),
+    Rolling(rolling_records::Endpoint),
 }
 
 impl Owner {
@@ -26,12 +28,22 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .storage_usage()
                 .map(|u| (u.capacity_bytes, u.allocations)),
+            Self::Rolling(endpoint) => endpoint
+                .storage_usage()
+                .map(|u| (u.capacity_bytes, u.allocations)),
         }
     }
     pub(super) fn new(
         configuration: &configuration::Configuration,
         context: Context,
     ) -> Result<Self, Error> {
+        if let configuration::Profile::Rolling { config, stream } =
+            configuration.descriptor().profile()
+        {
+            return rolling_records::Endpoint::new(*config, context, *stream, Tick(0))
+                .map(Self::Rolling)
+                .map_err(Error::Rolling);
+        }
         let local = configuration.descriptor().local(context.role);
         let recovery = recovery_context(context);
         match (local.send().profile(), local.receive().profile()) {
@@ -104,6 +116,10 @@ impl Owner {
                     Err(error) => Err(Error::Aligned(error)),
                 }
             }
+            Self::Rolling(endpoint) => endpoint
+                .enqueue_admitted_identified(now, channel, bytes)
+                .map(|identity| identity.map(ProfileIdentity::Rolling))
+                .map_err(Error::Rolling),
         }
     }
 
@@ -189,6 +205,25 @@ impl Owner {
                     overhead,
                 },
             ),
+            Self::Rolling(endpoint) => {
+                // Only explicit Engine::step budgets perform GF work. This
+                // zero-work service pumps already-ready codec/source ownership.
+                endpoint
+                    .step(now, crate::fec::rolling::WorkBudget::default())
+                    .map_err(Error::Rolling)?;
+                endpoint
+                    .prepare_output(now, number, allow_data, out, budget, witnesses)
+                    .map(|prepared| {
+                        prepared.map(|p| Emission {
+                            bytes: p.bytes,
+                            kind: p.kind,
+                            wire_bytes: p.wire_bytes,
+                            security_number: p.security_number,
+                            witnesses: p.witnesses,
+                        })
+                    })
+                    .map_err(Error::Rolling)
+            }
         }
     }
 
@@ -231,6 +266,9 @@ impl Owner {
                     .receive_authenticated(body, duration(now))
                     .map_err(Error::Aligned)
             }
+            Self::Rolling(endpoint) => endpoint
+                .accept_authenticated(now, kind, body)
+                .map_err(Error::Rolling),
         }
     }
 
@@ -239,6 +277,7 @@ impl Owner {
         now: Tick,
         channel: receiver::ChannelId,
         work: usize,
+        original_deadline: Tick,
         out: &mut [u8],
     ) -> Result<NativeStep, Error> {
         match self {
@@ -272,6 +311,19 @@ impl Owner {
                     .map_err(Error::Aligned)?;
                 copy_delivery(prepared, endpoint.pending(), out, ProfileIdentity::Packed)
             }
+            Self::Rolling(endpoint) => match endpoint
+                .prepare_native(now, work, original_deadline, out)
+                .map_err(Error::Rolling)?
+            {
+                rolling_records::NativePreparation::Idle => Ok(NativeStep::Idle),
+                rolling_records::NativePreparation::Progress => Ok(NativeStep::Progress),
+                rolling_records::NativePreparation::Ready(prepared) => Ok(NativeStep::Ready {
+                    identity: ProfileIdentity::Rolling(prepared.identity()),
+                    bytes: prepared.bytes(),
+                    early: prepared.early(),
+                }),
+                rolling_records::NativePreparation::AlreadyPending(_) => Err(Error::Invariant),
+            },
         }
     }
 
@@ -284,6 +336,10 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .commit_delivery(duration(now))
                 .map_err(Error::Aligned),
+            Self::Rolling(endpoint) => {
+                let token = endpoint.pending_native().ok_or(Error::Invariant)?.token();
+                endpoint.commit_native(now, token).map_err(Error::Rolling)
+            }
         }
     }
 
@@ -292,6 +348,9 @@ impl Owner {
             Self::Swift(_) => None,
             Self::Aligned(endpoint) => endpoint.pending_deadline(),
             Self::Packed(endpoint) => endpoint.pending_deadline(),
+            Self::Rolling(endpoint) => endpoint
+                .pending_native()
+                .map(|pending| duration(pending.deadline())),
         }
     }
 
@@ -300,6 +359,7 @@ impl Owner {
             Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Packed(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
+            Self::Rolling(endpoint) => endpoint.tick(now).map_err(Error::Rolling),
         }
     }
 
@@ -319,6 +379,7 @@ impl Owner {
                 endpoint.feedback_deadline(),
                 l2tunnel_reliable::ENVELOPE_BYTES + l2tunnel_recovery::ACK_PACKET_BYTES,
             ),
+            Self::Rolling(endpoint) => return Ok(endpoint.feedback_opportunity()),
         };
         at.map(|at| {
             u64::try_from(at.as_micros())
@@ -355,6 +416,7 @@ impl Owner {
                         .map_err(|_| Error::Arithmetic)
                 })
                 .transpose(),
+            Self::Rolling(endpoint) => Ok(endpoint.deadline()),
         }
     }
 
@@ -366,6 +428,7 @@ impl Owner {
             }
             Self::Aligned(endpoint) => Ok(endpoint.drained()),
             Self::Packed(endpoint) => Ok(endpoint.drained()),
+            Self::Rolling(endpoint) => Ok(endpoint.drained()),
         }
     }
 }
