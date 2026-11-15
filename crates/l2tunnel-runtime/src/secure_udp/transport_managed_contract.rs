@@ -108,14 +108,105 @@ impl CommonTransactionContract {
         settings: TransactionSettings,
         outer: AuthenticatedOuter,
     ) -> io::Result<Self> {
+        let native = carrier_native(&catalog)?;
+        let resource = resources.common_resource_digest(native)?;
+        Self::initial_on_carrier(
+            base_policy,
+            role,
+            resources,
+            cover,
+            ipv6,
+            base_envelope,
+            catalog,
+            settings,
+            outer,
+            resource,
+        )
+    }
+
+    /// Bind both endpoints' complete resources in fixed initiator/responder order.
+    /// The selected local owner still uses its exact role-specific template.
+    /// This explicit constructor supports asymmetric templates without deriving
+    /// different setup digests at the two authenticated endpoints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_on_carrier_paired(
+        base_policy: security::ConfigDigest,
+        role: security::Role,
+        resources: [Config; 2],
+        cover: cover::Config,
+        ipv6: bool,
+        base_envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        outer: AuthenticatedOuter,
+    ) -> io::Result<Self> {
+        let native = carrier_native(&catalog)?;
+        let mut pair = digest::Context::new(&digest::SHA256);
+        pair.update(b"l2tunnel/secure-udp-common-initial-carrier/paired-resources/v1\0");
+        for local in resources {
+            settings.validate(local)?;
+            if local.path_mtu != outer.requested().path_mtu
+                || covered_maximum(local, cover, false)? > outer.requested().max_record_bytes
+            {
+                return Err(invalid("paired resources exceed actual outer geometry"));
+            }
+            pair.update(&local.common_resource_digest(native)?.0);
+        }
+        let local = resources[match role {
+            security::Role::Initiator => 0,
+            security::Role::Responder => 1,
+        }];
+        let result = Self::initial_on_carrier(
+            base_policy,
+            role,
+            local,
+            cover,
+            ipv6,
+            base_envelope,
+            catalog,
+            settings,
+            outer,
+            core::ConfigDigest(finish(pair)),
+        )?;
+        let (peer_role, peer_resources) = match role {
+            security::Role::Initiator => (security::Role::Responder, resources[1]),
+            security::Role::Responder => (security::Role::Initiator, resources[0]),
+        };
+        // Validate the peer's complete catalog and message capacity without
+        // assigning this local authenticated proof to an opposite-role owner.
+        // This private temporary is discarded; only the genuine local result
+        // can be returned to the caller or transferred into a runtime.
+        Self::construct(
+            result.expected_configuration(),
+            peer_role,
+            peer_resources,
+            cover,
+            ipv6,
+            result.envelope(),
+            result.catalog().clone(),
+            settings,
+            None,
+            1,
+            None,
+        )?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initial_on_carrier(
+        base_policy: security::ConfigDigest,
+        role: security::Role,
+        resources: Config,
+        cover: cover::Config,
+        ipv6: bool,
+        base_envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        outer: AuthenticatedOuter,
+        resource: core::ConfigDigest,
+    ) -> io::Result<Self> {
         let descriptor = catalog.initial();
         validate_carrier(outer, role, resources, ipv6, descriptor)?;
-        let native = [mg::Role::Client, mg::Role::Server]
-            .into_iter()
-            .map(|role| descriptor.direction(role).max_native())
-            .max()
-            .ok_or_else(|| invalid("carrier native widths"))?;
-        let resource = resources.common_resource_digest(native)?;
         settings.validate(resources)?;
         if covered_maximum(resources, cover, false)? > outer.requested().max_record_bytes {
             return Err(invalid(
@@ -418,4 +509,13 @@ fn validate_carrier(
         return Err(invalid("selected original outer policy/geometry differs"));
     }
     Ok(())
+}
+
+fn carrier_native(catalog: &common::Catalog) -> io::Result<usize> {
+    let descriptor = catalog.initial();
+    [mg::Role::Client, mg::Role::Server]
+        .into_iter()
+        .map(|role| descriptor.direction(role).max_native())
+        .max()
+        .ok_or_else(|| invalid("carrier native widths"))
 }

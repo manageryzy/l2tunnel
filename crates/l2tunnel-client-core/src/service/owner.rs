@@ -155,6 +155,11 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             common::establish(&shared, &plan, accepted, deadline, profile)
         ),
+        #[cfg(unix)]
+        Transport::SecureUdpCommonCarrier { profile, outer } => selected!(
+            deadline,
+            common::carrier::establish(&shared, &plan, accepted, deadline, profile, outer)
+        ),
     }
 }
 

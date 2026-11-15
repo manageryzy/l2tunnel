@@ -9,7 +9,19 @@ Track implementation in the [checkbox ledger](implementation-checklist.md); deta
 [flow control](flow-control.md), [management/VXLAN/carriers](overlay-and-carriers.md)
 and [CLI/GUI clients](client-design.md) extend this architecture.
 
-The latest finite wave4 adds three functional components: an explicit
+The latest finite carrier integration now binds requested Common plans to
+genuine outer TLS/member proofs and runs the existing Noise/member and
+four-family Common Driver through the shared service on the original socket.
+Explicit OpenVPN-like CLI selection uses a complete outer policy and separately
+selected inner cover; status retains requested E0 and effective E1/catalog
+identities. See the [carrier service
+contract](modules/common-carrier-service.md) and [scoped
+evidence](../work/parallel-features-20261115/parallel-wave5-scoped-validation.json).
+This remains initial-only; automatic retained recovery, fresh-DH installation,
+production native CLI startup, full mode/resource/platform and performance gates
+remain open.
+
+The preceding finite wave4 adds three functional components: an explicit
 [initial-only Common runtime on the original public carrier](modules/managed-common-runtime.md),
 [typed fresh reconnect after backend failure](modules/generic-client-service.md)
 and [external Common control/inspection CLI](modules/common-client-api.md)

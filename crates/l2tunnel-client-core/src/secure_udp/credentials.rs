@@ -241,7 +241,13 @@ pub fn read_public(path: &std::path::Path) -> io::Result<[u8; 32]> {
 /// Parse the unchanged existing member PKCS#8 format from a bounded private file.
 #[cfg(unix)]
 pub fn read_member(path: &std::path::Path) -> io::Result<identity::IdentityKey> {
-    identity::IdentityKey::from_pkcs8(&read_file(path, 4096, true)?).map_err(io::Error::other)
+    identity::IdentityKey::from_pkcs8(&read_member_der(path)?).map_err(io::Error::other)
+}
+
+/// Read once for the maintained inner and TLS member parsers, with identical limits.
+#[cfg(unix)]
+pub(crate) fn read_member_der(path: &std::path::Path) -> io::Result<Zeroizing<Vec<u8>>> {
+    read_file(path, 4096, true)
 }
 
 #[cfg(test)]

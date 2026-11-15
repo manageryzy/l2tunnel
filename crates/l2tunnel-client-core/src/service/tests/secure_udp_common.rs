@@ -494,3 +494,6 @@ async fn actual_common_service_switches_swift_aligned_packed_swift_on_original_a
 
 #[path = "secure_udp_common_local.rs"]
 mod local_api;
+
+#[path = "secure_udp_common_carrier.rs"]
+mod original_carrier;

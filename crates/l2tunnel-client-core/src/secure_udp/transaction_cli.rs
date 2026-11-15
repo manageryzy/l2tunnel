@@ -438,17 +438,7 @@ struct DeliveryDto {
 impl DeliveryDto {
     fn build(self, wire_overhead: usize) -> delivery::Settings {
         delivery::Settings {
-            recovery: l2tunnel_recovery::ArqConfig {
-                max_source_bytes: self.recovery.max_source_bytes.0,
-                send_bytes: self.recovery.send_bytes.0,
-                receive_bytes: self.recovery.receive_bytes.0,
-                send_records: self.recovery.send_records.0,
-                receive_records: self.recovery.receive_records.0,
-                initial_rto: Duration::from_micros(self.recovery.initial_rto_micros),
-                maximum_rto: Duration::from_micros(self.recovery.maximum_rto_micros),
-                ack_delay: Duration::from_micros(self.recovery.ack_delay_micros),
-                max_retries: self.recovery.max_retries,
-            },
+            recovery: self.recovery.build(),
             interval: Duration::from_micros(self.interval_micros),
             packets_per_interval: self.packets_per_interval,
             bytes_per_interval: self.bytes_per_interval.0,
@@ -458,7 +448,7 @@ impl DeliveryDto {
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecoveryDto {
+pub(super) struct RecoveryDto {
     max_source_bytes: Size,
     send_bytes: Size,
     receive_bytes: Size,
@@ -468,6 +458,21 @@ struct RecoveryDto {
     maximum_rto_micros: u64,
     ack_delay_micros: u64,
     max_retries: u16,
+}
+impl RecoveryDto {
+    pub(super) fn build(self) -> l2tunnel_recovery::ArqConfig {
+        l2tunnel_recovery::ArqConfig {
+            max_source_bytes: self.max_source_bytes.0,
+            send_bytes: self.send_bytes.0,
+            receive_bytes: self.receive_bytes.0,
+            send_records: self.send_records.0,
+            receive_records: self.receive_records.0,
+            initial_rto: Duration::from_micros(self.initial_rto_micros),
+            maximum_rto: Duration::from_micros(self.maximum_rto_micros),
+            ack_delay: Duration::from_micros(self.ack_delay_micros),
+            max_retries: self.max_retries,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

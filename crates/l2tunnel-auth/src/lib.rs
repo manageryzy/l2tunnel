@@ -238,7 +238,8 @@ impl MemberAllowlist {
             .map_err(|_| Error::Configuration("allowlist must contain 1..=1024 entries"))
     }
 
-    fn contains(&self, key: MemberPublicKey) -> bool {
+    /// Check configured membership before I/O; this does not authenticate a peer.
+    pub fn contains(&self, key: MemberPublicKey) -> bool {
         self.0.contains(key)
     }
 }

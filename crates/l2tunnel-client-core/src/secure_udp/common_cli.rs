@@ -1,5 +1,5 @@
 //! Complete Common CLI plans reuse resource parsing, without inventing Swift policies.
-use super::transaction_cli::{RuntimeDto, TransactionDto, read_document};
+use super::transaction_cli::{RecoveryDto, RuntimeDto, TransactionDto, read_document};
 use crate::{ConnectionConfig, secure_udp};
 use l2tunnel::record_configuration::{Catalog, DESCRIPTOR_BYTES, Descriptor};
 use l2tunnel_runtime::secure_udp::{establish, transport};
@@ -12,6 +12,7 @@ pub(super) struct Plan {
     parameters: transport::TransactionSettings,
     runtime: RuntimeDto,
     rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    outer_carrier: Option<OuterCarrierDto>,
 }
 impl Plan {
     pub(super) fn read(path: &Path) -> io::Result<Self> {
@@ -37,6 +38,7 @@ impl Plan {
             parameters: dto.transaction.build(),
             runtime: dto.runtime,
             rolling_work: dto.rolling_work.0.map(|value| value.build()).transpose()?,
+            outer_carrier: dto.outer_carrier,
         })
     }
     pub(super) fn initial(&self) -> Descriptor {
@@ -44,6 +46,74 @@ impl Plan {
     }
     pub(super) fn report_interval(&self) -> Option<Duration> {
         self.runtime.report_interval()
+    }
+    pub(super) fn validate_carrier(&self, selected: bool) -> io::Result<()> {
+        match (selected, &self.outer_carrier) {
+            (false, None) => Ok(()),
+            (true, Some(value)) if value.version == 1 && value.backend == "openvpn_wire_common" => {
+                Ok(())
+            }
+            _ => Err(invalid(
+                "outer_carrier must be complete version1/openvpn_wire_common only for explicit OpenVPN Common selection",
+            )),
+        }
+    }
+    pub(super) fn outer_capacity(&self) -> io::Result<usize> {
+        self.validate_carrier(true)?;
+        usize::try_from(
+            self.outer_carrier
+                .as_ref()
+                .ok_or_else(|| invalid("outer carrier absent"))?
+                .max_record_bytes,
+        )
+        .map_err(|_| invalid("outer record capacity exceeds platform width"))
+    }
+    pub(super) fn outer_config(
+        &self,
+        profile: &secure_udp::common_transaction_profile::Profile,
+    ) -> io::Result<l2tunnel_openvpn::wire_carrier::common::Config> {
+        self.validate_carrier(true)?;
+        let value = self
+            .outer_carrier
+            .as_ref()
+            .ok_or_else(|| invalid("outer carrier absent"))?;
+        let size = |value| {
+            usize::try_from(value)
+                .map_err(|_| invalid("outer carrier capacity exceeds platform width"))
+        };
+        let mut base = profile.connection().session()?;
+        base.digest = l2tunnel_core::ConfigDigest(profile.requested_configuration()?.0);
+        let settings = profile.settings();
+        let config = l2tunnel_openvpn::wire_carrier::common::Config {
+            base,
+            path_mtu: self.initial().path_mtu(),
+            outer_overhead_bytes: if settings.gate.path.client.is_ipv6() {
+                49
+            } else {
+                29
+            },
+            max_record_bytes: size(value.max_record_bytes)?,
+            control_arq: value.control_arq.build(),
+            handshake_timeout: Duration::from_micros(value.handshake_timeout_micros),
+            lifetime: Duration::from_micros(value.lifetime_micros),
+            packet_slots: size(value.packet_slots)?,
+            stream_bytes: size(value.stream_bytes)?,
+            poll_interval: Duration::from_micros(value.poll_interval_micros),
+            work_limit: size(value.work_limit)?,
+            wire_budget: l2tunnel_openvpn::WireBudget {
+                interval: Duration::from_micros(value.wire_budget.interval_micros),
+                packets: size(value.wire_budget.packets)?,
+                ip_bytes: size(value.wire_budget.ip_bytes)?,
+                reserved_control_packets: size(value.wire_budget.reserved_control_packets)?,
+                reserved_control_bytes: size(value.wire_budget.reserved_control_bytes)?,
+                maximum_control_packets: size(value.wire_budget.maximum_control_packets)?,
+            },
+        };
+        config.validate().map_err(io::Error::other)?;
+        if config.handshake_timeout > profile.connection().handshake_timeout {
+            return Err(invalid("outer handshake exceeds original setup cap"));
+        }
+        Ok(config)
     }
     pub(super) fn build(
         &self,
@@ -108,6 +178,33 @@ struct PlanDto {
     transaction: TransactionDto,
     runtime: RuntimeDto,
     rolling_work: RequiredWork,
+    #[serde(default)]
+    outer_carrier: Option<OuterCarrierDto>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OuterCarrierDto {
+    version: u64,
+    backend: String,
+    max_record_bytes: u64,
+    control_arq: RecoveryDto,
+    handshake_timeout_micros: u64,
+    lifetime_micros: u64,
+    packet_slots: u64,
+    stream_bytes: u64,
+    poll_interval_micros: u64,
+    work_limit: u64,
+    wire_budget: OuterWireBudgetDto,
+}
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OuterWireBudgetDto {
+    interval_micros: u64,
+    packets: u64,
+    ip_bytes: u64,
+    reserved_control_packets: u64,
+    reserved_control_bytes: u64,
+    maximum_control_packets: u64,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1377,6 +1377,11 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--noise-psk-file",
             "--identity",
             "--allow-key",
+            "--udp-cover",
+            "--ca",
+            "--server-name",
+            "--cert",
+            "--key",
         ],
         "set-swift" => vec![
             "--control-socket",

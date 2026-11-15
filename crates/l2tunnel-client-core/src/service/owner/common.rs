@@ -4,6 +4,8 @@ use super::*;
 use l2tunnel::record_configuration::Configuration;
 use l2tunnel_runtime::secure_udp::transport;
 
+pub(super) mod carrier;
+
 pub(super) async fn establish(
     shared: &Arc<Shared>,
     plan: &Prepared,
@@ -40,7 +42,17 @@ pub(super) async fn establish(
     });
     let sink = backend.clone();
     let changed = shared.clone();
-    let mut runtime = make_runtime(device, parts, contract, requests, sink, changed);
+    let runtime = make_runtime(device, parts, contract, requests, sink, changed);
+    ready(shared, accepted, deadline, backend, runtime).await
+}
+
+async fn ready(
+    shared: &Arc<Shared>,
+    accepted: Accepted,
+    deadline: Instant,
+    backend: Arc<SecureUdpCommonBackend>,
+    mut runtime: RunFuture,
+) -> io::Result<Active> {
     setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
     std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
         Poll::Ready(Err(error)) => Poll::Ready(Err(error)),

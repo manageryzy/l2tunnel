@@ -99,11 +99,28 @@ pub(super) enum Endpoint {
     SecureClient(crate::secure_udp::credentials::Client),
     #[cfg(unix)]
     SecureServer(Box<SecureServer>),
+    #[cfg(unix)]
+    CommonCarrierClient {
+        outer: Client,
+        inner: crate::secure_udp::credentials::Client,
+    },
+    #[cfg(unix)]
+    CommonCarrierServer(Box<CommonCarrierServer>),
 }
 #[cfg(unix)]
 pub(super) struct SecureServer {
     pub credentials: crate::secure_udp::credentials::Server,
     pub admission: tokio::sync::Mutex<Option<crate::secure_udp::Server>>,
+}
+#[cfg(unix)]
+pub(super) struct CommonCarrierServer {
+    pub outer: Server,
+    pub inner: crate::secure_udp::credentials::Server,
+    // A quarantine is bound to one actual TLS proof. A new outer connection
+    // replaces it; this is not retained-session recovery across fresh TLS.
+    pub admission: tokio::sync::Mutex<
+        Option<l2tunnel_runtime::secure_udp::establish::carrier::InitialServerAdmission>,
+    >,
 }
 /// Selected setup backend. Each variant names one existing authenticated factory;
 /// this is not a carrier preference list and never falls back to another variant.
@@ -122,6 +139,11 @@ pub(super) enum Transport {
     SecureUdpTransaction(Arc<crate::secure_udp::transaction_profile::Profile>),
     #[cfg(unix)]
     SecureUdpCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
+    #[cfg(unix)]
+    SecureUdpCommonCarrier {
+        profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+        outer: l2tunnel_openvpn::wire_carrier::common::Config,
+    },
 }
 /// Longest time a swift acceptor keeps its listener open for a peer. Each
 /// accepted TCP connection is still bound by the original handshake timeout.
@@ -234,6 +256,50 @@ impl Prepared {
             Transport::SecureUdpCommon(Arc::new(profile)),
         )
     }
+    /// Explicit initial-only OpenVPN outer TLS and common Noise/member client.
+    /// Validation defers all socket, handshake and attachment work to the service.
+    #[cfg(unix)]
+    pub fn secure_udp_common_carrier_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        outer: l2tunnel_openvpn::wire_carrier::common::Config,
+        tls: Client,
+        inner: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&tls)?;
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonCarrierClient { outer: tls, inner },
+            attachment,
+            Transport::SecureUdpCommonCarrier {
+                profile: Arc::new(profile),
+                outer,
+            },
+        )
+    }
+    /// Explicit fixed-peer OpenVPN acceptor with independent TLS and Noise trust.
+    #[cfg(unix)]
+    pub fn secure_udp_common_carrier_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        outer: l2tunnel_openvpn::wire_carrier::common::Config,
+        tls: Server,
+        inner: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonCarrierServer(Box::new(CommonCarrierServer {
+                outer: tls,
+                inner,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::SecureUdpCommonCarrier {
+                profile: Arc::new(profile),
+                outer,
+            },
+        )
+    }
     #[cfg(unix)]
     pub(super) fn secure_udp(&self) -> bool {
         matches!(
@@ -241,6 +307,7 @@ impl Prepared {
             Transport::SecureUdpSwift(_)
                 | Transport::SecureUdpTransaction(_)
                 | Transport::SecureUdpCommon(_)
+                | Transport::SecureUdpCommonCarrier { .. }
         )
     }
     #[cfg(unix)]
@@ -249,7 +316,10 @@ impl Prepared {
     }
     #[cfg(unix)]
     pub(super) fn secure_udp_common(&self) -> bool {
-        matches!(&self.data.transport, Transport::SecureUdpCommon(_))
+        matches!(
+            &self.data.transport,
+            Transport::SecureUdpCommon(_) | Transport::SecureUdpCommonCarrier { .. }
+        )
     }
     /// Pure validation; credentials are already parsed and no provider is invoked.
     pub fn client(
@@ -517,6 +587,85 @@ impl Prepared {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "actual Noise credentials differ from Common plan pins",
+                    ));
+                }
+                profile.runtime_contract(role)?;
+                None
+            }
+            #[cfg(unix)]
+            Transport::SecureUdpCommonCarrier { profile, outer } => {
+                let session = profile.settings();
+                let (noise, role) = match &endpoint {
+                    Endpoint::CommonCarrierClient { outer: tls, inner } => {
+                        if tls.remote != session.gate.path.server
+                            || tls.member.public_key().0 != session.member.0
+                            || inner.member_key() != session.member
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "outer endpoint/member differs from the common credentials",
+                            ));
+                        }
+                        (inner.noise(), l2tunnel_security::Role::Initiator)
+                    }
+                    Endpoint::CommonCarrierServer(server) => {
+                        if !server
+                            .outer
+                            .members
+                            .contains(l2tunnel_auth::MemberPublicKey(session.member.0))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "outer allowlist excludes the configured common member",
+                            ));
+                        }
+                        if server.outer.listen != session.gate.path.server {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "outer listen endpoint differs from the common fixed path",
+                            ));
+                        }
+                        (server.inner.noise(), l2tunnel_security::Role::Responder)
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "common carrier requires independent TLS and Noise owners",
+                        ));
+                    }
+                };
+                if profile.carrier_binding().is_some()
+                    || noise.profile() != session.profile
+                    || !attachment.readable_kind()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "common carrier requires an unbound plan and readable attachment",
+                    ));
+                }
+                if noise.peers(role) != profile.peers() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "actual Noise credentials differ from the common carrier pins",
+                    ));
+                }
+                let mut base = connection.session()?;
+                base.digest = l2tunnel_core::ConfigDigest(profile.requested_configuration()?.0);
+                outer.validate().map_err(io::Error::other)?;
+                if outer.base != base
+                    || outer.path_mtu != profile.initial().descriptor().path_mtu()
+                    || outer.outer_overhead_bytes
+                        != if session.gate.path.client.is_ipv4() {
+                            29
+                        } else {
+                            49
+                        }
+                    || outer.max_record_bytes < session.cover.max_packet_bytes
+                    || outer.handshake_timeout > connection.handshake_timeout
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "outer policy differs from the requested common plan",
                     ));
                 }
                 profile.runtime_contract(role)?;

@@ -170,3 +170,62 @@ fn legacy_carriers_and_missing_selector_do_not_become_secure_udp() -> io::Result
     }
     Ok(())
 }
+
+#[test]
+fn explicit_common_carrier_rejects_missing_cover_and_standalone_or_role_flags_before_plan_io()
+-> io::Result<()> {
+    for command in ["connect", "serve"] {
+        let mut base = options_for(command, "openvpn-like");
+        for key in ["--swift-forward-kbit", "--swift-reverse-kbit"] {
+            base.remove(key);
+        }
+        base.insert("--record-profile".into(), "common".into());
+        base.insert(
+            "--common-transaction-plan".into(),
+            "/no-plan-opened-by-this-negative-case".into(),
+        );
+        base.insert("--udp-cover".into(), "quic-like".into());
+        if command == "connect" {
+            base.insert("--ca".into(), "absent-ca".into());
+            base.insert("--server-name".into(), "controlled.example".into());
+        } else {
+            base.insert("--cert".into(), "absent-cert".into());
+            base.insert("--key".into(), "absent-tls-key".into());
+        }
+        for (key, value) in [
+            ("--udp-cover", Some("openvpn-like")),
+            ("--udp-cover", None),
+            ("--common-transaction-plan", None),
+            ("--admission-key-file", Some("unused-raw64")),
+            ("--cookie-key-file", Some("unused-raw64-cookie")),
+            ("--udp-protection", Some("integrity")),
+            ("--openvpn-close-profile", Some("native-drain")),
+            ("--openvpn-stats-ms", Some("1000")),
+            ("--openvpn-lease-secs", Some("60")),
+            (
+                if command == "connect" {
+                    "--cert"
+                } else {
+                    "--ca"
+                },
+                Some("wrong-role-tls"),
+            ),
+        ] {
+            let mut changed = base.clone();
+            if let Some(value) = value {
+                changed.insert(key.into(), value.into());
+            } else {
+                changed.remove(key);
+            }
+            let error = selection(command, &changed, configuration(&changed)?)
+                .err()
+                .ok_or_else(|| input(format!("accepted invalid carrier input {key}")))?;
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{command} {key}: {error}"
+            );
+        }
+    }
+    Ok(())
+}

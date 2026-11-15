@@ -11,7 +11,17 @@ progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN ac
 flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.
 Update checkbox evidence and capability status with every implementation change.
 
-The latest finite wave4 now provides [initial-only carrier Common execution](modules/managed-common-runtime.md),
+The latest parallel carrier batch adds genuine requested-to-effective Common
+profile binding, the actual original-carrier shared service and explicit
+complete-plan CLI selection. The [finite carrier
+ledger](modules/common-carrier-service.md) and [scoped
+evidence](../work/parallel-features-20261115/parallel-wave5-scoped-validation.json)
+distinguish actual four-family service delivery from external offline
+inspection. Automatic retained recovery, full managed lifecycle, production
+native CLI startup and every unchanged mode/resource/platform/performance
+acceptance gate remain required.
+
+The preceding finite wave4 now provides [initial-only carrier Common execution](modules/managed-common-runtime.md),
 [typed failed-backend fresh reconnect](modules/generic-client-service.md) and
 [external Common control/inspection CLI](modules/common-client-api.md) against
 actual authenticating programmatic shared-service owners. Its [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)

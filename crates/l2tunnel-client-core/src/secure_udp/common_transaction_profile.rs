@@ -1,7 +1,7 @@
 //! Explicit common record selection authenticated by the existing same-socket factories.
 use super::{Settings, establish, security};
 use crate::{Compression, ConnectionConfig};
-use l2tunnel::record_configuration::{Catalog, Configuration, EnvelopeDigest};
+use l2tunnel::record_configuration::{self as common, Catalog, Configuration, EnvelopeDigest};
 use l2tunnel_core::{ConfigDigest, Duplex, traffic::NetworkLayer};
 use l2tunnel_device::PacketLayer;
 use l2tunnel_management::{Role, transaction};
@@ -22,6 +22,17 @@ pub struct Profile {
     envelope: EnvelopeDigest,
     initial: Configuration,
     data: ConfigDigest,
+    carrier: Option<CarrierBinding>,
+    requested_catalog: Option<Catalog>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CarrierBinding {
+    outer: establish::carrier::AuthenticatedOuter,
+    requested_configuration: security::ConfigDigest,
+    requested_envelope: EnvelopeDigest,
+    resources: [transport::Config; 2],
+    configuration: security::ConfigDigest,
 }
 impl Profile {
     /// Bind every common descriptor and actual shared resource to retained own trust.
@@ -121,6 +132,8 @@ impl Profile {
             envelope,
             initial,
             data,
+            carrier: None,
+            requested_catalog: None,
         };
         result.runtime_contract(security::Role::Initiator)?;
         result.runtime_contract(security::Role::Responder)?;
@@ -134,9 +147,103 @@ impl Profile {
     pub fn peers(&self) -> establish::Peers {
         self.peers
     }
-    /// Exact settings for existing real connect/Server authentication factories.
+    /// Original requested settings, unchanged after actual outer binding.
+    /// Bound factory callers must use establish_config() for effective geometry/H1.
     pub fn settings(&self) -> Settings {
         self.settings
+    }
+    /// Derive an effective plan only from a genuine completed outer proof.
+    /// The original settings/catalog/resources remain retained and unchanged.
+    pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
+        if self.carrier.is_some() {
+            return Err(invalid("common profile already bound to an outer session"));
+        }
+        if outer.endpoints()
+            != (
+                self.settings.gate.path.client,
+                self.settings.gate.path.server,
+            )
+            || outer.info().member.0 != self.settings.member.0
+            || outer.info().config.layer != self.connection.layer
+            || self.settings.cover.max_packet_bytes > outer.requested().max_record_bytes
+        {
+            return Err(invalid(
+                "actual outer proof differs from requested common plan",
+            ));
+        }
+        let role = outer_role(outer)?;
+        let mut resources = [self.initiator, self.responder];
+        for value in &mut resources {
+            value.control.wire_overhead = extra_byte(value.control.wire_overhead)?;
+            let streams = value
+                .streams
+                .as_mut()
+                .ok_or_else(|| invalid("common carrier requires explicit streams"))?;
+            for stream in &mut streams.streams {
+                stream.delivery.wire_overhead = extra_byte(stream.delivery.wire_overhead)?;
+            }
+        }
+        let requested_configuration = self.configuration()?;
+        let mut binding = CarrierBinding {
+            outer,
+            requested_configuration,
+            requested_envelope: self.envelope,
+            resources,
+            configuration: requested_configuration,
+        };
+        let mut result = self.clone();
+        result.catalog = carrier_catalog(&self.catalog)?;
+        result.requested_catalog = Some(self.catalog.clone());
+        let contract = result.carrier_contract(binding, role)?;
+        binding.configuration = contract.expected_configuration();
+        result.envelope = contract.envelope();
+        result.initial = contract.initial();
+        result.data = contract.data_digest();
+        result.carrier = Some(binding);
+        result.establish_config(role)?;
+        Ok(result)
+    }
+    /// Genuine completed outer observation, absent for the original UDP selection.
+    pub fn carrier_binding(&self) -> Option<establish::carrier::AuthenticatedOuter> {
+        self.carrier.map(|value| value.outer)
+    }
+    /// Original offline setup identity H0, before a fresh outer session is known.
+    pub fn requested_configuration(&self) -> io::Result<security::ConfigDigest> {
+        match self.carrier {
+            Some(value) => Ok(value.requested_configuration),
+            None => self.configuration(),
+        }
+    }
+    /// Original offline common envelope E0, without a fabricated outer proof.
+    pub fn requested_envelope(&self) -> EnvelopeDigest {
+        self.carrier
+            .map_or(self.envelope, |value| value.requested_envelope)
+    }
+    /// Full original offline catalog, including its unchanged canonical root.
+    pub fn requested_catalog(&self) -> &Catalog {
+        self.requested_catalog.as_ref().unwrap_or(&self.catalog)
+    }
+    /// Exact role-specific factory input; copied observations create no authority.
+    /// Bound profiles carry the actual extra opcode and effective setup identity.
+    pub fn establish_config(&self, role: security::Role) -> io::Result<establish::Config> {
+        let mut config = self.settings.runtime(role, self.peers)?;
+        if let Some(binding) = self.carrier {
+            if role != outer_role(binding.outer)? {
+                return Err(invalid(
+                    "bound common profile belongs to the other local role",
+                ));
+            }
+            config.gate.outer_overhead = extra_byte(config.gate.outer_overhead)?;
+            config.binding.outer = binding.outer.binding();
+            config.binding.configuration = binding.configuration.0;
+            // Reuse the factory's actual extra-byte validation and prologue
+            // derivation. This public session label is only a consistency input.
+            binding
+                .outer
+                .expected_binding(config, self.peers, l2tunnel_handshake::SessionId([1; 16]))
+                .map_err(io::Error::other)?;
+        }
+        Ok(config)
     }
     /// Complete transaction and combined-capacity requirements.
     pub fn parameters(&self) -> transport::TransactionSettings {
@@ -150,23 +257,34 @@ impl Profile {
     pub fn envelope(&self) -> EnvelopeDigest {
         self.envelope
     }
-    /// Exact complete common C0.
+    /// Exact complete initial value, using effective E1 after carrier binding.
     pub fn initial(&self) -> Configuration {
         self.initial
     }
-    /// Real initial management configuration digest D0.
+    /// Real initial management digest, using the effective initial value.
     pub fn data_digest(&self) -> ConfigDigest {
         self.data
     }
     /// Actual setup/Control digest consumed by the maintained authentication factories.
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
-        self.settings.configuration(self.peers)
+        match self.carrier {
+            Some(value) => Ok(value.configuration),
+            None => self.settings.configuration(self.peers),
+        }
     }
-    /// Transfer the retained exact role resources/catalog with independently recomputed H0.
+    /// Transfer the exact selected role resources/catalog and setup identity.
     pub fn runtime_contract(
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if let Some(binding) = self.carrier {
+            if role != outer_role(binding.outer)? {
+                return Err(invalid(
+                    "bound common profile belongs to the other local role",
+                ));
+            }
+            return self.carrier_contract(binding, role);
+        }
         transport::CommonTransactionContract::new(
             self.configuration()?,
             role,
@@ -182,7 +300,82 @@ impl Profile {
             self.parameters,
         )
     }
+    fn carrier_contract(
+        &self,
+        binding: CarrierBinding,
+        role: security::Role,
+    ) -> io::Result<transport::CommonTransactionContract> {
+        transport::CommonTransactionContract::new_on_carrier_paired(
+            binding.requested_configuration,
+            role,
+            binding.resources,
+            self.settings.cover.config(role)?,
+            self.settings.gate.path.client.is_ipv6(),
+            binding.requested_envelope,
+            self.catalog.clone(),
+            self.parameters,
+            binding.outer,
+        )
+    }
+}
+fn extra_byte(value: usize) -> io::Result<usize> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| invalid("common carrier opcode accounting overflow"))
+}
+fn carrier_catalog(catalog: &Catalog) -> io::Result<Catalog> {
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(catalog.descriptors().len())
+        .map_err(io::Error::other)?;
+    for descriptor in catalog.descriptors() {
+        descriptors.push(carrier_descriptor(*descriptor)?);
+    }
+    Catalog::new(carrier_descriptor(catalog.initial())?, &descriptors).map_err(io::Error::other)
+}
+fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Descriptor> {
+    let mut profile = *descriptor.profile();
+    match &mut profile {
+        common::Profile::Swift { .. } => {}
+        common::Profile::Aligned { forward, reverse } => {
+            for value in [forward, reverse] {
+                value.recovery.outer_overhead_bytes =
+                    extra_byte(value.recovery.outer_overhead_bytes)?;
+            }
+        }
+        common::Profile::Packed { forward, reverse } => {
+            for value in [forward, reverse] {
+                value.base.recovery.outer_overhead_bytes =
+                    extra_byte(value.base.recovery.outer_overhead_bytes)?;
+            }
+        }
+        common::Profile::Rolling { config, .. } => {
+            config.geometry.forward_overhead_bytes =
+                extra_byte(config.geometry.forward_overhead_bytes)?;
+            config.geometry.reverse_overhead_bytes =
+                extra_byte(config.geometry.reverse_overhead_bytes)?;
+        }
+    }
+    common::Descriptor::new(
+        descriptor.path_mtu(),
+        descriptor.duplex(),
+        *descriptor.direction(Role::Client).common(),
+        *descriptor.direction(Role::Server).common(),
+        profile,
+    )
+    .map_err(io::Error::other)
+}
+fn outer_role(outer: establish::carrier::AuthenticatedOuter) -> io::Result<security::Role> {
+    match outer.info().peer_member {
+        None => Ok(security::Role::Initiator),
+        Some(member) if member == outer.info().member => Ok(security::Role::Responder),
+        Some(_) => Err(invalid("actual outer member role differs")),
+    }
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+
+#[cfg(test)]
+#[path = "common_transaction_profile_tests.rs"]
+mod tests;

@@ -238,7 +238,8 @@ pub struct SecureUdpTransactionFrame {
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct SecureUdpCommonFrame {
-    /// Immutable complete startup plan and authenticated finite catalog.
+    /// Complete effective startup plan and authenticated finite catalog. A carrier
+    /// bound profile also retains the original requested envelope and policy.
     pub requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
     /// Authentication evidence from the original retained UDP socket.
     pub info: l2tunnel_runtime::secure_udp::member::Info,

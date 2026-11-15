@@ -79,7 +79,17 @@ dispatch removes unused backend poll scratch while reusing the existing one
 setup box; standard-stack service and APIv4 cases pass. These leaves do not close full lifecycle,
 carrier Driver/service, complete resources, mode parity or native/platform gates.
 
-The latest finite wave4 adds [initial-only carrier Common execution](modules/managed-common-runtime.md),
+The latest [original-carrier Common service
+leaf](modules/common-carrier-service.md) now has actual typed four-family
+service delivery and external full-64 offline CLI inspection, with requested E0
+and effective authenticated E1/catalog kept distinct. Its [scoped
+receipt](../work/parallel-features-20261115/parallel-wave5-scoped-validation.json)
+includes affected strict checks and preserves earlier failures. Full
+tools/check.py was not rerun; production native CLI startup, automatic retained
+recovery, managed fresh-DH, complete resources and all unchanged
+47-mode/SW-11/native/platform/performance gates remain open.
+
+The preceding finite wave4 adds [initial-only carrier Common execution](modules/managed-common-runtime.md),
 [typed failed-backend fresh reconnect](modules/generic-client-service.md) and
 [external Common control/inspection CLI](modules/common-client-api.md) using
 actual authenticating programmatic shared owners. The [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)

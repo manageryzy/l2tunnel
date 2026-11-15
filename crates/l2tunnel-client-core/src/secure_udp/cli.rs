@@ -28,7 +28,7 @@ pub(super) const OPTIONS: &[&str] = &[
     "--swift-transaction-plan",
     "--common-transaction-plan",
 ];
-pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate.";
+pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate. Explicit --carrier openvpn-like --record-profile common --common-transaction-plan PATH additionally requires --udp-cover quic-like|media-like and a complete outer_carrier version1/openvpn_wire_common object in the plan. Connect uses the existing --ca DER --server-name DNS trust inputs; serve uses --cert DER --key PKCS8, with the same member identity/pin as the inner session. The actual raw TLS/member carrier has no standalone RAW64 gate: --admission-key-file/--cookie-key-file and standalone protection/drain/stats flags are refused; inner --session-admission-key-file and server-only --session-cookie-key-file remain required. Offline inspection reports requested E0 and binding required; only actual outer authentication supplies effective E1/H0/catalog. No default or fallback changes.";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
@@ -63,7 +63,12 @@ impl From<Selection> for Common {
     }
 }
 
-pub(super) struct Selected(Choice);
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Carrier {
+    OriginalUdp,
+    OpenVpn,
+}
+pub(super) struct Selected(Choice, Carrier);
 enum Choice {
     Legacy(Selection),
     Transaction(Common, Box<transaction_cli::Plan>),
@@ -115,17 +120,35 @@ impl Selected {
                     .map(Built::Transaction)
             }
             Choice::Records(common, plan) => {
-                let (overhead, maximum_body) = common.geometry()?;
-                let raw = common.raw(
+                let mut raw = common.raw(
                     plan.initial().path_mtu(),
                     connection.handshake_timeout,
                     peers,
                     member,
                 )?;
+                let (overhead, maximum_body) = if self.1 == Carrier::OpenVpn {
+                    common.carrier_geometry(&mut raw, plan.outer_capacity()?)?
+                } else {
+                    common.geometry()?
+                };
                 plan.build(connection, raw, peers, maximum_body, overhead)
                     .map(Box::new)
                     .map(Built::Records)
             }
+        }
+    }
+    fn outer_config(
+        &self,
+        profile: &secure_udp::common_transaction_profile::Profile,
+    ) -> io::Result<Option<l2tunnel_openvpn::wire_carrier::common::Config>> {
+        if self.1 == Carrier::OriginalUdp {
+            return Ok(None);
+        }
+        match &self.0 {
+            Choice::Records(_, plan) => plan.outer_config(profile).map(Some),
+            _ => Err(input(
+                "OpenVPN carrier requires the complete Common record plan",
+            )),
         }
     }
 }
@@ -143,9 +166,33 @@ fn selection_for(
     config: ConnectionConfig,
     inspection: bool,
 ) -> io::Result<Option<Selected>> {
+    let records_plan = options.contains_key("--common-transaction-plan");
+    let carrier = if options.get("--carrier").map(String::as_str) == Some("openvpn-like")
+        && (records_plan || options.get("--record-profile").map(String::as_str) == Some("common"))
+    {
+        if !records_plan {
+            return Err(input(
+                "OpenVPN Common selection requires its complete transaction plan",
+            ));
+        }
+        Carrier::OpenVpn
+    } else {
+        Carrier::OriginalUdp
+    };
     let appearance = match options.get("--carrier").map(String::as_str) {
         Some("quic-like") => l2tunnel_cover::Appearance::QuicLike,
         Some("media-like") => l2tunnel_cover::Appearance::MediaLike,
+        Some("openvpn-like") if carrier == Carrier::OpenVpn => {
+            match required(options, "--udp-cover")? {
+                "quic-like" => l2tunnel_cover::Appearance::QuicLike,
+                "media-like" => l2tunnel_cover::Appearance::MediaLike,
+                _ => {
+                    return Err(input(
+                        "OpenVPN Common requires explicit inner cover quic-like or media-like",
+                    ));
+                }
+            }
+        }
         _ => {
             if OPTIONS.iter().any(|key| options.contains_key(*key)) {
                 return Err(input(
@@ -176,7 +223,7 @@ fn selection_for(
         "--swift-repair-permille",
         "--swift-report-ms",
     ];
-    let records_plan = options.contains_key("--common-transaction-plan");
+    let carrier_options = ["--udp-cover", "--ca", "--server-name", "--cert", "--key"];
     if records_plan && options.contains_key("--swift-transaction-plan") {
         return Err(input(
             "Common and Swift transaction plans are mutually exclusive",
@@ -189,11 +236,12 @@ fn selection_for(
         || options.keys().any(|key| {
             !(allowed.contains(&key.as_str())
                 || OPTIONS.contains(&key.as_str())
+                || carrier == Carrier::OpenVpn && carrier_options.contains(&key.as_str())
                 || inspection && key == "--role")
         })
     {
         return Err(input(
-            "secure UDP requires explicit Swift/full/no-compression and only its documented options",
+            "secure UDP requires its explicit matching record profile/full/no-compression and only documented options",
         ));
     }
     if inspection {
@@ -240,6 +288,31 @@ fn selection_for(
             ));
         }
     };
+    if carrier == Carrier::OpenVpn {
+        match command {
+            "connect"
+                if !["--cert", "--key"]
+                    .iter()
+                    .any(|key| options.contains_key(*key)) =>
+            {
+                required(options, "--ca")?;
+                required(options, "--server-name")?;
+            }
+            "serve"
+                if !["--ca", "--server-name"]
+                    .iter()
+                    .any(|key| options.contains_key(*key)) =>
+            {
+                required(options, "--cert")?;
+                required(options, "--key")?;
+            }
+            _ => {
+                return Err(input(
+                    "OpenVPN outer TLS inputs differ between connect and serve",
+                ));
+            }
+        }
+    }
     let profile = match required(options, "--noise-profile")? {
         "ik" if !options.contains_key("--noise-psk-file") => hs::Profile::Ik,
         "ikpsk2" if options.contains_key("--noise-psk-file") => hs::Profile::IkPsk2,
@@ -282,21 +355,25 @@ fn selection_for(
             ));
         }
         let plan = common_cli::Plan::read(std::path::Path::new(path))?;
+        plan.validate_carrier(carrier == Carrier::OpenVpn)?;
         let initial = plan.initial().path_mtu();
         if !(576..=9000).contains(&maximum_mtu) || !(576..=maximum_mtu).contains(&initial) {
             return Err(input("transaction initial MTU/capacity is out of range"));
         }
-        return Ok(Some(Selected(Choice::Records(
-            Common {
-                appearance,
-                role,
-                local,
-                peer,
-                maximum_mtu,
-                profile,
-            },
-            Box::new(plan),
-        ))));
+        return Ok(Some(Selected(
+            Choice::Records(
+                Common {
+                    appearance,
+                    role,
+                    local,
+                    peer,
+                    maximum_mtu,
+                    profile,
+                },
+                Box::new(plan),
+            ),
+            carrier,
+        )));
     }
     if let Some(path) = options.get("--swift-transaction-plan") {
         if [
@@ -320,17 +397,20 @@ fn selection_for(
         if !(576..=9000).contains(&maximum_mtu) || !(576..=maximum_mtu).contains(&initial) {
             return Err(input("transaction initial MTU/capacity is out of range"));
         }
-        return Ok(Some(Selected(Choice::Transaction(
-            Common {
-                appearance,
-                role,
-                local,
-                peer,
-                maximum_mtu,
-                profile,
-            },
-            Box::new(plan),
-        ))));
+        return Ok(Some(Selected(
+            Choice::Transaction(
+                Common {
+                    appearance,
+                    role,
+                    local,
+                    peer,
+                    maximum_mtu,
+                    profile,
+                },
+                Box::new(plan),
+            ),
+            carrier,
+        )));
     }
     let forward_kbit = required(options, "--swift-forward-kbit")?
         .parse()
@@ -362,16 +442,19 @@ fn selection_for(
         value @ 100..=60_000 => Some(Duration::from_millis(value)),
         _ => return Err(input("report interval must be0 or100..60000ms")),
     };
-    Ok(Some(Selected(Choice::Legacy(Selection {
-        appearance,
-        role,
-        local,
-        peer,
-        policy,
-        maximum_mtu,
-        profile,
-        report,
-    }))))
+    Ok(Some(Selected(
+        Choice::Legacy(Selection {
+            appearance,
+            role,
+            local,
+            peer,
+            policy,
+            maximum_mtu,
+            profile,
+            report,
+        }),
+        carrier,
+    )))
 }
 
 fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
@@ -384,6 +467,55 @@ fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
     result
 }
 impl Common {
+    fn carrier_geometry(
+        self,
+        settings: &mut secure_udp::Settings,
+        capacity: usize,
+    ) -> io::Result<(usize, usize)> {
+        let cover = settings.cover;
+        let prototype = l2tunnel_cover::Config::new(
+            cover.appearance,
+            l2tunnel_cover::ConnectionIds {
+                local: cover.initiator_connection,
+                peer: cover.responder_connection,
+            },
+            l2tunnel_cover::MediaConfig {
+                local_ssrc: cover.initiator_ssrc,
+                peer_ssrc: cover.responder_ssrc,
+                payload_type: cover.payload_type,
+            },
+            l2tunnel_cover::Limits {
+                max_packet_bytes: cover.max_packet_bytes,
+                max_protected_bytes: cover.max_protected_bytes,
+            },
+        )
+        .map_err(io::Error::other)?;
+        // Derive this new carrier's requested capacity with the maintained codec.
+        // Existing descriptors and source/native/MTU values are never rewritten.
+        let mut low = 0;
+        let mut high = capacity.min(cover.max_protected_bytes);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if prototype
+                .overhead(l2tunnel_cover::Phase::Handshake, middle)
+                .map_err(io::Error::other)?
+                .checked_add(middle)
+                .ok_or_else(|| input("carrier cover length overflow"))?
+                <= capacity
+            {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        settings.cover.max_packet_bytes = capacity;
+        settings.cover.max_protected_bytes = low;
+        settings.cover.bootstrap_overhead(self.local.is_ipv6())?;
+        let maximum_body = low
+            .checked_sub(9 + security::COMMON_PREFIX_BYTES + 16)
+            .ok_or_else(|| input("outer carrier cannot fit common protection"))?;
+        Ok((self.geometry()?.0, maximum_body))
+    }
     fn geometry(self) -> io::Result<(usize, usize)> {
         let ip = if self.local.is_ipv6() { 48 } else { 28 };
         let header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
@@ -676,7 +808,10 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
         Built::Transaction(profile) => {
             vec![transaction_cli_output::inspection(&profile, common.role)?]
         }
-        Built::Records(profile) => common_cli_output::inspection(&profile, common.role)?,
+        Built::Records(profile) => match selected.outer_config(&profile)? {
+            Some(outer) => common_cli_output::carrier_inspection(&profile, common.role, outer)?,
+            None => common_cli_output::inspection(&profile, common.role)?,
+        },
         Built::Legacy(_) => return Err(input("inspection requires explicit transaction plan")),
     };
     let mut stdout = io::stdout().lock();
@@ -724,7 +859,10 @@ pub(super) async fn execute(
     });
     let plan = match command {
         "connect" => {
-            let member = credentials::read_member(Path::new(required(options, "--identity")?))?;
+            let member_der =
+                credentials::read_member_der(Path::new(required(options, "--identity")?))?;
+            let member = l2tunnel_identity::IdentityKey::from_pkcs8(&member_der)
+                .map_err(io::Error::other)?;
             let profile = selected.build(config, peers, member.public_key())?;
             let credentials = credentials::Client::new(noise, member, admission)?;
             match profile {
@@ -736,9 +874,34 @@ pub(super) async fn execute(
                     credentials,
                     attachment,
                 )?,
-                Built::Records(profile) => {
-                    service::Prepared::secure_udp_common_client(*profile, credentials, attachment)?
-                }
+                Built::Records(profile) => match selected.outer_config(&profile)? {
+                    Some(outer) => {
+                        let tls = ClientTls::from_der_roots(&[bounded_file(
+                            required(options, "--ca")?,
+                            65536,
+                        )?])
+                        .map_err(auth_error)?;
+                        let member = MemberKey::from_pkcs8(&member_der).map_err(auth_error)?;
+                        let outer_credentials = service::Client {
+                            remote: common.peer,
+                            tls,
+                            server_name: required(options, "--server-name")?.to_owned(),
+                            member: std::sync::Arc::new(member),
+                        };
+                        service::Prepared::secure_udp_common_carrier_client(
+                            *profile,
+                            outer,
+                            outer_credentials,
+                            credentials,
+                            attachment,
+                        )?
+                    }
+                    None => service::Prepared::secure_udp_common_client(
+                        *profile,
+                        credentials,
+                        attachment,
+                    )?,
+                },
             }
         }
         "serve" => {
@@ -759,9 +922,34 @@ pub(super) async fn execute(
                     credentials,
                     attachment,
                 )?,
-                Built::Records(profile) => {
-                    service::Prepared::secure_udp_common_server(*profile, credentials, attachment)?
-                }
+                Built::Records(profile) => match selected.outer_config(&profile)? {
+                    Some(outer) => {
+                        let tls = ServerTls::from_der(
+                            &[bounded_file(required(options, "--cert")?, 65536)?],
+                            &bounded_file(required(options, "--key")?, 65536)?,
+                        )
+                        .map_err(auth_error)?;
+                        let members = MemberAllowlist::new(&[auth::MemberPublicKey(member.0)])
+                            .map_err(auth_error)?;
+                        let outer_credentials = service::Server {
+                            listen: common.local,
+                            tls,
+                            members,
+                        };
+                        service::Prepared::secure_udp_common_carrier_server(
+                            *profile,
+                            outer,
+                            outer_credentials,
+                            credentials,
+                            attachment,
+                        )?
+                    }
+                    None => service::Prepared::secure_udp_common_server(
+                        *profile,
+                        credentials,
+                        attachment,
+                    )?,
+                },
             }
         }
         _ => return Err(input("unsupported secure UDP command")),

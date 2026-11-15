@@ -318,15 +318,18 @@ impl Driver {
             addresses,
             io_capacity: 0,
         };
-        Self::new_common_input(input, contract, origin, parts.socket)
+        Self::new_common_input(input, contract, origin, parts.socket, |socket, driver| {
+            Ok((socket, driver))
+        })
     }
 
-    fn new_common_input<S>(
+    fn new_common_input<S, T>(
         input: CommonInput,
         contract: CommonTransactionContract,
         origin: Instant,
         companion: S,
-    ) -> io::Result<(S, Self)> {
+        finish: impl FnOnce(S, Self) -> io::Result<T>,
+    ) -> io::Result<T> {
         if Instant::now() >= input.deadline || origin >= input.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -553,10 +556,10 @@ impl Driver {
             .report_interval
             .map(|interval| add(0, interval))
             .transpose()?;
-        // Construct directly in the caller's tuple return place. A separate
-        // Result<Driver> wrapper retains another full compatibility extent on
-        // debug stacks while the actual reserved Bank is being constructed.
-        Ok((
+        // Complete ownership here. The carrier moves this same Driver into its
+        // existing cell without retaining additional inline Driver return slots
+        // in callers while the reserved Bank is being constructed.
+        finish(
             companion,
             Self {
                 config,
@@ -635,7 +638,7 @@ impl Driver {
                 next_report,
                 terminal: None,
             },
-        ))
+        )
     }
 
     pub(super) fn snapshot_common(&self, now: u64, running: bool) -> io::Result<CommonSnapshot> {

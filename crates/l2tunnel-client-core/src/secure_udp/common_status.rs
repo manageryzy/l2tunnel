@@ -122,6 +122,44 @@ pub struct RollingWork {
     /// Metadata operations per direction.
     pub metadata: u64,
 }
+/// Genuine original-carrier proof and the requested/effective Common bindings.
+/// These public values carry no credential, socket or authentication authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCarrier {
+    /// Explicit requested outer protocol.
+    pub requested: String,
+    /// Outer protocol that actually completed authentication.
+    pub effective: String,
+    /// Independently selected layout inside the outer carrier.
+    pub udp_cover: String,
+    /// Original offline Common configuration before the fresh outer proof.
+    pub requested_configuration: [u8; 32],
+    /// Original offline Common envelope E0.
+    pub requested_envelope: [u8; 32],
+    /// Original catalog before the selected carrier's explicit framing overhead.
+    pub requested_catalog: [u8; 32],
+    /// Actual Common configuration bound to this authenticated outer session.
+    pub effective_configuration: [u8; 32],
+    /// Actual Common envelope E1, also used by the complete runtime catalog.
+    pub effective_envelope: [u8; 32],
+    /// Actual catalog with the selected carrier's exact framing overhead.
+    pub effective_catalog: [u8; 32],
+    /// Actual nonsecret TLS/member session identity.
+    pub session: [u8; 16],
+    /// Complete authenticated outer policy digest.
+    pub configuration: [u8; 32],
+    /// Original-socket outer proof committed by the inner Noise prologue.
+    pub binding: [u8; 32],
+    /// Exact requested complete outer IP packet ceiling.
+    pub path_mtu: u64,
+    /// Exact requested opaque record capacity, excluding the outer opcode.
+    pub max_record_bytes: u64,
+    /// Explicit outer session-age policy, independent of any key refresh.
+    pub lifetime_nanos: u64,
+    /// Original reset/TLS/member establishment bound.
+    pub handshake_timeout_nanos: u64,
+}
 /// Separate truthful portable status for explicit finite-catalog generic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +170,9 @@ pub struct Status {
     pub next_request_key: Option<u64>,
     /// Explicit carrier appearance.
     pub carrier: String,
+    /// Present only after the original outer carrier actually authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_carrier: Option<OriginalCarrier>,
     /// Data algorithm, separate from carrier selection.
     pub algorithm: String,
     /// Actual required integrity/confidentiality profile.
@@ -260,10 +301,14 @@ mod observe {
         ) -> io::Result<Self> {
             let configuration = profile.configuration()?;
             let settings = profile.settings();
-            let expected = settings
-                .runtime(info.role, profile.peers())?
-                .expected_binding(profile.peers(), info.binding.session)
-                .map_err(invalid)?;
+            let effective = profile.establish_config(info.role)?;
+            let expected = match profile.carrier_binding() {
+                Some(outer) => {
+                    outer.expected_binding(effective, profile.peers(), info.binding.session)
+                }
+                None => effective.expected_binding(profile.peers(), info.binding.session),
+            }
+            .map_err(invalid)?;
             let path = settings.gate.path;
             let (local, peer) = match info.role {
                 Role::Initiator => (path.client, path.server),
@@ -307,14 +352,47 @@ mod observe {
                 }
             }
             let counters = snapshot.map(|value| value.counters);
+            let udp_cover = match settings.cover.appearance {
+                l2tunnel_cover::Appearance::QuicLike => "quic-like",
+                l2tunnel_cover::Appearance::MediaLike => "media-like",
+            };
+            let original_carrier = profile
+                .carrier_binding()
+                .map(|outer| {
+                    Ok::<_, io::Error>(OriginalCarrier {
+                        requested: "openvpn-like".into(),
+                        effective: "openvpn-like".into(),
+                        udp_cover: udp_cover.into(),
+                        requested_configuration: profile.requested_configuration()?.0,
+                        requested_envelope: *profile.requested_envelope().as_bytes(),
+                        requested_catalog: *profile.requested_catalog().root().as_bytes(),
+                        effective_configuration: configuration.0,
+                        effective_envelope: *profile.envelope().as_bytes(),
+                        effective_catalog: *profile.catalog().root().as_bytes(),
+                        session: outer.info().session_id,
+                        configuration: outer.info().config.digest.0,
+                        binding: outer.binding(),
+                        path_mtu: number(outer.requested().path_mtu)?,
+                        max_record_bytes: number(outer.requested().max_record_bytes)?,
+                        lifetime_nanos: u64::try_from(outer.requested().lifetime.as_nanos())
+                            .map_err(invalid)?,
+                        handshake_timeout_nanos: u64::try_from(
+                            outer.requested().handshake_timeout.as_nanos(),
+                        )
+                        .map_err(invalid)?,
+                    })
+                })
+                .transpose()?;
             Ok(Self {
                 generation,
                 next_request_key: None,
-                carrier: match settings.cover.appearance {
-                    l2tunnel_cover::Appearance::QuicLike => "quic-like",
-                    l2tunnel_cover::Appearance::MediaLike => "media-like",
+                carrier: if original_carrier.is_some() {
+                    "openvpn-like"
+                } else {
+                    udp_cover
                 }
                 .into(),
+                original_carrier,
                 algorithm: "common-records".into(),
                 protection: "chacha20-poly1305".into(),
                 backend: "common_records_v2".into(),

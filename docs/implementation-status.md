@@ -7,7 +7,19 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The latest finite wave4 implements three functional additions:
+The latest carrier batch now executes the shared service on the original
+OpenVPN-like socket with both inner appearances and Swift/Aligned/Packed/Rolling
+transitions, actual Unix packet-device bytes, liveness and release. Two external
+CLI processes inspect all 64 requested configurations without claiming
+authentication. Requested E0/catalog and actual authenticated E1/catalog remain
+separately observable. The [carrier ledger](modules/common-carrier-service.md)
+and [scoped
+receipt](../work/parallel-features-20261115/parallel-wave5-scoped-validation.json)
+preserve compile, stack and assertion failures and their focused repairs. Full
+tools/check.py, automatic retained recovery, managed refresh, production native
+CLI startup and all full mode/resource/platform/performance gates remain open.
+
+The preceding finite wave4 implements three functional additions:
 [initial-only public-carrier Common runtime](modules/managed-common-runtime.md),
 [typed fresh reconnect after actual backend failure](modules/generic-client-service.md)
 and [external Common control/inspection CLI](modules/common-client-api.md) over

@@ -42,7 +42,6 @@ where
         return Err(common_setup_expired());
     }
     let (socket, driver) = Driver::new_common_on_carrier(parts, contract)?;
-    let driver = owner::StateCell::new(driver)?;
     if Instant::now() >= setup_deadline {
         return Err(common_setup_expired());
     }
@@ -58,7 +57,7 @@ impl Driver {
     pub(super) fn new_common_on_carrier(
         parts: member::carrier::InitialParts,
         contract: CommonTransactionContract,
-    ) -> io::Result<(carrier::IoOwner, Self)> {
+    ) -> io::Result<(carrier::IoOwner, owner::StateCell<Self>)> {
         if contract.refresh_selection().is_some() || contract.extra_wire_bytes() != 1 {
             return Err(invalid(
                 "initial-only carrier requires its exact untimed contract",
@@ -88,29 +87,36 @@ impl Driver {
             io_capacity: plan.capacity_bytes(),
         };
         // Preflight the shared Bank limit before allocating the new I/O adapter.
-        let (datagram, driver) = Self::new_common_input(input, contract, origin, parts.datagram)?;
-        if driver
-            .records
-            .capacity(driver.config.security.max_body_bytes)
-            .map_err(invalid)?
-            .packet_bytes
-            > geometry.max_datagram_bytes
-        {
-            return Err(invalid(
-                "actual selected record exceeds original carrier capacity",
-            ));
-        }
-        let socket = carrier::IoOwner::from_original(datagram)?;
-        let usage = socket.adapter_usage()?;
-        if usage.capacity_bytes != plan.capacity_bytes()
-            || usage.allocations != 3
-            || socket.addresses()? != (driver.info.local_addr, driver.info.peer_addr)
-            || socket.ip_wire_bytes()? != driver.ip
-            || socket.extra_wire_bytes() != 1
-            || socket.maximum_datagram_bytes() != Some(geometry.max_datagram_bytes)
-        {
-            return Err(protocol("carrier adapter usage differs from admitted plan"));
-        }
-        Ok((socket, driver))
+        Self::new_common_input(
+            input,
+            contract,
+            origin,
+            parts.datagram,
+            |datagram, driver| {
+                if driver
+                    .records
+                    .capacity(driver.config.security.max_body_bytes)
+                    .map_err(invalid)?
+                    .packet_bytes
+                    > geometry.max_datagram_bytes
+                {
+                    return Err(invalid(
+                        "actual selected record exceeds original carrier capacity",
+                    ));
+                }
+                let socket = carrier::IoOwner::from_original(datagram)?;
+                let usage = socket.adapter_usage()?;
+                if usage.capacity_bytes != plan.capacity_bytes()
+                    || usage.allocations != 3
+                    || socket.addresses()? != (driver.info.local_addr, driver.info.peer_addr)
+                    || socket.ip_wire_bytes()? != driver.ip
+                    || socket.extra_wire_bytes() != 1
+                    || socket.maximum_datagram_bytes() != Some(geometry.max_datagram_bytes)
+                {
+                    return Err(protocol("carrier adapter usage differs from admitted plan"));
+                }
+                Ok((socket, owner::StateCell::new(driver)?))
+            },
+        )
     }
 }
