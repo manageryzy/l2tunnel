@@ -22,6 +22,8 @@ pub mod storage;
 pub use l2tunnel_codec::aligned_receiver::{
     ChannelId, Delivery, Prepared, RecordIdentity, UnitWitness,
 };
+/// Exact issuing Reliable output awaiting whole-carrier acceptance.
+pub use l2tunnel_reliable::PreparedOutput;
 
 /// Explicit authenticated native interpretation; never inferred from packet bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,6 +698,54 @@ impl Endpoint {
         }
         self.enqueue_admitted(channel, frame, now)
     }
+    /// Select actual Reliable physical-attempt custody before any traffic/stage.
+    /// Legacy endpoint constructors keep their existing poll-time behavior.
+    pub fn enable_physical_send_confirmation(&mut self) -> Result<(), Error> {
+        let status = self.receiver.status();
+        if self.failure.is_some()
+            || self.now != Duration::ZERO
+            || self.sender.is_pending()
+            || self.handoff.is_some()
+            || status.retained_records != 0
+            || status.retained_sources != 0
+            || status.pending_bytes.is_some()
+        {
+            return Err(Error::Configuration);
+        }
+        self.recovery
+            .enable_physical_send_confirmation()
+            .map_err(Error::Recovery)
+    }
+    /// Observe the same actual caller-held output, including after terminal error.
+    pub fn pending_output(&self) -> Option<PreparedOutput> {
+        self.recovery.pending_output()
+    }
+    /// Confirm only an actual whole-carrier write for this exact output witness.
+    /// Recovery custody is consumed before local original native/handoff expiry.
+    pub fn confirm_output(&mut self, now: Duration, output: PreparedOutput) -> Result<(), Error> {
+        self.confirm_output_at(now, now, output)
+    }
+    /// Retain actual whole-write time separately from later callback observation.
+    pub fn confirm_output_at(
+        &mut self,
+        observed: Duration,
+        accepted: Duration,
+        output: PreparedOutput,
+    ) -> Result<(), Error> {
+        if self.recovery.pending_output() != Some(output) {
+            return Err(Error::Recovery(l2tunnel_reliable::Error::OutputToken));
+        }
+        let prior = self.failure;
+        let physical = self
+            .recovery
+            .confirm_output_at(observed, accepted, output)
+            .map_err(Error::Recovery);
+        let timing = self.advance(observed);
+        if let Some(error) = prior {
+            return Err(error);
+        }
+        self.terminal_result(physical.and(timing))
+    }
     /// Emit at most one source/repair/retry under the caller's shared wire budget.
     /// The caller retains returned bytes until its carrier accepts them.
     pub fn poll_data(
@@ -794,6 +844,23 @@ impl Endpoint {
         }
     }
 
+    /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
+    pub fn expiry_deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.recovery
+            .expiry_deadline()
+            .into_iter()
+            .chain(self.handoff.map(|(_, _, deadline)| deadline))
+            .chain(
+                self.receiver
+                    .deadline()
+                    .map(|tick| Duration::from_millis(tick.0)),
+            )
+            .min()
+    }
+
     /// Next recovery, receiver or retained-handoff deadline; poll it even while idle.
     pub fn deadline(&self) -> Option<Duration> {
         if self.failure.is_some() {
@@ -802,17 +869,13 @@ impl Endpoint {
         self.recovery
             .deadline()
             .into_iter()
-            .chain(self.handoff.map(|(_, _, deadline)| deadline))
+            .chain(self.expiry_deadline())
             .chain(
                 self.sender
                     .packing()
+                    .filter(|_| self.recovery.pending_output().is_none())
                     .and_then(|s| s.packing.deadline_micros)
                     .map(Duration::from_micros),
-            )
-            .chain(
-                self.receiver
-                    .deadline()
-                    .map(|tick| Duration::from_millis(tick.0)),
             )
             .min()
     }

@@ -1,5 +1,12 @@
-//! Explicit post-carrier ownership for the actual rolling scheduler output.
+//! Explicit post-carrier custody for actual Rolling and Reliable output.
 use super::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Prepared {
+    Rolling(rolling_records::PreparedOutput),
+    Aligned(l2tunnel_reliable::PreparedOutput),
+    Packed(l2tunnel_reliable::PreparedOutput),
+}
 
 /// Move-only local pending witness, never proof of peer authentication or I/O.
 /// A generation Bank additionally binds its exact issuing generation.
@@ -7,7 +14,8 @@ use super::*;
 pub struct CarrierOutputToken {
     context: Context,
     digest: ConfigDigest,
-    prepared: rolling_records::PreparedOutput,
+    emission: Emission,
+    prepared: Prepared,
 }
 impl CarrierOutputToken {
     /// Actual original generation labels, without authentication authority.
@@ -19,32 +27,43 @@ impl CarrierOutputToken {
         self.digest
     }
     /// Actual retained caller-buffer emission, unchanged through WouldBlock.
-    pub fn emission(&self) -> Emission {
-        let p = &self.prepared;
-        Emission {
-            bytes: p.bytes,
-            kind: p.kind,
-            wire_bytes: p.wire_bytes,
-            security_number: p.security_number,
-            witnesses: p.witnesses,
-        }
+    pub const fn emission(&self) -> Emission {
+        self.emission
     }
 }
 impl Engine {
-    /// Observe the actual pending witness; repeated observations do not hand off output.
+    /// Observe actual pending custody; repeated observations do not hand off output.
     pub fn pending_carrier_output(&self) -> Option<CarrierOutputToken> {
-        match &self.owner {
+        let (emission, prepared) = match &self.owner {
             Owner::Rolling(endpoint) => {
-                endpoint
-                    .pending_output()
-                    .map(|prepared| CarrierOutputToken {
-                        context: self.context,
-                        digest: self.digest,
-                        prepared,
-                    })
+                let p = endpoint.pending_output()?;
+                (
+                    Emission {
+                        bytes: p.bytes,
+                        kind: p.kind,
+                        wire_bytes: p.wire_bytes,
+                        security_number: p.security_number,
+                        witnesses: p.witnesses,
+                    },
+                    Prepared::Rolling(p),
+                )
             }
-            _ => None,
-        }
+            Owner::Aligned(_) => {
+                let (emission, p) = self.reliable_pending?;
+                (emission, Prepared::Aligned(p))
+            }
+            Owner::Packed(_) => {
+                let (emission, p) = self.reliable_pending?;
+                (emission, Prepared::Packed(p))
+            }
+            Owner::Swift(_) => return None,
+        };
+        Some(CarrierOutputToken {
+            context: self.context,
+            digest: self.digest,
+            emission,
+            prepared,
+        })
     }
     /// Consume a matching witness after caller-observed whole carrier ownership.
     /// Encoding, sealing, local enqueue and partial writes cannot acknowledge it.
@@ -53,20 +72,38 @@ impl Engine {
         now: Tick,
         token: CarrierOutputToken,
     ) -> Result<(), Error> {
-        if token.context != self.context || token.digest != self.digest {
+        self.confirm_carrier_output_at(now, now, token)
+    }
+    /// Preserve asynchronous acceptance time for Aligned/Packed retry timers.
+    /// Rolling retains its existing completion-observation timer contract.
+    pub fn confirm_carrier_output_at(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
+        if self.pending_carrier_output().as_ref() != Some(&token) {
             return Err(Error::Token);
         }
-        match &self.owner {
-            Owner::Rolling(endpoint) if endpoint.pending_output() == Some(token.prepared) => {}
-            _ => return Err(Error::Token),
-        }
         let timing = self.advance(now);
-        // Actual carrier ownership has already happened. Let the original owner
-        // record it once even when later time validation makes the Engine fatal.
-        let result = match &mut self.owner {
-            Owner::Rolling(endpoint) => endpoint
-                .confirm_output(now, token.prepared)
-                .map_err(Error::Rolling),
+        // Actual carrier ownership already happened. Consume it exactly once
+        // even when later time/deadline validation makes this Engine terminal.
+        let result = match (&mut self.owner, token.prepared) {
+            (Owner::Rolling(endpoint), Prepared::Rolling(p)) => {
+                endpoint.confirm_output(now, p).map_err(Error::Rolling)
+            }
+            (Owner::Aligned(endpoint), Prepared::Aligned(p)) => {
+                self.reliable_pending = None;
+                endpoint
+                    .confirm_output_at(duration(now), duration(accepted), p)
+                    .map_err(Error::Aligned)
+            }
+            (Owner::Packed(endpoint), Prepared::Packed(p)) => {
+                self.reliable_pending = None;
+                endpoint
+                    .confirm_output_at(duration(now), duration(accepted), p)
+                    .map_err(Error::Aligned)
+            }
             _ => Err(Error::Invariant),
         };
         timing?;

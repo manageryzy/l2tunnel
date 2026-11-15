@@ -243,13 +243,14 @@ impl Fixture {
             endpoint.driver.service_selected_control(now, None)?;
             endpoint.driver.submit_control(now)?;
             let before = endpoint.driver.counters.socket_accepted_packets;
+            let drops = endpoint.driver.counters.socket_drops;
             endpoint.driver.send(
                 &endpoint.socket,
                 now,
                 endpoint.driver.origin + duration(now),
             )?;
             sent[side] = endpoint.driver.counters.socket_accepted_packets - before;
-            assert_eq!(endpoint.driver.counters.socket_drops, 0);
+            assert_eq!(endpoint.driver.counters.socket_drops, drops);
         }
         for (side, count) in sent.into_iter().enumerate() {
             let target = &mut self.endpoints[1 - side];
@@ -942,3 +943,9 @@ mod feedback;
 
 #[path = "transport_common_rolling_tests.rs"]
 mod rolling;
+
+#[path = "transport_common_recovery_tests.rs"]
+mod recovery;
+
+#[path = "transport_common_recovery_wake_tests.rs"]
+mod recovery_wake;

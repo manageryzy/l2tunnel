@@ -40,9 +40,6 @@ impl Sent {
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub(super) fn contains_key(&self, source: &SourceId) -> bool {
-        self.get(source).is_some()
-    }
     pub(super) fn first_key_value(&self) -> Option<(&SourceId, &Flight)> {
         self.iter().min_by_key(|(source, _)| **source)
     }
@@ -70,6 +67,9 @@ impl Sent {
                 map.insert(
                     source,
                     Flight {
+                        prepared_at: Duration::ZERO,
+                        transmission: 0,
+                        acknowledged: false,
                         payload: payload.to_vec(),
                         attempts: 0,
                         retry_at: None,
@@ -86,6 +86,9 @@ impl Sent {
                     .ok_or(RecoveryError::Capacity(BufferSide::Send))?;
                 slot.flight.payload.clear();
                 slot.flight.payload.extend_from_slice(payload);
+                slot.flight.prepared_at = Duration::ZERO;
+                slot.flight.transmission = 0;
+                slot.flight.acknowledged = false;
                 slot.flight.attempts = 0;
                 slot.flight.retry_at = None;
                 slot.flight.rto = rto;
@@ -112,7 +115,7 @@ impl Sent {
             }
         }
     }
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&SourceId, &Flight) -> bool) {
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&SourceId, &mut Flight) -> bool) {
         match self {
             Self::Legacy(map) => map.retain(|source, flight| keep(source, flight)),
             Self::Reserved(slots) => {
@@ -120,7 +123,7 @@ impl Sent {
                     if slot
                         .source
                         .as_ref()
-                        .is_some_and(|source| !keep(source, &slot.flight))
+                        .is_some_and(|source| !keep(source, &mut slot.flight))
                     {
                         slot.source = None;
                         slot.flight.payload.clear();

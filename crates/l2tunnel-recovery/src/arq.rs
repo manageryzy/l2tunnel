@@ -1,6 +1,7 @@
 use crate::RecoveryEngine;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod backing;
@@ -13,6 +14,9 @@ pub const DATA_HEADER_BYTES: usize = 44;
 pub const ACK_PACKET_BYTES: usize = 48;
 const COMMON_HEADER_BYTES: usize = 32;
 const WINDOW_LIMIT: usize = 64;
+
+// Local custody only; never serialized, authenticated or used as a nonce.
+static NEXT_PHYSICAL_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Independent endpoint role; accepting reflected local packets is forbidden.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +118,7 @@ pub enum BufferSide {
     Receive,
 }
 
-/// Explicit errors; only retry exhaustion makes an engine terminal.
+/// Explicit errors; retry exhaustion and invalid physical completion time are terminal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryError {
     /// Invalid local timing, window or memory configuration.
@@ -148,6 +152,8 @@ pub enum RecoveryError {
     TimeOverflow,
     /// A source ID or checked byte counter would overflow.
     CounterExhausted,
+    /// Physical confirmation is foreign, repeated or does not match the held attempt.
+    InvalidTransmission,
     /// The source's finite retry budget expired without confirmation.
     RetryExhausted {
         /// Source whose final retry deadline expired.
@@ -216,6 +222,9 @@ impl Profile {
 
 #[derive(Debug)]
 struct Flight {
+    prepared_at: Duration,
+    transmission: u64,
+    acknowledged: bool,
     payload: Vec<u8>,
     attempts: u32,
     retry_at: Option<Duration>,
@@ -230,6 +239,10 @@ struct Engine {
     profile: Profile,
     sent: Sent,
     received: Received,
+    physical_confirmation: bool,
+    physical_instance: u64,
+    next_transmission: u64,
+    pending_transmissions: usize,
     storage_usage: Option<crate::storage::Usage>,
     next_source: u64,
     receive_prefix: u64,
@@ -317,7 +330,125 @@ pub fn inspect_packet(
     parse(packet, context, Profile::Selective, max_source_bytes)
 }
 
+/// Local observation of one prepared source attempt; never peer authentication.
+/// Confirmation consumes the exact attempt once, including when
+/// an earlier attempt was acknowledged while this retry remained caller-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalTransmission {
+    instance: u64,
+    context: RecoveryContext,
+    source: SourceId,
+    serial: u64,
+}
+
 impl SelectiveRepeat {
+    /// Select whole-send timer custody before any source or peer input is used.
+    /// Legacy constructors keep poll-time custody unless explicitly selected.
+    pub fn enable_physical_send_confirmation(&mut self) -> Result<(), RecoveryError> {
+        self.0.running()?;
+        if self.0.next_source != 0 || self.0.statistics != Statistics::default() {
+            return Err(RecoveryError::InvalidConfig);
+        }
+        if !self.0.physical_confirmation {
+            self.0.physical_instance = NEXT_PHYSICAL_OWNER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| RecoveryError::CounterExhausted)?;
+        }
+        self.0.physical_confirmation = true;
+        Ok(())
+    }
+
+    /// Observe a prepared source that has not completed physical transmission.
+    pub fn pending_transmission(&self, source: SourceId) -> Option<PhysicalTransmission> {
+        let flight = self.0.sent.get(&source)?;
+        (self.0.physical_confirmation
+            && flight.retry_at.is_none()
+            && flight.attempts > 0
+            && flight.transmission != 0)
+            .then_some(PhysicalTransmission {
+                instance: self.0.physical_instance,
+                context: self.0.context,
+                source,
+                serial: flight.transmission,
+            })
+    }
+
+    /// Confirm a prepared attempt after actual whole-carrier acceptance.
+    /// Invalid time after acceptance consumes that custody and fails the owner.
+    pub fn confirm_transmission(
+        &mut self,
+        now: Duration,
+        token: PhysicalTransmission,
+    ) -> Result<(), RecoveryError> {
+        self.confirm_transmission_at(now, now, token)
+    }
+
+    /// Confirm asynchronous carrier acceptance at its original physical time.
+    /// Observation time remains monotonic; acceptance must lie between actual
+    /// preparation and observation. An already due retry stays due immediately.
+    pub fn confirm_transmission_at(
+        &mut self,
+        observed: Duration,
+        accepted: Duration,
+        token: PhysicalTransmission,
+    ) -> Result<(), RecoveryError> {
+        if !self.0.physical_confirmation
+            || token.context != self.0.context
+            || token.instance != self.0.physical_instance
+            || token.serial == 0
+            || self.0.pending_transmissions == 0
+            || !self.0.sent.get(&token.source).is_some_and(|flight| {
+                flight.transmission == token.serial
+                    && flight.retry_at.is_none()
+                    && flight.attempts > 0
+            })
+        {
+            return Err(RecoveryError::InvalidTransmission);
+        }
+        let timing = self.0.check_time(observed);
+        let flight = self
+            .0
+            .sent
+            .get_mut(&token.source)
+            .ok_or(RecoveryError::InvalidTransmission)?;
+        // Consume real physical ownership even if time validation later fails.
+        flight.transmission = 0;
+        self.0.pending_transmissions -= 1;
+        let timing = timing.and(if accepted < flight.prepared_at || accepted > observed {
+            Err(RecoveryError::NonMonotonicTime)
+        } else {
+            Ok(())
+        });
+        let acknowledged = flight.acknowledged;
+        let deadline = if acknowledged {
+            Ok(None)
+        } else {
+            accepted
+                .checked_add(flight.rto)
+                .map(Some)
+                .ok_or(RecoveryError::TimeOverflow)
+        };
+        if acknowledged {
+            self.0.send_bytes -= flight.payload.len();
+            self.0.sent.remove(&token.source);
+        }
+        match timing.and(deadline) {
+            Ok(deadline) => {
+                if let Some(flight) = self.0.sent.get_mut(&token.source) {
+                    flight.retry_at = deadline;
+                }
+                self.0.last_now = observed;
+                Ok(())
+            }
+            Err(error) => {
+                self.0.failure.get_or_insert(error);
+                Err(error)
+            }
+        }
+    }
+
     /// Construct the same ARQ engine with every metadata/payload buffer provisioned.
     /// The heap-only limit includes idle buffers and excludes the inline engine.
     pub fn new_reserved(
@@ -357,11 +488,17 @@ impl SelectiveRepeat {
     }
 
     /// Whether an allocated source was removed by a validated peer receipt.
-    /// Unallocated and retained sources return false; polling is not receipt.
+    /// Unallocated and unacknowledged sources return false; polling is not receipt.
+    /// A confirmed source can retain a locally held retry until physical completion.
     /// Sticky recovery failure remains an error rather than proving completion.
     pub fn source_confirmed(&self, source: SourceId) -> Result<bool, RecoveryError> {
         self.0.running()?;
-        Ok(source.0 < self.0.next_source && !self.0.sent.contains_key(&source))
+        Ok(source.0 < self.0.next_source
+            && self
+                .0
+                .sent
+                .get(&source)
+                .is_none_or(|flight| flight.acknowledged))
     }
 
     /// Earliest first-source or retry deadline, independent of pending receipts.
@@ -510,6 +647,7 @@ macro_rules! engine_api {
                     && self.0.sent.is_empty()
                     && self.0.received.is_empty()
                     && self.0.ack_at.is_none()
+                    && self.0.pending_transmissions == 0
             }
         }
     };
@@ -702,6 +840,9 @@ impl Engine {
             construction.sent.push(SendSlot {
                 source: None,
                 flight: Flight {
+                    prepared_at: Duration::ZERO,
+                    transmission: 0,
+                    acknowledged: false,
                     payload,
                     attempts: 0,
                     retry_at: None,
@@ -786,6 +927,10 @@ impl Engine {
             profile,
             sent,
             received,
+            physical_confirmation: false,
+            physical_instance: 0,
+            next_transmission: 0,
+            pending_transmissions: 0,
             storage_usage,
             next_source: 0,
             receive_prefix: 0,
@@ -937,16 +1082,22 @@ impl Engine {
                 return Err(RecoveryError::UnsentAcknowledgement);
             }
         }
-        if self
-            .sent
-            .iter()
-            .any(|(source, flight)| acknowledged(*source, prefix, bitmap) && flight.attempts == 0)
-        {
+        if self.sent.iter().any(|(source, flight)| {
+            acknowledged(*source, prefix, bitmap)
+                && (flight.attempts == 0
+                    || (self.physical_confirmation
+                        && flight.attempts == 1
+                        && flight.retry_at.is_none()))
+        }) {
             return Err(RecoveryError::UnsentAcknowledgement);
         }
         let mut released_bytes = 0;
         self.sent.retain(|source, flight| {
             if acknowledged(*source, prefix, bitmap) {
+                if self.physical_confirmation && flight.retry_at.is_none() {
+                    flight.acknowledged = true;
+                    return true;
+                }
                 released_bytes += flight.payload.len();
                 false
             } else {
@@ -992,7 +1143,10 @@ impl Engine {
     ) -> Result<Option<usize>, RecoveryError> {
         self.check_time(now)?;
         let ack_ready = allow_feedback && self.ack_at.is_some_and(|deadline| deadline <= now);
-        let data = if allow_sources {
+        let data = if allow_sources
+            && (!self.physical_confirmation
+                || self.pending_transmissions < self.config.send_records)
+        {
             self.ready_source(now)
         } else {
             None
@@ -1047,7 +1201,14 @@ impl Engine {
         } else {
             self.config.initial_rto
         };
-        let retry_at = if self.profile == Profile::Selective {
+        let transmission = if self.physical_confirmation {
+            self.next_transmission
+                .checked_add(1)
+                .ok_or(RecoveryError::CounterExhausted)?
+        } else {
+            0
+        };
+        let retry_at = if self.profile == Profile::Selective && !self.physical_confirmation {
             Some(now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?)
         } else {
             None
@@ -1065,8 +1226,14 @@ impl Engine {
                 .get_mut(&source)
                 .ok_or(RecoveryError::MalformedPacket)?;
             flight.attempts += 1;
+            flight.prepared_at = now;
+            flight.transmission = transmission;
             flight.rto = rto;
             flight.retry_at = retry_at;
+        }
+        self.next_transmission = transmission;
+        if self.physical_confirmation {
+            self.pending_transmissions += 1;
         }
         self.prefer_data = false;
         self.last_now = now;
@@ -1108,7 +1275,11 @@ impl Engine {
         }
         self.sent
             .values()
-            .map(|flight| flight.retry_at.unwrap_or(self.last_now))
+            .filter_map(|flight| {
+                flight
+                    .retry_at
+                    .or_else(|| (flight.attempts == 0).then_some(self.last_now))
+            })
             .min()
     }
 
@@ -1211,3 +1382,6 @@ mod directional_tests;
 mod storage_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod physical_tests;

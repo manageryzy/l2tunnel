@@ -242,7 +242,8 @@ impl Engine {
             },
         )
         .map_err(Error::Pipeline)?;
-        let owner = plan.record.construct(plan.context)?;
+        let mut owner = plan.record.construct(plan.context)?;
+        owner.enable_carrier_confirmation().map_err(Error::Engine)?;
         let p = pipeline.storage_usage().ok_or(Error::Invariant)?;
         let (record_bytes, record_allocations) = owner.storage_heap().ok_or(Error::Invariant)?;
         if p.capacity_bytes != plan.pipeline.capacity_bytes()

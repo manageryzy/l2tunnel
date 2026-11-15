@@ -325,6 +325,27 @@ impl Endpoint {
         self.0.terminal_result(result)?;
         self.0.submit_packed()
     }
+    /// Select the same actual Reliable physical-attempt owner before traffic.
+    pub fn enable_physical_send_confirmation(&mut self) -> Result<(), Error> {
+        self.0.enable_physical_send_confirmation()
+    }
+    /// Observe the exact same caller-held source/repair/feedback output witness.
+    pub fn pending_output(&self) -> Option<PreparedOutput> {
+        self.0.pending_output()
+    }
+    /// Confirm one whole-carrier write without renewing original native caps.
+    pub fn confirm_output(&mut self, now: Duration, output: PreparedOutput) -> Result<(), Error> {
+        self.0.confirm_output(now, output)
+    }
+    /// Use the actual whole-write instant even when its callback arrives later.
+    pub fn confirm_output_at(
+        &mut self,
+        observed: Duration,
+        accepted: Duration,
+        output: PreparedOutput,
+    ) -> Result<(), Error> {
+        self.0.confirm_output_at(observed, accepted, output)
+    }
     /// Emit data/repair/retry under the common full-wire allowance.
     pub fn poll_data(
         &mut self,
@@ -375,6 +396,11 @@ impl Endpoint {
     /// Actual next recovery ACK deadline, excluding data and native work.
     pub fn feedback_deadline(&self) -> Option<Duration> {
         self.0.feedback_deadline()
+    }
+
+    /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
+    pub fn expiry_deadline(&self) -> Option<Duration> {
+        self.0.expiry_deadline()
     }
 
     /// Earliest original packing/recovery/receiver/source-handoff deadline.

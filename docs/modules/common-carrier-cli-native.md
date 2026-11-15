@@ -85,6 +85,19 @@ operations. One retained cleanup deadline is shared by all cleanup. These are
 finite lab budgets, not product recovery defaults. Missing capabilities,
 tools, exhausted bounds and functional failures are explicit nonpassing results.
 
+The Common worker now explicitly selects the existing receipt writer's 4 MiB
+process soft file limit, retaining the 8 MiB hard ceiling required by capture
+children. The unselected generic worker default remains 1 MiB. Command/daemon
+children still install their own 1 MiB log limits and capture children their
+existing 8 MiB limits. Common `worker.log` has a separately checked 1 MiB
+acceptance bound and records its observed size; its process-level physical
+ceiling is 4 MiB, so this is not pre-write 1 MiB stdout enforcement. Receipt
+publication remains bounded at 4 MiB without pruning status/catalog evidence.
+The focused default/explicit/inherited-limit and independent-log regressions
+passed in the Wave8 full-check tooling stage. Its current native attempt passed
+three cases; the QUIC/TAP receipt-publication failure and single-case retry remain
+separate. Historical 1 MiB observations and failed attempts are preserved.
+
 The input plan must explicitly configure a positive integer
 `runtime.report_interval_micros` shorter than the existing five-second liveness
 observation cap. Preflight refuses disabled or inadequate cadence before lab

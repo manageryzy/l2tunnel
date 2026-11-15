@@ -36,3 +36,32 @@ retained recovery, native/platform/performance and every original parity gate
 remain required. See [rolling records](rolling-records.md),
 [local/global recovery](local-global-rlnc.md) and
 [implementation checklist](../implementation-checklist.md).
+
+## Committed feedback snapshot prerequisite
+
+Implemented and protocol-tested: derive feedback only from the committed
+decoder header. Compute checked historical sources as prefix minus
+actual evicted-before, future known as known-count minus that history, and
+missing extent as end minus prefix minus future-known. The deficit subtracts
+committed rank with saturation. Handoff can advance prefix before eviction;
+shadow, candidate and aborted transaction state cannot enter this snapshot.
+
+Freeze one concrete Feedback while serializing its unchanged 64 bytes under the
+existing copy/metadata budgets. Permit ingress and handoff subject to the real
+decoder Busy/Capacity constraints. Reset feedback events/due at snapshot start
+only; subsequent events retain their first due time through older output
+confirmation. Add no allocation, wire field, identity, deadline or budget.
+Higher-level feedback-building handoff guards remain unchanged.
+
+- [x] [RFB-01] Verify the checked snapshot against actual committed-column scans across lagging eviction, in-flight GF shadow and Capacity/abort; preserve the 64-byte format and identity exhaustion. Evidence: [finite Wave8 checks and preserved failures](../../work/parallel-features-20261115/parallel-wave8-scoped-validation.json).
+- [x] [RFB-02] Verify tiny-budget immutable serialization with concurrent ingress/handoff, retained later feedback debt/first trigger, unchanged work caps and original output expiry. Evidence: [finite Wave8 checks and preserved failures](../../work/parallel-features-20261115/parallel-wave8-scoped-validation.json).
+- [x] [RFB-03] Exercise actual global8192/local128/every16 recovery of an old hole using a real global repair, all exact originals, retained sender debt, ring reuse and stable storage; separate finite component evidence from full FIX-03. Evidence: [finite Wave8 checks and preserved failures](../../work/parallel-features-20261115/parallel-wave8-scoped-validation.json).
+
+Six new focused cases and the existing feedback identity-exhaustion case pass,
+alongside affected strict checks. The actual8192 experiment uses payload8 and
+rows4, with one old hole and two subsequent full ring reuses; it is finite
+component evidence, not full-width GF or kernel throughput qualification.
+
+The legacy support128 guard and window-times-lanes ingress queue remain unchanged.
+Full FIX-03 still requires decoupled ingress, full/half local2 pressure,
+Busy/Capacity loss/deadline coverage and global-GF/native/performance evidence.

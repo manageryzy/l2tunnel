@@ -331,8 +331,9 @@ impl Link {
                 wire_bytes: self.output.len() + self.overhead,
             };
             let mut budget = before;
+            let sent_at = next(clock);
             let Some(emission) = sender.poll(
-                next(clock),
+                sent_at,
                 self.number,
                 allow_data,
                 &mut self.output,
@@ -374,6 +375,11 @@ impl Link {
                 self.units.push(unit.identity);
             }
             let mut body = self.output[..emission.bytes].to_vec();
+            // This link observes whole carrier ownership before peer delivery.
+            if let Some(token) = sender.pending_carrier_output() {
+                assert_eq!(token.emission(), emission);
+                sender.confirm_carrier_output(sent_at, token)?;
+            }
             // This finite plaintext link assumes the caller's authentication boundary.
             receiver.accept_authenticated(
                 next(clock),
@@ -957,6 +963,11 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
                 &mut forward.witnesses,
             )? {
                 assert!(matches!(emission.kind, EmissionKind::Source(_)));
+                let token = sender
+                    .pending_carrier_output()
+                    .ok_or("actual carrier source token")?;
+                assert_eq!(token.emission(), emission);
+                sender.confirm_carrier_output(now, token)?;
                 let received_at = Tick(now.0 + 10);
                 let mut body = forward.output[..emission.bytes].to_vec();
                 receiver.accept_authenticated(
@@ -1004,6 +1015,11 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
                     &mut reverse.witnesses,
                 )? {
                     Some(emission) => {
+                        let token = receiver
+                            .pending_carrier_output()
+                            .ok_or("actual reverse carrier token")?;
+                        assert_eq!(token.emission(), emission);
+                        receiver.confirm_carrier_output(now, token)?;
                         retry_armed |= matches!(emission.kind, EmissionKind::Source(_));
                         reverse.number += 1;
                         // Drop the real reverse source deliberately, leaving its ARQ retry due.

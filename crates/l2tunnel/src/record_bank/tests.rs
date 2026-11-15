@@ -311,6 +311,10 @@ fn transfer(
         return Ok(false);
     };
     assert_eq!(emission.security_number, *number);
+    if let Some(token) = sender.entry(from)?.pending_carrier_output() {
+        assert_eq!(token.emission(), emission);
+        sender.entry(from)?.confirm_carrier_output(now, token)?;
+    }
     *number = number.checked_add(1).ok_or("test number exhausted")?;
     for (receiver, id) in receivers {
         let mut plaintext = output[..emission.bytes].to_vec();

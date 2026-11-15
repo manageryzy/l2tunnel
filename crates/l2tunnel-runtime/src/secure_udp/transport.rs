@@ -73,8 +73,8 @@ mod generic;
 #[path = "transport_generic_actions.rs"]
 mod generic_actions;
 pub use common::{
-    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, common_channel,
-    run_common, run_common_on_carrier,
+    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, SameFlowRecovery,
+    common_channel, run_common, run_common_on_carrier,
 };
 pub use common_contract::{CommonTransactionContract, FreshKeyPolicy};
 pub use generic::{
@@ -2600,6 +2600,9 @@ impl Driver {
             }
         };
         self.live.last_verified_micros = Some(now);
+        // This opener already checked the actual session keys and replay owner.
+        // Setup tails, rejected tags and replay cannot restore path availability.
+        self.restore_common_path();
         match opened.class {
             Class::Control => {
                 if opened.scope != self.records.control_scope() {

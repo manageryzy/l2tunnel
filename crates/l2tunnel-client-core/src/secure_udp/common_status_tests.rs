@@ -2,6 +2,32 @@ use super::*;
 use l2tunnel::{pipeline, record_configuration as common};
 use l2tunnel_core::{Duplex, traffic};
 use std::time::Duration;
+
+#[test]
+fn same_flow_recovery_observation_has_exact_bounded_fields_without_authority() -> io::Result<()> {
+    let value = PathRecovery {
+        unavailable: true,
+        send_failures: 2,
+        retry_attempts: 1,
+        resumptions: 0,
+        last_error: Some("NetworkDown".into()),
+        retry_at_micros: Some(123_456),
+    };
+    let encoded = serde_json::to_string(&value).map_err(io::Error::other)?;
+    assert_eq!(
+        encoded,
+        r#"{"unavailable":true,"send_failures":2,"retry_attempts":1,"resumptions":0,"last_error":"NetworkDown","retry_at_micros":123456}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<PathRecovery>(&encoded).map_err(io::Error::other)?,
+        value
+    );
+    assert!(encoded.len() < 256);
+    let mut invalid = serde_json::to_value(value).map_err(io::Error::other)?;
+    invalid["authenticated"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<PathRecovery>(invalid).is_err());
+    Ok(())
+}
 pub(crate) fn descriptor(rate: u64) -> io::Result<common::Descriptor> {
     let queue = pipeline::QueueLimits {
         bytes: 65536,

@@ -110,15 +110,18 @@ New successful source handoff supersedes the idle-tail due time, as Python's
 source serialization finish supersedes its tail generation. A due time is a
 service trigger; original debt/output deadlines remain hard expiry bounds.
 
-`Receiver` owns the actual Decoder, one budgeted feedback scan and one immutable
+`Receiver` owns the actual Decoder, one committed feedback snapshot and one immutable
 feedback output, without a sender payload ledger. Complete received source/repair
 wire bytes enter through the existing codec. Feedback carries full Scope, an
 independent nonwrapping feedback ID, actual published cumulative prefix,
 committed observed end and `max(unknown sources - independent rank, 0)` deficit.
 Count or first-event timeout triggers feedback; a repeated/stale tail can cause
-a fresh cumulative receipt after feedback loss. Feedback scans freeze new decode
-admission while visiting at most W known-column identities under metadata work;
-serialization advances under byte-copy work. A retained feedback output does
+a fresh cumulative receipt after feedback loss. Feedback snapshots derive prefix,
+observed end and deficit from the checked committed decoder header in constant
+work; serialization advances under byte-copy work. Ingress and handoff may
+continue while that snapshot is serialized, subject to actual decoder Busy/
+Capacity limits. New feedback debt retains its own first trigger. Higher-level
+Rolling Endpoint feedback-building admission guards are unchanged. A retained feedback output does
 not freeze independent decoder progress and never changes bytes. Its original
 handoff deadline remains fixed. Receiver handoff remains distinct from native
 delivery. An additive fixed 64-byte structural `L2RF` version-one feedback codec

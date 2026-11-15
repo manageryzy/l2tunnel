@@ -4,6 +4,49 @@ use l2tunnel::{record_bank, record_configuration as configuration, record_engine
 use l2tunnel_reliable::{OutboundBudget, RecordKind};
 
 impl Driver {
+    pub(super) fn restore_common_path(&mut self) {
+        if let Some(runtime) = &mut self.common
+            && runtime.path.unavailable
+        {
+            runtime.path.unavailable = false;
+            runtime.path.retry_at_micros = None;
+            runtime.path.resumptions = runtime.path.resumptions.saturating_add(1);
+            runtime.observation_dirty = true;
+        }
+    }
+
+    fn common_retry_attempt(&mut self, now: u64) -> io::Result<bool> {
+        let interval = self.config.work.receive_interval;
+        let runtime = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("common retry owner missing"))?;
+        if runtime.path.unavailable {
+            if runtime.path.retry_at_micros.is_some_and(|at| now < at) {
+                return Ok(false);
+            }
+            let next = add(now, interval)?;
+            runtime.path.retry_attempts = runtime.path.retry_attempts.saturating_add(1);
+            runtime.path.retry_at_micros = Some(next);
+        }
+        Ok(true)
+    }
+
+    fn common_path_failure(&mut self, now: u64, kind: io::ErrorKind) -> io::Result<()> {
+        let next = add(now, self.config.work.receive_interval)?;
+        let runtime = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("common retry owner missing"))?;
+        runtime.observation_dirty |= !runtime.path.unavailable;
+        runtime.path.unavailable = true;
+        runtime.path.send_failures = runtime.path.send_failures.saturating_add(1);
+        runtime.path.last_error = Some(kind);
+        runtime.path.retry_at_micros = Some(next);
+        self.counters.socket_drops = self.counters.socket_drops.saturating_add(1);
+        Ok(())
+    }
+
     /// Called once per sole-loop turn, never from per-packet progress callbacks.
     pub(super) fn service_common_rolling(&mut self, now: u64) -> io::Result<()> {
         let Some(work) = self.config.rolling_work else {
@@ -119,7 +162,11 @@ impl Driver {
             .common()
             .pipeline();
         let usage = engine.queue_usage();
-        Ok(state.can_admit_data()
+        Ok(!self
+            .common
+            .as_ref()
+            .is_some_and(|runtime| runtime.path.unavailable)
+            && state.can_admit_data()
             && usage.packets < policy.queue.packets
             && policy.queue.bytes.saturating_sub(usage.bytes)
                 >= engine
@@ -655,16 +702,19 @@ impl Driver {
         // accepted_at remains the independent physical fact, never rewritten.
         let observed = sample();
         let completed = clock(self.origin, observed);
+        let accepted = clock(self.origin, receipt.accepted_at);
         let at = completed.as_ref().copied().unwrap_or(u64::MAX);
+        let physical_at = accepted.as_ref().copied().unwrap_or(u64::MAX);
         let confirmation = if let Some(token) = pending.carrier {
             self.common_state_mut()?
                 .entry(core::Epoch(pending.scope.epoch.0))?
-                .confirm_carrier_output(engine::Tick(at), token)
+                .confirm_carrier_output_at(engine::Tick(at), engine::Tick(physical_at), token)
                 .map_err(protocol)
         } else {
             Ok(())
         };
         completed?;
+        accepted?;
         confirmation?;
         if late
             || receipt.accepted_at >= receipt.deadline
@@ -717,16 +767,19 @@ impl Driver {
                 "retained Common wire lost its original security scope/number",
             ));
         }
-        let runtime = self
-            .common
-            .as_mut()
-            .ok_or_else(|| protocol("common sealed owner"))?;
         if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original Common sealed output cap",
             ));
         }
+        if !self.common_retry_attempt(now)? {
+            return Ok(false);
+        }
+        let runtime = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("common sealed owner"))?;
         match send(&runtime.wire[..sealed.bytes]) {
             Ok(bytes) if bytes == sealed.bytes => {
                 self.counters.socket_accepted_packets =
@@ -766,6 +819,20 @@ impl Driver {
                 "partial Common UDP handoff",
             )),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::HostUnreachable
+                        | io::ErrorKind::NetworkUnreachable
+                        | io::ErrorKind::NetworkDown
+                ) =>
+            {
+                // This attempt accepted no datagram. Keep the exact sealed
+                // owner/token/debit; only genuine protected ingress resumes it.
+                self.common_path_failure(now, error.kind())?;
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -890,8 +957,21 @@ impl Driver {
                 .as_ref()
                 .and_then(|runtime| runtime.sealed.as_ref())
         {
-            wake = wake.min(now).min(pending.deadline);
+            let retry = self
+                .common
+                .as_ref()
+                .filter(|runtime| runtime.path.unavailable)
+                .and_then(|runtime| runtime.path.retry_at_micros)
+                .unwrap_or(now);
+            wake = wake.min(retry).min(pending.deadline);
         }
+        // A retained retry already owns the only User wire slot. Do not wake
+        // on another data/feedback poll while that exact slot waits its cadence.
+        let held_user = held_user
+            || self
+                .common
+                .as_ref()
+                .is_some_and(|runtime| runtime.path.unavailable && runtime.sealed.is_some());
         if self.control_work || self.control.ready_nontransaction()? {
             wake = wake.min(now);
         }
@@ -937,7 +1017,9 @@ impl Driver {
                 wake = wake.min(now);
             }
             if held_user {
-                if let Some(at) = engine.deadline().map_err(protocol)? {
+                // Soft output opportunities cannot progress while the sole
+                // carrier slot is held. Original retention caps still apply.
+                if let Some(at) = engine.expiry_deadline().map_err(protocol)? {
                     wake = wake.min(at.0);
                 }
                 continue;

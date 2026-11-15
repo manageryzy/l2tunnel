@@ -16,6 +16,17 @@ pub(super) enum Owner {
 }
 
 impl Owner {
+    pub(super) fn enable_carrier_confirmation(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Aligned(endpoint) => endpoint
+                .enable_physical_send_confirmation()
+                .map_err(Error::Aligned),
+            Self::Packed(endpoint) => endpoint
+                .enable_physical_send_confirmation()
+                .map_err(Error::Aligned),
+            Self::Swift(_) | Self::Rolling(_) => Ok(()),
+        }
+    }
     pub(super) fn storage_heap(&self) -> Option<(usize, usize)> {
         match self {
             Self::Swift(owned) => {
@@ -384,6 +395,21 @@ impl Owner {
         at.map(|at| {
             u64::try_from(at.as_micros())
                 .map(|at| (Tick(at), bytes))
+                .map_err(|_| Error::Arithmetic)
+        })
+        .transpose()
+    }
+
+    pub(super) fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
+        let at = match self {
+            Self::Swift(_) => return Ok(None),
+            Self::Aligned(endpoint) => endpoint.expiry_deadline(),
+            Self::Packed(endpoint) => endpoint.expiry_deadline(),
+            Self::Rolling(endpoint) => return Ok(endpoint.deadline()),
+        };
+        at.map(|at| {
+            u64::try_from(at.as_micros())
+                .map(Tick)
                 .map_err(|_| Error::Arithmetic)
         })
         .transpose()

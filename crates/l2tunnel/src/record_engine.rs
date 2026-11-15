@@ -301,6 +301,7 @@ pub struct Engine {
     next_channel: u16,
     limits: NativeLimits,
     pending: Option<PreparedNative>,
+    reliable_pending: Option<(Emission, l2tunnel_reliable::PreparedOutput)>,
     statistics: Statistics,
     last: Option<Tick>,
     failure: Option<Error>,
@@ -329,7 +330,8 @@ impl Engine {
                 .pipeline(),
         )
         .map_err(Error::Pipeline)?;
-        let owner = Owner::new(&configuration, context)?;
+        let mut owner = Owner::new(&configuration, context)?;
+        owner.enable_carrier_confirmation()?;
         Ok(Self::assemble(
             configuration,
             context,
@@ -374,6 +376,7 @@ impl Engine {
             next_channel: 0,
             limits,
             pending: None,
+            reliable_pending: None,
             statistics: Statistics::default(),
             last: None,
             failure: None,
@@ -527,6 +530,22 @@ impl Engine {
             self.overhead,
         ) {
             Ok(Some(emission)) => {
+                let pending = match &self.owner {
+                    Owner::Aligned(endpoint) => Some(endpoint.pending_output()),
+                    Owner::Packed(endpoint) => Some(endpoint.pending_output()),
+                    _ => None,
+                };
+                if let Some(pending) = pending {
+                    let Some(prepared) = pending else {
+                        return self.fail(Error::Invariant);
+                    };
+                    if prepared.bytes != emission.bytes
+                        || prepared.wire_bytes != emission.wire_bytes
+                    {
+                        return self.fail(Error::Invariant);
+                    }
+                    self.reliable_pending = Some((emission, prepared));
+                }
                 self.statistics.emitted = next;
                 Ok(Some(emission))
             }
@@ -606,6 +625,18 @@ impl Engine {
         Ok(self
             .owner
             .deadline()?
+            .into_iter()
+            .chain(self.pending.map(|p| p.deadline))
+            .min())
+    }
+
+    /// Original retained-state/native expiry, excluding output service opportunities.
+    /// Callers holding the shared carrier slot still service these hard bounds.
+    pub fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
+        self.healthy()?;
+        Ok(self
+            .owner
+            .expiry_deadline()?
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
             .min())

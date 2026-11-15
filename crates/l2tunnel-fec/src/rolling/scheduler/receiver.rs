@@ -15,7 +15,7 @@ pub struct ReceiverStep {
 pub struct ReceiverStatus {
     /// Actual committed decoder state.
     pub decoder: DecoderStatus,
-    /// A bounded known-column scan/serialization job freezes new decode admission.
+    /// One immutable committed snapshot is undergoing bounded serialization.
     pub feedback_building: bool,
     /// One immutable receipt is waiting for caller handoff.
     pub feedback_ready: bool,
@@ -27,12 +27,7 @@ pub struct ReceiverStatus {
     pub terminal: Option<Error>,
 }
 struct Scan {
-    prefix: u32,
-    end: u32,
-    rank: usize,
-    cursor: u32,
-    known: u32,
-    value: Option<Feedback>,
+    value: Feedback,
     copied: usize,
 }
 /// One pure receiver with an actual decoder and one bounded identified feedback output.
@@ -126,12 +121,10 @@ impl Receiver {
         Ok(())
     }
     /// Stage one complete caller-authenticated source/repair record through the existing codec.
-    /// No input queue is hidden: a decode/feedback-scan job returns Busy unchanged.
+    /// No input queue is hidden: an actual pending decode job returns Busy unchanged.
+    /// An immutable feedback snapshot does not prevent new decode admission.
     pub fn receive_wire(&mut self, bytes: &[u8], now: Tick) -> Result<Begin, Error> {
         self.time(now)?;
-        if self.scan.is_some() {
-            return Err(Error::Busy);
-        }
         let result = match wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?
         {
             wire::View::Source {
@@ -179,14 +172,15 @@ impl Receiver {
                 return self.fail(Error::Exhausted);
             }
             let end = deadline(now, self.policy.recovery.job_ticks).or_else(|e| self.fail(e))?;
-            let status = self.decoder.status();
+            let (prefix, observed_end, deficit) = self.decoder.feedback_state()?;
             self.scan = Some(Scan {
-                prefix: status.decoded_prefix,
-                end: status.observed_end,
-                rank: status.rank,
-                cursor: status.decoded_prefix,
-                known: 0,
-                value: None,
+                value: Feedback {
+                    scope: self.scope,
+                    id: FeedbackId(self.next_feedback),
+                    prefix,
+                    observed_end,
+                    deficit,
+                },
                 copied: 0,
             });
             self.events = 0;
@@ -195,20 +189,7 @@ impl Receiver {
         }
         while self.scan.is_some() && spend(&mut budget.metadata) {
             let scan = self.scan.as_mut().ok_or(Error::Busy)?;
-            if scan.cursor < scan.end {
-                if self.decoder.committed_known(SourceId(scan.cursor)) {
-                    scan.known += 1;
-                }
-                scan.cursor += 1;
-                continue;
-            }
-            let value = *scan.value.get_or_insert_with(|| Feedback {
-                scope: self.scope,
-                id: FeedbackId(self.next_feedback),
-                prefix: scan.prefix,
-                observed_end: scan.end,
-                deficit: (scan.end - scan.prefix - scan.known).saturating_sub(scan.rank as u32),
-            });
+            let value = scan.value;
             if scan.copied < FEEDBACK_BYTES {
                 if !spend(&mut budget.copies) {
                     break;
@@ -242,12 +223,9 @@ impl Receiver {
         }
         self.decoder.decoded_source(id)
     }
-    /// Confirm an exact upper handoff. A feedback scan freezes its committed snapshot.
+    /// Confirm an exact upper handoff without changing an existing feedback snapshot.
     pub fn confirm_handoff(&mut self, id: SourceId, now: Tick) -> Result<(), Error> {
         self.time(now)?;
-        if self.scan.is_some() {
-            return Err(Error::Busy);
-        }
         let before = self.decoder.status().decoded_prefix;
         self.decoder.confirm_handoff(id, now)?;
         if self.decoder.status().decoded_prefix != before {
@@ -305,3 +283,6 @@ impl Receiver {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod feedback_tests;

@@ -6,8 +6,8 @@ mod arq;
 pub mod storage;
 pub use arq::{
     ACK_PACKET_BYTES, ArqConfig, BufferSide, CarrierOnly, DATA_HEADER_BYTES, EndpointRole,
-    PacketView, RecoveryContext, RecoveryError, Retained, SelectiveRepeat, SourceId, Statistics,
-    inspect_packet,
+    PacketView, PhysicalTransmission, RecoveryContext, RecoveryError, Retained, SelectiveRepeat,
+    SourceId, Statistics, inspect_packet,
 };
 
 /// Incremental recovery uses injected monotonic time and bounded caller buffers.

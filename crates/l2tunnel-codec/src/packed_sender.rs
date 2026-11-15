@@ -67,6 +67,8 @@ pub enum Error {
     Envelope(envelope::Error),
     /// Internal source metadata disagrees with its exact packed contents.
     Ownership,
+    /// Explicit source-copy policy or canonical unit classification failed.
+    Copies(crate::source_copy::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -99,6 +101,7 @@ pub struct Sender {
     first_unit: Option<SourceId>,
     failure: Option<Error>,
     usage: Option<crate::aligned_storage::Usage>,
+    copy_policy: crate::source_copy::Policy,
 }
 #[allow(dead_code)]
 pub(crate) struct LegacyLayout {
@@ -138,6 +141,22 @@ impl Sender {
         result.usage = Some(allocation.finish(plan.capacity_bytes())?);
         Ok(result)
     }
+    /// Select an explicit immutable copy policy before any actual reservation.
+    /// Existing Config/wire identities are unchanged; the enclosing authenticated
+    /// profile must separately bind this selection before installing the sender.
+    pub fn new_reserved_with_copies(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+        policy: crate::source_copy::Policy,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        policy
+            .validate(config.packing.symbol_bytes)
+            .map_err(|error| crate::aligned_storage::Error::PackedSender(Error::Copies(error)))?;
+        let mut result = Self::new_reserved(scope, config, limits)?;
+        result.copy_policy = policy;
+        Ok(result)
+    }
     /// Actual complete backing observation; legacy construction reports None.
     pub fn storage_usage(&self) -> Option<crate::aligned_storage::Usage> {
         self.usage
@@ -157,6 +176,7 @@ impl Sender {
             first_unit: None,
             failure: None,
             usage: None,
+            copy_policy: crate::source_copy::Policy::ONE,
         })
     }
     /// Validate all products before allocating packet/metadata storage.
@@ -172,7 +192,26 @@ impl Sender {
             first_unit: None,
             failure: None,
             usage: None,
+            copy_policy: crate::source_copy::Policy::ONE,
         })
+    }
+    /// Select an explicit immutable policy while keeping existing constructors
+    /// on the exact one-copy default and retaining the same actual heap owners.
+    pub fn new_with_copies(
+        scope: Scope,
+        config: Config,
+        policy: crate::source_copy::Policy,
+    ) -> Result<Self, Error> {
+        policy
+            .validate(config.packing.symbol_bytes)
+            .map_err(Error::Copies)?;
+        let mut result = Self::new(scope, config)?;
+        result.copy_policy = policy;
+        Ok(result)
+    }
+    /// Exact immutable local policy; this observation authenticates nothing.
+    pub fn copy_policy(&self) -> crate::source_copy::Policy {
+        self.copy_policy
     }
     fn live(&self) -> Result<(), Error> {
         self.failure.map_or(Ok(()), Err)
@@ -252,7 +291,11 @@ impl Sender {
             };
             let unit = self.aligned.pending_unit().map_err(Error::Aligned)?;
             let record = unit.record;
-            let pushed = match self.packing.push(unit.bytes, 1, now) {
+            let copies = self
+                .copy_policy
+                .copies_for_unit(unit.bytes, self.config.packing.symbol_bytes)
+                .map_err(Error::Copies)?;
+            let pushed = match self.packing.push(unit.bytes, copies, now) {
                 Err(packed::Error::ClockExhausted) => {
                     return self.fail(Error::Packing(packed::Error::ClockExhausted));
                 }
@@ -286,7 +329,7 @@ impl Sender {
     pub fn write_pending(&self, source: SourceId, output: &mut [u8]) -> Result<usize, Error> {
         self.live()?;
         let packed = self.packing.pending().ok_or(Error::NoPending)?;
-        if usize::from(packed.units) != self.records.len() || packed.copies != 1 {
+        if usize::from(packed.units) != self.records.len() || !(1..=4).contains(&packed.copies) {
             return Err(Error::Ownership);
         }
         envelope::encode(
@@ -301,6 +344,12 @@ impl Sender {
             output,
         )
         .map_err(Error::Envelope)
+    }
+    /// Physical copies requested by the retained homogeneous packed source.
+    /// This neither emits copies nor acknowledges any physical/recovery handoff.
+    pub fn pending_copies(&self) -> Result<u8, Error> {
+        self.live()?;
+        Ok(self.packing.pending().ok_or(Error::NoPending)?.copies)
     }
     /// Release only after actual recovery copied the complete envelope with the same ID.
     /// This is neither a source-prefix receipt nor native-delivery confirmation.

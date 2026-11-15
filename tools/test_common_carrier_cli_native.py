@@ -163,6 +163,29 @@ class SelectionAndPlan(unittest.TestCase):
 
 
 class ActualObservationBounds(unittest.TestCase):
+    def test_receipt_above_log_bound_retains_full_bytes_and_worker_log_is_independently_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'receipt.json'
+            value = {'status': 'passed', 'retained_status': 'x' * (h.BOUNDS['log_bytes'] + 1)}
+            receipt = h.bounded.Receipt(path, value)
+            self.assertGreater(path.stat().st_size, h.BOUNDS['log_bytes'])
+            self.assertLess(path.stat().st_size, h.bounded.RECEIPT_LIMIT)
+            self.assertEqual(json.loads(path.read_text()), value)
+            self.assertEqual(receipt.value, value)
+            log = Path(directory) / 'worker.log'
+            log.write_bytes(b'x' * h.BOUNDS['log_bytes'])
+            launch = Mock()
+            self.assertEqual(h.observe_worker_log(log, launch), h.BOUNDS['log_bytes'])
+            launch.update.assert_called_once_with(worker_log_bytes=h.BOUNDS['log_bytes'],
+                worker_log_limit_bytes=h.BOUNDS['log_bytes'])
+            with log.open('ab') as stream:
+                stream.write(b'x')
+            with self.assertRaises(h.native.BoundExhausted) as exhausted:
+                h.observe_worker_log(log, launch)
+            self.assertEqual(h.failure_status(exhausted.exception), 'bound_exhausted')
+            self.assertEqual(launch.update.call_args.kwargs['worker_log_bytes'], h.BOUNDS['log_bytes'] + 1)
+            self.assertEqual(h.BOUNDS['observations'], 256)
+
     def test_full64_six_phase_receipt_keeps_artifacts_within_original_file_cap(self):
         # Serialization geometry only: these public-shape values do not claim
         # authenticated protocol validity or substitute for Rust fixture exports.

@@ -506,6 +506,39 @@ class CapturesAndOwnership(unittest.TestCase):
                     crypto.assert_not_called()
 
 
+class WorkerFileLimits(unittest.TestCase):
+    def test_default_and_explicit_receipt_cap_preserve_capture_ceiling(self):
+        for selected, expected in ((None, h.BOUNDS['log_bytes']), (4 * 1024 * 1024, 4 * 1024 * 1024)):
+            with patch.object(h.resource, 'getrlimit', return_value=(h.resource.RLIM_INFINITY, h.resource.RLIM_INFINITY)), \
+                    patch.object(h.resource, 'setrlimit') as apply:
+                limits = h.worker_limits() if selected is None else h.worker_limits(file_bytes=selected)
+                apply.assert_not_called()
+                limits()
+                apply.assert_called_once_with(h.resource.RLIMIT_FSIZE, (expected, h.BOUNDS['capture_bytes']))
+        self.assertEqual(h.BOUNDS['log_bytes'], 1024 * 1024)
+        self.assertEqual(h.BOUNDS['capture_bytes'], 8 * 1024 * 1024)
+
+    def test_invalid_or_insufficient_inherited_caps_refuse_without_limit_mutation(self):
+        for invalid in (False, True, 0, -1, '4194304', h.BOUNDS['capture_bytes'] + 1):
+            with patch.object(h.resource, 'getrlimit') as read, patch.object(h.resource, 'setrlimit') as apply:
+                with self.assertRaises(ValueError):
+                    h.worker_limits(file_bytes=invalid)
+                read.assert_not_called()
+                apply.assert_not_called()
+        maximum = h.BOUNDS['capture_bytes']
+        with patch.object(h.resource, 'getrlimit', return_value=(maximum - 1, maximum - 1)), \
+                patch.object(h.resource, 'setrlimit') as apply:
+            with self.assertRaises(h.native.ObservationError):
+                h.worker_limits(file_bytes=4 * 1024 * 1024)
+            apply.assert_not_called()
+        with patch.object(h.resource, 'getrlimit', side_effect=[(maximum, maximum), (maximum - 1, maximum - 1)]), \
+                patch.object(h.resource, 'setrlimit') as apply:
+            limits = h.worker_limits(file_bytes=4 * 1024 * 1024)
+            with self.assertRaises(ValueError):
+                limits()
+            apply.assert_not_called()
+
+
 class OriginalDeadlines(unittest.TestCase):
     def owner(self):
         return h.Owner(h.plan('unit', 'quic-like', 'tap'), Path('/unused'), Mock(), 240)

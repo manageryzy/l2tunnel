@@ -56,3 +56,6 @@ pub mod packed_envelope;
 
 /// Bounded timed aligned-unit packing with externally owned recovery source IDs.
 pub mod packed_sender;
+
+/// Explicit generic-short/context copy selection over canonical aligned units.
+pub mod source_copy;

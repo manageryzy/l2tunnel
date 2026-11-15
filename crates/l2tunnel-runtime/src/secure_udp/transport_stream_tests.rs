@@ -211,7 +211,7 @@ struct FaultFixture {
 }
 
 impl FaultFixture {
-    async fn new(appearance: cover::Appearance) -> Result<Self> {
+    async fn new(appearance: cover::Appearance) -> Result<owner::StateCell<Self>> {
         let mut configured = config(appearance);
         // This explicit finite test profile fits130 real round trips inside the
         // original policy cap. It changes no CLI defaults or production timeout.
@@ -252,7 +252,9 @@ impl FaultFixture {
             assert!(empty, "stream fault fixture retained setup input");
         }
         let start = add(clock(origin, setup_end)?, Duration::from_millis(20))?.max(1_000_000);
-        Ok(Self {
+        // Return only a fallible cell header from this async constructor. The
+        // actual pair stays owned once; shared Endpoint layout is unchanged.
+        Ok(owner::StateCell::new(Self {
             endpoints: [
                 Endpoint {
                     original: (a_socket.local_addr()?, a_socket.peer_addr()?),
@@ -267,7 +269,7 @@ impl FaultFixture {
             ],
             start,
             attempts: Vec::new(),
-        })
+        })?)
     }
 
     fn request(&mut self) -> Result<oneshot::Receiver<std::result::Result<u64, SwitchError>>> {

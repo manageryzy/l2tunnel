@@ -522,23 +522,23 @@ fn feedback_first_event_trigger_scan_work_and_held_bytes_have_original_deadlines
     receiver.step(Tick(3), work(1))?;
     assert!(receiver.status().feedback_building);
     assert_eq!(
-        receiver.receive_wire(&source_wire(SourceId(2), b"busy")?, Tick(3)),
-        Err(Error::Busy)
+        receiver.receive_wire(&source_wire(SourceId(2), b"three")?, Tick(3))?,
+        Begin::Staged
     );
-    assert_eq!(
-        receiver.confirm_handoff(SourceId(0), Tick(3)),
-        Err(Error::Busy)
-    );
+    receiver.confirm_handoff(SourceId(0), Tick(3))?;
     drive_receiver(&mut receiver, Tick(3), 1)?;
     let value = receiver.pending_feedback().ok_or("held feedback")?;
+    assert_eq!((value.prefix, value.observed_end, value.deficit), (2, 2, 0));
+    assert_eq!(receiver.status().decoder.decoded_prefix, 3);
+    assert_eq!(receiver.status().feedback_due, Some(Tick(6)));
     let held = receiver
         .pending_feedback_wire()
         .ok_or("held bytes")?
         .to_vec();
     assert_eq!(receiver.deadline(), Some(Tick(23)));
     // Independent input may progress behind a complete immutable feedback output.
-    receiver.confirm_handoff(SourceId(0), Tick(4))?;
-    receiver.receive_wire(&source_wire(SourceId(2), b"three")?, Tick(4))?;
+    receiver.confirm_handoff(SourceId(1), Tick(4))?;
+    receiver.receive_wire(&source_wire(SourceId(3), b"four")?, Tick(4))?;
     drive_receiver(&mut receiver, Tick(4), 1)?;
     assert_eq!(receiver.pending_feedback_wire(), Some(held.as_slice()));
     assert_eq!(receiver.pending_feedback(), Some(value));

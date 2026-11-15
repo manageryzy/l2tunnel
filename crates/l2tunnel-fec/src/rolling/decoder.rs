@@ -1288,13 +1288,28 @@ impl Decoder {
             .chain(self.job.as_ref().map(|job| job.deadline))
             .min()
     }
-    // Scheduler scans only committed columns while it freezes new decoder work.
-    // No payload or sender ledger is exposed, and each lookup is constant work.
-    pub(super) fn committed_known(&self, id: SourceId) -> bool {
-        self.live_known(id.0 as usize % (2 * self.config.window))
-            .ok()
-            .flatten()
-            == Some(id.0)
+    // Every retained ID below the contiguous prefix is known. Subtract that
+    // history from the committed count instead of scanning future columns.
+    // The actual eviction watermark can lag prefix advancement during handoff.
+    pub(super) fn feedback_state(&self) -> Result<(u32, u32, u32), Error> {
+        let live = self.live;
+        let history = live
+            .prefix
+            .checked_sub(live.evicted_before)
+            .ok_or(Error::Identity)?;
+        let history = usize::try_from(history).map_err(|_| Error::Identity)?;
+        let future = live
+            .known_count
+            .checked_sub(history)
+            .ok_or(Error::Identity)?;
+        let future = u32::try_from(future).map_err(|_| Error::Identity)?;
+        let extent = live
+            .observed
+            .checked_sub(live.prefix)
+            .ok_or(Error::Identity)?;
+        let unknown = extent.checked_sub(future).ok_or(Error::Identity)?;
+        let rank = u32::try_from(live.rank).map_err(|_| Error::Identity)?;
+        Ok((live.prefix, live.observed, unknown.saturating_sub(rank)))
     }
     /// Constant-size ownership snapshot without allocating or scanning payloads.
     pub fn status(&self) -> DecoderStatus {
@@ -1322,3 +1337,6 @@ mod systematic_work_tests;
 
 #[cfg(test)]
 mod decoded_source_tests;
+
+#[cfg(test)]
+mod feedback_tests;

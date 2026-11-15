@@ -25,9 +25,15 @@ stage owns the frame even if the packed source is already sealed. A second frame
 is Busy until the first is copied into the packer. Each copied unit has its exact
 absolute record ID retained in a preallocated vector. Unit IDs advance only when
 the packer copied that complete unit. Reaching max_units explicitly seals the
-source; capacity/timer/large-unit behavior remains the original packer. The first
-implementation has exactly one physical copy per source; it does not implement
-short-source copying or claim that a copy policy was charged by recovery.
+source; capacity/timer/large-unit behavior remains the original packer. Existing
+constructors keep exactly one physical copy per source. The additive explicit
+[copy policy](source-copy-policy.md) supplies `new_with_copies` and
+`new_reserved_with_copies`, retaining an immutable policy and classifying actual
+units before the same Packer admission. A different selected count seals a
+copy-policy boundary without consuming the new unit. `pending_copies` reports
+the actual homogeneous sealed-source count. This source implementation has
+focused tests authored but validation pending; returning the count does not
+perform or charge physical copies in recovery/runtime.
 
 `write_pending` binds the caller's actual next recovery source ID and writes the
 canonical complete envelope without consuming anything. The same source and
@@ -35,6 +41,9 @@ bytes remain retained under output/recovery backpressure. Call `commit_source`
 only after the actual recovery engine copied the complete envelope and returned
 that same ID. It releases the packer and its metadata, not peer/native credit.
 Recovery IDs are never allocated locally. No source-prefix feedback is invented.
+Multiple-copy selection does not change envelope bytes, unit/record IDs or this
+single recovery-ownership commit. Actual repeated physical sends must retain the
+same recovery source and independently satisfy their enclosing write budgets.
 
 ## Failure, time and resource boundary
 

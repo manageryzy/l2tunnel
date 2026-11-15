@@ -623,6 +623,15 @@ def worker(case, output, build, descriptors, token):
     return 0 if run_case(case, output, build, proof)['status'] == 'passed' else 1
 
 
+def observe_worker_log(path, launch):
+    """Enforce the diagnostic acceptance bound separately from the process cap."""
+    size = path.stat().st_size
+    launch.update(worker_log_bytes=size, worker_log_limit_bytes=BOUNDS['log_bytes'])
+    if size > BOUNDS['log_bytes']:
+        raise native.BoundExhausted('worker diagnostic log ceiling exhausted')
+    return size
+
+
 def launch_isolated(case, output, binary, build_receipt, plan_bytes):
     output.mkdir(mode=0o700)
     output = output.resolve()
@@ -662,14 +671,17 @@ def launch_isolated(case, output, binary, build_receipt, plan_bytes):
             ','.join(f'{name}:{value}' for name, value in descriptors.items()), '--apply']
         environment = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME')}
         environment.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1')
+        limits = g.worker_limits(file_bytes=bounded.RECEIPT_LIMIT)
         with (output / 'worker.log').open('xb') as log:
             child = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, pass_fds=tuple(descriptors.values()),
-                env=environment, start_new_session=True, preexec_fn=g.worker_limits())
+                env=environment, start_new_session=True, preexec_fn=limits)
             launch.update(status='running', worker_pid=child.pid, worker_argv=argv,
-                worker_file_limits={'soft': BOUNDS['log_bytes'], 'hard': BOUNDS['capture_bytes']})
+                worker_file_limits={'soft': bounded.RECEIPT_LIMIT, 'hard': BOUNDS['capture_bytes']},
+                worker_log_limit_bytes=BOUNDS['log_bytes'])
             code = child.wait(timeout=BOUNDS['launcher'])
         native.terminate_owned_group(child)
         child = None
+        observe_worker_log(output / 'worker.log', launch)
         path = output / 'receipt.json'
         result = None
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= bounded.RECEIPT_LIMIT:

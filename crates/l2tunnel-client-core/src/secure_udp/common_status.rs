@@ -160,6 +160,23 @@ pub struct OriginalCarrier {
     /// Original reset/TLS/member establishment bound.
     pub handshake_timeout_nanos: u64,
 }
+/// Same-flow UDP observations; not authentication or peer-state reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRecovery {
+    /// Actual local admission pause pending fresh protected peer input.
+    pub unavailable: bool,
+    /// Actual selected pre-accept send errors, including failed retries.
+    pub send_failures: u64,
+    /// Actual retained User send attempts while already unavailable.
+    pub retry_attempts: u64,
+    /// Actual fresh same-session protected receipts restoring availability.
+    pub resumptions: u64,
+    /// Bounded local I/O category, without peer text or credentials.
+    pub last_error: Option<String>,
+    /// Original Driver clock time for the next retained User attempt.
+    pub retry_at_micros: Option<u64>,
+}
 /// Separate truthful portable status for explicit finite-catalog generic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +268,9 @@ pub struct Status {
     pub security: Option<Security>,
     /// Actual fixed-scope authenticated challenge state.
     pub liveness: Option<Liveness>,
+    /// Same original UDP flow only; full retained-state recovery stays unqualified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_recovery: Option<PathRecovery>,
     /// Complete selected catalog changes are supported, distinct from cross-profile SW-11.
     pub configuration_change: bool,
     /// Only the authenticated initiator is the management coordinator.
@@ -496,6 +516,17 @@ mod observe {
                     deadline_micros: value.liveness.deadline_micros,
                     last_verified_micros: value.liveness.last_verified_micros,
                     last_pong_micros: value.liveness.last_pong_micros,
+                }),
+                path_recovery: snapshot.map(|value| PathRecovery {
+                    unavailable: value.path_recovery.unavailable,
+                    send_failures: value.path_recovery.send_failures,
+                    retry_attempts: value.path_recovery.retry_attempts,
+                    resumptions: value.path_recovery.resumptions,
+                    last_error: value
+                        .path_recovery
+                        .last_error
+                        .map(|kind| format!("{kind:?}")),
+                    retry_at_micros: value.path_recovery.retry_at_micros,
                 }),
                 configuration_change: true,
                 coordinator: info.role == Role::Initiator,

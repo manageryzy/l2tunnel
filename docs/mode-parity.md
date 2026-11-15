@@ -4,6 +4,29 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
+The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
+implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
+Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
+[explicit short-source copy selection](modules/source-copy-policy.md), and
+[committed Rolling feedback snapshots](modules/rolling-storage.md).
+Affected protocol/runtime cases and strict checks pass; failed aggregate attempts
+remain preserved. Real8192/local128/every16 old-hole recovery is finite component
+evidence. Copy selection is implemented in the codec; authenticated policy and
+repeated physical sends remain SCP-04. Same-flow recovery retains the original
+socket/session and deadlines; replacement/restart reconciliation remains SEC-08.
+No periodic fresh-DH or new cryptographic replay domain is selected. Reconnect
+remains in the underlying service. Native and full-stage evidence is recorded
+separately; all47 mode gates, full SW-11, complete resources, Windows/Android and
+80 Mbit/s performance remain open.
+
+This is a scoped checkpoint with open aggregate failures. The batch
+`tools/check.py` invocation failed in the legacy Packed pressure case and runtime
+fixture stack limits; its successful stages and exact continuations are retained.
+The full simulator passed 1,658 cases. Three current Linux native cases passed;
+the fourth requires a retry after bounded receipt-publication tooling was fixed.
+Unverified legacy actor and fixture repairs are excluded from this checkpoint.
+No full-suite pass or completed four-case current native matrix is claimed.
+
 ## Milestone vocabulary
 
 | Milestone | Completion boundary |

@@ -53,6 +53,8 @@ pub enum Error {
     Body(aligned_body::Error),
     /// Envelope output or identity failed.
     Envelope(aligned_envelope::Error),
+    /// Explicit source-copy policy or canonical unit classification failed.
+    Copies(crate::source_copy::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,6 +300,19 @@ impl Sender {
             completes_record: complete,
             completes_frame: complete && !pending.context,
         })
+    }
+    /// Classify the actual next meaningful unit without advancing ownership.
+    /// The caller must authenticate this explicit policy before installation;
+    /// returning a count does not perform or acknowledge physical packet writes.
+    pub fn pending_copies(&mut self, policy: crate::source_copy::Policy) -> Result<u8, Error> {
+        policy
+            .validate(self.config.body.symbol_bytes)
+            .map_err(Error::Copies)?;
+        let width = self.config.body.symbol_bytes;
+        let unit = self.pending_unit()?;
+        policy
+            .copies_for_unit(unit.bytes, width)
+            .map_err(Error::Copies)
     }
     fn build_symbol(&mut self) -> Result<(Pending, usize, bool), Error> {
         let pending = self.pending.ok_or(Error::NoPending)?;

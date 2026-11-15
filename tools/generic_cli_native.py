@@ -1031,8 +1031,10 @@ def run_case(case: dict, output: Path, build: dict, proof: dict) -> dict:
     return receipt.value
 
 
-def worker_limits():
+def worker_limits(*, file_bytes=None):
     maximum = BOUNDS['capture_bytes']
+    soft = BOUNDS['log_bytes'] if file_bytes is None else file_bytes
+    require(type(soft) is int and 0 < soft <= maximum, 'worker file cap must fit explicit capture ceiling')
     inherited = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
     if inherited != resource.RLIM_INFINITY and inherited < maximum:
         raise native.ObservationError('inherited file limit cannot permit explicit capture bound')
@@ -1040,7 +1042,7 @@ def worker_limits():
         hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
         if hard != resource.RLIM_INFINITY and hard < maximum:
             raise ValueError('worker inherited file ceiling changed before exec')
-        resource.setrlimit(resource.RLIMIT_FSIZE, (BOUNDS['log_bytes'], maximum))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, maximum))
     return apply
 
 

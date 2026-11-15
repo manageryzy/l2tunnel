@@ -157,11 +157,21 @@ impl<'a> Entry<'a> {
         now: engine::Tick,
         token: CarrierOutputToken,
     ) -> Result<(), Error> {
+        self.confirm_carrier_output_at(now, now, token)
+    }
+    /// Preserve actual acceptance separately from asynchronous observation.
+    /// Aligned/Packed timers use acceptance; generation custody remains exact.
+    pub fn confirm_carrier_output_at(
+        &mut self,
+        now: engine::Tick,
+        accepted: engine::Tick,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
         if token.generation != self.generation {
             return Err(Error::Stale);
         }
         self.engine
-            .confirm_carrier_output(now, token.token)
+            .confirm_carrier_output_at(now, accepted, token.token)
             .map_err(Error::Engine)
     }
     /// Advance actual rolling work only within the caller's explicit GF/copy/visit caps.

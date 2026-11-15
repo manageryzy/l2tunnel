@@ -37,6 +37,13 @@ No extra payload allocation or queue is added. The pending frame and per-channel
 encoder contexts retain their existing memory bounds. Work per inspection is
 bounded by the configured symbol size; no content scan trims zeroes.
 
+The additive `pending_copies(source_copy::Policy)` classifies that same exact
+meaningful unit under the explicit [copy policy](source-copy-policy.md), without
+committing a record, fragment or context. Policy validation precedes inspection;
+canonical unit parsing and generic-size/context selection do not grant physical
+send authority. Existing `pending_unit` and one-copy constructor behavior are
+unchanged. This addition is implemented in source with focused acceptance pending.
+
 ## Checklist
 
 - [x] [MOD-PACKUNIT-01] Implement exact borrowed unit boundaries and shared padded-symbol generation with an explicit local-copy commit API. Evidence: [sender interface](../../crates/l2tunnel-codec/src/aligned_sender.rs), [six focused tests](../../crates/l2tunnel-codec/src/aligned_sender_tests.rs).

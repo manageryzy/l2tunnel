@@ -4,15 +4,19 @@
 //! belong to the caller. Every emitted copy consumes an explicit wire allowance.
 use l2tunnel_fec as fec;
 use l2tunnel_recovery::{
-    ACK_PACKET_BYTES, ArqConfig, DATA_HEADER_BYTES, EndpointRole, PacketView, RecoveryContext,
-    RecoveryEngine, RecoveryError, Retained, SelectiveRepeat, Statistics as ArqStatistics,
-    inspect_packet,
+    ACK_PACKET_BYTES, ArqConfig, DATA_HEADER_BYTES, EndpointRole, PacketView, PhysicalTransmission,
+    RecoveryContext, RecoveryEngine, RecoveryError, Retained, SelectiveRepeat,
+    Statistics as ArqStatistics, inspect_packet,
 };
 mod backing;
 mod legacy_layout;
 pub mod storage;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+// Local output custody only; this identity never enters the wire or crypto.
+static NEXT_PHYSICAL_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Reliable envelope bytes preceding a strict ARQ or FEC packet.
 pub const ENVELOPE_BYTES: usize = 8;
@@ -61,6 +65,21 @@ pub enum RecordKind {
     Systematic,
     /// Real encoded FEC repair equation.
     Repair,
+}
+
+/// One exact caller-held output awaiting whole-carrier acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedOutput {
+    instance: u64,
+    serial: u64,
+    transmission: Option<PhysicalTransmission>,
+    prepared_at: Duration,
+    /// Exact initialized packet bytes retained in caller storage.
+    pub bytes: usize,
+    /// Already reserved complete wire charge, including outer overhead once.
+    pub wire_bytes: usize,
+    /// Actual maintained-parser classification of this emitted record.
+    pub kind: RecordKind,
 }
 
 /// Borrowed structural inspection, with no authentication, replay or recovery admission.
@@ -197,6 +216,8 @@ pub enum Error {
     Arq(RecoveryError),
     /// Malformed or conflicting coding input; authenticated protocol failures are terminal.
     Fec(fec::Error),
+    /// No matching exact caller-held physical output belongs to this owner.
+    OutputToken,
 }
 
 impl fmt::Display for Error {
@@ -308,6 +329,9 @@ pub struct Reliable {
     now: Duration,
     failure: Option<Error>,
     statistics: Statistics,
+    physical_instance: Option<u64>,
+    next_output: u64,
+    pending_output: Option<PreparedOutput>,
 }
 
 impl ReliableConfig {
@@ -456,6 +480,9 @@ impl Reliable {
             now: Duration::ZERO,
             failure: None,
             statistics: Statistics::default(),
+            physical_instance: None,
+            next_output: 1,
+            pending_output: None,
         })
     }
 
@@ -616,7 +643,78 @@ impl Reliable {
             now: Duration::ZERO,
             failure: None,
             statistics: Statistics::default(),
+            physical_instance: None,
+            next_output: 1,
+            pending_output: None,
         })
+    }
+    /// Select physical-attempt timing before any local/peer traffic is used.
+    /// Existing constructors retain their original poll-time handoff semantics.
+    pub fn enable_physical_send_confirmation(&mut self) -> Result<(), Error> {
+        self.running()?;
+        if self.physical_instance.is_some()
+            || self.now != Duration::ZERO
+            || self.next_fresh_source != 0
+            || self.statistics != Statistics::default()
+            || !self.building.is_empty()
+            || !self.outgoing.is_empty()
+            || !self.restored.is_empty()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let instance = NEXT_PHYSICAL_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| Error::Exhausted)?;
+        self.arq.enable_physical_send_confirmation()?;
+        self.physical_instance = Some(instance);
+        Ok(())
+    }
+    /// Observe exact output custody, including after an unrelated terminal error.
+    pub fn pending_output(&self) -> Option<PreparedOutput> {
+        self.pending_output
+    }
+    /// Consume one exact whole-carrier observation before later timing checks.
+    /// Wrong, foreign and repeated witnesses cannot mutate time or another flight.
+    pub fn confirm_output(&mut self, now: Duration, output: PreparedOutput) -> Result<(), Error> {
+        self.confirm_output_at(now, now, output)
+    }
+    /// Separate the actual whole-write instant from later receipt observation.
+    /// The accepted instant must lie within this output's original custody span.
+    pub fn confirm_output_at(
+        &mut self,
+        observed: Duration,
+        accepted: Duration,
+        output: PreparedOutput,
+    ) -> Result<(), Error> {
+        if self.pending_output != Some(output) {
+            return Err(Error::OutputToken);
+        }
+        let prior = self.failure();
+        self.pending_output = None;
+        let window = if accepted < output.prepared_at || accepted > observed {
+            Err(Error::NonMonotonicTime)
+        } else {
+            Ok(())
+        };
+        let physical = if let Some(transmission) = output.transmission {
+            self.arq
+                .confirm_transmission_at(observed, accepted, transmission)
+                .map_err(Error::Arq)
+        } else {
+            Ok(())
+        };
+        let timing = self
+            .check_time(observed)
+            .and_then(|()| self.advance(observed));
+        if let Some(error) = prior {
+            return Err(error);
+        }
+        window
+            .and(physical)
+            .and(timing)
+            .or_else(|error| self.fail(error))
     }
     /// Actual complete backing, including idle nested and wrapper storage.
     pub fn storage_usage(&self) -> Option<storage::Usage> {
@@ -767,6 +865,68 @@ impl Reliable {
         allow_feedback: bool,
         allow_data: bool,
     ) -> Result<Option<usize>, Error> {
+        let Some(instance) = self.physical_instance else {
+            return self.poll_selected_inner(now, output, budget, allow_feedback, allow_data);
+        };
+        if self.pending_output.is_some() {
+            self.check_time(now)?;
+            self.advance(now)?;
+            self.pump()?;
+            return Ok(None);
+        }
+        self.running()?;
+        let next = self
+            .next_output
+            .checked_add(1)
+            .ok_or(Error::Exhausted)
+            .or_else(|error| self.fail(error))?;
+        let Some(bytes) =
+            self.poll_selected_inner(now, output, budget, allow_feedback, allow_data)?
+        else {
+            return Ok(None);
+        };
+        let view = inspect_record_view(
+            &output[..bytes],
+            self.maximum_packet,
+            self.config.arq.max_source_bytes,
+            self.config.fec.block,
+            opposite_context(self.context),
+            self.send_fec,
+        )
+        .or_else(|error| self.fail(error))?;
+        let transmission = if let Some((source, _)) = view.source {
+            Some(
+                self.arq
+                    .pending_transmission(source)
+                    .ok_or(Error::OutputToken)
+                    .or_else(|error| self.fail(error))?,
+            )
+        } else {
+            None
+        };
+        self.pending_output = Some(PreparedOutput {
+            instance,
+            serial: self.next_output,
+            transmission,
+            prepared_at: now,
+            bytes,
+            wire_bytes: bytes
+                .checked_add(self.config.outer_overhead_bytes)
+                .ok_or(Error::Exhausted)?,
+            kind: view.kind,
+        });
+        self.next_output = next;
+        Ok(Some(bytes))
+    }
+
+    fn poll_selected_inner(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+        allow_feedback: bool,
+        allow_data: bool,
+    ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
         if output.len() < self.maximum_packet {
             return Err(Error::OutputTooSmall {
@@ -872,10 +1032,19 @@ impl Reliable {
 
     /// Actual next ARQ feedback deadline, independently of data/coding work.
     pub fn feedback_deadline(&self) -> Option<Duration> {
-        if self.failure().is_some() {
+        if self.failure().is_some() || self.pending_output.is_some() {
             None
         } else {
             self.arq.feedback_deadline()
+        }
+    }
+
+    /// Original receive-coding expiry, independent of queued output wakeups.
+    pub fn expiry_deadline(&self) -> Option<Duration> {
+        if self.failure().is_some() {
+            None
+        } else {
+            self.fec_deadlines.minimum().map(Duration::from_millis)
         }
     }
 
@@ -884,6 +1053,9 @@ impl Reliable {
         if self.failure().is_some() {
             return None;
         }
+        if self.pending_output.is_some() {
+            return self.expiry_deadline();
+        }
         if !self.outgoing.is_empty() || !self.restored.is_empty() {
             return Some(self.now);
         }
@@ -891,13 +1063,14 @@ impl Reliable {
             .deadline()
             .into_iter()
             .chain(self.building_deadline)
-            .chain(self.fec_deadlines.minimum().map(Duration::from_millis))
+            .chain(self.expiry_deadline())
             .min()
     }
 
     /// Full logical/retention drain; terminal FEC tombstones do not block it.
     pub fn drained(&self) -> bool {
         self.failure().is_none()
+            && self.pending_output.is_none()
             && self.arq.drained()
             && self.building.is_empty()
             && self.outgoing.is_empty()

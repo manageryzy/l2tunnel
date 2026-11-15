@@ -501,6 +501,12 @@ impl DifferentialLink {
                 self.feedback += 1;
             }
             let now = next(clock);
+            for sender in [&mut *senders.0, &mut *senders.1] {
+                if let Some(token) = sender.pending_carrier_output() {
+                    assert_eq!(token.emission(), emission);
+                    sender.confirm_carrier_output(now, token)?;
+                }
+            }
             // These paired pure owners receive the same caller-authenticated
             // plaintext. Security and physical socket custody remain external.
             receivers.0.accept_authenticated(

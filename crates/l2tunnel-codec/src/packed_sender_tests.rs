@@ -1,4 +1,6 @@
 use super::*;
+#[path = "packed_sender_copy_tests.rs"]
+mod copies;
 use crate::{aligned_body, aligned_receiver as receiver};
 use l2tunnel_core::Epoch;
 type TestResult = Result<(), Box<dyn std::error::Error>>;

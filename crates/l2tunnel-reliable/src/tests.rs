@@ -1,4 +1,6 @@
 use super::*;
+#[path = "physical_tests.rs"]
+mod physical;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

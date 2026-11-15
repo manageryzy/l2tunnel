@@ -158,6 +158,13 @@ fn early_short_roundtrip(raw: bool, role: Role) -> TestResult {
             else {
                 break;
             };
+            // The drop below models network loss after whole physical send,
+            // not a WouldBlock refusal at the retained carrier boundary.
+            let token = sender
+                .pending_carrier_output()
+                .ok_or("actual Aligned carrier token")?;
+            assert_eq!(token.emission(), emission);
+            sender.confirm_carrier_output(Tick(clock), token)?;
             let first = admitted.first().ok_or("first actual codec admission")?;
             let carries_first = witnesses[..emission.witnesses]
                 .iter()

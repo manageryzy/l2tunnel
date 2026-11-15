@@ -66,7 +66,8 @@ impl Driver {
             let _ = reply.send(Err(SwitchError::Closed));
             return Ok(());
         }
-        if runtime.request.is_some()
+        if runtime.path.unavailable
+            || runtime.request.is_some()
             || runtime.action.is_some()
             || runtime.outcome.is_some()
             || !state.can_admit_data()
@@ -175,7 +176,7 @@ impl Driver {
                 if let Some(request) = runtime.request.take() {
                     let _ = request.reply.send(Err(SwitchError::Rejected));
                 }
-            } else {
+            } else if !runtime.path.unavailable {
                 let mut sampled = first;
                 let mut first = Some(first);
                 match state.propose(

@@ -11,6 +11,23 @@ mod managed;
 mod provision;
 pub use managed::run_common_on_carrier;
 
+/// Observed recovery of the same connected UDP flow, not peer-state reconciliation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SameFlowRecovery {
+    /// New local ingress/proposals are paused until fresh authenticated input.
+    pub unavailable: bool,
+    /// Actual selected pre-accept User send failures, including failed retries.
+    pub send_failures: u64,
+    /// Actual User send attempts while the path was already unavailable.
+    pub retry_attempts: u64,
+    /// Unavailable paths restored by fresh same-session protected input.
+    pub resumptions: u64,
+    /// Last selected local pre-accept send failure, never peer-supplied text.
+    pub last_error: Option<io::ErrorKind>,
+    /// Earliest next retained User attempt on the original driver clock.
+    pub retry_at_micros: Option<u64>,
+}
+
 /// Actual generic transaction state, separate from legacy Swift policy status.
 #[derive(Clone, Debug)]
 pub struct CommonSnapshot {
@@ -62,6 +79,8 @@ pub struct CommonSnapshot {
     pub counters: Counters,
     /// Actual fixed-scope authenticated challenge observations.
     pub liveness: Liveness,
+    /// Actual same-flow retry state; no replacement socket/session is implied.
+    pub path_recovery: SameFlowRecovery,
     /// Original bounded terminal category, absent while running.
     pub terminal: Option<StopReason>,
 }
@@ -134,6 +153,7 @@ pub(super) struct Runtime {
     pub(super) delivered: Option<super::common_actions::Boundary>,
     pub(super) rolling_scheduler_steps: u64,
     pub(super) rolling_work_used: [u64; 3],
+    pub(super) path: SameFlowRecovery,
 }
 
 /// Run actual common record generations on the original authenticated UDP socket.
@@ -588,6 +608,7 @@ impl Driver {
                     delivered: None,
                     rolling_scheduler_steps: 0,
                     rolling_work_used: [0; 3],
+                    path: SameFlowRecovery::default(),
                 }),
                 send: config.send,
                 receive: config.receive,
@@ -684,6 +705,7 @@ impl Driver {
             control: self.control.retained(),
             counters,
             liveness: self.live,
+            path_recovery: runtime.path,
             terminal: self.terminal,
         })
     }

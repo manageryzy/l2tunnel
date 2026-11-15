@@ -3,7 +3,30 @@
 Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
-The current [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
+The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
+implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
+Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
+[explicit short-source copy selection](modules/source-copy-policy.md), and
+[committed Rolling feedback snapshots](modules/rolling-storage.md).
+Affected protocol/runtime cases and strict checks pass; failed aggregate attempts
+remain preserved. Real8192/local128/every16 old-hole recovery is finite component
+evidence. Copy selection is implemented in the codec; authenticated policy and
+repeated physical sends remain SCP-04. Same-flow recovery retains the original
+socket/session and deadlines; replacement/restart reconciliation remains SEC-08.
+No periodic fresh-DH or new cryptographic replay domain is selected. Reconnect
+remains in the underlying service. Native and full-stage evidence is recorded
+separately; all47 mode gates, full SW-11, complete resources, Windows/Android and
+80 Mbit/s performance remain open.
+
+This is a scoped checkpoint with open aggregate failures. The batch
+`tools/check.py` invocation failed in the legacy Packed pressure case and runtime
+fixture stack limits; its successful stages and exact continuations are retained.
+The full simulator passed 1,658 cases. Three current Linux native cases passed;
+the fourth requires a retry after bounded receipt-publication tooling was fixed.
+Unverified legacy actor and fixture repairs are excluded from this checkpoint.
+No full-suite pass or completed four-case current native matrix is claimed.
+
+The preceding [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
 adds implemented and protocol-tested [Rolling independent-short delivery](modules/rolling-records.md)
 and four finite [production Common native CLI cases](modules/common-carrier-cli-native.md).
 TAP/TUN with both inner appearances pass genuine outer TLS/member and inner
