@@ -7,6 +7,17 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The independent [OpenVPN outer-wire checkpoint](../work/parallel-features-20261115/openvpn-scoped-checkpoint-validation.json)
+adds a pure standard outer/control codec, actual verified TLS/member exchange
+and explicit protected or opaque data over the original connected UDP socket.
+Six pure cases and seven focused runtime-crate cases passed; strict affected
+formatting, Clippy and rustdoc passed. Opaque records retain the existing caller's
+Noise/security bytes and replay authority rather than adding exporter resealing.
+This is a carrier substrate, not selected Common Driver/service integration,
+full management/rekey/profile-switch acceptance, standard-dissector verification,
+native/platform/performance or ISP qualification. Historical custom-gate receipts
+and every original gate remain intact; no unaffected suite was repeated.
+
 The current [affected checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
 adds transactional admission through the actual MUX/DRR/Pipeline, actual reserved
 FEC/Reliable/Aligned/Packed backing and an explicit functional common Engine.

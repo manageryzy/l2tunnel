@@ -1,0 +1,12 @@
+[package]
+name = "l2tunnel-openvpn-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+l2tunnel-recovery = { path = "../l2tunnel-recovery" }
+
+[lints]
+workspace = true

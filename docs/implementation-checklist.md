@@ -25,6 +25,16 @@ add child IDs. Update this ledger and the detailed checklists with every change.
 Follow the [parallel development workflow](development-workflow.md) for module
 design, interface agreement, concurrent implementation and integration.
 
+The additive [OpenVPN outer-wire carrier](modules/openvpn-wire-carrier.md) now
+has an independently validated checkpoint: six pure wire/control cases and seven
+focused runtime-crate cases, plus strict affected Clippy/rustdoc/format checks.
+Its explicit opaque substrate carries the existing inner Noise/security bytes
+without exporter resealing over the original UDP socket, retaining actual outer
+TLS/member control. This does not install the Common Driver/service or qualify
+standard dissectors, native devices, ISP treatment or any full carrier/mode gate.
+The [scoped receipt](../work/parallel-features-20261115/openvpn-scoped-checkpoint-validation.json)
+preserves failed unrelated aggregate attempts and exact finite evidence reuse.
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),

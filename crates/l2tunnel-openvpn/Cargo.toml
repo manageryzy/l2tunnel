@@ -13,10 +13,14 @@ l2tunnel-datagram = { path = "../l2tunnel-datagram" }
 l2tunnel-recovery = { path = "../l2tunnel-recovery" }
 l2tunnel-udp = { path = "../l2tunnel-udp" }
 l2tunnel-udp-control = { path = "../l2tunnel-udp-control" }
+l2tunnel-openvpn-wire = { path = "../l2tunnel-openvpn-wire" }
 ring = "=0.17.14"
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+l2tunnel-handshake = { path = "../l2tunnel-handshake" }
+l2tunnel-security = { path = "../l2tunnel-security" }
+tokio = { version = "=1.53.1", features = ["test-util"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 
 [lints]

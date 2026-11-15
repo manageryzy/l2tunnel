@@ -15,6 +15,8 @@ pub use native::{
     client_pair_native, server_accept_native, server_pair_native,
 };
 mod runtime;
+/// Actual OpenVPN-format reset/TLS control and loss-visible protected data on one UDP socket.
+pub mod wire_carrier;
 pub use budget::WireStatus;
 pub use config::{Config, WireBudget};
 pub use pair::{

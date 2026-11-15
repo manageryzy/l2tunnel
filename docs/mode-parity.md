@@ -27,6 +27,12 @@ RLNC, parity, rolling, packed, proxy and every catalog entry remain in scope.
 Negotiated switching between Swift and the other record profiles retains the
 full SW-11 gate; changing Swift's own policy under SW-13 is only an internal
 policy operation and does not satisfy cross-profile parity or switching.
+
+The additive [OpenVPN outer-wire carrier](modules/openvpn-wire-carrier.md) has
+focused pure grammar/control and actual same-socket TLS/member/opaque-record
+evidence. It does not install another recovery mode or satisfy any complete
+catalog entry. Standard-dissector, Common Driver/service, full lifecycle and
+native/platform/ISP acceptance stay separate from these finite carrier checks.
 The explicit [streamed-control runtime checkpoint](modules/streamed-swift-control.md)
 retains that same boundary: SwiftPolicyV1 and independent Liveness are actual
 adapter functions; generic Management/DataFeedback and other record engines remain
