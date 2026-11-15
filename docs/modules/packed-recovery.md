@@ -70,8 +70,10 @@ kind-2 units within that limit enter one atomic eligible-unit batch. This adds n
 payload queue, logical credit or native completion. A separate ordered unit cursor
 preserves strict packed-source framing when a later recovery handoff encounters
 an already admitted prefix; pending native bytes and original expiry are retained.
-Zero keeps ordinary ordered admission. Rolling preview and full native/parity
-matrices remain separate unfinished deliverables.
+Zero keeps ordinary ordered admission. The separate
+[Rolling preview](rolling-records.md) now has finite committed-source,
+gap/deduplication, expiry and rescan protocol evidence. Full native/parity
+matrices remain unfinished deliverables.
 
 Validate packed source bytes against ARQ, FEC and physical recovery packet
 ceilings, counting the full identity header and all per-unit absolute record IDs.

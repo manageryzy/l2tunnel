@@ -7,13 +7,25 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
-The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
-implements explicit ARQ-only selection in the existing Reliable/Aligned/Packed
-owners and actual Packed independent-short preview. See [MOD-REL-*](modules/reliable.md),
-[MOD-PACKREC-*](modules/packed-recovery.md) and [CCS-*](modules/common-carrier-service.md).
-Finite original-carrier APIv4/Unix packet-device and pure gap/expiry evidence do
-not close production native CLI, retained recovery, Rolling preview or any of the
-unchanged full mode/resource/platform/performance definitions.
+The current [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
+adds implemented and protocol-tested [Rolling independent-short delivery](modules/rolling-records.md)
+and four finite [production Common native CLI cases](modules/common-carrier-cli-native.md).
+TAP/TUN with both inner appearances pass genuine outer TLS/member and inner
+Noise/member authentication, all64 catalog inspection/paging, four-family
+switching, exact bytes/liveness, runtime-failure API survival, fresh-session
+reconnect, capture and cleanup. One representative per family is activated;
+this is clean Linux IPv4 integration evidence, not full catalog or early-short
+native acceptance. The shared service retains the management API after an
+established backend fails. Automatic retained-state recovery, optional fresh-DH
+installation, full SW-11, all47 modes, complete resources, Windows/Android and
+80 Mbit/s performance remain open. No periodic exchange or new replay-domain
+wire decision is introduced.
+
+The preceding [record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+provides explicit ARQ-only Aligned/Packed and finite Packed short gap/expiry
+evidence. Its receipts retain their original Unix packet-device/pure scope.
+Earlier checkpoint descriptions below report their then-qualified scope; current
+native evidence is the finite CCN-01/02 leaf above, not completion of its parents.
 
 UDP framing terminology is aligned with the
 [datagram API and format](modules/datagram.md#project-specific-prefixes-and-exact-draft-format):
@@ -87,7 +99,7 @@ dispatch removes unused backend poll scratch while reusing the existing one
 setup box; standard-stack service and APIv4 cases pass. These leaves do not close full lifecycle,
 carrier Driver/service, complete resources, mode parity or native/platform gates.
 
-The latest [original-carrier Common service
+The preceding [original-carrier Common service
 leaf](modules/common-carrier-service.md) now has actual typed four-family
 service delivery and external full-64 offline CLI inspection, with requested E0
 and effective authenticated E1/catalog kept distinct. Its [scoped
@@ -421,6 +433,7 @@ does not qualify generic switching, other record profiles or full SW-11.
 | --- | --- | --- | --- |
 | Connection/authentication | CONN-* and UDP-* | [Architecture](architecture.md), [carriers](overlay-and-carriers.md) | BASE schema/security decisions |
 | Shared point-to-point security | SEC-01..SEC-12 | [Secure session](modules/secure-session.md) | maintained implementation/API review, opaque records, injected time, preserved data protection |
+| Common original-carrier native CLI | CCN-01..CCN-03 | [Finite native qualification](modules/common-carrier-cli-native.md) | genuine outer/inner authentication, complete catalog, shared APIv4, owned TAP/TUN and unchanged full acceptance gates |
 | Complete configuration wire bounds | TCE-01..TCE-05 | [Explicit encoding](modules/transaction-configuration-encoding.md) | actual typed limits/Peer/lease; selected runtime/resource/API integration remains open |
 | Complete directional record policies | RCF-01..RCF-06 | [Canonical record configuration](modules/record-configuration.md) | complete field-preserving values/catalogs; representation does not install a runtime capability |
 | Common record engine composition | CRE-01..CRE-08 | [Actual-owner adapter](modules/common-record-engine.md) | real functional three-profile Engine tested; complete policy/width/fence/resource/Bank/Driver acceptance remains open |

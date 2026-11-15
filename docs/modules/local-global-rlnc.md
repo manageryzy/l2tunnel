@@ -40,6 +40,21 @@ source without new peer input. During a job only the separate handoff watermark
 moves, preserving its bank snapshot. Existing batch handoff deadlines survive
 that interleaving and never restart. Prefix advancement is not native delivery.
 
+Wave7 adds `Decoder::decoded_source(SourceId)` and the same scheduler Receiver
+forwarder as an allocation-free immutable view of exact committed originals at
+or beyond the upper handoff prefix. Checked original lengths and the live
+identity bank exclude candidate/shadow GF bytes and retired handoffs. Reading
+this view changes no receipt, handoff, clock or authentication state. The
+[compact Rolling endpoint](rolling-records.md#bounded-independent-short-preview-wave7)
+uses it for bounded independent-short preview and deferred rescans, retaining the
+existing ordered recovery handoff. The
+[actual committed/shadow getter case](../../work/parallel-features-20261115/parallel-wave7-final-build-cases-attempt-1/validation.json)
+passed with a real GF repair, and the unchanged FEC accessor is reused by the
+[three final Endpoint passes](../../work/parallel-features-20261115/parallel-wave7-report-correction-attempt-1/validation.json).
+[Affected strict Clippy/format/rustdoc](../../work/parallel-features-20261115/parallel-wave7-strict-attempt-2/validation.json)
+also passed. This closes only the finite CRL-07 protocol leaf. No MOD-LGR parent,
+full8192, native, resource or Python-family gate is closed by this API.
+
 A small-window test is not W8192 deployment or full Python parity. The simulator's
 rank/source ledger is not used for Rust payload recovery. No performance/fairness
 claim is made. Python support/seed/extent fixtures remain distinct from the new

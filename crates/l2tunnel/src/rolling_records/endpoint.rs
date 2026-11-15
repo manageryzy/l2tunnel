@@ -43,10 +43,28 @@ pub struct Statistics {
 pub struct Step {
     /// Actual sending GF/copy/metadata work, bounded by the supplied budget.
     pub send: rolling::WorkUsed,
-    /// Actual receiving work and decode/feedback result, under its own same cap.
+    /// Decode/feedback plus preview lookup, eligibility and slab-copy work,
+    /// under the independent receiving cap. Existing bounded packed parsing and
+    /// atomic record admission remain in the fixed packing-unit work domain.
     pub receive: scheduler::ReceiverStep,
     /// A decoded compact source atomically entered the record receiver.
     pub source_handed: bool,
+}
+#[derive(Clone, Copy)]
+struct PreviewUnit {
+    identity: receiver::SymbolIdentity,
+    offset: usize,
+    length: usize,
+    cleared: usize,
+    copied: usize,
+}
+#[derive(Clone, Copy)]
+struct Preview {
+    source: rolling::SourceId,
+    count: usize,
+    unit: usize,
+    current: Option<PreviewUnit>,
+    selected: [u64; 4],
 }
 /// One actual directional sender, receiver, compact record stage and record ledger.
 ///
@@ -80,6 +98,11 @@ pub struct Endpoint {
     pub(super) next_native: u64,
     pub(super) next_channel: u16,
     pub(super) receive_progress: bool,
+    receive_unit: Option<receiver::SourceId>,
+    preview_next: u32,
+    preview: Option<Preview>,
+    preview_blocked: bool,
+    preview_rescan: bool,
     pub(super) usage: Option<storage::Usage>,
 }
 impl Endpoint {
@@ -239,6 +262,11 @@ impl Endpoint {
             next_native: 1,
             next_channel: 0,
             receive_progress: false,
+            receive_unit: Some(receive_config.receiver.first_source),
+            preview_next: 0,
+            preview: None,
+            preview_blocked: false,
+            preview_rescan: false,
             usage: None,
         })
     }
@@ -377,8 +405,12 @@ impl Endpoint {
         let Some((id, bytes)) = self.incoming.pending_source() else {
             return Ok(false);
         };
+        // The same slab belongs to one actual ordered handoff or one bounded
+        // preview preparation, never both. No preview admission is partial.
+        self.preview = None;
         let result = admit_packed(
             &mut self.records,
+            &mut self.receive_unit,
             self.receive_config,
             self.receive_scope,
             id,
@@ -401,8 +433,215 @@ impl Endpoint {
             Err(error) => self.fail(error),
         }
     }
+    fn request_preview_scan(&mut self) {
+        if self
+            .receive_config
+            .receiver
+            .body
+            .independent_short_frame_bytes
+            != 0
+        {
+            self.preview_rescan = true;
+            self.preview_blocked = false;
+        }
+    }
+    fn preview_receive(
+        &mut self,
+        now: Tick,
+        budget: &mut rolling::WorkBudget,
+    ) -> Result<(), Error> {
+        if self
+            .receive_config
+            .receiver
+            .body
+            .independent_short_frame_bytes
+            == 0
+            || self.incoming.status().feedback_building
+            || self.preview_blocked
+        {
+            return Ok(());
+        }
+        let config = self.receive_config;
+        let width = config.receiver.body.symbol_bytes;
+        let mut visits = 0;
+        while visits < config.packing.work_limit && budget.metadata > 0 {
+            if self.preview.is_none() {
+                budget.metadata -= 1;
+                visits += 1;
+                let status = self.incoming.status().decoder;
+                // New committed availability may precede the retained cursor.
+                // Coalesce it without discarding an in-progress slab copy.
+                if self.preview_rescan {
+                    self.preview_next = status.handoff_prefix;
+                    self.preview_rescan = false;
+                }
+                self.preview_next = self.preview_next.max(status.handoff_prefix);
+                if self.preview_next >= status.observed_end {
+                    break;
+                }
+                let source = rolling::SourceId(self.preview_next);
+                self.preview_next = self.preview_next.checked_add(1).ok_or(Error::Arithmetic)?;
+                let Some(bytes) = self
+                    .incoming
+                    .decoded_source(source)
+                    .map_err(Error::Rolling)?
+                else {
+                    continue;
+                };
+                let view = packed_view(config, self.receive_scope, source, bytes)?;
+                self.preview = Some(Preview {
+                    source,
+                    count: view.len(),
+                    unit: 0,
+                    current: None,
+                    selected: [0; 4],
+                });
+                continue;
+            }
+            let mut preview = self.preview.take().ok_or(Error::Identity)?;
+            if preview.unit == preview.count {
+                budget.metadata -= 1;
+                visits += 1;
+                let bytes = self
+                    .incoming
+                    .decoded_source(preview.source)
+                    .map_err(Error::Rolling)?
+                    .ok_or(Error::Identity)?;
+                let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
+                let mut inputs = empty_inputs(self.receive_scope);
+                let mut count = 0;
+                let floor = self.records.status().source_floor;
+                for (index, unit) in view.units().map_err(Error::Envelope)?.enumerate() {
+                    if preview.selected[index / 64] & (1 << (index % 64)) != 0
+                        && floor.is_some_and(|floor| unit.identity.source.0 > floor.0)
+                    {
+                        inputs[count] = receiver::AuthenticatedSymbol {
+                            identity: unit.identity,
+                            bytes: &self.symbols[index * width..(index + 1) * width],
+                        };
+                        count += 1;
+                    }
+                }
+                if count != 0 {
+                    let mut outcomes = [receiver::Admission::Accepted; 255];
+                    match self.records.admit_batch_authenticated_into(
+                        &inputs[..count],
+                        receiver_tick(now),
+                        &mut outcomes[..count],
+                    ) {
+                        Ok(admitted)
+                            if admitted == count
+                                && outcomes[..count].iter().all(|value| {
+                                    matches!(
+                                        value,
+                                        receiver::Admission::Accepted
+                                            | receiver::Admission::Duplicate
+                                            | receiver::Admission::StaleSource
+                                    )
+                                }) => {}
+                        Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
+                            self.preview = Some(preview);
+                            self.preview_blocked = true;
+                            break;
+                        }
+                        Ok(_) => return Err(Error::Identity),
+                        Err(error) => return Err(Error::Receiver(error)),
+                    }
+                }
+                continue;
+            }
+            if preview.current.is_none() {
+                budget.metadata -= 1;
+                visits += 1;
+                let bytes = self
+                    .incoming
+                    .decoded_source(preview.source)
+                    .map_err(Error::Rolling)?
+                    .ok_or(Error::Identity)?;
+                let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
+                // The maintained parser owns the bounded unit grammar. Retain
+                // the current exact slice coordinates so byte-budget resumes
+                // never walk the preceding units again.
+                let unit = view
+                    .units()
+                    .map_err(Error::Envelope)?
+                    .nth(preview.unit)
+                    .ok_or(Error::Identity)?;
+                let offset = (unit.bytes.as_ptr() as usize)
+                    .checked_sub(bytes.as_ptr() as usize)
+                    .ok_or(Error::Identity)?;
+                if offset
+                    .checked_add(unit.bytes.len())
+                    .is_none_or(|end| end > bytes.len())
+                {
+                    return Err(Error::Identity);
+                }
+                preview.current = Some(PreviewUnit {
+                    identity: unit.identity,
+                    offset,
+                    length: unit.bytes.len(),
+                    cleared: 0,
+                    copied: 0,
+                });
+                self.preview = Some(preview);
+                continue;
+            }
+            let current = preview.current.as_mut().ok_or(Error::Identity)?;
+            let symbol = &mut self.symbols[preview.unit * width..(preview.unit + 1) * width];
+            if current.cleared < width {
+                let count = budget.copies.min(width - current.cleared);
+                symbol[current.cleared..current.cleared + count].fill(0);
+                current.cleared += count;
+                budget.copies -= count;
+                if current.cleared < width {
+                    self.preview = Some(preview);
+                    break;
+                }
+            }
+            if current.copied < current.length {
+                if budget.copies == 0 {
+                    self.preview = Some(preview);
+                    break;
+                }
+                budget.metadata -= 1;
+                visits += 1;
+                let bytes = self
+                    .incoming
+                    .decoded_source(preview.source)
+                    .map_err(Error::Rolling)?
+                    .ok_or(Error::Identity)?;
+                let count = budget.copies.min(current.length - current.copied);
+                let start = current
+                    .offset
+                    .checked_add(current.copied)
+                    .ok_or(Error::Arithmetic)?;
+                let original = bytes.get(start..start + count).ok_or(Error::Identity)?;
+                symbol[current.copied..current.copied + count].copy_from_slice(original);
+                current.copied += count;
+                budget.copies -= count;
+                self.preview = Some(preview);
+                continue;
+            }
+            budget.metadata -= 1;
+            visits += 1;
+            check_policy(config, symbol)?;
+            if self
+                .records
+                .is_independent_short(current.identity, symbol)
+                .map_err(Error::Receiver)?
+            {
+                preview.selected[preview.unit / 64] |= 1 << (preview.unit % 64);
+            }
+            preview.unit += 1;
+            preview.current = None;
+            self.preview = Some(preview);
+        }
+        Ok(())
+    }
     /// Service each actual scheduler under the supplied independent work cap.
     /// One call hands at most one source to the compact record receiver.
+    /// Preview resumes use the existing scratch slab and remaining receive
+    /// metadata/copy allowance, with unit actions capped by packing.work_limit.
     pub fn step(&mut self, now: Tick, work: rolling::WorkBudget) -> Result<Step, Error> {
         self.advance(now)?;
         self.pump_send(now)?;
@@ -410,11 +649,31 @@ impl Endpoint {
             .sender
             .step(rolling_tick(now), work)
             .map_err(Error::Rolling)?;
-        let receive = self
+        if self.receive_progress {
+            self.request_preview_scan();
+        }
+        let mut receive = self
             .incoming
             .step(rolling_tick(now), work)
             .map_err(Error::Rolling)?;
+        if matches!(receive.decode, rolling::DecodeStep::Accepted { .. }) {
+            self.request_preview_scan();
+        }
         let source_handed = self.pump_receive(now)?;
+        if !source_handed {
+            let mut remaining = rolling::WorkBudget {
+                field: work.field - receive.work.field,
+                copies: work.copies - receive.work.copies,
+                metadata: work.metadata - receive.work.metadata,
+            };
+            let before = remaining;
+            let result = self.preview_receive(now, &mut remaining);
+            if let Err(error) = result {
+                return self.fail(error);
+            }
+            receive.work.copies += before.copies - remaining.copies;
+            receive.work.metadata += before.metadata - remaining.metadata;
+        }
         self.receive_progress = source_handed;
         Ok(Step {
             send,
@@ -576,6 +835,7 @@ impl Endpoint {
                 self.incoming
                     .receive_wire(bytes, rolling_tick(now))
                     .map_err(Error::Rolling)?;
+                self.request_preview_scan();
             }
             _ => return Err(Error::Identity),
         }
@@ -672,6 +932,16 @@ impl Endpoint {
             || receive.feedback_building
             || (self.receive_progress
                 && receive.decoder.decoded_prefix > receive.decoder.handoff_prefix)
+            || (self
+                .receive_config
+                .receiver
+                .body
+                .independent_short_frame_bytes
+                != 0
+                && !self.preview_blocked
+                && (self.preview.is_some()
+                    || self.preview_rescan
+                    || self.preview_next < receive.decoder.observed_end))
     }
     /// Service original hard bounds without performing hidden GF work.
     pub fn tick(&mut self, now: Tick) -> Result<(), Error> {
@@ -733,8 +1003,11 @@ impl Endpoint {
     }
 }
 
+// The exact ordered unit cursor is separate from the previewable record ledger.
+#[allow(clippy::too_many_arguments)]
 fn admit_packed(
     records: &mut receiver::Receiver,
+    ordered_unit: &mut Option<receiver::SourceId>,
     config: DirectionConfig,
     scope: receiver::Scope,
     id: rolling::SourceId,
@@ -742,23 +1015,21 @@ fn admit_packed(
     symbols: &mut [u8],
     now: Tick,
 ) -> Result<(), Error> {
-    let view = packed_envelope::decode(config.packing.envelope(), scope, bytes)
-        .map_err(Error::Envelope)?;
-    if view.identity().source.0 != u64::from(id.0)
-        || Some(view.identity().first_unit) != records.status().source_floor
-    {
+    let view = packed_view(config, scope, id, bytes)?;
+    if Some(view.identity().first_unit) != *ordered_unit {
         return Err(Error::Identity);
     }
-    let mut inputs: [receiver::AuthenticatedSymbol<'_>; 255] =
-        std::array::from_fn(|_| receiver::AuthenticatedSymbol {
-            identity: receiver::SymbolIdentity {
-                scope,
-                source: receiver::SourceId(0),
-                record: receiver::RecordId(0),
-            },
-            bytes: &[],
-        });
+    let next = view
+        .identity()
+        .first_unit
+        .0
+        .checked_add(view.len() as u64)
+        .map(receiver::SourceId);
+    let preview = config.receiver.body.independent_short_frame_bytes != 0;
+    let floor = records.status().source_floor;
+    let mut inputs = empty_inputs(scope);
     let mut count = 0;
+    let mut units = 0;
     for (unit, symbol) in view
         .units()
         .map_err(Error::Envelope)?
@@ -766,12 +1037,10 @@ fn admit_packed(
     {
         symbol.fill(0);
         symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
-        if config.native_policy == NativePolicy::RawIp {
-            let raw = symbol[3] == 2;
-            let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-            if !raw && !fragment {
-                return Err(Error::Policy);
-            }
+        check_policy(config, symbol)?;
+        units += 1;
+        if preview && floor.is_none_or(|floor| unit.identity.source.0 < floor.0) {
+            continue;
         }
         inputs[count] = receiver::AuthenticatedSymbol {
             identity: unit.identity,
@@ -779,8 +1048,12 @@ fn admit_packed(
         };
         count += 1;
     }
-    if count != view.len() {
+    if units != view.len() {
         return Err(Error::Identity);
+    }
+    if count == 0 {
+        *ordered_unit = next;
+        return Ok(());
     }
     let mut outcomes = [receiver::Admission::Accepted; 255];
     let admitted = records
@@ -791,11 +1064,53 @@ fn admit_packed(
         )
         .map_err(Error::Receiver)?;
     if admitted != count
-        || outcomes[..count]
-            .iter()
-            .any(|a| *a != receiver::Admission::Accepted)
+        || outcomes[..count].iter().any(|a| {
+            !(matches!(a, receiver::Admission::Accepted)
+                || preview
+                    && matches!(
+                        a,
+                        receiver::Admission::Duplicate | receiver::Admission::StaleSource
+                    ))
+        })
     {
         return Err(Error::Identity);
+    }
+    *ordered_unit = next;
+    Ok(())
+}
+
+fn empty_inputs<'a>(scope: receiver::Scope) -> [receiver::AuthenticatedSymbol<'a>; 255] {
+    std::array::from_fn(|_| receiver::AuthenticatedSymbol {
+        identity: receiver::SymbolIdentity {
+            scope,
+            source: receiver::SourceId(0),
+            record: receiver::RecordId(0),
+        },
+        bytes: &[],
+    })
+}
+
+fn packed_view(
+    config: DirectionConfig,
+    scope: receiver::Scope,
+    id: rolling::SourceId,
+    bytes: &[u8],
+) -> Result<packed_envelope::View<'_>, Error> {
+    let view = packed_envelope::decode(config.packing.envelope(), scope, bytes)
+        .map_err(Error::Envelope)?;
+    if view.identity().source.0 != u64::from(id.0) {
+        return Err(Error::Identity);
+    }
+    Ok(view)
+}
+
+fn check_policy(config: DirectionConfig, symbol: &[u8]) -> Result<(), Error> {
+    if config.native_policy == NativePolicy::RawIp {
+        let raw = symbol[3] == 2;
+        let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
+        if !raw && !fragment {
+            return Err(Error::Policy);
+        }
     }
     Ok(())
 }

@@ -1149,7 +1149,17 @@ def launch_isolated(case: dict, output: Path, binary: Path, build_receipt: Path)
 
 
 def main(argv=None) -> int:
+    selection = argparse.ArgumentParser(add_help=False)
+    selection.add_argument('--backend', choices=('swift', 'common-openvpn'), default='swift')
+    backend, _ = selection.parse_known_args(argv)
+    if backend.backend == 'common-openvpn':
+        try:
+            from . import common_carrier_cli_native
+        except ImportError:
+            import common_carrier_cli_native
+        return common_carrier_cli_native.main(argv)
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--backend', choices=('swift',), default='swift')
     parser.add_argument('--cover', choices=('quic-like', 'media-like'), required=True)
     parser.add_argument('--layer', choices=('tap', 'tun'), required=True)
     parser.add_argument('--lab-id', default='genericcli')

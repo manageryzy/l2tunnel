@@ -15,6 +15,14 @@ This additive lane addresses the missing compact-record-to-rolling composition i
 P-* family, full SW-11, full resources, selected runtime/service/CLI integration,
 native qualification or the 80 Mbit/s target. The original definitions remain.
 
+The Wave7 additive committed-source view and bounded independent-short preview
+are implemented and protocol-tested within CRL-07's finite scope below. The
+[committed-source case](../../work/parallel-features-20261115/parallel-wave7-final-build-cases-attempt-1/validation.json),
+[three final Endpoint cases](../../work/parallel-features-20261115/parallel-wave7-report-correction-attempt-1/validation.json)
+and [affected strict checks](../../work/parallel-features-20261115/parallel-wave7-strict-attempt-2/validation.json)
+passed. This does not qualify the full Rolling/native/resource or Python-family
+gates.
+
 Read the [architecture](../architecture.md), [plan](../implementation-plan.md),
 [checklist](../implementation-checklist.md), [complete parity matrix](../mode-parity.md),
 [actual rolling scheduler](local-global-rlnc.md), [legacy rolling runtime](rolling-runtime.md),
@@ -140,6 +148,69 @@ digest or nonce. Foreign endpoint output tokens are refused before time/custody
 mutation in a passing regression. This local custody identity is not an
 authenticated peer identity or a physical fence.
 
+## Bounded independent-short preview (Wave7)
+
+The actual decoder now exposes
+`decoded_source(SourceId) -> Result<Option<&[u8]>, Error>`, forwarded by its
+existing scheduler Receiver. It borrows exact bytes only when the live committed
+identity bank contains that source at or beyond the upper handoff prefix.
+Checked original length is required. A candidate or shadow GF recovery remains
+invisible until the existing atomic publication; retired handoffs are not exposed.
+The view changes no receipt, handoff, timer, native count or authentication state.
+
+When `independent_short_frame_bytes` is nonzero, Endpoint scans committed future
+sources through that view and the maintained packed-envelope parser. It rebuilds
+units in the same preallocated symbol slab, applies the existing generic-size
+`Receiver::is_independent_short` classifier and admits the selected symbols in
+one existing atomic receiver batch. Context-dependent records remain owned by
+the recovery path. No second payload queue, recovery algorithm or parser grammar
+is introduced. Zero disables the preview scan and retains ordinary ordered
+source handoff.
+
+Preview source lookups and unit actions consume the receive step's remaining
+metadata allowance; slab zeroing and copying consume its remaining copy
+allowance. At most `packing.work_limit` preview state actions occur per call.
+Partial unit preparation retains exact slice coordinates and the same slab,
+so a work budget of one can progress without restarting its byte copy. The
+reported `Step.receive.work` includes those new operations and the existing
+decode/feedback work, within the supplied receive cap. Complete synchronous
+packed parsing, bounded unit indexing and atomic record admission retain their
+existing fixed packing-unit work domain; these counters do not measure every
+parser instruction, CPU time or a physical service rate.
+
+An inline deferred-rescan flag coalesces actual successful source/repair ingress,
+new decoder publication and native progress. A new earlier committed source
+therefore cannot be missed merely because the scan already passed it while a
+later source's preview was being copied. The flag restarts the bounded scan only
+at a preview boundary, preserving the partial slab. Completion does not create
+another rescan event; no new ingress or progress means the scan can quiesce.
+
+The ordered packed-unit cursor is separate from the receiver's admission floor.
+Only successful ordinary source admission advances that cursor and confirms the
+actual recovery handoff. A later ordered source may encounter already-previewed
+units without replaying their native frames. Early physical completion retains
+the existing tombstone; committing an older native frame advances its channel
+once, and a subsequent bounded channel preparation retires the now-head
+tombstone. Recovery handoff completion alone is not that native cursor service.
+Pending native bytes/tokens remain immutable, and their original record,
+first-prepare and external caps are not renewed by preview, duplicates or rescan.
+
+Four focused protocol cases passed: decoder committed/shadow visibility using a real GF repair;
+actual missing-source bypass, later deduplication and tombstone retirement with
+work1 under both source formats/backing modes; retained native original expiry;
+and source2 partial preview followed by newly available source1, requiring both
+exact originals to release without further ingress. The getter case passed in the
+[final build/case receipt](../../work/parallel-features-20261115/parallel-wave7-final-build-cases-attempt-1/validation.json)
+and its FEC implementation was unchanged afterward. All three Endpoint cases
+were rerun and passed after the equivalent Clippy boolean simplification in the
+[report-correction receipt](../../work/parallel-features-20261115/parallel-wave7-report-correction-attempt-1/validation.json).
+[Strict checks](../../work/parallel-features-20261115/parallel-wave7-strict-attempt-2/validation.json)
+passed Clippy for all targets/features, formatting and rustdoc for FEC, facade
+and client-core. These finite results supply no native-device, full8192,
+platform, complete resource or full mode-parity evidence. Earlier failed
+attempts remain historical failures; these receipts do not promote the pending
+Common native runner or a wider aggregate to a pass.
+
 ## Source-bound common-session integration gaps
 
 These are engineering dependencies, not new owner decisions. The subsequent
@@ -157,12 +228,14 @@ The original standalone aggregate Statistics never substitutes for
 those per-channel observations or authenticated physical fences. Root's Bank
 adds issuing-generation custody; this is not selected runtime installation.
 
-The current common Noise/member path hands `member::Parts` to
-`transport::run_common`, whose selected runtime contract currently installs the original three
-record families. The additive rolling pure Engine/Bank slice does not install
-that runtime path. It must explicitly authenticate the complete rolling binding,
-service its actual feedback/debt/retained output through the same selected carrier,
-and route native completion to the issuing generation. No new authentication,
+The later [Common rolling runtime](common-rolling-runtime.md) installs the fourth
+family through the existing Noise/member handoff and sole runtime loop. The
+[Common original-carrier native leaf](common-carrier-cli-native.md) now adds four
+finite production TAP/TUN cases with actual four-family switches. The pure
+Engine/Bank receipts alone do not establish that integration. Complete acceptance
+must still authenticate the rolling binding, service feedback/debt/retained
+output through the selected carrier and route native completion to the issuing
+generation across the full fault/resource matrix. No new authentication,
 transport or transaction state machine is supplied by this pure endpoint. Shared
 service/CLI/GUI selection and requested/effective capabilities remain part of
 CRL-04; no automatic mode or default change is implied.
@@ -170,15 +243,14 @@ CRL-04; no automatic mode or default change is implied.
 ## Required scope that remains open
 
 The legacy runtime remains FrameCodec/LX over rolling and keeps its actual
-support128 guard. This module is a new real pure composition, not a selected
-same-UDP carrier, local service API profile, GUI, native device or successful
-switch. Full8192 deployment, local128/global8192/every16 geometry/retained debt,
+support128 guard. This module owns the pure composition; selected carrier/service and finite
+native switching evidence is recorded in the later integration leaves above.
+GUI, full8192 deployment, local128/global8192/every16 geometry/retained debt,
 complete authenticated control/rekey/recovery and original80 Mbit/s workload
-still require their original gates. The separate Aligned early-short path does
-not change this ordered rolling scheduler.
-This first composition hands rolling sources upward in source order, so it does
-not bypass an earlier missing rolling source for independent short records.
-That remains a required explicit follow-on, with its deduplication/native fences.
+still require their original gates. Actual rolling source handoff remains ordered.
+The Wave7 preview above adds independent-short record admission across a source
+gap without fabricating ordered recovery or native completion. Its finite pure
+acceptance does not complete the full independent-short/native-fence matrix.
 
 Existing packed_sender emits one physical copy per packed source. Selected
 context/independent-short three-copy scope, repair-padding trimming, compact
@@ -200,6 +272,7 @@ runtime evidence, not these finite pure exchanges.
 - [ ] [CRL-04] Integrate complete common configuration/catalog/Bank ownership and same-carrier runtime/control/service selection with real per-profile native/send fences, retained sealed output and authenticated negotiated switching; preserve full SW-11 and API/CLI gates.
 - [ ] [CRL-05] Complete independent-short gap bypass, configured copy scope/ACK policy/repair trimming/reference packing and complete P-local-global-rlnc/P-compact-wire/P-packed-wire/P-independent-short-records/P-unified-duplex-mux definitions; preserve all other P-* families.
 - [ ] [CRL-06] Qualify complete real resource admission/failure/drop/retirement, full reference8192 geometry, original native/platform/carrier matrices and actual80 Mbit/s performance with controlled evidence. No local pure test, compile or scalar bound completes this gate.
+- [x] [CRL-07] Validate the additive committed-source view and bounded independent-short preview with real GF shadow isolation, work1/zero-budget limits, both source formats/backing modes, actual gap bypass and ordered deduplication, bounded native tombstone retirement, original pending-native expiry and newly available earlier-source rescan while a later preview is retained; pass the affected strict checks. Evidence: [committed-source exact case](../../work/parallel-features-20261115/parallel-wave7-final-build-cases-attempt-1/validation.json), [three final Endpoint exact cases](../../work/parallel-features-20261115/parallel-wave7-report-correction-attempt-1/validation.json), [three-package strict Clippy/format/rustdoc](../../work/parallel-features-20261115/parallel-wave7-strict-attempt-2/validation.json). This finite pure leaf does not close CRL-05/06 or any complete parent gate.
 
 Recorded verification on 2026-11-15 is finite and source-bound:
 

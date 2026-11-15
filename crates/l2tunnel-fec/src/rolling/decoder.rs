@@ -1232,6 +1232,28 @@ impl Decoder {
         let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
         Some((SourceId(self.handoff), &vector[2..2 + length]))
     }
+    /// Borrow an exact committed original at or beyond the upper handoff prefix.
+    /// Candidate/shadow writes are never exposed, and this does not acknowledge
+    /// recovery, advance a prefix or grant native-delivery authority.
+    pub fn decoded_source(&self, id: SourceId) -> Result<Option<&[u8]>, Error> {
+        if self.terminal.is_some() {
+            return Err(Error::Terminal);
+        }
+        if id.0 < self.handoff {
+            return Ok(None);
+        }
+        let slot = id.0 as usize % (2 * self.config.window);
+        if self.live_known(slot)? != Some(id.0) {
+            return Ok(None);
+        }
+        let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
+        let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
+        let end = 2usize.checked_add(length).ok_or(Error::Length)?;
+        if length > self.config.max_payload || end > vector.len() {
+            return Err(Error::Length);
+        }
+        Ok(Some(&vector[2..end]))
+    }
     /// Confirm actual upper-owner acceptance, not TAP/TUN delivery or peer receipt.
     pub fn confirm_handoff(&mut self, id: SourceId, now: Tick) -> Result<(), Error> {
         self.time(now)?;
@@ -1297,3 +1319,6 @@ mod sparse_work_tests;
 
 #[cfg(test)]
 mod systematic_work_tests;
+
+#[cfg(test)]
+mod decoded_source_tests;

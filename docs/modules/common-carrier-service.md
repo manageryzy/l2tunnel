@@ -1,6 +1,12 @@
 # Common profiles on the original authenticated carrier
 
-Status: **implemented with finite profile, typed-service, APIv4 IPC and offline CLI evidence**.
+Status: **implemented with finite profile, typed-service, APIv4 IPC, offline CLI
+and four clean Linux TAP/TUN production CLI cases**. The later
+[native leaf](common-carrier-cli-native.md) verifies all64 catalog inspection/pages,
+four representative families, original owner custody, actual backend-failure API
+survival and fresh authenticated reconnect. It does not qualify automatic
+retained-state recovery, every catalog member as active, or full parent gates.
+The earlier receipts below retain their original scopes.
 The new [actual carrier IPC case](../../work/parallel-features-20261115/parallel-wave6-cases-attempt-1/carrier-ipc.log)
 passed in 4.060 s: both inner appearances, the complete four-member fixture
 catalog, explicit ARQ-only Aligned/Packed, keyed four-family transitions, exact
@@ -127,9 +133,9 @@ false. These positive subprocess results do not change the failed aggregate.
 - [x] [CCS-03] Install the actual bound profile through shared Prepared/service authentication and the existing Common Driver, including original socket/cap, complete typed switches, native delivery and independent liveness. (Evidence: [actual all-four-family typed service case passed after structural and assertion corrections](../../work/parallel-features-20261115/parallel-wave5-final-checks-attempt-1/stage-2.log).)
 - [ ] [CCS-04] Expose requested carrier policy and effective bound profile through
   the shared API/CLI without inventing authentication or changing old versions.
-  **Implemented in part; typed service, finite new-carrier IPC and offline
-  inspection passed. Complete IPC matrices and production external CLI/native
-  startup remain unqualified.**
+  **Implemented in part; typed service, finite new-carrier IPC, offline
+  inspection and [four production CLI/TAP/TUN cases](common-carrier-cli-native.md)
+  passed. Complete IPC/native/fault matrices remain unqualified.**
 - [ ] [CCS-05] Complete blocked/late/cancelled setup and runtime failure ownership,
   full resources, carrier/native/platform and original parent acceptance. The
   finite profile/service cases alone do not close these broader requirements.

@@ -7,17 +7,27 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
-adds two actual data-path functions: explicit direct ARQ-only selection in the
-existing Reliable/Aligned/Packed owners, with inactive FEC backing omitted, and
-Packed independent-short release across an older recovery gap. The original
-carrier APIv4 case passes both appearances and all four fixture families,
-including ARQ-only Aligned/Packed, exact Unix packet-device bytes and release.
-Packed gap/expiry evidence is pure protocol testing. Production native CLI,
-Rolling early-short, retained recovery, full SW-11 and all full acceptance gates
-remain open; no performance campaign or unrelated full suite was repeated.
+The current [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
+adds implemented and protocol-tested [Rolling independent-short delivery](modules/rolling-records.md)
+and four finite [production Common native CLI cases](modules/common-carrier-cli-native.md).
+TAP/TUN with both inner appearances pass genuine outer TLS/member and inner
+Noise/member authentication, all64 catalog inspection/paging, four-family
+switching, exact bytes/liveness, runtime-failure API survival, fresh-session
+reconnect, capture and cleanup. One representative per family is activated;
+this is clean Linux IPv4 integration evidence, not full catalog or early-short
+native acceptance. The shared service retains the management API after an
+established backend fails. Automatic retained-state recovery, optional fresh-DH
+installation, full SW-11, all47 modes, complete resources, Windows/Android and
+80 Mbit/s performance remain open. No periodic exchange or new replay-domain
+wire decision is introduced.
 
-The latest carrier batch now executes the shared service on the original
+The preceding [record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+provides explicit ARQ-only Aligned/Packed and finite Packed short gap/expiry
+evidence. Its receipts retain their original Unix packet-device/pure scope.
+Earlier checkpoint descriptions below report their then-qualified scope; current
+native evidence is the finite CCN-01/02 leaf above, not completion of its parents.
+
+The preceding carrier batch executes the shared service on the original
 OpenVPN-like socket with both inner appearances and Swift/Aligned/Packed/Rolling
 transitions, actual Unix packet-device bytes, liveness and release. Two external
 CLI processes inspect all 64 requested configurations without claiming

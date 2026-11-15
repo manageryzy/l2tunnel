@@ -6,19 +6,32 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
-The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
-implements explicit ARQ-only Aligned/Packed without another recovery engine and
-Packed independent-short preview through the existing bounded receiver. Actual
-original-carrier APIv4 covers a four-member fixture on both appearances; pure
-Packed gap/expiry cases do not qualify native use. Rolling early-short, retained
-recovery and all complete mode/resource/platform/performance gates remain open.
+The current [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
+adds implemented and protocol-tested [Rolling independent-short delivery](modules/rolling-records.md)
+and four finite [production Common native CLI cases](modules/common-carrier-cli-native.md).
+TAP/TUN with both inner appearances pass genuine outer TLS/member and inner
+Noise/member authentication, all64 catalog inspection/paging, four-family
+switching, exact bytes/liveness, runtime-failure API survival, fresh-session
+reconnect, capture and cleanup. One representative per family is activated;
+this is clean Linux IPv4 integration evidence, not full catalog or early-short
+native acceptance. The shared service retains the management API after an
+established backend fails. Automatic retained-state recovery, optional fresh-DH
+installation, full SW-11, all47 modes, complete resources, Windows/Android and
+80 Mbit/s performance remain open. No periodic exchange or new replay-domain
+wire decision is introduced.
+
+The preceding [record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+provides explicit ARQ-only Aligned/Packed and finite Packed short gap/expiry
+evidence. Its receipts retain their original Unix packet-device/pure scope.
+Earlier checkpoint descriptions below report their then-qualified scope; current
+native evidence is the finite CCN-01/02 leaf above, not completion of its parents.
 
 Use the [implementation checklist](implementation-checklist.md) as the durable
 progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN active
 flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.
 Update checkbox evidence and capability status with every implementation change.
 
-The latest parallel carrier batch adds genuine requested-to-effective Common
+The preceding parallel carrier batch adds genuine requested-to-effective Common
 profile binding, the actual original-carrier shared service and explicit
 complete-plan CLI selection. The [finite carrier
 ledger](modules/common-carrier-service.md) and [scoped
@@ -113,13 +126,13 @@ outputs, source-bound receipts and independently useful existing transports.
 | `crates/l2tunnel-management` | Fixed authenticated control framing and mode transactions | Prepare/drain/commit/retire state machine; runtime compression switching qualified; pure whole-message custody, stream gates and leased final-reply authority have protocol/original-UDP fixtures; explicit Swift runtime integration is tracked separately from generic dispatch |
 | `crates/l2tunnel-datagram`, `crates/l2tunnel-udp` | Protected custom UDP envelopes and lanes | AEAD/integrity profiles with retained TCP/TLS bootstrap/control; native tests passed |
 | `crates/l2tunnel-quic` | Genuine standalone QUIC carrier | UDP-only maintained QUIC/member auth and 36 native TAP/TUN/VXLAN cases with physical MTU captures |
-| `crates/l2tunnel-udp-control`, `crates/l2tunnel-openvpn-wire`, `crates/l2tunnel-openvpn` | Preserved standalone control; pure standard OpenVPN outer wire and actual retained TLS/member carrier | Historical custom-gate receipts remain separate. Same-socket outer layouts, opaque transport and actual physical send tickets have focused evidence; real Common bootstrap/member/Parts/Driver/service selection, complete native/platform and dissector qualification remain open |
+| `crates/l2tunnel-udp-control`, `crates/l2tunnel-openvpn-wire`, `crates/l2tunnel-openvpn` | Preserved standalone control; pure standard OpenVPN outer wire and actual retained TLS/member carrier | Historical custom-gate receipts remain separate. Same-socket outer layouts, opaque transport and actual physical send tickets have focused evidence; actual Common bootstrap/member/Parts/Driver/service selection has finite Linux TAP/TUN evidence; complete lifecycle/native/platform and dissector qualification remain open |
 | `crates/l2tunnel-raw-tcp`, `crates/l2tunnel-raw-io` | Single-owner userspace TCP and native adapter | Retained TLS-to-protected-packet transition, runtime and explicit shared client are implemented; original native packet captures and startup sampling are under separate qualification; congestion control, clean drain and broader path behavior remain open |
 | `crates/l2tunnel-tcp-proxy` | Explicit TCP ownership and reliable relay | Maintained-TCP legs and ACK-based fixed credit; clean Linux TUN full/half native split, exact-byte/FIN and lane-close tests passed; adaptive proxy windows pending |
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
-| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; explicit same-socket Common Driver uses the actual four-family Bank and leased State in the sole loop, with finite Unix packet-device switching/liveness/custody and explicit rolling work evidence. Actual OpenVPN inner factory/opaque Parts are separate from pending Driver/service installation |
+| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; explicit same-socket Common Driver uses the actual four-family Bank and leased State in the sole loop, with finite Unix packet-device switching/liveness/custody and explicit rolling work evidence. Actual OpenVPN inner factory/opaque Parts, Driver/service and four production TAP/TUN cases now have finite initial-only integration evidence |
 | `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; explicit Common Prepared/Handle and APIv4 carry full configuration/status/catalog/keyed operations, with finite authenticated original-UDP/local-socket cross-profile evidence. Existing APIv1/v2/v3 bytes remain unchanged; Common CLI is wired to the same Prepared/Run and has strict full64 plan/inspection evidence. External CLI/device execution, complete failure/resource/lifecycle matrices, native qualification, default retained recovery and GUI remain open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; explicit Common Prepared/Handle and APIv4 carry full configuration/status/catalog/keyed operations, with finite authenticated original-UDP/local-socket cross-profile evidence. Existing APIv1/v2/v3 bytes remain unchanged; Common CLI is wired to the same Prepared/Run and has strict full64 plan/inspection evidence. Four production Linux TAP/TUN cases pass external CLI execution and runtime-failure API survival. Complete failure/resource/lifecycle/native matrices, default retained recovery and GUI remain open |
 | `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
 | `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Status/help CLI; runtime returns nonzero |
 | `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |

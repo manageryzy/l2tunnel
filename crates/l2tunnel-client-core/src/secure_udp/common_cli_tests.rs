@@ -5,6 +5,9 @@ use l2tunnel_handshake as hs;
 use l2tunnel_security::Role;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
+
+#[path = "common_cli_native_fixtures.rs"]
+mod native_fixtures;
 fn hex(descriptor: Descriptor) -> io::Result<String> {
     let mut bytes = [0; DESCRIPTOR_BYTES];
     descriptor

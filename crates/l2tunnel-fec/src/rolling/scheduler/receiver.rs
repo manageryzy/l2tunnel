@@ -234,6 +234,14 @@ impl Receiver {
             self.decoder.pending_source()
         }
     }
+    /// Borrow a committed original without recovery/native receipt authority.
+    /// Decoder candidate/shadow storage and retired handoffs remain hidden.
+    pub fn decoded_source(&self, id: SourceId) -> Result<Option<&[u8]>, Error> {
+        if self.terminal.is_some() {
+            return Err(Error::Terminal);
+        }
+        self.decoder.decoded_source(id)
+    }
     /// Confirm an exact upper handoff. A feedback scan freezes its committed snapshot.
     pub fn confirm_handoff(&mut self, id: SourceId, now: Tick) -> Result<(), Error> {
         self.time(now)?;

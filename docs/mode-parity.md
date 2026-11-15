@@ -33,6 +33,11 @@ focused pure grammar/control and actual same-socket TLS/member/opaque-record
 evidence. It does not install another recovery mode or satisfy any complete
 catalog entry. Standard-dissector, Common Driver/service, full lifecycle and
 native/platform/ISP acceptance stay separate from these finite carrier checks.
+The later [Common native CLI leaf](modules/common-carrier-cli-native.md) passes
+four clean Linux TAP/TUN cases on the original OpenVPN-like carrier, with both
+inner appearances, all64 catalog pages, four representative family switches and
+fresh-session reconnect after actual backend failure. It does not close any P-*
+gate, native early-short matrix, retained recovery or full SW-11 definition.
 The explicit [streamed-control runtime checkpoint](modules/streamed-swift-control.md)
 retains that same boundary: SwiftPolicyV1 and independent Liveness are actual
 adapter functions; generic Management/DataFeedback and other record engines remain
@@ -62,7 +67,9 @@ Packed now also has finite pure gap/deduplication/expiry evidence in the
 [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json).
 Explicit ARQ-only Aligned/Packed runs through the actual original-carrier APIv4
 with Unix packet-device fixtures; it does not implement compact-arq RTT/serial
-semantics. Rolling early-short and all full matrices remain separate requirements.
+semantics. [Rolling independent-short delivery](modules/rolling-records.md) now
+has finite committed-source, gap/deduplication, expiry and rescan protocol tests;
+full native early-short and all complete matrices remain separate requirements.
 Complete resources, full rolling runtime qualification and all47 catalog gates retain
 their original definitions and remain open.
 

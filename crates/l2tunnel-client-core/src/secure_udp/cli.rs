@@ -958,6 +958,9 @@ pub(super) async fn execute(
         .get("--control-socket")
         .map(crate::local::Server::bind)
         .transpose()?;
+    // Keep this shared API for explicit lower-layer reconnect after a connected
+    // generation fails. This neither retries automatically nor resets Records.
+    let local_control = api.is_some();
     let (handle, run) = service::channel();
     let submit = |error| io::Error::other(format!("service request: {error:?}"));
     let accepted = handle
@@ -967,6 +970,7 @@ pub(super) async fn execute(
     let lifecycle = async move {
         let mut cursor = accepted.operation.value().saturating_sub(1);
         let mut live = None;
+        let mut connected = false;
         let mut last_performance = secure_udp::performance::Cursor::default();
         let mut report_tick =
             tokio::time::interval(report_interval.unwrap_or(Duration::from_secs(1)));
@@ -992,7 +996,7 @@ pub(super) async fn execute(
                         emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
                         output.emit(serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
                     }
-                    if let Terminal::Failed(failure) = terminal {
+                    if let Terminal::Failed(failure) = terminal && !local_control {
                         output.flush_turn();
                         return Err(io::Error::new(failure.kind, "secure UDP runtime failed"));
                     }
@@ -1002,6 +1006,7 @@ pub(super) async fn execute(
                     cursor = operation.value();
                     match result {
                         Completed::Connected { generation } => {
+                            connected = true;
                             if generic && let Some(previous) = live.take() {
                                 let terminal = life.wait_stopped(previous).await.map_err(submit)?;
                                 emit_transaction(life.snapshot().runtime.as_ref(), Some(previous), TransactionEvent::Terminal(terminal), &mut output);
@@ -1025,9 +1030,15 @@ pub(super) async fn execute(
                                 Ok(Some(observation)) => setup_output::failed(observation, &mut diagnostic),
                                 _ => diagnostic.projection_error(),
                             }
-                            return Err(io::Error::new(failure.kind, "secure UDP setup failed"));
+                            if !local_control || !connected {
+                                return Err(io::Error::new(failure.kind, "secure UDP setup failed"));
+                            }
                         },
-                        Completed::Cancelled => return Err(io::Error::new(io::ErrorKind::Interrupted, "secure UDP setup cancelled")),
+                        Completed::Cancelled => {
+                            if !local_control || !connected {
+                                return Err(io::Error::new(io::ErrorKind::Interrupted, "secure UDP setup cancelled"));
+                            }
+                        },
                         Completed::Aborted => {
                             if generic && let Some(generation) = live.take() {
                                 // Completion may win select before wait_stopped. Observe
