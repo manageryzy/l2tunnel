@@ -1,10 +1,14 @@
 # Complete Common client API and CLI
 
-Status: implemented and finite protocol/parser plus Linux user-space local-IPC
-integration tested. This is an engineering interface extension, not an owner
+Status: implemented and finite protocol/parser, Linux user-space local-IPC and
+external Common control/inspection CLI integration tested. This is an engineering interface extension, not an owner
 decision or a claim that the full parent CLI, GUI, resource, native, platform or
-SW-11 gates pass. The separate [strict affected checks](../../work/parallel-features-20261115/parallel-wave3-strict-attempt-2/validation.json) passed;
-full-stage acceptance is not inferred from these finite cases.
+SW-11 gates pass. The earlier wave3 [strict affected checks](../../work/parallel-features-20261115/parallel-wave3-strict-attempt-2/validation.json) passed;
+full-stage acceptance is not inferred from these finite cases. The later wave4
+[final scoped validation](../../work/parallel-features-20261115/parallel-wave4-scoped-validation.json)
+records affected strict Clippy/rustdoc/format and final checklist/diff passes,
+with failed attempts retained. Full `tools/check.py` was not run, avoiding
+unrelated suites.
 
 APIv4 selects the actual Common shared-service backend. The portable DTO carries
 exact 1304-byte CompleteV2 C as 2608 lowercase hex characters, including tag4.
@@ -54,7 +58,8 @@ readiness/status/terminal events use the actual same-generation Common frame.
 The existing bounded stdout sink remains best effort. Commands are status,
 disconnect/reconnect with --api-version4, switch-common-configuration with full C
 and --request-key, and common-catalog with generation/root/offset/limit. This
-source wiring is not proof of production TAP/TUN CLI startup or external processes.
+source wiring and the finite external control probe are not proof of production
+TAP/TUN CLI startup.
 
 - [x] [CCA-01] Execute strict full-C/parser/legacy-byte cases, bounded full64 Evidence: [exact passed cases within the preserved failed aggregate](../../work/parallel-features-20261115/parallel-wave3-cases-attempt-1/validation.json).
   inspection, and actual Common Profile construction for both roles.
@@ -64,6 +69,7 @@ source wiring is not proof of production TAP/TUN CLI startup or external process
 - [ ] [CCA-03] Qualify actual external CLI connect/serve and native TAP/TUN,
   all required faults/lifecycle/recovery/resource cases, complete catalog/capability
   observations, GUI/platform composition and all existing parent definitions.
+- [x] [CCA-04] Execute real external Common control/inspection CLI processes on both covers against actual shared service owners: both-role full 64 inspection, complete paged catalog, explicit APIv4/key/version/refusal/replay/conflict, four-family switches with real bidirectional native bytes/liveness, original tuple, disconnect/release and fresh authenticated reconnect. Evidence: [both-cover external probe and final affected cases](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json); this finite control/inspection deliverable excludes production connect/serve and native attachment qualification.
 
 The [first functional batch](../../work/parallel-features-20261115/parallel-wave3-cases-attempt-1/validation.json)
 remains failed:51 of55 exact cases passed. Its four API/parser cases passed:
@@ -103,3 +109,60 @@ a rolling service switch.
 No check or test was run by this author. Root executed the linked immutable-binary
 batches; historical build/functional failures remain preserved. CCA-03 and every
 full parent gate retain their complete original definitions.
+
+
+The explicit `common_cli_process_probe` passed on both covers in 4.131 s in the
+[final source/binary-stable receipt](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json).
+Its [actual output](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/external-cli.log)
+records 50 daemon processes per cover, all 64 catalog members in 16 pages, four
+actual transitions Swift→Aligned→Packed→Rolling→Swift, release and fresh
+reconnect. Both roles also undergo offline complete-plan inspection. Explicit
+APIv4 status, older-version refusal, unlisted targets, identical-key replay and
+conflict are exercised against the real service. Every stage carries literal
+bidirectional RawIP packets of 512..542 bytes, requiring multiple rolling symbols,
+plus actual liveness over the original authenticated UDP endpoints.
+
+Invocation requires `--binary /absolute/l2tunneld` and
+`--work-dir /absolute/fresh/private-directory`; the latter must keep every Unix
+socket path below SUN_LEN. The passing run used `/tmp/l2c4-0lycawbv/p`. It runs no
+Cargo and never skips a missing binary. Programmatic Prepared/Handle/Run own the
+real Noise/member original UDP session and UnixDatagram packet devices. Real
+subprocesses inspect and control those owners; they do not execute production
+connect/serve or attach native TAP/TUN. Capture limits remain 256 KiB stdout/16 KiB
+stderr per child, an original 8-second child cap, 96 commands per cover and 60
+seconds per cover, with at most two children active for paired lifecycle commands.
+These are explicit finite fixture controls, not protocol defaults.
+
+The failed history remains intact. The [first probe input](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-1/probe/validation.json)
+exceeded SUN_LEN before functional control steps. The [proper short-path attempt](../../work/parallel-features-20261115/parallel-wave4-cli-attempt-2/validation.json)
+then timed out after the real Rolling epoch 4 switch while waiting for native
+bytes. Added bounded stage/peer snapshots exposed the same failure as
+`family_switch index=2 epoch=4 phase=traffic`, native marker 91 from peer 0 to 1 in
+the [diagnostic rerun](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-2/validation.json).
+The [source-line debugger trace](../../work/parallel-features-20261115/parallel-wave4-rolling-error-debug-2/debugger.log)
+locates the actual Engine error through prepare_common_wire, send_common_user
+and the sole driver loop. The runtime now resamples the same injected clock
+before the next same-batch poll after a whole write; the final receipt includes
+the exact regression. No deadline, packet assertion or catalog scope was relaxed.
+
+The [first wave4 batch](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-1/validation.json)
+remains failed 23/24 because the existing Common nonempty switch case overflowed
+its standard stack during shared construction. The [frame diagnostic](../../work/parallel-features-20261115/parallel-wave4-stack-attempt-2/debugger.log)
+was followed by a structural constructor repair, retaining the same actual
+owners and ordinary stack. That exact old case passed in the [six-case repair run](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-2/validation.json)
+and again in the final nine-case run. The repair run still failed overall because
+the external probe exposed the separate Rolling clock defect. Together the
+preserved wave4 runs contain 26 distinct positive test cases, not 26 new features
+or full-stage acceptance. CCA-03 and all parent gates remain open. The
+[final scoped validation](../../work/parallel-features-20261115/parallel-wave4-scoped-validation.json)
+records runtime-only Build4 passing in 42.723 s and the final carrier/clock
+regressions passing in 0.216/0.166 s. The [first strict attempt](../../work/parallel-features-20261115/parallel-wave4-final-checks/validation.json)
+remains failed on six Clippy style warnings. Mechanical let-chain changes in
+session_refresh and equivalent async-fn syntax for run_prepared_common preserve
+the eager constructor call outside the future. The [second strict attempt](../../work/parallel-features-20261115/parallel-wave4-strict-attempt-2/validation.json)
+passes affected Clippy (30.196 s), rustdoc (18.016 s) and format check (3.908 s),
+but remains failed because RSF evidence was not on the checkbox line. After that
+documentation-only repair, standalone checklist validation passes with 1637
+unique IDs, 1036 checked tasks and all 47 modes; diff validation passes. Unchanged
+cases were reused rather than rerun. No new full `tools/check.py` or product-stage
+acceptance is claimed.

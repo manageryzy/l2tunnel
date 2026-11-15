@@ -368,6 +368,7 @@ the full native and compatibility gates retain their definitions.
 - [x] [GCS-07] Exercise two actual shared service owners on both covers with nonzero asymmetric native traffic and at least 2 complete configuration switches, plus credential/setup/attachment/cancel/reconnect/owner-drop/duplicate-key/failure cases; separate typed/IPC evidence from native and GUI claims. Evidence: [source-stable combined checks](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json); finite local scope and remaining gates are described below.
 - [x] [GCS-08] Run focused failure/compatibility tests and the required source-stable aggregate on the complete selected shared path; preserve failed attempts and commit exact evidence/status without closing broader parent gates. Evidence: [source-stable scoped checks](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json); broader parent gates remain open.
 - [ ] [GCS-09] Add explicit CLI generic plan/catalog selection and version3 commands through the same shared API, preserving the current CLI path/defaults and manual own-trust credentials; validate actual external requests separately from in-process tests.
+- [x] [GCS-10] Permit typed reconnect after an actual backend failure when a plan is retained; verify real fresh authentication/native delivery, release before replacement, unchanged original operation identity/cap/results, and refusal without a retained plan. Automatic retained-state recovery remains separately required. Evidence: `typed_reconnect_after_transport_loss_preserves_unknown_and_authenticates_fresh_native_session` passed in the [preserved failed 23/24 wave4 batch](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-1/validation.json); only this exact typed local deliverable is qualified.
 
 ## Current finite service evidence and remaining cases
 
@@ -407,6 +408,30 @@ JNI/VpnService/application shell. A portable DTO, cfg(unix) build or Adapter enu
 is not platform support. GUI and native cross-platform acceptance retain their
 original CL gates.
 
+The typed failed-backend reconnect case now passes with a real authenticated
+TCP/TLS peer. That peer reads the actual management request, supplies no outcome
+and drops its original transport. The service retains OutcomeUnknown and the
+original operation identity, accepted deadline and replay result, releases the
+native device, and admits an explicit typed reconnect only with a retained plan.
+Fresh authentication yields a different session/generation and exact native bytes
+in both directions; the recorded release precedes replacement acquisition.
+Reconnect without a retained plan is refused without consuming the service key.
+This is GCS-10’s finite typed recovery deliverable, not automatic retained-state
+recovery or evidence that reconnect preserves an old peer session. Its exact pass
+is retained inside the [failed wave4 batch](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-1/validation.json);
+the unrelated existing Common stack failure remains a failed result there.
+
+[Complete Common APIv4](common-client-api.md) now has separate finite external
+control/inspection CLI evidence: both covers, full 64 catalog, real four-family
+switching and fresh reconnect through programmatic shared owners. The [final
+nine-case and external-probe receipt](../../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
+does not qualify production CLI connect/serve, native TAP/TUN or GUI/platform
+acceptance. GCS-06/09 and all parent definitions remain open. Earlier passing
+strict receipts below remain historical. The wave4 [final scoped validation](../../work/parallel-features-20261115/parallel-wave4-scoped-validation.json)
+records affected Clippy/rustdoc/format and final checklist/diff passes, retaining
+failed style and evidence-format attempts. Unchanged cases were reused; no new
+full `tools/check.py` or product-stage acceptance is claimed.
+
 ## Functionality checkpoint validation
 
 The [required source-stable aggregate](../../work/generic-driver-20261114/functionality-aggregate-attempt-2/validation.json) passes1919 Rust
@@ -418,7 +443,7 @@ This is local Linux validation, with no new privileged/native performance, remot
 CI, Windows/Android device or GUI qualification. Every still-open task retains
 its complete acceptance definition.
 
-The [current full baseline](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json)
+The [earlier full baseline](../../work/generic-functionality-20261114-batch2/aggregate-attempt-3/validation.json)
 passes2011 Rust,406 tooling and1658 simulator cases. A later source-confirmed
 APIv3 completion projection repair passes the [77 affected service/local cases](../../work/generic-functionality-20261114-batch2/completion-projection-focused-attempt-1/validation.json)
 with4 test threads and strict client-core Clippy. Completed successful and

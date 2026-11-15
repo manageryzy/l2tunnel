@@ -67,6 +67,9 @@ def main() -> None:
         run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core',
             '--example', 'generic_cli_process_probe', '--', '--binary', str(daemon),
             '--work-dir', str(directory / 'probe'))
+        run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core',
+            '--example', 'common_cli_process_probe', '--', '--binary', str(daemon),
+            '--work-dir', str(directory / 'common'))
         shutil.rmtree(directory)
     if sys.platform == 'linux':
         run(sys.executable, '-m', 'unittest', 'tools.test_secure_udp_native', 'tools.test_secure_udp_capture_observations', '-v')

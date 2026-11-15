@@ -18,6 +18,9 @@ mod streamed;
 #[path = "transport_common_tests.rs"]
 mod common_selected;
 
+#[path = "transport_common_carrier_tests.rs"]
+mod common_carrier;
+
 #[path = "transport_generic_tests.rs"]
 mod generic_selected;
 

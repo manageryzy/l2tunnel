@@ -9,6 +9,25 @@ Track implementation in the [checkbox ledger](implementation-checklist.md); deta
 [flow control](flow-control.md), [management/VXLAN/carriers](overlay-and-carriers.md)
 and [CLI/GUI clients](client-design.md) extend this architecture.
 
+The latest finite wave4 adds three functional components: an explicit
+[initial-only Common runtime on the original public carrier](modules/managed-common-runtime.md),
+[typed fresh reconnect after backend failure](modules/generic-client-service.md)
+and [external Common control/inspection CLI](modules/common-client-api.md)
+against programmatic shared owners that perform actual authentication. The
+[last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
+records nine exact cases in 7.936 s and the both-cover CLI probe in 4.131 s; preserved
+wave4 runs contain 26 distinct positive cases, not 26 features. Clock and structural
+stack repairs have exact affected evidence. Managed contract/controller evidence
+remains finite pure protocol testing. Initial-only operation adds no periodic
+fresh-DH; reconnect belongs to the underlying carrier/session service, not Swift
+or the GUI. The [final scoped validation](../work/parallel-features-20261115/parallel-wave4-scoped-validation.json) records successful runtime-only Build4,
+both final affected regressions and affected strict Clippy/rustdoc/format
+checks, plus checklist and diff checks. Full `tools/check.py` was not run,
+avoiding unrelated suites.
+Production CLI connect/serve/TAP startup, full carrier service, automatic retained
+recovery, all 47 mode gates, SW-11/RLNC/parity/rolling/packed/proxy, complete resources,
+native/platform and performance definitions remain required and open.
+
 ## Reviewed target and implementation boundary
 
 The 2026-11-13 owner discussion confirmed a fixed point-to-point deployment for

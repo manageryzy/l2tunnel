@@ -26,6 +26,10 @@ The following requirements were explicitly confirmed in the architecture discuss
 - Authentication, data, management, liveness and rekeying use the selected carrier.
   Handshake-to-data transition retains its original connection or UDP socket and
   five-tuple. HTTPS-like additionally retains ports and coherent TCP sequence space.
+- The owner clarified on 2026-11-15 that a connection with no subsequent key
+  exchange must not acquire a refresh timeout. Reconnection belongs to the
+  underlying session/runtime layer. This does not remove the requested rekey
+  capability or qualify automatic retained-state recovery as implemented.
 - QUIC-like requires header appearance, not genuine QUIC data ACK/congestion
   semantics or complete standard-dissector validation. Add the simplest audio/video
   media appearance as another selectable outer profile; full WebRTC is not required.
@@ -53,6 +57,15 @@ packet phase remains the requested HTTPS-like path; continuous HTTP/2 streaming
 is a separate compatibility profile, not its replacement.
 
 ## Current source and evidence
+
+The initial-only Common entry installs ordinary, untimed `Records` and does not
+enable the managed refresh controller. An existing explicit `Lifetime::lease`
+still stops a healthy runtime at its configured session-age bound. This is a
+separate lifetime policy, not a failed key exchange. Authenticated liveness,
+native-output stalls and individual management/physical-output operations also
+have distinct bounds. Automatic lower-layer recovery and preservation of the
+logical session across it remain unfinished; a typed fresh reconnect does not
+prove retained-state recovery.
 
 The current QUIC-like/media-like path has actual Noise/member establishment, one
 original UDP socket, the generic Swift Driver, complete-C transactions, shared

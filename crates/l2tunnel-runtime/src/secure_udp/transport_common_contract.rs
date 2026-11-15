@@ -2,6 +2,10 @@
 use super::*;
 use l2tunnel::{record_configuration as common, record_engine as engine};
 
+#[path = "transport_managed_contract.rs"]
+mod managed;
+pub use managed::FreshKeyPolicy;
+
 /// Complete common policy/catalog handoff to the sole original-socket Driver.
 #[derive(Clone, Debug)]
 pub struct CommonTransactionContract {
@@ -16,6 +20,9 @@ pub struct CommonTransactionContract {
     data: core::ConfigDigest,
     settings: TransactionSettings,
     geometry: engine::Geometry,
+    managed: Option<managed::Managed>,
+    extra_wire_bytes: usize,
+    outer: Option<establish::carrier::AuthenticatedOuter>,
 }
 
 impl Config {
@@ -215,6 +222,25 @@ impl CommonTransactionContract {
         catalog: common::Catalog,
         settings: TransactionSettings,
     ) -> io::Result<Self> {
+        Self::construct(
+            expected, role, resources, cover, ipv6, envelope, catalog, settings, None, 0, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn construct(
+        expected: security::ConfigDigest,
+        role: security::Role,
+        resources: Config,
+        cover: cover::Config,
+        ipv6: bool,
+        envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        managed: Option<managed::Managed>,
+        extra_wire_bytes: usize,
+        outer: Option<establish::carrier::AuthenticatedOuter>,
+    ) -> io::Result<Self> {
         let initial = common::Configuration::new(envelope, catalog.initial()).map_err(invalid)?;
         if initial.descriptor().duplex() != core::Duplex::Full {
             return Err(io::Error::new(
@@ -239,7 +265,19 @@ impl CommonTransactionContract {
             .and_then(|value| {
                 value.checked_add(security::Protection::ChaCha20Poly1305.overhead_bytes())
             })
+            .and_then(|value| {
+                value.checked_add(if managed.is_some() {
+                    security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
+                } else {
+                    0
+                })
+            })
             .ok_or_else(exhausted)?;
+        if managed.is_some() && protected > cover.limits().max_protected_bytes {
+            return Err(invalid(
+                "managed security exceeds covered protected capacity",
+            ));
+        }
         let header = cover
             .overhead(cover::Phase::Established, protected)
             .map_err(invalid)?;
@@ -252,7 +290,13 @@ impl CommonTransactionContract {
         let overhead = record::ROUTE_BYTES
             + security::Protection::ChaCha20Poly1305.overhead_bytes()
             + header
-            + if ipv6 { 48 } else { 28 };
+            + if ipv6 { 48 } else { 28 }
+            + extra_wire_bytes
+            + if managed.is_some() {
+                security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
+            } else {
+                0
+            };
         if resources.control.wire_overhead != overhead {
             return Err(invalid("common control wire charge differs"));
         }
@@ -273,6 +317,9 @@ impl CommonTransactionContract {
             data,
             settings,
             geometry,
+            managed,
+            extra_wire_bytes,
+            outer,
         };
         for value in result.catalog.configurations(envelope).map_err(invalid)? {
             result.resolve(value)?;
@@ -283,6 +330,18 @@ impl CommonTransactionContract {
     /// Actual expected maintained setup/Control digest H0.
     pub fn expected_configuration(&self) -> security::ConfigDigest {
         self.expected
+    }
+    /// Extra outer carrier bytes, excluding the IP/UDP and record headers.
+    pub fn extra_wire_bytes(&self) -> usize {
+        self.extra_wire_bytes
+    }
+    /// Actual explicit initial refresh selection, never an authentication proof.
+    pub fn refresh_selection(&self) -> Option<security::refresh::Selection> {
+        self.managed.map(|value| value.selection)
+    }
+    /// Exact complete selected v2 settings; absence preserves the old namespace.
+    pub fn managed_streams(&self) -> Option<control_owner::SettingsV2> {
+        self.managed.map(|value| value.streams)
     }
     /// Exact authenticated local role.
     pub fn role(&self) -> security::Role {
@@ -438,18 +497,21 @@ impl CommonTransactionContract {
             .streams
             .ok_or_else(|| invalid("common stream absent"))?
             .streams[0];
+        let binding = delivery::Binding {
+            session: mg::SessionId([1; 16]),
+            lane: mg::LaneId(LANE),
+            local_role: mg::Role::Client,
+            control_epoch: self.resources.control_epoch.0,
+        };
+        let binding = if self.managed.is_some() {
+            streams::v2::delivery_binding(binding, streams::Stream::Transaction)
+        } else {
+            streams::delivery_binding(binding, streams::Stream::Transaction)
+        }
+        .map_err(invalid)?;
         let mut owner = mg::messages::Owner::new(
             entry,
-            streams::delivery_binding(
-                delivery::Binding {
-                    session: mg::SessionId([1; 16]),
-                    lane: mg::LaneId(LANE),
-                    local_role: mg::Role::Client,
-                    control_epoch: self.resources.control_epoch.0,
-                },
-                streams::Stream::Transaction,
-            )
-            .map_err(invalid)?,
+            binding,
             Duration::ZERO,
             self.resources.lifetime.lease,
         )

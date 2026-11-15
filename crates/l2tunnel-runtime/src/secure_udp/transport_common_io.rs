@@ -388,14 +388,16 @@ impl Driver {
         }
         result
     }
+    #[cfg(test)]
     pub(super) fn send_common_user(
         &mut self,
         socket: &tokio::net::UdpSocket,
         now: u64,
     ) -> io::Result<bool> {
         let origin = self.origin;
+        let current = clock(origin, Instant::now())?.max(now);
         self.send_common_user_sampled(
-            now,
+            current,
             |bytes| socket.try_send(bytes),
             || clock(origin, Instant::now()).map(|time| time.max(now)),
         )
@@ -414,12 +416,18 @@ impl Driver {
         mut send: impl FnMut(&[u8]) -> io::Result<usize>,
         mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
+        if !self.prepare_common_wire(now)? {
+            return Ok(false);
+        }
+        self.flush_common_wire_sampled(now, &mut send, &mut sample)
+    }
+    fn prepare_common_wire(&mut self, now: u64) -> io::Result<bool> {
         if self
             .common
             .as_ref()
             .is_some_and(|runtime| runtime.sealed.is_some())
         {
-            return self.flush_common_wire_sampled(now, &mut send, &mut sample);
+            return Ok(true);
         }
         let epochs = self.common_epochs();
         let runtime = self
@@ -495,16 +503,27 @@ impl Driver {
                     "common carrier witness differs from actual emission",
                 ));
             }
-            let sealed = self
-                .records
-                .seal_user_in(
+            let sealed = if self.records.key_epoch().is_ok() {
+                self.records
+                    .seal_user_in_at(
+                        l2tunnel::handshake::Time(now),
+                        scope,
+                        meta(self.outer, cover::Phase::Established),
+                        &self.buffers.frame[..emission.bytes],
+                        &mut self.buffers.seal,
+                        &mut self.buffers.wire,
+                    )
+                    .map(|sealed| sealed.record)
+            } else {
+                self.records.seal_user_in(
                     scope,
                     meta(self.outer, cover::Phase::Established),
                     &self.buffers.frame[..emission.bytes],
                     &mut self.buffers.seal,
                     &mut self.buffers.wire,
                 )
-                .map_err(record_error)?;
+            }
+            .map_err(record_error)?;
             if sealed.number != number
                 || sealed.bytes.checked_add(self.ip) != Some(emission.wire_bytes)
             {
@@ -557,7 +576,7 @@ impl Driver {
                 deadline,
                 carrier,
             });
-            return self.flush_common_wire_sampled(now, &mut send, &mut sample);
+            return Ok(true);
         }
         self.performance.counters.user_not_ready_polls = self
             .performance
@@ -565,6 +584,99 @@ impl Driver {
             .user_not_ready_polls
             .saturating_add(1);
         Ok(false)
+    }
+    pub(super) fn send_common_carrier(
+        &mut self,
+        socket: &mut carrier::IoOwner,
+        now: u64,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<bool> {
+        if !self.prepare_common_wire(now)? {
+            return Ok(false);
+        }
+        let runtime = self
+            .common
+            .as_ref()
+            .ok_or_else(|| protocol("common carrier output owner"))?;
+        let pending = runtime
+            .sealed
+            .as_ref()
+            .ok_or_else(|| protocol("common carrier output custody"))?;
+        let identity = carrier::UserIdentity {
+            scope: pending.scope,
+            number: pending.sealed.number,
+            bytes: pending.sealed.bytes,
+            deadline: self
+                .origin
+                .checked_add(duration(pending.deadline))
+                .ok_or_else(exhausted)?,
+        };
+        match socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])? {
+            carrier::SendProgress::Pending => Ok(false),
+            carrier::SendProgress::Whole { receipt, late } => {
+                self.complete_common_carrier(identity, receipt, late, &mut sample)
+            }
+        }
+    }
+    pub(super) fn complete_common_carrier(
+        &mut self,
+        identity: carrier::UserIdentity,
+        receipt: crate::secure_udp::original_datagram::SendReceipt,
+        late: bool,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<bool> {
+        // Physical facts are irreversible, including completion observed after a cap.
+        self.counters.socket_accepted_packets =
+            self.counters.socket_accepted_packets.saturating_add(1);
+        self.counters.socket_accepted_ip_bytes = self
+            .counters
+            .socket_accepted_ip_bytes
+            .saturating_add(receipt.ip_bytes as u64);
+        let pending = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("whole carrier write lost runtime"))?
+            .sealed
+            .take()
+            .ok_or_else(|| protocol("whole carrier write lost pending ciphertext"))?;
+        if pending.scope != identity.scope
+            || pending.sealed.number != identity.number
+            || pending.sealed.bytes != identity.bytes
+            || receipt.datagram_bytes != identity.bytes
+            || pending.cost != receipt.ip_bytes
+            || !self.scope_registered(pending.scope)
+        {
+            return Err(protocol(
+                "actual carrier completion differs from retained ciphertext",
+            ));
+        }
+        // Sample the same sole-loop clock only after retaining the irreversible
+        // receipt and removing its exact ciphertext custody. The receipt's own
+        // accepted_at remains the independent physical fact, never rewritten.
+        let observed = sample();
+        let completed = clock(self.origin, observed);
+        let at = completed.as_ref().copied().unwrap_or(u64::MAX);
+        let confirmation = if let Some(token) = pending.carrier {
+            self.common_state_mut()?
+                .entry(core::Epoch(pending.scope.epoch.0))?
+                .confirm_carrier_output(engine::Tick(at), token)
+                .map_err(protocol)
+        } else {
+            Ok(())
+        };
+        completed?;
+        confirmation?;
+        if late
+            || receipt.accepted_at >= receipt.deadline
+            || observed >= receipt.deadline
+            || at >= pending.deadline
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "whole carrier write crossed original cap",
+            ));
+        }
+        self.check_expiry(at)
     }
     #[cfg(test)]
     pub(super) fn flush_common_wire_with(
@@ -763,11 +875,20 @@ impl Driver {
         }
     }
     pub(super) fn wake_common(&self, now: u64) -> io::Result<Instant> {
+        self.wake_common_with_custody(now, false, false)
+    }
+    pub(super) fn wake_common_with_custody(
+        &self,
+        now: u64,
+        held_user: bool,
+        held_control: bool,
+    ) -> io::Result<Instant> {
         let mut wake = self.lease;
-        if let Some(pending) = self
-            .common
-            .as_ref()
-            .and_then(|runtime| runtime.sealed.as_ref())
+        if !held_user
+            && let Some(pending) = self
+                .common
+                .as_ref()
+                .and_then(|runtime| runtime.sealed.as_ref())
         {
             wake = wake.min(now).min(pending.deadline);
         }
@@ -803,15 +924,23 @@ impl Driver {
         if self.ingress.left == 0 {
             wake = wake.min(self.ingress.refill);
         }
-        wake = wake.min(
-            u64::try_from(self.control.deadline().as_micros())
-                .map_err(invalid)?
-                .max(self.bucket.ready_at(self.reserve)?),
-        );
+        if !held_control {
+            wake = wake.min(
+                u64::try_from(self.control.deadline().as_micros())
+                    .map_err(invalid)?
+                    .max(self.bucket.ready_at(self.reserve)?),
+            );
+        }
         for epoch in self.common_epochs().into_iter().flatten() {
             let engine = self.common_state()?.engine(epoch)?;
             if engine.work_pending().map_err(protocol)? {
                 wake = wake.min(now);
+            }
+            if held_user {
+                if let Some(at) = engine.deadline().map_err(protocol)? {
+                    wake = wake.min(at.0);
+                }
+                continue;
             }
             let local = engine
                 .configuration()
@@ -855,24 +984,26 @@ impl Driver {
             .origin
             .checked_add(duration(wake))
             .ok_or_else(exhausted)?;
-        for (at, bytes) in [
-            (
-                self.bootstrap.deadline(),
-                self.bootstrap.max_packet_bytes() + self.ip,
-            ),
-            (
-                self.joining.deadline(),
-                self.joining.max_packet_bytes() + self.ip,
-            ),
-        ] {
-            if let Some(at) = at {
-                instant = instant.min(
-                    at.max(
-                        self.origin
-                            .checked_add(duration(self.bucket.ready_at(bytes)?))
-                            .ok_or_else(exhausted)?,
-                    ),
-                );
+        if !held_control {
+            for (at, bytes) in [
+                (
+                    self.bootstrap.deadline(),
+                    self.bootstrap.max_packet_bytes() + self.ip,
+                ),
+                (
+                    self.joining.deadline(),
+                    self.joining.max_packet_bytes() + self.ip,
+                ),
+            ] {
+                if let Some(at) = at {
+                    instant = instant.min(
+                        at.max(
+                            self.origin
+                                .checked_add(duration(self.bucket.ready_at(bytes)?))
+                                .ok_or_else(exhausted)?,
+                        ),
+                    );
+                }
             }
         }
         let floor = self

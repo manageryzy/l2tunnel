@@ -621,6 +621,10 @@ pub struct BootstrapTail {
     peer: SocketAddr,
 }
 impl BootstrapTail {
+    /// Original immutable bootstrap lifetime, independent of retransmission wakes.
+    pub fn expiry(&self) -> Instant {
+        self.core.end
+    }
     /// Consume only handshake-tagged authenticated bootstrap packets.
     /// Other records and bad MACs cannot grant authority or trigger a response.
     pub fn receive(&mut self, decoded: cover::Decoded<'_>, now: Instant) -> Result<bool, Error> {

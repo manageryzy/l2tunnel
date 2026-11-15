@@ -12,6 +12,7 @@ use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T = ()> = std::result::Result<T, Error>;
 mod datagram;
+mod reconnect_recovery;
 #[cfg(unix)]
 mod secure_udp;
 #[cfg(unix)]

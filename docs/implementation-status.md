@@ -7,7 +7,25 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
-The latest parallel functionality batch adds actual
+The latest finite wave4 implements three functional additions:
+[initial-only public-carrier Common runtime](modules/managed-common-runtime.md),
+[typed fresh reconnect after actual backend failure](modules/generic-client-service.md)
+and [external Common control/inspection CLI](modules/common-client-api.md) over
+programmatic shared owners with real authentication. The [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
+contains nine exact cases in 7.936 s and a both-cover external probe in 4.131 s;
+26 distinct positive cases across the preserved attempts are not 26 new features.
+Clock and structural stack repairs pass their exact affected regressions; managed
+contract/controller proof remains finite pure protocol evidence. The [final scoped validation](../work/parallel-features-20261115/parallel-wave4-scoped-validation.json) records successful runtime-only Build4,
+both final affected regressions and affected strict Clippy/rustdoc/format
+checks, plus checklist and diff checks. Full `tools/check.py` was not run,
+avoiding unrelated suites. Initial-only has no
+periodic fresh-DH; reconnect belongs to the underlying carrier/session service,
+not Swift or GUI policy. Production CLI connect/serve/TAP/native startup, full
+carrier service, automatic retained recovery, complete resources, all 47 modes,
+full SW-11/RLNC/parity/rolling/packed/proxy and native/platform/performance gates
+remain open with unchanged acceptance definitions.
+
+The preceding parallel functionality batch adds actual
 [rolling common configuration/Engine/Bank](modules/rolling-common-records.md),
 [managed initial authentication handoff](modules/managed-initial-handoff.md) and
 [UDP/OpenVPN physical-send custody](modules/original-datagram-custody.md).

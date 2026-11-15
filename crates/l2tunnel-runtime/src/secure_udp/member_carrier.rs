@@ -3,6 +3,10 @@ use super::*;
 use establish::carrier::AuthenticatedOuter;
 use l2tunnel_handshake as hs;
 
+#[path = "member_carrier_initial.rs"]
+mod initial;
+pub use initial::{InitialAuthenticated, InitialParts, accept_initial, connect_initial};
+
 /// Actual accepted membership and selected initial custody, with no public constructor.
 pub struct Authenticated(Parts);
 impl Authenticated {
@@ -106,4 +110,4 @@ pub async fn accept(
 
 #[cfg(test)]
 #[path = "member_carrier_tests.rs"]
-mod tests;
+pub(in crate::secure_udp) mod tests;

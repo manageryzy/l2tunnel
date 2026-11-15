@@ -5,6 +5,12 @@ use super::*;
 use l2tunnel::record_configuration::Configuration as C;
 use l2tunnel::{record_bank::storage, record_engine as engine};
 
+#[path = "transport_common_managed.rs"]
+mod managed;
+#[path = "transport_common_provision.rs"]
+mod provision;
+pub use managed::run_common_on_carrier;
+
 /// Actual generic transaction state, separate from legacy Swift policy status.
 #[derive(Clone, Debug)]
 pub struct CommonSnapshot {
@@ -143,46 +149,60 @@ pub fn run_common<D>(
     contract: CommonTransactionContract,
     requests: Option<CommonControlRequests>,
     shutdown: impl Future<Output = ()> + Send,
-    mut observe: impl FnMut(&CommonSnapshot) + Send,
+    observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> impl Future<Output = io::Result<CommonStopped>> + Send
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
     // This is actual ownership, not a copied Driver or a future-only box: the
     // same initialized security, Bank, socket and native owners enter the loop.
-    let prepared = prepare_common_runtime(device, parts, contract);
-    async move {
-        let PreparedRuntime {
-            device,
-            socket,
-            mut driver,
-            setup_deadline,
-        } = prepared?;
-        match run_driver_clock(
-            device,
-            socket,
-            &mut driver,
-            setup_deadline,
-            Requests::Common(requests),
-            None,
-            shutdown,
-            move |driver, now, running| {
-                observe(&driver.snapshot_common(now, running)?);
-                Ok(())
-            },
-            Instant::now,
-        )
-        .await?
-        {
-            SelectedStopped::Common(stopped) => Ok(stopped),
-            _ => Err(protocol("common loop returned another backend")),
-        }
+    run_prepared_common(
+        prepare_common_runtime(device, parts, contract),
+        requests,
+        shutdown,
+        observe,
+    )
+}
+
+async fn run_prepared_common<D>(
+    prepared: io::Result<PreparedRuntime<D>>,
+    requests: Option<CommonControlRequests>,
+    shutdown: impl Future<Output = ()> + Send,
+    mut observe: impl FnMut(&CommonSnapshot) + Send,
+) -> io::Result<CommonStopped>
+where
+    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+{
+    let PreparedRuntime {
+        device,
+        socket,
+        mut driver,
+        setup_deadline,
+    } = prepared?;
+    match run_driver_clock(
+        device,
+        socket,
+        &mut driver,
+        setup_deadline,
+        Requests::Common(requests),
+        None,
+        shutdown,
+        move |driver, now, running| {
+            observe(&driver.snapshot_common(now, running)?);
+            Ok(())
+        },
+        Instant::now,
+    )
+    .await?
+    {
+        SelectedStopped::Common(stopped) => Ok(stopped),
+        _ => Err(protocol("common loop returned another backend")),
     }
 }
 
 struct PreparedRuntime<D> {
     device: D,
-    socket: tokio::net::UdpSocket,
+    socket: carrier::IoOwner,
     driver: owner::StateCell<Driver>,
     setup_deadline: Instant,
 }
@@ -215,7 +235,7 @@ where
     }
     Ok(PreparedRuntime {
         device,
-        socket,
+        socket: socket.into(),
         driver,
         setup_deadline,
     })
@@ -263,31 +283,68 @@ fn reserve_common_state(
     owner::ReservedCommonState::new(state)
 }
 
+// Only actual accepted membership handoffs enter this shared constructor.
+struct CommonInput {
+    material: establish::InitialMaterial,
+    cover: cover::Config,
+    bootstrap: establish::BootstrapTail,
+    joining: member::JoiningTail,
+    next_outer: u32,
+    info: member::Info,
+    deadline: Instant,
+    addresses: (std::net::SocketAddr, std::net::SocketAddr),
+    io_capacity: usize,
+}
+
 impl Driver {
     pub(super) fn new_common(
         parts: member::Parts,
         contract: CommonTransactionContract,
         origin: Instant,
     ) -> io::Result<(tokio::net::UdpSocket, Self)> {
-        if origin >= parts.deadline {
+        if contract.refresh_selection().is_some() || contract.extra_wire_bytes() != 0 {
+            return Err(invalid("legacy Common requires unselected legacy contract"));
+        }
+        contract.validate_outer(None)?;
+        let addresses = (parts.socket.local_addr()?, parts.socket.peer_addr()?);
+        let input = CommonInput {
+            material: establish::InitialMaterial::Legacy(parts.root),
+            cover: parts.cover,
+            bootstrap: parts.bootstrap,
+            joining: parts.joining,
+            next_outer: parts.next_outer,
+            info: parts.info,
+            deadline: parts.deadline,
+            addresses,
+            io_capacity: 0,
+        };
+        Self::new_common_input(input, contract, origin, parts.socket)
+    }
+
+    fn new_common_input<S>(
+        input: CommonInput,
+        contract: CommonTransactionContract,
+        origin: Instant,
+        companion: S,
+    ) -> io::Result<(S, Self)> {
+        if Instant::now() >= input.deadline || origin >= input.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original setup deadline before generic readiness",
             ));
         }
         let expected = contract.expected_configuration();
-        let local = parts.socket.local_addr()?;
-        let remote = parts.socket.peer_addr()?;
-        if parts.info.authenticated.configuration != expected.0
-            || parts.info.binding != parts.root.binding()
-            || parts.info.role != parts.root.role()
-            || parts.info.role != contract.role()
-            || parts.info.authenticated.session != parts.info.binding.session
-            || local != parts.info.local_addr
-            || remote != parts.info.peer_addr
+        let (local, remote) = input.addresses;
+        if input.info.authenticated.configuration != expected.0
+            || input.info.binding != input.material.binding()
+            || input.info.role != input.material.role()
+            || input.info.role != contract.role()
+            || input.info.authenticated.session != input.info.binding.session
+            || local != input.info.local_addr
+            || remote != input.info.peer_addr
             || local.is_ipv6() != contract.ipv6()
             || remote.is_ipv6() != contract.ipv6()
-            || parts.cover != contract.cover()
+            || input.cover != contract.cover()
         {
             return Err(invalid(
                 "generic contract differs from actual authenticated session/role/path/cover",
@@ -295,39 +352,70 @@ impl Driver {
         }
         contract.resolve(contract.initial())?;
         let config = contract.resources();
-        let selected = config
-            .streams
-            .ok_or_else(|| invalid("generic construction requires selected streams"))?;
-        let ip = if contract.ipv6() { 48 } else { 28 };
-        let control_scope = Scope {
+        let ip = (if contract.ipv6() { 48usize } else { 28usize })
+            .checked_add(contract.extra_wire_bytes())
+            .ok_or_else(exhausted)?;
+        let control_scope = contract.fixed_control_scope().unwrap_or(Scope {
             epoch: config.control_epoch,
             configuration: expected,
-        };
+        });
         let data_scope = Scope {
             epoch: config.data_epoch,
             configuration: security::ConfigDigest(contract.data_digest().0),
         };
-        let role = if parts.info.role == security::Role::Initiator {
+        let role = if input.info.role == security::Role::Initiator {
             mg::Role::Client
         } else {
             mg::Role::Server
         };
         let identity = transaction::Identity {
-            session: mg::SessionId(parts.info.binding.session.0),
+            session: mg::SessionId(input.info.binding.session.0),
             role,
             local: mg::EndpointId(if role == mg::Role::Client { 1 } else { 2 }),
             remote: mg::EndpointId(if role == mg::Role::Client { 2 } else { 1 }),
             lane: mg::LaneId(LANE),
         };
-        let records = record::Records::new(
-            parts.root,
-            security::LaneId(LANE),
-            config.security,
-            security::Protection::ChaCha20Poly1305,
-            parts.cover,
-            control_scope,
-            data_scope,
-        )
+        let records = match input.material {
+            establish::InitialMaterial::Legacy(root) => {
+                if contract.refresh_selection().is_some() {
+                    return Err(invalid("legacy material cannot install managed Records"));
+                }
+                record::Records::new(
+                    root,
+                    security::LaneId(LANE),
+                    config.security,
+                    security::Protection::ChaCha20Poly1305,
+                    input.cover,
+                    control_scope,
+                    data_scope,
+                )
+            }
+            establish::InitialMaterial::Managed(initial) => {
+                if Some(initial.selection()) != contract.refresh_selection()
+                    || initial.authenticated() != input.info.authenticated
+                {
+                    return Err(invalid(
+                        "managed contract differs from actual initial authority",
+                    ));
+                }
+                let elapsed = Instant::now()
+                    .checked_duration_since(origin)
+                    .ok_or_else(|| invalid("managed original clock is in the future"))?;
+                let now = u64::try_from(elapsed.as_micros()).map_err(invalid)?;
+                let expires = u64::try_from(config.lifetime.lease.as_micros()).map_err(invalid)?;
+                record::Records::new_refreshable(
+                    initial,
+                    security::LaneId(LANE),
+                    config.security,
+                    security::Protection::ChaCha20Poly1305,
+                    input.cover,
+                    control_scope,
+                    data_scope,
+                    l2tunnel::handshake::Time(now),
+                    l2tunnel::handshake::Time(expires),
+                )
+            }
+        }
         .map_err(invalid)?;
         let capacity = records
             .capacity(config.security.max_body_bytes)
@@ -338,33 +426,23 @@ impl Driver {
             local_role: role,
             control_epoch: config.control_epoch.0,
         };
-        let plans =
-            selected.message_storage_plans(binding, Duration::ZERO, config.lifetime.lease)?;
-        let wrapper_plan = control_owner::wrapper_storage::Plan::new(selected, config.control)?;
-        let message_bytes = plans.iter().try_fold(0usize, |total, plan| {
-            total
-                .checked_add(plan.capacity_bytes())
-                .ok_or_else(exhausted)
-        })?;
-        let message_max = selected
-            .streams
-            .iter()
-            .map(|s| s.max_message_bytes)
-            .max()
-            .ok_or_else(exhausted)?;
+        let plans = provision::ControlPlan::new(&contract, binding)?;
+        let wrapper_plan = plans.wrapper(config.control)?;
+        let message_bytes = plans.capacity_bytes()?;
+        let message_max = plans.maximum_message_bytes()?;
         let buffer_plan = buffers::Buffers::plan(
-            parts.cover.limits().max_packet_bytes,
+            input.cover.limits().max_packet_bytes,
             capacity
                 .seal_workspace_bytes
                 .max(capacity.open_workspace_bytes),
             config.security.max_body_bytes,
-            selected.max_packet_bytes(config.control)?,
+            plans.maximum_packet_bytes(config.control)?,
             message_max,
             config.security.max_body_bytes,
         )?;
         let input_plan = buffers::Inputs::plan(
             READ_BUFFER_BYTES,
-            parts
+            input
                 .cover
                 .limits()
                 .max_packet_bytes
@@ -400,9 +478,10 @@ impl Driver {
             .and_then(|v| v.checked_add(input_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(native_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(message_bytes))
+            .and_then(|v| v.checked_add(input.io_capacity))
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(witness_bytes))
-            .and_then(|v| v.checked_add(parts.cover.limits().max_packet_bytes))
+            .and_then(|v| v.checked_add(input.cover.limits().max_packet_bytes))
             .ok_or_else(exhausted)?;
         let initial_plan = engine::storage::Plan::for_engine(
             contract.initial(),
@@ -425,34 +504,7 @@ impl Driver {
                 },
             ));
         }
-        let control = control_owner::Owner::new_leased_reserved_messages_with_wrapper_plan(
-            config.control,
-            selected,
-            binding,
-            envelope_scope(control_scope),
-            envelope_scope(data_scope),
-            Duration::ZERO,
-            config.lifetime.lease,
-            plans.map(|plan| mg::messages::storage::Limits {
-                capacity_bytes: plan.capacity_bytes(),
-            }),
-            wrapper_plan,
-            control_owner::wrapper_storage::Limits {
-                capacity_bytes: wrapper_plan.capacity_bytes(),
-            },
-        )?;
-        let actual = control
-            .message_storage_usage()
-            .ok_or_else(|| protocol("common control reservation missing"))?;
-        if actual.iter().zip(plans).any(|(actual, plan)| {
-            actual.capacity_bytes != plan.capacity_bytes()
-                || actual.arq.capacity_bytes != plan.arq_plan().capacity_bytes()
-                || actual.reassembly.capacity_bytes != plan.reassembly_plan().capacity_bytes()
-        }) {
-            return Err(protocol(
-                "common control reservation differs from actual plan",
-            ));
-        }
+        let control = plans.construct(config, binding, control_scope, data_scope, wrapper_plan)?;
         let buffers = buffers::Buffers::with_plan(buffer_plan)?;
         let inputs = buffers::Inputs::with_plan(input_plan)?;
         let input_capacity = inputs.capacity_bytes();
@@ -476,9 +528,9 @@ impl Driver {
             },
         );
         let mut wire = Vec::new();
-        wire.try_reserve_exact(parts.cover.limits().max_packet_bytes)
+        wire.try_reserve_exact(input.cover.limits().max_packet_bytes)
             .map_err(io::Error::other)?;
-        if wire.capacity() != parts.cover.limits().max_packet_bytes {
+        if wire.capacity() != input.cover.limits().max_packet_bytes {
             return Err(invalid("common sealed wire capacity differs"));
         }
         wire.resize(wire.capacity(), 0);
@@ -501,16 +553,19 @@ impl Driver {
             .report_interval
             .map(|interval| add(0, interval))
             .transpose()?;
+        // Construct directly in the caller's tuple return place. A separate
+        // Result<Driver> wrapper retains another full compatibility extent on
+        // debug stacks while the actual reserved Bank is being constructed.
         Ok((
-            parts.socket,
+            companion,
             Self {
                 config,
-                info: parts.info,
-                cover: parts.cover,
+                info: input.info,
+                cover: input.cover,
                 origin,
-                bootstrap: parts.bootstrap,
-                joining: parts.joining,
-                outer: parts.next_outer,
+                bootstrap: input.bootstrap,
+                joining: input.joining,
+                outer: input.next_outer,
                 records,
                 owner: owner::DataOwner::Common(owner),
                 generic: None,
@@ -551,7 +606,7 @@ impl Driver {
                 // Inactive compatibility storage: width zero cannot authorize a
                 // Swift completion. Common uses its actual Engine tokens/counts.
                 written: NativeWritten {
-                    origin: NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
+                    origin: NativeOrigin::new(&input.info, data_scope, records::Direction::Receive),
                     channels: 0,
                     counts: [0; swift::MAX_CHANNELS],
                 },

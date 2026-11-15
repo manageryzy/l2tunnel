@@ -54,6 +54,8 @@ mod common_engines;
 mod transaction_contract;
 pub use performance::Performance;
 pub use transaction_contract::TransactionContract;
+#[path = "transport_carrier.rs"]
+mod carrier;
 #[path = "transport_common.rs"]
 mod common;
 #[path = "transport_common_actions.rs"]
@@ -72,9 +74,9 @@ mod generic;
 mod generic_actions;
 pub use common::{
     CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, common_channel,
-    run_common,
+    run_common, run_common_on_carrier,
 };
-pub use common_contract::CommonTransactionContract;
+pub use common_contract::{CommonTransactionContract, FreshKeyPolicy};
 pub use generic::{
     TransactionControlHandle, TransactionControlRequests, TransactionSnapshot, TransactionStopped,
     transaction_channel,
@@ -279,7 +281,7 @@ where
     };
     run_driver_clock(
         device,
-        socket,
+        socket.into(),
         &mut driver,
         setup_deadline,
         requests,
@@ -296,7 +298,7 @@ where
 #[allow(clippy::too_many_arguments)] // The original loop's owners and deadline remain explicit.
 async fn run_driver_clock<D>(
     device: D,
-    socket: tokio::net::UdpSocket,
+    mut socket: carrier::IoOwner,
     driver: &mut Driver,
     setup_deadline: Instant,
     mut requests: Requests,
@@ -325,6 +327,10 @@ where
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
+            if socket.is_carrier() {
+                socket.observe_completions().await;
+                driver.complete_carrier_io(&mut socket,&mut sample)?;
+            }
             if driver.has_transactions(){
                 if !driver.check_expiry(clock(origin,sample())?)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
                 if driver.common.is_some() {driver.admit_common(||clock(origin,sample()).map(duration))?;}
@@ -357,7 +363,7 @@ where
             }
             driver.service_selected_control(now,resolve.as_ref())?;
             driver.submit_control(now)?;
-            driver.send(&socket,now,instant)?;
+            driver.send_selected_io_sampled(&mut socket,now,instant,&mut sample)?;
             let native_before=driver.performance.counters.native_write_batch_packets;
             let native_spent=driver.flush_native_ready(&mut device,||clock(origin,sample())).await?;
             let native_write_remaining=driver.config.work.native_write_batch.saturating_sub(native_spent);
@@ -370,7 +376,7 @@ where
             let read_native=driver.can_admit_native()?;
             let write_native=!driver.native.is_empty();
             let interest=if read_native && write_native {Interest::READABLE.add(Interest::WRITABLE)}else if write_native {Interest::WRITABLE}else{Interest::READABLE};
-            let mut wake=driver.wake(now)?;
+            let mut wake=driver.wake_selected_io(&socket,now)?;
             if native_spent>0 || (driver.native_deliverable()? && driver.native_room()) {wake=wake.min(sample());}
             tokio::select! {
                 biased;
@@ -384,16 +390,16 @@ where
                         None=>requests.close(),
                     }
                 },
-                event=next_io(&socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
+                event=next_io(&mut socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
                 IoEvent::Udp=>{
                     native_first=true;
                     driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);
-                    let maximum=driver.config.work.receive_packets.min(driver.ingress.left);
+                    let maximum=if socket.receive_ready() {driver.config.work.receive_packets.min(driver.ingress.left)}else{0};
                     let mut batch=0u64;
                     for _ in 0..maximum {
                         if !driver.check_expiry(clock(origin,sample())?)? {break;}
                         driver.ingress.left-=1;
-                        match socket.try_recv(&mut inputs.datagram) {
+                        match socket.try_receive(&mut inputs.datagram) {
                             Ok(length)=>{
                                 batch+=1;
                                 driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
@@ -499,7 +505,7 @@ enum IoEvent<'a, D: AsRawFd> {
 // The caller polls shutdown and control first. Alternate ready I/O priorities so
 // elapsed receive work cannot renew UDP's quota ahead of every native read.
 async fn next_io<'a, D: AsRawFd>(
-    socket: &tokio::net::UdpSocket,
+    socket: &mut carrier::IoOwner,
     device: &'a mut AsyncFd<D>,
     interest: Interest,
     native: bool,
@@ -511,13 +517,13 @@ async fn next_io<'a, D: AsRawFd>(
         tokio::select! {
             biased;
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
-            ready = socket.readable(), if udp => ready.map(|()| IoEvent::Udp),
+            ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
             () = sleep_until(wake) => Ok(IoEvent::Timer),
         }
     } else {
         tokio::select! {
             biased;
-            ready = socket.readable(), if udp => ready.map(|()| IoEvent::Udp),
+            ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
             () = sleep_until(wake) => Ok(IoEvent::Timer),
         }
@@ -1199,7 +1205,13 @@ fn record_error(error: record::Error) -> io::Error {
     match error {
         record::Error::Security(
             security::Error::CounterExhausted | security::Error::KeyUsageExhausted,
-        ) => exhausted(),
+        )
+        | record::Error::Refresh(security::refresh::Error::Protection(
+            security::Error::CounterExhausted | security::Error::KeyUsageExhausted,
+        )) => exhausted(),
+        record::Error::Refresh(
+            security::refresh::Error::Deadline | security::refresh::Error::KeyExpired,
+        ) => io::Error::new(io::ErrorKind::TimedOut, error),
         _ => protocol(error),
     }
 }
@@ -2538,33 +2550,63 @@ impl Driver {
         {
             return Ok(());
         }
-        let opened =
-            match self
-                .records
+        let opened = if self.records.key_epoch().is_ok() {
+            self.records
+                .open_at(
+                    l2tunnel::handshake::Time(now),
+                    packet,
+                    &mut self.buffers.open,
+                    &mut self.buffers.plain,
+                )
+                .map(|opened| opened.record)
+        } else {
+            self.records
                 .open(packet, &mut self.buffers.open, &mut self.buffers.plain)
-            {
-                Ok(opened) => opened,
-                Err(record::Error::Security(security::Error::Replay)) => {
-                    self.counters.replay_rejections =
-                        self.counters.replay_rejections.saturating_add(1);
-                    return Ok(());
-                }
-                // Receive-side usage/generation guards inspect unauthenticated
-                // lengths/numbers. They cannot make a peer-origin terminal claim.
-                Err(
-                    error @ record::Error::Security(
+        };
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(
+                record::Error::Security(security::Error::Replay)
+                | record::Error::Refresh(security::refresh::Error::Protection(
+                    security::Error::Replay,
+                )),
+            ) => {
+                self.counters.replay_rejections = self.counters.replay_rejections.saturating_add(1);
+                return Ok(());
+            }
+            // Receive-side usage/generation guards inspect unauthenticated
+            // lengths/numbers. They cannot make a peer-origin terminal claim.
+            Err(
+                error @ record::Error::Security(
+                    security::Error::Crypto | security::Error::CounterExhausted,
+                ),
+            ) => return Err(record_error(error)),
+            Err(
+                error @ record::Error::Refresh(
+                    security::refresh::Error::Protection(
                         security::Error::Crypto | security::Error::CounterExhausted,
-                    ),
-                ) => return Err(record_error(error)),
-                Err(_) => {
-                    self.counters.rejected_packets =
-                        self.counters.rejected_packets.saturating_add(1);
-                    return Ok(());
-                }
-            };
+                    )
+                    | security::refresh::Error::TimeRegression,
+                ),
+            ) => return Err(record_error(error)),
+            Err(
+                error @ record::Error::Refresh(
+                    security::refresh::Error::Deadline | security::refresh::Error::KeyExpired,
+                ),
+            ) => return Err(io::Error::new(io::ErrorKind::TimedOut, error)),
+            Err(_) => {
+                self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+                return Ok(());
+            }
+        };
         self.live.last_verified_micros = Some(now);
         match opened.class {
             Class::Control => {
+                if opened.scope != self.records.control_scope() {
+                    return Err(protocol(
+                        "authenticated Control scope differs from actual Records",
+                    ));
+                }
                 self.control
                     .receive(
                         mg::Ingress::AuthenticatedManagement {
@@ -2919,6 +2961,10 @@ impl Driver {
         }
     }
     fn tail(&mut self, instant: Instant) -> io::Result<Option<usize>> {
+        self.tail_with_cap(instant)
+            .map(|value| value.map(|(bytes, _)| bytes))
+    }
+    fn tail_with_cap(&mut self, instant: Instant) -> io::Result<Option<(usize, Instant)>> {
         if self.outer == u32::MAX {
             return Err(exhausted());
         }
@@ -2934,7 +2980,7 @@ impl Driver {
             },
         );
         match result {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
+            Ok(Some(bytes)) => return Ok(Some((bytes, self.bootstrap.expiry()))),
             Ok(None) => {}
             Err(establish::Error::OutputTooSmall) if !enough => {}
             Err(error) => return Err(protocol(error)),
@@ -2950,7 +2996,7 @@ impl Driver {
             },
         );
         match result {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(result.map(|bytes| (bytes, self.joining.expiry()))),
             Err(error)
                 if !enough
                     && error
@@ -2969,11 +3015,36 @@ impl Driver {
         now: u64,
         instant: Instant,
     ) -> io::Result<()> {
+        self.send_sampled(socket, now, instant, Instant::now)
+    }
+    pub(super) fn send_sampled(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        now: u64,
+        instant: Instant,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<()> {
         self.performance.counters.send_calls =
             self.performance.counters.send_calls.saturating_add(1);
         self.performance.checked(now);
         let mut emitted = 0;
         for _ in 0..self.config.work.send_batch {
+            // Whole Common writes advance their actual Engine at completion.
+            // The next iteration must use the same injected clock again before
+            // touching any owner; the previous batch timestamp is no longer current.
+            let instant = if self.common.is_some() {
+                sample().max(instant)
+            } else {
+                instant
+            };
+            let now = if self.common.is_some() {
+                clock(self.origin, instant)?.max(now)
+            } else {
+                now
+            };
+            if self.common.is_some() && !self.check_expiry(now)? {
+                break;
+            }
             if let Some(bytes) = self.tail(instant)? {
                 self.handed(socket, bytes, performance::WireKind::Bootstrap)?;
                 emitted += 1;
@@ -2982,36 +3053,18 @@ impl Driver {
             if self.outer == u32::MAX {
                 return Err(exhausted());
             }
-            if let Some(emission) = self
-                .control
-                .poll(
-                    duration(now),
-                    self.bucket.allowance(),
-                    &mut self.buffers.control_wire,
-                )
-                .map_err(protocol)?
-            {
-                let sealed = self
-                    .records
-                    .seal(
-                        Class::Control,
-                        meta(self.outer, cover::Phase::Established),
-                        &self.buffers.control_wire[..emission.bytes],
-                        &mut self.buffers.seal,
-                        &mut self.buffers.wire,
-                    )
-                    .map_err(record_error)?;
-                if sealed.bytes + self.ip != emission.wire_bytes {
-                    return Err(protocol("control service full-wire accounting mismatch"));
-                }
-                self.counters.control_number = Some(sealed.number);
-                self.counters.control_generation = Some(sealed.generation);
-                self.handed(socket, sealed.bytes, performance::WireKind::Control)?;
+            if let Some(bytes) = self.prepare_control(now)? {
+                self.handed(socket, bytes, performance::WireKind::Control)?;
                 emitted += 1;
                 continue;
             }
             if self.common.is_some() {
-                if self.send_common_user(socket, now)? {
+                let origin = self.origin;
+                if self.send_common_user_sampled(
+                    now,
+                    |bytes| socket.try_send(bytes),
+                    || clock(origin, sample()).map(|at| at.max(now)),
+                )? {
                     emitted += 1;
                     continue;
                 }
@@ -3100,6 +3153,46 @@ impl Driver {
                 .saturating_add(1);
         }
         Ok(())
+    }
+    fn prepare_control(&mut self, now: u64) -> io::Result<Option<usize>> {
+        let Some(emission) = self
+            .control
+            .poll(
+                duration(now),
+                self.bucket.allowance(),
+                &mut self.buffers.control_wire,
+            )
+            .map_err(protocol)?
+        else {
+            return Ok(None);
+        };
+        let sealed = if self.records.key_epoch().is_ok() {
+            self.records
+                .seal_at(
+                    l2tunnel::handshake::Time(now),
+                    Class::Control,
+                    meta(self.outer, cover::Phase::Established),
+                    &self.buffers.control_wire[..emission.bytes],
+                    &mut self.buffers.seal,
+                    &mut self.buffers.wire,
+                )
+                .map(|sealed| sealed.record)
+        } else {
+            self.records.seal(
+                Class::Control,
+                meta(self.outer, cover::Phase::Established),
+                &self.buffers.control_wire[..emission.bytes],
+                &mut self.buffers.seal,
+                &mut self.buffers.wire,
+            )
+        }
+        .map_err(record_error)?;
+        if sealed.bytes + self.ip != emission.wire_bytes {
+            return Err(protocol("control service full-wire accounting mismatch"));
+        }
+        self.counters.control_number = Some(sealed.number);
+        self.counters.control_generation = Some(sealed.generation);
+        Ok(Some(sealed.bytes))
     }
     fn send_transaction_user(
         &mut self,

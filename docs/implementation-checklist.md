@@ -79,6 +79,22 @@ dispatch removes unused backend poll scratch while reusing the existing one
 setup box; standard-stack service and APIv4 cases pass. These leaves do not close full lifecycle,
 carrier Driver/service, complete resources, mode parity or native/platform gates.
 
+The latest finite wave4 adds [initial-only carrier Common execution](modules/managed-common-runtime.md),
+[typed failed-backend fresh reconnect](modules/generic-client-service.md) and
+[external Common control/inspection CLI](modules/common-client-api.md) using
+actual authenticating programmatic shared owners. The [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
+records nine exact cases in 7.936 s plus the both-cover probe in 4.131 s; the preserved
+wave4 attempts together provide 26 distinct positive cases, not 26 new features.
+Exact clock and structural stack regressions are repaired; pure managed
+contract/controller cases do not qualify managed runtime refresh. The [final scoped validation](../work/parallel-features-20261115/parallel-wave4-scoped-validation.json) records successful runtime-only Build4,
+both final affected regressions and affected strict Clippy/rustdoc/format
+checks, plus checklist and diff checks. Full `tools/check.py` was not run,
+avoiding unrelated suites. Initial-only adds no
+periodic fresh-DH, and reconnect remains underlying carrier/session service work.
+Production connect/serve/TAP startup, full carrier service, automatic retained
+recovery, complete resources, all 47 modes and full SW-11/RLNC/parity/rolling/packed/
+proxy/native/platform/performance gates retain their unchanged definitions.
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),

@@ -59,3 +59,7 @@ test = true
 [[example]]
 name = "generic_cli_process_probe"
 test = false
+
+[[example]]
+name = "common_cli_process_probe"
+test = false

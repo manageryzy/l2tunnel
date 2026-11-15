@@ -11,6 +11,22 @@ progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN ac
 flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.
 Update checkbox evidence and capability status with every implementation change.
 
+The latest finite wave4 now provides [initial-only carrier Common execution](modules/managed-common-runtime.md),
+[typed failed-backend fresh reconnect](modules/generic-client-service.md) and
+[external Common control/inspection CLI](modules/common-client-api.md) against
+actual authenticating programmatic shared-service owners. Its [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
+records nine exact cases in 7.936 s and both-cover CLI execution in 4.131 s, including
+exact clock and structural stack repair evidence. The preserved wave4 attempts
+contain 26 distinct positive cases, not 26 delivered features; managed contract/
+controller evidence is finite pure protocol testing. The [final scoped validation](../work/parallel-features-20261115/parallel-wave4-scoped-validation.json) records successful runtime-only Build4,
+both final affected regressions and affected strict Clippy/rustdoc/format
+checks, plus checklist and diff checks. Full `tools/check.py` was not run,
+avoiding unrelated suites. Initial-only does not schedule
+periodic fresh-DH; reconnect is underlying carrier/session service responsibility.
+Production CLI connect/serve/TAP startup, full carrier service, automatic retained
+recovery, complete resources, all 47 modes, full SW-11/RLNC/parity/rolling/packed/
+proxy and native/platform/performance acceptance remain unchanged required work.
+
 ## Target architecture and migration scope
 
 The approved target is a fixed point-to-point tunnel between an owner's client
@@ -215,7 +231,7 @@ stable task IDs and complete acceptance definitions below.
 6. Deliver shared CLI/GUI and Linux/Windows/Android integration after schema/API
    stability. Retain the existing toolkit decision and actual-device evidence
    gates; public protocol libraries remain independent of runtimes and OS handles.
-7. Complete all47 P-* parity gates, including the15 causal research families.
+7. Complete all 47 P-* parity gates, including the15 causal research families.
    Their independent work may start once interfaces stabilize rather than waiting
    for platform work. Existing primitives are reused after source/evidence audit.
 8. After functionality, concentrate native performance, kernel profiling, original

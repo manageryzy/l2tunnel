@@ -4,6 +4,9 @@ use l2tunnel::{
     codec, fec::rolling, record_configuration as c, record_engine as engine, rolling_records,
 };
 
+#[path = "transport_common_clock_tests.rs"]
+mod clock;
+
 fn work() -> rolling::WorkBudget {
     rolling::WorkBudget {
         field: 4096,

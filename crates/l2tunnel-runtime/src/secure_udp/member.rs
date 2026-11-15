@@ -274,6 +274,10 @@ pub struct JoiningTail {
     maximum: u32,
 }
 impl JoiningTail {
+    /// Original immutable Joining lifetime, independent of retransmission wakes.
+    pub fn expiry(&self) -> Instant {
+        self.end
+    }
     /// Exact complete covered acceptance size, excluding IP/UDP.
     /// This bounds retry storage without reserving the larger cover ceiling.
     pub const fn max_packet_bytes(&self) -> usize {
@@ -522,7 +526,9 @@ async fn drive(
     let peer_addr = socket
         .peer_addr()
         .inspect_err(|_| report.reason(Reason::LocalIo))?;
-    let origin = if matches!(&material, establish::InitialMaterial::Legacy(_)) {
+    let origin = if matches!(&material, establish::InitialMaterial::Legacy(_))
+        && matches!(&socket, establish::SocketBacking::Udp(_))
+    {
         Instant::now()
     } else {
         origin

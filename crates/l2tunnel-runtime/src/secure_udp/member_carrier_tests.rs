@@ -13,6 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
+#[path = "member_carrier_initial_tests.rs"]
+pub(in crate::secure_udp) mod initial;
+
 struct Entropy(u8);
 impl hs::Entropy for Entropy {
     fn fill(&mut self, output: &mut [u8; 32]) -> Result<(), hs::EntropyError> {
@@ -42,7 +45,7 @@ fn credentials() -> TestResult<Credentials> {
         members,
     })
 }
-fn outer_config() -> openvpn::Config {
+pub(in crate::secure_udp) fn outer_config() -> openvpn::Config {
     openvpn::Config {
         base: l2tunnel_auth::SessionConfig {
             layer: l2tunnel_device::PacketLayer::Ip,
@@ -123,7 +126,7 @@ fn selected() -> TestResult<hs::refresh::Selection> {
         max_flight_copies: 8,
     })?)
 }
-fn effective(
+pub(in crate::secure_udp) fn effective(
     outer: &factory::AuthenticatedOuter,
     client: bool,
 ) -> Result<establish::Config, establish::Error> {

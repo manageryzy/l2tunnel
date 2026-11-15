@@ -20,3 +20,9 @@ pub mod transport;
 
 #[cfg(test)]
 mod diagnostics_tests;
+
+/// Same-owner fresh-DH adapter; selected Driver service integration remains pending.
+#[cfg(unix)]
+#[allow(dead_code)]
+// Pure runtime adapter is exercised separately; no periodic default is installed.
+pub mod session_refresh;

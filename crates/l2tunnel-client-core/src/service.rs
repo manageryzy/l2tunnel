@@ -772,6 +772,8 @@ impl Handle {
         self.submit(Fingerprint::Disconnect, Command::Disconnect, key)
     }
     /// Abort and release the old generation before any replacement setup I/O.
+    /// After backend failure, an already retained plan also permits a fresh
+    /// authenticated replacement. This does not resume the failed protocol state.
     pub fn reconnect(&self, plan: Prepared, key: RequestKey) -> Result<Accepted, SubmitError> {
         self.submit(
             Fingerprint::Reconnect(plan.identity.clone()),
@@ -921,7 +923,10 @@ impl Handle {
         }
         match &command {
             Command::Connect(_) if connected => return Err(SubmitError::State),
-            Command::Reconnect(_) | Command::Disconnect | Command::Apply(_) if !connected => {
+            Command::Reconnect(_) if !connected && state.plan.is_none() => {
+                return Err(SubmitError::State);
+            }
+            Command::Disconnect | Command::Apply(_) if !connected => {
                 return Err(SubmitError::State);
             }
             _ => {}
