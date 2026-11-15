@@ -7,6 +7,23 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The [Common runtime/service checkpoint](../work/parallel-features-20261115/common-runtime-scoped-checkpoint-validation.json)
+installs the actual reserved mixed-profile Bank behind the existing leased
+transaction State, original Noise/member/security owners and sole UDP I/O loop.
+Finite tests pass authenticated Swift→Aligned→Packed→Swift with bidirectional
+Unix packet-device writes on both appearances/roles, continuing liveness, typed
+keyed service completion and requested/current/physical observations. Actual held
+native tokens and sealed User output preserve original identity/bytes/number/
+debit/caps; retained old-reader feedback works after a real smaller-burst switch.
+The service's standard-stack overflow was corrected structurally: the same
+fallible Driver cell is constructed before polling the borrowed sole continuation.
+No stack-size override, second loop, transaction FSM or crypto owner was added.
+Directly affected old Legacy/Generic entry smokes and strict two-package checks
+pass. Historical failed attempts remain failed and unchanged cases are explicitly
+reused. Complete resource/fault/lifecycle matrices, fresh-DH and retained recovery,
+portable Common IPC/CLI, rolling installation, full SW-11 and native/platform/
+performance acceptance remain open. This is not a new full `tools/check.py` pass.
+
 The independent [OpenVPN outer-wire checkpoint](../work/parallel-features-20261115/openvpn-scoped-checkpoint-validation.json)
 adds a pure standard outer/control codec, actual verified TLS/member exchange
 and explicit protected or opaque data over the original connected UDP socket.

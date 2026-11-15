@@ -3,6 +3,9 @@
 //! Authentication readiness is distinct from native runtime readiness. The caller
 //! transfers every returned tail to the one selected-carrier data/control reader.
 
+/// Explicit complete common record catalog and actual authentication handoff.
+#[cfg(unix)]
+pub mod common_transaction_profile;
 /// Explicit runtime credential owners and bounded manual key-file readers.
 pub mod credentials;
 /// Bounded performance telemetry shared by CLI and embedding frontends.

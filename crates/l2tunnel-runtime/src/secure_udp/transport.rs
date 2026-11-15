@@ -44,16 +44,37 @@ mod engines;
 #[path = "transport_transaction.rs"]
 mod transactions;
 
+#[path = "transport_transaction_family.rs"]
+mod transaction_family;
+
+#[path = "transport_common_engines.rs"]
+mod common_engines;
+
 #[path = "transport_contract.rs"]
 mod transaction_contract;
 pub use performance::Performance;
 pub use transaction_contract::TransactionContract;
+#[path = "transport_common.rs"]
+mod common;
+#[path = "transport_common_actions.rs"]
+mod common_actions;
+#[path = "transport_common_contract.rs"]
+mod common_contract;
+#[path = "transport_common_io.rs"]
+mod common_io;
+#[path = "transport_common_native.rs"]
+mod common_native;
 #[path = "transport_construction.rs"]
 mod construction;
 #[path = "transport_generic.rs"]
 mod generic;
 #[path = "transport_generic_actions.rs"]
 mod generic_actions;
+pub use common::{
+    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, common_channel,
+    run_common,
+};
+pub use common_contract::CommonTransactionContract;
 pub use generic::{
     TransactionControlHandle, TransactionControlRequests, TransactionSnapshot, TransactionStopped,
     transaction_channel,
@@ -70,10 +91,12 @@ enum Start {
 enum SelectedStopped {
     Legacy(Stopped),
     Transaction(TransactionStopped),
+    Common(CommonStopped),
 }
 enum Requests {
     Legacy(Option<ControlRequests>),
     Transaction(Option<TransactionControlRequests>),
+    Common(Option<CommonControlRequests>),
 }
 // One bounded complete canonical request crosses the channel without a new heap owner.
 #[allow(clippy::large_enum_variant)]
@@ -83,18 +106,24 @@ enum Request {
         l2tunnel::swift_configuration::Configuration,
         generic::TransactionReply,
     ),
+    Common(
+        l2tunnel::record_configuration::Configuration,
+        generic::TransactionReply,
+    ),
 }
 impl Requests {
     fn enabled(&self) -> bool {
         match self {
             Self::Legacy(value) => value.is_some(),
             Self::Transaction(value) => value.is_some(),
+            Self::Common(value) => value.is_some(),
         }
     }
     fn close(&mut self) {
         match self {
             Self::Legacy(value) => *value = None,
             Self::Transaction(value) => *value = None,
+            Self::Common(value) => *value = None,
         }
     }
 }
@@ -128,7 +157,9 @@ where
     .await?;
     match stopped {
         SelectedStopped::Transaction(stopped) => Ok(stopped),
-        SelectedStopped::Legacy(_) => Err(protocol("generic loop returned legacy status")),
+        SelectedStopped::Legacy(_) | SelectedStopped::Common(_) => {
+            Err(protocol("generic loop returned another backend status"))
+        }
     }
 }
 
@@ -207,7 +238,9 @@ where
     .await?;
     match stopped {
         SelectedStopped::Legacy(stopped) => Ok(stopped),
-        SelectedStopped::Transaction(_) => Err(protocol("legacy loop returned generic status")),
+        SelectedStopped::Transaction(_) | SelectedStopped::Common(_) => {
+            Err(protocol("legacy loop returned generic status"))
+        }
     }
 }
 
@@ -216,10 +249,10 @@ async fn run_selected_clock<D>(
     device: D,
     parts: member::Parts,
     start: Start,
-    mut requests: Requests,
+    requests: Requests,
     resolve: Option<Resolver>,
     shutdown: impl Future<Output = ()> + Send,
-    mut observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
+    observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
     mut sample: impl FnMut() -> Instant + Send,
 ) -> io::Result<SelectedStopped>
 where
@@ -244,6 +277,38 @@ where
         Start::Legacy(expected, config) => Driver::new(parts, expected, config, origin)?,
         Start::Transaction(contract) => Driver::new_transaction(parts, contract, origin)?,
     };
+    run_driver_clock(
+        device,
+        socket,
+        &mut driver,
+        setup_deadline,
+        requests,
+        resolve,
+        shutdown,
+        observe,
+        sample,
+    )
+    .await
+}
+
+// The one existing loop borrows its actual Driver. Common constructs its cell
+// before polling, so construction frames do not nest inside readiness polling.
+#[allow(clippy::too_many_arguments)] // The original loop's owners and deadline remain explicit.
+async fn run_driver_clock<D>(
+    device: D,
+    socket: tokio::net::UdpSocket,
+    driver: &mut Driver,
+    setup_deadline: Instant,
+    mut requests: Requests,
+    resolve: Option<Resolver>,
+    shutdown: impl Future<Output = ()> + Send,
+    mut observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
+    mut sample: impl FnMut() -> Instant + Send,
+) -> io::Result<SelectedStopped>
+where
+    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+{
+    let origin = driver.origin;
     let mut device = AsyncFd::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
     driver.counters.loop_input_capacity_bytes = inputs.capacity_bytes();
@@ -255,14 +320,15 @@ where
         ));
     }
     tokio::pin!(shutdown);
-    observe(&driver, clock(origin, ready)?, true)?;
+    observe(driver, clock(origin, ready)?, true)?;
     let mut observed_transaction = driver.transaction_observation()?;
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
-            if driver.generic.is_some(){
+            if driver.has_transactions(){
                 if !driver.check_expiry(clock(origin,sample())?)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                driver.admit_transaction(||clock(origin,sample()).map(duration))?;
+                if driver.common.is_some() {driver.admit_common(||clock(origin,sample()).map(duration))?;}
+                else {driver.admit_transaction(||clock(origin,sample()).map(duration))?;}
             }
             let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
@@ -275,16 +341,16 @@ where
             )?;
             let actual=driver.transaction_observation()?;
             let mut semantic_observed=false;
-            if driver.terminal.is_none() && !completed && (actual!=observed_transaction || driver.generic.as_ref().is_some_and(|runtime|runtime.observation_dirty)) {
+            if driver.terminal.is_none() && !completed && (actual!=observed_transaction || driver.observation_dirty()) {
                 let reported=clock(origin,sample())?;
                 if !driver.check_expiry(reported)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                observe(&driver,reported,true)?;
+                observe(driver,reported,true)?;
                 semantic_observed=true;
             }
             observed_transaction=actual;
-            if let Some(runtime)=&mut driver.generic {runtime.observation_dirty=false;}
+            driver.clear_observation_dirty();
             if let Some(reason)=driver.terminal {break Ok(reason);}
-            if driver.generic.is_some() && (completed || semantic_observed) {
+            if driver.has_transactions() && (completed || semantic_observed) {
                 instant=sample();now=clock(origin,instant)?;
                 if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             }
@@ -297,14 +363,14 @@ where
             if let Some(reason)=driver.terminal {break Ok(reason);}
             if driver.next_report.is_some_and(|at|now>=at) {
                 let reported=clock(origin,sample())?;
-                observe(&driver,reported,true)?;
+                observe(driver,reported,true)?;
                 driver.next_report=driver.config.report_interval.map(|interval|add(reported,interval)).transpose()?;
             }
             let read_native=driver.can_admit_native()?;
             let write_native=!driver.native.is_empty();
             let interest=if read_native && write_native {Interest::READABLE.add(Interest::WRITABLE)}else if write_native {Interest::WRITABLE}else{Interest::READABLE};
             let mut wake=driver.wake(now)?;
-            if native_spent>0 || (driver.owner.engine(core::Epoch(driver.feedback_scope.epoch.0))?.deliverable() && driver.native_room()) {wake=wake.min(sample());}
+            if native_spent>0 || (driver.native_deliverable()? && driver.native_room()) {wake=wake.min(sample());}
             tokio::select! {
                 biased;
                 ()=&mut shutdown=>break Ok(StopReason::Cancelled),
@@ -313,6 +379,7 @@ where
                     match request {
                         Some(Request::Legacy(requested,reply))=>driver.request(clock(origin,sample())?,requested,reply,resolve.as_ref().ok_or_else(||protocol("legacy resolver missing"))?)?,
                         Some(Request::Transaction(configuration,reply))=>driver.request_transaction(clock(origin,sample())?,configuration,reply)?,
+                        Some(Request::Common(configuration,reply))=>driver.request_common(clock(origin,sample())?,configuration,reply)?,
                         None=>requests.close(),
                     }
                 },
@@ -393,9 +460,22 @@ where
     {
         let _ = reply.send(Err(SwitchError::Closed));
     }
-    observe(&driver, now, false)?;
+    if let Some(common) = &mut driver.common {
+        if let Some(request) = common.request.take() {
+            let _ = request.reply.send(Err(SwitchError::Closed));
+        }
+        if let Some((reply, _)) = common.completion.take() {
+            let _ = reply.send(Err(SwitchError::Closed));
+        }
+    }
+    observe(driver, now, false)?;
     result.and_then(|reason| {
-        if driver.generic.is_some() {
+        if driver.common.is_some() {
+            Ok(SelectedStopped::Common(CommonStopped {
+                reason,
+                snapshot: driver.snapshot_common(now, false)?,
+            }))
+        } else if driver.generic.is_some() {
             Ok(SelectedStopped::Transaction(TransactionStopped {
                 reason,
                 snapshot: driver.snapshot_transaction(now, false)?,
@@ -455,6 +535,11 @@ async fn next_selected_request(requests: &mut Requests) -> Option<Request> {
             .recv()
             .await
             .map(|(value, reply)| Request::Transaction(value, reply)),
+        Requests::Common(Some(requests)) => requests
+            .0
+            .recv()
+            .await
+            .map(|(value, reply)| Request::Common(value, reply)),
         _ => std::future::pending().await,
     }
 }
@@ -1361,6 +1446,7 @@ struct Driver {
     records: record::Records,
     owner: owner::DataOwner,
     generic: Option<generic::Runtime>,
+    common: Option<common::Runtime>,
     send: policy::Direction,
     receive: policy::Direction,
     source_scope: Scope,
@@ -1377,7 +1463,7 @@ struct Driver {
     buffers: buffers::Buffers,
     inputs: Option<buffers::Inputs>,
     envelope_rx: u64,
-    native: native_storage::Queue<Native>,
+    native: common_native::OutputQueue,
     written: NativeWritten,
     retired_send: Option<NativeBoundary>,
     retired_receive: Option<NativeBoundary>,
@@ -1616,6 +1702,7 @@ impl Driver {
                     coordinator,
                 }),
                 generic: None,
+                common: None,
                 send: config.send,
                 receive: config.receive,
                 source_scope: data_scope,
@@ -1645,7 +1732,8 @@ impl Driver {
                     config.native.pending_packets,
                     config.native.pending_bytes,
                     config.send.records.max_native,
-                )?,
+                )?
+                .into(),
                 written: NativeWritten::new(
                     NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
                     config.receive.records.channels,
@@ -1677,7 +1765,7 @@ impl Driver {
     fn take_inputs(&mut self) -> io::Result<buffers::Inputs> {
         match self.inputs.take() {
             Some(inputs) => Ok(inputs),
-            None if self.generic.is_some() => Err(protocol("generic loop input owner is absent")),
+            None if self.has_transactions() => Err(protocol("generic loop input owner is absent")),
             None => buffers::Inputs::new(
                 READ_BUFFER_BYTES,
                 self.cover
@@ -1861,12 +1949,20 @@ impl Driver {
     // This guard has no delivery, policy-completion or refill side effects.
     // Event branches must check fresh time before removing any original expiry.
     fn check_expiry(&mut self, now: u64) -> io::Result<bool> {
-        self.check_expiry_with_native(now, self.native.front().map(|packet| packet.since()))
+        self.check_expiry_with_native(now, self.native.oldest_since())
     }
     fn check_expiry_with_native(
         &mut self,
         now: u64,
         native_since: Option<u64>,
+    ) -> io::Result<bool> {
+        self.check_expiry_with_completion(now, native_since, self.native.common_deadline())
+    }
+    fn check_expiry_with_completion(
+        &mut self,
+        now: u64,
+        native_since: Option<u64>,
+        native_deadline: Option<u64>,
     ) -> io::Result<bool> {
         if self.terminal.is_some() {
             return Ok(false);
@@ -1886,9 +1982,11 @@ impl Driver {
                 "authenticated liveness challenge expired",
             ));
         }
-        if native_since.is_some_and(|since| {
-            add(since, self.config.native.stall_timeout).is_ok_and(|end| now >= end)
-        }) {
+        if native_deadline.is_some_and(|deadline| now >= deadline)
+            || native_since.is_some_and(|since| {
+                add(since, self.config.native.stall_timeout).is_ok_and(|end| now >= end)
+            })
+        {
             self.terminal = Some(StopReason::NativeStall);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1910,6 +2008,22 @@ impl Driver {
                             };
                             Duration::from_millis(operation.expires().0)
                         }),
+                )
+                .min(),
+            owner::DataOwner::Common(state) => state
+                .operation_deadline()
+                .into_iter()
+                .chain(
+                    self.common
+                        .as_ref()
+                        .and_then(|r| r.outcome)
+                        .map(common_actions::outcome_deadline),
+                )
+                .chain(
+                    self.common
+                        .as_ref()
+                        .and_then(|r| r.sealed)
+                        .map(|pending| duration(pending.deadline)),
                 )
                 .min(),
             owner::DataOwner::Legacy(_) => None,
@@ -1945,6 +2059,9 @@ impl Driver {
         Ok(true)
     }
     fn progress(&mut self, now: u64) -> io::Result<()> {
+        if self.common.is_some() {
+            return self.progress_common(now);
+        }
         if self.generic.is_some() {
             return self.progress_transaction(now);
         }
@@ -2247,10 +2364,10 @@ impl Driver {
         self.service_selected_control(now, Some(resolve))
     }
     fn service_selected_control(&mut self, now: u64, resolve: Option<&Resolver>) -> io::Result<()> {
-        if self.generic.is_some() {
-            self.progress_transaction(now)?;
+        if self.has_transactions() {
+            self.progress(now)?;
         }
-        let ready = if self.generic.is_some() {
+        let ready = if self.has_transactions() {
             self.control.ready_nontransaction()?
         } else {
             self.control
@@ -2370,7 +2487,7 @@ impl Driver {
                 )?,
             }
             self.control.accepted(incoming, duration(now))?;
-            if self.generic.is_none() {
+            if !self.has_transactions() {
                 self.retain_policy_cap()?;
             }
         }
@@ -2394,8 +2511,8 @@ impl Driver {
         instant: Instant,
         resolve: Option<&Resolver>,
     ) -> io::Result<()> {
-        if self.generic.is_some() {
-            self.progress_transaction(now)?;
+        if self.has_transactions() {
+            self.progress(now)?;
         }
         self.counters.received_packets = self.counters.received_packets.saturating_add(1);
         let decoded = match self.cover.decode(packet) {
@@ -2451,6 +2568,9 @@ impl Driver {
                 self.delivered_selected_control(now, resolve)?;
             }
             Class::User => {
+                if self.common.is_some() {
+                    return self.receive_common_user(opened, now);
+                }
                 let lead = self
                     .buffers
                     .plain
@@ -2513,6 +2633,9 @@ impl Driver {
         self.native.can_acquire()
     }
     fn collect_native(&mut self, now: u64) -> io::Result<()> {
+        if self.common.is_some() {
+            return self.collect_common_native(now);
+        }
         if self.generic.is_some() {
             self.progress_transaction(now)?;
         }
@@ -2576,6 +2699,9 @@ impl Driver {
         output: &mut [u8],
         mut now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
+        if self.common.is_some() {
+            return self.read_common_native(ready, output, now);
+        }
         let before = now()?;
         if self.generic.is_some() {
             self.progress_transaction(before)?;
@@ -2701,6 +2827,9 @@ impl Driver {
         ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
         mut now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
+        if self.common.is_some() {
+            return self.write_common_native(ready, now);
+        }
         if !self.check_expiry(now()?)? {
             return Ok(false);
         }
@@ -2869,6 +2998,13 @@ impl Driver {
                 self.handed(socket, sealed.bytes, performance::WireKind::Control)?;
                 emitted += 1;
                 continue;
+            }
+            if self.common.is_some() {
+                if self.send_common_user(socket, now)? {
+                    emitted += 1;
+                    continue;
+                }
+                break;
             }
             if self.generic.is_some() {
                 if self.send_transaction_user(socket, now)? {
@@ -3054,6 +3190,9 @@ impl Driver {
         Ok(false)
     }
     fn wake(&self, now: u64) -> io::Result<Instant> {
+        if self.common.is_some() {
+            return self.wake_common(now);
+        }
         let mut wake = self.lease;
         let control_pending = if self.generic.is_some() {
             self.control.ready_nontransaction()?
@@ -3075,7 +3214,7 @@ impl Driver {
                 owner::DataOwner::Legacy(legacy) => {
                     legacy.coordinator.deadline().map(|value| value.0)
                 }
-                owner::DataOwner::Generic(_) => None,
+                owner::DataOwner::Generic(_) | owner::DataOwner::Common(_) => None,
             },
             self.policy_cap,
             Some(u64::try_from(self.control.expiry().as_micros()).map_err(invalid)?),

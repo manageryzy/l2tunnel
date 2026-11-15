@@ -1,307 +1,111 @@
-//! Fallible fixed storage for extracted native packets awaiting physical writes.
+//! Runtime I/O error adaptation over the single reusable native custody owner.
 
-use std::{alloc::Layout, collections::VecDeque, io, mem::size_of};
+use std::io;
 
-/// One retained packet, without authority to assert device completion.
-pub(super) struct Packet<T> {
-    metadata: T,
-    since: u64,
-    payload: Vec<u8>,
-}
+use l2tunnel::native_storage as storage;
 
-impl<T> Packet<T> {
-    pub(super) fn metadata(&self) -> &T {
-        &self.metadata
-    }
+pub(super) type Plan<T> = storage::Plan<T>;
+pub(super) type Packet<T> = storage::Packet<T>;
 
-    pub(super) fn since(&self) -> u64 {
-        self.since
-    }
-
-    pub(super) fn bytes(&self) -> &[u8] {
-        &self.payload
-    }
-}
-
-/// Exactly one FIFO and a reusable pool of complete native-packet buffers.
-///
-/// T is trusted fixed metadata, not an additional payload owner. Requested heap
-/// layouts include the ready/free headers and every empty or occupied buffer;
-/// they exclude this inline owner, allocator overhead, RSS and kernel storage.
+/// Retain the existing runtime API over the one actual pure Queue.
 pub(super) struct Queue<T> {
-    ready: VecDeque<Packet<T>>,
-    free: Vec<Vec<u8>>,
-    packets: usize,
-    limit: usize,
-    maximum: usize,
-    bytes: usize,
-    capacity_bytes: usize,
+    inner: storage::Queue<T>,
 }
 
-/// Exact validated queue layouts tied to the real packet metadata type.
-pub(super) struct Plan<T> {
-    packets: usize,
-    limit: usize,
-    maximum: usize,
-    capacity_bytes: usize,
-    metadata: std::marker::PhantomData<fn() -> T>,
-}
-impl<T> Plan<T> {
-    pub(super) fn capacity_bytes(&self) -> usize {
-        self.capacity_bytes
-    }
-}
-
-fn invalid() -> io::Error {
-    io::ErrorKind::InvalidInput.into()
-}
-
-fn invariant() -> io::Error {
-    io::ErrorKind::InvalidData.into()
-}
-
-fn layout<T>(count: usize) -> io::Result<usize> {
-    if size_of::<T>() == 0 {
-        return Err(invalid());
-    }
-    Layout::array::<T>(count)
-        .map(|value| value.size())
-        .map_err(|_| invalid())
-}
-
-#[derive(Default)]
-struct Allocation {
-    attempts: usize,
-    #[cfg(test)]
-    fail_at: Option<usize>,
-}
-
-impl Allocation {
-    fn attempt(&mut self) -> io::Result<()> {
-        self.attempts = self.attempts.checked_add(1).ok_or_else(invalid)?;
-        #[cfg(test)]
-        if self.fail_at == Some(self.attempts) {
-            return Err(io::ErrorKind::OutOfMemory.into());
+fn construction_error(error: storage::Error) -> io::Error {
+    let kind = match error {
+        storage::Error::Configuration | storage::Error::Layout | storage::Error::Invariant => {
+            io::ErrorKind::InvalidInput
         }
-        Ok(())
-    }
+        storage::Error::Allocation => io::ErrorKind::OutOfMemory,
+        storage::Error::Limit { .. } => io::ErrorKind::Other,
+    };
+    kind.into()
+}
 
-    fn vector<T>(&mut self, count: usize) -> io::Result<Vec<T>> {
-        layout::<T>(count)?;
-        self.attempt()?;
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(count)
-            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        if result.capacity() != count {
-            return Err(invalid());
-        }
-        Ok(result)
-    }
-
-    fn deque<T>(&mut self, count: usize) -> io::Result<VecDeque<T>> {
-        layout::<T>(count)?;
-        self.attempt()?;
-        let mut result = VecDeque::new();
-        result
-            .try_reserve_exact(count)
-            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        if result.capacity() != count {
-            return Err(invalid());
-        }
-        Ok(result)
-    }
+fn packet_error(error: storage::Error) -> io::Error {
+    let kind = match error {
+        storage::Error::Configuration | storage::Error::Layout => io::ErrorKind::InvalidInput,
+        storage::Error::Allocation => io::ErrorKind::OutOfMemory,
+        storage::Error::Invariant | storage::Error::Limit { .. } => io::ErrorKind::InvalidData,
+    };
+    kind.into()
 }
 
 impl<T> Queue<T> {
-    /// Fully reserve every header and payload before publishing this owner.
     pub(super) fn new(packets: usize, bytes: usize, max_native: usize) -> io::Result<Self> {
         Self::with_plan(Self::plan(packets, bytes, max_native)?)
     }
+
     pub(super) fn plan(packets: usize, bytes: usize, max_native: usize) -> io::Result<Plan<T>> {
-        if packets == 0 || max_native == 0 || bytes < max_native {
-            return Err(invalid());
-        }
-        let payload_bytes = layout::<u8>(max_native)?
-            .checked_mul(packets)
-            .ok_or_else(invalid)?;
-        let capacity_bytes = layout::<Packet<T>>(packets)?
-            .checked_add(layout::<Vec<u8>>(packets)?)
-            .and_then(|headers| headers.checked_add(payload_bytes))
-            .ok_or_else(invalid)?;
-        Ok(Plan {
+        Plan::for_queue(storage::Config {
             packets,
-            limit: bytes,
-            maximum: max_native,
-            capacity_bytes,
-            metadata: std::marker::PhantomData,
+            bytes,
+            max_native,
         })
+        .map_err(construction_error)
     }
 
     pub(super) fn with_plan(plan: Plan<T>) -> io::Result<Self> {
-        Self::allocate_plan(plan, &mut Allocation::default())
-    }
-
-    #[cfg(test)]
-    fn allocate(
-        packets: usize,
-        bytes: usize,
-        max_native: usize,
-        allocation: &mut Allocation,
-    ) -> io::Result<Self> {
-        Self::allocate_plan(Self::plan(packets, bytes, max_native)?, allocation)
-    }
-
-    fn allocate_plan(plan: Plan<T>, allocation: &mut Allocation) -> io::Result<Self> {
-        let Plan {
-            packets,
-            limit,
-            maximum,
-            capacity_bytes,
-            metadata: _,
-        } = plan;
-        let ready = allocation.deque(packets)?;
-        let mut free = allocation.vector(packets)?;
-        for _ in 0..packets {
-            free.push(allocation.vector(maximum)?);
-        }
+        let limits = storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        };
         Ok(Self {
-            ready,
-            free,
-            packets,
-            limit,
-            maximum,
-            bytes: 0,
-            capacity_bytes,
+            inner: storage::Queue::new_reserved(plan, limits).map_err(construction_error)?,
         })
     }
 
     pub(super) fn len(&self) -> usize {
-        self.ready.len()
+        self.inner.len()
     }
-
     pub(super) fn is_empty(&self) -> bool {
-        self.ready.is_empty()
+        self.inner.is_empty()
     }
-
     pub(super) fn bytes(&self) -> usize {
-        self.bytes
+        self.inner.bytes()
     }
-
     pub(super) fn capacity_bytes(&self) -> usize {
-        self.capacity_bytes
+        self.inner.storage_usage().capacity_bytes
     }
-
-    /// Preserve the existing conservative whole-maximum-packet admission rule.
     pub(super) fn can_acquire(&self) -> bool {
-        !self.free.is_empty()
-            && self.ready.len() < self.packets
-            && self
-                .bytes
-                .checked_add(self.maximum)
-                .is_some_and(|bytes| bytes <= self.limit)
+        self.inner.can_acquire()
     }
 
-    /// Hold an existing empty buffer before extracting an Engine packet.
     pub(super) fn acquire(&mut self) -> Option<Lease<'_, T>> {
-        if !self.can_acquire() {
-            return None;
-        }
-        let payload = self.free.pop()?;
-        Some(Lease {
-            queue: self,
-            payload: Some(payload),
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) fn front_metadata_mut(&mut self) -> Option<&mut T> {
-        self.ready.front_mut().map(|packet| &mut packet.metadata)
+        self.inner.acquire().map(|inner| Lease { inner })
     }
 
     #[cfg(test)]
     pub(super) fn iter(&self) -> impl Iterator<Item = &Packet<T>> {
-        self.ready.iter()
+        self.inner.iter()
     }
 
     pub(super) fn front(&self) -> Option<&Packet<T>> {
-        self.ready.front()
+        self.inner.front()
     }
 
-    /// Recycle exactly one item only after complete physical device acceptance.
-    /// Every fallible accounting/capacity check precedes FIFO or pool mutation.
     pub(super) fn complete_front(&mut self) -> io::Result<()> {
-        let packet = self.ready.front().ok_or_else(invariant)?;
-        let bytes = self
-            .bytes
-            .checked_sub(packet.payload.len())
-            .ok_or_else(invariant)?;
-        if packet.payload.is_empty()
-            || packet.payload.len() > self.maximum
-            || packet.payload.capacity() != self.maximum
-            || self.bytes > self.limit
-            || self.ready.len().checked_add(self.free.len()) != Some(self.packets)
-            || self.free.len() >= self.free.capacity()
-            || (self.ready.len() == 1 && bytes != 0)
-        {
-            return Err(invariant());
-        }
-        let packet = self.ready.pop_front().ok_or_else(invariant)?;
-        let mut payload = packet.payload;
-        payload.clear();
-        self.free.push(payload);
-        self.bytes = bytes;
-        Ok(())
+        self.inner.complete_front().map_err(packet_error)
     }
 }
 
-/// Exclusive buffer custody; dropping it returns the original allocation.
+/// Existing copy-in path borrows the same preallocated pure-owner lease.
 pub(super) struct Lease<'a, T> {
-    queue: &'a mut Queue<T>,
-    payload: Option<Vec<u8>>,
+    inner: storage::Lease<'a, T>,
 }
-
 impl<T> Lease<'_, T> {
-    /// Copy one complete native packet without changing its origin or first age.
-    /// Refusal returns the leased buffer through Drop and enqueues nothing.
-    pub(super) fn copy(mut self, metadata: T, since: u64, input: &[u8]) -> io::Result<()> {
-        if input.is_empty() || input.len() > self.queue.maximum {
-            return Err(invalid());
-        }
-        let bytes = self
-            .queue
-            .bytes
-            .checked_add(input.len())
-            .ok_or_else(invariant)?;
-        let payload = self.payload.as_ref().ok_or_else(invariant)?;
-        if bytes > self.queue.limit
-            || self.queue.ready.len() >= self.queue.packets
-            || self.queue.ready.len() >= self.queue.ready.capacity()
-            || !payload.is_empty()
-            || payload.capacity() != self.queue.maximum
-        {
-            return Err(invariant());
-        }
-        let mut payload = self.payload.take().ok_or_else(invariant)?;
-        payload.extend_from_slice(input);
-        self.queue.ready.push_back(Packet {
-            metadata,
-            since,
-            payload,
-        });
-        self.queue.bytes = bytes;
-        Ok(())
+    pub(super) fn output(&mut self) -> io::Result<&mut [u8]> {
+        self.inner.output().map_err(packet_error)
     }
-}
-
-impl<T> Drop for Lease<'_, T> {
-    fn drop(&mut self) {
-        if let Some(mut payload) = self.payload.take() {
-            payload.clear();
-            // Acquisition removed exactly one buffer. This exclusive borrow
-            // prevents another producer or completion from consuming its slot.
-            self.queue.free.push(payload);
-        }
+    pub(super) fn publish(self, metadata: T, since: u64, length: usize) -> io::Result<()> {
+        self.inner
+            .publish(metadata, since, length)
+            .map_err(packet_error)
+    }
+    pub(super) fn copy(self, metadata: T, since: u64, input: &[u8]) -> io::Result<()> {
+        self.inner
+            .copy(metadata, since, input)
+            .map_err(packet_error)
     }
 }
 

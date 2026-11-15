@@ -92,6 +92,7 @@ fn state(driver: &Driver) -> Result<&transactions::State> {
     match &driver.owner {
         owner::DataOwner::Generic(state) => Ok(state),
         owner::DataOwner::Legacy(_) => Err("fault fixture selected legacy State".into()),
+        owner::DataOwner::Common(_) => Err("fault fixture selected Common State".into()),
     }
 }
 

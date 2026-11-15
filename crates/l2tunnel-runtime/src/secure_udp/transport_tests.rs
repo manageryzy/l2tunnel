@@ -15,6 +15,9 @@ mod receive_service;
 #[path = "transport_stream_tests.rs"]
 mod streamed;
 
+#[path = "transport_common_tests.rs"]
+mod common_selected;
+
 #[path = "transport_generic_tests.rs"]
 mod generic_selected;
 

@@ -281,6 +281,7 @@ pub(super) async fn execute(
                         Completed::Aborted
                         | Completed::Applied(_)
                         | Completed::Rejected(_)
+                        | Completed::Common { .. }
                         | Completed::OutcomeUnknown => {}
                         Completed::Failed(failure) if restart => {
                             println!(

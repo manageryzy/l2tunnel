@@ -2,6 +2,8 @@ use super::*;
 use prepared::{Endpoint, Transport};
 use std::task::Poll;
 use tokio::net::TcpListener;
+#[cfg(unix)]
+mod common;
 pub(super) struct Active {
     runtime: RunFuture,
     backend: ObservedBackend,
@@ -150,6 +152,17 @@ pub(super) async fn establish(
                     deadline,
                     profile.clone(),
                 ),
+            )
+            .await
+            .map_err(|_| expired())?;
+            check(deadline)?;
+            return result;
+        }
+        #[cfg(unix)]
+        Transport::SecureUdpCommon(profile) => {
+            let result = tokio::time::timeout_at(
+                deadline,
+                common::establish(&shared, &plan, accepted, deadline, profile.clone()),
             )
             .await
             .map_err(|_| expired())?;
@@ -1045,6 +1058,31 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     };
                     let backend = backend.clone();
                     let apply = apply_secure_udp_transaction(&shared, &backend, configuration);
+                    tokio::pin!(apply);
+                    let result = tokio::select! {
+                        result = &mut apply => result,
+                        result = &mut session.runtime => {
+                            let failure = Failure {
+                                kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()),
+                            };
+                            stopped(&shared, &mut active, Terminal::Failed(failure));
+                            Completed::OutcomeUnknown
+                        }
+                    };
+                    finish(&shared, accepted.operation, result);
+                }
+                #[cfg(unix)]
+                Command::Common(configuration) => {
+                    let Some(session) = active.as_mut() else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let ObservedBackend::SecureUdpCommon(backend) = &session.backend else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let backend = backend.clone();
+                    let apply = common::apply(&backend, configuration);
                     tokio::pin!(apply);
                     let result = tokio::select! {
                         result = &mut apply => result,

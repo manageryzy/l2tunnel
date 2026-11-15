@@ -62,6 +62,14 @@ Packed/rolling early-short and their full matrices remain separate requirements.
 Complete resources, rolling runtime installation and all47 catalog gates retain
 their original definitions and remain open.
 
+The [explicit Common runtime/service](modules/common-transaction-state.md) now
+installs the real reserved Bank and passes finite authenticated original-UDP
+Swift→Aligned→Packed→Swift with actual Unix packet-device writes, liveness and
+typed complete-configuration operations. This is partial SW-11 implementation,
+not full parity or a new carrier/default. The full loss/fault/resource/lifecycle,
+rolling, native and platform matrices remain required. Portable Common IPC/CLI
+is not installed; existing Swift-only APIv3 is not a complete Common schema.
+
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s
 compact simulator sensitivity from current Rust directional hash/channel ordering.

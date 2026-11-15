@@ -120,6 +120,14 @@ pub(super) struct Runtime {
 
 impl Driver {
     pub(super) fn transaction_observation(&self) -> io::Result<Option<StateObservation>> {
+        if let owner::DataOwner::Common(state) = &self.owner {
+            return Ok(Some((
+                state.epoch(),
+                state.peer().phase(),
+                state.peer().operation(),
+                self.feedback_scope,
+            )));
+        }
         let owner::DataOwner::Generic(state) = &self.owner else {
             return Ok(None);
         };
@@ -353,6 +361,7 @@ impl Driver {
                 outer: parts.next_outer,
                 records,
                 owner: owner::DataOwner::Generic(owner::ReservedState::new(state)?),
+                common: None,
                 generic: Some(Runtime {
                     contract,
                     action: None,
@@ -378,7 +387,7 @@ impl Driver {
                 buffers,
                 inputs: Some(inputs),
                 envelope_rx: 1,
-                native,
+                native: native.into(),
                 written: NativeWritten::new(
                     NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
                     config.receive.records.channels,

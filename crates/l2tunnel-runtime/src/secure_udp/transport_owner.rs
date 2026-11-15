@@ -14,15 +14,18 @@ pub(super) struct Legacy {
 pub(super) enum DataOwner {
     Legacy(Legacy),
     Generic(ReservedState),
+    Common(ReservedCommonState),
 }
 
 /// One fallibly reserved State; no mutation of the backing vector is exposed.
-pub(super) struct ReservedState {
-    values: Vec<transactions::State>,
+pub(super) struct StateCell<S> {
+    values: Vec<S>,
 }
-impl ReservedState {
-    pub(super) fn new(state: transactions::State) -> io::Result<Self> {
-        std::alloc::Layout::array::<transactions::State>(1).map_err(io::Error::other)?;
+pub(super) type ReservedState = StateCell<transactions::State>;
+pub(super) type ReservedCommonState = StateCell<transactions::CommonState>;
+impl<S> StateCell<S> {
+    pub(super) fn new(state: S) -> io::Result<Self> {
+        std::alloc::Layout::array::<S>(1).map_err(io::Error::other)?;
         let mut values = Vec::new();
         values.try_reserve_exact(1).map_err(io::Error::other)?;
         if values.capacity() != 1 {
@@ -32,14 +35,14 @@ impl ReservedState {
         Ok(Self { values })
     }
 }
-impl std::ops::Deref for ReservedState {
-    type Target = transactions::State;
+impl<S> std::ops::Deref for StateCell<S> {
+    type Target = S;
     fn deref(&self) -> &Self::Target {
         // Only new constructs this private cell, always at immutable length one.
         &self.values[0]
     }
 }
-impl std::ops::DerefMut for ReservedState {
+impl<S> std::ops::DerefMut for StateCell<S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.values[0]
     }
@@ -49,14 +52,18 @@ impl DataOwner {
     pub(super) fn legacy(&self) -> io::Result<&Legacy> {
         match self {
             Self::Legacy(legacy) => Ok(legacy),
-            Self::Generic(_) => Err(protocol("legacy policy operation on generic data owner")),
+            Self::Generic(_) | Self::Common(_) => {
+                Err(protocol("legacy policy operation on generic data owner"))
+            }
         }
     }
 
     pub(super) fn legacy_mut(&mut self) -> io::Result<&mut Legacy> {
         match self {
             Self::Legacy(legacy) => Ok(legacy),
-            Self::Generic(_) => Err(protocol("legacy policy operation on generic data owner")),
+            Self::Generic(_) | Self::Common(_) => {
+                Err(protocol("legacy policy operation on generic data owner"))
+            }
         }
     }
 
@@ -66,6 +73,7 @@ impl DataOwner {
             // scopes cross independently; its existing scope guards stay live.
             Self::Legacy(legacy) => Ok(&legacy.engine),
             Self::Generic(state) => state.engine(epoch),
+            Self::Common(_) => Err(protocol("Swift Engine access on common data owner")),
         }
     }
 
@@ -73,6 +81,7 @@ impl DataOwner {
         match self {
             Self::Legacy(legacy) => Ok(Entry::Legacy(&mut legacy.engine)),
             Self::Generic(state) => state.entry(epoch).map(Entry::Reserved),
+            Self::Common(_) => Err(protocol("Swift Entry access on common data owner")),
         }
     }
 }

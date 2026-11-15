@@ -45,6 +45,18 @@ reused by actual inputs and semantic deltas; five changed pure packages pass
 strict formatting, Clippy and rustdoc. This is not full rolling installation,
 complete resource admission, full SW-11 or native/platform/performance acceptance.
 
+The [Common runtime/service checkpoint](../work/parallel-features-20261115/common-runtime-scoped-checkpoint-validation.json)
+installs that same actual Bank behind the existing leased State and sole I/O loop.
+Explicit typed shared-service selection passes real authenticated same-UDP
+Swift→Aligned→Packed→Swift, bidirectional Unix packet-device delivery and liveness.
+Held native and sealed User ownership, original caps, requested/current/physical
+observations and bounded old-reader feedback retain finite affected evidence.
+The standard-stack service failure was corrected by constructing the same
+fallible Driver cell before polling its borrowed continuation. Complete resources,
+fresh-DH/retained recovery, portable Common IPC/CLI, rolling integration, full
+SW-11 and native/platform/performance gates remain open. See the unchanged
+[CTS-* acceptance definitions](modules/common-transaction-state.md).
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),

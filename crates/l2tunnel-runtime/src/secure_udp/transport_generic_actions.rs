@@ -41,9 +41,13 @@ pub(super) fn check_native_fence(
 
 impl Driver {
     pub(super) fn can_admit_native(&self) -> io::Result<bool> {
+        if self.common.is_some() {
+            return self.can_admit_common_native();
+        }
         let admitted = match &self.owner {
             owner::DataOwner::Legacy(legacy) => legacy.coordinator.admission_allowed(),
             owner::DataOwner::Generic(state) => state.can_admit_data(),
+            owner::DataOwner::Common(_) => return Err(protocol("common owner lost selection")),
         };
         Ok(admitted
             && self
@@ -425,6 +429,9 @@ impl Driver {
         mut sample: impl FnMut() -> io::Result<u64>,
         observe: impl FnOnce(&Self, u64) -> io::Result<()>,
     ) -> io::Result<bool> {
+        if self.common.is_some() {
+            return self.report_common_completion(sample, observe);
+        }
         if self
             .generic
             .as_ref()

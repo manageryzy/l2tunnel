@@ -105,6 +105,15 @@ pub enum Completed {
     Applied(local::Response),
     /// Existing runtime definitively rejected/aborted the proposal before commit.
     Rejected(local::Response),
+    /// Actual complete Common-profile result, without a Swift-only DTO conversion.
+    /// Closed or uncertain peer outcomes use OutcomeUnknown instead.
+    #[cfg(unix)]
+    Common {
+        /// Exact originally submitted complete configuration.
+        configuration: l2tunnel::record_configuration::Configuration,
+        /// Confirmed epoch or definitive runtime refusal.
+        outcome: Result<l2tunnel_core::Epoch, l2tunnel_runtime::secure_udp::transport::SwitchError>,
+    },
     /// Setup was explicitly cancelled before becoming live.
     Cancelled,
     /// Service ownership ended during an accepted apply. Peer outcome may have
@@ -222,6 +231,22 @@ pub struct SecureUdpTransactionFrame {
     /// Service release, distinct from the runtime's last terminal observation.
     pub service_terminal: Option<Terminal>,
 }
+/// Actual selected mixed-profile runtime observation for shared embedding clients.
+/// This typed view does not claim CLI or local-IPC Common-profile support.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct SecureUdpCommonFrame {
+    /// Immutable complete startup plan and authenticated finite catalog.
+    pub requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+    /// Authentication evidence from the original retained UDP socket.
+    pub info: l2tunnel_runtime::secure_udp::member::Info,
+    /// Actual runtime observation; absent before readiness, never fabricated.
+    pub runtime: Option<l2tunnel_runtime::secure_udp::transport::CommonSnapshot>,
+    /// Exact local service generation.
+    pub generation: u64,
+    /// Actual service release, separate from the last runtime observation.
+    pub service_terminal: Option<Terminal>,
+}
 #[cfg(unix)]
 impl SecureUdpTransactionFrame {
     /// Bounded complete-configuration observation without credentials or payloads.
@@ -279,6 +304,9 @@ pub enum Observation {
     /// Explicit generic transaction owner, separate from SwiftPolicyV1.
     #[cfg(unix)]
     SecureUdpTransaction(Box<SecureUdpTransactionFrame>),
+    /// Explicit mixed-profile Common owner; no Swift status projection.
+    #[cfg(unix)]
+    SecureUdpCommon(Box<SecureUdpCommonFrame>),
 }
 impl Observation {
     #[cfg(unix)]
@@ -286,6 +314,7 @@ impl Observation {
         match self {
             Self::SecureUdp(frame) => frame.service_terminal = Some(terminal),
             Self::SecureUdpTransaction(frame) => frame.service_terminal = Some(terminal),
+            Self::SecureUdpCommon(frame) => frame.service_terminal = Some(terminal),
             _ => {}
         }
     }
@@ -327,6 +356,14 @@ impl Observation {
             _ => None,
         }
     }
+    /// Actual complete Common observation, absent for other backend selections.
+    #[cfg(unix)]
+    pub fn secure_udp_common(&self) -> Option<&SecureUdpCommonFrame> {
+        match self {
+            Self::SecureUdpCommon(frame) => Some(frame),
+            _ => None,
+        }
+    }
 }
 /// Authoritative handles of the live backend. Its presence is the live-session
 /// predicate; it is not a capability flag or a second lifecycle state machine.
@@ -343,6 +380,16 @@ enum ObservedBackend {
     SecureUdp(Arc<SecureUdpBackend>),
     #[cfg(unix)]
     SecureUdpTransaction(Arc<SecureUdpTransactionBackend>),
+    #[cfg(unix)]
+    SecureUdpCommon(Arc<SecureUdpCommonBackend>),
+}
+#[cfg(unix)]
+struct SecureUdpCommonBackend {
+    requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+    info: l2tunnel_runtime::secure_udp::member::Info,
+    counters: Mutex<Option<l2tunnel_runtime::secure_udp::transport::CommonSnapshot>>,
+    switcher: l2tunnel_runtime::secure_udp::transport::CommonControlHandle,
+    generation: u64,
 }
 #[cfg(unix)]
 struct SecureUdpTransactionBackend {
@@ -442,6 +489,20 @@ impl ObservedBackend {
                     service_terminal: None,
                 }),
             )),
+            #[cfg(unix)]
+            Self::SecureUdpCommon(secure) => Some(Observation::SecureUdpCommon(Box::new(
+                SecureUdpCommonFrame {
+                    requested: secure.requested.clone(),
+                    info: secure.info,
+                    runtime: secure
+                        .counters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                    generation: secure.generation,
+                    service_terminal: None,
+                },
+            ))),
         }
     }
     fn managed(&self) -> Option<&managed::ControlHandle> {
@@ -488,6 +549,9 @@ pub enum SubmitError {
     InvalidConfiguration,
 }
 #[derive(Clone)]
+// Retained history owns complete fixed-size values; boxing would add per-request
+// allocations to an already bounded local control path.
+#[allow(clippy::large_enum_variant)]
 enum Fingerprint {
     Connect(Arc<()>),
     Reconnect(Arc<()>),
@@ -495,6 +559,8 @@ enum Fingerprint {
     Apply(local::Request),
     #[cfg(unix)]
     Transaction(l2tunnel::swift_configuration::Configuration),
+    #[cfg(unix)]
+    Common(l2tunnel::record_configuration::Configuration),
 }
 impl Fingerprint {
     fn is_apply(&self) -> bool {
@@ -502,6 +568,8 @@ impl Fingerprint {
             Self::Apply(_) => true,
             #[cfg(unix)]
             Self::Transaction(_) => true,
+            #[cfg(unix)]
+            Self::Common(_) => true,
             _ => false,
         }
     }
@@ -514,6 +582,8 @@ impl Fingerprint {
             (Self::Apply(a), Self::Apply(b)) => a == b,
             #[cfg(unix)]
             (Self::Transaction(a), Self::Transaction(b)) => a == b,
+            #[cfg(unix)]
+            (Self::Common(a), Self::Common(b)) => a == b,
             _ => false,
         }
     }
@@ -526,6 +596,8 @@ struct Entry {
     #[cfg(unix)]
     setup: Option<setup::Record>,
 }
+// The sole queued command retains its complete value without another allocation.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Connect(Prepared),
     Reconnect(Prepared),
@@ -533,6 +605,8 @@ enum Command {
     Apply(local::Request),
     #[cfg(unix)]
     Transaction(l2tunnel::swift_configuration::Configuration),
+    #[cfg(unix)]
+    Common(l2tunnel::record_configuration::Configuration),
 }
 struct Job {
     accepted: Accepted,
@@ -720,6 +794,20 @@ impl Handle {
             key,
         )
     }
+    /// Submit a complete supported Common value through the same retained actor.
+    /// Retained keys replay their exact acceptance before fresh validation.
+    #[cfg(unix)]
+    pub fn apply_common(
+        &self,
+        configuration: l2tunnel::record_configuration::Configuration,
+        key: RequestKey,
+    ) -> Result<Accepted, SubmitError> {
+        self.submit(
+            Fingerprint::Common(configuration),
+            Command::Common(configuration),
+            key,
+        )
+    }
     fn submit(
         &self,
         fingerprint: Fingerprint,
@@ -763,6 +851,21 @@ impl Handle {
         #[cfg(unix)]
         if let Command::Transaction(configuration) = &command {
             let Some(ObservedBackend::SecureUdpTransaction(backend)) = &state.backend else {
+                return Err(if connected {
+                    SubmitError::Unsupported
+                } else {
+                    SubmitError::State
+                });
+            };
+            backend
+                .requested
+                .runtime_contract(backend.info.role)
+                .and_then(|contract| contract.resolve(*configuration))
+                .map_err(|_| SubmitError::InvalidConfiguration)?;
+        }
+        #[cfg(unix)]
+        if let Command::Common(configuration) = &command {
+            let Some(ObservedBackend::SecureUdpCommon(backend)) = &state.backend else {
                 return Err(if connected {
                     SubmitError::Unsupported
                 } else {
@@ -848,6 +951,8 @@ impl Handle {
             Command::Apply(_) => Phase::Applying,
             #[cfg(unix)]
             Command::Transaction(_) => Phase::Applying,
+            #[cfg(unix)]
+            Command::Common(_) => Phase::Applying,
             _ => Phase::Stopping,
         };
         state.queued = Some(Job { accepted, command });
@@ -1008,10 +1113,13 @@ impl Handle {
         #[cfg(unix)]
         {
             match &state.backend {
+                // Internal unavailable sentinel, never a new local wire version.
+                Some(ObservedBackend::SecureUdpCommon(_)) => 0,
                 Some(ObservedBackend::SecureUdpTransaction(_)) => local::TRANSACTION_VERSION,
                 Some(ObservedBackend::SecureUdp(_)) => local::SECURE_UDP_VERSION,
                 Some(_) => local::VERSION,
                 None => match &state.plan {
+                    Some(plan) if plan.secure_udp_common() => 0,
                     Some(plan) if plan.secure_udp_transaction() => local::TRANSACTION_VERSION,
                     Some(plan) if plan.secure_udp() => local::SECURE_UDP_VERSION,
                     _ => local::VERSION,
@@ -1028,7 +1136,9 @@ impl Handle {
         Self::version_refusal(request.version, self.selected_version())
     }
     fn version_refusal(version: u16, selected: u16) -> Option<local::Response> {
-        let code = if selected == local::TRANSACTION_VERSION
+        let code = if selected == 0 {
+            Some("unsupported_backend")
+        } else if selected == local::TRANSACTION_VERSION
             && matches!(version, local::VERSION | local::SECURE_UDP_VERSION)
         {
             Some("requires_version_3")
@@ -1092,6 +1202,13 @@ impl Handle {
             Some(ObservedBackend::SecureUdpTransaction(_)) => {
                 Self::transaction_status_from(view.snapshot, true, "ok")
             }
+            #[cfg(unix)]
+            Some(ObservedBackend::SecureUdpCommon(_)) => local::Response {
+                version: request.version,
+                ok: false,
+                code: "unsupported_backend".into(),
+                state: None,
+            },
             None if idle_ok => {
                 Self::lifecycle_reply_from(view.version, view.snapshot, false, true, "ok")
             }

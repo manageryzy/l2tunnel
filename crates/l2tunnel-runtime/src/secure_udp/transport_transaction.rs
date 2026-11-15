@@ -2,11 +2,15 @@
 //! This owner performs no I/O and supplies no physical or authentication proof.
 
 use super::super::control as control_owner;
+#[cfg(test)]
+use super::engines::Bank;
 use super::{
     TransactionSettings,
-    engines::{Bank, Prepared},
+    transaction_family::{Backend, CommonFamily, Family, Reservation, SwiftFamily},
 };
-use l2tunnel::swift_configuration::{Catalog, Configuration as C, EnvelopeDigest};
+use l2tunnel::swift_configuration::Configuration as C;
+#[cfg(test)]
+use l2tunnel::swift_configuration::{Catalog, EnvelopeDigest};
 use l2tunnel_core::Epoch;
 use l2tunnel_management::{
     self as mg, control_streams, delivery, session_control as sc, transaction as tx,
@@ -33,13 +37,13 @@ pub(super) struct WorkId {
     serial: u64,
 }
 
-pub(super) struct Action {
+pub(super) struct ActionFor<C: tx::Configuration> {
     id: WorkId,
     operation: tx::Operation,
     event: tx::Event<C>,
     finished: bool,
 }
-impl Action {
+impl<C: tx::Configuration> ActionFor<C> {
     pub(super) fn operation(&self) -> tx::Operation {
         self.operation
     }
@@ -79,7 +83,7 @@ enum WorkKind {
     Applied,
 }
 impl WorkKind {
-    fn of(event: &tx::Event<C>) -> Self {
+    fn of<C: tx::Configuration>(event: &tx::Event<C>) -> Self {
         match event {
             tx::Event::Stage { .. } => Self::Stage,
             tx::Event::Drain { .. } => Self::Drain,
@@ -89,8 +93,8 @@ impl WorkKind {
 }
 // Fixed inline Action custody avoids allocating during semantic admission.
 #[allow(clippy::large_enum_variant)]
-enum Work {
-    Ready(Action),
+enum Work<C: tx::Configuration> {
+    Ready(ActionFor<C>),
     Issued {
         serial: u64,
         operation: tx::Operation,
@@ -105,7 +109,7 @@ struct AwaitingAcceptance {
     operation: tx::Operation,
     terminal: bool,
 }
-struct Effect {
+struct Effect<C: tx::Configuration> {
     operation: tx::Operation,
     effects: tx::Effects<C>,
     incoming: Option<AwaitingAcceptance>,
@@ -122,23 +126,23 @@ struct PendingAdmission {
     deadline: Duration,
     cap: tx::Tick,
 }
-struct Contract {
+struct Contract<F: Family> {
     identity: tx::Identity,
-    envelope: EnvelopeDigest,
-    catalog: Catalog,
+    envelope: F::Envelope,
+    catalog: F::Catalog,
     settings: TransactionSettings,
     binding: delivery::Binding,
     session_expires: Duration,
 }
 
-pub(super) struct State {
-    peer: tx::Peer<C>,
-    bank: Bank,
-    contract: Contract,
+pub(super) struct TransactionState<F: Family> {
+    peer: tx::Peer<F::Value>,
+    bank: F::Bank,
+    contract: Contract<F>,
     operation: Option<tx::Operation>,
-    prepared: Option<Prepared>,
-    effect: Option<Effect>,
-    work: Option<Work>,
+    prepared: Option<<F::Bank as Backend<F::Value>>::Prepared>,
+    effect: Option<Effect<F::Value>>,
+    work: Option<Work<F::Value>>,
     acceptance: Option<AwaitingAcceptance>,
     pending_admission: Option<PendingAdmission>,
     outputs: [Option<Output>; 3],
@@ -151,21 +155,21 @@ pub(super) struct State {
     failed: bool,
 }
 
-impl State {
+impl<F: Family> TransactionState<F> {
     #[allow(clippy::too_many_arguments)] // Every original contract owner is explicit.
     pub(super) fn new(
         identity: tx::Identity,
         epoch: Epoch,
-        envelope: EnvelopeDigest,
-        catalog: Catalog,
+        envelope: F::Envelope,
+        catalog: F::Catalog,
         settings: TransactionSettings,
         transaction_binding: delivery::Binding,
         now: Duration,
         session_expires: Duration,
-        bank: Bank,
+        bank: F::Bank,
     ) -> io::Result<Self> {
         settings.protocol.validate().map_err(invalid)?;
-        let initial = C::new(envelope, catalog.initial()).map_err(invalid)?;
+        let initial = F::initial(envelope, &catalog)?;
         let base_epoch = transaction_binding
             .control_epoch
             .checked_sub(control_streams::Stream::Transaction as u64)
@@ -188,7 +192,7 @@ impl State {
             || bank.current() != &initial
             || settings.max_operation_ms == 0
             || settings.retained_bytes == 0
-            || bank.usage().limit_bytes > settings.retained_bytes
+            || bank.retained_limit() > settings.retained_bytes
             || now >= session_expires
         {
             return Err(invalid(
@@ -196,7 +200,7 @@ impl State {
             ));
         }
         u64::try_from(settings.retained_bytes).map_err(invalid)?;
-        let supported = catalog.configurations(envelope);
+        let supported = F::supported(envelope, &catalog)?;
         let peer = tx::Peer::new_leased_directional(
             identity,
             epoch,
@@ -247,7 +251,7 @@ impl State {
     pub(super) fn propose(
         &mut self,
         owner: &mut control_owner::Owner,
-        value: C,
+        value: F::Value,
         cap: tx::Tick,
         mut sample: impl FnMut() -> io::Result<Duration>,
     ) -> io::Result<Progress> {
@@ -258,13 +262,7 @@ impl State {
         if !self.can_start() {
             return Ok(Progress::Blocked);
         }
-        if value.envelope() != self.contract.envelope
-            || !self
-                .contract
-                .catalog
-                .descriptors()
-                .contains(&value.descriptor())
-        {
+        if !F::contains(self.contract.envelope, &self.contract.catalog, &value) {
             return Err(invalid("target is outside the exact authenticated catalog"));
         }
         if owner.preview_transaction(&self.peer, now, cap)?.is_some() {
@@ -361,7 +359,7 @@ impl State {
         } else {
             self.pending_admission = Some(pending);
         }
-        let kind = management_kind(view.envelope())?;
+        let kind = management_kind_for::<F::Value>(view.envelope())?;
         let intent = view.into_preparation();
         if !self.dispatch_capacity(kind, intent.is_some())? {
             return Ok(Progress::Blocked);
@@ -506,7 +504,7 @@ impl State {
         })
     }
 
-    pub(super) fn take_action(&mut self) -> Option<Action> {
+    pub(super) fn take_action(&mut self) -> Option<ActionFor<F::Value>> {
         match self.work.take()? {
             Work::Ready(action) => {
                 self.work = Some(Work::Issued {
@@ -523,7 +521,10 @@ impl State {
         }
     }
 
-    pub(super) fn interruption(&self, action: &Action) -> Option<&tx::Event<C>> {
+    pub(super) fn interruption(
+        &self,
+        action: &ActionFor<F::Value>,
+    ) -> Option<&tx::Event<F::Value>> {
         if !self.action_matches(action) {
             return None;
         }
@@ -541,7 +542,7 @@ impl State {
     pub(super) fn complete_action(
         &mut self,
         owner: &mut control_owner::Owner,
-        action: &mut Action,
+        action: &mut ActionFor<F::Value>,
         completion: Completion<'_>,
         now: Duration,
     ) -> io::Result<Progress> {
@@ -671,7 +672,7 @@ impl State {
                 }
                 if let Some(mut prepared) = self.prepared.take() {
                     self.bank.cancel(&mut prepared)?;
-                } else if self.bank.engine(operation.ticket().epoch).is_ok()
+                } else if self.bank.contains_epoch(operation.ticket().epoch)
                     && self.bank.epoch() == operation.origin().epoch
                 {
                     self.bank.abort(operation)?;
@@ -745,7 +746,7 @@ impl State {
             && self.bank.epoch() == self.peer.active_epoch()
             && self.bank.current() == self.peer.active_config()
     }
-    pub(super) fn peer(&self) -> &tx::Peer<C> {
+    pub(super) fn peer(&self) -> &tx::Peer<F::Value> {
         &self.peer
     }
     #[cfg(test)]
@@ -790,10 +791,13 @@ impl State {
         let command = effects
             .outbound
             .ok_or_else(|| invalid("actual final retry is not due"))?;
-        if mg::Frame::decode(&command, mg::Limits::default())
-            .map_err(protocol)?
-            .header
-            .kind
+        if mg::Frame::decode(
+            &command,
+            tx::configuration_limits::<F::Value>().map_err(protocol)?,
+        )
+        .map_err(protocol)?
+        .header
+        .kind
             != mg::MessageKind::Retire
         {
             return Err(protocol("actual final retry is not Retire"));
@@ -803,20 +807,11 @@ impl State {
     pub(super) fn take_outcome(&mut self) -> Option<Outcome> {
         self.outcome.take()
     }
-    pub(super) fn current(&self) -> &C {
+    pub(super) fn current(&self) -> &F::Value {
         self.bank.current()
     }
     pub(super) fn epoch(&self) -> Epoch {
         self.bank.epoch()
-    }
-    pub(super) fn engine(&self, epoch: Epoch) -> io::Result<&records::Engine> {
-        self.bank.engine(epoch)
-    }
-    pub(super) fn entry(&mut self, epoch: Epoch) -> io::Result<storage::Entry<'_>> {
-        self.bank.entry(epoch)
-    }
-    pub(super) fn usage(&self) -> storage::Usage {
-        self.bank.usage()
     }
 
     fn check_owner(&self, owner: &control_owner::Owner) -> io::Result<()> {
@@ -915,7 +910,10 @@ impl State {
         self.operation = Some(operation);
         Ok(())
     }
-    fn cancel_virgin(&mut self, prepared: &mut Option<Prepared>) -> io::Result<()> {
+    fn cancel_virgin(
+        &mut self,
+        prepared: &mut Option<<F::Bank as Backend<F::Value>>::Prepared>,
+    ) -> io::Result<()> {
         if let Some(mut target) = prepared.take() {
             self.bank.cancel(&mut target)?;
         }
@@ -1004,13 +1002,13 @@ impl State {
         };
         Ok(!outbound || cached_final || self.normal_output_room()?)
     }
-    fn action_matches(&self, action: &Action) -> bool {
+    fn action_matches(&self, action: &ActionFor<F::Value>) -> bool {
         !action.finished
             && action.id.owner == self.owner
             && matches!(self.work,
             Some(Work::Issued {serial,operation,..}) if serial==action.id.serial && operation==action.operation)
     }
-    fn finish_action(&mut self, action: &mut Action) {
+    fn finish_action(&mut self, action: &mut ActionFor<F::Value>) {
         action.finished = true;
         self.work = None;
     }
@@ -1043,7 +1041,7 @@ impl State {
                     .event
                     .take()
                     .ok_or_else(|| protocol("lifecycle event disappeared"))?;
-                self.work = Some(Work::Ready(Action {
+                self.work = Some(Work::Ready(ActionFor {
                     id: WorkId {
                         owner: self.owner,
                         serial: self.next_work,
@@ -1245,7 +1243,41 @@ impl State {
     }
 }
 
-fn current_output(
+/// Existing selected Swift runtime keeps its exact private type names.
+pub(super) type State = TransactionState<SwiftFamily>;
+pub(super) type Action = ActionFor<C>;
+/// Same actual Peer/custody implementation over complete common values.
+#[allow(dead_code)] // The actual common State precedes the selected common Driver.
+pub(super) type CommonState = TransactionState<CommonFamily>;
+#[allow(dead_code)] // Same actual lifecycle Action, awaiting the common Driver adapter.
+pub(super) type CommonAction = ActionFor<l2tunnel::record_configuration::Configuration>;
+
+impl TransactionState<SwiftFamily> {
+    pub(super) fn engine(&self, epoch: Epoch) -> io::Result<&records::Engine> {
+        self.bank.engine(epoch)
+    }
+    pub(super) fn entry(&mut self, epoch: Epoch) -> io::Result<storage::Entry<'_>> {
+        self.bank.entry(epoch)
+    }
+    pub(super) fn usage(&self) -> storage::Usage {
+        self.bank.usage()
+    }
+}
+
+#[allow(dead_code)] // Typed common accessors await the selected Driver; no erased Engine escape.
+impl TransactionState<CommonFamily> {
+    pub(super) fn engine(&self, epoch: Epoch) -> io::Result<&l2tunnel::record_engine::Engine> {
+        self.bank.engine(epoch)
+    }
+    pub(super) fn entry(&mut self, epoch: Epoch) -> io::Result<l2tunnel::record_bank::Entry<'_>> {
+        self.bank.entry(epoch)
+    }
+    pub(super) fn usage(&self) -> l2tunnel::record_bank::storage::Usage {
+        self.bank.usage()
+    }
+}
+
+fn current_output<C: tx::Configuration>(
     peer: &tx::Peer<C>,
     role: mg::Role,
     output: &Output,
@@ -1281,7 +1313,7 @@ fn current_output(
     }
     Ok(true)
 }
-fn management_kind(bytes: &[u8]) -> io::Result<mg::MessageKind> {
+fn management_kind_for<C: tx::Configuration>(bytes: &[u8]) -> io::Result<mg::MessageKind> {
     let envelope = sc::Envelope::decode(
         bytes,
         sc::Limits {
@@ -1294,10 +1326,16 @@ fn management_kind(bytes: &[u8]) -> io::Result<mg::MessageKind> {
     let sc::Body::Management(command) = envelope.body else {
         return Err(protocol("nonmanagement Transaction view"));
     };
-    Ok(mg::Frame::decode(command, mg::Limits::default())
-        .map_err(protocol)?
-        .header
-        .kind)
+    Ok(
+        mg::Frame::decode(command, tx::configuration_limits::<C>().map_err(protocol)?)
+            .map_err(protocol)?
+            .header
+            .kind,
+    )
+}
+#[cfg(test)]
+fn management_kind(bytes: &[u8]) -> io::Result<mg::MessageKind> {
+    management_kind_for::<C>(bytes)
 }
 fn tick(now: Duration) -> io::Result<tx::Tick> {
     u64::try_from(now.as_millis())
@@ -1320,3 +1358,7 @@ fn unreachable_result<T>() -> io::Result<T> {
 #[cfg(test)]
 #[path = "transport_transaction_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transport_transaction_common_tests.rs"]
+mod common_tests;

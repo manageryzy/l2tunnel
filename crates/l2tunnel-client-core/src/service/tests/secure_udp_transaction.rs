@@ -12,6 +12,8 @@ use l2tunnel_runtime::secure_udp::transport;
 
 #[path = "secure_udp_transaction_failures.rs"]
 mod command_failures;
+#[path = "secure_udp_common.rs"]
+mod common_service;
 #[path = "secure_udp_transaction_lifecycle.rs"]
 mod lifecycle_failures;
 #[path = "secure_udp_transaction_setup.rs"]

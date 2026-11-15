@@ -1,0 +1,461 @@
+//! Explicit complete common selection; no public label establishes authentication.
+use super::*;
+use l2tunnel::{record_configuration as common, record_engine as engine};
+
+/// Complete common policy/catalog handoff to the sole original-socket Driver.
+#[derive(Clone, Debug)]
+pub struct CommonTransactionContract {
+    expected: security::ConfigDigest,
+    role: security::Role,
+    resources: Config,
+    cover: cover::Config,
+    ipv6: bool,
+    envelope: common::EnvelopeDigest,
+    catalog: common::Catalog,
+    initial: common::Configuration,
+    data: core::ConfigDigest,
+    settings: TransactionSettings,
+    geometry: engine::Geometry,
+}
+
+impl Config {
+    /// Validate actual shared owners without consulting inactive Swift policies.
+    /// Common C supplies native geometry, rates, burst, queues and record policy.
+    pub fn validate_common_resources(&self, max_native: usize) -> io::Result<()> {
+        if !(1..=65_535).contains(&max_native)
+            || !(256..=65_535).contains(&self.path_mtu)
+            || self.control_epoch.0 == 0
+            || self.data_epoch.0 == 0
+            || !(1..=1024).contains(&self.native.pending_packets)
+            || !(max_native..=MAX_QUEUE).contains(&self.native.pending_bytes)
+            || self.work.receive_interval.is_zero()
+            || self.work.receive_interval > Duration::from_secs(1)
+            || !(1..=4096).contains(&self.work.receive_packets)
+            || [
+                self.work.send_batch,
+                self.work.native_read_batch,
+                self.work.native_write_batch,
+            ]
+            .iter()
+            .any(|value| !(1..=4096).contains(value))
+            || !(1..=security::MAX_BODY_BYTES).contains(&self.security.max_body_bytes)
+            || !(1..=security::MAX_PACKETS_PER_KEY).contains(&self.security.packets_per_key)
+            || !(1..=security::MAX_BODY_BYTES_PER_KEY)
+                .contains(&self.security.max_body_bytes_per_key)
+            || self.security.max_body_bytes as u64 > self.security.max_body_bytes_per_key
+            || self.control.recovery.max_source_bytes < control::HEADER_BYTES + mg::HEADER_LEN
+        {
+            return Err(invalid("common shared resource geometry"));
+        }
+        for value in [
+            self.lifetime.lease,
+            self.lifetime.ping_interval,
+            self.lifetime.pong_timeout,
+            self.native.stall_timeout,
+            self.work.receive_interval,
+        ]
+        .into_iter()
+        .chain(self.report_interval)
+        {
+            if value.as_micros() == 0 {
+                return Err(invalid("common timer requires an effective microsecond"));
+            }
+            u64::try_from(value.as_micros()).map_err(invalid)?;
+        }
+        let base = delivery::Binding {
+            session: mg::SessionId([1; 16]),
+            lane: mg::LaneId(LANE),
+            local_role: mg::Role::Client,
+            control_epoch: self.control_epoch.0,
+        };
+        self.control
+            .validate(base, Duration::ZERO, self.lifetime.lease)
+            .map_err(invalid)?;
+        let selected = self
+            .streams
+            .ok_or_else(|| invalid("common transactions require explicit streams"))?;
+        selected.validate(self.control, self.path_mtu, self.lifetime.lease)?;
+        for stream in streams::Stream::ALL {
+            streams::delivery_binding(base, stream).map_err(invalid)?;
+        }
+        let source = self
+            .control
+            .recovery
+            .max_source_bytes
+            .checked_add(recovery::DATA_HEADER_BYTES)
+            .and_then(|value| value.checked_add(streams::HEADER_BYTES))
+            .ok_or_else(exhausted)?;
+        if source > self.security.max_body_bytes {
+            return Err(invalid("common control exceeds protected body capacity"));
+        }
+        Ok(())
+    }
+
+    /// Exact shared-owner inventory for the new common authentication domain.
+    /// Inactive Swift directions/policy/wire burst are excluded; C binds actual data policy.
+    pub fn common_resource_digest(&self, max_native: usize) -> io::Result<core::ConfigDigest> {
+        self.validate_common_resources(max_native)?;
+        let mut hash = digest::Context::new(&digest::SHA256);
+        hash.update(b"l2tunnel/secure-udp-common-resources/v1\0");
+        let mut number = |value: u64| hash.update(&value.to_be_bytes());
+        let a = self.control.recovery;
+        for value in [
+            self.path_mtu as u64,
+            max_native as u64,
+            self.security.max_body_bytes as u64,
+            self.security.packets_per_key,
+            self.security.max_body_bytes_per_key,
+            self.control_epoch.0,
+            self.data_epoch.0,
+            self.work.receive_packets as u64,
+            self.work.send_batch as u64,
+            self.work.native_read_batch as u64,
+            self.work.native_write_batch as u64,
+            self.native.pending_packets as u64,
+            self.native.pending_bytes as u64,
+            a.max_source_bytes as u64,
+            a.send_bytes as u64,
+            a.receive_bytes as u64,
+            a.send_records as u64,
+            a.receive_records as u64,
+            a.max_retries as u64,
+            self.control.packets_per_interval as u64,
+            self.control.bytes_per_interval as u64,
+            self.control.wire_overhead as u64,
+        ] {
+            number(value);
+        }
+        for value in [
+            self.work.receive_interval,
+            self.native.stall_timeout,
+            self.lifetime.lease,
+            self.lifetime.ping_interval,
+            self.lifetime.pong_timeout,
+            self.control.interval,
+            a.initial_rto,
+            a.maximum_rto,
+            a.ack_delay,
+        ] {
+            number(value.as_secs());
+            number(u64::from(value.subsec_nanos()));
+        }
+        let selected = self
+            .streams
+            .ok_or_else(|| invalid("missing common streams"))?;
+        number(u64::from(streams::VERSION));
+        number(streams::HEADER_BYTES as u64);
+        for (stream, entry) in streams::Stream::ALL.into_iter().zip(selected.streams) {
+            number(stream as u64);
+            number(
+                streams::delivery_binding(
+                    delivery::Binding {
+                        session: mg::SessionId([1; 16]),
+                        lane: mg::LaneId(LANE),
+                        local_role: mg::Role::Client,
+                        control_epoch: self.control_epoch.0,
+                    },
+                    stream,
+                )
+                .map_err(invalid)?
+                .control_epoch,
+            );
+            for value in [
+                entry.delivery.wire_overhead as u64,
+                entry.path_mtu as u64,
+                entry.max_message_bytes as u64,
+                entry.max_outbound_messages as u64,
+                entry.max_outbound_bytes as u64,
+                u64::from(entry.max_fragments),
+                entry.max_reassembly_bytes as u64,
+                entry.max_incomplete_messages as u64,
+                entry.work_per_call as u64,
+                entry.message_lifetime.as_secs(),
+                u64::from(entry.message_lifetime.subsec_nanos()),
+            ] {
+                number(value);
+            }
+        }
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(hash.finish().as_ref());
+        Ok(core::ConfigDigest(bytes))
+    }
+}
+
+impl CommonTransactionContract {
+    /// Validate the exact common catalog and actual shared resources before I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        expected: security::ConfigDigest,
+        role: security::Role,
+        resources: Config,
+        cover: cover::Config,
+        ipv6: bool,
+        envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+    ) -> io::Result<Self> {
+        let initial = common::Configuration::new(envelope, catalog.initial()).map_err(invalid)?;
+        if initial.descriptor().duplex() != core::Duplex::Full {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "common selected runtime requires full duplex",
+            ));
+        }
+        let max_native = [mg::Role::Client, mg::Role::Server]
+            .into_iter()
+            .map(|sender| initial.descriptor().direction(sender).max_native())
+            .max()
+            .ok_or_else(|| invalid("common native widths"))?;
+        resources.validate_common_resources(max_native)?;
+        settings.validate(resources)?;
+        if resources.path_mtu != initial.descriptor().path_mtu() {
+            return Err(invalid("initial common MTU differs from resource template"));
+        }
+        let protected = resources
+            .security
+            .max_body_bytes
+            .checked_add(record::ROUTE_BYTES)
+            .and_then(|value| {
+                value.checked_add(security::Protection::ChaCha20Poly1305.overhead_bytes())
+            })
+            .ok_or_else(exhausted)?;
+        let header = cover
+            .overhead(cover::Phase::Established, protected)
+            .map_err(invalid)?;
+        if protected
+            .checked_add(header)
+            .is_none_or(|bytes| bytes > cover.limits().max_packet_bytes)
+        {
+            return Err(invalid("common security exceeds covered storage capacity"));
+        }
+        let overhead = record::ROUTE_BYTES
+            + security::Protection::ChaCha20Poly1305.overhead_bytes()
+            + header
+            + if ipv6 { 48 } else { 28 };
+        if resources.control.wire_overhead != overhead {
+            return Err(invalid("common control wire charge differs"));
+        }
+        let geometry = engine::Geometry {
+            forward_overhead_bytes: overhead,
+            reverse_overhead_bytes: overhead,
+        };
+        let data = transaction::configuration_digest(&initial).map_err(invalid)?;
+        let result = Self {
+            expected,
+            role,
+            resources,
+            cover,
+            ipv6,
+            envelope,
+            catalog,
+            initial,
+            data,
+            settings,
+            geometry,
+        };
+        for value in result.catalog.configurations(envelope).map_err(invalid)? {
+            result.resolve(value)?;
+        }
+        result.validate_message_capacity()?;
+        Ok(result)
+    }
+    /// Actual expected maintained setup/Control digest H0.
+    pub fn expected_configuration(&self) -> security::ConfigDigest {
+        self.expected
+    }
+    /// Exact authenticated local role.
+    pub fn role(&self) -> security::Role {
+        self.role
+    }
+    /// Actual shared resources; template Swift policies remain inactive.
+    pub fn resources(&self) -> Config {
+        self.resources
+    }
+    /// Actual native attachment layer from the common value, never its Swift template.
+    pub fn native_layer(&self) -> PacketLayer {
+        match self
+            .initial
+            .descriptor()
+            .direction(mg::Role::Client)
+            .common()
+            .traffic()
+            .layer
+        {
+            core::traffic::NetworkLayer::Tap => PacketLayer::Ethernet,
+            core::traffic::NetworkLayer::Tun => PacketLayer::Ip,
+        }
+    }
+    /// Exact role-local appearance and storage capacity.
+    pub fn cover(&self) -> cover::Config {
+        self.cover
+    }
+    /// Actual underlay address family.
+    pub fn ipv6(&self) -> bool {
+        self.ipv6
+    }
+    /// Full common envelope E.
+    pub fn envelope(&self) -> common::EnvelopeDigest {
+        self.envelope
+    }
+    /// Entire retained supported catalog.
+    pub fn catalog(&self) -> &common::Catalog {
+        &self.catalog
+    }
+    /// Complete exact initial common value.
+    pub fn initial(&self) -> common::Configuration {
+        self.initial
+    }
+    /// Real common management digest D0.
+    pub fn data_digest(&self) -> core::ConfigDigest {
+        self.data
+    }
+    /// Original generic transaction/resource requirements.
+    pub fn settings(&self) -> TransactionSettings {
+        self.settings
+    }
+    /// Exact actual full-wire overhead of each direction.
+    pub fn geometry(&self) -> engine::Geometry {
+        self.geometry
+    }
+    /// Checked original native completion age policy.
+    pub fn native_limits(&self) -> io::Result<engine::NativeLimits> {
+        Ok(engine::NativeLimits {
+            stall_micros: u64::try_from(self.resources.native.stall_timeout.as_micros())
+                .map_err(invalid)?,
+        })
+    }
+    /// Validate an exact catalog value without a Swift conversion or field clamp.
+    pub fn resolve(&self, value: common::Configuration) -> io::Result<common::Configuration> {
+        if value.envelope() != self.envelope
+            || !self.catalog.descriptors().contains(value.descriptor())
+            || value.descriptor().duplex() != self.initial.descriptor().duplex()
+        {
+            return Err(invalid("common value outside exact authenticated catalog"));
+        }
+        for sender in [mg::Role::Client, mg::Role::Server] {
+            let old = self.initial.descriptor().direction(sender);
+            let view = value.descriptor().direction(sender);
+            if view.max_native() != old.max_native()
+                || view.common().traffic().layer != old.common().traffic().layer
+            {
+                return Err(invalid("common catalog changes immutable native format"));
+            }
+            let maximum = maximum_body(view)?;
+            let wire = maximum
+                .checked_add(self.geometry.forward_overhead_bytes)
+                .ok_or_else(exhausted)?;
+            if maximum > self.resources.security.max_body_bytes
+                || value.descriptor().path_mtu() < self.control_maximum()?
+                || wire
+                    .checked_add(self.reserve()?)
+                    .is_none_or(|required| required > view.common().burst_bytes())
+            {
+                return Err(invalid("common data/control/burst geometry"));
+            }
+        }
+        engine::storage::Plan::for_engine(
+            value,
+            engine::Context {
+                session: 1,
+                epoch: self.resources.data_epoch.0,
+                role: mg_role(self.role),
+            },
+            self.geometry,
+            self.native_limits()?,
+        )
+        .map_err(invalid)?;
+        Ok(value)
+    }
+    pub(super) fn reserve(&self) -> io::Result<usize> {
+        self.resources
+            .control
+            .recovery
+            .max_source_bytes
+            .checked_add(recovery::DATA_HEADER_BYTES + recovery::ACK_PACKET_BYTES)
+            .and_then(|bytes| {
+                bytes
+                    .checked_add(2 * (self.geometry.forward_overhead_bytes + streams::HEADER_BYTES))
+            })
+            .ok_or_else(exhausted)
+    }
+    fn control_maximum(&self) -> io::Result<usize> {
+        self.resources
+            .control
+            .recovery
+            .max_source_bytes
+            .checked_add(recovery::DATA_HEADER_BYTES + streams::HEADER_BYTES)
+            .and_then(|bytes| bytes.checked_add(self.geometry.forward_overhead_bytes))
+            .ok_or_else(exhausted)
+    }
+    fn validate_message_capacity(&self) -> io::Result<()> {
+        let mut required = 0;
+        for descriptor in self.catalog.descriptors() {
+            required = required.max(
+                transaction::maximum_prepare_bytes::<common::Configuration>(
+                    descriptor.sender_channels(mg::Role::Client),
+                )
+                .map_err(invalid)?,
+            );
+            let ready = mg::HEADER_LEN
+                .checked_add(8 + 2 + 8 * usize::from(descriptor.sender_channels(mg::Role::Server)))
+                .ok_or_else(exhausted)?;
+            required = required.max(ready);
+        }
+        let required = required
+            .checked_add(control::HEADER_BYTES)
+            .ok_or_else(exhausted)?;
+        let entry = self
+            .resources
+            .streams
+            .ok_or_else(|| invalid("common stream absent"))?
+            .streams[0];
+        let mut owner = mg::messages::Owner::new(
+            entry,
+            streams::delivery_binding(
+                delivery::Binding {
+                    session: mg::SessionId([1; 16]),
+                    lane: mg::LaneId(LANE),
+                    local_role: mg::Role::Client,
+                    control_epoch: self.resources.control_epoch.0,
+                },
+                streams::Stream::Transaction,
+            )
+            .map_err(invalid)?,
+            Duration::ZERO,
+            self.resources.lifetime.lease,
+        )
+        .map_err(invalid)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(required)
+            .map_err(io::Error::other)?;
+        bytes.resize(required, 0);
+        owner
+            .submit(
+                mg::messages::SubmissionId(1),
+                &bytes,
+                Duration::ZERO,
+                entry.message_lifetime.min(self.resources.lifetime.lease),
+            )
+            .map_err(invalid)?;
+        Ok(())
+    }
+}
+pub(super) fn mg_role(role: security::Role) -> mg::Role {
+    if role == security::Role::Initiator {
+        mg::Role::Client
+    } else {
+        mg::Role::Server
+    }
+}
+pub(super) fn maximum_body(view: common::DirectionView<'_>) -> io::Result<usize> {
+    match view.profile() {
+        common::DirectionProfile::Swift(config) => Ok(config.codec.datagram_bytes),
+        common::DirectionProfile::Aligned(config) => {
+            config.recovery.maximum_packet_bytes().map_err(invalid)
+        }
+        common::DirectionProfile::Packed(config) => {
+            config.base.recovery.maximum_packet_bytes().map_err(invalid)
+        }
+    }
+}

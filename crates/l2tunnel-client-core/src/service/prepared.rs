@@ -120,6 +120,8 @@ pub(super) enum Transport {
     SecureUdpSwift(Arc<crate::secure_udp::profile::Profile>),
     #[cfg(unix)]
     SecureUdpTransaction(Arc<crate::secure_udp::transaction_profile::Profile>),
+    #[cfg(unix)]
+    SecureUdpCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
 }
 /// Longest time a swift acceptor keeps its listener open for a peer. Each
 /// accepted TCP connection is still bound by the original handshake timeout.
@@ -201,16 +203,53 @@ impl Prepared {
             Transport::SecureUdpTransaction(Arc::new(profile)),
         )
     }
+    /// Explicit mixed-profile client using the existing authenticated UDP factory.
+    #[cfg(unix)]
+    pub fn secure_udp_common_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureClient(credentials),
+            attachment,
+            Transport::SecureUdpCommon(Arc::new(profile)),
+        )
+    }
+    /// Explicit mixed-profile acceptor retaining the same admission quarantine.
+    #[cfg(unix)]
+    pub fn secure_udp_common_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureServer(Box::new(SecureServer {
+                credentials,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::SecureUdpCommon(Arc::new(profile)),
+        )
+    }
     #[cfg(unix)]
     pub(super) fn secure_udp(&self) -> bool {
         matches!(
             &self.data.transport,
-            Transport::SecureUdpSwift(_) | Transport::SecureUdpTransaction(_)
+            Transport::SecureUdpSwift(_)
+                | Transport::SecureUdpTransaction(_)
+                | Transport::SecureUdpCommon(_)
         )
     }
     #[cfg(unix)]
     pub(super) fn secure_udp_transaction(&self) -> bool {
         matches!(&self.data.transport, Transport::SecureUdpTransaction(_))
+    }
+    #[cfg(unix)]
+    pub(super) fn secure_udp_common(&self) -> bool {
+        matches!(&self.data.transport, Transport::SecureUdpCommon(_))
     }
     /// Pure validation; credentials are already parsed and no provider is invoked.
     pub fn client(
@@ -439,6 +478,45 @@ impl Prepared {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "actual Noise credentials differ from transaction plan pins",
+                    ));
+                }
+                profile.runtime_contract(role)?;
+                None
+            }
+            #[cfg(unix)]
+            Transport::SecureUdpCommon(profile) => {
+                let session = profile.settings();
+                let (noise, role) = match &endpoint {
+                    Endpoint::SecureClient(credentials) => {
+                        if credentials.member_key() != session.member {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "configured member differs from actual credential",
+                            ));
+                        }
+                        (credentials.noise(), l2tunnel_security::Role::Initiator)
+                    }
+                    Endpoint::SecureServer(server) => (
+                        server.credentials.noise(),
+                        l2tunnel_security::Role::Responder,
+                    ),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "common UDP requires distinct Noise credentials",
+                        ));
+                    }
+                };
+                if noise.profile() != session.profile || !attachment.readable_kind() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "common UDP profile/credentials or readable attachment differ",
+                    ));
+                }
+                if noise.peers(role) != profile.peers() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "actual Noise credentials differ from Common plan pins",
                     ));
                 }
                 profile.runtime_contract(role)?;

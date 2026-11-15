@@ -460,13 +460,7 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
         // These are deliberately inconsistent local metadata, not authenticated
         // peer flows. Genuine bytes and pure extracted boundaries remain intact.
         for variant in 0..8 {
-            let front = fixture
-                .driver
-                .native
-                .front_metadata_mut()
-                .ok_or("missing fixture native packet")?;
-            front.origin = origin;
-            front.identity = identity;
+            let mut front = Native { origin, identity };
             fixture.driver.written.counts = counts;
             fixture.driver.written.channels = 2;
             match variant {
@@ -484,6 +478,15 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
                     front.identity.record = records::NativeRecordId(u64::MAX);
                 }
             }
+            // Republish deliberately inconsistent trusted metadata through the
+            // same actual lease API; no public mutable backing escape is needed.
+            fixture.driver.native.complete_front()?;
+            fixture
+                .driver
+                .native
+                .acquire()
+                .ok_or("fixture native lease")?
+                .copy(front, age, &packet)?;
             fixture.time.store(fixture.now, Ordering::SeqCst);
             assert!(
                 fixture.write().await.is_err(),
@@ -500,13 +503,13 @@ async fn internal_native_metadata_guards_refuse_before_device_io_without_consump
         }
         fixture.driver.written.channels = 2;
         fixture.driver.written.counts = counts;
-        let front = fixture
+        fixture.driver.native.complete_front()?;
+        fixture
             .driver
             .native
-            .front_metadata_mut()
-            .ok_or("missing fixture native packet")?;
-        front.origin = origin;
-        front.identity = identity;
+            .acquire()
+            .ok_or("fixture native lease")?
+            .copy(Native { origin, identity }, age, &packet)?;
         assert!(fixture.write().await?);
         fixture.received_once(&packet)?;
         assert_eq!(fixture.driver.written.counts[1], 1);
