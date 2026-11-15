@@ -166,6 +166,7 @@ fn selection_for(
     config: ConnectionConfig,
     inspection: bool,
 ) -> io::Result<Option<Selected>> {
+    tls_frontend::preflight(command, options)?;
     let records_plan = options.contains_key("--common-transaction-plan");
     let carrier = if options.get("--carrier").map(String::as_str) == Some("openvpn-like")
         && (records_plan || options.get("--record-profile").map(String::as_str) == Some("common"))
@@ -223,7 +224,14 @@ fn selection_for(
         "--swift-repair-permille",
         "--swift-report-ms",
     ];
-    let carrier_options = ["--udp-cover", "--ca", "--server-name", "--cert", "--key"];
+    let carrier_options = [
+        "--udp-cover",
+        "--ca",
+        "--server-name",
+        "--sni",
+        "--cert",
+        "--key",
+    ];
     if records_plan && options.contains_key("--swift-transaction-plan") {
         return Err(input(
             "Common and Swift transaction plans are mutually exclusive",
@@ -299,7 +307,7 @@ fn selection_for(
                 required(options, "--server-name")?;
             }
             "serve"
-                if !["--ca", "--server-name"]
+                if !["--ca", "--server-name", "--sni"]
                     .iter()
                     .any(|key| options.contains_key(*key)) =>
             {
@@ -814,6 +822,7 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
         },
         Built::Legacy(_) => return Err(input("inspection requires explicit transaction plan")),
     };
+    let values = common_cli_output::requested_tls(values, tls_frontend::requested(options)?)?;
     let mut stdout = io::stdout().lock();
     for value in values {
         serde_json::to_writer(&mut stdout, &value).map_err(io::Error::other)?;
@@ -876,11 +885,7 @@ pub(super) async fn execute(
                 )?,
                 Built::Records(profile) => match selected.outer_config(&profile)? {
                     Some(outer) => {
-                        let tls = ClientTls::from_der_roots(&[bounded_file(
-                            required(options, "--ca")?,
-                            65536,
-                        )?])
-                        .map_err(auth_error)?;
+                        let tls = tls_frontend::client(options)?;
                         let member = MemberKey::from_pkcs8(&member_der).map_err(auth_error)?;
                         let outer_credentials = service::Client {
                             remote: common.peer,

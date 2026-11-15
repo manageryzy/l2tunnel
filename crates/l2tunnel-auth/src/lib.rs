@@ -22,7 +22,9 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+#[cfg(test)]
+use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsStream};
 use zeroize::Zeroizing;
 
 pub mod https_request;
@@ -244,31 +246,65 @@ impl MemberAllowlist {
     }
 }
 
-/// Private, verified TLS 1.3 client configuration with no SNI or early data.
+mod sni;
+pub use sni::ClientSni;
+
+/// Private, verified TLS 1.3 client configuration with explicit SNI and no early data.
 #[derive(Clone)]
-pub struct ClientTls(Arc<ClientConfig>);
+pub struct ClientTls(
+    Arc<ClientConfig>,
+    ClientSni,
+    Option<Arc<rustls::client::WebPkiServerVerifier>>,
+);
 
 impl ClientTls {
     /// Build certificate-root and name verification from DER trust anchors.
     /// SNI, resumption and early data are disabled; certificate validation remains enabled.
     pub fn from_der_roots(certificates: &[Vec<u8>]) -> Result<Self, Error> {
+        Self::from_der_roots_with_sni(certificates, ClientSni::Disabled)
+    }
+
+    /// Build verified TLS with an explicit ClientHello SNI policy.
+    /// Each connect call's server_name remains the certificate verification name.
+    pub fn from_der_roots_with_sni(
+        certificates: &[Vec<u8>],
+        sni: ClientSni,
+    ) -> Result<Self, Error> {
         validate_certificates(certificates, 64)?;
+        sni::validate(&sni)?;
         let mut roots = RootCertStore::empty();
         for encoded in certificates {
             roots
                 .add(CertificateDer::from(encoded.clone()))
                 .map_err(Error::Tls)?;
         }
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(Error::Tls)?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-        config.enable_sni = false;
+        let roots = Arc::new(roots);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = match &sni {
+            ClientSni::Disabled => None,
+            ClientSni::Named(_) => Some(
+                rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    roots.clone(),
+                    provider.clone(),
+                )
+                .build()
+                .map_err(|_| Error::Configuration("TLS server verifier"))?,
+            ),
+        };
+        let mut config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(Error::Tls)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.enable_sni = matches!(&sni, ClientSni::Named(_));
         config.enable_early_data = false;
         config.resumption = rustls::client::Resumption::disabled();
-        Ok(Self(Arc::new(config)))
+        Ok(Self(Arc::new(config), sni, verifier))
+    }
+
+    /// Requested public SNI policy; server trust remains separately configured.
+    pub fn sni(&self) -> &ClientSni {
+        &self.1
     }
 }
 
@@ -471,8 +507,8 @@ pub async fn client_connect_io<S: AsyncRead + AsyncWrite + Unpin>(
 /// This does not prove that caller-owned I/O uses UDP; the runtime must bind its
 /// carrier and full gate policy into `config.digest`. SessionConfig is opaque and
 /// has no inspectable carrier field. No QUIC profile can be selected here.
-/// Failure/cancellation drops I/O; TLS certificate/name verification and no-SNI
-/// policy are identical to the original factory. No early application I/O escapes.
+/// Failure/cancellation drops I/O; certificate/name verification remains anchored
+/// to the original server_name, independently of explicit SNI. No early I/O escapes.
 pub async fn client_connect_profile_io<S: AsyncRead + AsyncWrite + Unpin>(
     io: S,
     tls: &ClientTls,
@@ -485,11 +521,9 @@ pub async fn client_connect_profile_io<S: AsyncRead + AsyncWrite + Unpin>(
     validate_timeout(deadline)?;
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|_| Error::Configuration("invalid server verification name"))?;
+    let (connector, name) = sni::connection(tls, name)?;
     timeout(deadline, async {
-        let stream = TlsConnector::from(tls.0.clone())
-            .connect(name, io)
-            .await
-            .map_err(Error::Io)?;
+        let stream = connector.connect(name, io).await.map_err(Error::Io)?;
         let mut stream = TlsStream::Client(stream);
         require_tls13(&stream)?;
         let certificate = stream

@@ -303,6 +303,14 @@ pub struct SentRecord {
     /// Original successful PacketIo::send completion time.
     pub sent_at: Instant,
 }
+/// Physical-send observation independent of the carrier's continued liveness.
+#[derive(Debug)]
+pub struct SentRecordObservation {
+    /// One actual whole packet handoff, consumed once even after a terminal error.
+    pub sent: Option<SentRecord>,
+    /// Original sticky carrier failure; a physical send does not make it success.
+    pub failure: Option<Error>,
+}
 /// One complete authenticated carrier record, not a native-delivery confirmation.
 pub struct ReceivedRecord {
     /// Original successful authenticated parse receipt, before bounded retention.

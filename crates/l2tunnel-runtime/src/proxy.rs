@@ -159,15 +159,32 @@ pub struct CloseReport {
     pub tls_lanes_closed: usize,
 }
 type Reply = tokio::sync::oneshot::Sender<Result<CloseReport, String>>;
+type AbortReply = tokio::sync::oneshot::Sender<io::Result<()>>;
+enum Command {
+    Drain(Reply),
+    Abort {
+        deadline: tokio::time::Instant,
+        reply: AbortReply,
+    },
+}
+/// Exact original-child release acknowledgement, never a clean-close receipt.
+pub struct AbortWaiter(tokio::sync::oneshot::Receiver<io::Result<()>>);
+impl AbortWaiter {
+    /// Success requires actual child joins before the originally supplied cap.
+    /// A late error does not authorize treating a still-pending runtime as released.
+    pub async fn wait(self) -> io::Result<()> {
+        self.0.await.map_err(io::Error::other)?
+    }
+}
 /// One queued local command, one active drain reply and coalesced read-only status.
 #[derive(Clone)]
 pub struct Handle {
-    sender: tokio::sync::mpsc::Sender<Reply>,
+    sender: tokio::sync::mpsc::Sender<Command>,
     status: tokio::sync::watch::Receiver<Option<Status>>,
 }
 /// Runtime-owned bounded administrative input.
 pub struct Control {
-    receiver: tokio::sync::mpsc::Receiver<Reply>,
+    receiver: tokio::sync::mpsc::Receiver<Command>,
     status: StatusSink,
 }
 enum StatusSink {
@@ -194,10 +211,14 @@ impl Handle {
     pub fn request_drain(&self) -> io::Result<DrainWaiter> {
         request_drain(&self.sender)
     }
+    /// Request abnormal release under one immutable local ownership deadline.
+    pub fn request_abort(&self, deadline: tokio::time::Instant) -> io::Result<AbortWaiter> {
+        request_abort(&self.sender, deadline)
+    }
 }
-fn request_drain(sender: &tokio::sync::mpsc::Sender<Reply>) -> io::Result<DrainWaiter> {
+fn request_drain(sender: &tokio::sync::mpsc::Sender<Command>) -> io::Result<DrainWaiter> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    sender.try_send(tx).map_err(|e| {
+    sender.try_send(Command::Drain(tx)).map_err(|e| {
         io::Error::new(
             match e {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
@@ -207,6 +228,24 @@ fn request_drain(sender: &tokio::sync::mpsc::Sender<Reply>) -> io::Result<DrainW
         )
     })?;
     Ok(DrainWaiter(rx))
+}
+fn request_abort(
+    sender: &tokio::sync::mpsc::Sender<Command>,
+    deadline: tokio::time::Instant,
+) -> io::Result<AbortWaiter> {
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .try_send(Command::Abort { deadline, reply })
+        .map_err(|error| {
+            io::Error::new(
+                match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => io::ErrorKind::BrokenPipe,
+                },
+                "proxy abort command unavailable",
+            )
+        })?;
+    Ok(AbortWaiter(receiver))
 }
 /// Create the bounded command channel; retaining Handle owns the local controller.
 pub fn control_channel() -> (Handle, Control) {
@@ -234,6 +273,19 @@ pub async fn run<D: PacketDevice<Error = io::Error>>(
     control: Control,
 ) -> io::Result<CloseReport> {
     actor::run(device, link, config, control).await
+}
+
+/// Run the same actor while retaining failed child custody until every actual join.
+/// The caller must keep polling cleanup after an expired operation; returning
+/// from this future, including an error, proves its spawned I/O was released.
+/// Dropping the future still provides no asynchronous join acknowledgement.
+pub async fn run_service_owned<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    config: Config,
+    control: Control,
+) -> io::Result<CloseReport> {
+    actor::run_profile_owned(device, link, config, control, None, true).await
 }
 
 #[cfg(test)]

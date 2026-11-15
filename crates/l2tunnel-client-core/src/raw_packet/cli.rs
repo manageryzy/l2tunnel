@@ -74,9 +74,7 @@ pub(super) async fn execute(
     let opener = |raw, role| l2tunnel_raw_io::open_packet_marked(raw, role, mark);
     let session = match command {
         "connect" => {
-            let tls =
-                ClientTls::from_der_roots(&[bounded_file(required(options, "--ca")?, 65536)?])
-                    .map_err(auth_error)?;
+            let tls = tls_frontend::client(options)?;
             let member =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;

@@ -73,9 +73,7 @@ pub(super) async fn execute(
             let address = required(options, "--remote")?
                 .parse()
                 .map_err(|_| input("remote requires IP:PORT"))?;
-            let tls =
-                ClientTls::from_der_roots(&[bounded_file(required(options, "--ca")?, 65536)?])
-                    .map_err(auth_error)?;
+            let tls = tls_frontend::client(options)?;
             let member =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;

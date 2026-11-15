@@ -380,7 +380,9 @@ async fn cancellation_from_authenticated_attachment_keeps_actual_stage_without_r
         let server_task = tokio::spawn(server_run);
         assert_eq!(
             completion(&client, a.operation).await?,
-            Completed::Cancelled
+            Completed::Cancelled,
+            "actual setup: {:?}",
+            client.setup_observation(a.operation).map_err(submit)?,
         );
         let opened_at = during
             .lock()

@@ -6,6 +6,14 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
+The [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
+adds independent verified SNI, retained raw send observations, supported CLI naming
+and actual fixed/measured shared-service readiness/cleanup. Affected strict checks
+and finite TLS/Unix-device cases pass; failed attempts remain preserved. Production
+proxy CLI migration, Python behavior alignment and complete native/platform/
+resource/performance gates remain open. See [naming](modules/tcp-carrier-naming.md),
+[proxy service](modules/tcp-proxy-service.md) and [Python alignment](modules/python-behavior-alignment.md).
+
 The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
 implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
 Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
@@ -124,9 +132,38 @@ of the old five-tuple when recovery must create a new carrier connection.
 
 These are planned migration requirements. Current certificate-root/name and
 exporter-bound member APIs, finite Linux receipts, and existing custom UDP/raw
-formats do not implement the common target. Configurable cover SNI independent of
-server trust and pin-based verification remain unfinished. Preserve simulator
+formats do not implement the common target. Configurable cover SNI now has finite maintained-TLS and supported CLI evidence;
+complete effective IPC naming and pin-based verification remain unfinished. Preserve simulator
 outputs, source-bound receipts and independently useful existing transports.
+
+## Current execution priority: named Python behavior and L3 TCP
+
+Follow [PBA-01..06](modules/python-behavior-alignment.md) and FIX-14 before
+accepting any claim that the Common migration matches the simulator. Bind each
+profile to exact Python source/configuration, recovery ownership, ACK path and
+measurement units. The per-connection CompactARQ sensitivity and shared Packed
+C46/C47/C48 candidates are separate required comparisons, not interchangeable
+performance baselines. This changes no default selection.
+
+Run independent implementation lanes in parallel: actual CompactARQ serial/RTT/
+receiver-delay/guarded-retry behavior; flow ownership, learned reverse affinity
+and ACK custody; L3 codec and actual rolling/copy execution. The integrator owns
+authenticated configuration/wire revisions and selected runtime composition.
+Finish the pending TCP carrier/shared-proxy service batch while those bodies are
+implemented. Its completion cannot close Python parity gates.
+
+Then integrate the complete global8192/local128/every16 candidate with actual
+short copies and ACK coalescing, prioritizing real L3 TCP and preserving L2.
+Replace the legacy reliable algorithm-feedback side path for the lossy named
+profiles while retaining independent authenticated management on the same
+carrier. Explicit lossy ACK bypass needs truthful retirement/drain semantics;
+shared Packed ACK recovery remains a separate composition.
+
+Run changed-behavior differential/runtime cases together, reusing unchanged
+source-bound results. Run the required full suite at batch acceptance; native
+performance follows installed behavior with matched configurations and counters.
+Do not substitute component checks, a compile, an enum, RawIp packing or an API
+migration for end-to-end delivery. All existing full acceptance gates remain.
 
 ## Source projects
 

@@ -330,7 +330,7 @@ pub struct Status {
 /// One bounded drain-command producer and one coalesced observation subscription.
 #[derive(Clone)]
 pub struct Handle {
-    sender: tokio::sync::mpsc::Sender<super::Reply>,
+    sender: tokio::sync::mpsc::Sender<super::Command>,
     status: tokio::sync::watch::Receiver<Option<Status>>,
 }
 /// Runtime-owned command receiver; no second measurement command queue exists.
@@ -343,6 +343,10 @@ impl Handle {
     /// Submit finite drain; acceptance is distinct from the waiter's actual result.
     pub fn request_drain(&self) -> io::Result<super::DrainWaiter> {
         super::request_drain(&self.sender)
+    }
+    /// Request the same actual abnormal-release barrier as the fixed actor.
+    pub fn request_abort(&self, deadline: tokio::time::Instant) -> io::Result<super::AbortWaiter> {
+        super::request_abort(&self.sender, deadline)
     }
 }
 /// Allocate one command slot and one replaceable bounded lifetime snapshot.
@@ -376,6 +380,26 @@ pub async fn run<D: l2tunnel_device::PacketDevice<Error = io::Error>>(
         config.fixed.clone(),
         control.0,
         Some(config),
+    )
+    .await
+}
+
+/// Retain the same measured actor's failed child custody until actual join.
+/// Dropping this future is cancellation, never a completed release proof.
+pub async fn run_service_owned<D: l2tunnel_device::PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    config: Config,
+    control: Control,
+) -> io::Result<super::CloseReport> {
+    config.validate()?;
+    super::actor::run_profile_owned(
+        device,
+        link.inner,
+        config.fixed.clone(),
+        control.0,
+        Some(config),
+        true,
     )
     .await
 }

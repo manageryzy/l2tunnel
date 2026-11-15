@@ -1054,11 +1054,21 @@ pub(super) async fn run<D: PacketDevice<Error = io::Error>>(
     run_profile(device, link, config, control, None).await
 }
 pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    config: Config,
+    control: Control,
+    measured_config: Option<measured::Config>,
+) -> io::Result<CloseReport> {
+    run_profile_owned(device, link, config, control, measured_config, false).await
+}
+pub(super) async fn run_profile_owned<D: PacketDevice<Error = io::Error>>(
     mut device: D,
     link: Link,
     config: Config,
     mut control: Control,
     measured_config: Option<measured::Config>,
+    owned_cleanup: bool,
 ) -> io::Result<CloseReport> {
     config.validate()?;
     let binding = measured_config
@@ -1087,6 +1097,15 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
     let (events_tx, mut events) = mpsc::channel(8);
     let (users_tx, mut users) = mpsc::channel(config.runtime.queue_packets);
     let (quiesce_tx, quiesce) = watch::channel(None);
+    let table = session::Table::new(config.table(link.logical, link.originator, seed), Millis(0))
+        .map_err(error)?;
+    let measured = measured_config
+        .as_ref()
+        .map(|config| measured::State::new(config.clone(), &table))
+        .transpose()?;
+    let wire = Arbiter::new(&config, false)?;
+    let native = Arbiter::new(&config, true)?;
+    let is_measured = measured_config.is_some();
     let mut tasks = JoinSet::new();
     let send_lane = u8::from(config.duplex == Duplex::Half && !link.originator);
     let receive_lane = u8::from(config.duplex == Duplex::Half && link.originator);
@@ -1128,25 +1147,8 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
             },
         ));
     }
-    for (reader, direction) in readers {
-        let expected = Start {
-            digest: link.binding.digest.0,
-            session: link.logical,
-            originator: !link.originator,
-            duplex: config.duplex,
-            lane: direction.lane,
-        };
-        tasks.spawn(transport::reader(
-            reader,
-            direction,
-            expected,
-            (config.clone(), measured_config.is_some()),
-            events_tx.clone(),
-            users_tx.clone(),
-            quiesce_tx.clone(),
-        ));
-    }
     let mut writers = Vec::new();
+    let mut pending_writers = Vec::new();
     for (writer, direction) in outputs {
         let (ctx, crx) = mpsc::channel(8);
         let (utx, urx) = mpsc::channel(1);
@@ -1160,7 +1162,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
         };
         ctx.try_send(Output::Control(Frame::Start(hello)))
             .map_err(error)?;
-        tasks.spawn(transport::writer(
+        pending_writers.push(transport::writer(
             writer,
             direction,
             config.control_rate,
@@ -1184,21 +1186,37 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
             close: false,
         });
     }
+    for (reader, direction) in readers {
+        let expected = Start {
+            digest: link.binding.digest.0,
+            session: link.logical,
+            originator: !link.originator,
+            duplex: config.duplex,
+            lane: direction.lane,
+        };
+        tasks.spawn(transport::reader(
+            reader,
+            direction,
+            expected,
+            (config.clone(), is_measured),
+            events_tx.clone(),
+            users_tx.clone(),
+            quiesce_tx.clone(),
+        ));
+    }
+    for writer in pending_writers {
+        tasks.spawn(writer);
+    }
     drop(events_tx);
     drop(users_tx);
     drop(quiesce_tx);
-    let table = session::Table::new(config.table(link.logical, link.originator, seed), Millis(0))
-        .map_err(error)?;
-    let measured = measured_config
-        .map(|config| measured::State::new(config, &table))
-        .transpose()?;
     let mut actor = Actor {
         logical: link.logical,
         originator: link.originator,
         table,
         measured,
-        wire: Arbiter::new(&config, false)?,
-        native: Arbiter::new(&config, true)?,
+        wire,
+        native,
         config,
         bindings: BTreeMap::new(),
         announced: BTreeSet::new(),
@@ -1238,6 +1256,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
     let mut buffer = vec![0; l2tunnel_device::READ_BUFFER_BYTES];
     let mut tick = interval(actor.config.runtime.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut abort: Option<(Instant, AbortReply)> = None;
     let outcome = async {
         loop {
             let now = actor.micros()?;
@@ -1277,13 +1296,20 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
                 actor.drain(at)?;
             }
             match control.receiver.try_recv() {
-                Ok(reply) => {
+                Ok(Command::Drain(reply)) => {
                     if actor.reply.is_some() {
                         let _ = reply.send(Err("proxy drain already requested".into()));
                     } else {
                         actor.reply = Some(reply);
                         actor.drain(Instant::now())?;
                     }
+                }
+                Ok(Command::Abort { deadline, reply }) => {
+                    abort = Some((deadline, reply));
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "proxy owner requested abort",
+                    ));
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1352,7 +1378,7 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
         }
     }
     .await;
-    let outcome = match outcome {
+    let mut outcome = match outcome {
         Ok(report) => {
             let end = actor
                 .deadline
@@ -1363,8 +1389,24 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
     };
     if outcome.is_err() {
         tasks.abort_all();
-        let end = actor.deadline.unwrap_or_else(Instant::now);
-        let _ = timeout_at(end, async { while tasks.join_next().await.is_some() {} }).await;
+        if owned_cleanup || abort.is_some() {
+            // Keep the same actual children owned after an operation cap expires.
+            // The service can report that expiry while continuing this cleanup;
+            // it must not publish release or start a replacement before return.
+            while tasks.join_next().await.is_some() {}
+        } else {
+            let end = actor.deadline.unwrap_or_else(Instant::now);
+            let _ = timeout_at(end, async { while tasks.join_next().await.is_some() {} }).await;
+        }
+    }
+    if abort
+        .as_ref()
+        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+    {
+        outcome = Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original proxy abort deadline",
+        ));
     }
     let mut status = actor.snapshot(
         outcome
@@ -1378,6 +1420,17 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
     // Preserve the original transport/ownership error if diagnostics also fail.
     let publication = actor.publish(&control.status, status, true);
     let outcome = outcome.and_then(|report| publication.map(|()| report));
+    if let Some((deadline, reply)) = abort {
+        let result = if Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original proxy abort deadline",
+            ))
+        } else {
+            Ok(())
+        };
+        let _ = reply.send(result);
+    }
     if let Some(reply) = actor.reply {
         let _ = reply.send(
             outcome

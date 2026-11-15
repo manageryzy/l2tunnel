@@ -4,6 +4,8 @@ use tokio::net::TcpListener;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
 
+#[path = "sni_tests.rs"]
+mod sni;
 #[path = "udp_tests.rs"]
 mod udp;
 

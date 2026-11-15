@@ -39,6 +39,8 @@ mod host_runtime;
 mod profiling;
 #[path = "openvpn/cli.rs"]
 mod standalone;
+#[path = "cli_tls.rs"]
+mod tls_frontend;
 
 #[cfg(target_os = "linux")]
 #[path = "service_cli.rs"]
@@ -610,6 +612,7 @@ impl DeviceSpec {
 }
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
+    tls_frontend::preflight(command, options)?;
     let config = configuration(options)?;
     if let Some(selected) = secure_udp_frontend::selection(command, options, config)? {
         return secure_udp_frontend::execute(command, options, config, selected).await;
@@ -700,7 +703,7 @@ async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Resul
                 .parse()
                 .map_err(|_| input("remote requires IP:PORT"))?;
             let roots = vec![bounded_file(required(options, "--ca")?, 65536)?];
-            let tls = ClientTls::from_der_roots(&roots).map_err(auth_error)?;
+            let tls = tls_frontend::from_roots(options, &roots)?;
             let identity =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;
@@ -1323,6 +1326,9 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "\nHost experiment: --runtime-model multi-thread|current-thread, only for Linux quic-like/media-like Swift connect/serve. Omission keeps the existing multi-thread runtime. Explicit selection emits one host_runtime schema1 observation on stderr; it does not change peer configuration or the control backend."
         );
         println!("\n{}", raw_packet_frontend::HELP);
+        println!(
+            "\nTLS naming: connect --sni DNS_NAME explicitly sends that ClientHello name; --server-name remains the verified own-server identity. SNI is disabled when omitted. Supported TLS readers are TCP (system/active/proxy), raw-packet and Common OpenVPN. Other profiles reject this option. Common offline connect inspection reports requested naming only; persistent effective naming in IPC remains unavailable."
+        );
         println!("\n{}", delivery_frontend::HELP);
         println!(
             "\nProfiling: --profile-ms 0|100..60000 (default off), system frame records over TCP/TLS or base UDP/QUIC. TCP emits runtime_profile schema3; base UDP/QUIC emits distinct datagram_profile schema1 latest snapshots on the selected interval and at termination. Transport timing includes async waits."
@@ -1380,6 +1386,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--udp-cover",
             "--ca",
             "--server-name",
+            "--sni",
             "--cert",
             "--key",
         ],
@@ -1403,6 +1410,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--layer",
             "--ca",
             "--server-name",
+            "--sni",
             "--identity",
             "--duplex",
             "--max-packet",
@@ -1466,6 +1474,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         allowed.push("--api-version");
     }
     let result = options(&args[1..], &allowed).and_then(|mut options| {
+        tls_frontend::preflight(command, &options)?;
         if command == "keygen" {
             return generate(&options);
         }
@@ -1498,6 +1507,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
                 .build()?
                 .block_on(execute_api(command, &options));
         }
+        tls_frontend::report_requested(&options)?;
         let model = host_runtime::take(&mut options)?;
         let (runtime, observation) = host_runtime::build(model)?;
         if let Some(observation) = observation {

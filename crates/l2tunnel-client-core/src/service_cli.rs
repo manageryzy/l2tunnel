@@ -28,9 +28,7 @@ pub(super) async fn execute(
             let remote = required(options, "--remote")?
                 .parse()
                 .map_err(|_| input("remote requires IP:PORT"))?;
-            let tls =
-                ClientTls::from_der_roots(&[bounded_file(required(options, "--ca")?, 65536)?])
-                    .map_err(auth_error)?;
+            let tls = tls_frontend::client(options)?;
             let member =
                 MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
                     .map_err(auth_error)?;
@@ -150,6 +148,7 @@ pub(super) async fn execute(
                 .await
                 .map_err(service_error)?
             {
+                Terminal::Closed => Ok(()),
                 Terminal::Aborted => Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "managed session locally aborted",

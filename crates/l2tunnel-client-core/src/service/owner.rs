@@ -4,6 +4,7 @@ use std::task::Poll;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 mod common;
+mod proxy;
 pub(super) struct Active {
     runtime: RunFuture,
     backend: ObservedBackend,
@@ -25,7 +26,10 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
     if state.backend.is_none() {
         state.snapshot.listening = None;
     }
-    state.snapshot.phase = if state.backend.is_some() {
+    state.snapshot.phase = if matches!(&state.backend, Some(ObservedBackend::Proxy(backend)) if backend.awaiting_release())
+    {
+        Phase::Failed
+    } else if state.backend.is_some() {
         Phase::Connected
     } else if failed {
         Phase::Failed
@@ -70,7 +74,6 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     let mut state = shared.lock();
     state.backend = None;
     state.snapshot.runtime = backend.and_then(|backend| backend.observe());
-    #[cfg(unix)]
     if let Some(observation) = &mut state.snapshot.runtime {
         observation.record_service_terminal(terminal);
     }
@@ -131,6 +134,14 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
     }
     match plan.data.transport.clone() {
         Transport::Managed(options) => Box::pin(establish_managed(shared, plan, accepted, options)),
+        Transport::Proxy(settings) => selected!(
+            deadline,
+            proxy::fixed(&shared, &plan, accepted, deadline, settings)
+        ),
+        Transport::ProxyMeasured(settings) => selected!(
+            deadline,
+            proxy::measured(&shared, &plan, accepted, deadline, settings)
+        ),
         Transport::UdpFrame { settings, delivery } => selected!(
             deadline,
             establish_udp(&shared, &plan, accepted, deadline, settings, delivery)
@@ -971,7 +982,7 @@ pub(super) fn publish_ready(
     session: Active,
     accepted: Accepted,
 ) -> Option<Active> {
-    let mut state = shared.lock();
+    let state = shared.lock();
     if accepted
         .deadline
         .is_none_or(|deadline| Instant::now() >= deadline)
@@ -991,6 +1002,14 @@ pub(super) fn publish_ready(
         finish(shared, accepted.operation, Completed::Cancelled);
         return None;
     }
+    Some(commit_ready(shared, state, session, accepted))
+}
+fn commit_ready(
+    shared: &Shared,
+    mut state: std::sync::MutexGuard<'_, State>,
+    session: Active,
+    accepted: Accepted,
+) -> Active {
     state.snapshot.listening = None;
     state.snapshot.runtime = session.backend.observe();
     state.backend = Some(session.backend.clone());
@@ -1014,7 +1033,7 @@ pub(super) fn publish_ready(
     }
     drop(state);
     shared.changed();
-    Some(session)
+    session
 }
 pub(super) fn classify_apply(response: local::Response) -> Completed {
     if response.ok && response.code == "ok" {
@@ -1044,6 +1063,14 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
             }
             match command {
                 Command::Disconnect => {
+                    if let Some(session) = active.as_mut()
+                        && matches!(session.backend, ObservedBackend::Proxy(_))
+                        && let Err(error) = proxy::stop(session, accepted.deadline).await
+                    {
+                        proxy::retain_or_stop(&shared, &mut active, error.kind());
+                        finish(&shared, accepted.operation, failed(error));
+                        continue;
+                    }
                     stopped(&shared, &mut active, Terminal::Aborted);
                     finish(&shared, accepted.operation, Completed::Aborted);
                 }
@@ -1108,6 +1135,15 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         finish(&shared, accepted.operation, failed(expired()));
                         continue;
                     }
+                    if let Some(session) = active.as_mut()
+                        && matches!(session.backend, ObservedBackend::Proxy(_))
+                        && let Err(error) = proxy::stop(session, accepted.deadline).await
+                    {
+                        drop(plan);
+                        proxy::retain_or_stop(&shared, &mut active, error.kind());
+                        finish(&shared, accepted.operation, failed(error));
+                        continue;
+                    }
                     if active.is_some() {
                         stopped(&shared, &mut active, Terminal::Aborted);
                     }
@@ -1132,7 +1168,53 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                                 failed(error)
                             }
                         }
-                        Some(Ok(session)) => {
+                        Some(Ok(mut session)) => {
+                            if matches!(session.backend, ObservedBackend::Proxy(_)) {
+                                let ready = proxy::ready(&shared, &mut session, accepted).await;
+                                let result = match ready {
+                                    Ok(()) => match proxy::publish(&shared, session, accepted) {
+                                        proxy::Publication::Ready(session) => {
+                                            active = Some(session);
+                                            continue;
+                                        }
+                                        proxy::Publication::Cancelled(session) => {
+                                            active = Some(session);
+                                            Completed::Cancelled
+                                        }
+                                        proxy::Publication::Expired(session) => {
+                                            active = Some(session);
+                                            failed(expired())
+                                        }
+                                    },
+                                    Err(error) => {
+                                        active = Some(session);
+                                        if cancelled(&shared, accepted.operation) {
+                                            Completed::Cancelled
+                                        } else {
+                                            failed(error)
+                                        }
+                                    }
+                                };
+                                let cleanup = proxy::stop(
+                                    active.as_mut().ok_or_else(|| {
+                                        io::Error::other("proxy cleanup lost owner")
+                                    })?,
+                                    accepted.deadline,
+                                )
+                                .await;
+                                let result = match cleanup {
+                                    Ok(()) => {
+                                        stopped(&shared, &mut active, Terminal::Aborted);
+                                        result
+                                    }
+                                    Err(error) => {
+                                        proxy::retain_or_stop(&shared, &mut active, error.kind());
+                                        failed(error)
+                                    }
+                                };
+                                finish(&shared, accepted.operation, result);
+                                continue;
+                            }
                             if let Some(session) = publish_ready(&shared, session, accepted) {
                                 active = Some(session);
                             }
@@ -1152,6 +1234,11 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         );
                         continue;
                     };
+                    if let ObservedBackend::Proxy(backend) = &session.backend {
+                        let result = proxy::apply(&shared, backend, &request);
+                        finish(&shared, accepted.operation, result);
+                        continue;
+                    }
                     #[cfg(unix)]
                     if let ObservedBackend::Swift(swift) = &session.backend {
                         let swift = swift.clone();
@@ -1211,12 +1298,22 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                 }
             }
         } else if let Some(session) = active.as_mut() {
+            if let ObservedBackend::Proxy(backend) = &session.backend {
+                // An already expired operation may still own joining children.
+                // Retry only its retained command; never create a new deadline.
+                let _ = backend.drive_abort();
+            }
             tokio::select! {
                 ()=shared.wake.notified()=>{},
                 result=&mut session.runtime=>{
-                    let failure=Failure{kind:result.err().map_or(io::ErrorKind::UnexpectedEof,|e|e.kind())};
-                    stopped(&shared,&mut active,Terminal::Failed(failure));
-                    shared.lock().snapshot.phase=Phase::Failed;shared.changed();
+                    let clean = result.is_ok() && matches!(&session.backend,
+                        ObservedBackend::Proxy(backend) if backend.clean_closed());
+                    let terminal = if clean { Terminal::Closed } else {
+                        Terminal::Failed(Failure { kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()) })
+                    };
+                    stopped(&shared, &mut active, terminal);
+                    shared.lock().snapshot.phase = if clean { Phase::Disconnected } else { Phase::Failed };
+                    shared.changed();
                 },
             }
         } else {

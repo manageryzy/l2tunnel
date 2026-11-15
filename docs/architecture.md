@@ -3,6 +3,14 @@
 Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
+The [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
+adds independent verified SNI, retained raw send observations, supported CLI naming
+and actual fixed/measured shared-service readiness/cleanup. Affected strict checks
+and finite TLS/Unix-device cases pass; failed attempts remain preserved. Production
+proxy CLI migration, Python behavior alignment and complete native/platform/
+resource/performance gates remain open. See [naming](modules/tcp-carrier-naming.md),
+[proxy service](modules/tcp-proxy-service.md) and [Python alignment](modules/python-behavior-alignment.md).
+
 The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
 implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
 Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
@@ -76,6 +84,24 @@ avoiding unrelated suites.
 Production CLI connect/serve/TAP startup, full carrier service, automatic retained
 recovery, all 47 mode gates, SW-11/RLNC/parity/rolling/packed/proxy, complete resources,
 native/platform and performance definitions remain required and open.
+
+## Required Python behavior alignment
+
+The [named Python alignment contract](modules/python-behavior-alignment.md)
+requires actual recovery ownership, feedback loss/budget, retry timing, codec and
+ACK policy parity with each explicitly identified experiment configuration.
+The historical per-connection CompactARQ78.7502 Mbit/s reference and the shared
+Packed Mux16 C46/C47/C48 candidates are separate compositions. Common integration
+is not evidence of either complete algorithm. Replace incorrect selected Rust
+behavior; keep historical receipts and explicitly versioned compatibility only.
+
+Priority is L3 TCP, with L2 retained and improved. CompactARQ serial/RTT/ACK-delay/
+guarded retries, complete8192/128/every16 with actual short copies and ACK
+coalescing, and separately selected per-flow/shared recovery remain required.
+Lossy algorithm feedback must not use a reliable side channel. Authenticated
+reliable management, common security, selected-carrier continuity and every
+existing mode/SW-11/platform/resource/performance requirement remain in scope.
+No new default profile or owner wire decision follows from this source audit.
 
 ## Reviewed target and implementation boundary
 

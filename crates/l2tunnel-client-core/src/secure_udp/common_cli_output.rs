@@ -8,6 +8,23 @@ use l2tunnel_security::Role;
 use serde_json::{Value, json};
 use std::io;
 
+pub(super) fn requested_tls(
+    mut values: Vec<Value>,
+    naming: Option<Value>,
+) -> io::Result<Vec<Value>> {
+    if let Some(naming) = naming {
+        let first = values
+            .first_mut()
+            .ok_or_else(|| io::Error::other("inspection header absent"))?;
+        first
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("inspection header is not an object"))?
+            .insert("tls_name_policy".into(), naming);
+        *first = bounded(std::mem::take(first))?;
+    }
+    Ok(values)
+}
+
 pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>> {
     let contract = profile.runtime_contract(role)?;
     let parameters = profile.parameters();

@@ -234,6 +234,10 @@ pub(super) async fn execute(
                 terminal = stopped => {
                     live = None;
                     match terminal.map_err(service_error)? {
+                        Terminal::Closed => {
+                            ended(&life, "closed", true);
+                            return Ok(());
+                        }
                         // An explicit local command; its own result follows.
                         Terminal::Aborted => ended(&life, "aborted", true),
                         Terminal::Failed(failure) => {

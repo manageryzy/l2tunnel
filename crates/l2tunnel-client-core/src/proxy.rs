@@ -238,6 +238,15 @@ impl Session {
     ) -> io::Result<CloseReport> {
         runtime::run(device, self.link, self.config, control).await
     }
+    /// Shared-service ownership: failure returns only after actual I/O children join.
+    /// The service retains this future during late cleanup; drop is not a join proof.
+    pub(crate) async fn run_service_owned<D: PacketDevice<Error = io::Error>>(
+        self,
+        device: D,
+        control: Control,
+    ) -> io::Result<CloseReport> {
+        runtime::run_service_owned(device, self.link, self.config, control).await
+    }
 }
 pub(super) fn remote(address: SocketAddr) -> io::Result<()> {
     if address.port() == 0

@@ -128,6 +128,15 @@ Neither that study nor the later SUR-11 runtime fairness correction qualifies
 P-unified-duplex-mux, full mode parity, reverse affinity or connection-round-robin
 admission. All47 complete catalog gates retain their stated scope and status.
 
+The [named behavior-alignment contract](modules/python-behavior-alignment.md)
+separates the archived per-connection CompactARQ reference from the shared
+Packed C46/C47/C48 profiles, including their different reverse ACK paths.
+Current Common uses Pipeline channel assignment rather than the archived Swift
+FNV path, but complete learned reverse affinity and those two recovery topologies
+remain unqualified. Public codec/recovery components and Common service delivery
+do not close these named runtime requirements. L3 TCP has implementation priority;
+L2 and all existing entries retain their full scope.
+
 ## Recovery and scheduling
 
 | Catalog ID | Existing Python implementation | Knobs and behavior that must survive the port | Rust milestone |
@@ -137,7 +146,7 @@ admission. All47 complete catalog gates retain their stated scope and status.
 | `legacy-sliding-fec` | `model.py:Tunnel.flush_code/queue_repair` | Random linear sliding window; `long_window`, `repair_every`, `repairs_per_group`; optional integer-credit `interleave_repairs`, causal `feedback_repair`, residual ARQ. | M3 |
 | `legacy-hybrid-fec` | `model.py:Tunnel.flush_code` | Short-window repairs with every `long_every` repair using `long_window`; `short_window`, plus sliding-mode timing and feedback knobs. | M3 |
 | `compact-rlnc` | `compact.py:CompactTransport/coefficient/CompactConfig` | Elastic GF(256) window; `repair_ratio`, `block_sources`, `flush_ms`, `feedback_ms`, `feedback_packets`, `tail_repair_delay_ms`; cumulative confirmation, retained source window, feedback/tail repairs. | M3 |
-| `compact-arq` | `compact_arq.py:CompactARQTransport/ARQFlight` | Selective repeat, cumulative prefix plus receipt bitmap, transmission serial/ACK echo, receiver delay subtraction, RTT estimation, guarded retries and timeout backoff. | M3 |
+| `compact-arq` | `compact_arq.py:CompactARQTransport/ARQFlight` | Selective repeat, cumulative prefix plus receipt bitmap, transmission serial/ACK echo, receiver delay subtraction, RTT estimation, guarded fast retries, repeated lossy feedback and current-attempt timeouts using the adaptive RTO (no exponential timeout backoff in the Python source). | M3 |
 | `first-flight-arq` | `compact_lowlatency.py:FirstFlightARQTransport` | Fresh feedback acknowledging at least three later sources may expedite only the first retry; repeated retries keep the RTT guard. | M3 |
 | `bounded-gap-arq` | `compact_lowlatency.py:BoundedGapARQTransport` | First-flight recovery plus rate-limited feedback for an advancing qualified gap; `gap_feedback_min_interval_ms`. Feedback consumes opposite-direction service. | M3 |
 | `compact-block-fec` | `compact_block.py:CompactBlockTransport/CompactBlockConfig` | Bounded GF(256) generations, initial repair ratio, rank-deficit feedback and in-flight repair subtraction by transmission serial. `generation_sources`, `idle_flush_ms`, `maximum_block_ms`, `assumed_loss_rate`, `repair_margin`. | M3 |

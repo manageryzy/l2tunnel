@@ -26,6 +26,8 @@ pub use prepared::{Attachment, Client, Options, Prepared, Server};
 #[cfg(unix)]
 mod common_local;
 mod owner;
+mod proxy_backend;
+pub use proxy_backend::{ProxyFrame, ProxyProfile};
 #[cfg(unix)]
 mod setup;
 #[cfg(unix)]
@@ -103,7 +105,8 @@ pub enum Completed {
     },
     /// Original managed owners were dropped; this is deliberately not clean drain.
     Aborted,
-    /// Existing typed control response, obtained after runtime completion/rejection.
+    /// Existing typed control response. Proxy drain explicitly reports local
+    /// acceptance; only the separate actual terminal carries closure proof.
     Applied(local::Response),
     /// Existing runtime definitively rejected/aborted the proposal before commit.
     Rejected(local::Response),
@@ -124,12 +127,14 @@ pub enum Completed {
     /// Original deadline or actual factory/runtime failure.
     Failed(Failure),
 }
-/// Why a live generation stopped; none of these mean peer-confirmed clean close.
+/// Why a live generation stopped; only explicit Closed carries a clean proxy proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Terminal {
     /// Explicit disconnect, reconnect or service owner cancellation.
     Aborted,
-    /// Actual managed runtime returned or failed.
+    /// The selected proxy completed its actual authenticated drain and joined children.
+    Closed,
+    /// Actual runtime returned or failed.
     Failed(Failure),
 }
 /// Actual currently retained setup listener, associated with its operation.
@@ -313,6 +318,8 @@ impl SwiftFrame {
 pub enum Observation {
     /// Existing managed TCP/TLS runtime status.
     Managed(managed::Status),
+    /// Exact fixed/measured TCP proxy owner, separate from Common profiles.
+    Proxy(Box<ProxyFrame>),
     /// Base system/frame UDP runtime status, boxed because it carries two lanes.
     UdpFrame(Box<UdpFrame>),
     /// Swift runtime status.
@@ -329,11 +336,14 @@ pub enum Observation {
     SecureUdpCommon(Box<SecureUdpCommonFrame>),
 }
 impl Observation {
-    #[cfg(unix)]
     fn record_service_terminal(&mut self, terminal: Terminal) {
         match self {
+            Self::Proxy(frame) => frame.service_terminal = Some(terminal),
+            #[cfg(unix)]
             Self::SecureUdp(frame) => frame.service_terminal = Some(terminal),
+            #[cfg(unix)]
             Self::SecureUdpTransaction(frame) => frame.service_terminal = Some(terminal),
+            #[cfg(unix)]
             Self::SecureUdpCommon(frame) => frame.service_terminal = Some(terminal),
             _ => {}
         }
@@ -342,6 +352,13 @@ impl Observation {
     pub fn managed(&self) -> Option<&managed::Status> {
         match self {
             Self::Managed(status) => Some(status),
+            _ => None,
+        }
+    }
+    /// Actual fixed/measured proxy observation, absent for other selections.
+    pub fn proxy(&self) -> Option<&ProxyFrame> {
+        match self {
+            Self::Proxy(frame) => Some(frame),
             _ => None,
         }
     }
@@ -394,6 +411,7 @@ enum ObservedBackend {
         profile: Option<managed::ProfileHandle>,
     },
     UdpFrame(Arc<UdpBackend>),
+    Proxy(Arc<proxy_backend::Backend>),
     #[cfg(unix)]
     Swift(Arc<SwiftBackend>),
     #[cfg(unix)]
@@ -448,6 +466,7 @@ impl ObservedBackend {
     fn observe(&self) -> Option<Observation> {
         match self {
             Self::Managed { control, .. } => control.status().map(Observation::Managed),
+            Self::Proxy(proxy) => Some(Observation::Proxy(Box::new(proxy.observe()))),
             Self::UdpFrame(udp) => Some(Observation::UdpFrame(Box::new(UdpFrame {
                 requested: udp.requested,
                 effective: udp.effective,
@@ -791,7 +810,9 @@ impl Handle {
         if !local::supported_version(request.version)
             || !matches!(
                 request.action,
-                local::Action::SwitchCompression { .. } | local::Action::SetSwiftPolicy { .. }
+                local::Action::SwitchCompression { .. }
+                    | local::Action::SetSwiftPolicy { .. }
+                    | local::Action::DrainProxy {}
             )
         {
             return Err(SubmitError::Unsupported);
@@ -869,6 +890,12 @@ impl Handle {
         if state.snapshot.operation.is_some() {
             return Err(SubmitError::Busy);
         }
+        if matches!(&state.backend, Some(ObservedBackend::Proxy(backend)) if backend.awaiting_release())
+        {
+            // Retained keys above still replay, but no new work can replace an
+            // owner whose actual child joins have not yet completed.
+            return Err(SubmitError::Busy);
+        }
         let connected = state.backend.is_some();
         #[cfg(unix)]
         if let Command::Transaction(configuration) = &command {
@@ -916,6 +943,10 @@ impl Handle {
                         || (request.version == local::SECURE_UDP_VERSION
                             && matches!(backend, ObservedBackend::SecureUdp(_)))
                 }
+                local::Action::DrainProxy {} => {
+                    request.version == local::VERSION
+                        && matches!(backend, ObservedBackend::Proxy(_))
+                }
                 _ => false,
             };
             if !fits {
@@ -941,6 +972,14 @@ impl Handle {
                     .checked_add(p.setup_timeout())
                     .ok_or(SubmitError::Closed)?,
             ),
+            Command::Disconnect => match &state.backend {
+                Some(ObservedBackend::Proxy(backend)) => Some(
+                    accepted_at
+                        .checked_add(backend.stop_timeout())
+                        .ok_or(SubmitError::Closed)?,
+                ),
+                _ => None,
+            },
             _ => None,
         };
         if let Command::Connect(p) | Command::Reconnect(p) = &command {
@@ -1234,6 +1273,7 @@ impl Handle {
                     .request(request)
                     .await
             }
+            Some(ObservedBackend::Proxy(_)) => Self::proxy_status_from(view.snapshot, true, "ok"),
             // Existing base UDP has no local-v1 managed status projection.
             Some(ObservedBackend::UdpFrame(_)) => response("unsupported"),
             #[cfg(unix)]
@@ -1249,6 +1289,19 @@ impl Handle {
             #[cfg(unix)]
             Some(ObservedBackend::SecureUdpCommon(_)) => {
                 Self::common_status_from(view.snapshot, true, "ok")
+            }
+            None if view
+                .snapshot
+                .runtime
+                .as_ref()
+                .and_then(Observation::proxy)
+                .is_some() =>
+            {
+                Self::proxy_status_from(
+                    view.snapshot,
+                    idle_ok,
+                    if idle_ok { "ok" } else { "closed" },
+                )
             }
             None if idle_ok => {
                 Self::lifecycle_reply_from(view.version, view.snapshot, false, true, "ok")
@@ -1391,6 +1444,14 @@ impl Handle {
                 return Self::secure_udp_status_from(snapshot, connected, ok, code);
             }
             _ => {}
+        }
+        if snapshot
+            .runtime
+            .as_ref()
+            .and_then(Observation::proxy)
+            .is_some()
+        {
+            return Self::proxy_status_from(snapshot, ok, code);
         }
         #[cfg(unix)]
         if matches!(&snapshot.runtime, Some(Observation::Swift(_)) | None) {
@@ -1567,9 +1628,9 @@ fn response(code: &str) -> local::Response {
     }
 }
 type RunFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
-/// Sole lifecycle actor. No task is implicitly spawned. Original inline managed
-/// and base UDP socket/device futures drop before the completion guard publishes
-/// cancellation.
+/// Sole lifecycle actor. Original managed/base UDP owners stay inline. Selected
+/// proxy actors own spawned TLS I/O: explicit disconnect observes actual joins;
+/// dropping Run only requests their abort and never proves their release.
 pub struct Run {
     future: RunFuture,
     _completion: Completion,
@@ -1586,6 +1647,8 @@ impl Drop for Completion {
         let mut state = self.0.lock();
         state.snapshot.phase = Phase::Closed;
         state.snapshot.listening = None;
+        let proxy_unreleased = matches!(&state.backend,
+            Some(ObservedBackend::Proxy(backend)) if !backend.released());
         if let Some(backend) = state.backend.take() {
             state.snapshot.runtime = backend.observe();
         }
@@ -1597,7 +1660,14 @@ impl Drop for Completion {
             if state.terminals.len() == RETAINED {
                 state.terminals.pop_front();
             }
-            state.terminals.push_back((generation, Terminal::Aborted));
+            let terminal = if proxy_unreleased {
+                Terminal::Failed(Failure {
+                    kind: io::ErrorKind::Interrupted,
+                })
+            } else {
+                Terminal::Aborted
+            };
+            state.terminals.push_back((generation, terminal));
         }
         for entry in &mut state.entries {
             if entry.result.is_none() {
@@ -1620,7 +1690,6 @@ impl Drop for Completion {
         {
             state.snapshot.terminal = Some(*terminal);
         }
-        #[cfg(unix)]
         if let Some(terminal) = state.snapshot.terminal
             && let Some(observation) = &mut state.snapshot.runtime
         {

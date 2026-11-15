@@ -234,6 +234,7 @@ impl<I: PacketIo + Send + 'static> Unpin for PacketSetup<'_, I> {}
 /// The caller must continue polling it while another peer is still setting up.
 pub struct PacketCarrier<I: PacketIo + Send + 'static> {
     lanes: [Option<Detached<I>>; 2],
+    terminal_sent: [Option<SentRecord>; 2],
     info: PairInfo,
     policy: PacketPolicy,
     policy_digest: [u8; 32],
@@ -732,6 +733,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
         .encode()?;
         self.carrier = Some(PacketCarrier {
             lanes: std::mem::take(&mut self.detached),
+            terminal_sent: [None, None],
             info,
             policy: self.policy,
             policy_digest: self.policy_digest,
@@ -1230,6 +1232,13 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     }
     fn fail(&mut self, e: Error) -> Error {
         let e = self.fault.get_or_insert(e).clone();
+        for (saved, lane) in self.terminal_sent.iter_mut().zip(&mut self.lanes) {
+            if saved.is_none()
+                && let Some(lane) = lane
+            {
+                *saved = lane.completed.take();
+            }
+        }
         self.lanes = [None, None];
         self.records.clear();
         e
@@ -1315,6 +1324,26 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             .ok_or(Error::Configuration)?
             .completed
             .take())
+    }
+    /// Observe one real physical handoff even after expiry released original I/O.
+    /// No I/O is performed. A returned failure remains terminal and never changes
+    /// the original sent_at, grants peer-delivery credit or permits retransmission.
+    pub fn take_sent_record_observed(
+        &mut self,
+        lane: PairLane,
+    ) -> Result<SentRecordObservation, Error> {
+        let index = lane.index();
+        if index >= self.count() {
+            return Err(Error::Configuration);
+        }
+        let failure = self.check_live().err();
+        let sent = match self.terminal_sent[index].take() {
+            Some(sent) => Some(sent),
+            None => self.lanes[index]
+                .as_mut()
+                .and_then(|owner| owner.completed.take()),
+        };
+        Ok(SentRecordObservation { sent, failure })
     }
     /// Bounded fair physical progress, transition replies and authenticated liveness.
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {

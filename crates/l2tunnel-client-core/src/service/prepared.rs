@@ -78,7 +78,7 @@ pub struct Client {
     pub remote: SocketAddr,
     /// Maintained TLS verifier configuration.
     pub tls: ClientTls,
-    /// Explicit verified name; SNI remains disabled by existing TLS implementation.
+    /// Certificate verification name; public SNI is configured separately in tls.
     pub server_name: String,
     /// Existing authenticated member key, retained without serialization or Debug.
     pub member: Arc<MemberKey>,
@@ -127,6 +127,8 @@ pub(super) struct CommonCarrierServer {
 #[derive(Clone)]
 pub(super) enum Transport {
     Managed(Options),
+    Proxy(Arc<crate::proxy::Settings>),
+    ProxyMeasured(Arc<crate::proxy_measured::Settings>),
     UdpFrame {
         settings: crate::udp::Settings,
         delivery: managed::DeliveryConfig,
@@ -163,6 +165,64 @@ pub struct Prepared {
     pub(super) data: Arc<Data>,
 }
 impl Prepared {
+    /// Explicit fixed-credit maintained-TCP proxy; all attachment work is deferred.
+    pub fn proxy_client(
+        connection: ConnectionConfig,
+        credentials: Client,
+        settings: crate::proxy::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&credentials)?;
+        Self::new(
+            connection,
+            Endpoint::Client(credentials),
+            attachment,
+            Transport::Proxy(Arc::new(settings)),
+        )
+    }
+    /// Fixed proxy acceptor retaining the existing full/paired TLS factory.
+    pub fn proxy_server(
+        connection: ConnectionConfig,
+        credentials: Server,
+        settings: crate::proxy::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            connection,
+            Endpoint::Server(credentials),
+            attachment,
+            Transport::Proxy(Arc::new(settings)),
+        )
+    }
+    /// Explicit measured relay targets; this does not select exact native rwnd control.
+    pub fn proxy_measured_client(
+        connection: ConnectionConfig,
+        credentials: Client,
+        settings: crate::proxy_measured::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&credentials)?;
+        Self::new(
+            connection,
+            Endpoint::Client(credentials),
+            attachment,
+            Transport::ProxyMeasured(Arc::new(settings)),
+        )
+    }
+    /// Measured proxy acceptor with the same deferred attachment and TLS ownership.
+    pub fn proxy_measured_server(
+        connection: ConnectionConfig,
+        credentials: Server,
+        settings: crate::proxy_measured::Settings,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            connection,
+            Endpoint::Server(credentials),
+            attachment,
+            Transport::ProxyMeasured(Arc::new(settings)),
+        )
+    }
     /// Explicit same-socket Noise/member/Swift client, with deferred device work.
     #[cfg(unix)]
     pub fn secure_udp_client(
@@ -459,6 +519,16 @@ impl Prepared {
                     }
                 }
                 options.profile_interval
+            }
+            Transport::Proxy(settings) => {
+                let config = crate::proxy::runtime_config(connection, settings)?;
+                l2tunnel_runtime::proxy::session_config(&config)?;
+                None
+            }
+            Transport::ProxyMeasured(settings) => {
+                let config = crate::proxy_measured::runtime_config(connection, settings)?;
+                l2tunnel_runtime::proxy::measured::session_config(&config)?;
+                None
             }
             Transport::UdpFrame { settings, delivery } => {
                 // Same exact checks the authenticated factory repeats before I/O.
