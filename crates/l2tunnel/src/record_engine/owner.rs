@@ -8,28 +8,32 @@ use swift::records;
 
 #[allow(clippy::large_enum_variant)] // Exactly one actual owner; no extra heap indirection or unused engines.
 pub(super) enum Owner {
-    Swift {
-        set: swift::storage::Set,
-        id: swift::storage::EngineId,
-    },
+    Swift(swift::storage::Owned),
     Aligned(aligned::Endpoint),
     Packed(aligned::packed::Endpoint),
 }
 
 impl Owner {
+    pub(super) fn storage_heap(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Swift(owned) => {
+                let usage = owned.usage();
+                Some((usage.heap_bytes, usage.allocations))
+            }
+            Self::Aligned(endpoint) => endpoint
+                .storage_usage()
+                .map(|u| (u.capacity_bytes, u.allocations)),
+            Self::Packed(endpoint) => endpoint
+                .storage_usage()
+                .map(|u| (u.capacity_bytes, u.allocations)),
+        }
+    }
     pub(super) fn new(
         configuration: &configuration::Configuration,
         context: Context,
     ) -> Result<Self, Error> {
         let local = configuration.descriptor().local(context.role);
-        let recovery = RecoveryContext {
-            session: context.session,
-            epoch: context.epoch,
-            role: match context.role {
-                l2tunnel_management::Role::Client => EndpointRole::Initiator,
-                l2tunnel_management::Role::Server => EndpointRole::Responder,
-            },
-        };
+        let recovery = recovery_context(context);
         match (local.send().profile(), local.receive().profile()) {
             (
                 configuration::DirectionProfile::Swift(send),
@@ -37,14 +41,12 @@ impl Owner {
             ) => {
                 let plan =
                     swift::storage::Plan::for_engine(*send, *receive).map_err(Error::Storage)?;
-                let capacity_bytes = std::mem::size_of::<swift::storage::Set>()
+                let capacity_bytes = std::mem::size_of::<swift::storage::Owned>()
                     .checked_add(plan.capacity_bytes())
                     .ok_or(Error::Arithmetic)?;
-                let mut set =
-                    swift::storage::Set::new(swift::storage::Limits { capacity_bytes }, 0)
-                        .map_err(Error::Storage)?;
-                let id = set.prepare(plan).map_err(Error::Storage)?;
-                Ok(Self::Swift { set, id })
+                swift::storage::Owned::new(plan, swift::storage::Limits { capacity_bytes })
+                    .map(Self::Swift)
+                    .map_err(Error::Storage)
             }
             (
                 configuration::DirectionProfile::Aligned(send),
@@ -69,12 +71,11 @@ impl Owner {
         bytes: &[u8],
     ) -> Result<Option<ProfileIdentity>, Error> {
         match self {
-            Self::Swift { set, id } => {
+            Self::Swift(owned) => {
                 let channel =
                     records::ChannelId::new(usize::from(channel)).ok_or(Error::Configuration)?;
-                match set
-                    .entry(*id)
-                    .map_err(Error::Storage)?
+                match owned
+                    .entry()
                     .offer_on_channel_identified(now.0, channel, bytes)
                     .map_err(Error::Swift)?
                 {
@@ -118,13 +119,8 @@ impl Owner {
         overhead: usize,
     ) -> Result<Option<Emission>, Error> {
         match self {
-            Self::Swift { set, id } => {
-                let maximum = set
-                    .engine(*id)
-                    .map_err(Error::Storage)?
-                    .send_config()
-                    .codec
-                    .datagram_bytes;
+            Self::Swift(owned) => {
+                let maximum = owned.engine().send_config().codec.datagram_bytes;
                 if out.len() < maximum {
                     return Err(Error::Output { required: maximum });
                 }
@@ -132,7 +128,7 @@ impl Owner {
                 if budget.packets == 0 || budget.wire_bytes < maximum_wire {
                     return Ok(None);
                 }
-                let mut entry = set.entry(*id).map_err(Error::Storage)?;
+                let mut entry = owned.entry();
                 let Some(emission) = entry
                     .poll_emission(now.0, records::RecordNumber(number), allow_data)
                     .map_err(Error::Swift)?
@@ -196,7 +192,7 @@ impl Owner {
         body: &mut [u8],
     ) -> Result<(), Error> {
         match self {
-            Self::Swift { set, id } => {
+            Self::Swift(owned) => {
                 let observed = match *body.first().ok_or(Error::PacketSize)? & swift::KIND_MASK {
                     swift::KIND_SOURCE => EmissionKind::Source(SourceForm::Swift),
                     swift::KIND_REPAIR => EmissionKind::Repair,
@@ -206,8 +202,8 @@ impl Owner {
                 if observed != kind {
                     return Err(Error::Kind);
                 }
-                set.entry(*id)
-                    .map_err(Error::Storage)?
+                owned
+                    .entry()
                     .accept(now.0, records::RecordNumber(number), body)
                     .map_err(Error::Swift)
             }
@@ -238,16 +234,12 @@ impl Owner {
         out: &mut [u8],
     ) -> Result<NativeStep, Error> {
         match self {
-            Self::Swift { set, id } => {
-                let maximum = set
-                    .engine(*id)
-                    .map_err(Error::Storage)?
-                    .receive_config()
-                    .max_native;
+            Self::Swift(owned) => {
+                let maximum = owned.engine().receive_config().max_native;
                 if out.len() < maximum {
                     return Err(Error::Output { required: maximum });
                 }
-                let mut entry = set.entry(*id).map_err(Error::Storage)?;
+                let mut entry = owned.entry();
                 let Some(packet) = entry.pop_identified().map_err(Error::Swift)? else {
                     return Ok(NativeStep::Idle);
                 };
@@ -277,7 +269,7 @@ impl Owner {
 
     pub(super) fn commit(&mut self, now: Tick) -> Result<(), Error> {
         match self {
-            Self::Swift { .. } => Ok(()),
+            Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint
                 .commit_delivery(duration(now))
                 .map_err(Error::Aligned),
@@ -289,7 +281,7 @@ impl Owner {
 
     pub(super) fn pending_deadline(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Swift { .. } => None,
+            Self::Swift(_) => None,
             Self::Aligned(endpoint) => endpoint.pending_deadline(),
             Self::Packed(endpoint) => endpoint.pending_deadline(),
         }
@@ -297,7 +289,7 @@ impl Owner {
 
     pub(super) fn tick(&mut self, now: Tick) -> Result<(), Error> {
         match self {
-            Self::Swift { .. } => Ok(()),
+            Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Packed(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
         }
@@ -305,8 +297,8 @@ impl Owner {
 
     pub(super) fn deadline(&self) -> Result<Option<Tick>, Error> {
         match self {
-            Self::Swift { set, id } => {
-                let engine = set.engine(*id).map_err(Error::Storage)?;
+            Self::Swift(owned) => {
+                let engine = owned.engine();
                 Ok(engine
                     .data_deadline()
                     .into_iter()
@@ -335,8 +327,8 @@ impl Owner {
 
     pub(super) fn drained(&self) -> Result<bool, Error> {
         match self {
-            Self::Swift { set, id } => {
-                let engine = set.engine(*id).map_err(Error::Storage)?;
+            Self::Swift(owned) => {
+                let engine = owned.engine();
                 Ok(engine.send_drained() && engine.receive_drained())
             }
             Self::Aligned(endpoint) => Ok(endpoint.drained()),
@@ -507,4 +499,15 @@ fn poll_endpoint(
         security_number: number,
         witnesses: count,
     }))
+}
+
+pub(super) fn recovery_context(context: Context) -> RecoveryContext {
+    RecoveryContext {
+        session: context.session,
+        epoch: context.epoch,
+        role: match context.role {
+            l2tunnel_management::Role::Client => EndpointRole::Initiator,
+            l2tunnel_management::Role::Server => EndpointRole::Responder,
+        },
+    }
 }

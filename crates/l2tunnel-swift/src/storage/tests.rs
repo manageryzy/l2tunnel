@@ -5,6 +5,201 @@ use crate::records::{Admission, Direction, IdentifiedAdmission, Layer, RecordNum
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+fn owned_limits(plan: Plan) -> Result<Limits, Error> {
+    Ok(Limits {
+        capacity_bytes: size_of::<Owned>()
+            .checked_add(plan.capacity_bytes())
+            .ok_or(Error::Budget)?,
+    })
+}
+
+#[test]
+fn owned_exact_limits_and_movement_preserve_one_actual_duplex_engine() -> TestResult {
+    let plan = duplex(3, 1)?;
+    let limits = owned_limits(plan)?;
+    assert!(matches!(
+        Owned::new(
+            plan,
+            Limits {
+                capacity_bytes: limits.capacity_bytes - 1
+            }
+        ),
+        Err(Error::Budget)
+    ));
+    let owned = Owned::new(plan, limits)?;
+    let usage = owned.usage();
+    assert_eq!(usage.fixed_bytes, size_of::<Owned>());
+    assert_eq!(usage.heap_bytes, plan.capacity_bytes());
+    assert_eq!(usage.limit_bytes, usage.fixed_bytes + usage.heap_bytes);
+    assert!(usage.allocations > 4);
+    let mut slot = Some(owned);
+    let mut moved = slot.take().ok_or(Error::Stale)?;
+    assert!(slot.is_none());
+    assert_eq!(moved.engine().send_config(), config(3));
+    assert_eq!(moved.engine().receive_config(), config(1));
+    let channel = records::ChannelId::new(2).ok_or(Error::Stale)?;
+    let admitted = moved
+        .entry()
+        .offer_on_channel_identified(0, channel, &[0xad; 71])?;
+    assert_eq!(
+        admitted,
+        IdentifiedAdmission::Accepted(records::NativeIdentity {
+            channel,
+            record: records::NativeRecordId(0)
+        })
+    );
+    assert_eq!(moved.usage(), usage);
+    Ok(())
+}
+
+#[test]
+fn owned_every_constructor_reservation_refuses_without_mutating_existing_set() -> TestResult {
+    let target = duplex(3, 1)?;
+    let limits = owned_limits(target)?;
+    let count = Owned::new(target, limits)?.usage().allocations;
+    let old_plan = duplex(2, 3)?;
+    let mut old = with_plans(&[old_plan], 17)?;
+    let id = old.prepare(old_plan)?;
+    assert_eq!(old.entry(id)?.offer(0, &[0xab; 53])?, Admission::Accepted);
+    let usage = old.usage();
+    let stats = old.engine(id)?.stats();
+    let boundary = old.engine(id)?.boundary(
+        Direction::Send,
+        records::ChannelId::new(0).ok_or(Error::Stale)?,
+    );
+    for failure in 1..=count {
+        let mut allocation = Allocation::new(target.capacity_bytes());
+        allocation.fail_at = Some(failure);
+        assert!(matches!(
+            Owned::build(target, limits, allocation),
+            Err(Error::Engine(records::Error::Codec(
+                crate::Error::Allocation
+            )))
+        ));
+        assert_eq!(old.usage(), usage);
+        assert_eq!(old.engine(id)?.stats(), stats);
+        assert_eq!(
+            old.engine(id)?.boundary(
+                Direction::Send,
+                records::ChannelId::new(0).ok_or(Error::Stale)?
+            ),
+            boundary
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn owned_matches_existing_set_through_full_numbered_loss_feedback_and_native_delivery() -> TestResult
+{
+    let forward = duplex(3, 1)?;
+    let reverse = duplex(1, 3)?;
+    let mut left = Owned::new(forward, owned_limits(forward)?)?;
+    let mut right = Owned::new(reverse, owned_limits(reverse)?)?;
+    let mut left_set = with_plans(&[forward], 0)?;
+    let mut right_set = with_plans(&[reverse], 0)?;
+    let left_id = left_set.prepare(forward)?;
+    let right_id = right_set.prepare(reverse)?;
+    let channel = records::ChannelId::new(2).ok_or(Error::Stale)?;
+    let native = std::array::from_fn::<_, 87, _>(|index| (index as u8).wrapping_mul(29));
+    let a = left
+        .entry()
+        .offer_on_channel_identified(0, channel, &native)?;
+    let b = left_set
+        .entry(left_id)?
+        .offer_on_channel_identified(0, channel, &native)?;
+    assert_eq!(a, b);
+    let mut lost = false;
+    let mut delivered = Vec::new();
+    let mut serial = 1_u64 << 47;
+    for step in 0..32 {
+        let now = step * 1_000;
+        serial += 1;
+        let actual = {
+            let mut entry = left.entry();
+            entry
+                .poll(now, RecordNumber(serial), true)?
+                .map(<[u8]>::to_vec)
+        };
+        let expected = {
+            let mut entry = left_set.entry(left_id)?;
+            entry
+                .poll(now, RecordNumber(serial), true)?
+                .map(<[u8]>::to_vec)
+        };
+        assert_eq!(actual, expected);
+        if let Some(mut bytes) = actual {
+            if !lost {
+                lost = true;
+            } else {
+                let mut expected = bytes.clone();
+                right
+                    .entry()
+                    .accept(now, RecordNumber(serial), &mut bytes)?;
+                right_set
+                    .entry(right_id)?
+                    .accept(now, RecordNumber(serial), &mut expected)?;
+                assert_eq!(bytes, expected);
+            }
+        }
+        let actual = {
+            let mut entry = right.entry();
+            entry
+                .pop_identified()?
+                .map(|p| (p.identity, p.bytes.to_vec()))
+        };
+        let expected = {
+            let mut entry = right_set.entry(right_id)?;
+            entry
+                .pop_identified()?
+                .map(|p| (p.identity, p.bytes.to_vec()))
+        };
+        assert_eq!(actual, expected);
+        if let Some(packet) = actual {
+            delivered.push(packet);
+        }
+        serial += 1;
+        let actual = {
+            let mut entry = right.entry();
+            entry
+                .poll(now, RecordNumber(serial), false)?
+                .map(<[u8]>::to_vec)
+        };
+        let expected = {
+            let mut entry = right_set.entry(right_id)?;
+            entry
+                .poll(now, RecordNumber(serial), false)?
+                .map(<[u8]>::to_vec)
+        };
+        assert_eq!(actual, expected);
+        if let Some(mut bytes) = actual {
+            let mut expected = bytes.clone();
+            left.entry().accept(now, RecordNumber(serial), &mut bytes)?;
+            left_set
+                .entry(left_id)?
+                .accept(now, RecordNumber(serial), &mut expected)?;
+        }
+        if !delivered.is_empty() && left.engine().send_drained() && right.engine().receive_drained()
+        {
+            break;
+        }
+    }
+    assert!(lost);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered[0].0,
+        records::NativeIdentity {
+            channel,
+            record: records::NativeRecordId(0)
+        }
+    );
+    assert_eq!(delivered[0].1, native);
+    assert!(left.engine().send_drained());
+    assert!(right.engine().receive_drained());
+    assert_eq!(left.engine().stats(), left_set.engine(left_id)?.stats());
+    Ok(())
+}
+
 fn config(channels: usize) -> records::Config {
     records::Config {
         codec: crate::Config {

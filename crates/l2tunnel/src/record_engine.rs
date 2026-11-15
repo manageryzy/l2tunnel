@@ -1,8 +1,8 @@
-//! Functional composition of the actual queue and existing record algorithms.
+//! Actual shared-queue composition of the existing record algorithms.
 //!
 //! Authentication, replay, connection pacing and physical device completion stay
-//! with the caller. This explicit comparison owner is not a reserved runtime or
-//! a mixed-generation transaction bank. It never selects a carrier or clock.
+//! with the caller. Functional and actually reserved constructors remain explicit;
+//! neither is a mixed-generation runtime bank. No carrier or clock is selected.
 
 use crate::record_configuration as configuration;
 use l2tunnel_aligned as aligned;
@@ -16,8 +16,13 @@ use std::{fmt, time::Duration};
 
 #[cfg(test)]
 mod errors_tests;
+/// Complete actual reserved backing of one common record Engine.
+pub mod storage;
+
 mod native;
 mod owner;
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 mod tests;
 use owner::Owner;
@@ -141,6 +146,8 @@ pub enum Error {
     Kind,
     /// Positive bounded native preparation work is required.
     Work,
+    /// Reserved construction requires borrowed admission instead of an owned output Vec.
+    OwnedOutput,
     /// Original immutable native custody deadline expired.
     Expired,
     /// Local completion token is absent, stale or belongs to another handoff.
@@ -183,6 +190,8 @@ impl std::error::Error for EnqueueError {}
 pub enum Qualification {
     /// Real queues and algorithms, without complete reserved/runtime qualification.
     Functional,
+    /// Complete backing of this Engine; external/runtime/mixed-generation qualification stays separate.
+    Reserved,
 }
 
 /// Local observations, never substitutes for transaction drain fences.
@@ -283,6 +292,7 @@ pub struct Engine {
     statistics: Statistics,
     last: Option<Tick>,
     failure: Option<Error>,
+    usage: Option<storage::Usage>,
 }
 
 impl Engine {
@@ -296,52 +306,47 @@ impl Engine {
         geometry: Geometry,
         native_limits: NativeLimits,
     ) -> Result<Self, Error> {
-        configuration.validate().map_err(|_| Error::Configuration)?;
-        if context.session == 0 || context.epoch == 0 || native_limits.stall_micros == 0 {
-            return Err(Error::Configuration);
-        }
-        let descriptor = configuration.descriptor();
-        for (role, overhead) in [
-            (Role::Client, geometry.forward_overhead_bytes),
-            (Role::Server, geometry.reverse_overhead_bytes),
-        ] {
-            let view = descriptor.direction(role);
-            match view.common().traffic().tcp {
-                TcpControl::System => {}
-                TcpControl::TunnelCredits => {
-                    return Err(Error::Unsupported(Capability::TunnelCredits));
-                }
-                TcpControl::SplitTcpProxy => return Err(Error::Unsupported(Capability::TcpProxy)),
-            }
-            if !matches!(
-                view.common().native_window(),
-                configuration::NativeWindow::Disabled
-            ) {
-                return Err(Error::Unsupported(Capability::NativeWindow));
-            }
-            let (maximum, _, charge) = dimensions(view.profile())?;
-            let wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
-            if charge.is_some_and(|actual| actual != overhead)
-                || wire > descriptor.path_mtu()
-                || wire > view.common().burst_bytes()
-            {
-                return Err(Error::Geometry);
-            }
-        }
-        let local = descriptor.local(context.role);
-        let (send_max, witnesses, _) = dimensions(local.send().profile())?;
-        let (receive_max, _, _) = dimensions(local.receive().profile())?;
-        let native_max = local.receive().max_native();
-        let receive_channels = local.receive().channels();
-        let pipeline =
-            pipeline::Pipeline::new(local.send().common().pipeline()).map_err(Error::Pipeline)?;
+        let parameters = parameters(&configuration, context, geometry, native_limits)?;
+        let pipeline = pipeline::Pipeline::new(
+            configuration
+                .descriptor()
+                .local(context.role)
+                .send()
+                .common()
+                .pipeline(),
+        )
+        .map_err(Error::Pipeline)?;
         let owner = Owner::new(&configuration, context)?;
-        let digest = configuration.digest().map_err(|_| Error::Configuration)?;
-        let overhead = match context.role {
-            Role::Client => geometry.forward_overhead_bytes,
-            Role::Server => geometry.reverse_overhead_bytes,
-        };
-        Ok(Self {
+        Ok(Self::assemble(
+            configuration,
+            context,
+            native_limits,
+            parameters,
+            pipeline,
+            owner,
+            None,
+        ))
+    }
+
+    fn assemble(
+        configuration: configuration::Configuration,
+        context: Context,
+        limits: NativeLimits,
+        parameters: Parameters,
+        pipeline: pipeline::Pipeline,
+        owner: Owner,
+        usage: Option<storage::Usage>,
+    ) -> Self {
+        let Parameters {
+            digest,
+            send_max,
+            receive_max,
+            native_max,
+            witnesses,
+            overhead,
+            receive_channels,
+        } = parameters;
+        Self {
             configuration,
             context,
             digest,
@@ -354,12 +359,13 @@ impl Engine {
             overhead,
             receive_channels,
             next_channel: 0,
-            limits: native_limits,
+            limits,
             pending: None,
             statistics: Statistics::default(),
             last: None,
             failure: None,
-        })
+            usage,
+        }
     }
 
     /// Admit the original allocation to the actual common classifier/queue policy.
@@ -380,11 +386,15 @@ impl Engine {
     }
 
     /// Offer one actual selected MUX/DRR head to the maintained record algorithm.
+    /// Reserved construction requires `admit_borrowed`, without an output Vec.
     pub fn admit_one(
         &mut self,
         now: Tick,
     ) -> Result<Option<pipeline::Admitted<ProfileIdentity>>, Error> {
         self.advance(now)?;
+        if self.usage.is_some() {
+            return Err(Error::OwnedOutput);
+        }
         let next = self
             .statistics
             .admitted
@@ -395,6 +405,46 @@ impl Engine {
             .pipeline
             .offer_front(|metadata, bytes| owner.offer(now, metadata.binding.channel, bytes))
         {
+            Ok(Some(admitted)) => {
+                self.statistics.admitted = next;
+                Ok(Some(admitted))
+            }
+            Ok(None) => Ok(None),
+            Err(pipeline::DequeueError::Pipeline(error)) => self.fail(Error::Pipeline(error)),
+            Err(pipeline::DequeueError::Commit(error)) => self.fail(error),
+        }
+    }
+
+    /// Admit original borrowed bytes through the actual selected common queue.
+    ///
+    /// Reserved construction copies into its preallocated packet slab; legacy
+    /// functional backing may allocate. Caller input storage stays external.
+    pub fn enqueue_borrowed(
+        &mut self,
+        now: Tick,
+        bytes: &[u8],
+    ) -> Result<pipeline::PacketMetadata, Error> {
+        self.advance(now)?;
+        self.pipeline
+            .enqueue_borrowed(bytes, duration(now))
+            .map_err(Error::Pipeline)
+    }
+
+    /// Commit one actual selected head without allocating an owned payload result.
+    pub fn admit_borrowed(
+        &mut self,
+        now: Tick,
+    ) -> Result<Option<pipeline::Admission<ProfileIdentity>>, Error> {
+        self.advance(now)?;
+        let next = self
+            .statistics
+            .admitted
+            .checked_add(1)
+            .ok_or(Error::Arithmetic)?;
+        let owner = &mut self.owner;
+        match self.pipeline.offer_front_borrowed(|metadata, bytes| {
+            owner.offer(now, metadata.binding.channel, bytes)
+        }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
                 Ok(Some(admitted))
@@ -506,7 +556,11 @@ impl Engine {
     }
     /// Actual limited qualification of this constructor.
     pub const fn qualification(&self) -> Qualification {
-        Qualification::Functional
+        if self.usage.is_some() {
+            Qualification::Reserved
+        } else {
+            Qualification::Functional
+        }
     }
     /// Local observations; identities are never converted into native counts.
     pub const fn statistics(&self) -> Statistics {
@@ -539,6 +593,76 @@ impl Engine {
         self.failure.get_or_insert(error);
         Err(error)
     }
+}
+
+#[derive(Clone, Copy)]
+struct Parameters {
+    digest: ConfigDigest,
+    send_max: usize,
+    receive_max: usize,
+    native_max: usize,
+    witnesses: usize,
+    overhead: usize,
+    receive_channels: u16,
+}
+
+fn parameters(
+    configuration: &configuration::Configuration,
+    context: Context,
+    geometry: Geometry,
+    native_limits: NativeLimits,
+) -> Result<Parameters, Error> {
+    configuration.validate().map_err(|_| Error::Configuration)?;
+    if context.session == 0 || context.epoch == 0 || native_limits.stall_micros == 0 {
+        return Err(Error::Configuration);
+    }
+    let descriptor = configuration.descriptor();
+    for (role, overhead) in [
+        (Role::Client, geometry.forward_overhead_bytes),
+        (Role::Server, geometry.reverse_overhead_bytes),
+    ] {
+        let view = descriptor.direction(role);
+        match view.common().traffic().tcp {
+            TcpControl::System => {}
+            TcpControl::TunnelCredits => {
+                return Err(Error::Unsupported(Capability::TunnelCredits));
+            }
+            TcpControl::SplitTcpProxy => return Err(Error::Unsupported(Capability::TcpProxy)),
+        }
+        if !matches!(
+            view.common().native_window(),
+            configuration::NativeWindow::Disabled
+        ) {
+            return Err(Error::Unsupported(Capability::NativeWindow));
+        }
+        let (maximum, _, charge) = dimensions(view.profile())?;
+        let wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
+        if charge.is_some_and(|actual| actual != overhead)
+            || wire > descriptor.path_mtu()
+            || wire > view.common().burst_bytes()
+        {
+            return Err(Error::Geometry);
+        }
+    }
+    let local = descriptor.local(context.role);
+    let (send_max, witnesses, _) = dimensions(local.send().profile())?;
+    let (receive_max, _, _) = dimensions(local.receive().profile())?;
+    let native_max = local.receive().max_native();
+    let receive_channels = local.receive().channels();
+    let digest = configuration.digest().map_err(|_| Error::Configuration)?;
+    let overhead = match context.role {
+        Role::Client => geometry.forward_overhead_bytes,
+        Role::Server => geometry.reverse_overhead_bytes,
+    };
+    Ok(Parameters {
+        digest,
+        send_max,
+        receive_max,
+        native_max,
+        witnesses,
+        overhead,
+        receive_channels,
+    })
 }
 
 fn duration(now: Tick) -> Duration {

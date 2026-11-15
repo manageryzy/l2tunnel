@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::{FlowKey, Mapping};
+use crate::{FlowKey, Mapping, storage};
 
 /// Local nonreusable flow identifier; unrelated to channel and recovery IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -79,9 +79,82 @@ impl std::fmt::Display for FlowError {
 impl std::error::Error for FlowError {}
 
 #[derive(Clone, Copy, Debug)]
-struct Entry {
+pub(crate) struct Entry {
     binding: Binding,
     last_seen: Duration,
+}
+
+pub(crate) type Cell = (FlowKey, Entry);
+
+#[derive(Debug)]
+enum Entries {
+    Legacy(BTreeMap<FlowKey, Entry>),
+    Reserved(Vec<Cell>),
+}
+
+impl Entries {
+    fn get(&self, key: &FlowKey) -> Option<&Entry> {
+        match self {
+            Self::Legacy(entries) => entries.get(key),
+            Self::Reserved(entries) => entries
+                .binary_search_by_key(key, |(key, _)| *key)
+                .ok()
+                .map(|index| &entries[index].1),
+        }
+    }
+    fn contains_key(&self, key: &FlowKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(entries) => entries.len(),
+            Self::Reserved(entries) => entries.len(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn insert(&mut self, key: FlowKey, entry: Entry) {
+        match self {
+            Self::Legacy(entries) => {
+                entries.insert(key, entry);
+            }
+            Self::Reserved(entries) => match entries.binary_search_by_key(&key, |(key, _)| *key) {
+                Ok(index) => entries[index].1 = entry,
+                // The exclusive PreparedAssignment preview proved room before commit.
+                Err(index) => entries.insert(index, (key, entry)),
+            },
+        }
+    }
+    fn remove(&mut self, key: &FlowKey) -> Option<Entry> {
+        match self {
+            Self::Legacy(entries) => entries.remove(key),
+            Self::Reserved(entries) => entries
+                .binary_search_by_key(key, |(key, _)| *key)
+                .ok()
+                .map(|index| entries.remove(index).1),
+        }
+    }
+    fn iter(&self) -> EntriesIter<'_> {
+        match self {
+            Self::Legacy(entries) => EntriesIter::Legacy(entries.iter()),
+            Self::Reserved(entries) => EntriesIter::Reserved(entries.iter()),
+        }
+    }
+}
+
+enum EntriesIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, FlowKey, Entry>),
+    Reserved(std::slice::Iter<'a, Cell>),
+}
+impl<'a> Iterator for EntriesIter<'a> {
+    type Item = (&'a FlowKey, &'a Entry);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(entries) => entries.next(),
+            Self::Reserved(entries) => entries.next().map(|(key, entry)| (key, entry)),
+        }
+    }
 }
 
 /// Count-bounded flow identities with explicit, caller-drained retirement.
@@ -92,10 +165,11 @@ struct Entry {
 #[derive(Debug)]
 pub struct FlowTable {
     config: FlowTableConfig,
-    entries: BTreeMap<FlowKey, Entry>,
+    entries: Entries,
     next_id: Option<u64>,
     next_channel: u16,
     last_now: Duration,
+    usage: Option<storage::Usage>,
 }
 
 /// Exclusively borrowed assignment transaction; dropping it changes nothing.
@@ -144,11 +218,56 @@ impl FlowTable {
         config.validate()?;
         Ok(Self {
             config,
-            entries: BTreeMap::new(),
+            entries: Entries::Legacy(BTreeMap::new()),
             next_id: Some(1),
             next_channel: 0,
             last_now: Duration::ZERO,
+            usage: None,
         })
+    }
+
+    /// Fallibly provision the complete actual fixed flow table without an allocating fallback.
+    pub fn new_reserved(
+        config: FlowTableConfig,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        Self::with_plan(storage::Plan::for_config(config)?, limits)
+    }
+
+    /// Construct the exact immutable plan after admitting its full heap capacity.
+    pub fn with_plan(plan: storage::Plan, limits: storage::Limits) -> Result<Self, storage::Error> {
+        Self::with_allocation(plan, limits, &mut storage::Allocation::default())
+    }
+
+    fn with_allocation(
+        plan: storage::Plan,
+        limits: storage::Limits,
+        allocation: &mut storage::Allocation,
+    ) -> Result<Self, storage::Error> {
+        plan.check(limits)?;
+        let config = plan.config();
+        let entries = allocation.reserve::<Cell>(config.capacity)?;
+        let capacity_bytes = storage::array_bytes::<Cell>(entries.capacity())?;
+        if capacity_bytes != plan.capacity_bytes() {
+            return Err(storage::Error::Invariant);
+        }
+        Ok(Self {
+            config,
+            entries: Entries::Reserved(entries),
+            next_id: Some(1),
+            next_channel: 0,
+            last_now: Duration::ZERO,
+            usage: Some(storage::Usage {
+                limit_bytes: limits.capacity_bytes,
+                capacity_bytes,
+                allocations: 1,
+            }),
+        })
+    }
+
+    /// Actual retained heap for reserved construction; legacy allocating owners report None.
+    pub const fn storage_usage(&self) -> Option<storage::Usage> {
+        self.usage
     }
 
     /// Predict an assignment without consuming IDs, channel turns or timer state.
@@ -343,6 +462,9 @@ impl FlowTable {
 
 #[cfg(test)]
 mod validation_tests;
+
+#[cfg(test)]
+mod storage_tests;
 
 #[cfg(test)]
 mod tests {

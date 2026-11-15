@@ -293,7 +293,7 @@ fn metadata_accounting_and_busy_transit_fail_before_actual_downstream_admission(
         pipeline.usage = usage;
         if matches!(profile, Profile::TapSystem) {
             pipeline.channel_metadata[usize::from(metadata.binding.channel)]
-                .front_mut()
+                .front_mut(&mut pipeline.metadata_pool)
                 .ok_or("metadata")?
                 .classification
                 .observed_bytes += 1;
@@ -303,8 +303,9 @@ fn metadata_accounting_and_busy_transit_fail_before_actual_downstream_admission(
                 .get_mut(&metadata.classification.key)
                 .ok_or("flow")?
                 .metadata
-                .front_mut()
+                .front_mut(&mut pipeline.metadata_pool)
                 .ok_or("metadata")?
+                .classification
                 .observed_bytes += 1;
         }
         assert_eq!(
@@ -313,7 +314,7 @@ fn metadata_accounting_and_busy_transit_fail_before_actual_downstream_admission(
         );
         if matches!(profile, Profile::TapSystem) {
             pipeline.channel_metadata[usize::from(metadata.binding.channel)]
-                .front_mut()
+                .front_mut(&mut pipeline.metadata_pool)
                 .ok_or("metadata")?
                 .classification = metadata.classification;
         } else {
@@ -322,8 +323,8 @@ fn metadata_accounting_and_busy_transit_fail_before_actual_downstream_admission(
                 .get_mut(&metadata.classification.key)
                 .ok_or("flow")?
                 .metadata
-                .front_mut()
-                .ok_or("metadata")? = metadata.classification;
+                .front_mut(&mut pipeline.metadata_pool)
+                .ok_or("metadata")? = metadata;
             pipeline
                 .mux
                 .push(0, vec![99])

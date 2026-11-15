@@ -114,10 +114,10 @@ impl Allocation {
     }
 }
 
-/// Maximum controlled owned-storage capacity, including fixed and external bytes.
+/// Maximum controlled owner capacity, including its actual fixed header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
-    /// Requested layout bytes available to the complete two-slot owner.
+    /// Requested layout bytes available to the selected complete owner.
     pub capacity_bytes: usize,
 }
 
@@ -156,6 +156,74 @@ impl Plan {
     /// Exact locally receiving configuration supplied to the constructor.
     pub fn receive_config(&self) -> records::Config {
         self.receive
+    }
+}
+
+/// Actual single-owner layout, separate from a parent generation bank's headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedUsage {
+    /// Original complete single-owner allowance.
+    pub limit_bytes: usize,
+    /// Exact inline Owned header, including the one actual Engine.
+    pub fixed_bytes: usize,
+    /// Actual retained heap layouts, including idle reusable storage.
+    pub heap_bytes: usize,
+    /// Successful explicit nonzero reservations in this constructor.
+    pub allocations: usize,
+}
+
+/// Move-only actual reserved duplex engine, without an embedded generation Set.
+///
+/// A parent counts this header inside its actual enum/slot and adds only the
+/// reported heap. Restricted Entry operations provide no mutable Engine escape.
+pub struct Owned {
+    engine: records::Engine,
+    usage: OwnedUsage,
+}
+impl Owned {
+    /// Admit the exact inline-plus-heap layout before the first allocation.
+    pub fn new(plan: Plan, limits: Limits) -> Result<Self, Error> {
+        Self::build(plan, limits, Allocation::new(plan.capacity_bytes))
+    }
+
+    fn build(plan: Plan, limits: Limits, mut allocation: Allocation) -> Result<Self, Error> {
+        let total = size_of::<Self>()
+            .checked_add(plan.capacity_bytes)
+            .ok_or(Error::Budget)?;
+        if total > limits.capacity_bytes {
+            return Err(Error::Budget);
+        }
+        let engine = records::Engine::new_reserved(plan.send, plan.receive, &mut allocation)?;
+        if allocation.used() != plan.capacity_bytes {
+            drop(engine);
+            return Err(records::Error::Codec(crate::Error::Storage).into());
+        }
+        Ok(Self {
+            engine,
+            usage: OwnedUsage {
+                limit_bytes: limits.capacity_bytes,
+                fixed_bytes: size_of::<Self>(),
+                heap_bytes: allocation.used(),
+                allocations: allocation.allocations,
+            },
+        })
+    }
+
+    /// Immutable actual algorithm observations, without replacement authority.
+    pub fn engine(&self) -> &records::Engine {
+        &self.engine
+    }
+
+    /// Borrow restricted existing packet operations from this exact owner.
+    pub fn entry(&mut self) -> Entry<'_> {
+        Entry {
+            engine: &mut self.engine,
+        }
+    }
+
+    /// Exact successful backing observations; not allocator overhead or RSS.
+    pub const fn usage(&self) -> OwnedUsage {
+        self.usage
     }
 }
 

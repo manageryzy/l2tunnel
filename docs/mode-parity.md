@@ -43,6 +43,12 @@ the complete generic IPC/failure/fault/resource matrix and full cross-profile
 SW-11 remain open. Every complete catalog gate below retains its original
 definition and remains open.
 
+The [actual reserved common Engine checkpoint](modules/common-engine-storage.md)
+protocol-tests real Swift/Aligned/Packed owners over the same actual reserved
+Pipeline/MUX/DRR. Paired pure tests and selected existing caller regressions do
+not install that owner in a carrier/runtime or qualify full SW-11. Mixed Bank,
+complete resources and all47 catalog gates retain their original definitions.
+
 The [source-bound performance workload audit](../work/secure-udp-performance-analysis-20261113/hash-geometry-attempt-1/diagnostic.json)
 distinguishes the independent per-connection recovery used by the78.7502Mbit/s
 compact simulator sensitivity from current Rust directional hash/channel ordering.

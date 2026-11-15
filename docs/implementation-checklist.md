@@ -34,7 +34,11 @@ The next common-session foundation is tracked by
 [transactional queue handoff](modules/record-admission-handoff.md),
 [FEC/Reliable backing](modules/record-recovery-storage.md),
 [Aligned/Packed backing](modules/aligned-record-storage.md),
-[common engine prerequisites](modules/common-record-engine.md) and
+[common engine prerequisites](modules/common-record-engine.md),
+[actual common queue storage](modules/common-queue-storage.md),
+[reserved Scheduler](modules/qos-storage.md),
+[reserved Pipeline](modules/pipeline-storage.md),
+[reserved common Engine](modules/common-engine-storage.md) and
 [in-session fresh-DH](modules/session-refresh.md).
 Their leaf evidence does not close full SW-11, complete resource admission or
 retained-state recovery. Existing mode, native, platform and performance gates
@@ -49,10 +53,19 @@ proxy owners, full SW-11 and required stage/native/platform/performance gates
 remain open. Unchanged suites are reused explicitly; passing individual tests
 do not relabel a failed aggregate.
 
+The [reserved common Engine checkpoint](../work/common-reserved-records-20261115/scoped-checkpoint-validation.json)
+adds actual fixed FlowTable/MUX/Scheduler/Pipeline backing and one movable Swift
+owner, then composes the selected real reserved Swift/Aligned/Packed owner.
+It passes142 distinct affected cases, including32 new cases, with four bounded
+parallel test processes and exact single-test repairs. Current/prepared/draining
+mixed Bank, complete external/nested allocation admission, selected reserved
+runtime and the required full-stage gate remain open. No unaffected simulator,
+platform, native or performance campaign was repeated at this checkpoint.
+
 The [preceding448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
 qualifies the selected scalar/CompleteV2/common-configuration and first pure
 fresh-DH behavior with explicit reuse. Actual selected fresh-DH runtime,
-common reserved record Engine/Bank, full SW-11, complete resources, retained recovery and
+reserved mixed-profile Bank/runtime, full SW-11, complete resources, retained recovery and
 required full stage/native/platform acceptance remain open. The saved failed
 attempts and precise repair are not relabeled as passing aggregates.
 
@@ -318,6 +331,10 @@ does not qualify generic switching, other record profiles or full SW-11.
 | Actual transactional queue admission | RAH-01..RAH-06 | [MUX/DRR/Pipeline handoff](modules/record-admission-handoff.md) | actual queues pass49 local protocol tests and real-profile functional consumers pass; complete resources and runtime/native integration remain open |
 | Actual FEC/Reliable reserved backing | RRS-01..RRS-06 | [Record recovery storage](modules/record-recovery-storage.md) | real reusable encoder/decoder/duplex Reliable tested; complete nested allocator/drop qualification remains open |
 | Actual Aligned/Packed reserved backing | ARS-01..ARS-08 | [Aligned record storage](modules/aligned-record-storage.md) | actual codecs/duplex endpoints tested; full inventory/matrix and reserved Engine/Bank/runtime integration remain open |
+| Actual FlowTable/MUX storage | CQS-01..CQS-06 | [Common queue backing](modules/common-queue-storage.md) | actual fixed backing and borrowed handoff tested; complete Bank/runtime resources remain open |
+| Actual reserved Scheduler | QSR-01..QSR-08 | [Scheduler backing](modules/qos-storage.md) | one actual DRR over reserved slots tested; combined resource/stage gates remain open |
+| Actual reserved Pipeline | PQS-01..PQS-08 | [Pipeline backing](modules/pipeline-storage.md) | real nested queues/metadata and borrowed common Engine consumers tested; full nested failure/Bank/runtime remain open |
+| Actual reserved common Engine | CSE-01..CSE-08 | [Complete Engine backing](modules/common-engine-storage.md) | one actual selected Swift/Aligned/Packed owner and complete queues tested; mixed Bank/runtime and full resources remain open |
 | Authenticated fresh-DH lifecycle | SREF-01..SREF-08 | [Session refresh](modules/session-refresh.md) | real selected initial/refresh authority, continuing counters/replay; runtime and retained recovery remain separate |
 | TUN active flow control and QoS | FC-01..FC-25 | [Flow control](flow-control.md) | bounded records, authenticated feedback; TCP proxy needs owned TCP legs |
 | Internal L2 management/reload | MG-01..MG-08 | [Management protocol](overlay-and-carriers.md) | authenticated session; stable control framing before hot data modes |

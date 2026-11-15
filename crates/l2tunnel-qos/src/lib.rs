@@ -7,6 +7,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
+mod backing;
+pub mod storage;
+
 /// Caller-assigned local flow identity; peer generation/replay checks are external.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FlowId(u64);
@@ -211,6 +214,10 @@ pub enum AdmissionErrorKind {
     FlowBytes,
     /// This flow's retained packet count would exceed its limit.
     FlowPackets,
+    /// Internal fixed-pool/index/ring state is inconsistent; no packet was copied.
+    Invariant,
+    /// Legacy borrowed-copy convenience could not reserve caller-independent bytes.
+    Allocation,
 }
 
 /// Rejected admission with ownership of the original payload.
@@ -237,6 +244,8 @@ pub enum ScheduleError {
     Arithmetic,
     /// Internal queue/ring/accounting state is inconsistent.
     Invariant,
+    /// Caller-owned output for an allocating convenience method could not be reserved.
+    Allocation,
 }
 
 impl fmt::Display for ScheduleError {
@@ -285,6 +294,28 @@ struct Flow {
     bytes: usize,
     packets: VecDeque<Box<[u8]>>,
     eligible: bool,
+    fixed: Option<backing::Fifo>,
+}
+impl Flow {
+    fn packet_count(&self) -> usize {
+        self.fixed.map_or_else(|| self.packets.len(), |q| q.len)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Service {
+    head: PacketHead,
+    deficit: u64,
+    flow_bytes: usize,
+    queued_bytes: usize,
+    queued_packets: usize,
+    last: bool,
+}
+impl Service {
+    fn commit_flow(self, flow: &mut Flow) {
+        flow.deficit = if self.last { 0 } else { self.deficit };
+        flow.bytes = self.flow_bytes;
+    }
 }
 
 /// One direction's bounded, work-conserving flat weighted DRR scheduler.
@@ -301,6 +332,9 @@ pub struct Scheduler {
     queued_bytes: usize,
     queued_packets: usize,
     selected: Option<PacketHead>,
+    // The unused legacy containers above stay empty and allocate no backing for
+    // a reserved owner. Their actual inline headers belong to size_of<Self>.
+    reserved: Option<backing::Reserved>,
 }
 
 impl Scheduler {
@@ -320,41 +354,72 @@ impl Scheduler {
             queued_bytes: 0,
             queued_packets: 0,
             selected: None,
+            reserved: None,
         })
+    }
+
+    /// Reserve the complete actual class/flow/ring/packet/slab inventory fallibly.
+    pub fn new_reserved(
+        config: SchedulerConfig,
+        classes: &[ClassConfig],
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_scheduler(config, classes)?;
+        let mut allocation = storage::Allocation::new(plan, limits)?;
+        let reserved = backing::Reserved::new(plan, classes, &mut allocation)?;
+        Ok(Self {
+            config,
+            classes: BTreeMap::new(),
+            flows: BTreeMap::new(),
+            active: VecDeque::new(),
+            in_visit: false,
+            queued_bytes: 0,
+            queued_packets: 0,
+            selected: None,
+            reserved: Some(reserved),
+        })
+    }
+
+    /// Actual retained managed heap; allocating construction returns None.
+    pub fn storage_usage(&self) -> Option<storage::Usage> {
+        self.reserved.as_ref().and_then(|r| r.usage)
     }
 
     /// Register an idle flow; registration alone earns no deficit or ring entry.
     pub fn register_flow(&mut self, config: FlowConfig) -> Result<(), FlowError> {
-        if self.flows.contains_key(&config.id) {
+        if self.flow(config.id).is_some() {
             return Err(FlowError::Duplicate);
         }
-        if self.flows.len() >= self.config.max_flows {
+        if self.registered_flows() >= self.config.max_flows {
             return Err(FlowError::Capacity);
         }
         let quantum = self.flow_quantum(config.class, config.weight)?;
-        self.flows.insert(
-            config.id,
-            Flow {
-                class: config.class,
-                quantum,
-                deficit: 0,
-                bytes: 0,
-                packets: VecDeque::new(),
-                eligible: true,
-            },
-        );
+        let flow = Flow {
+            class: config.class,
+            quantum,
+            deficit: 0,
+            bytes: 0,
+            packets: VecDeque::new(),
+            eligible: true,
+            fixed: None,
+        };
+        if let Some(reserved) = &mut self.reserved {
+            reserved.insert(config.id, flow)?;
+        } else {
+            self.flows.insert(config.id, flow);
+        }
         self.selected = None;
         Ok(())
     }
 
     /// Change an empty flow's weight; active queues cannot gain a mid-visit boost.
     pub fn set_flow_weight(&mut self, id: FlowId, weight: u32) -> Result<(), FlowError> {
-        let flow = self.flows.get(&id).ok_or(FlowError::UnknownFlow)?;
-        if !flow.packets.is_empty() {
+        let flow = self.flow(id).ok_or(FlowError::UnknownFlow)?;
+        if flow.packet_count() != 0 {
             return Err(FlowError::Busy);
         }
         let quantum = self.flow_quantum(flow.class, weight)?;
-        let flow = self.flows.get_mut(&id).ok_or(FlowError::UnknownFlow)?;
+        let flow = self.flow_mut(id).ok_or(FlowError::UnknownFlow)?;
         flow.quantum = quantum;
         self.selected = None;
         Ok(())
@@ -365,11 +430,15 @@ impl Scheduler {
     /// Reuse of the numeric ID is locally allowed. The caller must separately
     /// enforce peer/session generation and retirement rules before reuse.
     pub fn remove_flow(&mut self, id: FlowId) -> Result<(), FlowError> {
-        let flow = self.flows.get(&id).ok_or(FlowError::UnknownFlow)?;
-        if !flow.packets.is_empty() {
+        let flow = self.flow(id).ok_or(FlowError::UnknownFlow)?;
+        if flow.packet_count() != 0 {
             return Err(FlowError::Busy);
         }
-        self.flows.remove(&id);
+        if let Some(reserved) = &mut self.reserved {
+            reserved.remove(id)?;
+        } else {
+            self.flows.remove(&id);
+        }
         self.selected = None;
         Ok(())
     }
@@ -381,6 +450,17 @@ impl Scheduler {
     pub fn enqueue(&mut self, id: FlowId, payload: Vec<u8>) -> Result<(), AdmissionError> {
         if let Some(kind) = self.admission_failure(id, payload.len()) {
             return Err(AdmissionError { kind, payload });
+        }
+        if let Some(reserved) = &mut self.reserved {
+            let prepared = match reserved.preflight_enqueue(id, payload.len()) {
+                Ok(prepared) => prepared,
+                Err(kind) => return Err(AdmissionError { kind, payload }),
+            };
+            reserved.enqueue(id, &payload, prepared);
+            self.queued_bytes += payload.len();
+            self.queued_packets += 1;
+            self.selected = None;
+            return Ok(());
         }
         let Some(flow) = self.flows.get_mut(&id) else {
             return Err(AdmissionError {
@@ -399,6 +479,33 @@ impl Scheduler {
         flow.packets.push_back(payload.into_boxed_slice());
         self.selected = None;
         Ok(())
+    }
+
+    /// Admit borrowed bytes through the same policy and actual queue ownership.
+    /// Reserved backing copies once into its slab without allocation; the legacy
+    /// convenience path fallibly creates its owned normalized payload first.
+    pub fn enqueue_borrowed(
+        &mut self,
+        id: FlowId,
+        payload: &[u8],
+    ) -> Result<(), AdmissionErrorKind> {
+        if let Some(error) = self.admission_failure(id, payload.len()) {
+            return Err(error);
+        }
+        if let Some(reserved) = &mut self.reserved {
+            let prepared = reserved.preflight_enqueue(id, payload.len())?;
+            reserved.enqueue(id, payload, prepared);
+            self.queued_bytes += payload.len();
+            self.queued_packets += 1;
+            self.selected = None;
+            return Ok(());
+        }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(payload.len())
+            .map_err(|_| AdmissionErrorKind::Allocation)?;
+        owned.extend_from_slice(payload);
+        self.enqueue(id, owned).map_err(|e| e.kind)
     }
 
     /// Select one FIFO packet whenever at least one flow is queued.
@@ -441,10 +548,11 @@ impl Scheduler {
     {
         self.selected = None;
         let mut any = false;
-        for id in &self.active {
-            let flow = self.flows.get_mut(id).ok_or(ScheduleError::Invariant)?;
-            let length = flow.packets.front().ok_or(ScheduleError::Invariant)?.len();
-            flow.eligible = eligible(*id, length);
+        for index in 0..self.active_flows() {
+            let id = self.active_id(index).ok_or(ScheduleError::Invariant)?;
+            let length = self.front_length(id).ok_or(ScheduleError::Invariant)?;
+            let flow = self.flow_mut(id).ok_or(ScheduleError::Invariant)?;
+            flow.eligible = eligible(id, length);
             if flow.eligible {
                 any = true;
             } else {
@@ -453,7 +561,8 @@ impl Scheduler {
         }
         if !any {
             self.in_visit = false;
-            return if self.active.is_empty() && (self.queued_packets != 0 || self.queued_bytes != 0)
+            return if self.active_flows() == 0
+                && (self.queued_packets != 0 || self.queued_bytes != 0)
             {
                 Err(ScheduleError::Invariant)
             } else {
@@ -497,70 +606,132 @@ impl Scheduler {
         &mut self,
         offer: impl FnOnce(PacketHead, &[u8]) -> Result<Option<T>, E>,
     ) -> Result<Option<(ScheduledPacket, T)>, OfferError<E>> {
-        let schedule = OfferError::Schedule;
+        let mut payload = Vec::new();
+        self.offer_selected_into(Some(&mut payload), offer)
+            .map(|result| {
+                result.map(|(head, token)| {
+                    (
+                        ScheduledPacket {
+                            flow: head.flow,
+                            class: head.class,
+                            payload,
+                        },
+                        token,
+                    )
+                })
+            })
+    }
+
+    /// Offer exact selected bytes, then recycle actual custody only after Some.
+    /// Neither refusal nor successful reserved service allocates an owned output.
+    pub fn offer_selected_borrowed<T, E>(
+        &mut self,
+        offer: impl FnOnce(PacketHead, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<(PacketHead, T)>, OfferError<E>> {
+        self.offer_selected_into(None, offer)
+    }
+
+    fn service_preflight(&self) -> Result<Option<Service>, ScheduleError> {
         let Some(selected) = self.selected else {
             return Ok(None);
         };
-        if self.peek_visit().map_err(schedule)? != Some(selected) {
-            return Err(schedule(ScheduleError::Invariant));
+        if self.peek_visit()? != Some(selected) {
+            return Err(ScheduleError::Invariant);
         }
-        let flow = self
-            .flows
-            .get_mut(&selected.flow)
-            .ok_or_else(|| schedule(ScheduleError::Invariant))?;
+        let flow = self.flow(selected.flow).ok_or(ScheduleError::Invariant)?;
         let length = selected.packet_bytes;
         if length == 0 {
-            return Err(schedule(ScheduleError::Invariant));
+            return Err(ScheduleError::Invariant);
         }
-        let charge = u64::try_from(length).map_err(|_| schedule(ScheduleError::Arithmetic))?;
+        let charge = u64::try_from(length).map_err(|_| ScheduleError::Arithmetic)?;
         let deficit = flow
             .deficit
             .checked_sub(charge)
-            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+            .ok_or(ScheduleError::Arithmetic)?;
         let flow_bytes = flow
             .bytes
             .checked_sub(length)
-            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+            .ok_or(ScheduleError::Arithmetic)?;
         let queued_bytes = self
             .queued_bytes
             .checked_sub(length)
-            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
+            .ok_or(ScheduleError::Arithmetic)?;
         let queued_packets = self
             .queued_packets
             .checked_sub(1)
-            .ok_or_else(|| schedule(ScheduleError::Arithmetic))?;
-        let last = flow.packets.len() == 1;
+            .ok_or(ScheduleError::Arithmetic)?;
+        let last = flow.packet_count() == 1;
         if last != (flow_bytes == 0) || (queued_packets == 0) != (queued_bytes == 0) {
-            return Err(schedule(ScheduleError::Invariant));
+            return Err(ScheduleError::Invariant);
         }
-        let front = flow
-            .packets
-            .front_mut()
-            .ok_or_else(|| schedule(ScheduleError::Invariant))?;
-        let Some(token) = offer(selected, front).map_err(OfferError::Downstream)? else {
+        Ok(Some(Service {
+            head: selected,
+            deficit,
+            flow_bytes,
+            queued_bytes,
+            queued_packets,
+            last,
+        }))
+    }
+
+    fn offer_selected_into<T, E>(
+        &mut self,
+        mut output: Option<&mut Vec<u8>>,
+        offer: impl FnOnce(PacketHead, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<(PacketHead, T)>, OfferError<E>> {
+        let schedule = OfferError::Schedule;
+        let Some(service) = self.service_preflight().map_err(schedule)? else {
             return Ok(None);
         };
-        let payload = std::mem::take(front);
-        flow.packets.pop_front();
-        flow.deficit = deficit;
-        flow.bytes = flow_bytes;
-        self.queued_bytes = queued_bytes;
-        self.queued_packets = queued_packets;
-        if last {
-            flow.deficit = 0;
-            flow.packets = VecDeque::new();
-            self.active.pop_front();
+        let token = if let Some(reserved) = &mut self.reserved {
+            let parts = reserved.service(service).map_err(schedule)?;
+            if let Some(output) = output.as_deref_mut() {
+                output
+                    .try_reserve_exact(parts.bytes.len())
+                    .map_err(|_| schedule(ScheduleError::Allocation))?;
+                output.extend_from_slice(parts.bytes);
+            }
+            let Some(token) = offer(service.head, parts.bytes).map_err(OfferError::Downstream)?
+            else {
+                return Ok(None);
+            };
+            parts.commit(service);
+            token
+        } else {
+            let flow = self
+                .flows
+                .get_mut(&service.head.flow)
+                .ok_or_else(|| schedule(ScheduleError::Invariant))?;
+            let front = flow
+                .packets
+                .front_mut()
+                .ok_or_else(|| schedule(ScheduleError::Invariant))?;
+            let Some(token) = offer(service.head, front).map_err(OfferError::Downstream)? else {
+                return Ok(None);
+            };
+            let payload = std::mem::take(front);
+            flow.packets.pop_front();
+            service.commit_flow(flow);
+            if service.last {
+                flow.packets = VecDeque::new();
+            }
+            if let Some(output) = output {
+                *output = payload.into_vec();
+            }
+            token
+        };
+        self.queued_bytes = service.queued_bytes;
+        self.queued_packets = service.queued_packets;
+        if service.last {
+            if let Some(reserved) = &mut self.reserved {
+                reserved.pop_active();
+            } else {
+                self.active.pop_front();
+            }
             self.in_visit = false;
         }
         self.selected = None;
-        Ok(Some((
-            ScheduledPacket {
-                flow: selected.flow,
-                class: selected.class,
-                payload: payload.into_vec(),
-            },
-            token,
-        )))
+        Ok(Some((service.head, token)))
     }
 
     /// Payload bytes retained inside this scheduler, excluding downstream queues.
@@ -575,21 +746,28 @@ impl Scheduler {
 
     /// Registered flow count, including idle flows.
     pub fn registered_flows(&self) -> usize {
-        self.flows.len()
+        self.reserved
+            .as_ref()
+            .map_or_else(|| self.flows.len(), |r| r.registered())
     }
 
     /// Nonempty flow count; only these entries are traversed for scheduling.
     pub fn active_flows(&self) -> usize {
-        self.active.len()
+        self.reserved
+            .as_ref()
+            .map_or_else(|| self.active.len(), |r| r.active_len())
     }
 
     fn flow_quantum(&self, class: ClassId, weight: u32) -> Result<u64, FlowError> {
-        self.config
-            .flow_quantum(self.classes.get(&class).copied(), weight)
+        let class_weight = self.reserved.as_ref().map_or_else(
+            || self.classes.get(&class).copied(),
+            |r| r.class_weight(class),
+        );
+        self.config.flow_quantum(class_weight, weight)
     }
 
     fn admission_failure(&self, id: FlowId, length: usize) -> Option<AdmissionErrorKind> {
-        let Some(flow) = self.flows.get(&id) else {
+        let Some(flow) = self.flow(id) else {
             return Some(AdmissionErrorKind::UnknownFlow);
         };
         if length == 0 {
@@ -610,7 +788,7 @@ impl Scheduler {
             .is_none_or(|total| total > self.config.per_flow_bytes)
         {
             Some(AdmissionErrorKind::FlowBytes)
-        } else if flow.packets.len() >= self.config.per_flow_packets {
+        } else if flow.packet_count() >= self.config.per_flow_packets {
             Some(AdmissionErrorKind::FlowPackets)
         } else {
             None
@@ -618,16 +796,20 @@ impl Scheduler {
     }
 
     fn rotate(&mut self) -> Result<(), ScheduleError> {
-        let id = self.active.pop_front().ok_or(ScheduleError::Invariant)?;
-        self.active.push_back(id);
+        if let Some(reserved) = &mut self.reserved {
+            reserved.rotate()?;
+        } else {
+            let id = self.active.pop_front().ok_or(ScheduleError::Invariant)?;
+            self.active.push_back(id);
+        }
         self.in_visit = false;
         Ok(())
     }
 
     fn scan_round(&mut self) -> Result<Option<PacketHead>, ScheduleError> {
-        for _ in 0..self.active.len() {
-            let id = self.active.front().ok_or(ScheduleError::Invariant)?;
-            let flow = self.flows.get_mut(id).ok_or(ScheduleError::Invariant)?;
+        for _ in 0..self.active_flows() {
+            let id = self.active_id(0).ok_or(ScheduleError::Invariant)?;
+            let flow = self.flow_mut(id).ok_or(ScheduleError::Invariant)?;
             if !flow.eligible {
                 self.rotate()?;
                 continue;
@@ -646,9 +828,9 @@ impl Scheduler {
     }
 
     fn peek_visit(&self) -> Result<Option<PacketHead>, ScheduleError> {
-        let id = *self.active.front().ok_or(ScheduleError::Invariant)?;
-        let flow = self.flows.get(&id).ok_or(ScheduleError::Invariant)?;
-        let length = flow.packets.front().ok_or(ScheduleError::Invariant)?.len();
+        let id = self.active_id(0).ok_or(ScheduleError::Invariant)?;
+        let flow = self.flow(id).ok_or(ScheduleError::Invariant)?;
+        let length = self.front_length(id).ok_or(ScheduleError::Invariant)?;
         let charge = u64::try_from(length).map_err(|_| ScheduleError::Arithmetic)?;
         Ok(
             (flow.eligible && charge <= flow.deficit).then_some(PacketHead {
@@ -661,12 +843,13 @@ impl Scheduler {
 
     fn skip_empty_rounds(&mut self) -> Result<(), ScheduleError> {
         let mut next_round = u64::MAX;
-        for id in &self.active {
-            let flow = self.flows.get(id).ok_or(ScheduleError::Invariant)?;
+        for index in 0..self.active_flows() {
+            let id = self.active_id(index).ok_or(ScheduleError::Invariant)?;
+            let flow = self.flow(id).ok_or(ScheduleError::Invariant)?;
             if !flow.eligible {
                 continue;
             }
-            let length = flow.packets.front().ok_or(ScheduleError::Invariant)?.len();
+            let length = self.front_length(id).ok_or(ScheduleError::Invariant)?;
             let charge = u64::try_from(length).map_err(|_| ScheduleError::Arithmetic)?;
             let missing = charge
                 .checked_sub(flow.deficit)
@@ -675,8 +858,9 @@ impl Scheduler {
             next_round = next_round.min(missing.div_ceil(flow.quantum));
         }
         let skip = next_round.checked_sub(1).ok_or(ScheduleError::Invariant)?;
-        for id in &self.active {
-            let flow = self.flows.get_mut(id).ok_or(ScheduleError::Invariant)?;
+        for index in 0..self.active_flows() {
+            let id = self.active_id(index).ok_or(ScheduleError::Invariant)?;
+            let flow = self.flow_mut(id).ok_or(ScheduleError::Invariant)?;
             if !flow.eligible {
                 continue;
             }
@@ -689,6 +873,30 @@ impl Scheduler {
                 .ok_or(ScheduleError::Arithmetic)?;
         }
         Ok(())
+    }
+    fn flow(&self, id: FlowId) -> Option<&Flow> {
+        self.reserved
+            .as_ref()
+            .map_or_else(|| self.flows.get(&id), |r| r.flow(id))
+    }
+    fn flow_mut(&mut self, id: FlowId) -> Option<&mut Flow> {
+        if let Some(reserved) = &mut self.reserved {
+            reserved.flow_mut(id)
+        } else {
+            self.flows.get_mut(&id)
+        }
+    }
+    fn active_id(&self, index: usize) -> Option<FlowId> {
+        self.reserved
+            .as_ref()
+            .map_or_else(|| self.active.get(index).copied(), |r| r.active(index))
+    }
+    fn front_length(&self, id: FlowId) -> Option<usize> {
+        let flow = self.flow(id)?;
+        self.reserved.as_ref().map_or_else(
+            || flow.packets.front().map(|p| p.len()),
+            |r| r.packet_len(flow),
+        )
     }
 }
 

@@ -17,7 +17,7 @@ fn queued_refusal_preserves_original_allocation_fifo_and_round_robin() -> TestRe
             mux.push(channel, bytes).map_err(|_| "admission")?;
         }
     }
-    let pointer = offered.lanes[2].front().ok_or("head")?.as_ptr();
+    let pointer = offered.legacy_lanes()[2].front().ok_or("head")?.as_ptr();
     let before = (offered.next, offered.queued_bytes, offered.queued_frames);
     for _ in 0..3 {
         assert_eq!(
@@ -124,7 +124,7 @@ fn borrowed_selected_transit_enforces_real_policy_without_retaining_or_copying_b
     legacy.push(1, bytes.clone()).map_err(|_| "same policy")?;
     assert_eq!(legacy.pop(), Some((1, bytes)));
     assert_eq!(mux.next, legacy.next);
-    assert!(mux.lanes.iter().all(VecDeque::is_empty));
+    assert!(mux.legacy_lanes().iter().all(VecDeque::is_empty));
     assert_eq!((mux.queued_bytes, mux.queued_frames), (0, 0));
     mux.next = 3;
     assert_eq!(
@@ -140,7 +140,7 @@ fn borrowed_selected_transit_enforces_real_policy_without_retaining_or_copying_b
 fn corrupt_queued_accounting_refuses_before_downstream_and_preserves_custody() -> TestResult {
     let mut mux = Mux::new(2, 8, 2)?;
     mux.push(1, vec![4, 5]).map_err(|_| "admission")?;
-    let pointer = mux.lanes[1].front().ok_or("head")?.as_ptr();
+    let pointer = mux.legacy_lanes()[1].front().ok_or("head")?.as_ptr();
     for (bytes, frames) in [(0, 1), (2, 0), (3, 1), (2, 2)] {
         mux.queued_bytes = bytes;
         mux.queued_frames = frames;
@@ -148,7 +148,10 @@ fn corrupt_queued_accounting_refuses_before_downstream_and_preserves_custody() -
             mux.offer_front(|_, _| -> Result<Option<()>, &str> { Err("invariant callback") }),
             Err(OfferError::Invariant)
         );
-        assert_eq!(mux.lanes[1].front().ok_or("retained")?.as_ptr(), pointer);
+        assert_eq!(
+            mux.legacy_lanes()[1].front().ok_or("retained")?.as_ptr(),
+            pointer
+        );
         assert_eq!(mux.next, 0);
     }
     mux.queued_bytes = 2;

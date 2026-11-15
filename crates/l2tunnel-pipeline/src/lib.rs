@@ -24,13 +24,19 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
 use l2tunnel_mux::Mux;
 use l2tunnel_packet::{FlowTable, classify};
 use l2tunnel_qos::{ClassConfig, ClassId, FlowConfig, Scheduler, SchedulerConfig};
+
+mod backing;
+/// Complete checked fallible Pipeline backing and actual retained capacity.
+pub mod storage;
+
+use backing::{ById, MetadataPool, MetadataQueue, States};
 
 pub use l2tunnel_packet::{
     Binding, Classification, FlowId, FlowKey, FlowTableConfig, Mapping, PacketLayer, ParseError,
@@ -171,6 +177,21 @@ pub struct Admitted<T> {
     pub permit: T,
 }
 
+/// Actual borrowed-byte handoff, without allocating or returning a payload owner.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Admission<T> {
+    /// Exact classification and selected flow/channel affinity.
+    pub metadata: PacketMetadata,
+    /// Token returned by the single successful downstream admission.
+    pub permit: T,
+}
+
+struct Handoff<T> {
+    metadata: PacketMetadata,
+    permit: T,
+    payload: Option<Vec<u8>>,
+}
+
 /// Fixed-size observation of one retained flow registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowSnapshot {
@@ -233,6 +254,8 @@ pub enum PipelineError {
     TunOnly,
     /// Local packets still exist, so a flow cannot retire.
     Busy,
+    /// An explicitly allocating compatibility ingress or owned handoff failed.
+    Allocation,
     /// Defensive internal component-accounting inconsistency.
     Invariant,
 }
@@ -281,19 +304,21 @@ impl<E: std::error::Error + 'static> std::error::Error for DequeueError<E> {}
 
 struct FlowState {
     snapshot: FlowSnapshot,
-    metadata: VecDeque<Classification>,
+    metadata: MetadataQueue,
 }
 
 /// Bounded actual-payload scheduler with explicit TAP/TUN semantics.
 pub struct Pipeline {
     config: PipelineConfig,
     flows: FlowTable,
-    states: BTreeMap<FlowKey, FlowState>,
-    by_id: BTreeMap<FlowId, FlowKey>,
+    states: States,
+    by_id: ById,
     qos: Option<Scheduler>,
     mux: Mux,
-    channel_metadata: Vec<VecDeque<PacketMetadata>>,
+    channel_metadata: Vec<MetadataQueue>,
+    metadata_pool: MetadataPool,
     usage: QueueUsage,
+    storage: Option<storage::Usage>,
 }
 
 impl Pipeline {
@@ -317,12 +342,16 @@ impl Pipeline {
         Ok(Self {
             config,
             flows,
-            states: BTreeMap::new(),
-            by_id: BTreeMap::new(),
+            states: States::Legacy(BTreeMap::new()),
+            by_id: ById::Legacy(BTreeMap::new()),
             qos,
             mux,
-            channel_metadata: vec![VecDeque::new(); usize::from(config.flows.channels)],
+            channel_metadata: (0..config.flows.channels)
+                .map(|_| MetadataQueue::new(false))
+                .collect(),
+            metadata_pool: MetadataPool::Legacy,
             usage: QueueUsage::default(),
+            storage: None,
         })
     }
 
@@ -354,77 +383,165 @@ impl Pipeline {
         weight: u32,
         now: Duration,
     ) -> Result<PacketMetadata, EnqueueError> {
-        let classification = match self.classify(&payload) {
+        self.enqueue_input(Input::Owned(payload), weight, now)
+            .map_err(|(kind, input)| EnqueueError {
+                kind,
+                payload: input.into_owned(),
+            })
+    }
+
+    /// Admit borrowed original bytes with trusted weight one.
+    ///
+    /// Reserved backing copies once into its actual retained slab without a
+    /// temporary Vec. Legacy backing is an explicitly allocating convenience.
+    pub fn enqueue_borrowed(
+        &mut self,
+        bytes: &[u8],
+        now: Duration,
+    ) -> Result<PacketMetadata, PipelineError> {
+        self.enqueue_borrowed_weighted(bytes, 1, now)
+    }
+
+    /// Admit borrowed unchanged bytes with the same trusted immutable weight policy.
+    pub fn enqueue_borrowed_weighted(
+        &mut self,
+        bytes: &[u8],
+        weight: u32,
+        now: Duration,
+    ) -> Result<PacketMetadata, PipelineError> {
+        self.enqueue_input(Input::Borrowed(bytes), weight, now)
+            .map_err(|(kind, _)| kind)
+    }
+
+    fn enqueue_input<'a>(
+        &mut self,
+        input: Input<'a>,
+        weight: u32,
+        now: Duration,
+    ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
+        let classification = match self.classify(input.bytes()) {
             Ok(value) => value,
-            Err(error) => {
-                return Err(EnqueueError {
-                    kind: PipelineError::Parse(error),
-                    payload,
-                });
-            }
+            Err(error) => return Err((PipelineError::Parse(error), input)),
         };
         let key = classification.key;
-        let (total, per_flow) = match self.preflight(key, payload.len(), weight) {
+        let (total, per_flow) = match self.preflight(key, input.bytes().len(), weight) {
             Ok(value) => value,
-            Err(kind) => return Err(EnqueueError { kind, payload }),
+            Err(kind) => return Err((kind, input)),
         };
         let new = !self.states.contains_key(&key);
         let transaction = match self.flows.prepare_assign(key, now) {
             Ok(value) => value,
-            Err(error) => {
-                return Err(EnqueueError {
-                    kind: PipelineError::Flow(error),
-                    payload,
-                });
-            }
+            Err(error) => return Err((PipelineError::Flow(error), input)),
         };
+        if !self.metadata_pool.has_room()
+            || new && (!self.states.has_room() || !self.by_id.has_room())
+        {
+            return Err((PipelineError::Invariant, input));
+        }
         let binding = transaction.binding();
-        if let Some(qos) = &mut self.qos {
-            if new && let Err(error) = qos.register_flow(qos_flow(binding.id, weight)) {
-                return Err(EnqueueError {
-                    kind: PipelineError::QosFlow(error),
-                    payload,
-                });
+        let sidecar = if self.qos.is_some() {
+            if new {
+                MetadataQueue::new(self.metadata_pool.is_reserved())
+                    .validate_push(&self.metadata_pool)
+            } else {
+                self.states
+                    .get(&key)
+                    .ok_or(PipelineError::Invariant)
+                    .and_then(|state| state.metadata.validate_push(&self.metadata_pool))
             }
-            if let Err(error) = qos.enqueue(l2tunnel_qos::FlowId::new(binding.id.0), payload) {
-                if new {
-                    let _ = qos.remove_flow(l2tunnel_qos::FlowId::new(binding.id.0));
-                }
-                return Err(EnqueueError {
-                    kind: PipelineError::Invariant,
-                    payload: error.payload,
-                });
+        } else {
+            self.channel_metadata
+                .get(usize::from(binding.channel))
+                .ok_or(PipelineError::Invariant)
+                .and_then(|queue| queue.validate_push(&self.metadata_pool))
+        };
+        if let Err(kind) = sidecar {
+            return Err((kind, input));
+        }
+        if new && self.by_id.get(&binding.id).is_some()
+            || !new && self.by_id.get(&binding.id) != Some(&key)
+        {
+            return Err((PipelineError::Invariant, input));
+        }
+        // A legacy borrowed convenience reserves before scheduler registration,
+        // so allocation failure cannot invalidate an existing DRR selection.
+        let input = match input.prepare(self.metadata_pool.is_reserved()) {
+            Ok(input) => input,
+            Err(input) => return Err((PipelineError::Allocation, input)),
+        };
+        if new
+            && let Some(qos) = &mut self.qos
+            && let Err(error) = qos.register_flow(qos_flow(binding.id, weight))
+        {
+            return Err((PipelineError::QosFlow(error), input));
+        }
+        let admitted = match (&mut self.qos, input) {
+            (Some(qos), Input::Owned(payload)) => qos
+                .enqueue(l2tunnel_qos::FlowId::new(binding.id.0), payload)
+                .map_err(|error| (qos_admission_error(error.kind), Input::Owned(error.payload))),
+            (Some(qos), Input::Borrowed(bytes)) => qos
+                .enqueue_borrowed(l2tunnel_qos::FlowId::new(binding.id.0), bytes)
+                .map_err(|error| (qos_admission_error(error), Input::Borrowed(bytes))),
+            (None, Input::Owned(payload)) => {
+                self.mux.push(binding.channel, payload).map_err(|error| {
+                    let (l2tunnel_mux::AdmissionError::Budget(payload)
+                    | l2tunnel_mux::AdmissionError::Channel(payload)) = error;
+                    (PipelineError::Invariant, Input::Owned(payload))
+                })
             }
-        } else if let Err(error) = self.mux.push(binding.channel, payload) {
-            let (l2tunnel_mux::AdmissionError::Budget(payload)
-            | l2tunnel_mux::AdmissionError::Channel(payload)) = error;
-            return Err(EnqueueError {
-                kind: PipelineError::Invariant,
-                payload,
-            });
+            (None, Input::Borrowed(bytes)) => self
+                .mux
+                .push_borrowed(binding.channel, bytes)
+                .map_err(|error| (mux_admission_error(error), Input::Borrowed(bytes))),
+        };
+        if let Err(error) = admitted {
+            if new && let Some(qos) = &mut self.qos {
+                let _ = qos.remove_flow(l2tunnel_qos::FlowId::new(binding.id.0));
+            }
+            return Err(error);
         }
         let binding = transaction.commit();
         let metadata = PacketMetadata {
             classification,
             binding,
         };
-        let state = self.states.entry(key).or_insert_with(|| FlowState {
-            snapshot: FlowSnapshot {
-                binding,
-                weight,
-                queued: QueueUsage::default(),
-                last_activity: now,
-            },
-            metadata: VecDeque::new(),
-        });
+        if new {
+            self.states
+                .insert(
+                    key,
+                    FlowState {
+                        snapshot: FlowSnapshot {
+                            binding,
+                            weight,
+                            queued: QueueUsage::default(),
+                            last_activity: now,
+                        },
+                        metadata: MetadataQueue::new(self.metadata_pool.is_reserved()),
+                    },
+                )
+                .map_err(|kind| (kind, Input::Borrowed(&[])))?;
+        }
+        let state = self
+            .states
+            .get_mut(&key)
+            .ok_or((PipelineError::Invariant, Input::Borrowed(&[])))?;
+        if self.qos.is_some() {
+            state
+                .metadata
+                .push(&mut self.metadata_pool, metadata)
+                .map_err(|kind| (kind, Input::Borrowed(&[])))?;
+        } else {
+            self.channel_metadata
+                .get_mut(usize::from(binding.channel))
+                .ok_or((PipelineError::Invariant, Input::Borrowed(&[])))?
+                .push(&mut self.metadata_pool, metadata)
+                .map_err(|kind| (kind, Input::Borrowed(&[])))?;
+        }
         state.snapshot.queued = per_flow;
         state.snapshot.last_activity = now;
-        if self.qos.is_some() {
-            state.metadata.push_back(classification);
-        } else {
-            self.channel_metadata[usize::from(binding.channel)].push_back(metadata);
-        }
-        self.by_id.insert(binding.id, key);
+        self.by_id
+            .insert(binding.id, key)
+            .map_err(|kind| (kind, Input::Borrowed(&[])))?;
         self.usage = total;
         Ok(metadata)
     }
@@ -446,22 +563,34 @@ impl Pipeline {
             .prepare_learn(key, channel, now)
             .map_err(PipelineError::Flow)?;
         let binding = transaction.binding();
+        if new && (!self.states.has_room() || !self.by_id.has_room()) {
+            return Err(PipelineError::Invariant);
+        }
         if new && let Some(qos) = &mut self.qos {
             qos.register_flow(qos_flow(binding.id, weight))
                 .map_err(PipelineError::QosFlow)?;
         }
         let binding = transaction.commit();
-        let state = self.states.entry(key).or_insert_with(|| FlowState {
-            snapshot: FlowSnapshot {
-                binding,
-                weight,
-                queued: QueueUsage::default(),
-                last_activity: now,
-            },
-            metadata: VecDeque::new(),
-        });
-        state.snapshot.last_activity = now;
-        self.by_id.insert(binding.id, key);
+        if new {
+            self.states.insert(
+                key,
+                FlowState {
+                    snapshot: FlowSnapshot {
+                        binding,
+                        weight,
+                        queued: QueueUsage::default(),
+                        last_activity: now,
+                    },
+                    metadata: MetadataQueue::new(self.metadata_pool.is_reserved()),
+                },
+            )?;
+        }
+        self.states
+            .get_mut(&key)
+            .ok_or(PipelineError::Invariant)?
+            .snapshot
+            .last_activity = now;
+        self.by_id.insert(binding.id, key)?;
         Ok(binding)
     }
 
@@ -510,57 +639,90 @@ impl Pipeline {
         &mut self,
         offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
     ) -> Result<Option<Admitted<T>>, DequeueError<E>> {
+        self.offer_front_inner(offer, true).and_then(owned_handoff)
+    }
+
+    /// Offer actual retained bytes and release their slot only after Some permit.
+    ///
+    /// No owned payload is created or returned. Reserved backing performs no
+    /// allocation; refusal retains the same packet, metadata and service debit.
+    pub fn offer_front_borrowed<T, E>(
+        &mut self,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<Admission<T>>, DequeueError<E>> {
+        self.offer_front_inner(offer, false).map(borrowed_handoff)
+    }
+
+    fn offer_front_inner<T, E>(
+        &mut self,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+        owned: bool,
+    ) -> Result<Option<Handoff<T>>, DequeueError<E>> {
         if self.qos.is_some() {
-            return self.offer_with(|_| true, offer);
+            return self.offer_with_inner(|_| true, offer, owned);
         }
         let states = &mut self.states;
         let by_id = &self.by_id;
         let channel_metadata = &mut self.channel_metadata;
+        let pool = &mut self.metadata_pool;
         let usage = &mut self.usage;
         let mut entered = false;
-        let selected = self
-            .mux
-            .offer_front(|channel, bytes| {
-                entered = true;
-                let error = || DequeueError::Pipeline(PipelineError::Invariant);
-                let metadata_queue = channel_metadata
-                    .get_mut(usize::from(channel))
-                    .ok_or_else(error)?;
-                let metadata = *metadata_queue.front().ok_or_else(error)?;
-                let key = metadata.classification.key;
-                let state = states.get_mut(&key).ok_or_else(error)?;
-                if metadata.binding.channel != channel
-                    || state.snapshot.binding != metadata.binding
-                    || by_id.get(&metadata.binding.id) != Some(&key)
-                    || metadata.classification.observed_bytes != bytes.len()
-                {
-                    return Err(error());
-                }
-                let flow_usage = subtract_usage(state.snapshot.queued, bytes.len())
-                    .map_err(DequeueError::Pipeline)?;
-                let total_usage =
-                    subtract_usage(*usage, bytes.len()).map_err(DequeueError::Pipeline)?;
-                let Some(token) = offer(metadata, bytes).map_err(DequeueError::Commit)? else {
-                    return Ok(None);
-                };
-                metadata_queue.pop_front();
-                if metadata_queue.is_empty() {
-                    *metadata_queue = VecDeque::new();
-                }
-                state.snapshot.queued = flow_usage;
-                *usage = total_usage;
-                Ok(Some((metadata, token)))
+        let commit = |channel, bytes: &[u8]| {
+            entered = true;
+            let error = || DequeueError::Pipeline(PipelineError::Invariant);
+            let metadata_queue = channel_metadata
+                .get_mut(usize::from(channel))
+                .ok_or_else(error)?;
+            metadata_queue
+                .validate_pop(pool)
+                .map_err(DequeueError::Pipeline)?;
+            let metadata = metadata_queue.front(pool).ok_or_else(error)?;
+            let key = metadata.classification.key;
+            let state = states.get_mut(&key).ok_or_else(error)?;
+            if metadata.binding.channel != channel
+                || state.snapshot.binding != metadata.binding
+                || by_id.get(&metadata.binding.id) != Some(&key)
+                || metadata.classification.observed_bytes != bytes.len()
+            {
+                return Err(error());
+            }
+            let flow_usage = subtract_usage(state.snapshot.queued, bytes.len())
+                .map_err(DequeueError::Pipeline)?;
+            let total_usage =
+                subtract_usage(*usage, bytes.len()).map_err(DequeueError::Pipeline)?;
+            let Some(token) = offer(metadata, bytes).map_err(DequeueError::Commit)? else {
+                return Ok(None);
+            };
+            if metadata_queue.pop(pool) != Some(metadata) {
+                return Err(error());
+            }
+            state.snapshot.queued = flow_usage;
+            *usage = total_usage;
+            Ok(Some((metadata, token)))
+        };
+        let selected = if owned {
+            self.mux.offer_front(commit).map(|selected| {
+                selected.map(|(_, payload, (metadata, permit))| Handoff {
+                    metadata,
+                    permit,
+                    payload: Some(payload),
+                })
             })
-            .map_err(mux_offer_error)?;
+        } else {
+            self.mux.offer_front_borrowed(commit).map(|selected| {
+                selected.map(|(_, (metadata, permit))| Handoff {
+                    metadata,
+                    permit,
+                    payload: None,
+                })
+            })
+        }
+        .map_err(mux_offer_error)?;
         match selected {
-            Some((_, payload, (metadata, permit))) => Ok(Some(Admitted {
-                packet: Packet { payload, metadata },
-                permit,
-            })),
             None if !entered && self.usage != QueueUsage::default() => {
                 Err(DequeueError::Pipeline(PipelineError::Invariant))
             }
-            None => Ok(None),
+            value => Ok(value),
         }
     }
 
@@ -571,9 +733,29 @@ impl Pipeline {
     /// TAP rejects this per-flow policy before either callback is entered.
     pub fn offer_with<T, E>(
         &mut self,
-        mut eligible: impl FnMut(Candidate) -> bool,
+        eligible: impl FnMut(Candidate) -> bool,
         offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
     ) -> Result<Option<Admitted<T>>, DequeueError<E>> {
+        self.offer_with_inner(eligible, offer, true)
+            .and_then(owned_handoff)
+    }
+
+    /// Apply the same TUN eligibility/DRR commit without returning owned bytes.
+    pub fn offer_with_borrowed<T, E>(
+        &mut self,
+        eligible: impl FnMut(Candidate) -> bool,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+    ) -> Result<Option<Admission<T>>, DequeueError<E>> {
+        self.offer_with_inner(eligible, offer, false)
+            .map(borrowed_handoff)
+    }
+
+    fn offer_with_inner<T, E>(
+        &mut self,
+        mut eligible: impl FnMut(Candidate) -> bool,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+        owned: bool,
+    ) -> Result<Option<Handoff<T>>, DequeueError<E>> {
         let error = DequeueError::Pipeline;
         let qos = self
             .qos
@@ -613,16 +795,17 @@ impl Pipeline {
             .states
             .get_mut(&key)
             .ok_or_else(|| error(PipelineError::Invariant))?;
-        let classification = *state
+        state
             .metadata
-            .front()
+            .validate_pop(&self.metadata_pool)
+            .map_err(error)?;
+        let metadata = state
+            .metadata
+            .front(&self.metadata_pool)
             .ok_or_else(|| error(PipelineError::Invariant))?;
-        let metadata = PacketMetadata {
-            classification,
-            binding: state.snapshot.binding,
-        };
-        if classification.key != key
-            || classification.observed_bytes != head.packet_bytes
+        if metadata.classification.key != key
+            || metadata.classification.observed_bytes != head.packet_bytes
+            || metadata.binding != state.snapshot.binding
             || metadata.binding.id != FlowId(head.flow.value())
             || self.by_id.get(&metadata.binding.id) != Some(&key)
             || state.metadata.len() != state.snapshot.queued.packets
@@ -633,40 +816,48 @@ impl Pipeline {
         let total_usage = subtract_usage(self.usage, head.packet_bytes).map_err(error)?;
         let mux = &mut self.mux;
         let usage = &mut self.usage;
-        let selected = qos
-            .offer_selected(|actual, bytes| {
-                if actual != head {
-                    return Err(error(PipelineError::Invariant));
-                }
-                let admitted = mux
-                    .offer_selected(metadata.binding.channel, bytes, |_, bytes| {
-                        offer(metadata, bytes).map_err(DequeueError::Commit)
-                    })
-                    .map_err(mux_offer_error)?;
-                let Some(token) = admitted else {
-                    return Ok(None);
-                };
-                state.metadata.pop_front();
-                if state.metadata.is_empty() {
-                    state.metadata = VecDeque::new();
-                }
-                state.snapshot.queued = flow_usage;
-                *usage = total_usage;
-                Ok(Some(token))
+        let pool = &mut self.metadata_pool;
+        let commit = |actual, bytes: &[u8]| {
+            if actual != head {
+                return Err(error(PipelineError::Invariant));
+            }
+            let admitted = mux
+                .offer_selected(metadata.binding.channel, bytes, |_, bytes| {
+                    offer(metadata, bytes).map_err(DequeueError::Commit)
+                })
+                .map_err(mux_offer_error)?;
+            let Some(token) = admitted else {
+                return Ok(None);
+            };
+            if state.metadata.pop(pool) != Some(metadata) {
+                return Err(error(PipelineError::Invariant));
+            }
+            state.snapshot.queued = flow_usage;
+            *usage = total_usage;
+            Ok(Some(token))
+        };
+        let selected = if owned {
+            qos.offer_selected(commit).map(|selected| {
+                selected.map(|(selected, permit)| Handoff {
+                    metadata,
+                    permit,
+                    payload: Some(selected.payload),
+                })
             })
-            .map_err(|source| match source {
-                l2tunnel_qos::OfferError::Schedule(source) => {
-                    error(PipelineError::Schedule(source))
-                }
-                l2tunnel_qos::OfferError::Downstream(source) => source,
-            })?;
-        Ok(selected.map(|(selected, permit)| Admitted {
-            packet: Packet {
-                payload: selected.payload,
-                metadata,
-            },
-            permit,
-        }))
+        } else {
+            qos.offer_selected_borrowed(commit).map(|selected| {
+                selected.map(|(_, permit)| Handoff {
+                    metadata,
+                    permit,
+                    payload: None,
+                })
+            })
+        }
+        .map_err(|source| match source {
+            l2tunnel_qos::OfferError::Schedule(source) => error(PipelineError::Schedule(source)),
+            l2tunnel_qos::OfferError::Downstream(source) => source,
+        })?;
+        Ok(selected)
     }
 
     /// Aggregate original-packet retention across every stage.
@@ -693,7 +884,10 @@ impl Pipeline {
         Ok(self.states.iter().map(|(key, state)| FlowHead {
             key: *key,
             snapshot: state.snapshot,
-            packet_bytes: state.metadata.front().map(|packet| packet.observed_bytes),
+            packet_bytes: state
+                .metadata
+                .front(&self.metadata_pool)
+                .map(|packet| packet.classification.observed_bytes),
         }))
     }
 
@@ -728,16 +922,13 @@ impl Pipeline {
         work: usize,
         excluded: Option<FlowKey>,
     ) -> Result<IdleScan, PipelineError> {
-        use std::ops::Bound::{Excluded, Unbounded};
         self.flows.validate_time(now).map_err(PipelineError::Flow)?;
         let mut result = IdleScan {
             after,
             examined: 0,
             candidate: None,
         };
-        let mut entries = self
-            .states
-            .range((after.map_or(Unbounded, Excluded), Unbounded));
+        let mut entries = self.states.after(after);
         for _ in 0..work {
             let Some((key, state)) = entries.next() else {
                 result.after = None;
@@ -878,9 +1069,83 @@ impl Pipeline {
     }
 }
 
+enum Input<'a> {
+    Owned(Vec<u8>),
+    Borrowed(&'a [u8]),
+}
+
+impl<'a> Input<'a> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Borrowed(bytes) => bytes,
+        }
+    }
+    fn prepare(self, reserved: bool) -> Result<Self, Self> {
+        match self {
+            Self::Borrowed(bytes) if !reserved => {
+                let mut owned = Vec::new();
+                if owned.try_reserve_exact(bytes.len()).is_err() {
+                    return Err(Self::Borrowed(bytes));
+                }
+                owned.extend_from_slice(bytes);
+                Ok(Self::Owned(owned))
+            }
+            input => Ok(input),
+        }
+    }
+    fn into_owned(self) -> Vec<u8> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Borrowed(bytes) => bytes.to_vec(),
+        }
+    }
+}
+
+fn owned_handoff<T, E>(
+    handoff: Option<Handoff<T>>,
+) -> Result<Option<Admitted<T>>, DequeueError<E>> {
+    handoff
+        .map(|handoff| {
+            let payload = handoff
+                .payload
+                .ok_or(DequeueError::Pipeline(PipelineError::Invariant))?;
+            Ok(Admitted {
+                packet: Packet {
+                    payload,
+                    metadata: handoff.metadata,
+                },
+                permit: handoff.permit,
+            })
+        })
+        .transpose()
+}
+
+fn borrowed_handoff<T>(handoff: Option<Handoff<T>>) -> Option<Admission<T>> {
+    handoff.map(|handoff| Admission {
+        metadata: handoff.metadata,
+        permit: handoff.permit,
+    })
+}
+
+fn qos_admission_error(error: l2tunnel_qos::AdmissionErrorKind) -> PipelineError {
+    match error {
+        l2tunnel_qos::AdmissionErrorKind::Allocation => PipelineError::Allocation,
+        _ => PipelineError::Invariant,
+    }
+}
+
+fn mux_admission_error(error: l2tunnel_mux::BorrowedAdmissionError) -> PipelineError {
+    match error {
+        l2tunnel_mux::BorrowedAdmissionError::Allocation => PipelineError::Allocation,
+        _ => PipelineError::Invariant,
+    }
+}
+
 fn mux_offer_error<E>(source: l2tunnel_mux::OfferError<DequeueError<E>>) -> DequeueError<E> {
     match source {
         l2tunnel_mux::OfferError::Downstream(error) => error,
+        l2tunnel_mux::OfferError::Allocation => DequeueError::Pipeline(PipelineError::Allocation),
         _ => DequeueError::Pipeline(PipelineError::Invariant),
     }
 }
@@ -956,3 +1221,6 @@ mod validation_tests;
 
 #[cfg(test)]
 mod handoff_tests;
+
+#[cfg(test)]
+mod storage_tests;

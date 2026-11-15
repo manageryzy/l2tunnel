@@ -25,6 +25,9 @@
 mod flow;
 mod parse;
 
+/// Actual fallible fixed-capacity flow-table backing.
+pub mod storage;
+
 pub use flow::{Binding, FlowError, FlowId, FlowTable, FlowTableConfig, PreparedAssignment};
 pub use l2tunnel_core::Mapping;
 pub use l2tunnel_device::PacketLayer;

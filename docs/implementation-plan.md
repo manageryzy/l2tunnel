@@ -250,10 +250,20 @@ initial/managed Joining/member/refresh/Records path. The subsequent
 implements transactional real-queue admission, reserved FEC/Reliable/Aligned/Packed
 libraries and the explicit functional three-profile Engine. It passes affected
 library and selected downstream caller tests with bounded parallelism. Reserved
-Engine/Bank and selected runtime/resource/API composition, full stage acceptance, runtime fresh-DH
+mixed-profile Bank and selected runtime/resource/API composition, full stage acceptance, runtime fresh-DH
 lifecycle and complete retained recovery remain open. Passing unaffected
 checks are reused; a failed new expected literal was repaired with one exact
 test rerun rather than repeating the whole batch.
+
+The [actual reserved common Engine checkpoint](../work/common-reserved-records-20261115/scoped-checkpoint-validation.json)
+adds complete real queue backing, borrowed admission and one move-only Swift
+owner. Actual reserved Swift/Aligned/Packed Engine constructors pass142 distinct
+affected cases, including32 new cases, with paired TAP/TUN, asymmetric roles,
+full64 byte/identity/witness/charge comparisons and exact Full/Busy retries.
+Initial failures and exact reuse bindings remain preserved. Complete mixed Bank,
+shared external owners, nested allocator/drop qualification, selected runtime,
+full-stage/native/platform/performance acceptance remain open. Unchanged tooling,
+simulator and unrelated performance suites were not repeated.
 
 ## Ordered milestones and exit gates
 

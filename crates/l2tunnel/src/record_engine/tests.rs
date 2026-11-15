@@ -8,7 +8,7 @@ use l2tunnel_reliable::ReliableConfig;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Family {
+pub(super) enum Family {
     Swift,
     Aligned,
     Packed,
@@ -165,7 +165,7 @@ fn common(
     )?)
 }
 
-fn fixture(family: Family, raw: bool) -> TestResult<configuration::Configuration> {
+pub(super) fn fixture(family: Family, raw: bool) -> TestResult<configuration::Configuration> {
     let profile = match family {
         Family::Swift => configuration::Profile::Swift {
             forward: swift_policy(false, raw),
@@ -203,14 +203,14 @@ fn fixture(family: Family, raw: bool) -> TestResult<configuration::Configuration
     )?)
 }
 
-fn context(role: Role) -> Context {
+pub(super) fn context(role: Role) -> Context {
     Context {
         session: 0x1234_5678_9012_3456,
         epoch: 7,
         role,
     }
 }
-fn geometry() -> Geometry {
+pub(super) fn geometry() -> Geometry {
     Geometry {
         forward_overhead_bytes: 17,
         reverse_overhead_bytes: 73,
@@ -221,7 +221,7 @@ fn next(clock: &mut u64) -> Tick {
     *clock += 1;
     now
 }
-fn identity_channel(identity: ProfileIdentity) -> u16 {
+pub(super) fn identity_channel(identity: ProfileIdentity) -> u16 {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index() as u16,
         ProfileIdentity::Aligned(identity) | ProfileIdentity::Packed(identity) => {
@@ -230,7 +230,7 @@ fn identity_channel(identity: ProfileIdentity) -> u16 {
     }
 }
 
-fn packet(raw: bool, port: u16, native_length: usize, value: u8) -> Vec<u8> {
+pub(super) fn packet(raw: bool, port: u16, native_length: usize, value: u8) -> Vec<u8> {
     let length = native_length - if raw { 0 } else { 14 };
     let mut bytes = vec![value; length];
     bytes[..40].fill(0);
@@ -257,7 +257,7 @@ fn packet(raw: bool, port: u16, native_length: usize, value: u8) -> Vec<u8> {
     }
 }
 
-struct Link {
+pub(super) struct Link {
     number: u64,
     overhead: usize,
     channels: u16,
@@ -270,7 +270,7 @@ struct Link {
     swift: bool,
 }
 impl Link {
-    fn new(configuration: &configuration::Configuration, role: Role) -> Self {
+    pub(super) fn new(configuration: &configuration::Configuration, role: Role) -> Self {
         let direction = configuration.descriptor().direction(role);
         let (maximum, witnesses, swift) = match direction.profile() {
             configuration::DirectionProfile::Swift(config) => {
@@ -313,7 +313,7 @@ impl Link {
         }
     }
 
-    fn transfer(
+    pub(super) fn transfer(
         &mut self,
         sender: &mut Engine,
         receiver: &mut Engine,
