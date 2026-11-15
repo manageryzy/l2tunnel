@@ -7,6 +7,14 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
+The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+implements explicit ARQ-only selection in the existing Reliable/Aligned/Packed
+owners and actual Packed independent-short preview. See [MOD-REL-*](modules/reliable.md),
+[MOD-PACKREC-*](modules/packed-recovery.md) and [CCS-*](modules/common-carrier-service.md).
+Finite original-carrier APIv4/Unix packet-device and pure gap/expiry evidence do
+not close production native CLI, retained recovery, Rolling preview or any of the
+unchanged full mode/resource/platform/performance definitions.
+
 UDP framing terminology is aligned with the
 [datagram API and format](modules/datagram.md#project-specific-prefixes-and-exact-draft-format):
 the cover names identify project-specific prefix layouts, with explicit

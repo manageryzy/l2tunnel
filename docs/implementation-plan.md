@@ -6,6 +6,13 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
+The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+implements explicit ARQ-only Aligned/Packed without another recovery engine and
+Packed independent-short preview through the existing bounded receiver. Actual
+original-carrier APIv4 covers a four-member fixture on both appearances; pure
+Packed gap/expiry cases do not qualify native use. Rolling early-short, retained
+recovery and all complete mode/resource/platform/performance gates remain open.
+
 Use the [implementation checklist](implementation-checklist.md) as the durable
 progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN active
 flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.

@@ -81,7 +81,8 @@ struct ReliableHeader {
     prefer_feedback: bool,
     now: Duration,
     failure: Option<ReliableError>,
-    statistics: super::Statistics,
+    // Preserve the ten original u64 counters even when live telemetry grows.
+    statistics: [u64; 10],
 }
 pub(super) const fn reliable_bytes() -> usize {
     std::mem::size_of::<ReliableHeader>()

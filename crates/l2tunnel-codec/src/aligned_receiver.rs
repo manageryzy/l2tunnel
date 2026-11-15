@@ -491,6 +491,24 @@ impl Receiver {
         shadow.failure = self.failure;
         Ok(shadow)
     }
+    /// Classify a complete symbol using this receiver's actual scope and parser.
+    /// Only an unfragmented self-contained kind-2 frame within the explicitly
+    /// configured generic size limit qualifies. This grants no authentication,
+    /// admission or native credit and changes no receiver state.
+    pub fn is_independent_short(
+        &self,
+        identity: SymbolIdentity,
+        symbol: &[u8],
+    ) -> Result<bool, Error> {
+        if identity.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        let parsed = parse(symbol, identity.record, self.limits)?;
+        Ok(self.limits.body.independent_short_frame_bytes != 0
+            && parsed.fragments == 0
+            && parsed.body.first() == Some(&2)
+            && parsed.body.len() - 3 <= self.limits.body.independent_short_frame_bytes)
+    }
     /// Admit one authenticated complete protected symbol; errors consume no source ID.
     pub fn admit_authenticated(
         &mut self,
@@ -1006,3 +1024,7 @@ mod tests;
 #[cfg(test)]
 #[path = "aligned_batch_tests.rs"]
 mod batch_tests;
+
+#[cfg(test)]
+#[path = "aligned_short_preview_tests.rs"]
+mod short_preview_tests;

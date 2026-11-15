@@ -53,8 +53,8 @@ pub struct Plan {
     receive: ReliableConfig,
     bytes: usize,
     pub(crate) arq: l2tunnel_recovery::storage::DuplexPlan,
-    pub(crate) encoder: l2tunnel_fec::storage::EncoderPlan,
-    pub(crate) decoder: l2tunnel_fec::storage::DecoderPlan,
+    pub(crate) encoder: Option<l2tunnel_fec::storage::EncoderPlan>,
+    pub(crate) decoder: Option<l2tunnel_fec::storage::DecoderPlan>,
 }
 impl Plan {
     /// Validate both complete directions before computing nested and wrapper layouts.
@@ -63,14 +63,18 @@ impl Plan {
         receive.validate().map_err(Error::Reliable)?;
         let arq = l2tunnel_recovery::storage::DuplexPlan::for_arq(send.arq, receive.arq)
             .map_err(Error::Recovery)?;
-        let encoder =
-            l2tunnel_fec::storage::EncoderPlan::for_encoder(send.fec.block).map_err(Error::Fec)?;
-        let decoder =
-            l2tunnel_fec::storage::DecoderPlan::for_decoder(receive.fec).map_err(Error::Fec)?;
-        let n = send.fec.block.max_sources;
+        let encoder = (send.repair_symbols != 0)
+            .then(|| l2tunnel_fec::storage::EncoderPlan::for_encoder(send.fec.block))
+            .transpose()
+            .map_err(Error::Fec)?;
+        let decoder = (receive.repair_symbols != 0)
+            .then(|| l2tunnel_fec::storage::DecoderPlan::for_decoder(receive.fec))
+            .transpose()
+            .map_err(Error::Fec)?;
+        let n = encoder.map_or(0, |_| send.fec.block.max_sources);
         let o = add(n, send.repair_symbols)?;
         let r = receive.max_restored_packets;
-        let g = receive.fec.max_generations;
+        let g = decoder.map_or(0, |_| receive.fec.max_generations);
         let bs = add(
             l2tunnel_recovery::DATA_HEADER_BYTES,
             send.arq.max_source_bytes,
@@ -82,7 +86,10 @@ impl Plan {
         let scratch = bs.max(l2tunnel_recovery::ACK_PACKET_BYTES);
         let mut bytes = add(
             arq.capacity_bytes(),
-            add(encoder.capacity_bytes(), decoder.capacity_bytes())?,
+            add(
+                encoder.map_or(0, |p| p.capacity_bytes()),
+                decoder.map_or(0, |p| p.capacity_bytes()),
+            )?,
         )?;
         for charge in [
             array_bytes::<Vec<u8>>(n)?,

@@ -84,15 +84,13 @@ impl Config {
         {
             return Err(Error::Configuration);
         }
-        let maximum = 8usize
-            .checked_add(56)
-            .and_then(|n| n.checked_add(self.recovery.fec.block.max_sources))
-            .and_then(|n| n.checked_add(2 + 44 + original))
-            .ok_or(Error::Configuration)?;
+        let maximum = self
+            .recovery
+            .maximum_packet_bytes()
+            .map_err(Error::Recovery)?;
         if maximum > self.max_recovery_packet_bytes {
             return Err(Error::Configuration);
         }
-        self.recovery.validate().map_err(Error::Recovery)?;
         Ok(())
     }
     /// Maximum configured retry timer sum plus partial-block flush duration.
@@ -277,6 +275,9 @@ pub struct Endpoint {
     sender: packed::SenderOwner,
     packing: Option<packed::Options>,
     receive_packing: Option<packed::Options>,
+    // Ordered packed-source framing is independent of out-of-order short-unit
+    // proofs. Only actual ordered recovery handoff advances this cursor.
+    receive_unit: Option<receiver::SourceId>,
     packed_symbols: Vec<u8>,
     recovery: Reliable,
     receiver: receiver::Receiver,
@@ -460,6 +461,7 @@ impl Endpoint {
             sender,
             packing,
             receive_packing,
+            receive_unit: Some(receive_config.receiver.first_source),
             packed_symbols,
             recovery,
             receiver,
@@ -549,6 +551,7 @@ impl Endpoint {
             },
             packing,
             receive_packing,
+            receive_unit: Some(receive_config.receiver.first_source),
             packed_symbols: vec![
                 0;
                 receive_packing.map_or(0, |p| usize::from(p.max_units)
@@ -1018,15 +1021,17 @@ impl Endpoint {
     }
 
     fn preview_receive(&mut self) -> Result<(), Error> {
-        if self.receive_packing.is_some()
-            || self
-                .receive_config
-                .receiver
-                .body
-                .independent_short_frame_bytes
-                == 0
+        if self
+            .receive_config
+            .receiver
+            .body
+            .independent_short_frame_bytes
+            == 0
         {
             return Ok(());
+        }
+        if let Some(options) = self.receive_packing {
+            return self.preview_packed(options);
         }
         let now = ticks(self.now)?;
         let result = (|| {
@@ -1075,20 +1080,6 @@ impl Endpoint {
         id: u64,
         length: usize,
     ) -> Result<(), Error> {
-        let view = l2tunnel_codec::packed_envelope::decode(
-            options.config(self.receive_config).envelope(),
-            self.receive_scope,
-            &self.receive_buffer[..length],
-        )
-        .map_err(Error::PackedEnvelope)?;
-        if view.identity().source.0 != id
-            || Some(view.identity().first_unit) != self.receiver.status().source_floor
-        {
-            return Err(Error::Identity);
-        }
-        let width = self.receive_config.receiver.body.symbol_bytes;
-        let units = view.units().map_err(Error::PackedEnvelope)?;
-        let count = units.len();
         let mut inputs: [receiver::AuthenticatedSymbol<'_>; 255] =
             std::array::from_fn(|_| receiver::AuthenticatedSymbol {
                 identity: receiver::SymbolIdentity {
@@ -1098,25 +1089,50 @@ impl Endpoint {
                 },
                 bytes: &[],
             });
-        let mut received = 0;
-        for (unit, symbol) in units.zip(self.packed_symbols.chunks_exact_mut(width)) {
-            symbol.fill(0);
-            symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
-            if self.receive_config.native_policy == NativePolicy::RawIp {
-                let raw = symbol[3] == 2;
-                let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-                if !raw && !fragment {
-                    return Err(Error::Policy);
+        let (first, count) = packed_inputs(
+            options,
+            self.receive_config,
+            self.receive_scope,
+            id,
+            &self.receive_buffer[..length],
+            &mut self.packed_symbols,
+            &mut inputs,
+        )?;
+        if Some(first) != self.receive_unit {
+            return Err(Error::Identity);
+        }
+        // The envelope parser already checked every unit's full-width ID.
+        // None is the exact exhausted next ID, never wrapping back to zero.
+        let next = first.0.checked_add(count as u64).map(receiver::SourceId);
+        let preview = self
+            .receive_config
+            .receiver
+            .body
+            .independent_short_frame_bytes
+            != 0;
+        let count = if preview {
+            // Previewed units can already belong to the actual contiguous
+            // admission prefix, including its exhausted u64 endpoint. The
+            // independent ordered-source cursor still validates this immutable
+            // recovery-owned envelope's complete unit range.
+            let floor = self.receiver.status().source_floor;
+            let mut retained = 0;
+            for index in 0..count {
+                if floor.is_some_and(|floor| inputs[index].identity.source.0 >= floor.0) {
+                    inputs[retained] = receiver::AuthenticatedSymbol {
+                        identity: inputs[index].identity,
+                        bytes: inputs[index].bytes,
+                    };
+                    retained += 1;
                 }
             }
-            inputs[received] = receiver::AuthenticatedSymbol {
-                identity: unit.identity,
-                bytes: symbol,
-            };
-            received += 1;
-        }
-        if received != count {
-            return Err(Error::Identity);
+            retained
+        } else {
+            count
+        };
+        if count == 0 {
+            self.receive_unit = next;
+            return Ok(());
         }
         let mut outcomes = [receiver::Admission::Accepted; 255];
         let admitted = self
@@ -1128,13 +1144,91 @@ impl Endpoint {
             )
             .map_err(Error::Receiver)?;
         if admitted != count
-            || outcomes[..count]
-                .iter()
-                .any(|a| *a != receiver::Admission::Accepted)
+            || outcomes[..count].iter().any(|a| {
+                !(matches!(a, receiver::Admission::Accepted)
+                    || preview
+                        && matches!(
+                            a,
+                            receiver::Admission::Duplicate | receiver::Admission::StaleSource
+                        ))
+            })
         {
             return Err(Error::Identity);
         }
+        self.receive_unit = next;
         Ok(())
+    }
+    fn preview_packed(&mut self, options: packed::Options) -> Result<(), Error> {
+        let now = ticks(self.now)?;
+        let result = (|| {
+            for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+                let mut inputs: [receiver::AuthenticatedSymbol<'_>; 255] =
+                    std::array::from_fn(|_| receiver::AuthenticatedSymbol {
+                        identity: receiver::SymbolIdentity {
+                            scope: self.receive_scope,
+                            source: receiver::SourceId(0),
+                            record: receiver::RecordId(0),
+                        },
+                        bytes: &[],
+                    });
+                let (_, count) = packed_inputs(
+                    options,
+                    self.receive_config,
+                    self.receive_scope,
+                    id,
+                    payload,
+                    &mut self.packed_symbols,
+                    &mut inputs,
+                )?;
+                let mut selected = 0;
+                // Validate all units before one atomic eligible-ledger admission.
+                // Ordinary context-dependent frames remain recovery-owned.
+                for index in 0..count {
+                    let eligible = self
+                        .receiver
+                        .is_independent_short(inputs[index].identity, inputs[index].bytes)
+                        .map_err(Error::Receiver)?;
+                    if eligible
+                        && self
+                            .receiver
+                            .status()
+                            .source_floor
+                            .is_some_and(|floor| inputs[index].identity.source.0 > floor.0)
+                    {
+                        inputs[selected] = receiver::AuthenticatedSymbol {
+                            identity: inputs[index].identity,
+                            bytes: inputs[index].bytes,
+                        };
+                        selected += 1;
+                    }
+                }
+                if selected == 0 {
+                    continue;
+                }
+                let mut outcomes = [receiver::Admission::Accepted; 255];
+                match self.receiver.admit_batch_authenticated_into(
+                    &inputs[..selected],
+                    now,
+                    &mut outcomes[..selected],
+                ) {
+                    Ok(admitted)
+                        if admitted == selected
+                            && outcomes[..selected].iter().all(|a| {
+                                matches!(
+                                    a,
+                                    receiver::Admission::Accepted
+                                        | receiver::Admission::Duplicate
+                                        | receiver::Admission::StaleSource
+                                )
+                            }) => {}
+                    Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                    Ok(_) => return Err(Error::Identity),
+                    Err(error) => return Err(Error::Receiver(error)),
+                }
+            }
+            Ok(())
+        })();
+        self.terminal_result(result)
     }
     fn recovery_result<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         match result {
@@ -1157,6 +1251,51 @@ impl Endpoint {
         self.failure = Some(error);
         Err(error)
     }
+}
+
+// Reuse the exact ordinary packed parser and retained padded symbol slab for
+// ordered admission and short preview. No payload queue or codec is duplicated.
+#[allow(clippy::too_many_arguments)] // Explicit existing owners and borrowed caller scratch.
+fn packed_inputs<'a>(
+    options: packed::Options,
+    config: Config,
+    scope: receiver::Scope,
+    source: u64,
+    packet: &[u8],
+    scratch: &'a mut [u8],
+    output: &mut [receiver::AuthenticatedSymbol<'a>; 255],
+) -> Result<(receiver::SourceId, usize), Error> {
+    let view =
+        l2tunnel_codec::packed_envelope::decode(options.config(config).envelope(), scope, packet)
+            .map_err(Error::PackedEnvelope)?;
+    if view.identity().source.0 != source {
+        return Err(Error::Identity);
+    }
+    let first = view.identity().first_unit;
+    let units = view.units().map_err(Error::PackedEnvelope)?;
+    let count = units.len();
+    let width = config.receiver.body.symbol_bytes;
+    let mut received = 0;
+    for (unit, symbol) in units.zip(scratch.chunks_exact_mut(width)) {
+        symbol.fill(0);
+        symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
+        if config.native_policy == NativePolicy::RawIp {
+            let raw = symbol[3] == 2;
+            let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
+            if !raw && !fragment {
+                return Err(Error::Policy);
+            }
+        }
+        output[received] = receiver::AuthenticatedSymbol {
+            identity: unit.identity,
+            bytes: symbol,
+        };
+        received += 1;
+    }
+    if received != count {
+        return Err(Error::Identity);
+    }
+    Ok((first, count))
 }
 
 fn sender_config(config: Config) -> sender::Config {
@@ -1187,6 +1326,8 @@ fn duration(output: &mut Vec<u8>, value: Duration) {
 
 #[cfg(test)]
 mod directional_tests;
+#[cfg(test)]
+mod packed_early_tests;
 #[cfg(test)]
 mod packed_tests;
 #[cfg(test)]

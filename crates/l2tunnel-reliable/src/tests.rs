@@ -539,7 +539,7 @@ fn protection_rejects_corruption_before_recovery_mutation() -> TestResult {
 #[test]
 fn canonical_cross_module_caps_and_time_arithmetic_are_checked() -> TestResult {
     let good = config();
-    let cases: [fn(&mut ReliableConfig); 12] = [
+    let cases: [fn(&mut ReliableConfig); 11] = [
         |c| c.fec.block.max_source_bytes -= 1,
         |c| c.fec.block.max_packet_bytes -= 1,
         |c| c.fec.block.max_work_per_symbol = 1,
@@ -548,7 +548,6 @@ fn canonical_cross_module_caps_and_time_arithmetic_are_checked() -> TestResult {
         |c| c.max_restored_packets = 10,
         |c| c.max_restored_bytes = 16 * 108 - 1,
         |c| c.repair_symbols = 254,
-        |c| c.repair_symbols = 0,
         |c| c.flush_after = c.arq.initial_rto,
         |c| c.flush_after = Duration::ZERO,
         |c| c.outer_overhead_bytes = usize::MAX,

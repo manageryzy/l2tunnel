@@ -58,7 +58,11 @@ not qualify full SW-11. The subsequent
 [native event counts](modules/common-native-counts.md) and
 [compact rolling records](modules/rolling-records.md) have finite protocol evidence.
 Unpacked Aligned independent-short delivery is implemented across an older gap;
-Packed/rolling early-short and their full matrices remain separate requirements.
+Packed now also has finite pure gap/deduplication/expiry evidence in the
+[affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json).
+Explicit ARQ-only Aligned/Packed runs through the actual original-carrier APIv4
+with Unix packet-device fixtures; it does not implement compact-arq RTT/serial
+semantics. Rolling early-short and all full matrices remain separate requirements.
 Complete resources, full rolling runtime qualification and all47 catalog gates retain
 their original definitions and remain open.
 

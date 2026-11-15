@@ -61,6 +61,18 @@ preflight cannot advance native delivery counters.
 
 ## Limits and time
 
+The additive independent-short path is implemented in the shared endpoint with
+[finite affected evidence](../../work/parallel-features-20261115/parallel-wave6-packed-repair-attempt-2/validation.json).
+When the existing generic size limit is explicitly
+nonzero, it observes the actual reliable owner's retained future sources and
+uses the same packed-envelope and receiver parsers. Only complete self-contained
+kind-2 units within that limit enter one atomic eligible-unit batch. This adds no
+payload queue, logical credit or native completion. A separate ordered unit cursor
+preserves strict packed-source framing when a later recovery handoff encounters
+an already admitted prefix; pending native bytes and original expiry are retained.
+Zero keeps ordinary ordered admission. Rolling preview and full native/parity
+matrices remain separate unfinished deliverables.
+
 Validate packed source bytes against ARQ, FEC and physical recovery packet
 ceilings, counting the full identity header and all per-unit absolute record IDs.
 Reserve max_units padded symbols and metadata, and include that reservation with
@@ -89,6 +101,7 @@ handoff, receiver records/proofs and pending native bytes with no terminal error
 - [x] [MOD-PACKREC-03] Test blocked native delivery, full recovery/batch storage, output/budget pressure, malformed late units, source/unit mismatch, rollback, expiry and finite retry exhaustion without false drain. Evidence: [nine packed composition tests](../../crates/l2tunnel-aligned/src/packed_tests.rs), [ordinary output-capacity regression](../../crates/l2tunnel-aligned/src/tests.rs).
 - [x] [MOD-PACKREC-04] Run all ordinary aligned regressions and independent ownership review, strict checks and stable aggregate validation. Evidence: [17 focused tests](../../crates/l2tunnel-aligned/src/packed_tests.rs), [stable wave9 aggregate](../../work/implementation-wave9/validation.json); independent ownership review found no remaining blocker.
 - [ ] [MOD-PACKREC-05] Add separately authenticated runtime/client selection and scoped native tests before claiming packed-wire parity or exposing a CLI option.
+- [x] [MOD-PACKREC-06] Verify actual Packed independent-short release across a lost recovery source, exact later ordered deduplication, both backing modes and original pending-native expiry, using the shared parser without a second recovery engine. Evidence: [two actual Packed passes](../../work/parallel-features-20261115/parallel-wave6-packed-repair-attempt-2/validation.json) and [shared parser case](../../work/parallel-features-20261115/parallel-wave6-cases-attempt-1/codec-short.log). The first fixture omitted the initial real recovery poll; its failed receipt is preserved. Only the sender fixture was corrected; receiver deadlines and production behavior were unchanged. Full Rolling/native/parity acceptance remains open.
 
 ## Focused checkpoint
 

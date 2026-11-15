@@ -1,4 +1,4 @@
-# Reliable systematic block FEC with selective-repeat fallback
+# Reliable selective repeat with optional systematic block FEC
 
 Status: implemented and locally unit-tested. This crate composes the existing
 [selective-repeat engine](recovery.md) and [full-byte block FEC](fec.md). It is a
@@ -26,6 +26,18 @@ and maximum original payload. The configured FEC packet limit must accommodate
 that complete inner FEC packet. Callers subtract actual protection/IP/UDP overhead
 from path MTU before selecting these limits. Contradictory or excessive limits fail
 construction; `max_packet_bytes()` reports this exact worst-case emitted size.
+
+Explicit `repair_symbols = 0` selects the existing selective-repeat engine alone.
+It sends the existing kind-1 direct source envelope on the first eligible poll,
+without collecting a block or waiting for `flush_after`. Original IDs, selective
+receipts, retained-source bounds, retry deadlines and exhaustion are unchanged.
+The exact maximum is `8 + max(44 + max_payload, 48)`. Each direction selects this
+independently; a no-FEC sender can receive real FEC in the opposite direction.
+The complete represented FEC policy is still validated and authenticated, but
+inactive encoder/decoder, block/output queues and generation-expiry slots reserve
+no heap capacity. Restored staging, scratch and actual ARQ custody remain counted.
+Positive-repair defaults and their existing packet bytes are unchanged. This is
+not completion of compact-arq RTT/serial/ACK-echo or any complete P-* contract.
 
 ```rust
 Reliable::submit(source: &[u8], now: Duration) -> Result<u64, Error>;
@@ -161,6 +173,8 @@ before exhausting counters; no automatic context or key reset is performed.
 - [x] [MOD-REL-05] Test no loss, source loss repaired before RTO, insufficient-rank ARQ fallback, duplicate/reorder, partial/one-source blocks, budgets/caps and lower-layer corruption rejection. Evidence: [17 focused tests](../../crates/l2tunnel-reliable/src/tests.rs), [local validation](#local-validation).
 - [ ] [MOD-REL-06] Integrate negotiated configuration/flow credit/MUX, authenticated carrier adapters, measured CPU/memory and real loss/reorder/native-device receipts.
 - [ ] [MOD-REL-07] Port distinct Python generation scheduling/rank-feedback/sliding/hybrid families and their byte/trace parity gates; do not infer them from this baseline.
+- [x] [MOD-REL-08] Implement explicitly selected direct ARQ-only emission through the existing owner, independently per direction, with exact no-FEC backing, strict coding-record refusal, shared wire charging and original retry/exhaustion behavior. Evidence: [three affected loss/storage/failure cases](../../work/parallel-features-20261115/parallel-wave6-reliable-cases-attempt-1.json), passed locally in 0.006 s; this is finite protocol evidence.
+- [ ] [MOD-REL-09] Validate ARQ-only Aligned/Packed through complete authenticated Common configuration, actual shared carrier service/API switches and original native custody; retain full mode, native-platform and performance acceptance separately. **Finite Common configuration and actual carrier API/Unix packet-device cases now pass** in the [affected batch](../../work/parallel-features-20261115/parallel-wave6-cases-attempt-1/validation.json), whose two Packed fixture failures remain failed. Production native CLI/device qualification remains open.
 
 ## Local validation
 

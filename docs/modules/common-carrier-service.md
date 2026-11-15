@@ -1,9 +1,14 @@
 # Common profiles on the original authenticated carrier
 
-Status: **implemented with finite profile, typed-service and offline CLI evidence**.
+Status: **implemented with finite profile, typed-service, APIv4 IPC and offline CLI evidence**.
+The new [actual carrier IPC case](../../work/parallel-features-20261115/parallel-wave6-cases-attempt-1/carrier-ipc.log)
+passed in 4.060 s: both inner appearances, the complete four-member fixture
+catalog, explicit ARQ-only Aligned/Packed, keyed four-family transitions, exact
+Unix packet-device bytes, liveness and release. This is finite local IPC/runtime
+evidence; it does not qualify all64 members, production native CLI or TAP/TUN.
 The actual four-family carrier service case passed in 3.478 s in the
 [final selected service log](../../work/parallel-features-20261115/parallel-wave5-final-checks-attempt-1/stage-2.log).
-Complete new-carrier IPC, production external CLI/native startup and parent
+Complete new-carrier IPC matrices, production external CLI/native startup and parent
 carrier/resource/platform/performance qualification remain open. The source-stable
 [first case receipt](../../work/parallel-features-20261115/parallel-wave5-cases-attempt-1/validation.json)
 retains **10/11 passed in 0.683 s, aggregate failed**. Both genuine-outer Profile
@@ -122,12 +127,14 @@ false. These positive subprocess results do not change the failed aggregate.
 - [x] [CCS-03] Install the actual bound profile through shared Prepared/service authentication and the existing Common Driver, including original socket/cap, complete typed switches, native delivery and independent liveness. (Evidence: [actual all-four-family typed service case passed after structural and assertion corrections](../../work/parallel-features-20261115/parallel-wave5-final-checks-attempt-1/stage-2.log).)
 - [ ] [CCS-04] Expose requested carrier policy and effective bound profile through
   the shared API/CLI without inventing authentication or changing old versions.
-  **Implemented in part; typed service and offline inspection passed. New-carrier
-  IPC and production external CLI/native startup remain unqualified.**
+  **Implemented in part; typed service, finite new-carrier IPC and offline
+  inspection passed. Complete IPC matrices and production external CLI/native
+  startup remain unqualified.**
 - [ ] [CCS-05] Complete blocked/late/cancelled setup and runtime failure ownership,
   full resources, carrier/native/platform and original parent acceptance. The
   finite profile/service cases alone do not close these broader requirements.
 - [x] [CCS-06] Validate the complete explicit outer plan and strict selector/unsupported-flag rules, then run both actual external offline CLI processes with all 64 members/pages and truthful requested-only output. (Evidence: [strict parser/selector cases](../../work/parallel-features-20261115/parallel-wave5-cases-attempt-1/validation.json) and [two full-catalog external processes in the preserved failed second aggregate](../../work/parallel-features-20261115/parallel-wave5-cases-attempt-2/validation.json).) **Offline only: no CA/TLS verification, network/device startup, carrier IPC, native or production-client qualification.**
+- [x] [CCS-07] Exercise actual original-carrier shared service through private APIv4 sockets on both inner appearances, with a complete four-member fixture catalog, truthful E0/E1 status, keyed switches/replay and stale-catalog refusal, actual packet-device bytes/liveness and released device/socket ownership. Evidence: [one finite runtime/IPC case](../../work/parallel-features-20261115/parallel-wave6-cases-attempt-1/carrier-ipc.log), including explicitly selected ARQ-only Aligned/Packed in both directions. The all64-member IPC, production CLI/TAP/TUN, full lifecycle and platform gates remain open.
 
 All existing OCF/OWC, SREF, SW-11 and complete resource definitions remain intact.
 Historical receipts remain evidence for their original source and scope.

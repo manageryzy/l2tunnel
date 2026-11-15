@@ -3,6 +3,11 @@
 Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
+The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+adds explicit ARQ-only Aligned/Packed through the existing recovery owner and
+actual original-carrier APIv4, plus finite pure Packed independent-short release.
+Its Unix packet-device evidence is distinct from production native qualification;
+Rolling early-short, retained recovery and the complete mode gates remain open.
 The referenced experiment chat and current local Python sources informed this
 plan; [mode parity](mode-parity.md) records the actual evidence and limitations.
 Track implementation in the [checkbox ledger](implementation-checklist.md); detailed
@@ -61,7 +66,7 @@ following are evidence boundaries, not a declaration that the target is running:
 | Swift | Historical TLS/separate-UDP receipts remain preserved. The explicitly selected QUIC-header/media-like path composes same-socket Noise/member authentication, common AEAD, Swift records and policy control through the shared service; socket/device fixtures and finite Linux CLI/TAP baselines now exist. | The full native matrix and impaired 80 Mbit/s target, complete session lifecycle, every other carrier and full SW-11. |
 | Common record runtime | Explicit Common Driver uses the actual reserved four-family Bank on the original authenticated UDP pair. Finite Unix packet-device cases pass nonempty Swift/Rolling/Aligned/Packed switching, explicit GF work, real repair and physical custody. Shared typed service and APIv4 have finite actual local-socket/cross-profile evidence. | Complete resource/fault/lifecycle matrices, fresh-DH installation, external Common CLI/device qualification and full SW-11 remain open; these are not TAP/TUN or platform/performance results. |
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
-| OpenVPN-like UDP | Preserved custom-gate native slices; additive outer-wire/control codec and actual same-socket TLS/member carrier. Actual cookie/selected Noise/managed member factory yields opaque original-carrier Parts and exchanges inner User/Control records without exporter resealing. | Complete shared-session Driver/service selection, factory blocked/late-send matrices, standard-dissector capture and native/platform/ISP qualification remain open. The historical custom 144-byte gate is a separate path. |
+| OpenVPN-like UDP | Preserved custom-gate native slices; additive outer-wire/control codec and actual same-socket TLS/member carrier. The selected shared-session Common Driver/service and finite APIv4 case exchange all four actual record families without exporter resealing, including explicit ARQ-only Aligned/Packed. | Complete factory/service fault and resource matrices, production native CLI, standard-dissector capture and native/platform/ISP qualification remain open. The historical custom 144-byte gate is a separate path. |
 | HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
 | Platforms | Linux has named, finite native compositions. Windows is a status/help scaffold; Android has no JNI/VpnService. | New common-session support, Windows and Android execution are unqualified. |
 

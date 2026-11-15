@@ -7,6 +7,16 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The latest [affected record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
+adds two actual data-path functions: explicit direct ARQ-only selection in the
+existing Reliable/Aligned/Packed owners, with inactive FEC backing omitted, and
+Packed independent-short release across an older recovery gap. The original
+carrier APIv4 case passes both appearances and all four fixture families,
+including ARQ-only Aligned/Packed, exact Unix packet-device bytes and release.
+Packed gap/expiry evidence is pure protocol testing. Production native CLI,
+Rolling early-short, retained recovery, full SW-11 and all full acceptance gates
+remain open; no performance campaign or unrelated full suite was repeated.
+
 The latest carrier batch now executes the shared service on the original
 OpenVPN-like socket with both inner appearances and Swift/Aligned/Packed/Rolling
 transitions, actual Unix packet-device bytes, liveness and release. Two external

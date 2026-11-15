@@ -128,6 +128,8 @@ fn complete_nested_plan_matches_actual_capacity_and_refuses_one_short() -> TestR
     assert_eq!(actual.limit_bytes, p.capacity_bytes());
     let nested = e.arq.storage_usage().ok_or("ARQ usage")?.capacity_bytes
         + e.decoder
+            .as_ref()
+            .ok_or("decoder")?
             .storage_usage()
             .ok_or("decoder usage")?
             .capacity_bytes
@@ -156,6 +158,164 @@ fn complete_nested_plan_matches_actual_capacity_and_refuses_one_short() -> TestR
         )))
     ));
     assert!(Reliable::legacy_inline_bytes() > 0);
+    Ok(())
+}
+
+#[test]
+fn arq_only_emits_immediately_and_recovers_original_ids_without_coding_storage() -> TestResult {
+    let c = policy(32, 2, 0, 17);
+    for reserved in [false, true] {
+        let mut left = make(c, c, EndpointRole::Initiator, reserved)?;
+        let mut right = make(c, c, EndpointRole::Responder, reserved)?;
+        assert!(left.encoder.is_none() && left.decoder.is_none());
+        let maximum = ENVELOPE_BYTES + DATA_HEADER_BYTES + 32;
+        assert_eq!(left.send_max_packet_bytes(), maximum);
+        let originals = [b"first\0source".to_vec(), vec![0x72; 32]];
+        for (id, bytes) in originals.iter().enumerate() {
+            assert_eq!(left.submit(bytes, ms(0))?, id as u64);
+        }
+        let mut output = vec![0xa5; maximum];
+        let mut blocked = OutboundBudget {
+            packets: 1,
+            wire_bytes: maximum + 16,
+        };
+        let before = left.arq_statistics();
+        assert_eq!(left.poll_data(ms(0), &mut output, &mut blocked)?, None);
+        assert!(output.iter().all(|byte| *byte == 0xa5));
+        assert_eq!(left.arq_statistics(), before);
+        let first = packets(&mut left, ms(0), false)?;
+        assert_eq!(
+            first.len(),
+            2,
+            "no partial-block deadline may delay ARQ-only sources"
+        );
+        for (id, bytes) in first.iter().enumerate() {
+            assert_eq!(left.inspect_output(bytes)?, RecordKind::Source);
+            let view =
+                inspect_structural(bytes, EndpointRole::Initiator, maximum, 32, c.fec.block)?;
+            assert_eq!(view.source.ok_or("source")?.0.0, id as u64);
+            assert!(view.fec.is_none());
+        }
+        // Lose the first source; receiving a later source never acknowledges the gap.
+        right.receive(&first[1], ms(1))?;
+        assert!(delivered(&mut right)?.is_empty());
+        let receipt = packets(&mut right, ms(3), true)?;
+        assert_eq!(receipt.len(), 1);
+        left.receive(&receipt[0], ms(3))?;
+        assert_eq!(left.storage().arq.send_records, 1);
+        assert!(packets(&mut left, ms(99), false)?.is_empty());
+        let retry = packets(&mut left, ms(100), false)?;
+        assert_eq!(retry, vec![first[0].clone()]);
+        right.receive(&retry[0], ms(101))?;
+        right.receive(&first[1], ms(101))?;
+        assert_eq!(
+            delivered(&mut right)?,
+            vec![(0, originals[0].clone()), (1, originals[1].clone())]
+        );
+        let receipt = packets(&mut right, ms(103), true)?;
+        assert_eq!(receipt.len(), 1);
+        left.receive(&receipt[0], ms(103))?;
+        assert!(left.drained() && right.drained());
+        let stats = left.statistics();
+        assert_eq!((stats.source_packets, stats.retry_packets), (2, 1));
+        assert_eq!((stats.systematic_packets, stats.repair_packets), (0, 0));
+        assert_eq!(
+            stats.emitted_wire_bytes,
+            first
+                .iter()
+                .chain(&retry)
+                .map(|p| (p.len() + 17) as u64)
+                .sum::<u64>()
+        );
+        let held = left.storage();
+        assert_eq!(
+            (
+                held.building_packets,
+                held.outbound_packets,
+                held.fec_reserved_bytes
+            ),
+            (0, 0, 0)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn arq_only_reserved_plan_is_exact_and_mixed_direction_keeps_real_fec() -> TestResult {
+    let a = policy(32, 2, 0, 17);
+    let b = policy(96, 3, 2, 73);
+    let zero = storage::Plan::for_duplex(a, a)?;
+    let mut coded = a;
+    coded.repair_symbols = 1;
+    coded.fec.max_symbols_per_generation += 1;
+    assert!(zero.capacity_bytes() < storage::Plan::for_duplex(coded, coded)?.capacity_bytes());
+    assert!(zero.encoder.is_none() && zero.decoder.is_none());
+    assert!(matches!(
+        Reliable::new_duplex_reserved(
+            a,
+            a,
+            context(EndpointRole::Initiator),
+            storage::Limits {
+                capacity_bytes: zero.capacity_bytes() - 1
+            }
+        ),
+        Err(storage::Error::Limit { .. })
+    ));
+    let endpoint = make(a, a, EndpointRole::Initiator, true)?;
+    assert_eq!(
+        endpoint.storage_usage().ok_or("usage")?.capacity_bytes,
+        zero.capacity_bytes()
+    );
+    let mut left = make(a, b, EndpointRole::Initiator, true)?;
+    let mut right = make(b, a, EndpointRole::Responder, true)?;
+    assert!(left.encoder.is_none() && left.decoder.is_some());
+    assert!(right.encoder.is_some() && right.decoder.is_none());
+    left.submit(b"uncoded", ms(0))?;
+    let p = packets(&mut left, ms(0), false)?;
+    assert_eq!(p.len(), 1);
+    right.receive(&p[0], ms(1))?;
+    assert_eq!(delivered(&mut right)?, vec![(0, b"uncoded".to_vec())]);
+    for bytes in [vec![7; 96], vec![0; 11], vec![9; 45]] {
+        right.submit(&bytes, ms(1))?;
+    }
+    let p = packets(&mut right, ms(1), false)?;
+    assert_eq!(p.len(), 5);
+    for bytes in p.iter().skip(1) {
+        left.receive(bytes, ms(2))?;
+    }
+    assert_eq!(
+        delivered(&mut left)?,
+        vec![(0, vec![7; 96]), (1, vec![0; 11]), (2, vec![9; 45])]
+    );
+    assert_eq!(left.statistics().repaired_unique_sources, 1);
+    Ok(())
+}
+
+#[test]
+fn arq_only_rejects_coding_records_and_retains_retry_exhaustion() -> TestResult {
+    let c = policy(128, 2, 0, 17);
+    let mut coded = c;
+    coded.repair_symbols = 1;
+    coded.fec.max_symbols_per_generation += 1;
+    let mut sender = make(coded, coded, EndpointRole::Initiator, true)?;
+    sender.submit(b"short", ms(0))?;
+    assert!(packets(&mut sender, ms(0), false)?.is_empty());
+    let p = packets(&mut sender, ms(5), false)?;
+    let mut receiver = make(c, c, EndpointRole::Responder, true)?;
+    assert!(p[0].len() < receiver.receive_max_packet_bytes());
+    assert_eq!(receiver.inspect_peer(&p[0]), Err(Error::Malformed));
+    let before = receiver.storage();
+    assert_eq!(receiver.receive(&p[0], ms(6)), Err(Error::Malformed));
+    assert_eq!(receiver.storage(), before);
+    let mut sender = make(c, c, EndpointRole::Initiator, true)?;
+    sender.submit(b"never acknowledged", ms(0))?;
+    assert_eq!(packets(&mut sender, ms(0), false)?.len(), 1);
+    for now in [100, 300, 700] {
+        assert_eq!(packets(&mut sender, ms(now), false)?.len(), 1);
+    }
+    assert!(packets(&mut sender, ms(1500), false).is_err());
+    assert!(sender.failure().is_some());
+    assert_eq!(sender.storage().arq.send_records, 1);
     Ok(())
 }
 

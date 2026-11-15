@@ -28,7 +28,8 @@ pub struct ReliableConfig {
     pub arq: ArqConfig,
     /// Receiver coding limits; block.max_sources is also the sending block target.
     pub fec: fec::DecoderConfig,
-    /// Cauchy repairs for a full block; partial blocks round their ratio upward.
+    /// Cauchy repairs for a full block; zero selects direct selective repeat
+    /// without block collection, coding state or a partial-flush delay.
     pub repair_symbols: usize,
     /// Positive maximum partial-block age, shorter than ARQ's initial RTO.
     pub flush_after: Duration,
@@ -224,6 +225,8 @@ pub struct Statistics {
     pub emitted_wire_bytes: u64,
     /// Emitted FEC systematic packets.
     pub systematic_packets: u64,
+    /// First transmissions of direct ARQ-only sources, excluding timeout retries.
+    pub source_packets: u64,
     /// Emitted Cauchy repair packets.
     pub repair_packets: u64,
     /// Emitted direct ARQ timeout retry packets.
@@ -263,6 +266,7 @@ pub struct Storage {
 
 #[derive(Clone, Copy)]
 enum Emission {
+    Source,
     Systematic,
     Repair,
     Retry,
@@ -283,7 +287,7 @@ pub struct Reliable {
     receive_config: ReliableConfig,
     context: RecoveryContext,
     arq: SelectiveRepeat,
-    decoder: fec::Decoder,
+    decoder: Option<fec::Decoder>,
     send_fec: fec::FecContext,
     receive_fec: fec::FecContext,
     building: backing::Building,
@@ -356,7 +360,6 @@ impl ReliableConfig {
             || count > config.arq.send_records
             || count > config.arq.receive_records
             || config.arq.send_records > config.arq.receive_records
-            || config.repair_symbols == 0
             || symbols > 256
             || config.fec.block.max_source_bytes != source_bytes
             || source_bytes > fec::MAX_SOURCE_BYTES
@@ -379,7 +382,13 @@ impl ReliableConfig {
             return Err(Error::InvalidConfig);
         }
         config.fec.validate()?;
-        Ok(maximum_packet)
+        if config.repair_symbols == 0 {
+            ENVELOPE_BYTES
+                .checked_add(source_bytes.max(ACK_PACKET_BYTES))
+                .ok_or(Error::InvalidConfig)
+        } else {
+            Ok(maximum_packet)
+        }
     }
 }
 
@@ -404,14 +413,22 @@ impl Reliable {
     ) -> Result<Self, Error> {
         let maximum_packet = config.maximum_packet()?;
         let receive_maximum_packet = receive_config.maximum_packet()?;
-        let count = config.fec.block.max_sources;
+        let count = if config.repair_symbols == 0 {
+            0
+        } else {
+            config.fec.block.max_sources
+        };
         let symbols = count
             .checked_add(config.repair_symbols)
             .ok_or(Error::InvalidConfig)?;
         let arq = SelectiveRepeat::new_duplex(config.arq, receive_config.arq, context)?;
         let send_fec = fec_context(context, false);
         let receive_fec = fec_context(context, true);
-        let decoder = fec::Decoder::new(receive_fec, receive_config.fec)?;
+        let decoder = if receive_config.repair_symbols == 0 {
+            None
+        } else {
+            Some(fec::Decoder::new(receive_fec, receive_config.fec)?)
+        };
         let scratch = vec![0; arq.send_max_packet_bytes()];
         Ok(Self {
             config,
@@ -477,28 +494,46 @@ impl Reliable {
         .map_err(storage::Error::Recovery)?;
         let send_fec = fec_context(context, false);
         let receive_fec = fec_context(context, true);
-        let encoder = fec::BlockEncoder::new_reserved(
-            send_fec,
-            config.fec.block,
-            fec::storage::Limits {
-                capacity_bytes: plan.encoder.capacity_bytes(),
-            },
-        )
-        .map_err(storage::Error::Fec)?;
-        let decoder = fec::Decoder::new_reserved(
-            receive_fec,
-            receive_config.fec,
-            fec::storage::Limits {
-                capacity_bytes: plan.decoder.capacity_bytes(),
-            },
-        )
-        .map_err(storage::Error::Fec)?;
+        let encoder = plan
+            .encoder
+            .map(|p| {
+                fec::BlockEncoder::new_reserved(
+                    send_fec,
+                    config.fec.block,
+                    fec::storage::Limits {
+                        capacity_bytes: p.capacity_bytes(),
+                    },
+                )
+            })
+            .transpose()
+            .map_err(storage::Error::Fec)?;
+        let decoder = plan
+            .decoder
+            .map(|p| {
+                fec::Decoder::new_reserved(
+                    receive_fec,
+                    receive_config.fec,
+                    fec::storage::Limits {
+                        capacity_bytes: p.capacity_bytes(),
+                    },
+                )
+            })
+            .transpose()
+            .map_err(storage::Error::Fec)?;
         let arq_usage = arq.storage_usage().ok_or(storage::Error::Invariant)?;
-        let encoder_usage = encoder.storage_usage().ok_or(storage::Error::Invariant)?;
-        let decoder_usage = decoder.storage_usage().ok_or(storage::Error::Invariant)?;
+        let encoder_usage = encoder
+            .as_ref()
+            .map(|e| e.storage_usage().ok_or(storage::Error::Invariant))
+            .transpose()?;
+        let decoder_usage = decoder
+            .as_ref()
+            .map(|e| e.storage_usage().ok_or(storage::Error::Invariant))
+            .transpose()?;
         if arq_usage.capacity_bytes != plan.arq.capacity_bytes()
-            || encoder_usage.capacity_bytes != plan.encoder.capacity_bytes()
-            || decoder_usage.capacity_bytes != plan.decoder.capacity_bytes()
+            || encoder_usage.map_or(0, |u| u.capacity_bytes)
+                != plan.encoder.map_or(0, |p| p.capacity_bytes())
+            || decoder_usage.map_or(0, |u| u.capacity_bytes)
+                != plan.decoder.map_or(0, |p| p.capacity_bytes())
         {
             return Err(storage::Error::Invariant);
         }
@@ -506,23 +541,24 @@ impl Reliable {
         let receive_maximum_packet = receive_config
             .maximum_packet()
             .map_err(storage::Error::Reliable)?;
+        let sources = plan.encoder.map_or(0, |_| config.fec.block.max_sources);
+        let generations = plan
+            .decoder
+            .map_or(0, |_| receive_config.fec.max_generations);
         let building = backing::Building::reserved(
-            config.fec.block.max_sources,
+            sources,
             DATA_HEADER_BYTES + config.arq.max_source_bytes,
             a,
         )?;
-        let outgoing = backing::Queue::reserved(
-            config.fec.block.max_sources + config.repair_symbols,
-            maximum_packet,
-            a,
-        )?;
+        let outgoing =
+            backing::Queue::reserved(sources + config.repair_symbols, maximum_packet, a)?;
         let restored = backing::RestoredMap::reserved(
             receive_config.max_restored_packets,
             DATA_HEADER_BYTES + receive_config.arq.max_source_bytes,
             a,
         )?;
-        let fec_deadlines = backing::Deadlines::reserved(receive_config.fec.max_generations, a)?;
-        let expired = backing::expired(receive_config.fec.max_generations, a)?;
+        let fec_deadlines = backing::Deadlines::reserved(generations, a)?;
+        let expired = backing::expired(generations, a)?;
         let mut scratch = a.vec(arq.send_max_packet_bytes())?;
         scratch.resize(arq.send_max_packet_bytes(), 0);
         let wrapper = a.usage();
@@ -530,14 +566,20 @@ impl Reliable {
             wrapper.capacity_bytes,
             storage::add(
                 arq_usage.capacity_bytes,
-                storage::add(encoder_usage.capacity_bytes, decoder_usage.capacity_bytes)?,
+                storage::add(
+                    encoder_usage.map_or(0, |u| u.capacity_bytes),
+                    decoder_usage.map_or(0, |u| u.capacity_bytes),
+                )?,
             )?,
         )?;
         let allocations = storage::add(
             wrapper.allocations,
             storage::add(
                 arq_usage.allocations,
-                storage::add(encoder_usage.allocations, decoder_usage.allocations)?,
+                storage::add(
+                    encoder_usage.map_or(0, |u| u.allocations),
+                    decoder_usage.map_or(0, |u| u.allocations),
+                )?,
             )?,
         )?;
         if bytes != plan.capacity_bytes() {
@@ -564,7 +606,7 @@ impl Reliable {
             restored,
             restored_bytes: 0,
             fec_deadlines,
-            encoder: Some(encoder),
+            encoder,
             expired,
             usage: Some(usage),
             scratch,
@@ -629,7 +671,7 @@ impl Reliable {
                     .or_else(|error| self.fail(error.into()))?;
                 self.advance(now)?;
             }
-            3 => self.receive_fec(inner, now)?,
+            3 if self.receive_config.repair_symbols != 0 => self.receive_fec(inner, now)?,
             _ => return self.fail(Error::Malformed),
         }
         Ok(())
@@ -703,15 +745,18 @@ impl Reliable {
         config: ReliableConfig,
         maximum_packet: usize,
     ) -> Result<RecordKind, Error> {
-        Ok(inspect_record_view(
+        let view = inspect_record_view(
             packet,
             maximum_packet,
             config.arq.max_source_bytes,
             config.fec.block,
             arq_context,
             fec_context,
-        )?
-        .kind)
+        )?;
+        if config.repair_symbols == 0 && view.fec.is_some() {
+            return Err(Error::Malformed);
+        }
+        Ok(view.kind)
     }
 
     fn poll_selected(
@@ -768,6 +813,15 @@ impl Reliable {
                 }
                 if source != self.next_fresh_source {
                     return self.fail(Error::SourceConflict);
+                }
+                if self.config.repair_symbols == 0 {
+                    self.next_fresh_source = self
+                        .next_fresh_source
+                        .checked_add(1)
+                        .ok_or(Error::Exhausted)?;
+                    return self
+                        .emit_scratch(1, length, Emission::Source, output, budget)
+                        .map(Some);
                 }
                 if self.building.is_empty() {
                     self.building_deadline = Some(
@@ -848,7 +902,10 @@ impl Reliable {
             && self.building.is_empty()
             && self.outgoing.is_empty()
             && self.restored.is_empty()
-            && self.decoder.generation_count() == 0
+            && self
+                .decoder
+                .as_ref()
+                .is_none_or(|decoder| decoder.generation_count() == 0)
     }
     /// Maximum complete returned packet, excluding configured outer overhead.
     pub fn max_packet_bytes(&self) -> usize {
@@ -884,7 +941,10 @@ impl Reliable {
             outbound_bytes: self.outgoing.bytes(),
             restored_packets: self.restored.len(),
             restored_bytes: self.restored_bytes,
-            fec_reserved_bytes: self.decoder.reserved_bytes(),
+            fec_reserved_bytes: self
+                .decoder
+                .as_ref()
+                .map_or(0, fec::Decoder::reserved_bytes),
         }
     }
 
@@ -912,14 +972,26 @@ impl Reliable {
         self.ensure_restored(view.source_count, maximum)?;
         self.advance(now)?;
         let ticks = milliseconds(now)?;
-        let accepted = self.decoder.accept(inner, ticks);
+        let accepted = self
+            .decoder
+            .as_mut()
+            .ok_or(Error::Malformed)?
+            .accept(inner, ticks);
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
                 let checked = (|| -> Result<(), Error> {
-                    let mut sources = self.decoder.decoded_sources(view.generation)?;
+                    let mut sources = self
+                        .decoder
+                        .as_ref()
+                        .ok_or(Error::Malformed)?
+                        .decoded_sources(view.generation)?;
                     let first = self.source_id(sources.next().ok_or(Error::Malformed)?)?;
-                    for (index, source) in
-                        self.decoder.decoded_sources(view.generation)?.enumerate()
+                    for (index, source) in self
+                        .decoder
+                        .as_ref()
+                        .ok_or(Error::Malformed)?
+                        .decoded_sources(view.generation)?
+                        .enumerate()
                     {
                         let identity = self.source_id(source)?;
                         if identity != first.checked_add(index as u64).ok_or(Error::Exhausted)? {
@@ -941,7 +1013,11 @@ impl Reliable {
                 let direct_identity = systematic
                     .map(|source| self.source_id(source))
                     .transpose()?;
-                let sources = self.decoder.decoded_sources(view.generation)?;
+                let sources = self
+                    .decoder
+                    .as_ref()
+                    .ok_or(Error::Malformed)?
+                    .decoded_sources(view.generation)?;
                 let count = sources.len();
                 for source in sources {
                     let identity = source_id_with(
@@ -962,7 +1038,10 @@ impl Reliable {
                         self.restored_bytes = total;
                     }
                 }
-                self.decoder.commit_decoded(view.generation)?;
+                self.decoder
+                    .as_mut()
+                    .ok_or(Error::Malformed)?
+                    .commit_decoded(view.generation)?;
                 self.fec_deadlines.remove(&view.generation);
                 self.statistics.decoded_source_vectors = self
                     .statistics
@@ -1117,6 +1196,7 @@ impl Reliable {
             .emitted_wire_bytes
             .saturating_add(charge as u64);
         let statistic = match emission {
+            Emission::Source => &mut self.statistics.source_packets,
             Emission::Systematic => &mut self.statistics.systematic_packets,
             Emission::Repair => &mut self.statistics.repair_packets,
             Emission::Retry => &mut self.statistics.retry_packets,
@@ -1213,20 +1293,20 @@ impl Reliable {
     }
 
     fn advance(&mut self, now: Duration) -> Result<(), Error> {
-        if self.usage.is_some() {
-            let count = self
-                .decoder
-                .expire_into(milliseconds(now)?, &mut self.expired)?;
-            for generation in &self.expired[..count] {
-                self.fec_deadlines.remove(&generation.generation);
-                self.statistics.expired_generations =
-                    self.statistics.expired_generations.saturating_add(1);
-            }
-        } else {
-            for generation in self.decoder.expire(milliseconds(now)?)? {
-                self.fec_deadlines.remove(&generation.generation);
-                self.statistics.expired_generations =
-                    self.statistics.expired_generations.saturating_add(1);
+        if let Some(decoder) = &mut self.decoder {
+            if self.usage.is_some() {
+                let count = decoder.expire_into(milliseconds(now)?, &mut self.expired)?;
+                for generation in &self.expired[..count] {
+                    self.fec_deadlines.remove(&generation.generation);
+                    self.statistics.expired_generations =
+                        self.statistics.expired_generations.saturating_add(1);
+                }
+            } else {
+                for generation in decoder.expire(milliseconds(now)?)? {
+                    self.fec_deadlines.remove(&generation.generation);
+                    self.statistics.expired_generations =
+                        self.statistics.expired_generations.saturating_add(1);
+                }
             }
         }
         self.now = now;

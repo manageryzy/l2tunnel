@@ -3,6 +3,9 @@ use super::*;
 use l2tunnel::{codec, fec::rolling, record_engine, rolling_records};
 use l2tunnel_openvpn::{WireBudget, wire_carrier::common as opaque};
 
+#[path = "secure_udp_common_carrier_local.rs"]
+mod local_api;
+
 struct CarrierPlans {
     plans: [Prepared; 2],
     addresses: [std::net::SocketAddr; 2],

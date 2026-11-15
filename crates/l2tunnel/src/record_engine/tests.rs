@@ -659,6 +659,47 @@ fn actual_packed_queue_roundtrips_tap_and_tun_in_both_asymmetric_directions() ->
 }
 
 #[test]
+fn explicit_arq_only_configuration_roundtrips_actual_aligned_and_packed_native_custody()
+-> TestResult {
+    for family in [Family::Aligned, Family::Packed] {
+        for raw in [false, true] {
+            let old = fixture(family, raw)?;
+            let descriptor = old.descriptor();
+            let mut profile = *descriptor.profile();
+            let policies = match &mut profile {
+                configuration::Profile::Aligned { forward, reverse } => [forward, reverse],
+                configuration::Profile::Packed { forward, reverse } => {
+                    [&mut forward.base, &mut reverse.base]
+                }
+                _ => return Err("aligned-family fixture".into()),
+            };
+            for policy in policies {
+                policy.recovery.repair_symbols = 0;
+                policy.max_recovery_packet_bytes = policy.recovery.maximum_packet_bytes()?;
+            }
+            let selected = configuration::Configuration::new(
+                old.envelope(),
+                configuration::Descriptor::new(
+                    descriptor.path_mtu(),
+                    descriptor.duplex(),
+                    *descriptor.direction(Role::Client).common(),
+                    *descriptor.direction(Role::Server).common(),
+                    profile,
+                )?,
+            )?;
+            let mut bytes = vec![0; configuration::CONFIGURATION_BYTES];
+            selected.encode_into(&mut bytes)?;
+            let selected = configuration::Configuration::decode(&bytes)?;
+            assert_ne!(selected, old);
+            for role in [Role::Client, Role::Server] {
+                roundtrip(selected, raw, role, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn actual_full_or_busy_preserves_common_head_until_recovery_allows_exact_retry() -> TestResult {
     for family in [Family::Swift, Family::Aligned, Family::Packed] {
         let original = fixture(family, true)?;
