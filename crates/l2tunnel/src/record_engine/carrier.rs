@@ -74,8 +74,7 @@ impl Engine {
     ) -> Result<(), Error> {
         self.confirm_carrier_output_at(now, now, token)
     }
-    /// Preserve asynchronous acceptance time for Aligned/Packed retry timers.
-    /// Rolling retains its existing completion-observation timer contract.
+    /// Preserve asynchronous acceptance time for actual source/retry/copy timers.
     pub fn confirm_carrier_output_at(
         &mut self,
         now: Tick,
@@ -89,9 +88,9 @@ impl Engine {
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
         let result = match (&mut self.owner, token.prepared) {
-            (Owner::Rolling(endpoint), Prepared::Rolling(p)) => {
-                endpoint.confirm_output(now, p).map_err(Error::Rolling)
-            }
+            (Owner::Rolling(endpoint), Prepared::Rolling(p)) => endpoint
+                .confirm_output_at(now, accepted, p)
+                .map_err(Error::Rolling),
             (Owner::Aligned(endpoint), Prepared::Aligned(p)) => {
                 self.reliable_pending = None;
                 endpoint

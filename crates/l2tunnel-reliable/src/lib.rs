@@ -9,6 +9,9 @@ use l2tunnel_recovery::{
     Statistics as ArqStatistics, inspect_packet,
 };
 mod backing;
+mod compact;
+mod recovery_owner;
+pub use compact::{CompactReliableConfig, inspect_compact_structural};
 mod legacy_layout;
 pub mod storage;
 use std::fmt;
@@ -195,6 +198,8 @@ fn inspect_record_view(
 pub enum Error {
     /// Contradictory or excessive composition limits.
     InvalidConfig,
+    /// Selected fallible backing reservation failed.
+    Allocation,
     /// Unknown/noncanonical reliable envelope or unexpected inner packet kind.
     Malformed,
     /// Restored-source byte/count headroom is full; the new input was not admitted.
@@ -286,6 +291,13 @@ pub struct Storage {
 }
 
 #[derive(Clone, Copy)]
+enum OutputScope {
+    Combined,
+    Data,
+    Feedback,
+}
+
+#[derive(Clone, Copy)]
 enum Emission {
     Source,
     Systematic,
@@ -304,10 +316,9 @@ struct Restored {
 
 /// One independently owned reliable block endpoint with no socket or system clock.
 pub struct Reliable {
-    config: ReliableConfig,
-    receive_config: ReliableConfig,
+    policies: compact::Policies,
     context: RecoveryContext,
-    arq: SelectiveRepeat,
+    arq: recovery_owner::Owner,
     decoder: Option<fec::Decoder>,
     send_fec: fec::FecContext,
     receive_fec: fec::FecContext,
@@ -332,6 +343,7 @@ pub struct Reliable {
     physical_instance: Option<u64>,
     next_output: u64,
     pending_output: Option<PreparedOutput>,
+    independent_feedback: Option<PreparedOutput>,
 }
 
 impl ReliableConfig {
@@ -455,10 +467,12 @@ impl Reliable {
         };
         let scratch = vec![0; arq.send_max_packet_bytes()];
         Ok(Self {
-            config,
-            receive_config,
+            policies: compact::Policies::Legacy {
+                send: config,
+                receive: receive_config,
+            },
             context,
-            arq,
+            arq: recovery_owner::Owner::Legacy(arq),
             decoder,
             send_fec,
             receive_fec,
@@ -483,6 +497,7 @@ impl Reliable {
             physical_instance: None,
             next_output: 1,
             pending_output: None,
+            independent_feedback: None,
         })
     }
 
@@ -618,10 +633,12 @@ impl Reliable {
             allocations,
         };
         Ok(Self {
-            config,
-            receive_config,
+            policies: compact::Policies::Legacy {
+                send: config,
+                receive: receive_config,
+            },
             context,
-            arq,
+            arq: recovery_owner::Owner::Legacy(arq),
             decoder,
             send_fec,
             receive_fec,
@@ -646,6 +663,7 @@ impl Reliable {
             physical_instance: None,
             next_output: 1,
             pending_output: None,
+            independent_feedback: None,
         })
     }
     /// Select physical-attempt timing before any local/peer traffic is used.
@@ -673,7 +691,18 @@ impl Reliable {
     }
     /// Observe exact output custody, including after an unrelated terminal error.
     pub fn pending_output(&self) -> Option<PreparedOutput> {
+        self.pending_output.or(self.independent_feedback)
+    }
+    /// Exact main-lane custody. Legacy combined polling may put feedback here.
+    /// Independently prepared feedback never occupies this slot.
+    pub fn pending_data_output(&self) -> Option<PreparedOutput> {
         self.pending_output
+    }
+    /// Exact independently prepared feedback, without borrowing data custody.
+    pub fn pending_feedback_output(&self) -> Option<PreparedOutput> {
+        self.independent_feedback.or(self
+            .pending_output
+            .filter(|output| output.kind == RecordKind::Feedback))
     }
     /// Consume one exact whole-carrier observation before later timing checks.
     /// Wrong, foreign and repeated witnesses cannot mutate time or another flight.
@@ -688,11 +717,14 @@ impl Reliable {
         accepted: Duration,
         output: PreparedOutput,
     ) -> Result<(), Error> {
-        if self.pending_output != Some(output) {
+        if self.pending_output == Some(output) {
+            self.pending_output = None;
+        } else if self.independent_feedback == Some(output) {
+            self.independent_feedback = None;
+        } else {
             return Err(Error::OutputToken);
         }
         let prior = self.failure();
-        self.pending_output = None;
         let window = if accepted < output.prepared_at || accepted > observed {
             Err(Error::NonMonotonicTime)
         } else {
@@ -725,7 +757,7 @@ impl Reliable {
     /// The snapshot expires at this exclusive owner's next successful submit.
     pub fn next_source_id(&self) -> Result<u64, Error> {
         self.running()?;
-        if self.next_generation.is_none() {
+        if !self.arq.is_compact() && self.next_generation.is_none() {
             return Err(Error::Exhausted);
         }
         Ok(self.arq.next_source_id()?.0)
@@ -734,7 +766,7 @@ impl Reliable {
     /// Admit exactly one new logical source; repairs/retries never call this method.
     pub fn submit(&mut self, source: &[u8], now: Duration) -> Result<u64, Error> {
         self.check_time(now)?;
-        if self.next_generation.is_none() {
+        if !self.arq.is_compact() && self.next_generation.is_none() {
             return Err(Error::Exhausted);
         }
         let source = self.arq.submit(source, now)?;
@@ -745,6 +777,9 @@ impl Reliable {
     /// Consume one complete record after lower-layer integrity and replay checks.
     /// Resource pressure is retryable; malformed authenticated protocol input fails closed.
     pub fn receive(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
+        self.receive_at(packet, now, now)
+    }
+    fn receive_legacy(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
         self.check_time(now)?;
         let (kind, inner) = match envelope(packet, self.receive_maximum_packet) {
             Ok(view) => view,
@@ -759,7 +794,11 @@ impl Reliable {
                 self.pump()?;
             }
             2 => {
-                match inspect_packet(inner, self.context, self.config.arq.max_source_bytes) {
+                match inspect_packet(
+                    inner,
+                    self.context,
+                    self.legacy_send()?.arq.max_source_bytes,
+                ) {
                     Ok(PacketView::Ack { .. }) => {}
                     Ok(_) => return self.fail(Error::Malformed),
                     Err(error) => return self.fail(error.into()),
@@ -769,7 +808,7 @@ impl Reliable {
                     .or_else(|error| self.fail(error.into()))?;
                 self.advance(now)?;
             }
-            3 if self.receive_config.repair_symbols != 0 => self.receive_fec(inner, now)?,
+            3 if self.legacy_receive()?.repair_symbols != 0 => self.receive_fec(inner, now)?,
             _ => return self.fail(Error::Malformed),
         }
         Ok(())
@@ -797,6 +836,22 @@ impl Reliable {
         self.poll_selected(now, output, budget, true, false)
     }
 
+    /// Emit feedback through its own one-slot physical custody while a data or
+    /// repair output is held by a backpressured carrier. The same ARQ encoder,
+    /// clock and wire budget remain authoritative. Existing polling methods
+    /// retain their original single-output behavior. Physical mode is required.
+    pub fn poll_feedback_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        if self.physical_instance.is_none() {
+            return Err(Error::InvalidConfig);
+        }
+        self.poll_selected_scoped(now, output, budget, true, false, OutputScope::Feedback)
+    }
+
     /// Emit a systematic, repair or original-ID retry while retaining due feedback.
     /// The caller must service feedback separately with a bounded shared allowance.
     pub fn poll_data(
@@ -808,15 +863,33 @@ impl Reliable {
         self.poll_selected(now, output, budget, false, true)
     }
 
+    /// Emit through the existing main output slot while independently held
+    /// feedback retains its separate exact witness. Legacy poll/poll_data keep
+    /// their original combined-slot gate; physical mode is mandatory here.
+    pub fn poll_data_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        if self.physical_instance.is_none() {
+            return Err(Error::InvalidConfig);
+        }
+        self.poll_selected_scoped(now, output, budget, false, true, OutputScope::Data)
+    }
+
     /// Classify a complete outgoing record with the authoritative inner parsers.
     /// This checks local sending role/session/epoch and all encoding bounds; it
     /// neither authenticates bytes nor advances sender/receiver state.
     pub fn inspect_output(&self, packet: &[u8]) -> Result<RecordKind, Error> {
+        if self.arq.is_compact() {
+            return self.compact_inspect(packet, true).map(|view| view.kind);
+        }
         self.inspect_record(
             packet,
             opposite_context(self.context),
             self.send_fec,
-            self.config,
+            *self.legacy_send()?,
             self.maximum_packet,
         )
     }
@@ -826,11 +899,14 @@ impl Reliable {
     /// allowing callers to reject feedback on data lanes or data on control lanes.
     /// Lower-layer integrity/replay verification must precede this operation.
     pub fn inspect_peer(&self, packet: &[u8]) -> Result<RecordKind, Error> {
+        if self.arq.is_compact() {
+            return self.compact_inspect(packet, false).map(|view| view.kind);
+        }
         self.inspect_record(
             packet,
             self.context,
             self.receive_fec,
-            self.receive_config,
+            *self.legacy_receive()?,
             self.receive_maximum_packet,
         )
     }
@@ -865,10 +941,34 @@ impl Reliable {
         allow_feedback: bool,
         allow_data: bool,
     ) -> Result<Option<usize>, Error> {
+        self.poll_selected_scoped(
+            now,
+            output,
+            budget,
+            allow_feedback,
+            allow_data,
+            OutputScope::Combined,
+        )
+    }
+
+    fn poll_selected_scoped(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+        allow_feedback: bool,
+        allow_data: bool,
+        scope: OutputScope,
+    ) -> Result<Option<usize>, Error> {
         let Some(instance) = self.physical_instance else {
             return self.poll_selected_inner(now, output, budget, allow_feedback, allow_data);
         };
-        if self.pending_output.is_some() {
+        let blocked = match scope {
+            OutputScope::Feedback => self.pending_feedback_output().is_some(),
+            OutputScope::Data => self.pending_data_output().is_some(),
+            OutputScope::Combined => self.pending_output().is_some(),
+        };
+        if blocked {
             self.check_time(now)?;
             self.advance(now)?;
             self.pump()?;
@@ -885,14 +985,18 @@ impl Reliable {
         else {
             return Ok(None);
         };
-        let view = inspect_record_view(
-            &output[..bytes],
-            self.maximum_packet,
-            self.config.arq.max_source_bytes,
-            self.config.fec.block,
-            opposite_context(self.context),
-            self.send_fec,
-        )
+        let view = if self.arq.is_compact() {
+            self.compact_inspect(&output[..bytes], true)
+        } else {
+            inspect_record_view(
+                &output[..bytes],
+                self.maximum_packet,
+                self.legacy_send()?.arq.max_source_bytes,
+                self.legacy_send()?.fec.block,
+                opposite_context(self.context),
+                self.send_fec,
+            )
+        }
         .or_else(|error| self.fail(error))?;
         let transmission = if let Some((source, _)) = view.source {
             Some(
@@ -904,17 +1008,25 @@ impl Reliable {
         } else {
             None
         };
-        self.pending_output = Some(PreparedOutput {
+        let prepared = PreparedOutput {
             instance,
             serial: self.next_output,
             transmission,
             prepared_at: now,
             bytes,
             wire_bytes: bytes
-                .checked_add(self.config.outer_overhead_bytes)
+                .checked_add(self.outer_overhead())
                 .ok_or(Error::Exhausted)?,
             kind: view.kind,
-        });
+        };
+        if matches!(scope, OutputScope::Feedback) {
+            if prepared.kind != RecordKind::Feedback {
+                return self.fail(Error::OutputToken);
+            }
+            self.independent_feedback = Some(prepared);
+        } else {
+            self.pending_output = Some(prepared);
+        }
         self.next_output = next;
         Ok(Some(bytes))
     }
@@ -927,6 +1039,9 @@ impl Reliable {
         allow_feedback: bool,
         allow_data: bool,
     ) -> Result<Option<usize>, Error> {
+        if self.arq.is_compact() {
+            return self.poll_compact_inner(now, output, budget, allow_feedback, allow_data);
+        }
         self.check_time(now)?;
         if output.len() < self.maximum_packet {
             return Err(Error::OutputTooSmall {
@@ -953,7 +1068,7 @@ impl Reliable {
             return Ok(Some(length));
         }
         if allow_data && self.outgoing.is_empty() && self.allowed(self.maximum_packet, budget)? {
-            for _ in 0..self.config.fec.block.max_sources {
+            for _ in 0..self.legacy_send()?.fec.block.max_sources {
                 let Some(length) = self.arq.poll_source(now, &mut self.scratch)? else {
                     break;
                 };
@@ -961,7 +1076,7 @@ impl Reliable {
                 let source = match inspect_packet(
                     &self.scratch[..length],
                     own,
-                    self.config.arq.max_source_bytes,
+                    self.legacy_send()?.arq.max_source_bytes,
                 )? {
                     PacketView::Data { source, .. } => source.0,
                     _ => return self.fail(Error::Malformed),
@@ -974,7 +1089,7 @@ impl Reliable {
                 if source != self.next_fresh_source {
                     return self.fail(Error::SourceConflict);
                 }
-                if self.config.repair_symbols == 0 {
+                if self.legacy_send()?.repair_symbols == 0 {
                     self.next_fresh_source = self
                         .next_fresh_source
                         .checked_add(1)
@@ -985,7 +1100,7 @@ impl Reliable {
                 }
                 if self.building.is_empty() {
                     self.building_deadline = Some(
-                        now.checked_add(self.config.flush_after)
+                        now.checked_add(self.legacy_send()?.flush_after)
                             .ok_or(Error::TimeOverflow)?,
                     );
                 }
@@ -994,7 +1109,7 @@ impl Reliable {
                     .next_fresh_source
                     .checked_add(1)
                     .ok_or(Error::Exhausted)?;
-                if self.building.len() == self.config.fec.block.max_sources {
+                if self.building.len() == self.legacy_send()?.fec.block.max_sources {
                     self.seal()?;
                     if let Some(length) = self.emit_front(output, budget)? {
                         return Ok(Some(length));
@@ -1032,7 +1147,7 @@ impl Reliable {
 
     /// Actual next ARQ feedback deadline, independently of data/coding work.
     pub fn feedback_deadline(&self) -> Option<Duration> {
-        if self.failure().is_some() || self.pending_output.is_some() {
+        if self.failure().is_some() || self.pending_output().is_some() {
             None
         } else {
             self.arq.feedback_deadline()
@@ -1053,7 +1168,7 @@ impl Reliable {
         if self.failure().is_some() {
             return None;
         }
-        if self.pending_output.is_some() {
+        if self.pending_output().is_some() {
             return self.expiry_deadline();
         }
         if !self.outgoing.is_empty() || !self.restored.is_empty() {
@@ -1067,10 +1182,47 @@ impl Reliable {
             .min()
     }
 
+    /// Next ACK opportunity for the explicit independent-feedback polling API.
+    /// A held main data output cannot hide this free physical lane. The old
+    /// feedback_deadline retains the original combined-slot polling contract.
+    pub fn feedback_deadline_independent(&self) -> Option<Duration> {
+        if self.failure().is_some() || self.pending_feedback_output().is_some() {
+            None
+        } else {
+            self.arq.feedback_deadline()
+        }
+    }
+
+    /// Earliest actionable independent data/feedback wake or original hard expiry.
+    /// Only the occupied lane's soft opportunities are suppressed; neither an
+    /// opposite-lane receipt nor a retry renews an existing timer. The original
+    /// deadline method remains paired with the combined-slot polling APIs.
+    pub fn deadline_independent(&self) -> Option<Duration> {
+        if self.failure().is_some() {
+            return None;
+        }
+        let data = if self.pending_data_output().is_some() {
+            None
+        } else if !self.outgoing.is_empty() || !self.restored.is_empty() {
+            Some(self.now)
+        } else {
+            self.arq
+                .source_deadline()
+                .into_iter()
+                .chain(self.building_deadline)
+                .min()
+        };
+        data.into_iter()
+            .chain(self.feedback_deadline_independent())
+            .chain(self.expiry_deadline())
+            .min()
+    }
+
     /// Full logical/retention drain; terminal FEC tombstones do not block it.
     pub fn drained(&self) -> bool {
         self.failure().is_none()
             && self.pending_output.is_none()
+            && self.independent_feedback.is_none()
             && self.arq.drained()
             && self.building.is_empty()
             && self.outgoing.is_empty()
@@ -1122,7 +1274,8 @@ impl Reliable {
     }
 
     fn receive_fec(&mut self, inner: &[u8], now: Duration) -> Result<(), Error> {
-        let view = fec::inspect(inner, self.receive_fec, self.receive_config.fec.block)
+        let maximum_source_bytes = self.legacy_receive()?.arq.max_source_bytes;
+        let view = fec::inspect(inner, self.receive_fec, self.legacy_receive()?.fec.block)
             .or_else(|error| self.fail(error.into()))?;
         let systematic = if view.kind == fec::SymbolKind::Systematic {
             let length = usize::from(u16::from_be_bytes(
@@ -1193,11 +1346,7 @@ impl Reliable {
                     .decoded_sources(view.generation)?;
                 let count = sources.len();
                 for source in sources {
-                    let identity = source_id_with(
-                        self.context,
-                        self.receive_config.arq.max_source_bytes,
-                        source,
-                    )?;
+                    let identity = source_id_with(self.context, maximum_source_bytes, source)?;
                     if !self.restored.contains_key(&identity) {
                         let total = self
                             .restored_bytes
@@ -1225,7 +1374,7 @@ impl Reliable {
                 self.fec_deadlines.insert(
                     view.generation,
                     ticks
-                        .checked_add(self.receive_config.fec.max_lifetime_ticks)
+                        .checked_add(self.legacy_receive()?.fec.max_lifetime_ticks)
                         .ok_or(Error::TimeOverflow)?,
                 )?;
                 if let Some(source) = systematic {
@@ -1263,17 +1412,17 @@ impl Reliable {
         };
         let count = self.building.len();
         let repairs = count
-            .checked_mul(self.config.repair_symbols)
+            .checked_mul(self.legacy_send()?.repair_symbols)
             .ok_or(Error::Exhausted)?
-            .div_ceil(self.config.fec.block.max_sources);
+            .div_ceil(self.legacy_send()?.fec.block.max_sources);
+        let block = self.legacy_send()?.fec.block;
         let mut legacy_encoder;
         let encoder = if let Some(encoder) = &mut self.encoder {
             encoder.seal_sources(generation, self.building.iter().map(Vec::as_slice))?;
             encoder
         } else {
             let sources: Vec<_> = self.building.iter().map(Vec::as_slice).collect();
-            legacy_encoder =
-                fec::BlockEncoder::new(self.send_fec, generation, self.config.fec.block, &sources)?;
+            legacy_encoder = fec::BlockEncoder::new(self.send_fec, generation, block, &sources)?;
             &mut legacy_encoder
         };
         let size = ENVELOPE_BYTES + fec::HEADER_BYTES + count + encoder.coded_bytes();
@@ -1356,7 +1505,7 @@ impl Reliable {
         budget: &mut OutboundBudget,
     ) -> Result<(), Error> {
         let charge = bytes
-            .checked_add(self.config.outer_overhead_bytes)
+            .checked_add(self.outer_overhead())
             .ok_or(Error::Exhausted)?;
         if budget.packets == 0 || budget.wire_bytes < charge {
             return Err(Error::Exhausted);
@@ -1384,7 +1533,7 @@ impl Reliable {
         Ok(budget.packets > 0
             && budget.wire_bytes
                 >= bytes
-                    .checked_add(self.config.outer_overhead_bytes)
+                    .checked_add(self.outer_overhead())
                     .ok_or(Error::Exhausted)?)
     }
 
@@ -1394,12 +1543,12 @@ impl Reliable {
             .len()
             .checked_add(packets)
             .ok_or(Error::Exhausted)?
-            > self.receive_config.max_restored_packets
+            > self.legacy_receive()?.max_restored_packets
             || self
                 .restored_bytes
                 .checked_add(bytes)
                 .ok_or(Error::Exhausted)?
-                > self.receive_config.max_restored_bytes
+                > self.legacy_receive()?.max_restored_bytes
         {
             return Err(Error::RestoredCapacity);
         }
@@ -1410,7 +1559,7 @@ impl Reliable {
         match inspect_packet(
             bytes,
             self.context,
-            self.receive_config.arq.max_source_bytes,
+            self.legacy_receive()?.arq.max_source_bytes,
         )? {
             PacketView::Data { source, .. } => Ok(source.0),
             _ => Err(Error::Malformed),
@@ -1444,7 +1593,10 @@ impl Reliable {
     }
 
     fn pump(&mut self) -> Result<(), Error> {
-        for _ in 0..self.receive_config.max_restored_packets {
+        if self.arq.is_compact() {
+            return Ok(());
+        }
+        for _ in 0..self.legacy_receive()?.max_restored_packets {
             let Some((&identity, record)) = self.restored.first_key_value() else {
                 break;
             };
@@ -1491,12 +1643,15 @@ impl Reliable {
         if now < self.now {
             return Err(Error::NonMonotonicTime);
         }
-        now.checked_add(self.config.arq.maximum_rto)
+        if self.arq.is_compact() {
+            return Ok(());
+        }
+        now.checked_add(self.legacy_send()?.arq.maximum_rto)
             .ok_or(Error::TimeOverflow)?;
-        now.checked_add(self.config.flush_after)
+        now.checked_add(self.legacy_send()?.flush_after)
             .ok_or(Error::TimeOverflow)?;
         milliseconds(now)?
-            .checked_add(self.receive_config.fec.max_lifetime_ticks)
+            .checked_add(self.legacy_receive()?.fec.max_lifetime_ticks)
             .ok_or(Error::TimeOverflow)?;
         Ok(())
     }
@@ -1575,3 +1730,6 @@ mod directional_tests;
 
 #[cfg(test)]
 mod storage_tests;
+
+#[cfg(test)]
+mod compact_tests;

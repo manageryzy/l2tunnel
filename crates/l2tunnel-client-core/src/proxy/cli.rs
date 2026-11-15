@@ -2,7 +2,7 @@
 use super::*;
 use crate::proxy as client;
 
-pub(super) const HELP: &str = "Fixed-credit proxy: --traffic proxy --proxy-policy JSON_FILE; TUN, TCP/TLS, frame records and compression off only. Both peers require the same explicit route/channel/TIME-WAIT policy. Default TIME-WAIT remains maintained. Optional private --control-socket supports status and drain-proxy. Drain acknowledges submission promptly; query status for the actual terminal result. After termination only local status remains for five seconds. No adaptive window or reload is implied. Measured relay targets require explicit --traffic proxy-measured --proxy-policy JSON_FILE; the same TUN/TCP/frame/compression restrictions apply. Native window qualification and hot reload remain unavailable.";
+pub(super) const HELP: &str = "Fixed-credit proxy: --traffic proxy --proxy-policy JSON_FILE; TUN, TCP/TLS, frame records and compression off only. Both peers require the same explicit route/channel/TIME-WAIT policy. Default TIME-WAIT remains maintained. Optional private --control-socket supports shared-service status, drain-proxy, disconnect and explicit fresh reconnect. Drain acknowledges submission promptly; query status for the actual terminal result. After actual release local status remains for five seconds; pending or live replacement setup retains the shared owner. No adaptive window or reload is implied. Measured relay targets require explicit --traffic proxy-measured --proxy-policy JSON_FILE; the same TUN/TCP/frame/compression restrictions apply. Native window qualification and hot reload remain unavailable.";
 
 pub(super) fn selection(
     options: &BTreeMap<String, String>,
@@ -64,68 +64,25 @@ pub(super) async fn execute(
     let settings = client::Settings::from_json(&bounded_file(path, client::MAX_POLICY_BYTES)?)?;
     client::runtime_config(config, &settings)?;
     let device = DeviceSpec::parse(options, config)?;
-    let api = options
-        .get("--control-socket")
-        .map(crate::local::Server::bind)
-        .transpose()?;
-    let session = match command {
-        "connect" => {
-            let address = required(options, "--remote")?
-                .parse()
-                .map_err(|_| input("remote requires IP:PORT"))?;
-            let tls = tls_frontend::client(options)?;
-            let member =
-                MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
-                    .map_err(auth_error)?;
-            client::connect(
-                address,
-                &tls,
-                required(options, "--server-name")?,
-                &member,
-                config,
-                &settings,
-            )
-            .await?
-        }
-        "serve" => {
-            let address: SocketAddr = required(options, "--listen")?
-                .parse()
-                .map_err(|_| input("listen requires IP:PORT"))?;
-            let tls = ServerTls::from_der(
-                &[bounded_file(required(options, "--cert")?, 65536)?],
-                &bounded_file(required(options, "--key")?, 65536)?,
-            )
-            .map_err(auth_error)?;
-            let public: [u8; 32] = bounded_file(required(options, "--allow-key")?, 32)?
-                .try_into()
-                .map_err(|_| input("allow-key must contain exactly 32 raw bytes"))?;
-            let allow = MemberAllowlist::new(&[MemberPublicKey(public)]).map_err(auth_error)?;
-            let listener = TcpListener::bind(address).await?;
-            client::accept(&listener, &tls, &allow, config, &settings).await?
-        }
-        _ => return Err(input("unsupported proxy command")),
-    };
-    let digest = l2tunnel_runtime::proxy::session_config(session.config())?
-        .digest
-        .0;
-    let device = device.open(config)?;
-    let (handle, control) = client::control_channel();
-    println!(
-        "Authenticated TUN {:?}; fixed-credit proxy over retained TCP/TLS; immutable route policy; forwarding packet device",
-        config.duplex
-    );
-    serve(
-        session.run(device, control),
-        handle,
-        digest,
-        api,
-        Duration::from_secs(5),
+    shared::execute(
+        command,
+        options,
+        config,
+        device,
+        shared::Policy::Fixed(settings),
     )
     .await
-    .map(|_| ())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+#[path = "cli_service.rs"]
+mod shared;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use shared::{
+    Event as ServiceEvent, Presentation as ServicePresentation, serve as serve_shared_for_test,
+};
+
+#[cfg(all(test, unix))]
 mod service {
     use super::*;
     use crate::local::{
@@ -371,7 +328,7 @@ mod service {
         }
     }
 }
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) async fn serve<F>(
     run: F,
     handle: client::Handle,
@@ -391,7 +348,7 @@ where
     )
     .await
 }
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) async fn serve_measured<F>(
     run: F,
     handle: crate::proxy_measured::Handle,

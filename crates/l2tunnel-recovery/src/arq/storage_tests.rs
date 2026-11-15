@@ -421,7 +421,7 @@ fn state_snapshot(owner: &SelectiveRepeat) -> StateSnapshot {
             .iter()
             .map(|(source, payload)| (*source, payload.clone()))
             .collect(),
-        Received::Reserved(slots) => slots
+        Received::Reserved(slots) | Received::Indexed(slots) => slots
             .iter()
             .filter_map(|slot| slot.source.map(|source| (source, slot.payload.clone())))
             .collect(),

@@ -194,7 +194,7 @@ fn endpoint_recovery_and_blocked_native_survive_registration_retirement() -> Tes
                 };
                 receiver.receive_authenticated(&wire[..length], now)?;
             }
-            receiver.prepare(channel, now, 16)?;
+            receiver.prepare_ordered(channel, now, 16)?;
             if receiver.pending().is_some() {
                 break;
             }

@@ -4,8 +4,11 @@
 //! deliver short frames early. The caller must supply authenticated ordered bodies
 //! from one peer/channel/direction/epoch and negotiate drained resets.
 
-use crate::tcp_header::{self, CONTEXT_BYTES, HeaderDecoder, HeaderEncoder, HeaderProfile};
+use crate::tcp_header::{self, HeaderDecoder, HeaderEncoder, HeaderProfile};
 use std::fmt;
+mod header;
+pub(crate) use header::DecoderState;
+use header::EncoderHeader;
 
 const ECHO_DELTAS: [u32; 16] = [
     0, 1, 17, 18, 19, 20, 36, 37, 38, 55, 56, 74, 75, 92, 93, 111,
@@ -143,8 +146,19 @@ impl From<tcp_header::Error> for Error {
 /// One body encoder and fixed bounded staging allocation, with transactional context.
 pub struct Encoder {
     config: Config,
+    header: EncoderHeader,
+    scratch: Vec<u8>,
+}
+#[allow(dead_code)]
+struct LegacyEncoder {
+    config: Config,
     header: HeaderEncoder,
     scratch: Vec<u8>,
+}
+impl Encoder {
+    pub(crate) const fn legacy_inline_bytes() -> usize {
+        std::mem::size_of::<LegacyEncoder>()
+    }
 }
 impl Encoder {
     pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
@@ -155,13 +169,14 @@ impl Encoder {
                 .ok_or(crate::aligned_storage::Error::Layout)?,
         )
     }
-    pub(crate) fn new_in(
+    pub(crate) fn new_in_mode(
         config: Config,
         allocation: &mut crate::aligned_storage::Allocation,
+        ip: bool,
     ) -> Result<Self, crate::aligned_storage::Error> {
         let map = |e| crate::aligned_storage::Error::Sender(crate::aligned_sender::Error::Body(e));
         let config = config.validate().map_err(map)?;
-        let header = HeaderEncoder::new(HeaderProfile::TcpDelta, config.max_frame_bytes)
+        let header = EncoderHeader::new(config.max_frame_bytes, ip)
             .map_err(Error::Header)
             .map_err(map)?;
         let scratch = allocation.bytes(header.max_encoded_len())?;
@@ -173,8 +188,15 @@ impl Encoder {
     }
     /// Validate bounds and allocate at most maximum native bytes plus 29 scratch bytes.
     pub fn new(config: Config) -> Result<Self, Error> {
+        Self::new_mode(config, false)
+    }
+    /// Explicit native-IP TCP header coding; legacy constructors retain Ethernet bytes.
+    pub fn new_ip(config: Config) -> Result<Self, Error> {
+        Self::new_mode(config, true)
+    }
+    fn new_mode(config: Config, ip: bool) -> Result<Self, Error> {
         let config = config.validate()?;
-        let header = HeaderEncoder::new(HeaderProfile::TcpDelta, config.max_frame_bytes)?;
+        let header = EncoderHeader::new(config.max_frame_bytes, ip)?;
         let scratch = vec![0; header.max_encoded_len()];
         Ok(Self {
             config,
@@ -229,44 +251,60 @@ impl Encoder {
         } else {
             staged.encode(frame, &mut self.scratch)?
         };
-        let context_len = if self.scratch[0] == 0 { 69 } else { 0 };
+        let context_len = if matches!(self.scratch[0], 0 | 8) {
+            3 + usize::from(word16(&self.scratch, 1))
+        } else {
+            0
+        };
         let mut body_len = written - context_len;
         if body_len > 65_535 {
             return Err(Error::RecordTooLarge);
         }
-        let previous = self.header.context();
+        let previous = self.header.view();
         let body_capacity = self.config.symbol_bytes - 3;
         if self.config.predictive
             && context_len == 0
-            && self.scratch[0] == 3
+            && self.scratch[0] == self.header.delta_tag()
             && let Some(context) = previous
-            && frame.len() >= CONTEXT_BYTES
-            && frame.len() - CONTEXT_BYTES == payload_length(context)?
-            && word16(frame, 18) == word16(context, 18).wrapping_add(1)
-            && word32(frame, 38)
-                == word32(context, 38).wrapping_add((frame.len() - CONTEXT_BYTES) as u32)
-            && frame[42..46] == context[42..46]
+            && let Some(current) = context.packet(frame)
+            && frame.len() - current.header_bytes() == context.payload_length()?
+            && match (current.ipid(), context.ipid()) {
+                (Some(value), Some(old)) => value == old.wrapping_add(1),
+                (None, None) => true,
+                _ => false,
+            }
+            && current.sequence()
+                == context
+                    .sequence()
+                    .wrapping_add((frame.len() - current.header_bytes()) as u32)
+            && current.ack() == context.ack()
         {
-            let payload = frame.len() - CONTEXT_BYTES;
-            let skip = 5 + if payload == 0 {
-                0
-            } else {
-                varint_len(payload as u32)
-            };
-            let packed_len = 1 + body_len - skip;
+            let payload = frame.len() - current.header_bytes();
+            let skip = 4
+                + usize::from(current.ipid().is_some())
+                + if payload == 0 {
+                    0
+                } else {
+                    varint_len(payload as u32)
+                };
+            let packed_len = 1 + body_len.checked_sub(skip).ok_or(Error::InvalidRecord)?;
             let mask = self.scratch[3];
             if packed_len <= body_capacity {
                 let pair = if self.config.timestamp_pair_dictionary && mask & 0x38 == 0 {
-                    pair_index(
-                        word32(frame, 58).wrapping_sub(word32(context, 58)),
-                        word32(frame, 62).wrapping_sub(word32(context, 62)),
+                    current.timestamps().zip(context.timestamps()).and_then(
+                        |((timestamp, echo), (old_timestamp, old_echo))| {
+                            pair_index(
+                                timestamp.wrapping_sub(old_timestamp),
+                                echo.wrapping_sub(old_echo),
+                            )
+                        },
                     )
                 } else {
                     None
                 };
                 if let Some(index) = pair {
                     self.scratch[0] = 5 | (index << 3);
-                    self.scratch[1..1 + payload].copy_from_slice(&frame[CONTEXT_BYTES..]);
+                    self.scratch[1..1 + payload].copy_from_slice(&frame[current.header_bytes()..]);
                     body_len = 1 + payload;
                 } else {
                     self.scratch.copy_within(skip..body_len, 1);
@@ -276,15 +314,15 @@ impl Encoder {
             }
         }
         let length_context = if context_len != 0 {
-            staged.context()
+            staged.view()
         } else {
             previous
         };
         if self.config.elide_payload_length
-            && self.scratch[context_len] == 3
+            && self.scratch[context_len] == self.header.delta_tag()
             && body_len - 2 <= body_capacity
             && let Some(context) = length_context
-            && usize::from(word16(&self.scratch, context_len + 1)) == payload_length(context)?
+            && usize::from(word16(&self.scratch, context_len + 1)) == context.payload_length()?
         {
             self.scratch
                 .copy_within(context_len + 3..context_len + body_len, context_len + 1);
@@ -306,9 +344,21 @@ impl Encoder {
 /// One body decoder, with fixed expanded-record and native-output staging buffers.
 pub struct Decoder {
     config: Config,
+    header: DecoderState,
+    expanded: Vec<u8>,
+    native: Vec<u8>,
+}
+#[allow(dead_code)]
+struct LegacyDecoder {
+    config: Config,
     header: HeaderDecoder,
     expanded: Vec<u8>,
     native: Vec<u8>,
+}
+impl Decoder {
+    pub(crate) const fn legacy_inline_bytes() -> usize {
+        std::mem::size_of::<LegacyDecoder>()
+    }
 }
 impl Decoder {
     pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
@@ -322,34 +372,42 @@ impl Decoder {
             crate::aligned_storage::array_bytes::<u8>(config.max_frame_bytes)?,
         ])
     }
-    pub(crate) fn new_in(
+    pub(crate) fn new_in_mode(
         config: Config,
         allocation: &mut crate::aligned_storage::Allocation,
+        ip: bool,
     ) -> Result<Self, crate::aligned_storage::Error> {
         let map =
             |e| crate::aligned_storage::Error::Receiver(crate::aligned_receiver::Error::Body(e));
         let config = config.validate().map_err(map)?;
         Ok(Self {
             config,
-            header: HeaderDecoder::new(config.max_frame_bytes)
+            header: DecoderState::new(config.max_frame_bytes, ip)
                 .map_err(Error::Header)
                 .map_err(map)?,
             expanded: allocation.bytes(config.max_frame_bytes + 44)?,
             native: allocation.bytes(config.max_frame_bytes)?,
         })
     }
-    pub(crate) fn checkpoint(&self) -> HeaderDecoder {
+    pub(crate) fn checkpoint(&self) -> DecoderState {
         self.header.clone()
     }
-    pub(crate) fn restore(&mut self, header: HeaderDecoder) {
+    pub(crate) fn restore(&mut self, header: DecoderState) {
         self.header = header;
     }
     /// Validate bounds and allocate at most twice maximum native bytes plus 44 bytes.
     pub fn new(config: Config) -> Result<Self, Error> {
+        Self::new_mode(config, false)
+    }
+    /// Explicit native-IP TCP header coding; legacy constructors retain Ethernet bytes.
+    pub fn new_ip(config: Config) -> Result<Self, Error> {
+        Self::new_mode(config, true)
+    }
+    fn new_mode(config: Config, ip: bool) -> Result<Self, Error> {
         let config = config.validate()?;
         Ok(Self {
             config,
-            header: HeaderDecoder::new(config.max_frame_bytes)?,
+            header: DecoderState::new(config.max_frame_bytes, ip)?,
             expanded: vec![0; config.max_frame_bytes + 44],
             native: vec![0; config.max_frame_bytes],
         })
@@ -390,18 +448,18 @@ impl Decoder {
             }
             let context = self
                 .header
-                .context()
+                .view()
                 .ok_or(tcp_header::Error::MissingContext)?;
-            let payload = payload_length(context)?;
+            let payload = context.payload_length()?;
             let header_bytes = if tag == 6 { 2 } else { 1 };
             if payload > body_capacity - header_bytes {
                 return Err(Error::InvalidRecord);
             }
-            self.expanded[0] = 3;
+            self.expanded[0] = self.header.delta_tag();
             self.expanded[1..3].copy_from_slice(&(payload as u16).to_be_bytes());
             let mut cursor = 3;
             if tag != 6 {
-                let mut mask = (tag & 0xf8) | 1 | if payload == 0 { 0 } else { 2 };
+                let mut mask = (tag & 0xf8) | context.prediction_mask(payload);
                 let pair = if tag & 7 == 5 {
                     Some((
                         18 + u32::from(tag >> 7),
@@ -411,12 +469,13 @@ impl Decoder {
                     None
                 };
                 if let Some((_, echo)) = pair {
-                    mask =
-                        1 | if payload == 0 { 0 } else { 2 } | 64 | if echo == 0 { 0 } else { 128 };
+                    mask = context.prediction_mask(payload) | 64 | if echo == 0 { 0 } else { 128 };
                 }
                 self.expanded[cursor] = mask;
                 cursor += 1;
-                append_varint(&mut self.expanded, &mut cursor, 1);
+                if context.ipid().is_some() {
+                    append_varint(&mut self.expanded, &mut cursor, 1);
+                }
                 if payload != 0 {
                     append_varint(&mut self.expanded, &mut cursor, payload as u32);
                 }
@@ -459,7 +518,7 @@ impl Decoder {
             _ => {}
         }
         require_output(output, written)?;
-        let result = if tag == 0 {
+        let result = if matches!(tag, 0 | 8) {
             Decoded::Context { consumed }
         } else {
             Decoded::Frame {
@@ -477,7 +536,7 @@ fn kind(tag: u8) -> Result<BodyKind, Error> {
     match tag {
         1 => Ok(BodyKind::Timestamp),
         2 => Ok(BodyKind::Raw),
-        3 => Ok(BodyKind::Delta),
+        3 | 9 => Ok(BodyKind::Delta),
         6 => Ok(BodyKind::Elided),
         _ if tag & 7 == 7 => Ok(BodyKind::Predictive),
         _ if tag & 7 == 5 => Ok(BodyKind::TimestampPair),
@@ -486,19 +545,6 @@ fn kind(tag: u8) -> Result<BodyKind, Error> {
 }
 fn word16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
-}
-fn word32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-fn payload_length(context: &[u8; CONTEXT_BYTES]) -> Result<usize, Error> {
-    usize::from(word16(context, 16))
-        .checked_sub(52)
-        .ok_or(Error::InvalidRecord)
 }
 fn varint_len(mut value: u32) -> usize {
     let mut len = 1;

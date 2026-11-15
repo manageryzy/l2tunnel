@@ -54,15 +54,27 @@ impl std::error::Error for Error {}
 pub struct SenderPlan {
     config: aligned_sender::Config,
     capacity: usize,
+    ip_headers: bool,
 }
 impl SenderPlan {
     /// Validate the existing complete sender policy before calculating layouts.
     pub fn for_config(config: aligned_sender::Config) -> Result<Self, Error> {
         config.memory_bound_bytes().map_err(Error::Sender)?;
         Ok(Self {
+            ip_headers: false,
             config,
             capacity: aligned_sender::Sender::reserved_bytes(config)?,
         })
+    }
+    /// Select native-IP header state before construction; no policy or bound is reduced.
+    pub fn for_ip_config(config: aligned_sender::Config) -> Result<Self, Error> {
+        let mut plan = Self::for_config(config)?;
+        plan.ip_headers = true;
+        Ok(plan)
+    }
+    /// Whether the actual selected state is native-IP header compression.
+    pub fn ip_headers(&self) -> bool {
+        self.ip_headers
     }
     /// Exact immutable sender policy.
     pub fn config(&self) -> aligned_sender::Config {
@@ -78,15 +90,27 @@ impl SenderPlan {
 pub struct PackedSenderPlan {
     config: packed_sender::Config,
     capacity: usize,
+    ip_headers: bool,
 }
 impl PackedSenderPlan {
     /// Validate complete packing/body policy before calculating layouts.
     pub fn for_config(config: packed_sender::Config) -> Result<Self, Error> {
         config.memory_bound_bytes().map_err(Error::PackedSender)?;
         Ok(Self {
+            ip_headers: false,
             config,
             capacity: packed_sender::Sender::reserved_bytes(config)?,
         })
+    }
+    /// Select native-IP header state before construction; no policy or bound is reduced.
+    pub fn for_ip_config(config: packed_sender::Config) -> Result<Self, Error> {
+        let mut plan = Self::for_config(config)?;
+        plan.ip_headers = true;
+        Ok(plan)
+    }
+    /// Whether the actual selected state is native-IP header compression.
+    pub fn ip_headers(&self) -> bool {
+        self.ip_headers
     }
     /// Exact immutable packing/body policy.
     pub fn config(&self) -> packed_sender::Config {
@@ -102,15 +126,27 @@ impl PackedSenderPlan {
 pub struct ReceiverPlan {
     limits: aligned_receiver::Limits,
     capacity: usize,
+    ip_headers: bool,
 }
 impl ReceiverPlan {
     /// Validate all existing receive maxima without reducing them to fit a budget.
     pub fn for_limits(limits: aligned_receiver::Limits) -> Result<Self, Error> {
         limits.memory_bound_bytes().map_err(Error::Receiver)?;
         Ok(Self {
+            ip_headers: false,
             limits,
             capacity: aligned_receiver::Receiver::reserved_bytes(limits)?,
         })
+    }
+    /// Select native-IP header state before construction; no policy or bound is reduced.
+    pub fn for_ip_limits(limits: aligned_receiver::Limits) -> Result<Self, Error> {
+        let mut plan = Self::for_limits(limits)?;
+        plan.ip_headers = true;
+        Ok(plan)
+    }
+    /// Whether the actual selected state is native-IP header compression.
+    pub fn ip_headers(&self) -> bool {
+        self.ip_headers
     }
     /// Exact immutable receiver policy.
     pub fn limits(&self) -> aligned_receiver::Limits {

@@ -723,7 +723,8 @@ fn parameters(
         return Err(Error::Configuration);
     }
     let descriptor = configuration.descriptor();
-    if let configuration::Profile::Rolling { config, .. } = descriptor.profile()
+    if let configuration::Profile::Rolling { config, .. }
+    | configuration::Profile::RollingCopies { config, .. } = descriptor.profile()
         && (config.geometry != geometry || config.native_stall_micros != native_limits.stall_micros)
     {
         return Err(Error::Geometry);

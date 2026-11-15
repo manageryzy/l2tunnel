@@ -6,15 +6,33 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
-The [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
+The current [Batch9 scoped evidence](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json)
+adds finite selected CompactARQ/Python-event differential and Reliable R0 passes,
+actual UDP Rolling three-copy delivery/switching, shared production proxy CLI
+adapter/Unix lifecycle checks, and native-IP codec/Aligned/Packed protocol tests.
+These are separate finite compositions: selected Compact Common installation and
+L3 runtime/native integration remain open. The exact Aligned FIFO pressure repair
+passes, while Packed pressure still fails under its original caps. Full-check
+attempt2 passed 1,735 Rust cases and 65 Python tooling cases before a runtime loss
+fixture stack overflow aborted its test binary; the simulator stage was not reached.
+That fixture now stores its actual Driver in the existing fallible StateCell:
+all five affected loss/liveness cases pass with unchanged stack limits, timeouts
+and assertions. The earlier Clippy failure is also corrected. Affected format,
+strict Clippy and rustdoc pass; these continuations are not a whole-batch pass.
+Full Python behavior, native, resource, platform, all47 and SW-11 gates retain
+their complete definitions.
+
+The preceding [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
 adds independent verified SNI, retained raw send observations, supported CLI naming
 and actual fixed/measured shared-service readiness/cleanup. Affected strict checks
-and finite TLS/Unix-device cases pass; failed attempts remain preserved. Production
+and finite TLS/Unix-device cases pass; failed attempts remain preserved. At that
+checkpoint, production
 proxy CLI migration, Python behavior alignment and complete native/platform/
-resource/performance gates remain open. See [naming](modules/tcp-carrier-naming.md),
+resource/performance gates remained open; the finite CLI follow-on is recorded
+above. See [naming](modules/tcp-carrier-naming.md),
 [proxy service](modules/tcp-proxy-service.md) and [Python alignment](modules/python-behavior-alignment.md).
 
-The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
+The preceding [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
 implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
 Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
 [explicit short-source copy selection](modules/source-copy-policy.md), and
@@ -29,7 +47,7 @@ remains in the underlying service. Native and full-stage evidence is recorded
 separately; all47 mode gates, full SW-11, complete resources, Windows/Android and
 80 Mbit/s performance remain open.
 
-This is a scoped checkpoint with open aggregate failures. The batch
+That Wave8 checkpoint preserved open aggregate failures. Its
 `tools/check.py` invocation failed in the legacy Packed pressure case and runtime
 fixture stack limits; its successful stages and exact continuations are retained.
 The full simulator passed 1,658 cases. Three current Linux native cases passed;

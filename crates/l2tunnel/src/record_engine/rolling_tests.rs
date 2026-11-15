@@ -409,3 +409,120 @@ fn actual_rolling_plan_limits_aliases_foreign_tokens_and_functional_emissions_ar
     ));
     Ok(())
 }
+
+#[test]
+fn selected_tag5_installs_real_copies_in_functional_and_reserved_owners() -> TestResult {
+    use crate::codec::source_copy::{Policy, Scope};
+    let old = fixture(true, rolling::wire::SourceWire::Exact)?;
+    let configuration::Profile::Rolling { config, stream } = *old.descriptor().profile() else {
+        return Err("missing Rolling fixture".into());
+    };
+    let copies = rolling_records::CopyPolicies {
+        forward: Policy {
+            max_unit_bytes: 128,
+            copies: 3,
+            scope: Scope::AllShort,
+        },
+        reverse: Policy {
+            max_unit_bytes: 128,
+            copies: 2,
+            scope: Scope::AllShort,
+        },
+    };
+    let descriptor = old.descriptor();
+    let selected = configuration::Configuration::new(
+        old.envelope(),
+        configuration::Descriptor::new(
+            descriptor.path_mtu(),
+            descriptor.duplex(),
+            *descriptor.direction(Role::Client).common(),
+            *descriptor.direction(Role::Server).common(),
+            configuration::Profile::RollingCopies {
+                config,
+                stream,
+                copies,
+            },
+        )?,
+    )?;
+    for reserved in [false, true] {
+        for (role, peer_role, count) in [
+            (Role::Client, Role::Server, 3),
+            (Role::Server, Role::Client, 2),
+        ] {
+            let mut sender = build(selected, role, reserved)?;
+            let mut peer = build(selected, peer_role, reserved)?;
+            assert_eq!(sender.configuration(), &selected);
+            let initial = [sender.storage_usage(), peer.storage_usage()];
+            let original = packet(true, 3333, 64, 0x57);
+            sender.enqueue_borrowed(Tick(0), &original)?;
+            sender
+                .admit_borrowed(Tick(0))?
+                .ok_or("missing real admission")?;
+            sender.step(Tick(1000), work())?;
+            let mut first = None;
+            let mut previous = None;
+            for ordinal in 0..count {
+                let now = Tick(1000 + ordinal);
+                sender.step(now, work())?;
+                let mut output = [0; 1500];
+                let mut units = witnesses();
+                let mut budget = OutboundBudget {
+                    packets: 1,
+                    wire_bytes: 1500,
+                };
+                let emission = sender
+                    .poll(
+                        now,
+                        100 + ordinal,
+                        true,
+                        &mut output,
+                        &mut budget,
+                        &mut units,
+                    )?
+                    .ok_or("missing selected copy")?;
+                assert!(matches!(emission.kind, EmissionKind::Source(_)));
+                assert_eq!(emission.security_number, 100 + ordinal);
+                assert_eq!(budget.packets, 0);
+                let bytes = output[..emission.bytes].to_vec();
+                if let Some(first) = &first {
+                    assert_eq!(&bytes, first);
+                } else {
+                    first = Some(bytes);
+                }
+                if let Some(previous) = previous {
+                    assert_eq!(
+                        sender.confirm_carrier_output(now, previous),
+                        Err(Error::Token)
+                    );
+                }
+                previous = sender.pending_carrier_output();
+                let token = sender
+                    .pending_carrier_output()
+                    .ok_or("missing selected custody")?;
+                sender.confirm_carrier_output(now, token)?;
+                peer.accept_authenticated(
+                    now,
+                    emission.security_number,
+                    emission.kind,
+                    &mut output[..emission.bytes],
+                )?;
+                peer.step(now, work())?;
+                let mut native = [0; 1024];
+                for _ in 0..16 {
+                    if let NativePreparation::Ready(prepared) =
+                        peer.prepare_native(now, 128, Tick(100000), &mut native)?
+                    {
+                        assert_eq!(ordinal, 0);
+                        assert_eq!(&native[..prepared.bytes()], original);
+                        peer.commit_native(now, prepared.token())?;
+                    }
+                }
+                assert_eq!(peer.statistics().committed, 1);
+            }
+            assert_eq!(sender.statistics().admitted, 1);
+            assert_eq!(sender.statistics().emitted, count);
+            assert_eq!([sender.storage_usage(), peer.storage_usage()], initial);
+        }
+    }
+    Ok(())
+}

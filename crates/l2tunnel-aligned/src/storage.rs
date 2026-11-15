@@ -83,20 +83,33 @@ impl Plan {
     ) -> Result<Self, Error> {
         let (sender, cell) = if let Some(packed) = send_packed {
             (
-                codec::PackedSenderPlan::for_config(packed.sender())
-                    .map_err(Error::Codec)?
-                    .capacity_bytes(),
+                (if send.native_policy == super::NativePolicy::IpHeaders {
+                    codec::PackedSenderPlan::for_ip_config
+                } else {
+                    codec::PackedSenderPlan::for_config
+                })(packed.sender())
+                .map_err(Error::Codec)?
+                .capacity_bytes(),
                 array_bytes::<packed_sender::Sender>(1)?,
             )
         } else {
             (
-                codec::SenderPlan::for_config(super::sender_config(send))
-                    .map_err(Error::Codec)?
-                    .capacity_bytes(),
+                (if send.native_policy == super::NativePolicy::IpHeaders {
+                    codec::SenderPlan::for_ip_config
+                } else {
+                    codec::SenderPlan::for_config
+                })(super::sender_config(send))
+                .map_err(Error::Codec)?
+                .capacity_bytes(),
                 array_bytes::<sender::Sender>(1)?,
             )
         };
-        let receiver = codec::ReceiverPlan::for_limits(receive.receiver).map_err(Error::Codec)?;
+        let receiver = (if receive.native_policy == super::NativePolicy::IpHeaders {
+            codec::ReceiverPlan::for_ip_limits
+        } else {
+            codec::ReceiverPlan::for_limits
+        })(receive.receiver)
+        .map_err(Error::Codec)?;
         let reliable =
             reliable::Plan::for_duplex(send.recovery, receive.recovery).map_err(Error::Reliable)?;
         let symbols = receive_packed.map_or(Ok(0), |p| {

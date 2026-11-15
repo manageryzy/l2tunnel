@@ -55,6 +55,22 @@ impl Owner {
                 .map(Self::Rolling)
                 .map_err(Error::Rolling);
         }
+        if let configuration::Profile::RollingCopies {
+            config,
+            stream,
+            copies,
+        } = configuration.descriptor().profile()
+        {
+            return rolling_records::Endpoint::new_with_copies(
+                *config,
+                context,
+                *stream,
+                Tick(0),
+                *copies,
+            )
+            .map(Self::Rolling)
+            .map_err(Error::Rolling);
+        }
         let local = configuration.descriptor().local(context.role);
         let recovery = recovery_context(context);
         match (local.send().profile(), local.receive().profile()) {

@@ -46,6 +46,7 @@ def main() -> None:
     run(sys.executable, 'tools/generate_aligned_receiver_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run(sys.executable, 'tools/generate_aligned_sender_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run(sys.executable, 'tools/generate_packed_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    run(sys.executable, 'tools/generate_compact_arq_events.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run('cargo', 'fmt', '--all', '--check')
     run('cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings')
     run('cargo', 'test', '--workspace', '--all-features', '--locked', '--no-fail-fast')

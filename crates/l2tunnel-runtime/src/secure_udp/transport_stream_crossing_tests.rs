@@ -136,7 +136,7 @@ struct Crossing {
 }
 
 impl Crossing {
-    async fn new(kind: cover::Appearance, work: usize) -> Result<Self> {
+    async fn new(kind: cover::Appearance, work: usize) -> Result<owner::StateCell<Self>> {
         Self::with_receive_window(kind, work, 32, false).await
     }
 
@@ -145,7 +145,7 @@ impl Crossing {
         work: usize,
         receive_records: usize,
         quiet_liveness: bool,
-    ) -> Result<Self> {
+    ) -> Result<owner::StateCell<Self>> {
         let mut configured = config(kind);
         configured.policy.transaction_micros = 10_000_000;
         configured.lifetime.lease = Duration::from_secs(60);
@@ -195,7 +195,10 @@ impl Crossing {
             assert!(empty, "crossing setup input did not drain");
         }
         let start = add(clock(origin, setup_end)?, Duration::from_millis(20))?.max(1_000_000);
-        Ok(Self {
+        // Return only the existing fallible cell header from setup. Keeping
+        // this actual pair inline in its caller duplicates both Driver layouts
+        // in async return/await storage during the real authentication phase.
+        Ok(owner::StateCell::new(Self {
             fixture: FaultFixture {
                 endpoints: [
                     Endpoint {
@@ -222,7 +225,7 @@ impl Crossing {
             hold_next_proposal: false,
             held_proposal: None,
             prepare_tiny_window: receive_records == 1,
-        })
+        })?)
     }
 
     fn request(
@@ -494,7 +497,8 @@ impl Crossing {
 }
 
 async fn crossing(kind: cover::Appearance, work: usize, alignment: usize) -> Result {
-    let mut case = Crossing::new(kind, work).await?;
+    let mut storage = Crossing::new(kind, work).await?;
+    let case = &mut *storage;
     let start = case.fixture.start;
     let mut first = case.request(start, policy_value())?;
     let first_deadline = case.fixture.endpoints[0]
@@ -713,7 +717,8 @@ async fn whole_receipt_reordered_behind_next_origin_settles_before_gate_on_both_
 }
 
 async fn no_ingress_after_final_custody(kind: cover::Appearance, alignment: usize) -> Result<bool> {
-    let mut case = Crossing::with_receive_window(kind, 1, 1, false).await?;
+    let mut storage = Crossing::with_receive_window(kind, 1, 1, false).await?;
+    let case = &mut *storage;
     case.capture_pong = true;
     let start = case.fixture.start;
     let mut first = case.request(start, policy_value())?;

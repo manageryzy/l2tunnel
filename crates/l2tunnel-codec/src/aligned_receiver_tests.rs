@@ -293,6 +293,11 @@ fn independent_short_tombstone_retains_body_gap_and_conflict_proof_until_contigu
     let mut receiver = Receiver::new(scope(), config)?;
     let short = raw(1460, 0, 1, b"generic independent bytes");
     receiver.admit_authenticated(identity(1, 1), &short, Tick(1))?;
+    assert_eq!(
+        receiver.prepare_ordered(ChannelId(0), Tick(2), 1)?,
+        Prepared::Idle
+    );
+    assert!(receiver.pending().is_none());
     assert_eq!(receiver.prepare(ChannelId(0), Tick(2), 1)?, Prepared::Ready);
     assert!(receiver.pending().ok_or("early")?.early);
     receiver.commit_delivery(Tick(2))?;

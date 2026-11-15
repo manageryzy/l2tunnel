@@ -126,6 +126,77 @@ impl Plan {
         self.bytes
     }
 }
+
+/// Exact actual backing for the explicitly selected Compact R0 body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactPlan {
+    send: crate::CompactReliableConfig,
+    receive: crate::CompactReliableConfig,
+    bytes: usize,
+    pub(crate) arq: l2tunnel_recovery::storage::CompactPlan,
+    pub(crate) scratch_bytes: usize,
+    pub(crate) send_maximum: usize,
+    pub(crate) receive_maximum: usize,
+}
+impl CompactPlan {
+    /// Validate complete independent policies and reserve no unused FEC owner.
+    pub fn for_duplex(
+        send: crate::CompactReliableConfig,
+        receive: crate::CompactReliableConfig,
+    ) -> Result<Self, Error> {
+        send.validate().map_err(Error::Reliable)?;
+        receive.validate().map_err(Error::Reliable)?;
+        let arq = l2tunnel_recovery::storage::CompactPlan::for_compact(send.arq(), receive.arq())
+            .map_err(Error::Recovery)?;
+        let source = add(
+            l2tunnel_recovery::COMPACT_DATA_HEADER_BYTES,
+            send.arq().bounds().max_source_bytes,
+        )?;
+        let peer_source = add(
+            l2tunnel_recovery::COMPACT_DATA_HEADER_BYTES,
+            receive.arq().bounds().max_source_bytes,
+        )?;
+        let scratch_bytes = source.max(receive.arq().maximum_feedback_bytes());
+        let send_maximum =
+            crate::compact::packet_maximum(scratch_bytes, send.outer_overhead_bytes())
+                .map_err(Error::Reliable)?;
+        let receive_maximum = crate::compact::packet_maximum(
+            peer_source.max(send.arq().maximum_feedback_bytes()),
+            receive.outer_overhead_bytes(),
+        )
+        .map_err(Error::Reliable)?;
+        Ok(Self {
+            send,
+            receive,
+            bytes: add(arq.capacity_bytes(), scratch_bytes)?,
+            arq,
+            scratch_bytes,
+            send_maximum,
+            receive_maximum,
+        })
+    }
+    /// Exact sending requested policy.
+    pub const fn send_config(&self) -> crate::CompactReliableConfig {
+        self.send
+    }
+    /// Exact receiving requested policy.
+    pub const fn receive_config(&self) -> crate::CompactReliableConfig {
+        self.receive
+    }
+    /// Complete requested nested and scratch heap, excluding inline Reliable.
+    pub const fn capacity_bytes(&self) -> usize {
+        self.bytes
+    }
+    /// Exact complete local output maximum, excluding configured outer overhead.
+    pub const fn send_max_packet_bytes(&self) -> usize {
+        self.send_maximum
+    }
+    /// Exact complete peer output maximum, excluding configured outer overhead.
+    pub const fn receive_max_packet_bytes(&self) -> usize {
+        self.receive_maximum
+    }
+}
+
 pub(crate) fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b).ok_or(Error::Layout)
 }

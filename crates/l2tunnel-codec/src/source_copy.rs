@@ -63,7 +63,11 @@ impl Policy {
         let kind = unit[3];
         let length = usize::from(u16::from_be_bytes([unit[4], unit[5]]));
         Ok(
-            if unit.len() == 6 + length && (kind == 2 || kind == 0 && length == 66) {
+            if unit.len() == 6 + length
+                && (kind == 2
+                    || kind == 0 && length == 66
+                    || kind == 8 && (40..=crate::tcp_header::MAX_IP_HEADER_BYTES).contains(&length))
+            {
                 self.copies
             } else {
                 1

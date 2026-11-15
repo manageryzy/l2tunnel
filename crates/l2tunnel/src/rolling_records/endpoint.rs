@@ -15,6 +15,8 @@ pub enum OutputId {
 pub struct PreparedOutput {
     pub(super) instance: u64,
     pub(super) serial: u64,
+    pub(super) source_copy: Option<scheduler::SourceCopy>,
+    pub(super) prepared_at: Tick,
     /// Exact authoritative scheduler output identity.
     pub id: OutputId,
     /// Actual protected-record kind for the carrier's authenticated metadata.
@@ -27,6 +29,12 @@ pub struct PreparedOutput {
     pub wire_bytes: usize,
     /// Original native units initialized in caller witness storage.
     pub witnesses: usize,
+}
+impl PreparedOutput {
+    /// Exact physical-copy ordinal; this local witness is not I/O evidence.
+    pub const fn source_copy(self) -> Option<scheduler::SourceCopy> {
+        self.source_copy
+    }
 }
 /// Constant-size actual composition counters, without delivery-rate inference.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,6 +82,7 @@ struct Preview {
 pub struct Endpoint {
     pub(super) instance: u64,
     pub(super) config: Config,
+    pub(super) copies: CopyPolicies,
     pub(super) digest: crate::core::ConfigDigest,
     pub(super) stream: u32,
     pub(super) send_rolling_scope: rolling::Scope,
@@ -109,7 +118,21 @@ impl Endpoint {
     /// Construct real codec and rolling owners after complete scalar validation.
     /// Every tick in this composition is one injected microsecond.
     pub fn new(config: Config, context: Context, stream: u32, now: Tick) -> Result<Self, Error> {
-        Self::construct(config, context, stream, now, None)
+        Self::construct(config, context, stream, now, None, CopyPolicies::ONE)
+    }
+    /// Select complete caller-authenticated directional source-copy policies.
+    pub fn new_with_copies(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        copies: CopyPolicies,
+    ) -> Result<Self, Error> {
+        Self::construct(config, context, stream, now, None, copies)
+    }
+    /// Observe exact selected policies; local observation provides no peer authority.
+    pub const fn source_copy_policies(&self) -> CopyPolicies {
+        self.copies
     }
     pub(super) fn construct(
         config: Config,
@@ -117,9 +140,10 @@ impl Endpoint {
         stream: u32,
         now: Tick,
         reserved: Option<storage::Plan>,
+        copies: CopyPolicies,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        let digest = config.binding_digest(stream)?;
+        copies.validate(config)?;
+        let digest = copies.binding_digest(config, stream)?;
         if context.session == 0 || context.epoch == 0 {
             return Err(Error::Configuration);
         }
@@ -149,11 +173,8 @@ impl Endpoint {
                 receiver::Direction::ResponderToInitiator => 1,
             },
         };
-        let sender_plan = codec::aligned_storage::PackedSenderPlan::for_config(send_config.packing)
-            .map_err(Error::Storage)?;
-        let receiver_plan =
-            codec::aligned_storage::ReceiverPlan::for_limits(receive_config.receiver)
-                .map_err(Error::Storage)?;
+        let sender_plan = send_config.packing_plan()?;
+        let receiver_plan = receive_config.receiver_plan()?;
         let source_bytes = send_config
             .packing
             .envelope()
@@ -183,15 +204,24 @@ impl Endpoint {
         }
         let source = bytes(source_bytes)?;
         let symbols = bytes(symbol_bytes)?;
-        let packing = packed_sender::Sender::new_reserved(
+        let packing = (if send_config.native_policy == NativePolicy::IpHeaders {
+            packed_sender::Sender::new_reserved_ip_with_copies
+        } else {
+            packed_sender::Sender::new_reserved_with_copies
+        })(
             send_scope,
             send_config.packing,
             codec::aligned_storage::Limits {
                 capacity_bytes: sender_plan.capacity_bytes(),
             },
+            copies.local(context.role),
         )
         .map_err(Error::Storage)?;
-        let records = receiver::Receiver::new_reserved(
+        let records = (if receive_config.native_policy == NativePolicy::IpHeaders {
+            receiver::Receiver::new_reserved_ip
+        } else {
+            receiver::Receiver::new_reserved
+        })(
             receive_scope,
             receive_config.receiver,
             codec::aligned_storage::Limits {
@@ -238,6 +268,7 @@ impl Endpoint {
         Ok(Self {
             instance: allocate_instance()?,
             config,
+            copies,
             digest,
             stream,
             send_rolling_scope: rolling_scope(send_direction),
@@ -336,7 +367,9 @@ impl Endpoint {
         self.advance(now)?;
         let channel = receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
         let result = match self.send_config.native_policy {
-            NativePolicy::EthernetHeaders => self.packing.stage_identified(channel, frame, now.0),
+            NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
+                self.packing.stage_identified(channel, frame, now.0)
+            }
             NativePolicy::RawIp => self.packing.stage_raw_identified(channel, frame, now.0),
         };
         match result {
@@ -379,10 +412,12 @@ impl Endpoint {
             .packing
             .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
             .map_err(Error::Sender)?;
-        match self
-            .sender
-            .admit_source(&self.source[..length], rolling_tick(now))
-        {
+        let copies = self.packing.pending_copies().map_err(Error::Sender)?;
+        match self.sender.admit_source_with_copies(
+            &self.source[..length],
+            rolling_tick(now),
+            copies,
+        ) {
             Ok(id) if id == expected => {
                 let result = self.packing.commit_source().map_err(Error::Sender);
                 if let Err(error) = result {
@@ -759,6 +794,12 @@ impl Endpoint {
         let pending = PreparedOutput {
             instance: self.instance,
             serial: self.next_output,
+            prepared_at: now,
+            source_copy: if matches!(id, OutputId::Data(scheduler::OutputId::Source(_))) {
+                Some(self.sender.pending_source_copy().ok_or(Error::Identity)?)
+            } else {
+                None
+            },
             id,
             kind,
             security_number,
@@ -779,6 +820,15 @@ impl Endpoint {
     /// Record exactly one caller-observed complete carrier handoff, never enqueue.
     /// Physical observation is retained even if subsequent timing validation fails.
     pub fn confirm_output(&mut self, now: Tick, pending: PreparedOutput) -> Result<(), Error> {
+        self.confirm_output_at(now, now, pending)
+    }
+    /// Keep original actual acceptance distinct from delayed callback observation.
+    pub fn confirm_output_at(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        pending: PreparedOutput,
+    ) -> Result<(), Error> {
         if self.prepared_output != Some(pending) {
             return Err(Error::Token);
         }
@@ -787,13 +837,24 @@ impl Endpoint {
             .handed
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
-        let timing = self.advance(now);
+        let timing = if accepted < pending.prepared_at || accepted > now {
+            self.fail(Error::Time)
+        } else {
+            self.advance(now)
+        };
         self.prepared_output = None;
         self.statistics.handed = handed;
         timing?;
-        let result = match pending.id {
-            OutputId::Data(id) => self.sender.confirm_output(id, rolling_tick(now)),
-            OutputId::Feedback(id) => self.incoming.confirm_feedback(id, rolling_tick(now)),
+        let result = match (pending.id, pending.source_copy) {
+            (OutputId::Data(scheduler::OutputId::Source(id)), Some(copy))
+                if copy.source() == id =>
+            {
+                self.sender
+                    .confirm_source_copy(rolling_tick(now), rolling_tick(accepted), copy)
+            }
+            (OutputId::Data(id), None) => self.sender.confirm_output(id, rolling_tick(now)),
+            (OutputId::Feedback(id), None) => self.incoming.confirm_feedback(id, rolling_tick(now)),
+            _ => Err(rolling::Error::Identity),
         }
         .map_err(Error::Rolling);
         if let Err(error) = result {

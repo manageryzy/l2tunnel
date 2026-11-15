@@ -349,7 +349,7 @@ fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Desc
                     extra_byte(value.base.recovery.outer_overhead_bytes)?;
             }
         }
-        common::Profile::Rolling { config, .. } => {
+        common::Profile::Rolling { config, .. } | common::Profile::RollingCopies { config, .. } => {
             config.geometry.forward_overhead_bytes =
                 extra_byte(config.geometry.forward_overhead_bytes)?;
             config.geometry.reverse_overhead_bytes =

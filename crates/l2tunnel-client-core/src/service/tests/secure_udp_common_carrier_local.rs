@@ -13,7 +13,9 @@ fn arq_only_descriptor(value: common::Descriptor) -> Result<common::Descriptor> 
             forward.base.recovery.repair_symbols = 0;
             reverse.base.recovery.repair_symbols = 0;
         }
-        common::Profile::Swift { .. } | common::Profile::Rolling { .. } => return Ok(value),
+        common::Profile::Swift { .. }
+        | common::Profile::Rolling { .. }
+        | common::Profile::RollingCopies { .. } => return Ok(value),
     }
     Ok(common::Descriptor::new(
         value.path_mtu(),
@@ -116,7 +118,9 @@ fn assert_arq_only(value: common::Configuration) {
             assert_eq!(forward.base.recovery.repair_symbols, 0);
             assert_eq!(reverse.base.recovery.repair_symbols, 0);
         }
-        common::Profile::Swift { .. } | common::Profile::Rolling { .. } => {}
+        common::Profile::Swift { .. }
+        | common::Profile::Rolling { .. }
+        | common::Profile::RollingCopies { .. } => {}
     }
 }
 

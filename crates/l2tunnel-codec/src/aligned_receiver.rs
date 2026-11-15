@@ -112,7 +112,7 @@ impl Limits {
         let products = [
             (
                 channels,
-                65535 + self.max_fragments_per_record + size_of::<Channel>(),
+                65535 + self.max_fragments_per_record + size_of::<LegacyChannel>(),
             ),
             (
                 self.source_window,
@@ -285,6 +285,11 @@ impl Record {
         self.count == self.pieces.len()
     }
 }
+#[allow(dead_code)]
+struct LegacyChannel {
+    expected: Option<RecordId>,
+    decoder: [u8; Decoder::legacy_inline_bytes()],
+}
 struct Channel {
     expected: Option<RecordId>,
     decoder: Decoder,
@@ -329,7 +334,7 @@ struct LegacyLayout {
     records: Vec<Option<Record>>,
     proofs: Vec<Option<Proof>>,
     floor: Option<SourceId>,
-    staged: Decoder,
+    staged: [u8; Decoder::legacy_inline_bytes()],
     native: Vec<u8>,
     pending: Option<Pending>,
     last_time: Option<Tick>,
@@ -343,6 +348,13 @@ impl Receiver {
     }
     /// Validate all fixed allocation products and reserve progress independently of lookahead.
     pub fn new(scope: Scope, limits: Limits) -> Result<Self, Error> {
+        Self::new_mode(scope, limits, false)
+    }
+    /// Native-IP contexts/deltas use the same channel/record/native ownership FSM.
+    pub fn new_ip(scope: Scope, limits: Limits) -> Result<Self, Error> {
+        Self::new_mode(scope, limits, true)
+    }
+    fn new_mode(scope: Scope, limits: Limits, ip: bool) -> Result<Self, Error> {
         limits.memory_bound_bytes()?;
         if scope.session == [0; 16] {
             return Err(Error::Configuration);
@@ -351,7 +363,12 @@ impl Receiver {
         for _ in 0..limits.channels {
             channels.push(Channel {
                 expected: Some(limits.first_record),
-                decoder: Decoder::new(limits.body).map_err(Error::Body)?,
+                decoder: if ip {
+                    Decoder::new_ip(limits.body)
+                } else {
+                    Decoder::new(limits.body)
+                }
+                .map_err(Error::Body)?,
             });
         }
         let mut records =
@@ -369,7 +386,12 @@ impl Receiver {
             records,
             proofs,
             floor: Some(limits.first_source),
-            staged: Decoder::new(limits.body).map_err(Error::Body)?,
+            staged: if ip {
+                Decoder::new_ip(limits.body)
+            } else {
+                Decoder::new(limits.body)
+            }
+            .map_err(Error::Body)?,
             native: vec![0; limits.body.max_frame_bytes],
             pending: None,
             last_time: None,
@@ -641,6 +663,25 @@ impl Receiver {
         now: Tick,
         max_records: usize,
     ) -> Result<Prepared, Error> {
+        self.prepare_selected(channel, now, max_records, true)
+    }
+    /// Preserve channel FIFO even when independent short bodies are enabled.
+    /// Already exposed native bytes retain custody until their original commit.
+    pub fn prepare_ordered(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(channel, now, max_records, false)
+    }
+    fn prepare_selected(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+        allow_early: bool,
+    ) -> Result<Prepared, Error> {
         self.check_time(now)?;
         self.expected(channel)?;
         self.last_time = Some(now);
@@ -661,7 +702,8 @@ impl Receiver {
                     .enumerate()
                     .filter_map(|(i, entry)| {
                         let entry = entry.as_ref()?;
-                        (entry.channel == channel
+                        (allow_early
+                            && entry.channel == channel
                             && entry.id > expected
                             && entry.complete()
                             && entry.pieces.is_empty()
@@ -987,9 +1029,10 @@ pub(crate) fn explicit_length(body: &[u8]) -> Result<usize, Error> {
     let mut cursor = 3usize;
     match body[0] {
         0 if size == 66 => {}
+        8 if (40..=crate::tcp_header::MAX_IP_HEADER_BYTES).contains(&size) => {}
         1 => cursor += 23,
         2 => {}
-        3 => {
+        3 | 9 => {
             let mask = *body.get(cursor).ok_or(Error::Malformed)?;
             cursor += 1;
             for bit in 0..8 {

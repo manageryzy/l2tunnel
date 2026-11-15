@@ -1,4 +1,4 @@
-//! Additive tag4 inside the unchanged CompleteV2 fixed directional slot.
+//! Additive tag4/tag5 inside the unchanged CompleteV2 fixed directional slot.
 use super::*;
 use crate::{
     codec::{aligned_sender, packed, packed_sender},
@@ -25,6 +25,7 @@ pub(super) fn encode(
         match config.native_policy {
             aligned::NativePolicy::EthernetHeaders => 1,
             aligned::NativePolicy::RawIp => 2,
+            aligned::NativePolicy::IpHeaders => 3,
         },
         integer(b.max_frame_bytes)?,
         integer(b.symbol_bytes)?,
@@ -83,12 +84,18 @@ fn boolean(reader: &mut Reader<'_>) -> Result<bool, Error> {
     }
 }
 
-fn decode(input: &[u8]) -> Result<(rolling_records::DirectionConfig, usize, u64, u32), Error> {
-    padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
+fn decode(
+    input: &[u8],
+    copies: bool,
+) -> Result<(rolling_records::DirectionConfig, usize, u64, u32), Error> {
+    if !copies {
+        padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
+    }
     let mut reader = Reader::new(input.get(..ACTIVE_BYTES).ok_or(Error::Length)?);
     let native_policy = match reader.number()? {
         1 => aligned::NativePolicy::EthernetHeaders,
         2 => aligned::NativePolicy::RawIp,
+        3 => aligned::NativePolicy::IpHeaders,
         _ => return Err(Error::Prefix),
     };
     let body = aligned_body::Config {
@@ -177,8 +184,14 @@ fn decode(input: &[u8]) -> Result<(rolling_records::DirectionConfig, usize, u64,
 }
 
 pub(super) fn decode_pair(a: &[u8], b: &[u8]) -> Result<Profile, Error> {
-    let (forward, forward_overhead_bytes, stall, stream) = decode(a)?;
-    let (reverse, reverse_overhead_bytes, other_stall, other_stream) = decode(b)?;
+    pair(a, b, false)
+}
+pub(super) fn decode_pair_with_copies(a: &[u8], b: &[u8]) -> Result<Profile, Error> {
+    pair(a, b, true)
+}
+fn pair(a: &[u8], b: &[u8], copies: bool) -> Result<Profile, Error> {
+    let (forward, forward_overhead_bytes, stall, stream) = decode(a, copies)?;
+    let (reverse, reverse_overhead_bytes, other_stall, other_stream) = decode(b, copies)?;
     if stall != other_stall || stream != other_stream {
         return Err(Error::Relation);
     }
@@ -192,5 +205,49 @@ pub(super) fn decode_pair(a: &[u8], b: &[u8]) -> Result<Profile, Error> {
         native_stall_micros: stall,
     };
     config.validate().map_err(|_| Error::Profile)?;
-    Ok(Profile::Rolling { config, stream })
+    if copies {
+        let copies = rolling_records::CopyPolicies {
+            forward: decode_copy(a.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?,
+            reverse: decode_copy(b.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?,
+        };
+        copies.validate(config).map_err(|_| Error::Profile)?;
+        Ok(Profile::RollingCopies {
+            config,
+            stream,
+            copies,
+        })
+    } else {
+        Ok(Profile::Rolling { config, stream })
+    }
+}
+
+pub(super) fn encode_copy(
+    policy: crate::codec::source_copy::Policy,
+    output: &mut [u8],
+) -> Result<(), Error> {
+    use crate::codec::source_copy::Scope;
+    let threshold = u16::try_from(policy.max_unit_bytes).map_err(|_| Error::Integer)?;
+    if output.len() != 4 {
+        return Err(Error::Length);
+    }
+    output[..2].copy_from_slice(&threshold.to_be_bytes());
+    output[2] = policy.copies;
+    output[3] = match policy.scope {
+        Scope::AllShort => 1,
+        Scope::ContextAndIndependent => 2,
+    };
+    Ok(())
+}
+fn decode_copy(input: &[u8]) -> Result<crate::codec::source_copy::Policy, Error> {
+    use crate::codec::source_copy::{Policy, Scope};
+    let [hi, lo, copies, scope] = *<&[u8; 4]>::try_from(input).map_err(|_| Error::Length)?;
+    Ok(Policy {
+        max_unit_bytes: usize::from(u16::from_be_bytes([hi, lo])),
+        copies,
+        scope: match scope {
+            1 => Scope::AllShort,
+            2 => Scope::ContextAndIndependent,
+            _ => return Err(Error::Prefix),
+        },
+    })
 }

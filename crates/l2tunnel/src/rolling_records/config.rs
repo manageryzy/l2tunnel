@@ -16,11 +16,26 @@ pub struct DirectionConfig {
     pub scheduler: scheduler::Policy,
 }
 impl DirectionConfig {
+    pub(super) fn packing_plan(self) -> Result<codec::aligned_storage::PackedSenderPlan, Error> {
+        (if self.native_policy == NativePolicy::IpHeaders {
+            codec::aligned_storage::PackedSenderPlan::for_ip_config
+        } else {
+            codec::aligned_storage::PackedSenderPlan::for_config
+        })(self.packing)
+        .map_err(Error::Storage)
+    }
+    pub(super) fn receiver_plan(self) -> Result<codec::aligned_storage::ReceiverPlan, Error> {
+        (if self.native_policy == NativePolicy::IpHeaders {
+            codec::aligned_storage::ReceiverPlan::for_ip_limits
+        } else {
+            codec::aligned_storage::ReceiverPlan::for_limits
+        })(self.receiver)
+        .map_err(Error::Storage)
+    }
     /// Validate actual owners and every cross-owner source/record geometry.
     pub fn validate(self) -> Result<(), Error> {
-        codec::aligned_storage::PackedSenderPlan::for_config(self.packing)
-            .map_err(Error::Storage)?;
-        codec::aligned_storage::ReceiverPlan::for_limits(self.receiver).map_err(Error::Storage)?;
+        self.packing_plan()?;
+        self.receiver_plan()?;
         self.receiver
             .batch_memory_bound_bytes()
             .map_err(Error::Receiver)?;
@@ -151,6 +166,7 @@ impl Config {
                 match c.native_policy {
                     NativePolicy::EthernetHeaders => 1,
                     NativePolicy::RawIp => 2,
+                    NativePolicy::IpHeaders => 3,
                 },
                 b.max_frame_bytes as u64,
                 b.symbol_bytes as u64,

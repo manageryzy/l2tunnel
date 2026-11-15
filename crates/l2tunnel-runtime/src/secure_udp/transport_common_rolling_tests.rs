@@ -392,3 +392,6 @@ fn actual_rolling_late_whole_write_records_physical_fact_and_retires_original_to
             Ok(())
         })
 }
+
+#[path = "transport_common_rolling_copy_tests.rs"]
+mod source_copies;

@@ -249,12 +249,14 @@ async fn actual_send_reserves_bounded_observer_before_io_and_retains_original_ti
             lane: 7,
             units: vec![],
             at: origin,
+            output: None,
         })
         .await?;
     packets
         .send(Outbound {
             bytes: vec![1],
             units: vec![witness],
+            output: None,
         })
         .await?;
     let task = tokio::spawn(write_datagrams(
@@ -298,6 +300,7 @@ async fn failed_actual_send_never_publishes_native_first_flight() -> TestResult 
         .send(Outbound {
             bytes: vec![1],
             units: vec![unit(identity(0, 0), 0, 1)],
+            output: None,
         })
         .await?;
     let result = write_datagrams(
@@ -316,5 +319,347 @@ async fn failed_actual_send_never_publishes_native_first_flight() -> TestResult 
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(rx.try_recv().is_err());
+    Ok(())
+}
+
+fn physical_config(
+    duplex: Duplex,
+    queue_packets: usize,
+) -> Result<(Config, DatagramPolicy), Box<dyn std::error::Error>> {
+    let runtime = RuntimeConfig {
+        layer: PacketLayer::Ip,
+        max_packet: 1500,
+        compression: Compression::None,
+        queue_packets,
+        poll_interval: Duration::from_millis(1),
+    };
+    let transport = udp::Config::new(
+        duplex,
+        l2tunnel_datagram::CoverProfile::QuicLike,
+        l2tunnel_datagram::Protection::ChaCha20Poly1305,
+        576,
+        false,
+    )?
+    .with_recovery(udp::RecoveryMode::Cauchy {
+        sources: 3,
+        repairs: 2,
+        flush_after: Duration::from_millis(2),
+    })?;
+    let delivery = crate::managed::DeliveryConfig {
+        forward: policy(),
+        reverse: policy(),
+    };
+    Ok((
+        Config::for_udp(runtime, transport, 1, delivery)?,
+        transport.policy()?,
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn actual_peer_ack_waits_for_its_source_send_callback_without_blocking_native_receipts()
+-> TestResult {
+    let (config, wire_policy) = physical_config(Duplex::Full, 2)?;
+    let context = RecoveryContext {
+        session: 42,
+        epoch: 1,
+        role: EndpointRole::Initiator,
+    };
+    let mut endpoint = Selection::Aligned(config).endpoint(context)?;
+    let mut peer = Selection::Aligned(config).endpoint(RecoveryContext {
+        role: EndpointRole::Responder,
+        ..context
+    })?;
+    let origin = Instant::now();
+    endpoint.enqueue_identified(protocol::ChannelId(0), &[0x45; 40], Duration::ZERO)?;
+    let mut bytes = vec![0; wire_policy.payload_bytes];
+    let mut allowance = l2tunnel_reliable::OutboundBudget {
+        packets: 1,
+        wire_bytes: 65_535,
+    };
+    // The first real poll collects the partial FEC block; it is eligible only
+    // after that block's original configured flush, not at initial admission.
+    assert!(
+        endpoint
+            .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+            .is_none()
+    );
+    tokio::time::advance(config.protocol.recovery.flush_after).await;
+    let length = endpoint
+        .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+        .ok_or("actual source after original flush")?;
+    let output = endpoint.pending_output().ok_or("actual output token")?;
+    assert!(matches!(
+        output.kind,
+        l2tunnel_reliable::RecordKind::Source | l2tunnel_reliable::RecordKind::Systematic
+    ));
+    let (packets, input) = mpsc::channel(1);
+    let (events, mut sent) = mpsc::channel(1);
+    packets
+        .send(Outbound {
+            bytes: bytes[..length].to_vec(),
+            units: vec![],
+            output: Some(output),
+        })
+        .await?;
+    let task = tokio::spawn(write_datagrams(
+        Sender {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail: false,
+        },
+        input,
+        0,
+        events,
+    ));
+    // The actual carrier accepted this source, but its callback has not yet
+    // reached the actor. A genuine peer can already send its recovery receipt.
+    tokio::task::yield_now().await;
+    peer.receive_authenticated(&bytes[..length], origin.elapsed())?;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let now = origin.elapsed();
+    let mut allowance = l2tunnel_reliable::OutboundBudget {
+        packets: 1,
+        wire_bytes: 65_535,
+    };
+    let length = peer
+        .poll_feedback(now, &mut bytes, &mut allowance)?
+        .ok_or("actual peer ACK")?;
+    let event = udp::NativeControlEvent::Ack(bytes[..length].to_vec());
+    let (feedback, _changes) = watch::channel(Feedback::default());
+    let (native_feedback, _native) = mpsc::channel(1);
+    let mut state = State {
+        endpoint,
+        outbound: None,
+        feedback,
+        native_feedback,
+        receives: false,
+        flight: None,
+        incoming: policy(),
+        next_channel: 0,
+        feedback_first: true,
+    };
+    let before = state.endpoint.status().recovery.arq.send_records;
+    assert!(state.waits_for_source_send(&event));
+    assert!(
+        !state.waits_for_source_send(&udp::NativeControlEvent::Delivered {
+            channel: 0,
+            record: 0
+        })
+    );
+    let completion = sent.try_recv()?;
+    assert_eq!(completion.output, Some(output));
+    assert_eq!(
+        completion.at.duration_since(origin),
+        config.protocol.recovery.flush_after
+    );
+    state.sent(completion, origin, now)?;
+    assert!(!state.waits_for_source_send(&event));
+    state.control(event, now, now)?;
+    assert_eq!(
+        state.endpoint.status().recovery.arq.send_records,
+        before - 1
+    );
+    assert_eq!(state.endpoint.status().failure, None);
+    task.abort();
+    let _ = task.await;
+    Ok(())
+}
+
+struct BlockedSender(std::sync::Arc<tokio::sync::Notify>);
+impl DatagramSend for BlockedSender {
+    const BOUNDARY: crate::datagram::SendBoundary =
+        crate::datagram::SendBoundary::OsDatagramAccepted;
+    async fn send(&mut self, _bytes: &[u8]) -> io::Result<crate::datagram::DatagramSent> {
+        self.0.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn half_queue_one_blocked_source_cannot_reserve_feedback_and_heartbeat_completion()
+-> TestResult {
+    blocked_source_control(Duplex::Half).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_queue_one_same_endpoint_feedback_flushes_while_actual_data_send_is_blocked()
+-> TestResult {
+    blocked_source_control(Duplex::Full).await
+}
+
+async fn blocked_source_control(duplex: Duplex) -> TestResult {
+    use tokio::io::AsyncReadExt;
+    let (config, mut wire_policy) = physical_config(duplex, 1)?;
+    wire_policy.control_magic = *b"L2A2";
+    let origin = Instant::now();
+    let context = RecoveryContext {
+        session: 42,
+        epoch: 1,
+        role: EndpointRole::Initiator,
+    };
+    let mut sending = Selection::Aligned(config).endpoint(context)?;
+    let incoming_session = if duplex == Duplex::Full { 42 } else { 43 };
+    let mut receiving = if duplex == Duplex::Half {
+        Some(Selection::Aligned(config).endpoint(RecoveryContext {
+            session: incoming_session,
+            ..context
+        })?)
+    } else {
+        None
+    };
+    let mut remote = Selection::Aligned(config).endpoint(RecoveryContext {
+        session: incoming_session,
+        role: EndpointRole::Responder,
+        ..context
+    })?;
+    let mut bytes = vec![0; wire_policy.payload_bytes];
+    let mut allowance = l2tunnel_reliable::OutboundBudget {
+        packets: 1,
+        wire_bytes: 65_535,
+    };
+    sending.enqueue_identified(protocol::ChannelId(0), &[0x45; 40], origin.elapsed())?;
+    assert!(
+        sending
+            .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+            .is_none()
+    );
+    tokio::time::advance(config.protocol.recovery.flush_after).await;
+    let length = sending
+        .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+        .ok_or("blocked source")?;
+    let source = sending.pending_output().ok_or("blocked source token")?;
+    let capacity = completion_capacity(if duplex == Duplex::Full { 1 } else { 2 }, duplex, true)?;
+    assert_eq!(capacity, if duplex == Duplex::Full { 2 } else { 3 });
+    let (events, mut completions) = mpsc::channel(capacity);
+    let (packets, input) = mpsc::channel(1);
+    packets
+        .send(Outbound {
+            bytes: bytes[..length].to_vec(),
+            units: vec![],
+            output: Some(source),
+        })
+        .await?;
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let data_task = tokio::spawn(write_datagrams(
+        BlockedSender(entered.clone()),
+        input,
+        0,
+        events.clone(),
+    ));
+    timeout(wire_policy.control_timeout, entered.notified()).await?;
+    assert_eq!(
+        events.capacity(),
+        capacity - 1,
+        "actual blocked data owns one permit"
+    );
+
+    // Full duplex uses the SAME real endpoint; half duplex uses its opposite
+    // receive lane. Both must ACK actual ingress while data remains blocked.
+    remote.enqueue_identified(protocol::ChannelId(0), &[0x46; 40], origin.elapsed())?;
+    let mut allowance = l2tunnel_reliable::OutboundBudget {
+        packets: 1,
+        wire_bytes: 65_535,
+    };
+    assert!(
+        remote
+            .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+            .is_none()
+    );
+    tokio::time::advance(config.protocol.recovery.flush_after).await;
+    let length = remote
+        .poll_data(origin.elapsed(), &mut bytes, &mut allowance)?
+        .ok_or("incoming source")?;
+    let incoming = remote.pending_output().ok_or("incoming source token")?;
+    remote.confirm_output_at(origin.elapsed(), origin.elapsed(), incoming)?;
+    let receiving = receiving.as_mut().unwrap_or(&mut sending);
+    receiving.receive_authenticated(&bytes[..length], origin.elapsed())?;
+    tokio::time::advance(config.protocol.recovery.arq.ack_delay).await;
+    let mut allowance = l2tunnel_reliable::OutboundBudget {
+        packets: 1,
+        wire_bytes: 65_535,
+    };
+    if duplex == Duplex::Full {
+        let before = allowance;
+        assert!(
+            receiving
+                .poll_feedback(origin.elapsed(), &mut bytes, &mut allowance)?
+                .is_none(),
+            "legacy single-slot polling exposes the real full-duplex coupling"
+        );
+        assert_eq!(allowance, before);
+    }
+    let length = receiving
+        .poll_feedback_independent(origin.elapsed(), &mut bytes, &mut allowance)?
+        .ok_or("independent feedback")?;
+    let feedback = receiving
+        .pending_feedback_output()
+        .ok_or("independent feedback token")?;
+    assert_eq!(
+        receiving.pending_data_output(),
+        if duplex == Duplex::Full {
+            Some(source)
+        } else {
+            None
+        }
+    );
+    let ack = bytes[..length].to_vec();
+    let (changes, receiver) = watch::channel(Feedback {
+        ack: Some(FeedbackOutput {
+            bytes: ack.clone(),
+            output: feedback,
+        }),
+    });
+    let (_native, native) = mpsc::channel(1);
+    let (writer, mut reader) = tokio::io::duplex(256);
+    let lane = usize::from(duplex == Duplex::Half);
+    let control_task = tokio::spawn(write_control(
+        writer,
+        receiver,
+        native,
+        wire_policy,
+        udp::SharedBudget::from_policy(wire_policy, origin),
+        lane,
+        events.clone(),
+    ));
+    timeout(wire_policy.control_timeout, async {
+        let mut header = [0; 8];
+        reader.read_exact(&mut header).await?;
+        assert_eq!(&header[..6], b"L2A2\x01\x02");
+        assert_eq!(
+            usize::from(u16::from_be_bytes([header[6], header[7]])),
+            ack.len()
+        );
+        let mut actual = vec![0; ack.len()];
+        reader.read_exact(&mut actual).await?;
+        assert_eq!(actual, ack);
+        reader.read_exact(&mut header).await?;
+        assert_eq!(&header, b"L2A2\x01\x01\0\0");
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    let completed = completions.try_recv()?;
+    assert_eq!(completed.lane, lane);
+    assert_eq!(completed.output, Some(feedback));
+    assert!(completed.units.is_empty());
+    receiving.confirm_output_at(origin.elapsed(), since(origin, completed.at)?, feedback)?;
+    assert_eq!(receiving.pending_feedback_output(), None);
+    assert_eq!(
+        receiving.pending_output(),
+        if duplex == Duplex::Full {
+            Some(source)
+        } else {
+            None
+        }
+    );
+    assert_eq!(sending.pending_output(), Some(source));
+    assert!(
+        completions.try_recv().is_err(),
+        "blocked data has no physical receipt"
+    );
+    assert!(!data_task.is_finished());
+    drop(changes);
+    data_task.abort();
+    control_task.abort();
+    let _ = data_task.await;
+    let _ = control_task.await;
     Ok(())
 }

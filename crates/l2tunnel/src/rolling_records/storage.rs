@@ -23,6 +23,7 @@ pub struct Usage {
 #[derive(Clone, Copy)]
 pub struct Plan {
     config: Config,
+    copies: CopyPolicies,
     context: Context,
     stream: u32,
     now: Tick,
@@ -42,8 +43,18 @@ impl Plan {
         stream: u32,
         now: Tick,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        config.binding_digest(stream)?;
+        Self::for_endpoint_with_copies(config, context, stream, now, CopyPolicies::ONE)
+    }
+    /// Plan the same actual heap owners with exact selected directional policies.
+    pub fn for_endpoint_with_copies(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        copies: CopyPolicies,
+    ) -> Result<Self, Error> {
+        copies.validate(config)?;
+        copies.binding_digest(config, stream)?;
         if context.session == 0 || context.epoch == 0 {
             return Err(Error::Configuration);
         }
@@ -68,10 +79,8 @@ impl Plan {
             rolling::storage::Plan::for_sender(send.scheduler).map_err(Error::RollingStorage)?;
         let incoming = rolling::storage::Plan::for_receiver(receive.scheduler)
             .map_err(Error::RollingStorage)?;
-        let packing = codec::aligned_storage::PackedSenderPlan::for_config(send.packing)
-            .map_err(Error::Storage)?;
-        let receiver = codec::aligned_storage::ReceiverPlan::for_limits(receive.receiver)
-            .map_err(Error::Storage)?;
+        let packing = send.packing_plan()?;
+        let receiver = receive.receiver_plan()?;
         let source_bytes = send
             .packing
             .envelope()
@@ -100,6 +109,7 @@ impl Plan {
         })?;
         Ok(Self {
             config,
+            copies,
             context,
             stream,
             now,
@@ -115,6 +125,10 @@ impl Plan {
     /// Both complete globally ordered policies, unchanged.
     pub const fn config(&self) -> Config {
         self.config
+    }
+    /// Exact complete global policies retained for actual construction.
+    pub const fn source_copy_policies(&self) -> CopyPolicies {
+        self.copies
     }
     /// Exact context used by the actual selected owner.
     pub const fn context(&self) -> Context {
@@ -136,14 +150,27 @@ impl Plan {
 impl Endpoint {
     /// Construct the same actual owners only after complete heap admission.
     pub fn new_reserved(plan: Plan, limits: Limits) -> Result<Self, Error> {
+        if plan.copies != CopyPolicies::ONE {
+            return Err(Error::Configuration);
+        }
+        Self::new_reserved_with_copies(plan, limits)
+    }
+    /// Construct selected copy policies from their exact admitted complete plan.
+    pub fn new_reserved_with_copies(plan: Plan, limits: Limits) -> Result<Self, Error> {
         if plan.capacity_bytes > limits.capacity_bytes {
             return Err(Error::Capacity {
                 required: plan.capacity_bytes,
                 limit: limits.capacity_bytes,
             });
         }
-        let mut endpoint =
-            Self::construct(plan.config, plan.context, plan.stream, plan.now, Some(plan))?;
+        let mut endpoint = Self::construct(
+            plan.config,
+            plan.context,
+            plan.stream,
+            plan.now,
+            Some(plan),
+            plan.copies,
+        )?;
         let packing = endpoint
             .packing
             .storage_usage()

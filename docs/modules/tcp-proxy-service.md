@@ -121,10 +121,37 @@ Complete TCP advertised-window, Common record-family composition, all modes,
 full SW-11, platform/native/resource/performance and retained-session recovery
 requirements remain unchanged. This additive service backend does not close them.
 
-- [ ] [TPS-06] Move actual fixed/measured production CLI dispatch and external local commands onto this same shared Prepared/Run/Handle, removing the private production lifecycle after its meaningful coverage is migrated. Current typed shared-service tests do not close this CLI integration gate.
+- [x] [TPS-06] Move actual fixed/measured production CLI dispatch and external local commands onto this same shared Prepared/Run/Handle, removing the private production lifecycle after its meaningful coverage is migrated. Current typed shared-service tests do not close this CLI integration gate. Evidence: [Batch9 finite checks and preserved failures](../../work/parallel-features-20261115/parallel-batch9-scoped-validation.json).
 
 The scoped batch preserves its initial failures. Expired proxy stop now requests
 cleanup and checks the original cap before polling release; actual late joins
 remain with the same retained Active. One existing secure-UDP cancellation case
 initially timed out; its exact diagnostic retry passed twice, without a proven
 root cause or increased timeout. No new full-suite or native pass is inferred.
+
+### Finite production CLI migration evidence
+
+TPS-06 implementation now routes fixed and measured production connect/serve
+through the same Prepared/Run/Handle, with deferred original device attachment
+and the maintained SNI-aware TLS reader. Thirteen focused CLI cases pass,
+including the actual presentation adapter and Unix local lifecycle. Local v1 status, drain, abnormal disconnect and explicit fresh
+reconnect use the shared owner; exact runtime phase remains the v1 projection,
+while the typed Snapshot retains its separate service phase.
+
+The original native readiness sentence is emitted only after actual Connected
+and matching Forwarding/profile/digest facts. A terminal grace can exit only
+after actual released/not-releasing observation, with no queued/pending operation
+or live replacement setup. Read-only close-report lookup uses the existing
+bounded 32-generation terminal ledger with inline report data; it retains no
+backend, control sender or cancellation owner. Uncontrolled owner drop supplies
+no successful close report. The superseded private lifecycle adapter is retained
+only for historical transport tests.
+
+Executed focused cases use the actual production presentation adapter, genuine
+TLS/member factories, packet devices and Unix local sockets for both profiles,
+including bytes, exact v1 phase, drain/terminal, fresh reconnect, and pending
+setup surviving expired local observation grace. A separate actual pair checks
+that the first close-body read after replacement still returns the original
+report. These are actual adapter/TLS/packet-device/Unix-local cases, not external
+production TUN startup. No platform, complete resource, Python-parity or
+performance qualification follows. See [Batch9 finite checks and preserved failures](../../work/parallel-features-20261115/parallel-batch9-scoped-validation.json).

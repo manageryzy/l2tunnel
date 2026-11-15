@@ -411,3 +411,6 @@ async fn dropping_live_proxy_service_never_claims_joined_release_or_clean_close(
         result = pair.brun.as_mut() => Err(format!("peer service stopped: {result:?}").into()),
     }
 }
+
+#[cfg(target_os = "linux")]
+mod cli;

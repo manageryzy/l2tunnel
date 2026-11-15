@@ -17,12 +17,13 @@ pub(crate) struct ReceiveSlot {
 pub(super) enum Sent {
     Legacy(BTreeMap<SourceId, Flight>),
     Reserved(Vec<SendSlot>),
+    Indexed(Vec<SendSlot>),
 }
 impl Sent {
     pub(super) fn iter(&self) -> impl Iterator<Item = (&SourceId, &Flight)> {
         let (map, slots) = match self {
             Self::Legacy(map) => (Some(map), None),
-            Self::Reserved(slots) => (None, Some(slots)),
+            Self::Reserved(slots) | Self::Indexed(slots) => (None, Some(slots)),
         };
         map.into_iter().flat_map(|map| map.iter()).chain(
             slots
@@ -44,12 +45,21 @@ impl Sent {
         self.iter().min_by_key(|(source, _)| **source)
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Flight> {
+        if let Self::Indexed(slots) = self {
+            let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
+            return (slot.source.as_ref() == Some(source)).then_some(&slot.flight);
+        }
         self.iter()
             .find_map(|(id, flight)| (id == source).then_some(flight))
     }
     pub(super) fn get_mut(&mut self, source: &SourceId) -> Option<&mut Flight> {
         match self {
             Self::Legacy(map) => map.get_mut(source),
+            Self::Indexed(slots) => {
+                let index = (source.0 % slots.len() as u64) as usize;
+                let slot = slots.get_mut(index)?;
+                (slot.source.as_ref() == Some(source)).then_some(&mut slot.flight)
+            }
             Self::Reserved(slots) => slots
                 .iter_mut()
                 .find(|slot| slot.source.as_ref() == Some(source))
@@ -62,6 +72,7 @@ impl Sent {
         payload: &[u8],
         rto: Duration,
     ) -> Result<(), RecoveryError> {
+        let indexed = matches!(self, Self::Indexed(_));
         match self {
             Self::Legacy(map) => {
                 map.insert(
@@ -77,13 +88,18 @@ impl Sent {
                     },
                 );
             }
-            Self::Reserved(slots) => {
-                let slot = slots
-                    .iter_mut()
-                    .find(|slot| {
+            Self::Reserved(slots) | Self::Indexed(slots) => {
+                let index = (source.0 % slots.len() as u64) as usize;
+                let slot = if indexed {
+                    slots.get_mut(index).filter(|slot| {
                         slot.source.is_none() && slot.flight.payload.capacity() >= payload.len()
                     })
-                    .ok_or(RecoveryError::Capacity(BufferSide::Send))?;
+                } else {
+                    slots.iter_mut().find(|slot| {
+                        slot.source.is_none() && slot.flight.payload.capacity() >= payload.len()
+                    })
+                }
+                .ok_or(RecoveryError::Capacity(BufferSide::Send))?;
                 slot.flight.payload.clear();
                 slot.flight.payload.extend_from_slice(payload);
                 slot.flight.prepared_at = Duration::ZERO;
@@ -98,15 +114,23 @@ impl Sent {
         Ok(())
     }
     pub(super) fn remove(&mut self, source: &SourceId) {
+        let indexed = matches!(self, Self::Indexed(_));
         match self {
             Self::Legacy(map) => {
                 map.remove(source);
             }
-            Self::Reserved(slots) => {
-                if let Some(slot) = slots
-                    .iter_mut()
-                    .find(|slot| slot.source.as_ref() == Some(source))
-                {
+            Self::Reserved(slots) | Self::Indexed(slots) => {
+                let index = (source.0 % slots.len() as u64) as usize;
+                let selected = if indexed {
+                    slots
+                        .get_mut(index)
+                        .filter(|slot| slot.source.as_ref() == Some(source))
+                } else {
+                    slots
+                        .iter_mut()
+                        .find(|slot| slot.source.as_ref() == Some(source))
+                };
+                if let Some(slot) = selected {
                     slot.source = None;
                     slot.flight.payload.clear();
                     slot.flight.attempts = 0;
@@ -118,7 +142,7 @@ impl Sent {
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&SourceId, &mut Flight) -> bool) {
         match self {
             Self::Legacy(map) => map.retain(|source, flight| keep(source, flight)),
-            Self::Reserved(slots) => {
+            Self::Reserved(slots) | Self::Indexed(slots) => {
                 for slot in slots {
                     if slot
                         .source
@@ -140,12 +164,13 @@ impl Sent {
 pub(super) enum Received {
     Legacy(BTreeMap<SourceId, Vec<u8>>),
     Reserved(Vec<ReceiveSlot>),
+    Indexed(Vec<ReceiveSlot>),
 }
 impl Received {
     pub(super) fn iter(&self) -> impl Iterator<Item = (&SourceId, &Vec<u8>)> {
         let (map, slots) = match self {
             Self::Legacy(map) => (Some(map), None),
-            Self::Reserved(slots) => (None, Some(slots)),
+            Self::Reserved(slots) | Self::Indexed(slots) => (None, Some(slots)),
         };
         map.into_iter().flat_map(|map| map.iter()).chain(
             slots
@@ -167,6 +192,10 @@ impl Received {
         self.get(source).is_some()
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Vec<u8>> {
+        if let Self::Indexed(slots) = self {
+            let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
+            return (slot.source.as_ref() == Some(source)).then_some(&slot.payload);
+        }
         self.iter()
             .find_map(|(id, payload)| (id == source).then_some(payload))
     }
@@ -175,15 +204,23 @@ impl Received {
         source: SourceId,
         payload: &[u8],
     ) -> Result<(), RecoveryError> {
+        let indexed = matches!(self, Self::Indexed(_));
         match self {
             Self::Legacy(map) => {
                 map.insert(source, payload.to_vec());
             }
-            Self::Reserved(slots) => {
-                let slot = slots
-                    .iter_mut()
-                    .find(|slot| slot.source.is_none() && slot.payload.capacity() >= payload.len())
-                    .ok_or(RecoveryError::Capacity(BufferSide::Receive))?;
+            Self::Reserved(slots) | Self::Indexed(slots) => {
+                let index = (source.0 % slots.len() as u64) as usize;
+                let slot = if indexed {
+                    slots.get_mut(index).filter(|slot| {
+                        slot.source.is_none() && slot.payload.capacity() >= payload.len()
+                    })
+                } else {
+                    slots.iter_mut().find(|slot| {
+                        slot.source.is_none() && slot.payload.capacity() >= payload.len()
+                    })
+                }
+                .ok_or(RecoveryError::Capacity(BufferSide::Receive))?;
                 slot.payload.clear();
                 slot.payload.extend_from_slice(payload);
                 slot.source = Some(source);
@@ -192,15 +229,23 @@ impl Received {
         Ok(())
     }
     pub(super) fn remove(&mut self, source: &SourceId) {
+        let indexed = matches!(self, Self::Indexed(_));
         match self {
             Self::Legacy(map) => {
                 map.remove(source);
             }
-            Self::Reserved(slots) => {
-                if let Some(slot) = slots
-                    .iter_mut()
-                    .find(|slot| slot.source.as_ref() == Some(source))
-                {
+            Self::Reserved(slots) | Self::Indexed(slots) => {
+                let index = (source.0 % slots.len() as u64) as usize;
+                let selected = if indexed {
+                    slots
+                        .get_mut(index)
+                        .filter(|slot| slot.source.as_ref() == Some(source))
+                } else {
+                    slots
+                        .iter_mut()
+                        .find(|slot| slot.source.as_ref() == Some(source))
+                };
+                if let Some(slot) = selected {
                     slot.source = None;
                     slot.payload.clear();
                 }

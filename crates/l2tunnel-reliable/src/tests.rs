@@ -1,4 +1,6 @@
 use super::*;
+#[path = "feedback_custody_tests.rs"]
+mod feedback_custody;
 #[path = "physical_tests.rs"]
 mod physical;
 

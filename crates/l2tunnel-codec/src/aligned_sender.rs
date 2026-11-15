@@ -28,8 +28,8 @@ impl Config {
         }
         let count = usize::from(self.channels);
         let total = (count + 2) * (self.body.max_frame_bytes + 29)
-            + (count + 1) * size_of::<Encoder>()
-            + count * size_of::<Channel>()
+            + (count + 1) * Encoder::legacy_inline_bytes()
+            + count * size_of::<LegacyChannel>()
             + self.body.symbol_bytes
             + size_of::<LegacyLayout>();
         if total > 32 * 1024 * 1024 {
@@ -72,6 +72,11 @@ impl From<aligned_envelope::Error> for Error {
         Self::Envelope(value)
     }
 }
+#[allow(dead_code)]
+struct LegacyChannel {
+    encoder: [u8; Encoder::legacy_inline_bytes()],
+    next: Option<RecordId>,
+}
 struct Channel {
     encoder: Encoder,
     next: Option<RecordId>,
@@ -92,7 +97,7 @@ pub(crate) struct LegacyLayout {
     config: Config,
     scope: Scope,
     channels: Vec<Channel>,
-    staged: Encoder,
+    staged: [u8; Encoder::legacy_inline_bytes()],
     bodies: Vec<u8>,
     symbol: Vec<u8>,
     pending: Option<Pending>,
@@ -139,13 +144,33 @@ impl Sender {
         config: Config,
         limits: crate::aligned_storage::Limits,
     ) -> Result<Self, crate::aligned_storage::Error> {
-        let plan = crate::aligned_storage::SenderPlan::for_config(config)?;
+        Self::new_reserved_mode(scope, config, limits, false)
+    }
+    /// Reserve the actual native-IP header state and the same channel/source owners.
+    pub fn new_reserved_ip(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        Self::new_reserved_mode(scope, config, limits, true)
+    }
+    fn new_reserved_mode(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+        ip: bool,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let plan = if ip {
+            crate::aligned_storage::SenderPlan::for_ip_config(config)?
+        } else {
+            crate::aligned_storage::SenderPlan::for_config(config)?
+        };
         if scope.session == [0; 16] {
             return Err(crate::aligned_storage::Error::Sender(Error::Configuration));
         }
         let mut allocation =
             crate::aligned_storage::Allocation::new(plan.capacity_bytes(), limits)?;
-        let mut result = Self::new_in(scope, config, &mut allocation)?;
+        let mut result = Self::new_in_mode(scope, config, &mut allocation, ip)?;
         result.usage = Some(allocation.finish(plan.capacity_bytes())?);
         Ok(result)
     }
@@ -153,15 +178,24 @@ impl Sender {
     pub fn storage_usage(&self) -> Option<crate::aligned_storage::Usage> {
         self.usage
     }
+    #[cfg(test)]
     pub(crate) fn new_in(
         scope: Scope,
         config: Config,
         allocation: &mut crate::aligned_storage::Allocation,
     ) -> Result<Self, crate::aligned_storage::Error> {
+        Self::new_in_mode(scope, config, allocation, false)
+    }
+    pub(crate) fn new_in_mode(
+        scope: Scope,
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+        ip: bool,
+    ) -> Result<Self, crate::aligned_storage::Error> {
         let mut channels = allocation.vec(usize::from(config.channels))?;
         for _ in 0..config.channels {
             channels.push(Channel {
-                encoder: Encoder::new_in(config.body, allocation)?,
+                encoder: Encoder::new_in_mode(config.body, allocation, ip)?,
                 next: Some(config.first_record),
             });
         }
@@ -169,7 +203,7 @@ impl Sender {
             config,
             scope,
             channels,
-            staged: Encoder::new_in(config.body, allocation)?,
+            staged: Encoder::new_in_mode(config.body, allocation, ip)?,
             bodies: allocation.bytes(config.body.max_frame_bytes + 29)?,
             symbol: allocation.bytes(config.body.symbol_bytes)?,
             pending: None,
@@ -178,6 +212,13 @@ impl Sender {
     }
     /// Validate and allocate a context per channel plus one transactional stage.
     pub fn new(scope: Scope, config: Config) -> Result<Self, Error> {
+        Self::new_mode(scope, config, false)
+    }
+    /// Select native IPv4/IPv6 TCP compression without a synthetic Ethernet frame.
+    pub fn new_ip(scope: Scope, config: Config) -> Result<Self, Error> {
+        Self::new_mode(scope, config, true)
+    }
+    fn new_mode(scope: Scope, config: Config, ip: bool) -> Result<Self, Error> {
         config.memory_bound_bytes()?;
         if scope.session == [0; 16] {
             return Err(Error::Configuration);
@@ -185,7 +226,11 @@ impl Sender {
         let mut channels = Vec::with_capacity(usize::from(config.channels));
         for _ in 0..config.channels {
             channels.push(Channel {
-                encoder: Encoder::new(config.body)?,
+                encoder: if ip {
+                    Encoder::new_ip(config.body)?
+                } else {
+                    Encoder::new(config.body)?
+                },
                 next: Some(config.first_record),
             });
         }
@@ -193,7 +238,11 @@ impl Sender {
             config,
             scope,
             channels,
-            staged: Encoder::new(config.body)?,
+            staged: if ip {
+                Encoder::new_ip(config.body)?
+            } else {
+                Encoder::new(config.body)?
+            },
             bodies: vec![0; config.body.max_frame_bytes + 29],
             symbol: vec![0; config.body.symbol_bytes],
             pending: None,

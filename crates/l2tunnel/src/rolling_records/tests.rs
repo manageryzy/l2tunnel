@@ -545,3 +545,6 @@ fn actual_reserved_pipeline_handoff_retains_busy_head_and_original_native_expiry
     assert_eq!(pipeline.storage_usage(), usage);
     Ok(())
 }
+
+#[path = "copy_tests.rs"]
+mod copies;

@@ -66,15 +66,27 @@ fn ping(driver: &mut Driver) -> Result<Vec<u8>> {
     Ok(wire)
 }
 
+#[inline(never)]
+fn fixture_driver(
+    parts: member::Parts,
+    config: Config,
+    origin: Instant,
+) -> Result<(tokio::net::UdpSocket, owner::StateCell<Driver>)> {
+    let (socket, driver) = Driver::new(parts, security::ConfigDigest([3; 32]), config, origin)?;
+    // Keep the real owner once without embedding inline Driver construction
+    // temporaries in the fixture's later borrowed production-loop future.
+    Ok((socket, owner::StateCell::new(driver)?))
+}
+
 async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Result {
     let config = fairness_config(kind);
     let (local, other) = parts_pair(kind).await?;
+    let setup_deadline = local.deadline;
     for socket in [&local.socket, &other.socket] {
         empty_setup(socket)?;
     }
     let origin = Instant::now();
-    let (remote_socket, mut remote) =
-        Driver::new(other, security::ConfigDigest([3; 32]), config, origin)?;
+    let (remote_socket, mut remote) = fixture_driver(other, config, origin)?;
     remote_socket.writable().await?;
     let mut frames = vec![ping(&mut remote)?];
     for number in 0..SOURCES {
@@ -101,8 +113,20 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
         .ok_or_else(exhausted)?;
     let samples = Arc::new(AtomicU64::new(0));
     let counted = samples.clone();
+    let sample = move || {
+        let step = counted.fetch_add(1, Ordering::SeqCst);
+        if step >= MAX_SAMPLES {
+            return expired;
+        }
+        base.checked_add(duration(step * SAMPLE_MICROS))
+            .unwrap_or(expired)
+    };
+    // Match run_selected_clock's original first origin sample, then retain the
+    // real local Driver in one fallible cell before polling the shared loop.
+    // This also keeps later Driver construction out of earlier auth poll frames.
+    let (local_socket, mut local) = fixture_driver(local, config, sample())?;
     let producer = async {
-        start.await?;
+        start.await.map_err(io::Error::other)?;
         // The real loop has registered its descriptor and yielded with both
         // inputs empty. Queue both readiness causes in this one nonawaiting turn.
         if native_input {
@@ -111,23 +135,24 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
         for frame in &frames {
             assert_eq!(remote_socket.try_send(frame)?, frame.len());
         }
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        Ok::<(), io::Error>(())
     };
-    let runtime = run_clock(
+    let runtime = run_driver_clock(
         Device {
             socket,
             blocked,
             wouldblock: None,
         },
-        local,
-        security::ConfigDigest([3; 32]),
-        config,
-        None,
-        resolve(config),
+        local_socket.into(),
+        &mut local,
+        setup_deadline,
+        Requests::Legacy(None),
+        Some(resolve(config)),
         async {
             let _ = cancelled.await;
         },
-        move |snapshot| {
+        move |driver, now, running| {
+            let snapshot = driver.snapshot(now, running)?;
             if snapshot.running
                 && let Some(started) = started.take()
             {
@@ -143,23 +168,17 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
                     let _ = cancel.send(());
                 }
             }
+            Ok(())
         },
-        move || {
-            let step = counted.fetch_add(1, Ordering::SeqCst);
-            if step >= MAX_SAMPLES {
-                return expired;
-            }
-            base.checked_add(duration(step * SAMPLE_MICROS))
-                .unwrap_or(expired)
-        },
+        sample,
     );
     let (stopped, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-        tokio::try_join!(
-            async { Ok::<_, Box<dyn std::error::Error + Send + Sync>>(runtime.await?) },
-            producer
-        )
+        tokio::try_join!(runtime, producer)
     })
     .await??;
+    let SelectedStopped::Legacy(stopped) = stopped else {
+        return Err("fairness loop returned a different selected backend".into());
+    };
     assert_eq!(stopped.reason, StopReason::Cancelled);
     assert!(!stopped.snapshot.running);
     assert!(samples.load(Ordering::SeqCst) < MAX_SAMPLES);
@@ -227,10 +246,11 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
     for offset in 0..responses {
         let length =
             tokio::time::timeout_at(response_deadline, remote_socket.recv(&mut received)).await??;
+        let received_at = remote.origin + duration(REMOTE_TIME + 100_000 + offset);
         remote.receive(
             &received[..length],
             REMOTE_TIME + 100_000 + offset,
-            remote.origin + duration(REMOTE_TIME + 100_000 + offset),
+            received_at,
             &resolve(config),
         )?;
     }

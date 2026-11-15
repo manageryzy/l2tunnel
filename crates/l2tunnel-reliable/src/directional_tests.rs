@@ -66,7 +66,7 @@ fn packets(endpoint: &mut Reliable, now: Duration) -> Result<Vec<Vec<u8>>, Error
 fn delivered(endpoint: &mut Reliable) -> Result<Vec<Vec<u8>>, Error> {
     let mut result = Vec::new();
     for _ in 0..16 {
-        let mut bytes = vec![0; endpoint.receive_config.arq.max_source_bytes];
+        let mut bytes = vec![0; endpoint.legacy_receive()?.arq.max_source_bytes];
         let Some((id, n)) = endpoint.poll_delivered(&mut bytes)? else {
             break;
         };
@@ -114,7 +114,7 @@ fn asymmetric_cauchy_restores_real_sources_before_rto_and_charges_local_egress()
         assert_eq!(
             sender.statistics().emitted_wire_bytes,
             sent.iter()
-                .map(|bytes| (bytes.len() + sender.config.outer_overhead_bytes) as u64)
+                .map(|bytes| (bytes.len() + sender.outer_overhead()) as u64)
                 .sum::<u64>()
         );
     }

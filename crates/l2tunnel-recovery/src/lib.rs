@@ -1,13 +1,17 @@
 //! Bounded real-payload selective repeat and explicit reliable-carrier forwarding.
-//! FEC, fast recovery and Python wire/behavior parity remain separate work.
+//! Explicit CompactARQv2 adds adaptive feedback/fast recovery over the same owner.
+//! Complete Python behavioral/runtime parity and FEC composition remain separate work.
 use std::time::Duration;
 
 mod arq;
 pub mod storage;
 pub use arq::{
-    ACK_PACKET_BYTES, ArqConfig, BufferSide, CarrierOnly, DATA_HEADER_BYTES, EndpointRole,
-    PacketView, PhysicalTransmission, RecoveryContext, RecoveryError, Retained, SelectiveRepeat,
-    SourceId, Statistics, inspect_packet,
+    ACK_PACKET_BYTES, ArqConfig, BufferSide, COMPACT_DATA_HEADER_BYTES,
+    COMPACT_FEEDBACK_HEADER_BYTES, CarrierOnly, CompactArqConfig, CompactBounds, CompactFeedback,
+    CompactPacketView, CompactRecovery, CompactRepeat, CompactTiming, CompactTimingSnapshot,
+    DATA_HEADER_BYTES, EndpointRole, PacketView, PhysicalTransmission, RecoveryContext,
+    RecoveryError, Retained, SelectiveRepeat, SourceId, Statistics, inspect_compact_packet,
+    inspect_packet,
 };
 
 /// Incremental recovery uses injected monotonic time and bounded caller buffers.

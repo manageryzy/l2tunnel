@@ -15,6 +15,11 @@ mod proxy_frontend;
 pub(crate) use proxy_frontend::serve_for_test as serve_proxy_for_test;
 #[cfg(all(test, unix))]
 pub(crate) use proxy_frontend::serve_measured as serve_measured_for_test;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use proxy_frontend::{
+    ServiceEvent as ProxyServiceEvent, ServicePresentation as ProxyServicePresentation,
+    serve_shared_for_test as serve_shared_proxy_for_test,
+};
 #[path = "packed_cli.rs"]
 mod packed_frontend;
 #[path = "raw_packet/cli.rs"]

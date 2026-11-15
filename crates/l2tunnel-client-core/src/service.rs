@@ -651,6 +651,12 @@ struct Job {
     accepted: Accepted,
     command: Command,
 }
+struct TerminalRecord {
+    generation: OperationId,
+    terminal: Terminal,
+    // Inline bounded data only; no runtime/control/cancellation owner is retained.
+    proxy_close_report: Option<local::ProxyCloseReport>,
+}
 struct State {
     snapshot: Snapshot,
     backend: Option<ObservedBackend>,
@@ -659,7 +665,7 @@ struct State {
     /// Latest accepted setup plan, kept so a local lifecycle request can
     /// connect again without re-parsing credentials.
     plan: Option<Prepared>,
-    terminals: VecDeque<(OperationId, Terminal)>,
+    terminals: VecDeque<TerminalRecord>,
     last_key: u64,
     retired_through: u64,
 }
@@ -1099,32 +1105,53 @@ impl Handle {
             changed.changed().await.map_err(|_| SubmitError::Closed)?;
         }
     }
+    fn terminal_record(
+        state: &State,
+        generation: OperationId,
+    ) -> Result<Option<&TerminalRecord>, SubmitError> {
+        if let Some(record) = state
+            .terminals
+            .iter()
+            .find(|record| record.generation == generation)
+        {
+            return Ok(Some(record));
+        }
+        if state
+            .terminals
+            .front()
+            .is_some_and(|record| record.generation > generation)
+        {
+            return Err(SubmitError::Expired);
+        }
+        if state.snapshot.phase == Phase::Closed {
+            return Err(SubmitError::Closed);
+        }
+        if generation.0 > state.last_key {
+            return Err(SubmitError::FutureKey);
+        }
+        if state.snapshot.generation != Some(generation) {
+            return Err(SubmitError::State);
+        }
+        Ok(None)
+    }
+    /// Read an actual successful proxy drain report from the bounded terminal ledger.
+    /// Active or non-clean generations have no report. This retains no runtime owner.
+    /// Retired/unknown identities have the same errors as `wait_stopped`.
+    pub fn proxy_close_report(
+        &self,
+        generation: OperationId,
+    ) -> Result<Option<local::ProxyCloseReport>, SubmitError> {
+        Ok(Self::terminal_record(&self.0.lock(), generation)?
+            .and_then(|record| record.proxy_close_report.clone()))
+    }
     /// Wait for an actual retained generation to stop, independently of operation acceptance.
     pub async fn wait_stopped(&self, generation: OperationId) -> Result<Terminal, SubmitError> {
         let mut changed = self.subscribe();
         loop {
             {
                 let state = self.0.lock();
-                if let Some((_, terminal)) =
-                    state.terminals.iter().find(|(id, _)| *id == generation)
-                {
-                    return Ok(*terminal);
-                }
-                if state
-                    .terminals
-                    .front()
-                    .is_some_and(|(id, _)| *id > generation)
-                {
-                    return Err(SubmitError::Expired);
-                }
-                if state.snapshot.phase == Phase::Closed {
-                    return Err(SubmitError::Closed);
-                }
-                if generation.0 > state.last_key {
-                    return Err(SubmitError::FutureKey);
-                }
-                if state.snapshot.generation != Some(generation) {
-                    return Err(SubmitError::State);
+                if let Some(record) = Self::terminal_record(&state, generation)? {
+                    return Ok(record.terminal);
                 }
             }
             changed.changed().await.map_err(|_| SubmitError::Closed)?;
@@ -1653,7 +1680,10 @@ impl Drop for Completion {
             state.snapshot.runtime = backend.observe();
         }
         if let Some(generation) = state.snapshot.generation
-            && !state.terminals.iter().any(|(id, _)| *id == generation)
+            && !state
+                .terminals
+                .iter()
+                .any(|record| record.generation == generation)
         {
             // Evict before insertion: pushing into the full fixed-capacity deque
             // would grow its allocation even if the count were trimmed later.
@@ -1667,7 +1697,11 @@ impl Drop for Completion {
             } else {
                 Terminal::Aborted
             };
-            state.terminals.push_back((generation, terminal));
+            state.terminals.push_back(TerminalRecord {
+                generation,
+                terminal,
+                proxy_close_report: None,
+            });
         }
         for entry in &mut state.entries {
             if entry.result.is_none() {
@@ -1686,9 +1720,12 @@ impl Drop for Completion {
         // Keep an already observed runtime failure; dropping an idle service
         // must not rewrite its actual terminal outcome as a fresh local abort.
         if let Some(generation) = state.snapshot.generation
-            && let Some((_, terminal)) = state.terminals.iter().find(|(id, _)| *id == generation)
+            && let Some(record) = state
+                .terminals
+                .iter()
+                .find(|record| record.generation == generation)
         {
-            state.snapshot.terminal = Some(*terminal);
+            state.snapshot.terminal = Some(record.terminal);
         }
         if let Some(terminal) = state.snapshot.terminal
             && let Some(observation) = &mut state.snapshot.runtime

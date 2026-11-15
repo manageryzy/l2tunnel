@@ -223,6 +223,15 @@ pub enum Profile {
         /// Exact authenticated coding stream, independent of native record IDs.
         stream: u32,
     },
+    /// Explicit tag5 with complete physical-source copy selection.
+    RollingCopies {
+        /// Same actual directional recovery and codec owners.
+        config: rolling_records::Config,
+        /// Exact authenticated coding stream.
+        stream: u32,
+        /// Complete immutable directional source-copy policies.
+        copies: rolling_records::CopyPolicies,
+    },
 }
 /// Borrowed exact directional record policy; no engine or admission authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,7 +296,9 @@ impl DirectionProfile<'_> {
 fn native_layer(policy: aligned::NativePolicy) -> traffic::NetworkLayer {
     match policy {
         aligned::NativePolicy::EthernetHeaders => traffic::NetworkLayer::Tap,
-        aligned::NativePolicy::RawIp => traffic::NetworkLayer::Tun,
+        aligned::NativePolicy::RawIp | aligned::NativePolicy::IpHeaders => {
+            traffic::NetworkLayer::Tun
+        }
     }
 }
 /// Common policy and exact family reference for one globally identified sender.
@@ -389,20 +400,22 @@ impl Descriptor {
                 forward: a,
                 reverse: b,
             } => DirectionProfile::Packed(if forward { a } else { b }),
-            Profile::Rolling { config, stream } => DirectionProfile::Rolling {
-                config: if forward {
-                    &config.forward
-                } else {
-                    &config.reverse
-                },
-                overhead_bytes: if forward {
-                    config.geometry.forward_overhead_bytes
-                } else {
-                    config.geometry.reverse_overhead_bytes
-                },
-                native_stall_micros: config.native_stall_micros,
-                stream: *stream,
-            },
+            Profile::Rolling { config, stream } | Profile::RollingCopies { config, stream, .. } => {
+                DirectionProfile::Rolling {
+                    config: if forward {
+                        &config.forward
+                    } else {
+                        &config.reverse
+                    },
+                    overhead_bytes: if forward {
+                        config.geometry.forward_overhead_bytes
+                    } else {
+                        config.geometry.reverse_overhead_bytes
+                    },
+                    native_stall_micros: config.native_stall_micros,
+                    stream: *stream,
+                }
+            }
         };
         DirectionView {
             common: if forward {
@@ -439,8 +452,12 @@ impl Descriptor {
         let reverse = self.direction(Role::Server);
         forward.profile.validate()?;
         reverse.profile.validate()?;
-        if let Profile::Rolling { config, .. } = self.profile {
-            config.validate().map_err(|_| Error::Profile)?;
+        match self.profile {
+            Profile::Rolling { config, .. } => config.validate().map_err(|_| Error::Profile)?,
+            Profile::RollingCopies { config, copies, .. } => {
+                copies.validate(config).map_err(|_| Error::Profile)?
+            }
+            _ => {}
         }
         if let Profile::Swift { forward, reverse } = self.profile
             && (forward.layer != reverse.layer
@@ -497,6 +514,20 @@ impl Descriptor {
             writer.take(PROFILE_SLOT_BYTES)?,
         )?;
         writer.finish()?;
+        if let Profile::RollingCopies { copies, .. } = self.profile {
+            for (offset, policy) in [
+                (
+                    HEADER_BYTES + COMMON_DIRECTION_BYTES + rolling::ACTIVE_BYTES,
+                    copies.forward,
+                ),
+                (
+                    HEADER_BYTES + DIRECTION_BYTES + COMMON_DIRECTION_BYTES + rolling::ACTIVE_BYTES,
+                    copies.reverse,
+                ),
+            ] {
+                rolling::encode_copy(policy, &mut bytes[offset..offset + 4])?;
+            }
+        }
         Ok(bytes)
     }
     /// Decode exact CompleteV2 bytes, requiring canonical re-encoding equality.
@@ -509,7 +540,7 @@ impl Descriptor {
             return Err(Error::Prefix);
         }
         let tag = reader.byte()?;
-        if !(1..=4).contains(&tag) {
+        if !(1..=5).contains(&tag) {
             return Err(Error::Prefix);
         }
         let duplex = match reader.byte()? {
@@ -554,6 +585,7 @@ impl Descriptor {
                 reverse: decode_packed(b)?,
             },
             4 => rolling::decode_pair(a, b)?,
+            5 => rolling::decode_pair_with_copies(a, b)?,
             _ => return Err(Error::Prefix),
         };
         let value = Self::new(path_mtu, duplex, forward, reverse, profile)?;
@@ -569,6 +601,7 @@ fn profile_tag(profile: Profile) -> u8 {
         Profile::Aligned { .. } => 2,
         Profile::Packed { .. } => 3,
         Profile::Rolling { .. } => 4,
+        Profile::RollingCopies { .. } => 5,
     }
 }
 
@@ -1140,6 +1173,7 @@ fn encode_aligned(config: aligned::Config, output: &mut [u8]) -> Result<(), Erro
     writer.byte(match config.native_policy {
         aligned::NativePolicy::EthernetHeaders => 1,
         aligned::NativePolicy::RawIp => 2,
+        aligned::NativePolicy::IpHeaders => 3,
     })?;
     for value in [
         body.max_frame_bytes,
@@ -1214,6 +1248,7 @@ fn read_aligned(reader: &mut Reader<'_>) -> Result<aligned::Config, Error> {
     let native_policy = match reader.byte()? {
         1 => aligned::NativePolicy::EthernetHeaders,
         2 => aligned::NativePolicy::RawIp,
+        3 => aligned::NativePolicy::IpHeaders,
         _ => return Err(Error::Prefix),
     };
     let max_frame_bytes = reader.size()?;

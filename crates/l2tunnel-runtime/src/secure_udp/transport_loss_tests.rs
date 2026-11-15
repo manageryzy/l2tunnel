@@ -41,13 +41,26 @@ struct Attempt {
 }
 struct Endpoint {
     socket: tokio::net::UdpSocket,
-    driver: Driver,
+    driver: owner::StateCell<Driver>,
 }
 struct LossFixture {
     endpoints: [Endpoint; 2],
     start: u64,
     attempts: Vec<Attempt>,
 }
+
+#[inline(never)]
+fn fixture_driver(
+    parts: member::Parts,
+    config: Config,
+    origin: Instant,
+) -> Result<(tokio::net::UdpSocket, owner::StateCell<Driver>)> {
+    let (socket, driver) = Driver::new(parts, security::ConfigDigest([3; 32]), config, origin)?;
+    // Keep the actual owner once without retaining large inline construction
+    // temporaries in the asynchronous fixture and each awaiting test future.
+    Ok((socket, owner::StateCell::new(driver)?))
+}
+
 impl LossFixture {
     async fn new(kind: cover::Appearance) -> Result<Self> {
         let mut config = config(kind);
@@ -82,8 +95,8 @@ impl LossFixture {
         let (a, b) = parts_pair(kind).await?;
         let end = a.deadline.max(b.deadline);
         let origin = Instant::now();
-        let (a_socket, mut a) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
-        let (b_socket, mut b) = Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+        let (a_socket, mut a) = fixture_driver(a, config, origin)?;
+        let (b_socket, mut b) = fixture_driver(b, config, origin)?;
         for driver in [&mut a, &mut b] {
             driver.bucket.tokens = 0;
             assert!(driver.tail(end)?.is_none());
@@ -191,8 +204,8 @@ impl LossFixture {
         from.driver.progress(at)?;
         from.driver.submit_control(at)?;
         let before = from.driver.counters;
-        from.driver
-            .send(&from.socket, at, from.driver.origin + duration(at))?;
+        let sent_at = from.driver.origin + duration(at);
+        from.driver.send(&from.socket, at, sent_at)?;
         let packets = from.driver.counters.wire_packets - before.wire_packets;
         if packets == 0 {
             assert_eq!(from.driver.counters.control_number, before.control_number);
@@ -227,12 +240,10 @@ impl LossFixture {
         attempt.dropped = fault(&attempt);
         if !attempt.dropped {
             assert!(to.driver.check_expiry(at)?);
-            to.driver.receive(
-                &wire[..length],
-                at,
-                to.driver.origin + duration(at),
-                &resolve(to.driver.config),
-            )?;
+            let received_at = to.driver.origin + duration(at);
+            let resolver = resolve(to.driver.config);
+            to.driver
+                .receive(&wire[..length], at, received_at, &resolver)?;
             to.driver.collect_native(at)?;
         }
         let index = self.attempts.len();

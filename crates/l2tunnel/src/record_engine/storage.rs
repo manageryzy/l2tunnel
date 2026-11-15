@@ -78,6 +78,22 @@ impl RecordPlan {
             .map(Self::Rolling)
             .map_err(Error::Rolling);
         }
+        if let configuration::Profile::RollingCopies {
+            config,
+            stream,
+            copies,
+        } = config.descriptor().profile()
+        {
+            return rolling_records::storage::Plan::for_endpoint_with_copies(
+                *config,
+                context,
+                *stream,
+                Tick(0),
+                *copies,
+            )
+            .map(Self::Rolling)
+            .map_err(Error::Rolling);
+        }
         let local = config.descriptor().local(context.role);
         match (local.send().profile(), local.receive().profile()) {
             (
@@ -139,7 +155,7 @@ impl RecordPlan {
             )
             .map(Owner::Packed)
             .map_err(Error::Aligned),
-            Self::Rolling(plan) => rolling_records::Endpoint::new_reserved(
+            Self::Rolling(plan) => rolling_records::Endpoint::new_reserved_with_copies(
                 plan,
                 rolling_records::storage::Limits {
                     capacity_bytes: plan.capacity_bytes(),

@@ -129,7 +129,27 @@ impl Sender {
         config: Config,
         limits: crate::aligned_storage::Limits,
     ) -> Result<Self, crate::aligned_storage::Error> {
-        let plan = crate::aligned_storage::PackedSenderPlan::for_config(config)?;
+        Self::new_reserved_mode(scope, config, limits, false)
+    }
+    /// Select real native-IP aligned contexts inside the same packing owner.
+    pub fn new_reserved_ip(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        Self::new_reserved_mode(scope, config, limits, true)
+    }
+    fn new_reserved_mode(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+        ip: bool,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        let plan = if ip {
+            crate::aligned_storage::PackedSenderPlan::for_ip_config(config)?
+        } else {
+            crate::aligned_storage::PackedSenderPlan::for_config(config)?
+        };
         if scope.session == [0; 16] {
             return Err(crate::aligned_storage::Error::PackedSender(
                 Error::Configuration,
@@ -137,7 +157,7 @@ impl Sender {
         }
         let mut allocation =
             crate::aligned_storage::Allocation::new(plan.capacity_bytes(), limits)?;
-        let mut result = Self::new_in(scope, config, &mut allocation)?;
+        let mut result = Self::new_in_mode(scope, config, &mut allocation, ip)?;
         result.usage = Some(allocation.finish(plan.capacity_bytes())?);
         Ok(result)
     }
@@ -157,19 +177,42 @@ impl Sender {
         result.copy_policy = policy;
         Ok(result)
     }
+    /// Select both native-IP context geometry and authenticated short-copy policy.
+    pub fn new_reserved_ip_with_copies(
+        scope: Scope,
+        config: Config,
+        limits: crate::aligned_storage::Limits,
+        policy: crate::source_copy::Policy,
+    ) -> Result<Self, crate::aligned_storage::Error> {
+        policy
+            .validate(config.packing.symbol_bytes)
+            .map_err(|error| crate::aligned_storage::Error::PackedSender(Error::Copies(error)))?;
+        let mut result = Self::new_reserved_ip(scope, config, limits)?;
+        result.copy_policy = policy;
+        Ok(result)
+    }
     /// Actual complete backing observation; legacy construction reports None.
     pub fn storage_usage(&self) -> Option<crate::aligned_storage::Usage> {
         self.usage
     }
+    #[cfg(test)]
     pub(crate) fn new_in(
         scope: Scope,
         config: Config,
         allocation: &mut crate::aligned_storage::Allocation,
     ) -> Result<Self, crate::aligned_storage::Error> {
+        Self::new_in_mode(scope, config, allocation, false)
+    }
+    fn new_in_mode(
+        scope: Scope,
+        config: Config,
+        allocation: &mut crate::aligned_storage::Allocation,
+        ip: bool,
+    ) -> Result<Self, crate::aligned_storage::Error> {
         Ok(Self {
             scope,
             config,
-            aligned: aligned::Sender::new_in(scope, config.sender, allocation)?,
+            aligned: aligned::Sender::new_in_mode(scope, config.sender, allocation, ip)?,
             packing: packed::Packer::new_in(config.packing, allocation)?,
             records: allocation.vec(usize::from(config.max_units))?,
             next_unit: Some(config.first_unit),
@@ -181,11 +224,23 @@ impl Sender {
     }
     /// Validate all products before allocating packet/metadata storage.
     pub fn new(scope: Scope, config: Config) -> Result<Self, Error> {
+        Self::new_mode(scope, config, false)
+    }
+    /// Select actual native-IP delta/prediction with exact original source identities.
+    pub fn new_ip(scope: Scope, config: Config) -> Result<Self, Error> {
+        Self::new_mode(scope, config, true)
+    }
+    fn new_mode(scope: Scope, config: Config, ip: bool) -> Result<Self, Error> {
         config.memory_bound_bytes()?;
         Ok(Self {
             scope,
             config,
-            aligned: aligned::Sender::new(scope, config.sender).map_err(Error::Aligned)?,
+            aligned: if ip {
+                aligned::Sender::new_ip(scope, config.sender)
+            } else {
+                aligned::Sender::new(scope, config.sender)
+            }
+            .map_err(Error::Aligned)?,
             packing: packed::Packer::new(config.packing).map_err(Error::Packing)?,
             records: Vec::with_capacity(usize::from(config.max_units)),
             next_unit: Some(config.first_unit),
@@ -206,6 +261,19 @@ impl Sender {
             .validate(config.packing.symbol_bytes)
             .map_err(Error::Copies)?;
         let mut result = Self::new(scope, config)?;
+        result.copy_policy = policy;
+        Ok(result)
+    }
+    /// Explicit native-IP functional owner with the same real copy policy.
+    pub fn new_ip_with_copies(
+        scope: Scope,
+        config: Config,
+        policy: crate::source_copy::Policy,
+    ) -> Result<Self, Error> {
+        policy
+            .validate(config.packing.symbol_bytes)
+            .map_err(Error::Copies)?;
+        let mut result = Self::new_ip(scope, config)?;
         result.copy_policy = policy;
         Ok(result)
     }

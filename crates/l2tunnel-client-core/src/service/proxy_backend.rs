@@ -274,10 +274,11 @@ impl Handle {
             code: code.into(),
             state: Some(local::Snapshot {
                 epoch: 1,
-                phase: match snapshot.phase {
-                    Phase::Connected => "forwarding".into(),
-                    other => format!("{other:?}").to_lowercase(),
-                },
+                // Preserve v1 proxy CLI/native parser semantics. Service phase
+                // remains separately available on the typed lifecycle Snapshot.
+                phase: proxy
+                    .and_then(|frame| frame.runtime.as_ref())
+                    .map_or_else(|| "Starting".into(), |status| format!("{:?}", status.phase)),
                 compression: local::Compression::Off,
                 active: None,
                 openvpn_drain: None,

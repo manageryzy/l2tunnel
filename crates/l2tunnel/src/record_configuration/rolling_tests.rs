@@ -118,3 +118,99 @@ fn tag4_padding_shared_bindings_narrow_fields_and_aliases_refuse_without_output_
     assert_eq!(output, [0x93; CONFIGURATION_BYTES]);
     Ok(())
 }
+
+#[test]
+fn tag5_binds_both_copy_policies_and_rejects_noncanonical_fields() -> TestResult {
+    use crate::codec::source_copy::{Policy, Scope};
+    let old =
+        crate::record_engine::rolling_tests::fixture(true, fec::rolling::wire::SourceWire::Exact)?;
+    let Profile::Rolling { config, stream } = *old.descriptor().profile() else {
+        return Err("missing Rolling fixture".into());
+    };
+    let policies = rolling_records::CopyPolicies {
+        forward: Policy {
+            max_unit_bytes: 128,
+            copies: 3,
+            scope: Scope::ContextAndIndependent,
+        },
+        reverse: Policy {
+            max_unit_bytes: 64,
+            copies: 2,
+            scope: Scope::AllShort,
+        },
+    };
+    let select = |copies| -> TestResult<Configuration> {
+        let descriptor = old.descriptor();
+        Ok(Configuration::new(
+            old.envelope(),
+            Descriptor::new(
+                descriptor.path_mtu(),
+                descriptor.duplex(),
+                *descriptor.direction(Role::Client).common(),
+                *descriptor.direction(Role::Server).common(),
+                Profile::RollingCopies {
+                    config,
+                    stream,
+                    copies,
+                },
+            )?,
+        )?)
+    };
+    let selected = select(policies)?;
+    let mut old_bytes = [0; CONFIGURATION_BYTES];
+    let mut bytes = old_bytes;
+    old.encode_into(&mut old_bytes)?;
+    selected.encode_into(&mut bytes)?;
+    assert_eq!(bytes[5], 5);
+    let a = HEADER_BYTES + 32 + COMMON_DIRECTION_BYTES + rolling::ACTIVE_BYTES;
+    let b = a + DIRECTION_BYTES;
+    assert_eq!(&bytes[a..a + 4], &[0, 128, 3, 2]);
+    assert_eq!(&bytes[b..b + 4], &[0, 64, 2, 1]);
+    assert_eq!(Configuration::decode(&bytes)?, selected);
+    assert_ne!(selected.digest()?, old.digest()?);
+    let one = select(rolling_records::CopyPolicies::ONE)?;
+    assert_ne!(one.digest()?, old.digest()?);
+    let mut normalized = bytes;
+    normalized[5] = 4;
+    normalized[a..a + 4].fill(0);
+    normalized[b..b + 4].fill(0);
+    assert_eq!(normalized, old_bytes);
+    for (offset, value) in [
+        (a, 1),
+        (a + 2, 0),
+        (a + 2, 5),
+        (b + 2, 5),
+        (a + 3, 0),
+        (b + 3, 3),
+    ] {
+        let mut bad = bytes;
+        bad[offset] = value;
+        assert!(Configuration::decode(&bad).is_err());
+    }
+    for changed in [
+        rolling_records::CopyPolicies {
+            forward: Policy {
+                copies: 2,
+                ..policies.forward
+            },
+            ..policies
+        },
+        rolling_records::CopyPolicies {
+            reverse: Policy {
+                max_unit_bytes: 63,
+                ..policies.reverse
+            },
+            ..policies
+        },
+        rolling_records::CopyPolicies {
+            reverse: Policy {
+                scope: Scope::ContextAndIndependent,
+                ..policies.reverse
+            },
+            ..policies
+        },
+    ] {
+        assert_ne!(select(changed)?.digest()?, selected.digest()?);
+    }
+    Ok(())
+}

@@ -1,7 +1,7 @@
 //! Reserved versions share the real Receiver transitions. Only first-touched
 //! payloads are copied; proof/history owners otherwise move without snapshots.
 use super::*;
-use crate::{aligned_storage as heap, tcp_header::HeaderDecoder};
+use crate::{aligned_body::DecoderState, aligned_storage as heap};
 
 struct RecordBuffer {
     bytes: Vec<u8>,
@@ -14,14 +14,14 @@ enum Undo<T> {
 }
 struct ChannelCheckpoint {
     expected: Option<RecordId>,
-    header: HeaderDecoder,
+    header: DecoderState,
 }
 struct Globals {
     floor: Option<SourceId>,
     pending: Option<Pending>,
     last_time: Option<Tick>,
     failure: Option<Error>,
-    staged: HeaderDecoder,
+    staged: DecoderState,
 }
 
 #[cfg(test)]
@@ -111,12 +111,32 @@ impl Receiver {
         limits: Limits,
         budget: heap::Limits,
     ) -> Result<Self, heap::Error> {
-        let plan = heap::ReceiverPlan::for_limits(limits)?;
+        Self::new_reserved_mode(scope, limits, budget, false)
+    }
+    /// Fallibly reserve the actual selected IP context and transaction journals.
+    pub fn new_reserved_ip(
+        scope: Scope,
+        limits: Limits,
+        budget: heap::Limits,
+    ) -> Result<Self, heap::Error> {
+        Self::new_reserved_mode(scope, limits, budget, true)
+    }
+    fn new_reserved_mode(
+        scope: Scope,
+        limits: Limits,
+        budget: heap::Limits,
+        ip: bool,
+    ) -> Result<Self, heap::Error> {
+        let plan = if ip {
+            heap::ReceiverPlan::for_ip_limits(limits)?
+        } else {
+            heap::ReceiverPlan::for_limits(limits)?
+        };
         if scope.session == [0; 16] {
             return Err(heap::Error::Receiver(Error::Configuration));
         }
         let mut allocation = heap::Allocation::new(plan.capacity_bytes(), budget)?;
-        let mut result = Self::new_in(scope, limits, &mut allocation)?;
+        let mut result = Self::new_in_mode(scope, limits, &mut allocation, ip)?;
         result
             .reserved
             .as_mut()
@@ -128,10 +148,19 @@ impl Receiver {
     pub fn storage_usage(&self) -> Option<heap::Usage> {
         self.reserved.as_ref().and_then(|r| r.usage)
     }
+    #[cfg(test)]
     pub(crate) fn new_in(
         scope: Scope,
         l: Limits,
         a: &mut heap::Allocation,
+    ) -> Result<Self, heap::Error> {
+        Self::new_in_mode(scope, l, a, false)
+    }
+    fn new_in_mode(
+        scope: Scope,
+        l: Limits,
+        a: &mut heap::Allocation,
+        ip: bool,
     ) -> Result<Self, heap::Error> {
         let c = usize::from(l.channels);
         let r = c + l.lookahead_records;
@@ -140,14 +169,14 @@ impl Receiver {
         for _ in 0..c {
             channels.push(Channel {
                 expected: Some(l.first_record),
-                decoder: Decoder::new_in(l.body, a)?,
+                decoder: Decoder::new_in_mode(l.body, a, ip)?,
             });
         }
         let mut records = a.vec(r)?;
         records.resize_with(r, || None);
         let mut proofs = a.vec(s)?;
         proofs.resize_with(s, || None);
-        let staged = Decoder::new_in(l.body, a)?;
+        let staged = Decoder::new_in_mode(l.body, a, ip)?;
         let native = a.bytes(l.body.max_frame_bytes)?;
         let mut free_records = a.vec(3 * r)?;
         for _ in 0..3 * r {

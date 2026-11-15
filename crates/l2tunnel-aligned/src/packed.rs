@@ -191,7 +191,9 @@ impl SenderOwner {
     ) -> Result<receiver::RecordIdentity, Error> {
         match self {
             Self::Aligned(s) => match policy {
-                NativePolicy::EthernetHeaders => s[0].stage_identified(channel, frame),
+                NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
+                    s[0].stage_identified(channel, frame)
+                }
                 NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame),
             }
             .map_err(|e| {
@@ -202,7 +204,7 @@ impl SenderOwner {
                 }
             }),
             Self::Packed(s) => match policy {
-                NativePolicy::EthernetHeaders => {
+                NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                     s[0].stage_identified(channel, frame, micros(now)?)
                 }
                 NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame, micros(now)?),
@@ -333,6 +335,14 @@ impl Endpoint {
     pub fn pending_output(&self) -> Option<PreparedOutput> {
         self.0.pending_output()
     }
+    /// Exact main-lane custody, independent of the separate feedback slot.
+    pub fn pending_data_output(&self) -> Option<PreparedOutput> {
+        self.0.pending_data_output()
+    }
+    /// Exact independent feedback custody from the same underlying endpoint.
+    pub fn pending_feedback_output(&self) -> Option<PreparedOutput> {
+        self.0.pending_feedback_output()
+    }
     /// Confirm one whole-carrier write without renewing original native caps.
     pub fn confirm_output(&mut self, now: Duration, output: PreparedOutput) -> Result<(), Error> {
         self.0.confirm_output(now, output)
@@ -355,6 +365,15 @@ impl Endpoint {
     ) -> Result<Option<usize>, Error> {
         self.0.poll_data(now, output, budget)
     }
+    /// Emit through the same main slot while independent feedback remains held.
+    pub fn poll_data_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.0.poll_data_independent(now, output, budget)
+    }
     /// Emit authoritative feedback under that same allowance.
     pub fn poll_feedback(
         &mut self,
@@ -363,6 +382,15 @@ impl Endpoint {
         budget: &mut OutboundBudget,
     ) -> Result<Option<usize>, Error> {
         self.0.poll_feedback(now, output, budget)
+    }
+    /// Service feedback without borrowing a held data output's physical slot.
+    pub fn poll_feedback_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.0.poll_feedback_independent(now, output, budget)
     }
     /// Receive complete recovery bytes only after carrier authentication/replay checks.
     pub fn receive_authenticated(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
@@ -376,6 +404,15 @@ impl Endpoint {
         max_records: usize,
     ) -> Result<Prepared, Error> {
         self.0.prepare(channel, now, max_records)
+    }
+    /// Preserve channel FIFO with the same selected short-body encoding.
+    pub fn prepare_ordered(
+        &mut self,
+        channel: ChannelId,
+        now: Duration,
+        max_records: usize,
+    ) -> Result<Prepared, Error> {
+        self.0.prepare_ordered(channel, now, max_records)
     }
     /// Immutable native output awaiting actual complete device acceptance.
     pub fn pending(&self) -> Option<Delivery<'_>> {
@@ -406,6 +443,14 @@ impl Endpoint {
     /// Earliest original packing/recovery/receiver/source-handoff deadline.
     pub fn deadline(&self) -> Option<Duration> {
         self.0.deadline()
+    }
+    /// ACK wake for explicit independent-feedback polling, excluding data work.
+    pub fn feedback_deadline_independent(&self) -> Option<Duration> {
+        self.0.feedback_deadline_independent()
+    }
+    /// Independent-lane wake while preserving original codec/native hard expiry.
+    pub fn deadline_independent(&self) -> Option<Duration> {
+        self.0.deadline_independent()
     }
     /// True only when every codec, recovery and native owner drained without failure.
     pub fn drained(&self) -> bool {

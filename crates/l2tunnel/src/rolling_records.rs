@@ -21,6 +21,7 @@ fn allocate_instance() -> Result<u64, Error> {
 }
 
 mod config;
+mod copies;
 mod endpoint;
 mod native;
 /// Exact backing of the actual codec, rolling schedulers and scratch owners.
@@ -29,6 +30,7 @@ pub mod storage;
 mod tests;
 
 pub use config::{Config, DirectionConfig};
+pub use copies::{COPY_POLICY_BYTES, CopyPolicies};
 pub use endpoint::{Endpoint, OutputId, PreparedOutput, Statistics, Step};
 pub use l2tunnel_aligned::NativePolicy;
 pub use l2tunnel_reliable::OutboundBudget;

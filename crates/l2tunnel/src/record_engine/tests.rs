@@ -813,7 +813,9 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 forward.base.max_recovery_packet_bytes = 60_000;
                 reverse.base.max_recovery_packet_bytes = 60_000;
             }
-            configuration::Profile::Swift { .. } | configuration::Profile::Rolling { .. } => {
+            configuration::Profile::Swift { .. }
+            | configuration::Profile::Rolling { .. }
+            | configuration::Profile::RollingCopies { .. } => {
                 return Err("aligned-family fixture".into());
             }
         }

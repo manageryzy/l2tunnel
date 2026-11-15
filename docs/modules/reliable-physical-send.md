@@ -6,7 +6,7 @@ configuration digests, recovery engines or default timing changes.
 
 `Reliable::enable_physical_send_confirmation()` explicitly selects the mode
 before traffic. Legacy constructors retain poll-time transmission semantics.
-Selected mode retains one inline `PreparedOutput` witness with private checked
+Ordinary selected polling retains one inline `PreparedOutput` witness with private checked
 owner/serial and optional actual ARQ `PhysicalTransmission`; public metadata is
 `bytes`, `wire_bytes` and authoritative `RecordKind`. `pending_output()` observes
 it, and `confirm_output(now, witness)` consumes exactly that witness after one
@@ -62,3 +62,32 @@ identified in the Wave8 receipt. Full RPC-04 remains open.
 - [x] [RPC-02] Forward exact enable/pending/confirm through actual Aligned/Packed owners, preserving original receiver/native caps and exact one-time physical observation even on later timing failure. Evidence: [finite Wave8 checks and preserved failures](../../work/parallel-features-20261115/parallel-wave8-scoped-validation.json).
 - [x] [RPC-03] Pass focused delayed-partial-FEC and blocked-output timing, held retry/ACK race, exact/foreign/repeated witness, real peer/native reconstruction and legacy-compatibility cases, plus affected strict checks. Evidence: [finite Wave8 checks and preserved failures](../../work/parallel-features-20261115/parallel-wave8-scoped-validation.json).
 - [ ] [RPC-04] Qualify actual Common Engine/Bank/runtime completion under the complete carrier, mixed-family, fault/resource/native/platform matrices and unchanged compact-arq/full SW-11 definitions. This finite pure slice does not close that gate or APC-02/03 by itself.
+
+## Independent bounded feedback custody
+
+The selected legacy actor needs feedback progress while its actual full-duplex
+source DatagramSend remains blocked. Add poll_feedback_independent and
+pending_feedback_output to the same Reliable/Aligned/Packed owners, with one
+extra inline PreparedOutput slot. Existing combined/data/feedback polls retain
+their single-slot behavior. The explicit independent poll reuses the same ARQ
+feedback encoder, time and wire budget; it does not create another recovery FSM.
+Exact confirmation may consume either token and never the other. Both slots
+participate in expiry, failed state, drain and actual owner layout accounting.
+The legacy actor opts in through its independently writable control lane. Its
+callback inventory is bounded by the actual data/control writer count rather
+than the user queue limit, so a held data completion cannot consume the only
+control completion reservation.
+This repairs real local scheduling coupling; reliable legacy feedback remains
+a Python model difference, not the selected lossy reference path.
+
+- [ ] [RFC-01] Implement independent exact feedback custody and prove real opposite-direction ACK emission/flush while one source physical token is held, both callback orders, unchanged source bytes/debit/deadline and explicit storage/drain behavior. The existing Packed pressure failure remains open until its actual runtime case passes.
+
+The symmetric `poll_data_independent`/`pending_data_output` path reuses the same
+selection and physical owner. Additive `deadline_independent` and
+`feedback_deadline_independent` expose only eligible lane soft wakes plus
+unconditional original hard expiry; the old combined getters remain unchanged.
+Finite independent-custody, original accepted-time and crossed Compact geometry
+cases pass. The Aligned pressure/FIFO repair passes its exact Cases10 regression.
+The Packed pressure regression still fails under its original caps, so RFC-01
+remains open; these changes are not a claimed causal or complete runtime fix.
+See [Batch9 finite checks and preserved failures](../../work/parallel-features-20261115/parallel-batch9-scoped-validation.json).

@@ -261,11 +261,38 @@ impl Flight {
 pub(super) struct Outbound {
     pub bytes: Vec<u8>,
     pub units: Vec<protocol::UnitWitness>,
+    pub output: Option<protocol::PreparedOutput>,
 }
 pub(super) struct Sent {
     pub lane: usize,
     pub units: Vec<protocol::UnitWitness>,
     pub at: Instant,
+    pub output: Option<protocol::PreparedOutput>,
+}
+pub(super) fn completion_capacity(
+    lanes: usize,
+    duplex: Duplex,
+    initiator: bool,
+) -> io::Result<usize> {
+    let data_writers = (0..lanes)
+        .filter(|index| duplex == Duplex::Full || (*index == 0) == initiator)
+        .count();
+    // Each endpoint retains its physical token until the actor consumes Sent.
+    // Thus each real data/control writer can own only one reservation/event.
+    // Count those owners, independently of native admission or packet queues.
+    lanes
+        .checked_add(data_writers)
+        .filter(|capacity| *capacity != 0)
+        .ok_or_else(|| invalid("aligned completion owner capacity"))
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FeedbackOutput {
+    pub bytes: Vec<u8>,
+    pub output: protocol::PreparedOutput,
+}
+#[derive(Clone, Debug, Default)]
+pub(super) struct Feedback {
+    pub ack: Option<FeedbackOutput>,
 }
 pub(super) async fn write_datagrams<S: DatagramSend>(
     mut sender: S,
@@ -274,7 +301,7 @@ pub(super) async fn write_datagrams<S: DatagramSend>(
     sent: mpsc::Sender<Sent>,
 ) -> io::Result<()> {
     while let Some(packet) = packets.recv().await {
-        let permit = if packet.units.is_empty() {
+        let permit = if packet.units.is_empty() && packet.output.is_none() {
             None
         } else {
             Some(
@@ -290,6 +317,7 @@ pub(super) async fn write_datagrams<S: DatagramSend>(
                 lane,
                 units: packet.units,
                 at,
+                output: packet.output,
             });
         }
     }
@@ -297,10 +325,12 @@ pub(super) async fn write_datagrams<S: DatagramSend>(
 }
 pub(super) async fn write_control(
     mut writer: impl AsyncWrite + Unpin,
-    mut changes: watch::Receiver<udp::Feedback>,
+    mut changes: watch::Receiver<Feedback>,
     mut native: mpsc::Receiver<protocol::RecordIdentity>,
     config: DatagramPolicy,
     budget: udp::SharedBudget,
+    lane: usize,
+    sent: mpsc::Sender<Sent>,
 ) -> io::Result<()> {
     let mut heartbeat = interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -316,7 +346,20 @@ pub(super) async fn write_control(
             if latest.ack != previous_ack
                 && let Some(ack) = &latest.ack
             {
-                udp::write_control_frame_bound(&mut writer, 2, ack, config.control_magic).await?;
+                let permit = sent
+                    .reserve()
+                    .await
+                    .map_err(|_| invalid("aligned feedback observer closed"))?;
+                udp::write_control_frame_bound(&mut writer, 2, &ack.bytes, config.control_magic)
+                    .await?;
+                // The maintained frame writer has flushed the exact bytes.
+                // Keep that completion time across any later actor delay.
+                permit.send(Sent {
+                    lane,
+                    units: Vec::new(),
+                    at: Instant::now(),
+                    output: Some(ack.output),
+                });
             }
             if let Some(identity) = receipt {
                 let mut body = [0; 9];

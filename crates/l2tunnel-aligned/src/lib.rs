@@ -32,6 +32,8 @@ pub enum NativePolicy {
     EthernetHeaders,
     /// Native IP is always an exact kind-2 raw body, including fragmented packets.
     RawIp,
+    /// Native IPv4/IPv6 TCP uses explicit IP contexts/deltas, with exact raw fallback.
+    IpHeaders,
 }
 
 /// Complete immutable policy, including exact external wire charges.
@@ -125,6 +127,7 @@ impl Config {
         bytes.push(match self.native_policy {
             NativePolicy::EthernetHeaders => 1,
             NativePolicy::RawIp => 2,
+            NativePolicy::IpHeaders => 3,
         });
         let limits = self.receiver;
         let body = limits.body;
@@ -357,7 +360,12 @@ impl Endpoint {
         }
         let (sender, sender_usage) = if let Some(packed) = plan.send_packed() {
             let mut cell = allocation.vec(1)?;
-            let sender = l2tunnel_codec::packed_sender::Sender::new_reserved(
+            let make = if config.native_policy == NativePolicy::IpHeaders {
+                l2tunnel_codec::packed_sender::Sender::new_reserved_ip
+            } else {
+                l2tunnel_codec::packed_sender::Sender::new_reserved
+            };
+            let sender = make(
                 send_scope,
                 packed.sender(),
                 codec::Limits {
@@ -370,7 +378,12 @@ impl Endpoint {
             (packed::SenderOwner::Packed(cell), usage)
         } else {
             let mut cell = allocation.vec(1)?;
-            let sender = sender::Sender::new_reserved(
+            let make = if config.native_policy == NativePolicy::IpHeaders {
+                sender::Sender::new_reserved_ip
+            } else {
+                sender::Sender::new_reserved
+            };
+            let sender = make(
                 send_scope,
                 sender_config(config),
                 codec::Limits {
@@ -400,8 +413,13 @@ impl Endpoint {
             )
             .map_err(storage::Error::Reliable)?,
         );
+        let make_receiver = if receive_config.native_policy == NativePolicy::IpHeaders {
+            receiver::Receiver::new_reserved_ip
+        } else {
+            receiver::Receiver::new_reserved
+        };
         construction.receiver = Some(
-            receiver::Receiver::new_reserved(
+            make_receiver(
                 receive_scope,
                 receive_config.receiver,
                 codec::Limits {
@@ -540,15 +558,20 @@ impl Endpoint {
             send_scope,
             sender: match packing {
                 Some(p) => packed::SenderOwner::Packed(vec![
-                    l2tunnel_codec::packed_sender::Sender::new(
-                        send_scope,
-                        p.config(config).sender(),
-                    )
+                    (if config.native_policy == NativePolicy::IpHeaders {
+                        l2tunnel_codec::packed_sender::Sender::new_ip
+                    } else {
+                        l2tunnel_codec::packed_sender::Sender::new
+                    })(send_scope, p.config(config).sender())
                     .map_err(Error::PackedSender)?,
                 ]),
                 None => packed::SenderOwner::Aligned(vec![
-                    sender::Sender::new(send_scope, sender_config(config))
-                        .map_err(Error::Sender)?,
+                    (if config.native_policy == NativePolicy::IpHeaders {
+                        sender::Sender::new_ip
+                    } else {
+                        sender::Sender::new
+                    })(send_scope, sender_config(config))
+                    .map_err(Error::Sender)?,
                 ]),
             },
             packing,
@@ -561,8 +584,12 @@ impl Endpoint {
             ],
             recovery: Reliable::new_duplex(config.recovery, receive_config.recovery, context)
                 .map_err(Error::Recovery)?,
-            receiver: receiver::Receiver::new(receive_scope, receive_config.receiver)
-                .map_err(Error::Receiver)?,
+            receiver: (if receive_config.native_policy == NativePolicy::IpHeaders {
+                receiver::Receiver::new_ip
+            } else {
+                receiver::Receiver::new
+            })(receive_scope, receive_config.receiver)
+            .map_err(Error::Receiver)?,
             send_buffer: vec![0; config.recovery.arq.max_source_bytes],
             receive_buffer: vec![0; receive_config.recovery.arq.max_source_bytes],
             handoff: None,
@@ -720,6 +747,15 @@ impl Endpoint {
     pub fn pending_output(&self) -> Option<PreparedOutput> {
         self.recovery.pending_output()
     }
+    /// Exact main-lane physical custody; independent feedback uses its own slot.
+    /// Legacy combined polling may also place feedback in the main slot.
+    pub fn pending_data_output(&self) -> Option<PreparedOutput> {
+        self.recovery.pending_data_output()
+    }
+    /// Exact independent feedback custody, separate from a held data output.
+    pub fn pending_feedback_output(&self) -> Option<PreparedOutput> {
+        self.recovery.pending_feedback_output()
+    }
     /// Confirm only an actual whole-carrier write for this exact output witness.
     /// Recovery custody is consumed before local original native/handoff expiry.
     pub fn confirm_output(&mut self, now: Duration, output: PreparedOutput) -> Result<(), Error> {
@@ -732,7 +768,9 @@ impl Endpoint {
         accepted: Duration,
         output: PreparedOutput,
     ) -> Result<(), Error> {
-        if self.recovery.pending_output() != Some(output) {
+        if self.recovery.pending_output() != Some(output)
+            && self.recovery.pending_feedback_output() != Some(output)
+        {
             return Err(Error::Recovery(l2tunnel_reliable::Error::OutputToken));
         }
         let prior = self.failure;
@@ -762,6 +800,22 @@ impl Endpoint {
             .map_err(Error::Recovery);
         self.recovery_result(result)
     }
+    /// Emit data without borrowing independently held feedback custody.
+    /// This retains the same actual main output slot and mandatory wire budget.
+    pub fn poll_data_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.advance(now)?;
+        self.pump_send()?;
+        let result = self
+            .recovery
+            .poll_data_independent(now, output, budget)
+            .map_err(Error::Recovery);
+        self.recovery_result(result)
+    }
     /// Emit only feedback, using the same common budget as all data emissions.
     pub fn poll_feedback(
         &mut self,
@@ -773,6 +827,21 @@ impl Endpoint {
         let result = self
             .recovery
             .poll_feedback(now, output, budget)
+            .map_err(Error::Recovery);
+        self.recovery_result(result)
+    }
+    /// Service the same feedback encoder while a data carrier is backpressured.
+    /// Both exact outputs remain owned until their own physical confirmations.
+    pub fn poll_feedback_independent(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+    ) -> Result<Option<usize>, Error> {
+        self.advance(now)?;
+        let result = self
+            .recovery
+            .poll_feedback_independent(now, output, budget)
             .map_err(Error::Recovery);
         self.recovery_result(result)
     }
@@ -791,12 +860,33 @@ impl Endpoint {
         now: Duration,
         max_records: usize,
     ) -> Result<Prepared, Error> {
+        self.prepare_selected(channel, now, max_records, false)
+    }
+    /// Deliver in channel order while preserving independent short encoding.
+    pub fn prepare_ordered(
+        &mut self,
+        channel: ChannelId,
+        now: Duration,
+        max_records: usize,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(channel, now, max_records, true)
+    }
+    fn prepare_selected(
+        &mut self,
+        channel: ChannelId,
+        now: Duration,
+        max_records: usize,
+        ordered: bool,
+    ) -> Result<Prepared, Error> {
         self.advance(now)?;
         self.pump_receive()?;
-        let result = self
-            .receiver
-            .prepare(channel, ticks(now)?, max_records)
-            .map_err(Error::Receiver);
+        let now = ticks(now)?;
+        let result = if ordered {
+            self.receiver.prepare_ordered(channel, now, max_records)
+        } else {
+            self.receiver.prepare(channel, now, max_records)
+        }
+        .map_err(Error::Receiver);
         self.terminal_result(result)
     }
     /// Immutable native bytes; never hiddenly retired by polling or WouldBlock.
@@ -879,6 +969,36 @@ impl Endpoint {
             )
             .min()
     }
+    /// ACK wake for explicit independent-feedback polling, excluding data work.
+    pub fn feedback_deadline_independent(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            None
+        } else {
+            self.recovery.feedback_deadline_independent()
+        }
+    }
+
+    /// Independent-lane recovery/packing wake plus every original hard expiry.
+    /// A held feedback token does not occupy the actual data/packing lane.
+    /// The original deadline getter preserves combined-poll compatibility.
+    pub fn deadline_independent(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.recovery
+            .deadline_independent()
+            .into_iter()
+            .chain(self.expiry_deadline())
+            .chain(
+                self.sender
+                    .packing()
+                    .filter(|_| self.recovery.pending_data_output().is_none())
+                    .and_then(|status| status.packing.deadline_micros)
+                    .map(Duration::from_micros),
+            )
+            .min()
+    }
+
     /// True only after all local staging, recovery and native record ownership drains.
     pub fn drained(&self) -> bool {
         let status = self.receiver.status();

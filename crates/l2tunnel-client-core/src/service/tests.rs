@@ -768,9 +768,11 @@ async fn dropping_full_terminal_history_keeps_capacity_and_latest_retired_result
     let original_capacity = {
         let mut state = handle.0.lock();
         for id in 1..=RETAINED as u64 {
-            state
-                .terminals
-                .push_back((OperationId(id), Terminal::Aborted));
+            state.terminals.push_back(TerminalRecord {
+                generation: OperationId(id),
+                terminal: Terminal::Aborted,
+                proxy_close_report: None,
+            });
         }
         state.last_key = RETAINED as u64 + 1;
         state.snapshot.generation = Some(OperationId(state.last_key));
@@ -787,9 +789,18 @@ async fn dropping_full_terminal_history_keeps_capacity_and_latest_retired_result
             original_capacity,
             "teardown expanded bounded terminal storage"
         );
-        assert_eq!(state.terminals.front().map(|(id, _)| id.value()), Some(2));
         assert_eq!(
-            state.terminals.back().map(|(id, _)| id.value()),
+            state
+                .terminals
+                .front()
+                .map(|record| record.generation.value()),
+            Some(2)
+        );
+        assert_eq!(
+            state
+                .terminals
+                .back()
+                .map(|record| record.generation.value()),
             Some(RETAINED as u64 + 1)
         );
     }

@@ -124,3 +124,7 @@ parallel; it is not Python parity evidence.
 None of these complete deliverables is checked by this design change. Keep
 planned, protocol-tested, implemented, integration-tested and measured-native
 evidence separate, and retain failed attempts with their exact source scope.
+
+Implementation details remain separately qualified: [selected CompactARQ](compact-arq.md)
+and [physical Rolling copies](rolling-source-copies.md). Their finite leaves do
+not replace the complete PBA-01..06 definitions above.

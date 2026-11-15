@@ -32,6 +32,34 @@ impl Output<'_> {
         }
     }
 }
+/// One local physical-copy ordinal; source wire identity remains unchanged.
+/// This is not peer authority or evidence that any carrier accepted bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceCopy {
+    source: SourceId,
+    ordinal: u8,
+    total: u8,
+    prepared_at: Tick,
+}
+impl SourceCopy {
+    /// The one original recovery source shared by every physical copy.
+    pub const fn source(self) -> SourceId {
+        self.source
+    }
+    /// One-based physical ordinal, unchanged through local backpressure.
+    pub const fn ordinal(self) -> u8 {
+        self.ordinal
+    }
+    /// Exact selected physical count, from one through four.
+    pub const fn total(self) -> u8 {
+        self.total
+    }
+    /// Earliest caller time at which this exact ordinal became available.
+    pub const fn prepared_at(self) -> Tick {
+        self.prepared_at
+    }
+}
+
 /// Bounded handling of an authenticated identified cumulative receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackDisposition {
@@ -76,6 +104,7 @@ pub struct Sender {
     encoder: Encoder,
     pending: Option<Pending>,
     output_end: Option<Tick>,
+    source_copy: Option<SourceCopy>,
     sent: u32,
     credit: u32,
     regular_due: u32,
@@ -127,6 +156,7 @@ impl Sender {
             scope,
             pending: None,
             output_end: None,
+            source_copy: None,
             sent: 0,
             credit: 0,
             regular_due: 0,
@@ -160,6 +190,19 @@ impl Sender {
     /// Admit one source into the only output slot; no repair credit is earned yet.
     /// Performs only the primitive's bounded source copy; no wire buffer is allocated.
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
+        self.admit_source_with_copies(original, now, 1)
+    }
+    /// Admit one actual source and a bounded physical-copy group. No additional
+    /// source, debt or repair credit is created for subsequent copies.
+    pub fn admit_source_with_copies(
+        &mut self,
+        original: &[u8],
+        now: Tick,
+        copies: u8,
+    ) -> Result<SourceId, Error> {
+        if !(1..=4).contains(&copies) {
+            return Err(Error::Configuration);
+        }
         self.time(now)?;
         if self.pending.is_some()
             || self.regular_due != 0
@@ -171,6 +214,12 @@ impl Sender {
         let end = self.later(now, self.policy.recovery.job_ticks)?;
         let id = self.encoder.admit_source(original, now)?;
         self.pending = Some(Pending::Source(id));
+        self.source_copy = Some(SourceCopy {
+            source: id,
+            ordinal: 1,
+            total: copies,
+            prepared_at: now,
+        });
         self.output_end = Some(end);
         Ok(id)
     }
@@ -268,22 +317,80 @@ impl Sender {
                 .ok_or(Error::Length),
         }
     }
-    /// Confirm complete caller handoff of this identity, earning source credit or retiring repair.
-    /// WouldBlock must leave this uncalled; repeated polls do not move any timer.
+    /// Observe the exact current systematic-copy ordinal without changing time.
+    pub fn pending_source_copy(&self) -> Option<SourceCopy> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        self.source_copy
+    }
+    /// Confirm an ordinary one-copy source or repair. Explicit repeated-source
+    /// groups require their ordinal-bearing witness and cannot use this method.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
+        if self.source_copy.is_some_and(|copy| copy.total != 1) {
+            return Err(Error::Identity);
+        }
         self.time(now)?;
+        self.finish_output(id, now, now)
+    }
+    /// Consume exactly one caller-observed whole systematic-copy acceptance.
+    /// A repeated ordinal is rejected before clock, counters or retirement change.
+    /// The original group deadline remains fixed from initial source admission.
+    pub fn confirm_source_copy(
+        &mut self,
+        observed: Tick,
+        accepted: Tick,
+        copy: SourceCopy,
+    ) -> Result<(), Error> {
+        if self.source_copy != Some(copy)
+            || !matches!(self.pending, Some(Pending::Source(id)) if id == copy.source)
+        {
+            return Err(Error::Identity);
+        }
+        // Physical ownership has already happened. Retire this local witness
+        // even when its timing subsequently makes this scheduler terminal.
+        self.source_copy = None;
+        if accepted < copy.prepared_at || accepted > observed {
+            return self.fail(Error::TimeRegression);
+        }
+        self.time(observed)?;
+        if copy.ordinal < copy.total {
+            self.sent = copy.source.0.checked_add(1).ok_or(Error::Exhausted)?;
+            self.source_copy = Some(SourceCopy {
+                ordinal: copy.ordinal + 1,
+                prepared_at: observed,
+                ..copy
+            });
+            return Ok(());
+        }
+        self.finish_output(OutputId::Source(copy.source), observed, accepted)
+    }
+    fn finish_output(&mut self, id: OutputId, now: Tick, accepted: Tick) -> Result<(), Error> {
         let output = self.pending_output().ok_or(Error::Busy)?;
         if output.id() != id {
             return Err(Error::Identity);
         }
         match self.pending.ok_or(Error::Busy)? {
             Pending::Source(source) => {
-                let tail_due = self.later(now, self.policy.tail_ticks)?;
-                self.sent = source.0 + 1;
+                let tail_due =
+                    deadline(accepted, self.policy.tail_ticks).or_else(|error| self.fail(error))?;
+                self.sent = source.0.checked_add(1).ok_or(Error::Exhausted)?;
                 let earned = self.credit + self.policy.repair_numerator;
                 self.regular_due += earned / self.policy.repair_denominator;
                 self.credit = earned % self.policy.repair_denominator;
                 self.tail_due = Some(tail_due);
+                self.source_copy = None;
+                // A peer may have acknowledged the first actual copy already.
+                // Remaining physical copies pinned the exact encoder payload;
+                // applying the retained real prefix now cannot invent receipt.
+                if let Some(feedback) = self.feedback {
+                    self.encoder.confirm_prefix(feedback.prefix, now)?;
+                    if feedback.prefix == self.encoder.status().next_source {
+                        self.regular_due = 0;
+                        self.tail_remaining = 0;
+                        self.tail_due = None;
+                    }
+                }
             }
             Pending::Repair { id, tail } => {
                 let needs_timer = tail
@@ -331,7 +438,11 @@ impl Sender {
                 };
             }
         }
-        if feedback.prefix < self.encoder.status().confirmed_prefix {
+        if feedback.prefix < self.encoder.status().confirmed_prefix
+            || self
+                .feedback
+                .is_some_and(|old| feedback.prefix < old.prefix)
+        {
             return Ok(FeedbackDisposition::Stale);
         }
         if self
@@ -340,9 +451,12 @@ impl Sender {
         {
             return Err(Error::Identity);
         }
-        self.encoder.confirm_prefix(feedback.prefix, now)?;
+        let released = self
+            .source_copy
+            .map_or(feedback.prefix, |copy| feedback.prefix.min(copy.source.0));
+        self.encoder.confirm_prefix(released, now)?;
         self.feedback = Some(feedback);
-        if feedback.prefix == self.encoder.status().next_source {
+        if released == self.encoder.status().next_source {
             self.regular_due = 0;
             self.tail_remaining = 0;
             self.tail_due = None;
@@ -384,3 +498,7 @@ impl Sender {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sender_copy_tests.rs"]
+mod copy_tests;

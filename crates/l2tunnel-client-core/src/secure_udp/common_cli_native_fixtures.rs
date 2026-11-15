@@ -325,7 +325,9 @@ fn all_native_carrier_plans_validate_four_full_families_and_both_roles_before_ex
                         common::Profile::Swift { .. } => 0,
                         common::Profile::Aligned { .. } => 1,
                         common::Profile::Packed { .. } => 2,
-                        common::Profile::Rolling { .. } => 3,
+                        common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. } => {
+                            3
+                        }
                     };
                     families[slot] += 1;
                     for data_role in [DataRole::Client, DataRole::Server] {

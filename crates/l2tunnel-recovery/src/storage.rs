@@ -93,6 +93,59 @@ impl DuplexPlan {
     }
 }
 
+/// Checked heap-only inventory for the explicitly selected CompactARQ owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactPlan {
+    send: crate::CompactArqConfig,
+    receive: crate::CompactArqConfig,
+    capacity_bytes: usize,
+}
+impl CompactPlan {
+    /// Include the actual indexed payload slots, selected metadata and all history.
+    pub fn for_compact(
+        send: crate::CompactArqConfig,
+        receive: crate::CompactArqConfig,
+    ) -> Result<Self, Error> {
+        send.validate().map_err(Error::Recovery)?;
+        receive.validate().map_err(Error::Recovery)?;
+        let sb = send.bounds();
+        let rb = receive.bounds();
+        let values = [
+            array_bytes::<crate::arq::SendSlot>(sb.send_records)?,
+            array_bytes::<crate::arq::ReceiveSlot>(rb.receive_records)?,
+            array_bytes::<u8>(sb.max_source_bytes)?
+                .checked_mul(sb.send_records)
+                .ok_or(Error::Layout)?,
+            array_bytes::<u8>(rb.max_source_bytes)?
+                .checked_mul(rb.receive_records)
+                .ok_or(Error::Layout)?,
+            array_bytes::<crate::arq::CompactMeta>(sb.send_records)?,
+            array_bytes::<Option<crate::arq::CompactHistory>>(send.history_entries())?,
+            array_bytes::<crate::arq::CompactState>(1)?,
+        ];
+        let capacity_bytes = values.into_iter().try_fold(0usize, |sum, value| {
+            sum.checked_add(value).ok_or(Error::Layout)
+        })?;
+        Ok(Self {
+            send,
+            receive,
+            capacity_bytes,
+        })
+    }
+    /// Exact complete local sending policy.
+    pub const fn send_config(&self) -> crate::CompactArqConfig {
+        self.send
+    }
+    /// Exact complete peer data-direction policy.
+    pub const fn receive_config(&self) -> crate::CompactArqConfig {
+        self.receive
+    }
+    /// Actual requested persistent heap subtotal; excludes the inline owner.
+    pub const fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+}
+
 /// Observation of actual retained backing; never accepted as allocation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Usage {

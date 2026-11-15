@@ -66,14 +66,23 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
 }
 fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     let generation = active.as_ref().map(|a| a.generation);
-    let backend = active.as_ref().map(|a| a.backend.clone());
+    let observation = active.as_ref().and_then(|a| a.backend.observe());
+    let proxy_close_report = observation
+        .as_ref()
+        .and_then(Observation::proxy)
+        .and_then(|frame| match (&frame.terminal, terminal) {
+            (Some(local::ProxyTerminal::Closed { report }), Terminal::Closed) if frame.released => {
+                Some(report.clone())
+            }
+            _ => None,
+        });
     // Managed branches and the inline base UDP runtime own their I/O futures
     // without spawned children. Drop every original socket/device owner before
     // publishing release or reconnect.
     drop(active.take());
     let mut state = shared.lock();
     state.backend = None;
-    state.snapshot.runtime = backend.and_then(|backend| backend.observe());
+    state.snapshot.runtime = observation;
     if let Some(observation) = &mut state.snapshot.runtime {
         observation.record_service_terminal(terminal);
     }
@@ -82,7 +91,11 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
         if state.terminals.len() == RETAINED {
             state.terminals.pop_front();
         }
-        state.terminals.push_back((generation, terminal));
+        state.terminals.push_back(TerminalRecord {
+            generation,
+            terminal,
+            proxy_close_report,
+        });
         state.snapshot.terminal = Some(terminal);
     }
     drop(state);

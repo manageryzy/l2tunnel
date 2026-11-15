@@ -38,7 +38,7 @@ impl Selection {
         }
     }
     pub(super) fn endpoint(self, context: RecoveryContext) -> io::Result<Endpoint> {
-        match self {
+        let mut endpoint = match self {
             Self::Aligned(c) => protocol::Endpoint::new(c.protocol, context)
                 .map(Box::new)
                 .map(Endpoint::Aligned),
@@ -46,7 +46,11 @@ impl Selection {
                 .map(Box::new)
                 .map(Endpoint::Packed),
         }
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+        endpoint
+            .enable_physical_send_confirmation()
+            .map_err(io::Error::other)?;
+        Ok(endpoint)
     }
 }
 pub(super) enum Endpoint {
@@ -63,15 +67,66 @@ macro_rules! forward {
     };
 }
 impl Endpoint {
+    pub(super) fn arq_statistics(&self) -> l2tunnel_recovery::Statistics {
+        match self {
+            Self::Aligned(e) => e.arq_statistics(),
+            Self::Packed(e) => e.arq_statistics(),
+        }
+    }
     forward! {
+        fn enable_physical_send_confirmation(&mut self) -> Result<(), protocol::Error>;
+        fn confirm_output_at(&mut self, observed: Duration, accepted: Duration, output: protocol::PreparedOutput) -> Result<(), protocol::Error>;
         fn tick(&mut self, now: Duration) -> Result<(), protocol::Error>;
         fn enqueue_identified(&mut self, channel: protocol::ChannelId, bytes: &[u8], now: Duration) -> Result<protocol::RecordIdentity, protocol::Error>;
         fn outgoing_units(&mut self, packet: &[u8], output: &mut [protocol::UnitWitness]) -> Result<usize, protocol::Error>;
         fn receive_authenticated(&mut self, bytes: &[u8], now: Duration) -> Result<(), protocol::Error>;
-        fn prepare(&mut self, channel: protocol::ChannelId, now: Duration, work: usize) -> Result<protocol::Prepared, protocol::Error>;
+        fn prepare_ordered(&mut self, channel: protocol::ChannelId, now: Duration, work: usize) -> Result<protocol::Prepared, protocol::Error>;
         fn commit_delivery(&mut self, now: Duration) -> Result<(), protocol::Error>;
-        fn poll_data(&mut self, now: Duration, output: &mut [u8], budget: &mut l2tunnel_reliable::OutboundBudget) -> Result<Option<usize>, protocol::Error>;
-        fn poll_feedback(&mut self, now: Duration, output: &mut [u8], budget: &mut l2tunnel_reliable::OutboundBudget) -> Result<Option<usize>, protocol::Error>;
+        fn poll_data_independent(&mut self, now: Duration, output: &mut [u8], budget: &mut l2tunnel_reliable::OutboundBudget) -> Result<Option<usize>, protocol::Error>;
+        fn poll_feedback_independent(&mut self, now: Duration, output: &mut [u8], budget: &mut l2tunnel_reliable::OutboundBudget) -> Result<Option<usize>, protocol::Error>;
+    }
+    #[cfg(test)]
+    pub(super) fn poll_data(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut l2tunnel_reliable::OutboundBudget,
+    ) -> Result<Option<usize>, protocol::Error> {
+        match self {
+            Self::Aligned(e) => e.poll_data(now, output, budget),
+            Self::Packed(e) => e.poll_data(now, output, budget),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn poll_feedback(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        budget: &mut l2tunnel_reliable::OutboundBudget,
+    ) -> Result<Option<usize>, protocol::Error> {
+        match self {
+            Self::Aligned(e) => e.poll_feedback(now, output, budget),
+            Self::Packed(e) => e.poll_feedback(now, output, budget),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn pending_output(&self) -> Option<protocol::PreparedOutput> {
+        match self {
+            Self::Aligned(e) => e.pending_output(),
+            Self::Packed(e) => e.pending_output(),
+        }
+    }
+    pub(super) fn pending_data_output(&self) -> Option<protocol::PreparedOutput> {
+        match self {
+            Self::Aligned(e) => e.pending_data_output(),
+            Self::Packed(e) => e.pending_data_output(),
+        }
+    }
+    pub(super) fn pending_feedback_output(&self) -> Option<protocol::PreparedOutput> {
+        match self {
+            Self::Aligned(e) => e.pending_feedback_output(),
+            Self::Packed(e) => e.pending_feedback_output(),
+        }
     }
     pub(super) fn status(&self) -> protocol::Status {
         match self {

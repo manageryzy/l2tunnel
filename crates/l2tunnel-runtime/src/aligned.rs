@@ -527,14 +527,42 @@ pub async fn run_quic<D: PacketDevice<Error = io::Error>>(
 struct State {
     endpoint: Endpoint,
     outbound: Option<mpsc::Sender<delivery::Outbound>>,
-    feedback: watch::Sender<udp::Feedback>,
+    feedback: watch::Sender<delivery::Feedback>,
     native_feedback: mpsc::Sender<protocol::RecordIdentity>,
     receives: bool,
     flight: Option<delivery::Flight>,
     incoming: l2tunnel_flow_control::delivery_window::Config,
     next_channel: u16,
+    feedback_first: bool,
 }
 impl State {
+    fn waits_for_source_send(&self, event: &udp::NativeControlEvent) -> bool {
+        matches!(event, udp::NativeControlEvent::Ack(_))
+            && self.endpoint.pending_data_output().is_some_and(|output| {
+                matches!(
+                    output.kind,
+                    l2tunnel_reliable::RecordKind::Source
+                        | l2tunnel_reliable::RecordKind::Systematic
+                )
+            })
+    }
+    fn sent(&mut self, sent: delivery::Sent, origin: Instant, now: Duration) -> io::Result<()> {
+        let actual = delivery::since(origin, sent.at)?;
+        let physical = sent.output.map_or(Ok(()), |output| {
+            self.endpoint
+                .confirm_output_at(now, actual, output)
+                .map_err(io::Error::other)
+        });
+        let native = if sent.units.is_empty() {
+            Ok(())
+        } else {
+            self.flight
+                .as_mut()
+                .ok_or_else(|| invalid("aligned unexpected native send callback"))?
+                .sent(&sent.units, actual, now)
+        };
+        physical.and(native)
+    }
     fn check_retention(&self, runtime: RuntimeConfig) -> io::Result<()> {
         let retained = self.endpoint.status().receiver;
         if retained.native_records > self.incoming.max_records
@@ -600,6 +628,12 @@ where
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ActorStatus {
     pub flight: [Option<l2tunnel_flow_control::delivery_window::Status>; 2],
+    pub endpoint: [Option<protocol::Status>; 2],
+    pub pending_data: [Option<protocol::PreparedOutput>; 2],
+    pub pending_feedback: [Option<protocol::PreparedOutput>; 2],
+    pub arq: [Option<l2tunnel_recovery::Statistics>; 2],
+    #[allow(dead_code)] // Retained in diagnostic Debug snapshots on actor failure.
+    pub pending_control_lane: Option<usize>,
 }
 pub(super) async fn run_parts_observed<D, C, S, R>(
     mut device: D,
@@ -631,7 +665,7 @@ where
     let budget = udp::SharedBudget::from_policy(policy, started);
     let mut tasks = JoinSet::new();
     let mut states = Vec::new();
-    let sent_capacity = runtime.queue_packets;
+    let sent_capacity = delivery::completion_capacity(parts.len(), policy.duplex, initiator)?;
     let (sent_tx, mut sent_rx) = mpsc::channel(sent_capacity);
     let role = if initiator {
         crate::managed::Role::Client
@@ -651,7 +685,7 @@ where
             },
         };
         let (reader, writer) = tokio::io::split(part.control);
-        let (feedback, changes) = watch::channel(udp::Feedback::default());
+        let (feedback, changes) = watch::channel(delivery::Feedback::default());
         tasks.spawn(udp::read_native_control_bound_timed(
             reader,
             index,
@@ -667,6 +701,8 @@ where
             native_changes,
             policy,
             budget.clone(),
+            index,
+            sent_tx.clone(),
         ));
         if receives {
             tasks.spawn(udp::read_datagrams(
@@ -705,6 +741,7 @@ where
                 })
                 .transpose()?,
             next_channel: 0,
+            feedback_first: true,
         });
     }
     drop(control_tx);
@@ -728,6 +765,10 @@ where
     let mut ingress: Option<Vec<u8>> = None;
     let mut selected: Option<pipeline::Packet> = None;
     let mut idle_cursor = None;
+    // A genuine peer ACK can beat our already-successful writer's callback.
+    // Retain that exact event until source acceptance is observed; neither a
+    // repair/feedback token nor native receipts/heartbeats require this deferral.
+    let mut pending_control = None;
     let result = async {
     loop {
         let packing_wake = states.iter().filter_map(|state| state.endpoint.packing_wake()).min();
@@ -737,8 +778,8 @@ where
                 None => std::future::pending().await,
             }}=>{},
             Some(result)=tasks.join_next()=>return match result { Ok(Err(error))=>Err(error), Err(error)=>Err(io::Error::other(error)), Ok(Ok(()))=>Err(invalid("aligned carrier task ended")) },
-            Some((lane,event,actual))=control_rx.recv()=>states[lane].control(event,delivery::since(started, actual)?,started.elapsed())?,
-            Some(sent)=sent_rx.recv()=>states[sent.lane].flight.as_mut().ok_or_else(||invalid("aligned send callback on receive-only lane"))?.sent(&sent.units,delivery::since(started, sent.at)?,started.elapsed())?,
+            Some(event)=control_rx.recv(), if pending_control.is_none()=>pending_control=Some(event),
+            Some(sent)=sent_rx.recv()=>states[sent.lane].sent(sent,started,started.elapsed())?,
             Some((lane,bytes))=data_rx.recv()=>{
                 let state=&mut states[lane];
                 if !state.receives || state.endpoint.inspect_peer(&bytes).map_err(io::Error::other)? == l2tunnel_reliable::RecordKind::Feedback { return Err(invalid("aligned datagram role or kind")); }
@@ -751,8 +792,19 @@ where
         // concurrently producing writer cannot create an unbounded drain loop.
         for _ in 0..sent_capacity {
             let Ok(sent) = sent_rx.try_recv() else { break };
-            states[sent.lane].flight.as_mut().ok_or_else(|| invalid("aligned unexpected send callback"))?
-                .sent(&sent.units, delivery::since(started, sent.at)?, started.elapsed())?;
+            states[sent.lane].sent(sent, started, started.elapsed())?;
+        }
+        if let Some((lane, event, actual)) = pending_control.as_ref() {
+            let original = delivery::since(started, *actual)?;
+            if started.elapsed() >= original.checked_add(policy.control_timeout)
+                .ok_or_else(|| invalid("aligned retained control deadline overflow"))? {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "aligned original control event deadline"));
+            }
+            let waits_for_source = states[*lane].waits_for_source_send(event);
+            if !waits_for_source {
+                let (lane, event, actual) = pending_control.take().ok_or_else(|| invalid("aligned retained control event"))?;
+                states[lane].control(event, delivery::since(started, actual)?, started.elapsed())?;
+            }
         }
         for state in &mut states {
             if let Some(flight) = &mut state.flight { flight.tick(started.elapsed())?; }
@@ -785,7 +837,7 @@ where
                     let now = if selection.burst_limit() == 0 { now } else { started.elapsed() };
                     state
                         .endpoint
-                        .prepare(channel, now, 4)
+                        .prepare_ordered(channel, now, 4)
                         .map_err(io::Error::other)?;
                     let Some(frame) = state.endpoint.pending() else {
                         continue;
@@ -826,24 +878,48 @@ where
                     state.check_retention(runtime)?;
                 }
             }
-            if state.outbound.is_some() {
-                if selection.burst_limit() == 0 {
-                    admit_native(state, &mut pipeline, &mut selected, now)?;
-                }
-                let outbound = state.outbound.as_ref().ok_or_else(|| invalid("missing aligned sender"))?;
+            if state.outbound.is_some() && selection.burst_limit() == 0 {
+                admit_native(state, &mut pipeline, &mut selected, now)?;
+            }
+            // Each physical lane retains its own exact output. A held datagram
+            // must not prevent independently writable recovery feedback.
+            // Alternate successful service, falling back immediately when the
+            // preferred class is idle, so neither data nor ACK debt can own it
+            // indefinitely while the other class has a due emission.
+            let order = if state.feedback_first { [true, false] } else { [false, true] };
+            for feedback in order {
                 let now = if selection.burst_limit() == 0 { now } else { started.elapsed() };
+                if feedback {
+                    if state.endpoint.pending_feedback_output().is_some() { continue; }
+                    if let Some(length) =
+                        budget.poll_with(true, now, &mut encoded, |output, allowance| {
+                            state.endpoint.poll_feedback_independent(now, output, allowance).map_err(io::Error::other)
+                        })?
+                    {
+                        let output = state.endpoint.pending_feedback_output()
+                            .ok_or_else(|| invalid("aligned feedback output has no physical token"))?;
+                        state.feedback.send_modify(|feedback| feedback.ack = Some(delivery::FeedbackOutput {
+                            bytes: encoded[..length].to_vec(), output,
+                        }));
+                        state.feedback_first = false;
+                    }
+                } else if state.outbound.is_some() {
+                if state.endpoint.pending_data_output().is_some() { continue; }
+                let outbound = state.outbound.as_ref().ok_or_else(|| invalid("missing aligned sender"))?;
                 match outbound.try_reserve() {
                     Ok(permit) => {
                         if let Some(length) =
                             budget.poll_with(false, now, &mut encoded, |output, allowance| {
                                 state
                                     .endpoint
-                                    .poll_data(now, output, allowance)
+                                    .poll_data_independent(now, output, allowance)
                                     .map_err(io::Error::other)
                             })?
                         {
                             let count = state.endpoint.outgoing_units(&encoded[..length], &mut units).map_err(io::Error::other)?;
-                            permit.send(delivery::Outbound { bytes: encoded[..length].to_vec(), units: units[..count].to_vec() });
+                            let output = state.endpoint.pending_data_output().ok_or_else(|| invalid("aligned data output has no physical token"))?;
+                            permit.send(delivery::Outbound { bytes: encoded[..length].to_vec(), units: units[..count].to_vec(), output: Some(output) });
+                            state.feedback_first = true;
                         }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {}
@@ -851,28 +927,20 @@ where
                         return Err(invalid("aligned datagram writer closed"));
                     }
                 }
-            }
-            let now = if selection.burst_limit() == 0 { now } else { started.elapsed() };
-            if let Some(length) =
-                budget.poll_with(true, now, &mut encoded, |output, allowance| {
-                    state
-                        .endpoint
-                        .poll_feedback(now, output, allowance)
-                        .map_err(io::Error::other)
-                })?
-            {
-                state
-                    .feedback
-                    .send_modify(|feedback| feedback.ack = Some(encoded[..length].to_vec()));
+                }
             }
         }
         if selection.burst_limit() == 0 {
             ingress_step(&mut device, &mut pipeline, &mut ingress, &mut packet, runtime, config, now)?;
         }
         if let Some(observer) = &observer {
-            let mut status = ActorStatus::default();
+            let mut status = ActorStatus { pending_control_lane: pending_control.as_ref().map(|(lane, _, _)| *lane), ..ActorStatus::default() };
             for (index, state) in states.iter().enumerate() {
                 status.flight[index] = state.flight.as_ref().map(|flight| flight.controller.status(delivery::micros(started.elapsed())?).map_err(io::Error::other)).transpose()?;
+                status.endpoint[index] = Some(state.endpoint.status());
+                status.pending_data[index] = state.endpoint.pending_data_output();
+                status.pending_feedback[index] = state.endpoint.pending_feedback_output();
+                status.arq[index] = Some(state.endpoint.arq_statistics());
             }
             observer.send_replace(status);
         }

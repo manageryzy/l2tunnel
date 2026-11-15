@@ -9,7 +9,7 @@ mod receiver;
 mod sender;
 pub use feedback::{FEEDBACK_BYTES, Feedback, FeedbackId, decode_feedback, encode_feedback};
 pub use receiver::{Receiver, ReceiverStatus, ReceiverStep};
-pub use sender::{FeedbackDisposition, Output, OutputId, Sender, SenderStatus};
+pub use sender::{FeedbackDisposition, Output, OutputId, Sender, SenderStatus, SourceCopy};
 
 /// Explicit scheduling and total owner reservation, with no inferred link properties.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
