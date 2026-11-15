@@ -86,6 +86,27 @@ pub struct Sender {
     terminal: Option<Error>,
 }
 impl Sender {
+    /// Admit the complete exact heap layout before constructing the same encoder.
+    /// Existing conservative policy/config caps and all original time checks remain.
+    pub fn new_reserved(
+        policy: Policy,
+        scope: Scope,
+        now: Tick,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_sender(policy)?;
+        plan.admit(limits, now)?;
+        let value = Self::new(policy, scope, now)?;
+        plan.verify(value.storage_usage()?, limits)?;
+        Ok(value)
+    }
+
+    /// Observe actual retained nested capacities, excluding the inline owner header.
+    /// This observation is also available for the unchanged compatibility constructor.
+    pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+        self.encoder.storage_usage()
+    }
+
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
         policy.validate()?;

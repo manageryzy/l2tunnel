@@ -227,6 +227,50 @@ enum Action {
     Capacity,
 }
 impl Decoder {
+    pub(super) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
+        let width = storage::width(config)?;
+        let row_bytes = mul(config.max_rows, add(config.window, width)?)?;
+        let cells = add(mul(3, config.window)?, mul(2, config.max_rows)?)?;
+        storage::requested::<u8>(row_bytes)?
+            .join(storage::requested::<u8>(row_bytes)?)?
+            .join(storage::requested::<Cell<Option<u32>>>(mul(
+                2,
+                config.window,
+            )?)?)?
+            .join(storage::requested::<Cell<Option<u32>>>(config.max_rows)?)?
+            .join(storage::requested::<Cell<Option<usize>>>(config.window)?)?
+            .join(storage::requested::<Cell<()>>(config.max_rows)?)?
+            .join(Pool::requested_storage(cells)?)?
+            .join(storage::requested::<u8>(mul(
+                mul(2, config.window)?,
+                width,
+            )?)?)?
+            .join(storage::requested::<u8>(width)?)?
+            .join(storage::requested::<u8>(add(config.window, width)?)?)?
+            .join(storage::requested::<u8>(mul(
+                config.repair_history,
+                width,
+            )?)?)?
+            .join(storage::requested::<Option<Descriptor>>(
+                config.repair_history,
+            )?)
+    }
+
+    pub(super) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+        storage::Usage::vector(&self.data[0])?
+            .join(storage::Usage::vector(&self.data[1])?)?
+            .join(storage::Usage::vector(&self.known)?)?
+            .join(storage::Usage::vector(&self.pivots)?)?
+            .join(storage::Usage::vector(&self.map)?)?
+            .join(storage::Usage::vector(&self.rows)?)?
+            .join(self.decisions.storage_usage()?)?
+            .join(storage::Usage::vector(&self.known_data)?)?
+            .join(storage::Usage::vector(&self.input)?)?
+            .join(storage::Usage::vector(&self.candidate)?)?
+            .join(storage::Usage::vector(&self.history)?)?
+            .join(storage::Usage::vector(&self.history_meta)?)
+    }
+
     /// Fixed equation versions, metadata decisions and history, checked before allocation.
     pub fn memory_bound(c: Config) -> Result<usize, Error> {
         let width = c.width()?;

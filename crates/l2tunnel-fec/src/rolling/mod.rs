@@ -8,6 +8,7 @@ use std::fmt;
 mod decoder;
 mod encoder;
 pub mod scheduler;
+pub mod storage;
 pub mod wire;
 pub use decoder::{Begin, DecodeStep, Decoder, DecoderStatus};
 pub use encoder::{Encoder, EncoderStatus};

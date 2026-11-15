@@ -51,6 +51,27 @@ pub struct Receiver {
     terminal: Option<Error>,
 }
 impl Receiver {
+    /// Admit every exact decoder bank, decision pool and scratch allocation first.
+    /// Existing conservative policy/config caps and all original time checks remain.
+    pub fn new_reserved(
+        policy: Policy,
+        scope: Scope,
+        now: Tick,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        let plan = storage::Plan::for_receiver(policy)?;
+        plan.admit(limits, now)?;
+        let value = Self::new(policy, scope, now)?;
+        plan.verify(value.storage_usage()?, limits)?;
+        Ok(value)
+    }
+
+    /// Observe every actual retained nested capacity, excluding the inline header.
+    /// The same observation works with the unchanged compatibility constructor.
+    pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+        self.decoder.storage_usage()
+    }
+
     /// Conservative total reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
         policy.validate()?;

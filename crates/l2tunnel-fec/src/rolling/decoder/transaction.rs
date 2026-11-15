@@ -22,6 +22,21 @@ pub(super) struct Pool {
     next: u64,
 }
 impl Pool {
+    pub(super) fn requested_storage(
+        cells: usize,
+    ) -> Result<super::super::storage::Usage, super::super::storage::Error> {
+        use super::super::storage;
+        let count = Self::count(cells)?;
+        storage::requested::<Decision>(count)?.join(storage::requested::<usize>(count)?)
+    }
+
+    pub(super) fn storage_usage(
+        &self,
+    ) -> Result<super::super::storage::Usage, super::super::storage::Error> {
+        use super::super::storage;
+        storage::Usage::vector(&self.decisions)?.join(storage::Usage::vector(&self.free)?)
+    }
+
     fn count(cells: usize) -> Result<usize, Error> {
         add(mul(2, cells)?, 1)
     }

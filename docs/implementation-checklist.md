@@ -76,6 +76,10 @@ The subsequent [mixed Bank](modules/common-record-bank.md),
 [native counts](modules/common-native-counts.md),
 [shared native storage](modules/shared-native-storage.md) and
 [compact rolling records](modules/rolling-records.md) have their own finite ledgers.
+The subsequent [actual rolling scheduler storage](modules/rolling-storage.md)
+adds complete requested/observed nested heap admission over the same existing
+owners. Three focused cases and strict affected checks pass; literal allocation
+failure and complete record/runtime integration remain required and open.
 Their leaf evidence does not close full SW-11, complete resource admission or
 retained-state recovery. Existing mode, native, platform and performance gates
 retain their full definitions.

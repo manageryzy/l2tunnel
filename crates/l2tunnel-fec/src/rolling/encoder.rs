@@ -42,6 +42,19 @@ pub struct Encoder {
     terminal: Option<Error>,
 }
 impl Encoder {
+    pub(super) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
+        let width = storage::width(config)?;
+        storage::requested::<u8>(mul(config.window, width)?)?
+            .join(storage::requested::<Option<u32>>(config.window)?)?
+            .join(storage::requested::<u8>(width)?)
+    }
+
+    pub(super) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+        storage::Usage::vector(&self.vectors)?
+            .join(storage::Usage::vector(&self.ids)?)?
+            .join(storage::Usage::vector(&self.output)?)
+    }
+
     /// Conservative payload and metadata reservation before allocating.
     pub fn memory_bound(config: Config) -> Result<usize, Error> {
         let width = config.width()?;
