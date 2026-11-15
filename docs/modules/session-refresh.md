@@ -634,6 +634,18 @@ changed after functional execution. Failed attempts and the build inventory
 sampling caveat remain in the receipt. No new full `tools/check.py`, selected
 runtime rekey, recovery default, native, CI or non-Linux qualification is claimed.
 
+## Managed initial runtime prerequisite checkpoint
+
+The [managed initial handoff](managed-initial-handoff.md), 2026-11-15, now carries
+actual selected Noise through managed Joining and real member admission on the
+original UDP socket, retaining opaque authority, the Noise clock origin, original
+caps and exact ciphertext tails. Four focused runtime cases individually pass in
+the [source-stable case receipt](../../work/parallel-features-20261115/parallel-wave2-cases-attempt-1/validation.json).
+The enclosing batch remains **FAILED, 26/27**; separate affected strict checks
+[passed](../../work/parallel-features-20261115/parallel-wave2-strict-attempt-1/validation.json).
+This prerequisite does not install v2 in the Common Driver, implement Lifecycle
+control or runtime fresh-DH/recovery. It does not close or narrow any SREF row.
+
 ## Acceptance ledger
 
 - [ ] [SREF-01] Freeze source-bound v2 selection, initial/refresh authority, exact wire/AAD/derivation, error/time/overlap/capacity and no-reset contracts before production changes; keep parent scope and owner decisions distinct.

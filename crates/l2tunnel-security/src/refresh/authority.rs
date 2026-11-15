@@ -283,6 +283,10 @@ pub struct Joining {
     failed: bool,
 }
 impl Joining {
+    /// Actual retained Joining cap, including original setup and initial key age.
+    pub const fn deadline(&self) -> Tick {
+        self.deadline
+    }
     /// Nonsecret actual initial context.
     pub const fn context(&self) -> Context {
         self.initial.context

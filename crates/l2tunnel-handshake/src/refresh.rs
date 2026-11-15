@@ -136,6 +136,10 @@ pub struct InitialJoining {
     inner: sec::Joining,
 }
 impl InitialJoining {
+    /// Actual retained Joining cap in the original confirmed Noise time domain.
+    pub fn deadline(&self) -> Time {
+        Time(self.inner.deadline().0)
+    }
     /// Actual initial session/transcript.
     pub fn binding(&self) -> SessionBinding {
         self.inner.context().binding

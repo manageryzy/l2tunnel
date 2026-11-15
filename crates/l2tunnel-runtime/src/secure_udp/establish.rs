@@ -19,6 +19,10 @@ use tokio::{
 };
 use zeroize::Zeroize;
 
+/// Explicit selected initial authority; the legacy root handoff is unchanged.
+#[path = "establish_refresh.rs"]
+pub mod refresh;
+
 /// Handshake-cover tag around an exact legacy admission record.
 pub const GATE_TAG: u8 = 0x80;
 /// Handshake-cover tag around a complete authenticated bootstrap ARQ packet.
@@ -132,6 +136,8 @@ pub enum Error {
     Gate(gate::Error),
     /// Maintained pinned-key Noise primitive rejected the exchange.
     Noise(hs::Error),
+    /// Selected managed initial custody rejected the consuming handoff.
+    Refresh(hs::refresh::Error),
     /// Selected bounded appearance codec rejected the operation.
     Cover(cover::Error),
     /// Native socket I/O failed; no retry/default migration is inferred.
@@ -151,6 +157,11 @@ impl From<gate::Error> for Error {
 impl From<hs::Error> for Error {
     fn from(value: hs::Error) -> Self {
         Self::Noise(value)
+    }
+}
+impl From<hs::refresh::Error> for Error {
+    fn from(value: hs::refresh::Error) -> Self {
+        Self::Refresh(value)
     }
 }
 impl From<cover::Error> for Error {
@@ -251,6 +262,80 @@ pub struct Established {
     pub deadline: Instant,
     /// Establishment observations at this handoff, not member/native readiness.
     pub statistics: Statistics,
+}
+
+// The material variants are created only by the corresponding actual Noise finish.
+// Public metadata cannot convert the legacy root into selected initial authority.
+#[allow(clippy::large_enum_variant)] // Transfer the actual bounded owner without a second root/allocation.
+pub(in crate::secure_udp) enum InitialMaterial {
+    Legacy(security::SessionRoot),
+    Managed(hs::refresh::ConfirmedInitial),
+}
+impl InitialMaterial {
+    pub(in crate::secure_udp) fn binding(&self) -> security::SessionBinding {
+        match self {
+            Self::Legacy(root) => root.binding(),
+            Self::Managed(initial) => initial.binding(),
+        }
+    }
+    pub(in crate::secure_udp) fn role(&self) -> security::Role {
+        match self {
+            Self::Legacy(root) => root.role(),
+            Self::Managed(initial) => initial.role(),
+        }
+    }
+}
+
+pub(in crate::secure_udp) struct EstablishedState {
+    pub(in crate::secure_udp) socket: UdpSocket,
+    pub(in crate::secure_udp) material: InitialMaterial,
+    pub(in crate::secure_udp) binding: security::SessionBinding,
+    pub(in crate::secure_udp) authenticated: hs::Binding,
+    pub(in crate::secure_udp) peers: Peers,
+    pub(in crate::secure_udp) cover: cover::Config,
+    pub(in crate::secure_udp) tail: BootstrapTail,
+    pub(in crate::secure_udp) next_outer: u32,
+    pub(in crate::secure_udp) deadline: Instant,
+    pub(in crate::secure_udp) statistics: Statistics,
+    // Selected Joining must continue the actual confirmed Noise time domain.
+    pub(in crate::secure_udp) origin: Instant,
+}
+impl EstablishedState {
+    fn into_legacy(self) -> Result<Established, Error> {
+        let InitialMaterial::Legacy(root) = self.material else {
+            return Err(Error::Protocol);
+        };
+        Ok(Established {
+            socket: self.socket,
+            root,
+            binding: self.binding,
+            authenticated: self.authenticated,
+            peers: self.peers,
+            cover: self.cover,
+            tail: self.tail,
+            next_outer: self.next_outer,
+            deadline: self.deadline,
+            statistics: self.statistics,
+        })
+    }
+}
+impl From<Established> for EstablishedState {
+    fn from(value: Established) -> Self {
+        Self {
+            socket: value.socket,
+            material: InitialMaterial::Legacy(value.root),
+            binding: value.binding,
+            authenticated: value.authenticated,
+            peers: value.peers,
+            cover: value.cover,
+            tail: value.tail,
+            next_outer: value.next_outer,
+            deadline: value.deadline,
+            statistics: value.statistics,
+            // Preserve the existing legacy member clock origin.
+            origin: Instant::now(),
+        }
+    }
 }
 
 struct Core {
@@ -648,12 +733,13 @@ pub async fn connect_observed(
         deadline,
         entropy,
         &mut report,
+        None,
     ))
     .await;
     if let Err(error) = &result {
         report.fail(diagnostics::establishment_reason(error));
     }
-    result
+    result.and_then(EstablishedState::into_legacy)
 }
 
 #[allow(clippy::too_many_arguments)] // Same bounded setup inputs plus a borrowed observation sink.
@@ -665,7 +751,8 @@ async fn connect_inner(
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
-) -> Result<Established, Error> {
+    selection: Option<hs::refresh::Selection>,
+) -> Result<EstablishedState, Error> {
     let peers = Peers {
         initiator: identity.local.public_key(),
         responder: identity.peer,
@@ -726,7 +813,7 @@ async fn connect_inner(
         next_outer,
         client: Some(client),
     }
-    .run(entropy, None, report)
+    .run(entropy, None, report, selection)
     .await
 }
 
@@ -760,13 +847,14 @@ pub async fn accept_observed(
         deadline,
         entropy,
         &mut report,
+        None,
     ))
     .await;
     report.server(admission.statistics());
     if let Err(error) = &result {
         report.fail(diagnostics::establishment_reason(error));
     }
-    result
+    result.and_then(EstablishedState::into_legacy)
 }
 
 async fn accept_inner(
@@ -776,7 +864,8 @@ async fn accept_inner(
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
-) -> Result<Established, Error> {
+    selection: Option<hs::refresh::Selection>,
+) -> Result<EstablishedState, Error> {
     let peers = Peers {
         initiator: identity.peer,
         responder: identity.local.public_key(),
@@ -851,7 +940,7 @@ async fn accept_inner(
         next_outer,
         client: None,
     }
-    .run(entropy, Some(admission), report)
+    .run(entropy, Some(admission), report, selection)
     .await;
     admission
         .gate
@@ -877,7 +966,8 @@ impl Exchange {
         entropy: &mut (impl hs::Entropy + Send),
         mut server: Option<&mut ServerAdmission>,
         report: &mut Reporter<'_, '_>,
-    ) -> Result<Established, Error> {
+        selection: Option<hs::refresh::Selection>,
+    ) -> Result<EstablishedState, Error> {
         report.stage(Stage::Noise);
         let role = if self.client.is_some() {
             hs::Role::Initiator
@@ -897,19 +987,32 @@ impl Exchange {
             core.statistics,
             core.control.as_ref().map(gate::ControlEngine::statistics),
         );
-        let mut handshake = hs::Handshake::new(
-            hs::Config {
-                role,
-                profile: self.setup.config.profile,
-                binding: authenticated,
-                deadline: hs_time(self.origin, core.end)?,
-            },
-            self.identity.local,
-            self.identity.peer,
-            self.identity.psk,
-            hs_time(self.origin, Instant::now())?,
-            entropy,
-        )?;
+        let config = hs::Config {
+            role,
+            profile: self.setup.config.profile,
+            binding: authenticated,
+            deadline: hs_time(self.origin, core.end)?,
+        };
+        let now = hs_time(self.origin, Instant::now())?;
+        let mut handshake = match selection {
+            Some(selection) => hs::Handshake::new_refreshable(
+                config,
+                selection,
+                self.identity.local,
+                self.identity.peer,
+                self.identity.psk,
+                now,
+                entropy,
+            )?,
+            None => hs::Handshake::new(
+                config,
+                self.identity.local,
+                self.identity.peer,
+                self.identity.psk,
+                now,
+                entropy,
+            )?,
+        };
         let mut parser = Parser::new();
         let mut pending = [0; FRAME_BYTES];
         let mut pending_len = 0;
@@ -990,9 +1093,21 @@ impl Exchange {
             }
             if handshake.is_complete() && pending_len == 0 {
                 before(Instant::now(), core.end)?;
-                let confirmed =
-                    handshake.finish_with_confirmation(hs_time(self.origin, Instant::now())?)?;
-                let binding = confirmed.root.binding();
+                let now = hs_time(self.origin, Instant::now())?;
+                let (material, confirmation) = if selection.is_some() {
+                    let confirmed = handshake.finish_refreshable_with_confirmation(now)?;
+                    (
+                        InitialMaterial::Managed(confirmed.initial),
+                        confirmed.confirmation,
+                    )
+                } else {
+                    let confirmed = handshake.finish_with_confirmation(now)?;
+                    (
+                        InitialMaterial::Legacy(confirmed.root),
+                        confirmed.confirmation,
+                    )
+                };
+                let binding = material.binding();
                 let statistics = core.statistics;
                 report.bootstrap(
                     statistics,
@@ -1001,14 +1116,14 @@ impl Exchange {
                 let peer = peer(self.setup.gate.path, role);
                 let tail = BootstrapTail {
                     core,
-                    confirmation: Some(confirmed.confirmation),
+                    confirmation: Some(confirmation),
                     peer_confirmation,
                     parser,
                     peer,
                 };
-                return Ok(Established {
+                return Ok(EstablishedState {
                     socket: self.socket,
-                    root: confirmed.root,
+                    material,
                     binding,
                     authenticated,
                     peers: self.peers,
@@ -1017,6 +1132,7 @@ impl Exchange {
                     next_outer: self.next_outer,
                     deadline: self.deadline,
                     statistics,
+                    origin: self.origin,
                 });
             }
             let now = Instant::now();

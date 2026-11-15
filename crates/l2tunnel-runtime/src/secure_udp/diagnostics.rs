@@ -178,7 +178,36 @@ pub fn establishment_reason(error: &establish::Error) -> Reason {
             hs::Error::Crypto | hs::Error::Protection => Reason::Crypto,
             _ => Reason::Protocol,
         },
+        establish::Error::Refresh(error) => refresh_reason(*error),
         establish::Error::Cover(_) => Reason::Cover,
         establish::Error::Io(_) => Reason::LocalIo,
+    }
+}
+
+/// Classify selected initial custody without public metadata or error strings.
+pub fn refresh_reason(error: hs::refresh::Error) -> Reason {
+    use l2tunnel_security::refresh::Error as Refresh;
+    match error {
+        hs::refresh::Error::Credentials => Reason::Authentication,
+        hs::refresh::Error::Handshake(error) => {
+            establishment_reason(&establish::Error::Noise(error))
+        }
+        hs::refresh::Error::Security(error) => match error {
+            Refresh::Configuration | Refresh::Context | Refresh::Mode | Refresh::Domains => {
+                Reason::Configuration
+            }
+            Refresh::TimeRegression => Reason::Clock,
+            Refresh::Deadline | Refresh::KeyExpired => Reason::OriginalDeadline,
+            Refresh::EpochExhausted => Reason::CounterExhausted,
+            Refresh::CopiesExhausted | Refresh::Allocation => Reason::Capacity,
+            Refresh::Protection(error) => match error {
+                l2tunnel_security::Error::Crypto => Reason::Crypto,
+                l2tunnel_security::Error::CounterExhausted
+                | l2tunnel_security::Error::KeyUsageExhausted => Reason::CounterExhausted,
+                l2tunnel_security::Error::Authentication => Reason::Authentication,
+                _ => Reason::Protocol,
+            },
+            _ => Reason::Protocol,
+        },
     }
 }

@@ -18,6 +18,10 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+/// Explicit managed initial authority, released only by actual member acceptance.
+#[path = "member_refresh.rs"]
+pub mod refresh;
+
 const ROUTE: u8 = 3;
 const ACCEPT_BYTES: usize = 34;
 const PROOF_WIRE: usize = 1 + 26 + identity::MEMBER_PROOF_BYTES;
@@ -95,6 +99,157 @@ pub struct Parts {
     pub deadline: Instant,
     /// Non-secret authenticated status.
     pub info: Info,
+}
+
+struct MemberState {
+    socket: UdpSocket,
+    material: establish::InitialMaterial,
+    cover: cover::Config,
+    bootstrap: establish::BootstrapTail,
+    joining: JoiningTail,
+    next_outer: u32,
+    deadline: Instant,
+    info: Info,
+    origin: Instant,
+}
+impl MemberState {
+    fn into_legacy(self) -> io::Result<Authenticated> {
+        let establish::InitialMaterial::Legacy(root) = self.material else {
+            return Err(invalid("selected member custody is not a legacy root"));
+        };
+        Ok(Authenticated(Parts {
+            socket: self.socket,
+            root,
+            cover: self.cover,
+            bootstrap: self.bootstrap,
+            joining: self.joining,
+            next_outer: self.next_outer,
+            deadline: self.deadline,
+            info: self.info,
+        }))
+    }
+}
+
+#[allow(clippy::large_enum_variant)] // Both branches retain the actual crypto pair in the same setup loop.
+enum JoiningCrypto {
+    Legacy {
+        sender: security::Sender,
+        receiver: security::Receiver,
+    },
+    Managed(l2tunnel_handshake::refresh::InitialJoining),
+}
+enum JoiningError {
+    Packet(security::Error),
+    Managed(l2tunnel_handshake::refresh::Error),
+}
+impl JoiningError {
+    fn reason(&self) -> Reason {
+        match *self {
+            Self::Packet(error) => security_reason(error),
+            Self::Managed(error) => diagnostics::refresh_reason(error),
+        }
+    }
+    fn terminal(&self) -> bool {
+        match self {
+            Self::Packet(error) => matches!(
+                error,
+                security::Error::Crypto
+                    | security::Error::CounterExhausted
+                    | security::Error::KeyUsageExhausted
+            ),
+            Self::Managed(_) => true,
+        }
+    }
+}
+impl JoiningCrypto {
+    fn open(
+        &mut self,
+        origin: Instant,
+        now: Instant,
+        context: identity::Context,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<security::Opened, JoiningError> {
+        match self {
+            Self::Legacy { receiver, .. } => receiver
+                .open(joining_metadata(context), input, output)
+                .map_err(JoiningError::Packet),
+            Self::Managed(joining) => {
+                let now = joining_time(origin, now).map_err(|_| {
+                    JoiningError::Managed(l2tunnel_handshake::refresh::Error::Security(
+                        security::refresh::Error::TimeRegression,
+                    ))
+                })?;
+                joining
+                    .open(now, input, output)
+                    .map_err(|error| match error {
+                        l2tunnel_handshake::refresh::Error::Security(
+                            security::refresh::Error::Protection(error),
+                        ) => JoiningError::Packet(error),
+                        error => JoiningError::Managed(error),
+                    })
+            }
+        }
+    }
+    fn seal(
+        &mut self,
+        origin: Instant,
+        now: Instant,
+        context: identity::Context,
+        body: &[u8],
+        output: &mut [u8],
+        report: &mut Reporter<'_, '_>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Legacy { sender, .. } => seal_observed(sender, context, body, output, report),
+            Self::Managed(joining) => {
+                let destination = output
+                    .get_mut(1..)
+                    .ok_or_else(|| invalid("Joining output bound"))?;
+                let sealed = joining
+                    .seal(joining_time(origin, now)?, body, destination)
+                    .map_err(|error| refresh_error(error, report))?;
+                if sealed.number != security::PacketNumber(0) || sealed.bytes + 1 != output.len() {
+                    return Err(invalid("Joining flight must be sealed once at number zero"));
+                }
+                output[0] = ROUTE;
+                Ok(())
+            }
+        }
+    }
+    fn deadline(&self, origin: Instant, outer: Instant) -> io::Result<Instant> {
+        match self {
+            Self::Legacy { .. } => Ok(outer),
+            Self::Managed(joining) => origin
+                .checked_add(Duration::from_micros(joining.deadline().0))
+                .map(|end| end.min(outer))
+                .ok_or_else(|| invalid("Joining cap conversion overflow")),
+        }
+    }
+    fn finish(
+        self,
+        root: Option<security::SessionRoot>,
+        origin: Instant,
+        now: Instant,
+        report: &mut Reporter<'_, '_>,
+    ) -> io::Result<establish::InitialMaterial> {
+        match self {
+            Self::Legacy { sender, receiver } => {
+                drop((sender, receiver));
+                root.map(establish::InitialMaterial::Legacy)
+                    .ok_or_else(|| invalid("legacy member root custody missing"))
+            }
+            Self::Managed(joining) => {
+                if root.is_some() {
+                    return Err(invalid("managed member has legacy root custody"));
+                }
+                joining
+                    .retire(joining_time(origin, now)?)
+                    .map(establish::InitialMaterial::Managed)
+                    .map_err(|error| refresh_error(error, report))
+            }
+        }
+    }
 }
 
 struct Cache {
@@ -256,7 +411,9 @@ pub async fn connect_observed(
     settings: Settings,
     observe: &mut diagnostics::Observer<'_>,
 ) -> io::Result<Authenticated> {
-    drive_observed(established, Local::Client(member), settings, observe).await
+    drive_observed(established.into(), Local::Client(member), settings, observe)
+        .await?
+        .into_legacy()
 }
 
 /// Verify membership with observations; no secret or provider error text is published.
@@ -266,15 +423,22 @@ pub async fn accept_observed(
     settings: Settings,
     observe: &mut diagnostics::Observer<'_>,
 ) -> io::Result<Authenticated> {
-    drive_observed(established, Local::Server(members), settings, observe).await
+    drive_observed(
+        established.into(),
+        Local::Server(members),
+        settings,
+        observe,
+    )
+    .await?
+    .into_legacy()
 }
 
 async fn drive_observed(
-    established: establish::Established,
+    established: establish::EstablishedState,
     local: Local<'_>,
     settings: Settings,
     observe: &mut diagnostics::Observer<'_>,
-) -> io::Result<Authenticated> {
+) -> io::Result<MemberState> {
     let mut report = Reporter::at(observe, Stage::Membership);
     report.bootstrap(
         established.tail.statistics(),
@@ -322,22 +486,22 @@ impl Quota {
 }
 
 async fn drive(
-    established: establish::Established,
+    established: establish::EstablishedState,
     local: Local<'_>,
     settings: Settings,
     report: &mut Reporter<'_, '_>,
-) -> io::Result<Authenticated> {
+) -> io::Result<MemberState> {
     let role = if matches!(&local, Local::Client(_)) {
         security::Role::Initiator
     } else {
         security::Role::Responder
     };
-    validate_observed(&established, settings, role, report)
+    validate_observed(EstablishedView::from(&established), settings, role, report)
         .inspect_err(|_| report.fail(Reason::Configuration))?;
     report.stage(Stage::Membership);
-    let establish::Established {
+    let establish::EstablishedState {
         socket,
-        mut root,
+        material,
         binding,
         authenticated,
         peers,
@@ -346,6 +510,7 @@ async fn drive(
         mut next_outer,
         deadline,
         statistics: _,
+        origin,
     } = established;
     let local_addr = socket
         .local_addr()
@@ -353,68 +518,96 @@ async fn drive(
     let peer_addr = socket
         .peer_addr()
         .inspect_err(|_| report.reason(Reason::LocalIo))?;
-    let origin = Instant::now();
-    observed_before(report, origin, deadline)?;
+    let origin = if matches!(&material, establish::InitialMaterial::Legacy(_)) {
+        Instant::now()
+    } else {
+        origin
+    };
+    let now = Instant::now();
+    observed_before(report, now, deadline)?;
     let identity_deadline = identity_time(origin, deadline)?;
-    let mut sender = root
-        .sender(
-            security::Purpose::Joining,
-            security::LaneId(0),
-            JOINING_LIMITS,
-            security::Protection::ChaCha20Poly1305,
-        )
-        .map_err(|error| {
-            report.reason(security_reason(error));
-            security_error(error)
-        })?;
-    let mut receiver = root
-        .receiver(
-            security::Purpose::Joining,
-            security::LaneId(0),
-            JOINING_LIMITS,
-            security::Protection::ChaCha20Poly1305,
-        )
-        .map_err(|error| {
-            report.reason(security_reason(error));
-            security_error(error)
-        })?;
+    let (mut crypto, root) = match material {
+        establish::InitialMaterial::Legacy(mut root) => {
+            let sender = root
+                .sender(
+                    security::Purpose::Joining,
+                    security::LaneId(0),
+                    JOINING_LIMITS,
+                    security::Protection::ChaCha20Poly1305,
+                )
+                .map_err(|error| {
+                    report.reason(security_reason(error));
+                    security_error(error)
+                })?;
+            let receiver = root
+                .receiver(
+                    security::Purpose::Joining,
+                    security::LaneId(0),
+                    JOINING_LIMITS,
+                    security::Protection::ChaCha20Poly1305,
+                )
+                .map_err(|error| {
+                    report.reason(security_reason(error));
+                    security_error(error)
+                })?;
+            (JoiningCrypto::Legacy { sender, receiver }, Some(root))
+        }
+        establish::InitialMaterial::Managed(initial) => {
+            let joining = initial
+                .joining(
+                    JOINING_LIMITS,
+                    joining_time(origin, now)?,
+                    joining_time(origin, deadline)?,
+                )
+                .map_err(|error| refresh_error(error, report))?;
+            (JoiningCrypto::Managed(joining), None)
+        }
+    };
+    let joining_deadline = crypto.deadline(origin, deadline)?;
+    observed_before(report, Instant::now(), joining_deadline)?;
     let mut client_member = None;
     let mut outgoing = [0; PROOF_WIRE];
     let mut retained_root = None;
     let mut pending = None;
+    let mut managed_members = None;
     match local {
         Local::Client(member) => {
             let proof = identity::MemberProof::sign(member, settings.context).map_err(|error| {
                 report.reason(identity_reason(error));
                 identity_error(error)
             })?;
-            seal_observed(
-                &mut sender,
+            crypto.seal(
+                origin,
+                Instant::now(),
                 settings.context,
                 proof.as_bytes(),
                 &mut outgoing,
                 report,
             )?;
             client_member = Some(member.public_key());
-            retained_root = Some(root);
+            retained_root = root;
         }
         Local::Server(members) => {
-            pending = Some(
-                identity::ServerPending::new(
-                    root,
-                    settings.context,
-                    members,
-                    identity::Time(0),
-                    identity_deadline,
-                )
-                .map_err(|error| {
-                    report.reason(identity_reason(error));
-                    identity_error(error)
-                })?,
-            );
+            if let Some(root) = root {
+                pending = Some(
+                    identity::ServerPending::new(
+                        root,
+                        settings.context,
+                        members,
+                        identity_time(origin, now)?,
+                        identity_deadline,
+                    )
+                    .map_err(|error| {
+                        report.reason(identity_reason(error));
+                        identity_error(error)
+                    })?,
+                );
+            } else {
+                managed_members = Some(members);
+            }
         }
     }
-    let mut quota = Quota::new(settings, origin)?;
+    let mut quota = Quota::new(settings, now)?;
     let mut input = vec![
         0;
         cover
@@ -427,11 +620,12 @@ async fn drive(
     let mut workspace = [0; identity::MEMBER_PROOF_BYTES + 16];
     let mut attempts = 0u32;
     report.member(attempts);
-    let mut retry = origin;
+    let mut retry = now;
     loop {
         report.bootstrap(tail.statistics(), tail.control_statistics());
         let now = Instant::now();
         observed_before(report, now, deadline)?;
+        observed_before(report, now, joining_deadline)?;
         if let Some(length) = tail
             .poll(
                 now,
@@ -446,7 +640,7 @@ async fn drive(
         {
             advance(&mut next_outer)?;
             report.bootstrap(tail.statistics(), tail.control_statistics());
-            handoff_observed(deadline, send(&socket, &output[..length]), report).await?;
+            handoff_observed(joining_deadline, send(&socket, &output[..length]), report).await?;
         }
         let now = Instant::now();
         observed_before(report, now, deadline)?;
@@ -469,7 +663,7 @@ async fn drive(
             attempts += 1;
             report.member(attempts);
             report.bootstrap(tail.statistics(), tail.control_statistics());
-            handoff_observed(deadline, send(&socket, &output[..length]), report).await?;
+            handoff_observed(joining_deadline, send(&socket, &output[..length]), report).await?;
             retry = Instant::now()
                 .checked_add(settings.retry_interval)
                 .ok_or_else(|| invalid("Joining retry overflow"))?;
@@ -477,7 +671,11 @@ async fn drive(
         let now = Instant::now();
         observed_before(report, now, deadline)?;
         let ready = quota.ready(now)?;
-        let mut wake = tail.deadline().unwrap_or(deadline).min(deadline);
+        let mut wake = tail
+            .deadline()
+            .unwrap_or(deadline)
+            .min(deadline)
+            .min(joining_deadline);
         if client_member.is_some() {
             wake = wake.min(retry);
         }
@@ -488,7 +686,8 @@ async fn drive(
             wake = now
                 .checked_add(settings.retry_interval.min(settings.receive_interval))
                 .ok_or_else(|| invalid("Joining wake overflow"))?
-                .min(deadline);
+                .min(deadline)
+                .min(joining_deadline);
         }
         report.bootstrap(tail.statistics(), tail.control_statistics());
         tokio::select! {
@@ -496,6 +695,7 @@ async fn drive(
             received = receive(&socket, &mut input), if ready => {
                 let now = Instant::now();
                 observed_before(report, now, deadline)?;
+                observed_before(report, now, joining_deadline)?;
                 quota.used += 1;
                 let length = match received {
                     Ok(length) => length,
@@ -508,10 +708,10 @@ async fn drive(
                 let expected = if client_member.is_some() { ACCEPT_WIRE } else { PROOF_WIRE };
                 if decoded.phase != cover::Phase::Established || decoded.protected.len() != expected
                     || decoded.protected.first() != Some(&ROUTE) { continue; }
-                let opened = match receiver.open(joining_metadata(settings.context), &decoded.protected[1..], &mut workspace) {
+                let opened = match crypto.open(origin, now, settings.context, &decoded.protected[1..], &mut workspace) {
                     Ok(opened) => opened,
-                    Err(error @ (security::Error::Crypto | security::Error::CounterExhausted | security::Error::KeyUsageExhausted)) =>
-                        { report.reason(security_reason(error)); return Err(io::Error::new(io::ErrorKind::InvalidData, "Joining security owner failed")); },
+                    Err(error) if error.terminal() =>
+                        { report.reason(error.reason()); return Err(io::Error::new(io::ErrorKind::InvalidData, "Joining security owner failed")); },
                     Err(_) => continue,
                 };
                 if opened.number != security::PacketNumber(0) { report.reason(Reason::Protocol); return Err(denied("unexpected authenticated Joining number")); }
@@ -521,34 +721,42 @@ async fn drive(
                         return Err(denied("authenticated member acceptance mismatch"));
                     }
                     observed_before(report, Instant::now(), deadline)?;
-                    let root = retained_root.take().ok_or_else(|| invalid("client root custody missing"))?;
-                    let joining = JoiningTail::empty(cover, settings, deadline, Instant::now());
+                    let material = crypto.finish(retained_root.take(), origin, Instant::now(), report)?;
+                    let joining = JoiningTail::empty(cover, settings, joining_deadline, Instant::now());
                     let info = Info { binding, authenticated, member, peers, role, local_addr, peer_addr, statistics: tail.statistics() };
                     observed_before(report, Instant::now(), deadline)?;
                     report.bootstrap(tail.statistics(), tail.control_statistics());
-                    return Ok(Authenticated(Parts { socket, root, cover, bootstrap: tail, joining, next_outer, deadline, info }));
+                    return Ok(MemberState { socket, material, cover, bootstrap: tail, joining, next_outer, deadline, info, origin });
                 }
-                let admitted = pending.take().ok_or_else(|| invalid("server root custody missing"))?
-                    .accept(identity_time(origin, now)?, &workspace[..opened.bytes]).map_err(|error| { report.reason(identity_reason(error)); identity_error(error) })?;
+                let (member, root) = if let Some(members) = managed_members.as_ref() {
+                    let member = identity::verify_member(&workspace[..opened.bytes], settings.context, members)
+                        .map_err(|error| { report.reason(identity_reason(error)); identity_error(error) })?;
+                    (member, None)
+                } else {
+                    let admitted = pending.take().ok_or_else(|| invalid("server root custody missing"))?
+                        .accept(identity_time(origin, now)?, &workspace[..opened.bytes]).map_err(|error| { report.reason(identity_reason(error)); identity_error(error) })?;
+                    (admitted.member, Some(admitted.root))
+                };
                 observed_before(report, Instant::now(), deadline)?;
                 let mut body = [0; ACCEPT_BYTES];
                 body[..2].copy_from_slice(&[1, 2]);
-                body[2..].copy_from_slice(&admitted.member.0);
+                body[2..].copy_from_slice(&member.0);
                 let mut accepted = [0; ACCEPT_WIRE];
-                seal_observed(&mut sender, settings.context, &body, &mut accepted, report)?;
+                crypto.seal(origin, Instant::now(), settings.context, &body, &mut accepted, report)?;
                 let length = cover.encode(metadata(next_outer, cover::Phase::Established), &accepted, &mut output).map_err(|error| { report.reason(Reason::Cover); cover_error(error) })?;
                 advance(&mut next_outer)?;
                 report.member(1);
                 report.bootstrap(tail.statistics(), tail.control_statistics());
-                handoff_observed(deadline, send_acceptance(&socket, &output[..length]), report).await?;
+                handoff_observed(joining_deadline, send_acceptance(&socket, &output[..length]), report).await?;
                 let now = Instant::now();
                 observed_before(report, now, deadline)?;
+                let material = crypto.finish(root, origin, now, report)?;
                 let proof: [u8; PROOF_WIRE] = decoded.protected.try_into().map_err(|_| invalid("authenticated proof length"))?;
-                let joining = JoiningTail::server(cover, settings, deadline, now, proof, accepted);
-                let info = Info { binding, authenticated, member: admitted.member, peers, role, local_addr, peer_addr, statistics: tail.statistics() };
+                let joining = JoiningTail::server(cover, settings, joining_deadline, now, proof, accepted);
+                let info = Info { binding, authenticated, member, peers, role, local_addr, peer_addr, statistics: tail.statistics() };
                 observed_before(report, Instant::now(), deadline)?;
                 report.bootstrap(tail.statistics(), tail.control_statistics());
-                return Ok(Authenticated(Parts { socket, root: admitted.root, cover, bootstrap: tail, joining, next_outer, deadline, info }));
+                return Ok(MemberState { socket, material, cover, bootstrap: tail, joining, next_outer, deadline, info, origin });
             }
         }
     }
@@ -562,10 +770,54 @@ fn validate(
 ) -> io::Result<()> {
     let mut noop = |_| {};
     let mut report = Reporter::at(&mut noop, Stage::Membership);
-    validate_observed(established, settings, role, &mut report)
+    validate_observed(
+        EstablishedView::from(established),
+        settings,
+        role,
+        &mut report,
+    )
+}
+struct EstablishedView<'a> {
+    socket: &'a UdpSocket,
+    actual_binding: security::SessionBinding,
+    role: security::Role,
+    binding: security::SessionBinding,
+    authenticated: l2tunnel_handshake::Binding,
+    peers: establish::Peers,
+    cover: cover::Config,
+    deadline: Instant,
+}
+#[cfg(test)]
+impl<'a> From<&'a establish::Established> for EstablishedView<'a> {
+    fn from(value: &'a establish::Established) -> Self {
+        Self {
+            socket: &value.socket,
+            actual_binding: value.root.binding(),
+            role: value.root.role(),
+            binding: value.binding,
+            authenticated: value.authenticated,
+            peers: value.peers,
+            cover: value.cover,
+            deadline: value.deadline,
+        }
+    }
+}
+impl<'a> From<&'a establish::EstablishedState> for EstablishedView<'a> {
+    fn from(value: &'a establish::EstablishedState) -> Self {
+        Self {
+            socket: &value.socket,
+            actual_binding: value.material.binding(),
+            role: value.material.role(),
+            binding: value.binding,
+            authenticated: value.authenticated,
+            peers: value.peers,
+            cover: value.cover,
+            deadline: value.deadline,
+        }
+    }
 }
 fn validate_observed(
-    established: &establish::Established,
+    established: EstablishedView<'_>,
     settings: Settings,
     role: security::Role,
     report: &mut Reporter<'_, '_>,
@@ -580,9 +832,9 @@ fn validate_observed(
     {
         return Err(invalid("Joining interval/attempt/receive policy"));
     }
-    let binding = established.root.binding();
+    let binding = established.actual_binding;
     let authenticated = established.authenticated;
-    if established.root.role() != role
+    if established.role != role
         || binding != established.binding
         || binding.session != settings.context.session
         || binding.transcript != settings.context.transcript
@@ -684,6 +936,25 @@ fn identity_time(origin: Instant, now: Instant) -> io::Result<identity::Time> {
     Ok(identity::Time(u64::try_from(elapsed.as_micros()).map_err(
         |_| invalid("Joining time conversion overflow"),
     )?))
+}
+fn joining_time(origin: Instant, now: Instant) -> io::Result<l2tunnel_handshake::Time> {
+    identity_time(origin, now).map(|at| l2tunnel_handshake::Time(at.0))
+}
+fn refresh_error(
+    error: l2tunnel_handshake::refresh::Error,
+    report: &mut Reporter<'_, '_>,
+) -> io::Error {
+    let reason = diagnostics::refresh_reason(error);
+    report.reason(reason);
+    let kind = match reason {
+        Reason::OriginalDeadline | Reason::BootstrapDeadline | Reason::MembershipDeadline => {
+            io::ErrorKind::TimedOut
+        }
+        Reason::Authentication => io::ErrorKind::PermissionDenied,
+        Reason::Configuration => io::ErrorKind::InvalidInput,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, "managed Joining owner rejected operation")
 }
 fn before(now: Instant, end: Instant) -> io::Result<()> {
     if now >= end {
@@ -837,3 +1108,7 @@ fn bootstrap_error(error: establish::Error) -> io::Error {
 #[cfg(test)]
 #[path = "member_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "member_refresh_tests.rs"]
+mod refresh_tests;
