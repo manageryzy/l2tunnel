@@ -1,9 +1,11 @@
 # OpenVPN outer-wire carrier
 
-Status: **implemented; six pure wire/control tests, four protected-factory tests
-and three explicit raw-substrate tests passed in their recorded finite scopes**.
-The latest affected batch revalidated all seven carrier cases; its aggregate
-result is **failed: 23 of 26 cases passed**, not a passing stage acceptance.
+Status: **implemented; earlier six pure wire/control cases and the latest ten
+carrier plus three original-datagram adapter cases passed in their finite scopes**.
+The latest affected batch remains **failed: 26 of 27 cases passed**; the failing
+case was a rolling literal fixture. The new six-package strict checks passed;
+the [named custody receipt](../../work/parallel-features-20261115/parallel-wave2-datagram-custody-scoped-validation.json)
+preserves the failed enclosing batch and its individual positive evidence.
 The raw substrate retains real TLS/member control without exporter data resealing;
 it is not yet the selected common Noise/member/runtime handoff.
 The original custom-gate implementation and its native, outage and drain receipts
@@ -66,6 +68,18 @@ replay, authenticated User/Control dispatch and full/half-direction policy. Loca
 `outer_info()` reports the real outer TLS/member proof, not common Noise membership;
 `control()` retains that actual TLS stream. Addresses, exact effective config and
 wire-admission status remain observable.
+
+Raw `try_send_until(Class, record, deadline)` now returns a move-only
+`PendingSend`, never a successful socket byte count on queue admission. The actor
+retains its class permit, exact encoded output and original cap across
+`WouldBlock`, checks that cap before and after the whole write, and returns
+`SendFailure::Expired { accepted: Some(receipt) }` when a real whole write crosses
+it. That physical fact is not rolled back or qualified as a successful drain.
+User and Control retain independent bounded custody; outer TLS service continues.
+`physical_status()` observes actual whole socket writes separately from wire
+admissions; overlapping inner/outer ledger counts must not be added as network
+bytes. Raw `client_connect_until`/`server_accept_until` also retain the accepted
+operation's absolute setup cap without restarting it.
 
 The real certificate-root/name check and existing member allowlist remain the
 authority. Outer session/key IDs and reset completion grant no membership. This
@@ -141,8 +155,10 @@ primitives use test-injected bindings; they do not establish that integration.
 Conversely, the existing common Noise/member `member::Parts` and
 `transport::run_common` handoff owns a concrete connected `UdpSocket`, appearance
 configuration/counter, session root and retained bootstrap/Joining tails. It does
-not accept this OpenVPN actor/TLS-control owner. Integration therefore needs an
-explicit bounded carrier handoff that retains the original socket and genuine
+not install this OpenVPN actor/TLS-control owner. The registered
+[OriginalDatagram custody adapter](original-datagram-custody.md) now owns real UDP
+or raw OpenVPN I/O, but actual bootstrap/member/Parts/Driver/service installation
+still needs the explicit handoff that retains the original socket and genuine
 TLS control, preserves original setup/final-flight deadlines and exact full-wire
 pacing, and gives the actual common security/management loop one authoritative
 owner. The new outer contract, authenticated binding, handshake placement and
@@ -246,9 +262,10 @@ protected carrier cases above and these three exact raw-substrate cases passed:
 - `wire_carrier::common::tests::actual_raw_emission_retains_wouldblock_bytes_and_exact_wire_charge_without_crypto_storage`: the actor's actual shared raw encoder uses an empty crypto buffer and emits one standard opcode plus byte-exact opaque content; two injected `WouldBlock` attempts retain identical bytes, pending completion and one full-IP debit; a subsequent actual connected UDP whole write completes the pending output. This exercises the physical-output helper, not simultaneous whole-actor TLS/Control service under a blocked User output.
 - `wire_carrier::common::tests::raw_policy_has_distinct_binding_and_retains_control_reservation_after_user_saturation`: exact raw MTU boundary/refusal and a distinct authenticated configuration domain; the actual shared budget blocks further User admission after saturation while still admitting Control. Paused time makes this quota test deterministic; it is separate from the retained-output test.
 
-The raw source provides separate bounded User/Control ownership, but combined
-whole-actor retained User-`WouldBlock` with continuing TLS and common Control
-service remains an explicit unverified case. These passes do not demonstrate a
+Those original three raw cases did not exercise combined whole-actor retained
+User-`WouldBlock` with continuing TLS and common Control. The later finite custody
+case below now covers that path with a per-construction injected User write gate.
+Neither set of passes demonstrates a
 production `Parts` handoff, selected common admission/member binding, shared
 service/native loop, complete authenticated management FSM, liveness, rekey or
 negotiated switching through OpenVPN. They also provide no standard-dissector,
@@ -270,3 +287,22 @@ reuses these13 distinct positive cases and passes strict affected formatting,
 Clippy and rustdoc after the raw addition. The single later recv rustdoc
 clarification changes no behavior. No failed full aggregate is relabeled and
 no unaffected test suite is repeated. OWC-04..06 remain open.
+
+The later [custody batch](../../work/parallel-features-20261115/parallel-wave2-cases-attempt-1/validation.json)
+records source/executable stability, all seven earlier carrier cases passing
+again, and three new exact `wire_carrier::common::tests::custody` passes:
+
+- `real_actor_retains_user_wouldblock_while_common_control_and_tls_complete`: waits for the actual actor's User WB counter under a per-construction test gate; real common Control and TLS complete on the same socket before User is released.
+- `real_actor_original_packet_expiry_refuses_held_user_without_blocking_control`: the original packet cap refuses the held User write while Control remains usable.
+- `actual_whole_write_crossing_original_cap_retains_late_fact_and_single_debit`: real kernel UDP write with injected pre/post observation times preserves the late receipt and one wire debit. This is not measured kernel deadline latency.
+
+The same receipt records the three registered runtime adapter passes described in
+[original-datagram-custody.md](original-datagram-custody.md). Its aggregate remains
+**failed, 26/27**, regardless of the unrelated fixture's later repair. The
+[source freeze](../../work/openvpn-send-custody-20261115/source-freeze-v0.json)
+binds the authored custody slice; root additionally registered the runtime module
+and added its checked pending-total overflow guard. New six-package strict
+Clippy/rustdoc/format validation [passed separately](../../work/parallel-features-20261115/parallel-wave2-strict-attempt-1/validation.json),
+not by inheritance from the earlier checkpoint. Actual common admission/member binding, bootstrap/Parts/Driver/shared
+service installation, all management/liveness/rekey/SW-11 requirements and the
+complete OWC-04..06 definitions remain open.

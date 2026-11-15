@@ -239,6 +239,7 @@ struct Submission {
     bytes: Vec<u8>,
     control: bool,
     completion: oneshot::Sender<Result<(), Error>>,
+    custody: Option<common::send::Custody>,
 }
 // Exactly one selected data owner stays inline; opaque activation creates no
 // exporter sealer/opener and this tag never grants authentication to input.
@@ -314,6 +315,7 @@ impl Carrier {
                 bytes: owned,
                 control: false,
                 completion,
+                custody: None,
             })
             .await
             .map_err(|_| Error::Closed)?;
@@ -340,6 +342,7 @@ struct Started {
     local: SocketAddr,
     peer: SocketAddr,
     budget: crate::budget::Budget,
+    raw: Option<common::send::Shared>,
 }
 impl Drop for Started {
     fn drop(&mut self) {
@@ -418,6 +421,9 @@ fn start(
         activate,
         started,
         budget: budget.clone(),
+        physical: None,
+        #[cfg(test)]
+        user_gate: None,
     }));
     Ok(Started {
         io: Some(io),
@@ -429,6 +435,7 @@ fn start(
         local,
         peer,
         budget,
+        raw: None,
     })
 }
 

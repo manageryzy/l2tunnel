@@ -7,6 +7,18 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The latest parallel functionality batch adds actual
+[rolling common configuration/Engine/Bank](modules/rolling-common-records.md),
+[managed initial authentication handoff](modules/managed-initial-handoff.md) and
+[UDP/OpenVPN physical-send custody](modules/original-datagram-custody.md).
+The27-case batch has26 individual passes and remains failed; its one new reverse
+literal fixture was corrected and passed alone. Six affected packages pass
+strict formatting, Clippy and rustdoc. No unrelated suite ran. Actual fourth-family
+runtime work/whole-send completion, Common timed-v2/fresh-DH Lifecycle dispatch,
+OpenVPN bootstrap/Joining/Parts/Driver/service selection and every full resource/
+fault/native/platform/performance gate remain open. No full `tools/check.py`,
+mode-parity or platform qualification is inferred.
+
 The [Common runtime/service checkpoint](../work/parallel-features-20261115/common-runtime-scoped-checkpoint-validation.json)
 installs the actual reserved mixed-profile Bank behind the existing leased
 transaction State, original Noise/member/security owners and sole UDP I/O loop.

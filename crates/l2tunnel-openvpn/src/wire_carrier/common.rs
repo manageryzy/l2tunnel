@@ -20,6 +20,9 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+pub(super) mod send;
+pub use send::{PendingSend, PhysicalStatus, SendFailure, SendReceipt};
+
 /// Explicit complete outer-wire policy, with no inner cipher/key-use settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -188,6 +191,7 @@ pub struct Carrier {
     budget: crate::budget::Budget,
     local: SocketAddr,
     peer: SocketAddr,
+    shared: send::Shared,
 }
 impl Carrier {
     /// Actual outer TLS/member proof, explicitly distinct from common Noise membership.
@@ -206,6 +210,15 @@ impl Carrier {
     pub fn wire_status(&self) -> Result<crate::WireStatus, Error> {
         self.budget.status().map_err(Error::Admission)
     }
+    /// Actual whole socket writes, including outer TLS traffic. These overlap
+    /// admission counters and must never be added to an inner policy ledger.
+    pub fn physical_status(&self) -> Result<PhysicalStatus, Error> {
+        self.shared.physical.status()
+    }
+    /// Original absolute outer lifetime; traffic and ticket retries never renew it.
+    pub fn expires(&self) -> Instant {
+        self.shared.expires
+    }
     /// The original real TLS stream remains available over OpenVPN control records.
     pub fn control(&mut self) -> &mut AuthenticatedIo<DuplexStream> {
         &mut self.connection
@@ -214,34 +227,126 @@ impl Carrier {
     /// Completes after one whole socket write, with no cipher operation or user ARQ.
     /// Local class selection reserves pacing only; cancellation may still send bytes.
     pub async fn send(&self, class: Class, record: &[u8]) -> Result<(), Error> {
-        if record.is_empty() || record.len() > self.config.max_record_bytes {
-            return Err(Error::Configuration);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(record.len())
-            .map_err(|_| Error::Allocation)?;
-        bytes.extend_from_slice(record);
-        let (completion, response) = oneshot::channel();
+        self.validate_send(record, self.shared.expires)?;
+        let permit = timeout_at(
+            self.shared.expires,
+            self.shared.slots(class).acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Closed)?;
+        let (submission, pending) = self.submission(class, record, self.shared.expires, permit)?;
         let input = if class == Class::Control {
             &self.priority
         } else {
             &self.input
         };
-        input
-            .send(Submission {
+        timeout_at(self.shared.expires, input.send(submission))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Closed)?;
+        match pending.await {
+            Ok(_) => Ok(()),
+            Err(SendFailure::Expired { .. }) => Err(Error::Timeout),
+            Err(SendFailure::Transport(error)) => Err(error),
+            Err(SendFailure::Consumed) => Err(Error::Closed),
+        }
+    }
+    /// Begin one bounded original-cap send without waiting for local capacity.
+    /// WouldBlock means no submission, encoding, wire debit or physical write.
+    /// Success returns custody only; the move-only ticket reports the whole write.
+    pub fn try_send_until(
+        &self,
+        class: Class,
+        record: &[u8],
+        deadline: Instant,
+    ) -> Result<PendingSend, Error> {
+        let deadline = deadline.min(self.shared.expires);
+        self.validate_send(record, deadline)?;
+        let permit = self
+            .shared
+            .slots(class)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => {
+                    Error::Io(std::io::ErrorKind::WouldBlock.into())
+                }
+                tokio::sync::TryAcquireError::Closed => Error::Closed,
+            })?;
+        let (submission, pending) = self.submission(class, record, deadline, permit)?;
+        let input = if class == Class::Control {
+            &self.priority
+        } else {
+            &self.input
+        };
+        input.try_send(submission).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => Error::Io(std::io::ErrorKind::WouldBlock.into()),
+            mpsc::error::TrySendError::Closed(_) => Error::Closed,
+        })?;
+        Ok(pending)
+    }
+    fn validate_send(&self, record: &[u8], deadline: Instant) -> Result<(), Error> {
+        if record.is_empty() || record.len() > self.config.max_record_bytes {
+            return Err(Error::Configuration);
+        }
+        record
+            .len()
+            .checked_add(self.config.outer_overhead_bytes)
+            .filter(|bytes| *bytes <= self.config.path_mtu)
+            .ok_or(Error::Configuration)?;
+        before_deadline(deadline)?;
+        Ok(())
+    }
+    fn submission(
+        &self,
+        class: Class,
+        record: &[u8],
+        deadline: Instant,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(Submission, PendingSend), Error> {
+        self.validate_send(record, deadline)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(record.len())
+            .map_err(|_| Error::Allocation)?;
+        bytes.extend_from_slice(record);
+        before_deadline(deadline)?;
+        let (completion, _) = oneshot::channel();
+        let (response, receiver) = oneshot::channel();
+        Ok((
+            Submission {
                 bytes,
                 control: class == Class::Control,
                 completion,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        response.await.map_err(|_| Error::Closed)?
+                custody: Some(send::Custody {
+                    deadline,
+                    class,
+                    record_bytes: record.len(),
+                    response,
+                    _permit: permit,
+                }),
+            },
+            PendingSend {
+                response: Some(receiver),
+                deadline,
+                class,
+                record_bytes: record.len(),
+            },
+        ))
     }
     /// Receive exact untrusted opaque bytes in arrival order; common security must open them.
     /// The caller authenticates and replay-checks them; this substrate does not filter duplicates.
     pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
         self.output.recv().await.ok_or(Error::Closed)
+    }
+    /// Poll the unique raw receive owner without adding another reader or queue.
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Vec<u8>, Error>> {
+        self.output
+            .poll_recv(cx)
+            .map(|packet| packet.ok_or(Error::Closed))
     }
 }
 impl Drop for Carrier {
@@ -283,6 +388,16 @@ fn start(
     let (outputs, output) = mpsc::channel(config.packet_slots);
     let (activation, activate) = mpsc::channel(1);
     let budget = crate::budget::Budget::new(config.wire_budget, started);
+    let expires = started
+        .checked_add(config.lifetime)
+        .ok_or(Error::Configuration)?;
+    let shared = send::Shared::new(
+        config
+            .packet_slots
+            .checked_add(2)
+            .ok_or(Error::Configuration)?,
+        expires,
+    );
     let actor = tokio::spawn(actor::run(actor::Inputs {
         socket,
         settings: config.actor(),
@@ -294,6 +409,9 @@ fn start(
         activate,
         started,
         budget: budget.clone(),
+        physical: Some(shared.physical.clone()),
+        #[cfg(test)]
+        user_gate: Some(shared.user_gate.clone()),
     }));
     Ok(Started {
         io: Some(io),
@@ -305,6 +423,7 @@ fn start(
         local,
         peer,
         budget,
+        raw: Some(shared),
     })
 }
 
@@ -318,6 +437,31 @@ pub async fn client_connect(
     let deadline = started
         .checked_add(config.handshake_timeout)
         .ok_or(Error::Configuration)?;
+    client_connect_from(socket, config, credentials, started, deadline).await
+}
+/// Retain the accepted operation's original absolute cap across the outer handshake.
+/// The configured maximum also applies; neither phase restarts that deadline.
+pub async fn client_connect_until(
+    socket: UdpSocket,
+    config: Config,
+    credentials: ClientCredentials<'_>,
+    accepted_deadline: Instant,
+) -> Result<Carrier, Error> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(config.handshake_timeout)
+        .ok_or(Error::Configuration)?
+        .min(accepted_deadline);
+    before_deadline(deadline)?;
+    client_connect_from(socket, config, credentials, started, deadline).await
+}
+async fn client_connect_from(
+    socket: UdpSocket,
+    config: Config,
+    credentials: ClientCredentials<'_>,
+    started: Instant,
+    deadline: Instant,
+) -> Result<Carrier, Error> {
     let mut parts = start(socket, config, control::Role::Client, started)?;
     let session = config.session_config()?;
     before_deadline(deadline)?;
@@ -349,6 +493,30 @@ pub async fn server_accept(
     let deadline = started
         .checked_add(config.handshake_timeout)
         .ok_or(Error::Configuration)?;
+    server_accept_from(socket, config, credentials, started, deadline).await
+}
+/// Server counterpart retaining the same externally accepted original setup cap.
+pub async fn server_accept_until(
+    socket: UdpSocket,
+    config: Config,
+    credentials: ServerCredentials<'_>,
+    accepted_deadline: Instant,
+) -> Result<Carrier, Error> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(config.handshake_timeout)
+        .ok_or(Error::Configuration)?
+        .min(accepted_deadline);
+    before_deadline(deadline)?;
+    server_accept_from(socket, config, credentials, started, deadline).await
+}
+async fn server_accept_from(
+    socket: UdpSocket,
+    config: Config,
+    credentials: ServerCredentials<'_>,
+    started: Instant,
+    deadline: Instant,
+) -> Result<Carrier, Error> {
     let mut parts = start(socket, config, control::Role::Server, started)?;
     let session = config.session_config()?;
     before_deadline(deadline)?;
@@ -391,6 +559,7 @@ async fn activate(
     .await;
     before_deadline(deadline)?;
     activated.map_err(|_| Error::Timeout)??;
+    let shared = parts.raw.take().ok_or(Error::Closed)?;
     let carrier = Carrier {
         connection,
         input: parts.input.take().ok_or(Error::Closed)?,
@@ -401,6 +570,7 @@ async fn activate(
         budget: parts.budget.clone(),
         local: parts.local,
         peer: parts.peer,
+        shared,
     };
     before_deadline(deadline)?;
     Ok(carrier)

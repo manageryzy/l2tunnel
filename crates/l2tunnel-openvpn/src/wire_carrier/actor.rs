@@ -1,5 +1,6 @@
 //! The sole connected socket owner. Retained emissions survive WouldBlock without
 //! another recovery attempt, packet number, encryption operation or wire charge.
+use super::common::send::{Custody, Ledger, SendFailure, SendReceipt};
 use super::{Activation, Data, Error, Submission, control, wire};
 use crate::budget::Budget;
 use l2tunnel_recovery::RecoveryError;
@@ -21,6 +22,9 @@ pub(super) struct Inputs {
     pub activate: mpsc::Receiver<Activation>,
     pub started: Instant,
     pub budget: Budget,
+    pub physical: Option<Ledger>,
+    #[cfg(test)]
+    pub user_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +133,7 @@ pub(super) fn poll_data(
 pub(super) struct PendingData {
     pub length: usize,
     pub completion: oneshot::Sender<Result<(), Error>>,
+    pub custody: Option<Custody>,
 }
 
 async fn priority_input(input: &mut Option<mpsc::Receiver<Submission>>) -> Option<Submission> {
@@ -138,18 +143,78 @@ async fn priority_input(input: &mut Option<mpsc::Receiver<Submission>>) -> Optio
     }
 }
 
+#[cfg(test)]
 pub(super) fn flush_data(
     pending: &mut Option<PendingData>,
     output: &[u8],
+    send: impl FnMut(&[u8]) -> std::io::Result<usize>,
+) -> Result<bool, Error> {
+    flush_data_with(pending, output, 0, None, Instant::now, send)
+}
+
+pub(super) fn flush_data_with(
+    pending: &mut Option<PendingData>,
+    output: &[u8],
+    ip_overhead: usize,
+    physical: Option<&Ledger>,
+    mut now: impl FnMut() -> Instant,
     mut send: impl FnMut(&[u8]) -> std::io::Result<usize>,
 ) -> Result<bool, Error> {
     let Some(packet) = pending.as_ref() else {
         return Ok(false);
     };
+    if let Some(custody) = packet.custody.as_ref() {
+        let cancelled = custody.response.is_closed();
+        if cancelled || now() >= custody.deadline {
+            if let Some(physical) = physical {
+                physical.refused(cancelled)?;
+            }
+            let packet = pending.take().ok_or(Error::Closed)?;
+            let custody = packet.custody.ok_or(Error::Closed)?;
+            let _ = custody
+                .response
+                .send(Err(SendFailure::Expired { accepted: None }));
+            let _ = packet.completion.send(Err(Error::Timeout));
+            return Ok(true);
+        }
+    }
     let bytes = output.get(..packet.length).ok_or(Error::Configuration)?;
+    let full_ip = packet
+        .length
+        .checked_add(ip_overhead)
+        .ok_or(Error::Configuration)?;
     match send(bytes) {
         Ok(sent) if sent == packet.length => {
+            let accepted_at = now();
             let packet = pending.take().ok_or(Error::Closed)?;
+            let late = packet
+                .custody
+                .as_ref()
+                .is_some_and(|value| accepted_at >= value.deadline);
+            if let Some(physical) = physical {
+                physical.written(
+                    packet.custody.as_ref().map(|value| value.class),
+                    full_ip,
+                    late,
+                )?;
+            }
+            if let Some(custody) = packet.custody {
+                let receipt = SendReceipt {
+                    record_bytes: custody.record_bytes,
+                    udp_bytes: sent,
+                    ip_bytes: full_ip,
+                    accepted_at,
+                    deadline: custody.deadline,
+                };
+                let result = if late {
+                    Err(SendFailure::Expired {
+                        accepted: Some(receipt),
+                    })
+                } else {
+                    Ok(receipt)
+                };
+                let _ = custody.response.send(result);
+            }
             let _ = packet.completion.send(Ok(()));
             Ok(true)
         }
@@ -158,9 +223,34 @@ pub(super) fn flush_data(
             "partial UDP data datagram",
         )
         .into()),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Some(physical) = physical {
+                physical.blocked(packet.custody.as_ref().map(|value| value.class))?;
+            }
+            Ok(false)
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+fn expire_held(held: &mut Option<Submission>, physical: Option<&Ledger>) -> Result<bool, Error> {
+    let Some(custody) = held.as_ref().and_then(|value| value.custody.as_ref()) else {
+        return Ok(false);
+    };
+    let cancelled = custody.response.is_closed();
+    if !cancelled && Instant::now() < custody.deadline {
+        return Ok(false);
+    }
+    if let Some(physical) = physical {
+        physical.refused(cancelled)?;
+    }
+    let submission = held.take().ok_or(Error::Closed)?;
+    let custody = submission.custody.ok_or(Error::Closed)?;
+    let _ = custody
+        .response
+        .send(Err(SendFailure::Expired { accepted: None }));
+    let _ = submission.completion.send(Err(Error::Timeout));
+    Ok(true)
 }
 
 pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
@@ -175,6 +265,9 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
         mut activate,
         started,
         budget,
+        physical,
+        #[cfg(test)]
+        user_gate,
     } = inputs;
     let maximum = transport.config().max_datagram_bytes;
     let ip_overhead = settings.ip_overhead;
@@ -205,6 +298,8 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                 return Err(Error::Control(control::Error::Expired));
             }
             let mut progress = false;
+            progress |= expire_held(&mut held, physical.as_ref())?;
+            progress |= expire_held(&mut held_priority, physical.as_ref())?;
             match socket.try_recv(&mut receive) {
                 Ok(length) => {
                     progress = true;
@@ -293,6 +388,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                 pending_data = Some(PendingData {
                     length,
                     completion: submission.completion,
+                    custody: submission.custody,
                 });
                 progress = true;
             }
@@ -312,12 +408,32 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                 pending_priority = Some(PendingData {
                     length,
                     completion: submission.completion,
+                    custody: submission.custody,
                 });
                 progress = true;
             }
             if let Some(length) = control_length {
+                let original_cap = started
+                    .checked_add(transport.expires())
+                    .ok_or(Error::Configuration)?;
+                if physical.is_some() && Instant::now() >= original_cap {
+                    return Err(Error::Control(control::Error::Expired));
+                }
                 match socket.try_send(&control_output[..length]) {
                     Ok(sent) if sent == length => {
+                        let late = physical.is_some() && Instant::now() >= original_cap;
+                        if let Some(physical) = &physical {
+                            physical.written(
+                                None,
+                                length
+                                    .checked_add(ip_overhead)
+                                    .ok_or(Error::Configuration)?,
+                                late,
+                            )?;
+                        }
+                        if late {
+                            return Err(Error::Control(control::Error::Expired));
+                        }
                         control_length = None;
                         progress = true;
                     }
@@ -332,18 +448,58 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                     Err(error) => return Err(error.into()),
                 }
             }
-            progress |= flush_data(&mut pending_priority, &priority_output, |bytes| {
-                socket.try_send(bytes)
-            })?;
-            progress |= flush_data(&mut pending_data, &data_output, |bytes| {
-                socket.try_send(bytes)
-            })?;
+            progress |= flush_data_with(
+                &mut pending_priority,
+                &priority_output,
+                ip_overhead,
+                physical.as_ref(),
+                Instant::now,
+                |bytes| socket.try_send(bytes),
+            )?;
+            progress |= flush_data_with(
+                &mut pending_data,
+                &data_output,
+                ip_overhead,
+                physical.as_ref(),
+                Instant::now,
+                |bytes| {
+                    #[cfg(test)]
+                    if user_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    socket.try_send(bytes)
+                },
+            )?;
             if !progress {
                 break;
             }
         }
+        let deadline = [
+            held.as_ref()
+                .and_then(|value| value.custody.as_ref())
+                .map(|value| value.deadline),
+            held_priority
+                .as_ref()
+                .and_then(|value| value.custody.as_ref())
+                .map(|value| value.deadline),
+            pending_data
+                .as_ref()
+                .and_then(|value| value.custody.as_ref())
+                .map(|value| value.deadline),
+            pending_priority
+                .as_ref()
+                .and_then(|value| value.custody.as_ref())
+                .map(|value| value.deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         tokio::select! {
             _ = timer.tick() => {},
+            _ = async { match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {},
             ready = socket.readable() => { ready?; },
             ready = socket.writable(), if control_length.is_some() || pending_priority.is_some() || pending_data.is_some() => { ready?; },
             read = tls_read.read(&mut tls_source), if tls_source_length == 0 => {

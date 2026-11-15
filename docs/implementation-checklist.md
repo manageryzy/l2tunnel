@@ -57,6 +57,16 @@ fresh-DH/retained recovery, portable Common IPC/CLI, rolling integration, full
 SW-11 and native/platform/performance gates remain open. See the unchanged
 [CTS-* acceptance definitions](modules/common-transaction-state.md).
 
+The subsequent parallel batch adds three actual prerequisites:
+[rolling as a fourth pure record family](modules/rolling-common-records.md),
+[managed initial Noise/member handoff](modules/managed-initial-handoff.md) and
+[original datagram physical custody](modules/original-datagram-custody.md).
+It retains27 distinct positive case results through one26/27 batch and an exact
+single literal-fixture repair, plus source-stable strict checks for six affected
+packages. The failed batch remains failed. Actual Common rolling work/completion,
+timed-v2/fresh-DH Lifecycle installation and OpenVPN complete bootstrap/Parts/
+Driver/service selection remain required, as do all unchanged full parent gates.
+
 The next common-session foundation is tracked by
 [directional Aligned/Packed owners](modules/directional-record-endpoints.md),
 [Swift admission/emission adapters](modules/swift-record-adapter.md),

@@ -62,6 +62,15 @@ Packed/rolling early-short and their full matrices remain separate requirements.
 Complete resources, rolling runtime installation and all47 catalog gates retain
 their original definitions and remain open.
 
+The [fourth pure rolling family](modules/rolling-common-records.md) now has complete
+tag4 bytes, actual reserved Engine/Bank custody and real repair/feedback-loss
+fixtures for both native interpretations and source-wire versions. Older readers
+reject tag4; the three existing profile byte formats remain unchanged. Explicit
+GF work and post-carrier confirmation still require selected runtime installation.
+The [managed initial](modules/managed-initial-handoff.md) and
+[physical send](modules/original-datagram-custody.md) prerequisites do not qualify
+another whole carrier or recovery mode. All47 complete definitions remain open.
+
 The [explicit Common runtime/service](modules/common-transaction-state.md) now
 installs the real reserved Bank and passes finite authenticated original-UDP
 Swift→Aligned→Packed→Swift with actual Unix packet-device writes, liveness and

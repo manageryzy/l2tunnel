@@ -11,6 +11,9 @@ use tokio::{
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
 
+#[path = "custody_tests.rs"]
+mod custody;
+
 fn config() -> Config {
     Config {
         base: SessionConfig {
@@ -262,7 +265,11 @@ async fn actual_raw_emission_retains_wouldblock_bytes_and_exact_wire_charge_with
         }
     );
     let (completion, mut result) = oneshot::channel();
-    let mut pending = Some(actor::PendingData { length, completion });
+    let mut pending = Some(actor::PendingData {
+        length,
+        completion,
+        custody: None,
+    });
     for _ in 0..2 {
         assert!(!actor::flush_data(&mut pending, &packet, |_| Err(
             std::io::ErrorKind::WouldBlock.into()

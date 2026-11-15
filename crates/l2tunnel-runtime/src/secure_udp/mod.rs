@@ -12,6 +12,8 @@ pub mod diagnostics;
 pub mod establish;
 /// Actual existing-member proof and authenticated acceptance on that same socket.
 pub mod member;
+/// Single original UDP/OpenVPN owner with explicit physical-send completion tickets.
+pub mod original_datagram;
 /// Unix native forwarding and fixed authenticated control on the original socket.
 #[cfg(unix)]
 pub mod transport;
