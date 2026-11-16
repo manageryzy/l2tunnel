@@ -349,6 +349,16 @@ fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Desc
                     extra_byte(value.base.recovery.outer_overhead_bytes)?;
             }
         }
+        common::Profile::AlignedCompact { forward, reverse } => {
+            for value in [forward, reverse] {
+                value.recovery = compact_extra_byte(value.recovery)?;
+            }
+        }
+        common::Profile::PackedCompact { forward, reverse } => {
+            for value in [forward, reverse] {
+                value.base.recovery = compact_extra_byte(value.base.recovery)?;
+            }
+        }
         common::Profile::Rolling { config, .. } | common::Profile::RollingCopies { config, .. } => {
             config.geometry.forward_overhead_bytes =
                 extra_byte(config.geometry.forward_overhead_bytes)?;
@@ -362,6 +372,16 @@ fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Desc
         *descriptor.direction(Role::Client).common(),
         *descriptor.direction(Role::Server).common(),
         profile,
+    )
+    .map_err(io::Error::other)
+}
+// Retain the exact complete adaptive policy; only actual carrier framing changes.
+fn compact_extra_byte(
+    value: l2tunnel::reliable::CompactReliableConfig,
+) -> io::Result<l2tunnel::reliable::CompactReliableConfig> {
+    l2tunnel::reliable::CompactReliableConfig::new(
+        value.arq(),
+        extra_byte(value.outer_overhead_bytes())?,
     )
     .map_err(io::Error::other)
 }

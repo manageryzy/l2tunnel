@@ -137,6 +137,20 @@ impl<'a> Entry<'a> {
             .accept_authenticated(now, security_number, kind, body)
             .map_err(Error::Engine)
     }
+    /// Retry exact authenticated plaintext with its immutable original arrival.
+    /// This forwards to the same actual generation and creates no new proof.
+    pub fn accept_authenticated_at(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        security_number: u64,
+        kind: engine::EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        self.engine
+            .accept_authenticated_at(received, now, security_number, kind, body)
+            .map_err(Error::Engine)
+    }
     /// Service actual injected deadlines without reading a real clock.
     pub fn tick(&mut self, now: engine::Tick) -> Result<(), Error> {
         self.engine.tick(now).map_err(Error::Engine)

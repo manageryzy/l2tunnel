@@ -1154,6 +1154,24 @@ impl Reliable {
         }
     }
 
+    /// Next feedback deadline and exact current body length, excluding outer
+    /// carrier overhead. Compact uses its actual rotating bitmap selection.
+    pub fn feedback_opportunity(&self) -> Result<Option<(Duration, usize)>, Error> {
+        let Some(at) = self.feedback_deadline() else {
+            return Ok(None);
+        };
+        let body = if self.arq.is_compact() {
+            let Some(bytes) = self.arq.compact_packet_bytes(at.max(self.now), true)? else {
+                return Ok(None);
+            };
+            bytes
+        } else {
+            l2tunnel_recovery::ACK_PACKET_BYTES
+        };
+        let bytes = body.checked_add(ENVELOPE_BYTES).ok_or(Error::Exhausted)?;
+        Ok(Some((at, bytes)))
+    }
+
     /// Original receive-coding expiry, independent of queued output wakeups.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         if self.failure().is_some() {

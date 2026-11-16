@@ -428,7 +428,12 @@ impl CommonTransactionContract {
             {
                 return Err(invalid("common catalog changes immutable native format"));
             }
-            let maximum = maximum_body(view)?;
+            let peer = if sender == mg::Role::Client {
+                mg::Role::Server
+            } else {
+                mg::Role::Client
+            };
+            let maximum = maximum_body(view, value.descriptor().direction(peer))?;
             let wire = maximum
                 .checked_add(self.geometry.forward_overhead_bytes)
                 .ok_or_else(exhausted)?;
@@ -539,7 +544,10 @@ pub(super) fn mg_role(role: security::Role) -> mg::Role {
         mg::Role::Server
     }
 }
-pub(super) fn maximum_body(view: common::DirectionView<'_>) -> io::Result<usize> {
+pub(super) fn maximum_body(
+    view: common::DirectionView<'_>,
+    opposite: common::DirectionView<'_>,
+) -> io::Result<usize> {
     match view.profile() {
         common::DirectionProfile::Swift(config) => Ok(config.codec.datagram_bytes),
         common::DirectionProfile::Aligned(config) => {
@@ -547,6 +555,25 @@ pub(super) fn maximum_body(view: common::DirectionView<'_>) -> io::Result<usize>
         }
         common::DirectionProfile::Packed(config) => {
             config.base.recovery.maximum_packet_bytes().map_err(invalid)
+        }
+        common::DirectionProfile::AlignedCompact(send) => {
+            let common::DirectionProfile::AlignedCompact(receive) = opposite.profile() else {
+                return Err(invalid("compact directional family mismatch"));
+            };
+            l2tunnel_reliable::storage::CompactPlan::for_duplex(send.recovery, receive.recovery)
+                .map(|plan| plan.send_max_packet_bytes())
+                .map_err(invalid)
+        }
+        common::DirectionProfile::PackedCompact(send) => {
+            let common::DirectionProfile::PackedCompact(receive) = opposite.profile() else {
+                return Err(invalid("packed compact directional family mismatch"));
+            };
+            l2tunnel_reliable::storage::CompactPlan::for_duplex(
+                send.base.recovery,
+                receive.base.recovery,
+            )
+            .map(|plan| plan.send_max_packet_bytes())
+            .map_err(invalid)
         }
         common::DirectionProfile::Rolling { config, .. } => Ok(config
             .maximum_packet_bytes()

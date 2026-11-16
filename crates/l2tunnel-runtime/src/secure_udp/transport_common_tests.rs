@@ -27,10 +27,13 @@ fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
                 reverse.base.recovery.outer_overhead_bytes = overhead;
                 c::Profile::Packed { forward, reverse }
             }
-            c::Profile::Rolling { .. } | c::Profile::RollingCopies { .. } => {
+            c::Profile::Rolling { .. }
+            | c::Profile::RollingCopies { .. }
+            | c::Profile::AlignedCompact { .. }
+            | c::Profile::PackedCompact { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "three-family runtime fixture does not install rolling work or carrier custody",
+                    "legacy three-family fixture does not select this profile",
                 )
                 .into());
             }
@@ -142,16 +145,16 @@ fn frame(port: u16, number: u8) -> Vec<u8> {
     packet
 }
 
-struct Endpoint {
+struct Endpoint<D: AsRawFd = Device> {
     socket: tokio::net::UdpSocket,
     driver: Box<Driver>,
-    device: AsyncFd<Device>,
+    device: AsyncFd<D>,
     host: UnixDatagram,
     original: (SocketAddr, SocketAddr),
 }
 
-struct Fixture {
-    endpoints: [Endpoint; 2],
+struct Fixture<D: AsRawFd = Device> {
+    endpoints: [Endpoint<D>; 2],
     now: u64,
 }
 
@@ -160,9 +163,18 @@ impl Fixture {
         Self::from_contracts(kind, contracts(kind)?).await
     }
 
-    async fn from_contracts(
+    fn from_contracts(
         kind: cover::Appearance,
         contracts: [CommonTransactionContract; 2],
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        // Return the same future directly, without nesting its construction state.
+        Self::from_contracts_with_tail(kind, contracts, true)
+    }
+
+    async fn from_contracts_with_tail(
+        kind: cover::Appearance,
+        contracts: [CommonTransactionContract; 2],
+        retire_at_deadline: bool,
     ) -> Result<Self> {
         let [client, server] = contracts;
         let (a, b) = parts_pair(kind).await?;
@@ -172,7 +184,9 @@ impl Fixture {
             let original = (parts.socket.local_addr()?, parts.socket.peer_addr()?);
             let (socket, mut driver) = Driver::new_common(parts, contract, origin)?;
             driver.bucket.tokens = 0;
-            assert!(driver.tail(setup_end)?.is_none());
+            if retire_at_deadline {
+                assert!(driver.tail(setup_end)?.is_none());
+            }
             let (native, host) = UnixDatagram::pair()?;
             native.set_nonblocking(true)?;
             host.set_nonblocking(true)?;
@@ -193,8 +207,9 @@ impl Fixture {
             })
         };
         let endpoints = [make(a, client)?, make(b, server)?];
-        // Retire only the actual original setup tails, then clear their finite
-        // already-queued datagrams before exact new-emission accounting starts.
+        // Injected-clock cases retire the original setup tails above. Real-clock
+        // receipt cases retain them and never observe a future tail timestamp.
+        // Clear finite already-queued setup datagrams before exact accounting.
         for _ in 0..2 {
             tokio::task::yield_now().await;
             for endpoint in &endpoints {
@@ -218,7 +233,9 @@ impl Fixture {
             now: clock(origin, setup_end)? + 20_000,
         })
     }
+}
 
+impl<D: PacketDevice<Error = io::Error> + AsRawFd> Fixture<D> {
     async fn turn(&mut self) -> Result {
         self.turn_with_held_native(None).await
     }
@@ -949,3 +966,12 @@ mod recovery;
 
 #[path = "transport_common_recovery_wake_tests.rs"]
 mod recovery_wake;
+
+#[path = "transport_common_ip_tests.rs"]
+mod ip_headers;
+
+#[path = "transport_common_compact_tests.rs"]
+mod compact;
+
+#[path = "transport_common_feedback_input_tests.rs"]
+mod compact_feedback_input;

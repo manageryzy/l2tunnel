@@ -216,6 +216,20 @@ pub enum Profile {
         /// Complete global reverse packed direction.
         reverse: aligned::packed::Config,
     },
+    /// Actual Aligned codec with explicit Compact R0 recovery, tag6.
+    AlignedCompact {
+        /// Complete forward direction.
+        forward: aligned::CompactConfig,
+        /// Complete reverse direction.
+        reverse: aligned::CompactConfig,
+    },
+    /// Actual Packed codec with explicit Compact R0 recovery, tag7.
+    PackedCompact {
+        /// Complete forward direction.
+        forward: aligned::packed::CompactConfig,
+        /// Complete reverse direction.
+        reverse: aligned::packed::CompactConfig,
+    },
     /// Actual compact records over causal local/global rolling recovery.
     Rolling {
         /// Both complete directions, exact wire geometry and original native cap.
@@ -242,6 +256,10 @@ pub enum DirectionProfile<'a> {
     Aligned(&'a aligned::Config),
     /// Complete existing Packed data-direction policy.
     Packed(&'a aligned::packed::Config),
+    /// Complete requested Aligned/Compact R0 direction, separate from installation.
+    AlignedCompact(&'a aligned::CompactConfig),
+    /// Complete requested Packed/Compact R0 direction.
+    PackedCompact(&'a aligned::packed::CompactConfig),
     /// Complete actual rolling direction and its authenticated shared binding.
     Rolling {
         /// Actual codec, recovery, scheduling and native policy.
@@ -260,6 +278,8 @@ impl DirectionProfile<'_> {
         match self {
             Self::Swift(config) => config.channels,
             Self::Aligned(config) => usize::from(config.receiver.channels),
+            Self::AlignedCompact(config) => usize::from(config.receiver.channels),
+            Self::PackedCompact(config) => usize::from(config.base.receiver.channels),
             Self::Packed(config) => usize::from(config.base.receiver.channels),
             Self::Rolling { config, .. } => usize::from(config.receiver.channels),
         }
@@ -269,6 +289,8 @@ impl DirectionProfile<'_> {
         match self {
             Self::Swift(config) => config.max_native,
             Self::Aligned(config) => config.receiver.body.max_frame_bytes,
+            Self::AlignedCompact(config) => config.receiver.body.max_frame_bytes,
+            Self::PackedCompact(config) => config.base.receiver.body.max_frame_bytes,
             Self::Packed(config) => config.base.receiver.body.max_frame_bytes,
             Self::Rolling { config, .. } => config.receiver.body.max_frame_bytes,
         }
@@ -280,6 +302,8 @@ impl DirectionProfile<'_> {
                 records::Layer::Ip => traffic::NetworkLayer::Tun,
             },
             Self::Aligned(config) => native_layer(config.native_policy),
+            Self::AlignedCompact(config) => native_layer(config.native_policy),
+            Self::PackedCompact(config) => native_layer(config.base.native_policy),
             Self::Packed(config) => native_layer(config.base.native_policy),
             Self::Rolling { config, .. } => native_layer(config.native_policy),
         }
@@ -288,6 +312,8 @@ impl DirectionProfile<'_> {
         match self {
             Self::Swift(config) => config.validate().map_err(|_| Error::Profile),
             Self::Aligned(config) => config.validate().map_err(|_| Error::Profile),
+            Self::AlignedCompact(config) => config.validate().map_err(|_| Error::Profile),
+            Self::PackedCompact(config) => config.validate().map_err(|_| Error::Profile),
             Self::Packed(config) => config.validate().map_err(|_| Error::Profile),
             Self::Rolling { config, .. } => config.validate().map_err(|_| Error::Profile),
         }
@@ -400,6 +426,14 @@ impl Descriptor {
                 forward: a,
                 reverse: b,
             } => DirectionProfile::Packed(if forward { a } else { b }),
+            Profile::AlignedCompact {
+                forward: a,
+                reverse: b,
+            } => DirectionProfile::AlignedCompact(if forward { a } else { b }),
+            Profile::PackedCompact {
+                forward: a,
+                reverse: b,
+            } => DirectionProfile::PackedCompact(if forward { a } else { b }),
             Profile::Rolling { config, stream } | Profile::RollingCopies { config, stream, .. } => {
                 DirectionProfile::Rolling {
                     config: if forward {
@@ -540,7 +574,7 @@ impl Descriptor {
             return Err(Error::Prefix);
         }
         let tag = reader.byte()?;
-        if !(1..=5).contains(&tag) {
+        if !(1..=7).contains(&tag) {
             return Err(Error::Prefix);
         }
         let duplex = match reader.byte()? {
@@ -565,6 +599,8 @@ impl Descriptor {
                 1 => padding(&slot[SWIFT_BYTES..])?,
                 2 => padding(&slot[ALIGNED_BYTES..])?,
                 4 => padding(&slot[rolling::ACTIVE_BYTES..])?,
+                6 => padding(&slot[aligned::COMPACT_CONFIG_BYTES..])?,
+                7 => padding(&slot[aligned::packed::COMPACT_CONFIG_BYTES..])?,
                 _ => {}
             }
         }
@@ -586,6 +622,22 @@ impl Descriptor {
             },
             4 => rolling::decode_pair(a, b)?,
             5 => rolling::decode_pair_with_copies(a, b)?,
+            6 => Profile::AlignedCompact {
+                forward: aligned::CompactConfig::decode(&a[..aligned::COMPACT_CONFIG_BYTES])
+                    .map_err(|_| Error::Profile)?,
+                reverse: aligned::CompactConfig::decode(&b[..aligned::COMPACT_CONFIG_BYTES])
+                    .map_err(|_| Error::Profile)?,
+            },
+            7 => Profile::PackedCompact {
+                forward: aligned::packed::CompactConfig::decode(
+                    &a[..aligned::packed::COMPACT_CONFIG_BYTES],
+                )
+                .map_err(|_| Error::Profile)?,
+                reverse: aligned::packed::CompactConfig::decode(
+                    &b[..aligned::packed::COMPACT_CONFIG_BYTES],
+                )
+                .map_err(|_| Error::Profile)?,
+            },
             _ => return Err(Error::Prefix),
         };
         let value = Self::new(path_mtu, duplex, forward, reverse, profile)?;
@@ -602,6 +654,8 @@ fn profile_tag(profile: Profile) -> u8 {
         Profile::Packed { .. } => 3,
         Profile::Rolling { .. } => 4,
         Profile::RollingCopies { .. } => 5,
+        Profile::AlignedCompact { .. } => 6,
+        Profile::PackedCompact { .. } => 7,
     }
 }
 
@@ -1098,6 +1152,20 @@ fn encode_profile(profile: DirectionProfile<'_>, output: &mut [u8]) -> Result<()
             writer.size(config.work_limit)?;
             writer.finish()
         }
+        DirectionProfile::AlignedCompact(config) => config
+            .encode_into(
+                output
+                    .get_mut(..aligned::COMPACT_CONFIG_BYTES)
+                    .ok_or(Error::Length)?,
+            )
+            .map_err(|_| Error::Profile),
+        DirectionProfile::PackedCompact(config) => config
+            .encode_into(
+                output
+                    .get_mut(..aligned::packed::COMPACT_CONFIG_BYTES)
+                    .ok_or(Error::Length)?,
+            )
+            .map_err(|_| Error::Profile),
         DirectionProfile::Rolling {
             config,
             overhead_bytes,

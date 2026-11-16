@@ -460,3 +460,149 @@ fn compact_crossed_feedback_geometry_accepts_exact_directional_limit_and_refuses
     );
     Ok(())
 }
+
+#[test]
+fn compact_history_pressure_keeps_feedback_live_then_releases_exact_next_source_without_failure()
+-> Result {
+    let original = policy(32, CompactRecovery::Guarded, 70)?;
+    let arq = original.arq();
+    let selected = CompactReliableConfig::new(
+        CompactArqConfig::new(
+            arq.bounds(),
+            arq.timing(),
+            arq.maximum_feedback_bytes(),
+            1,
+            arq.maximum_attempts(),
+            arq.recovery(),
+        )?,
+        original.outer_overhead_bytes(),
+    )?;
+    let mut a = Reliable::new_compact(selected, context(EndpointRole::Initiator))?;
+    let mut b = Reliable::new_compact(selected, context(EndpointRole::Responder))?;
+    let usage = a.storage_usage();
+    assert_eq!(a.submit(b"first", ms(0))?, 0);
+    assert_eq!(a.submit(b"second", ms(0))?, 1);
+    assert_eq!(b.submit(b"reverse", ms(0))?, 0);
+    let mut source = vec![0; a.send_max_packet_bytes()];
+    let bytes = a
+        .poll_data_independent(ms(0), &mut source, &mut budget())?
+        .ok_or("actual first source")?;
+    let token = a.pending_data_output().ok_or("actual source custody")?;
+    a.confirm_output(ms(0), token)?;
+    b.receive(&source[..bytes], ms(0))?;
+    let mut reverse = vec![0; b.send_max_packet_bytes()];
+    let bytes = b
+        .poll_data_independent(ms(0), &mut reverse, &mut budget())?
+        .ok_or("actual reverse source")?;
+    let token = b.pending_data_output().ok_or("actual reverse custody")?;
+    b.confirm_output(ms(0), token)?;
+    a.receive(&reverse[..bytes], ms(0))?;
+
+    // The public direct recovery call still reports exact transactional pressure.
+    let mut core_out = [0xaa; 128];
+    let before = a.arq_statistics();
+    assert_eq!(
+        a.arq.poll_source(ms(1), &mut core_out),
+        Err(RecoveryError::HistoryCapacity)
+    );
+    assert_eq!(core_out, [0xaa; 128]);
+    assert_eq!(a.arq_statistics(), before);
+    source.fill(0xa5);
+    let untouched = source.clone();
+    let mut allowance = budget();
+    let original_allowance = allowance;
+    let before = (a.statistics(), a.arq_statistics());
+    assert_eq!(
+        a.poll_data_independent(ms(1), &mut source, &mut allowance)?,
+        None
+    );
+    assert_eq!(source, untouched);
+    assert_eq!(allowance, original_allowance);
+    assert_eq!((a.statistics(), a.arq_statistics()), before);
+    assert_eq!(a.failure(), None);
+    assert_eq!(a.pending_data_output(), None);
+    assert_eq!(a.storage_usage(), usage);
+    assert_eq!(a.arq.source_deadline(), None);
+    assert_eq!(a.deadline_independent(), Some(ms(5)));
+
+    // Its own genuine reverse-direction ACK remains independently serviceable.
+    let bytes = a
+        .poll_feedback_independent(ms(5), &mut source, &mut budget())?
+        .ok_or("feedback while source history is full")?;
+    let token = a.pending_feedback_output().ok_or("feedback custody")?;
+    a.confirm_output(ms(5), token)?;
+    b.receive(&source[..bytes], ms(5))?;
+    let bytes = b
+        .poll_feedback_independent(ms(5), &mut reverse, &mut budget())?
+        .ok_or("real echo releasing source history")?;
+    let token = b.pending_feedback_output().ok_or("peer feedback custody")?;
+    b.confirm_output(ms(5), token)?;
+    a.receive(&reverse[..bytes], ms(5))?;
+    assert_eq!(a.arq.source_deadline(), Some(ms(5)));
+    let bytes = a
+        .poll_data_independent(ms(5), &mut source, &mut budget())?
+        .ok_or("exact next source after peer echo")?;
+    let view = a.inspect_output_record(&source[..bytes])?;
+    assert_eq!(view.kind, RecordKind::Source);
+    assert_eq!(
+        view.source,
+        Some((l2tunnel_recovery::SourceId(1), b"second".as_slice()))
+    );
+    let recovery_owner::Owner::Compact(actual) = &a.arq else {
+        return Err("actual Compact owner missing".into());
+    };
+    assert!(matches!(
+        l2tunnel_recovery::inspect_compact_packet(
+            &source[ENVELOPE_BYTES..bytes],
+            context(EndpointRole::Responder),
+            actual.send_config()?
+        )?,
+        l2tunnel_recovery::CompactPacketView::Data { serial: 2, .. }
+    ));
+    let token = a.pending_data_output().ok_or("same owner's next custody")?;
+    a.confirm_output(ms(5), token)?;
+    b.receive(&source[..bytes], ms(5))?;
+    assert_eq!(a.failure(), None);
+    assert_eq!(a.storage_usage(), usage);
+    let mut delivered = [0; 32];
+    assert_eq!(b.poll_delivered(&mut delivered)?, Some((0, 5)));
+    assert_eq!(&delivered[..5], b"first");
+    assert_eq!(b.poll_delivered(&mut delivered)?, Some((1, 6)));
+    assert_eq!(&delivered[..6], b"second");
+
+    // Full history must not hide an actually exhausted attempt's terminal path.
+    let bounded = CompactReliableConfig::new(
+        CompactArqConfig::new(
+            arq.bounds(),
+            arq.timing(),
+            arq.maximum_feedback_bytes(),
+            1,
+            1,
+            arq.recovery(),
+        )?,
+        original.outer_overhead_bytes(),
+    )?;
+    let mut failed = Reliable::new_compact(bounded, context(EndpointRole::Initiator))?;
+    failed.submit(b"lost", ms(0))?;
+    failed
+        .poll_data_independent(ms(0), &mut source, &mut budget())?
+        .ok_or("actual bounded source")?;
+    let token = failed
+        .pending_data_output()
+        .ok_or("actual bounded custody")?;
+    failed.confirm_output(ms(0), token)?;
+    let expiry = failed
+        .deadline_independent()
+        .ok_or("original finite retry opportunity")?;
+    assert!(matches!(
+        failed.poll_data_independent(expiry, &mut source, &mut budget()),
+        Err(Error::Arq(RecoveryError::RetryExhausted {
+            source: l2tunnel_recovery::SourceId(0)
+        }))
+    ));
+    assert!(matches!(
+        failed.failure(),
+        Some(Error::Arq(RecoveryError::RetryExhausted { .. }))
+    ));
+    Ok(())
+}

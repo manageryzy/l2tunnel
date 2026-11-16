@@ -284,6 +284,14 @@ impl Link {
                 usize::from(config.max_units),
                 false,
             ),
+            configuration::DirectionProfile::AlignedCompact(config) => {
+                (config.max_recovery_packet_bytes, 1, false)
+            }
+            configuration::DirectionProfile::PackedCompact(config) => (
+                config.base.max_recovery_packet_bytes,
+                usize::from(config.max_units),
+                false,
+            ),
             configuration::DirectionProfile::Rolling { config, .. } => (
                 configuration.descriptor().path_mtu(),
                 usize::from(config.packing.max_units),
@@ -814,6 +822,8 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 reverse.base.max_recovery_packet_bytes = 60_000;
             }
             configuration::Profile::Swift { .. }
+            | configuration::Profile::AlignedCompact { .. }
+            | configuration::Profile::PackedCompact { .. }
             | configuration::Profile::Rolling { .. }
             | configuration::Profile::RollingCopies { .. } => {
                 return Err("aligned-family fixture".into());
@@ -839,6 +849,8 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                     (config.base.recovery, config.base.max_recovery_packet_bytes)
                 }
                 configuration::DirectionProfile::Swift(_)
+                | configuration::DirectionProfile::AlignedCompact(_)
+                | configuration::DirectionProfile::PackedCompact(_)
                 | configuration::DirectionProfile::Rolling { .. } => {
                     return Err("aligned-family direction".into());
                 }
@@ -987,6 +999,8 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
             configuration::DirectionProfile::Aligned(config) => config.receiver.lifetime_ticks,
             configuration::DirectionProfile::Packed(config) => config.base.receiver.lifetime_ticks,
             configuration::DirectionProfile::Swift(_)
+            | configuration::DirectionProfile::AlignedCompact(_)
+            | configuration::DirectionProfile::PackedCompact(_)
             | configuration::DirectionProfile::Rolling { .. } => {
                 return Err("aligned-family lifetime".into());
             }

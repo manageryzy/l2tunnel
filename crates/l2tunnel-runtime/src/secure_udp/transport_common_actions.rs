@@ -220,6 +220,7 @@ impl Driver {
         if !self.check_expiry(now)? {
             return Ok(());
         }
+        self.retry_common_feedback(now)?;
         let mut runtime = self
             .common
             .take()
@@ -401,6 +402,9 @@ impl Driver {
                         return Err(protocol("common Stage original scopes"));
                     }
                     runtime.contract.resolve(*config)?;
+                    if runtime.pending_feedback.is_some() {
+                        return Ok(false);
+                    }
                     // Queued originals predate the stopped-ingress barrier. They
                     // must reach their real codecs before its admitted fence.
                     if self
@@ -446,6 +450,7 @@ impl Driver {
                     if !engine.drained().map_err(protocol)?
                         || !self.native.is_empty()
                         || runtime.sealed.is_some()
+                        || runtime.pending_feedback.is_some()
                     {
                         return Ok(false);
                     }
@@ -595,7 +600,8 @@ impl Driver {
         )? == transactions::Progress::Advanced)
     }
     fn common_barrier_ready(&self, runtime: &common::Runtime, old: Scope) -> io::Result<bool> {
-        if !self.native.is_empty() || runtime.sealed.is_some() {
+        if !self.native.is_empty() || runtime.sealed.is_some() || runtime.pending_feedback.is_some()
+        {
             return Ok(false);
         }
         let engine = self.common_state()?.engine(core::Epoch(old.epoch.0))?;

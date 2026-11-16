@@ -3,8 +3,13 @@
 Status: actual pure codec and Aligned/Packed construction pass finite protocol
 checks. Source-stable Build17 passes (53.808 s); Cases11 passes 125 selected cases
 in 1.296 s, including all three new L3 cases and affected legacy L2 goldens.
-Affected format, strict Clippy and rustdoc checks pass. No selected
-Common/client runtime or native L3 execution is claimed. This is a prerequisite
+The later Cases18 runtime continuation passes selected Common IpHeaders/TunDrr
+over protected original UDP and Unix packet-device custody: actual context loss,
+recovery, literal delta bytes, exact native output, late-context replay rejection,
+management and Aligned-to-Packed epoch switching. Its real session fixture does
+not prove new-profile service establishment, privileged TUN or native throughput.
+Earlier affected format, strict Clippy and rustdoc checks passed for Batch9;
+current batch checkpoint checks remain pending. This is a prerequisite
 for PBA-05, not completion of its safe ACK/runtime/differential gates.
 
 The explicit IpHeaders native policy3 uses native IPv4/IPv6 bytes. EthernetHeaders1
@@ -58,3 +63,5 @@ Full PBA-05, all47 mode definitions, SW-11, global8192/local128/copies/coalescin
 RLNC/parity/rolling/packed/proxy, management, complete resources, platforms and
 80 Mbit/s retain their complete definitions. No stage checkbox is closed by
 authored source, an enum or a successful compile.
+
+Current finite runtime evidence: [Cases18](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-18/validation.json). L3C-03 retains its complete native/differential/service acceptance.

@@ -265,6 +265,8 @@ struct Engine {
     receive_bytes: usize,
     ack_at: Option<Duration>,
     prefer_data: bool,
+    // Fair source service is separate from the existing ACK/data alternation.
+    prefer_retry: bool,
     last_now: Duration,
     failure: Option<RecoveryError>,
     statistics: Statistics,
@@ -873,6 +875,7 @@ impl Engine {
             receive_bytes: 0,
             ack_at: None,
             prefer_data: false,
+            prefer_retry: true,
             last_now: Duration::ZERO,
             failure: None,
             statistics: Statistics::default(),
@@ -1052,7 +1055,8 @@ impl Engine {
     }
 
     fn ready_source(&self, now: Duration) -> Option<SourceId> {
-        self.sent
+        let retry = self
+            .sent
             .iter()
             .filter_map(|(source, flight)| {
                 flight
@@ -1061,14 +1065,20 @@ impl Engine {
                     .map(|deadline| (deadline, *source))
             })
             .min()
-            .map(|(_, source)| source)
-            .or_else(|| {
-                self.sent
-                    .iter()
-                    .filter(|(_, flight)| flight.attempts == 0)
-                    .map(|(source, _)| *source)
-                    .min()
-            })
+            .map(|(_, source)| source);
+        let unsent = self
+            .sent
+            .iter()
+            .filter(|(_, flight)| flight.attempts == 0)
+            .map(|(source, _)| *source)
+            .min();
+        // A carrier can take longer than another retry interval to accept an
+        // output. Strict retry priority would then indefinitely suppress fresh
+        // sources even though they already own finite send-window capacity.
+        match (retry, unsent) {
+            (Some(retry), Some(unsent)) => Some(if self.prefer_retry { retry } else { unsent }),
+            (retry, unsent) => retry.or(unsent),
+        }
     }
 
     fn poll(&mut self, now: Duration, output: &mut [u8]) -> Result<Option<usize>, RecoveryError> {
@@ -1180,6 +1190,7 @@ impl Engine {
             self.pending_transmissions += 1;
         }
         self.prefer_data = false;
+        self.prefer_retry = !is_retry;
         self.last_now = now;
         self.statistics.transmissions = self.statistics.transmissions.saturating_add(1);
         self.statistics.retransmissions = self
@@ -1217,12 +1228,8 @@ impl Engine {
         if self.failure.is_some() {
             return None;
         }
-        if self
-            .compact
-            .as_ref()
-            .is_some_and(|state| state.has_fast_retry())
-        {
-            return Some(self.last_now);
+        if self.compact.is_some() {
+            return self.compact_source_deadline();
         }
         self.sent
             .values()

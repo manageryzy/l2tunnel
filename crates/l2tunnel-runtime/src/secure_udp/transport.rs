@@ -2048,6 +2048,12 @@ impl Driver {
                         .and_then(|r| r.sealed.as_ref())
                         .map(|pending| duration(pending.deadline)),
                 )
+                .chain(
+                    self.common
+                        .as_ref()
+                        .and_then(|r| r.pending_feedback)
+                        .map(|pending| duration(pending.deadline)),
+                )
                 .min(),
             owner::DataOwner::Legacy(_) => None,
         };

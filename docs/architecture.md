@@ -4,7 +4,25 @@ Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
 
-The current [Batch9 scoped evidence](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json)
+The [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
+installs explicit AlignedCompact/PackedCompact policies through actual reserved
+Engine owners and the original UDP Driver. Finite integration covers lossy source
+and feedback, retained authenticated feedback across delayed physical receipts,
+L3 TCP context/delta/replay, exact native bytes and negotiated record switching.
+All16 affected Common cases pass. Both Compact forms refuse unsupported physical
+copy counts before provisioning while retaining the complete requested policy.
+
+The full check passed workspace Clippy and formatting, with1,739 passing Rust cases
+in successful targets plus522 runtime passes; one legacy Packed pressure case
+failed. Its production staging loop now stops retrying unchanged sealed work in
+the same burst: all22 affected Aligned/Packed cases pass with original limits and
+timeouts. The two Compact endpoint/capability cases and affected strict checks
+also pass. Earlier failures remain preserved; these continuations are not a full
+check pass, and later full-check stages were not reached. Genuine new-profile
+service setup, complete named Python topologies, native/platform/resource/
+performance, all47 and full SW-11 remain open. See [actual composition](modules/compact-endpoint.md).
+
+The preceding [Batch9 scoped evidence](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json)
 adds finite selected CompactARQ/Python-event differential and Reliable R0 passes,
 actual UDP Rolling three-copy delivery/switching, shared production proxy CLI
 adapter/Unix lifecycle checks, and native-IP codec/Aligned/Packed protocol tests.

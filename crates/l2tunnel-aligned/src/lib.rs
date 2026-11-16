@@ -14,10 +14,15 @@ use l2tunnel_recovery::{BufferSide, EndpointRole, RecoveryContext, RecoveryError
 use l2tunnel_reliable::{OutboundBudget, Reliable, ReliableConfig};
 use std::{fmt, time::Duration};
 
+mod compact;
+mod compact_packed;
+/// Complete actual Compact R0 endpoint storage.
+pub mod compact_storage;
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
 /// Complete fallible backing for actual directional codec/recovery owners.
 pub mod storage;
+pub use compact::{CONFIG_BYTES as COMPACT_CONFIG_BYTES, Config as CompactConfig};
 
 pub use l2tunnel_codec::aligned_receiver::{
     ChannelId, Delivery, Prepared, RecordIdentity, UnitWitness,
@@ -209,6 +214,10 @@ impl Config {
 /// Explicit ownership, configuration and terminal protocol failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// Configured ordinary source repetitions lack an installed physical scheduler.
+    UnsupportedCopies,
+    /// Selected recovery pressure retains exact authenticated input for retry.
+    RecoveryPressure(l2tunnel_reliable::Error),
     /// Contradictory or excessive local limits.
     Configuration,
     /// The single frame stage is occupied; no new frame was admitted.
@@ -240,6 +249,7 @@ impl Error {
         matches!(
             self,
             Self::Busy
+                | Self::RecoveryPressure(_)
                 | Self::Recovery(
                     l2tunnel_reliable::Error::RestoredCapacity
                         | l2tunnel_reliable::Error::Arq(RecoveryError::Capacity(_))
@@ -273,8 +283,8 @@ pub struct Status {
 
 /// Pure exclusive owner of codec/recovery/native handoffs for both directions.
 pub struct Endpoint {
-    config: Config,
-    receive_config: Config,
+    config: compact::BodyConfig,
+    receive_config: compact::BodyConfig,
     receive_scope: receiver::Scope,
     send_scope: receiver::Scope,
     sender: packed::SenderOwner,
@@ -474,8 +484,8 @@ impl Endpoint {
         let receive_buffer = std::mem::take(&mut construction.receive_buffer);
         construction.transferred(capacity_bytes);
         Ok(Self {
-            config,
-            receive_config,
+            config: config.into(),
+            receive_config: receive_config.into(),
             receive_scope,
             send_scope,
             sender,
@@ -552,8 +562,8 @@ impl Endpoint {
             ..send_scope
         };
         Ok(Self {
-            config,
-            receive_config,
+            config: config.into(),
+            receive_config: receive_config.into(),
             receive_scope,
             send_scope,
             sender: match packing {
@@ -654,27 +664,16 @@ impl Endpoint {
         packet: &[u8],
         output: &mut [UnitWitness],
     ) -> Result<usize, Error> {
-        self.recovery
-            .inspect_output(packet)
+        let view = self
+            .recovery
+            .inspect_output_record(packet)
             .map_err(Error::Recovery)?;
-        let role = match self.send_scope.direction {
-            receiver::Direction::InitiatorToResponder => EndpointRole::Initiator,
-            receiver::Direction::ResponderToInitiator => EndpointRole::Responder,
-        };
-        let view = l2tunnel_reliable::inspect_structural(
-            packet,
-            role,
-            self.config.max_recovery_packet_bytes,
-            self.config.recovery.arq.max_source_bytes,
-            self.config.recovery.fec.block,
-        )
-        .map_err(Error::Recovery)?;
         let Some((source, bytes)) = view.source else {
             return Ok(0);
         };
         if let Some(options) = self.packing {
             let packed = l2tunnel_codec::packed_envelope::decode(
-                options.config(self.config).envelope(),
+                options.envelope(self.config),
                 self.send_scope,
                 bytes,
             )
@@ -848,6 +847,9 @@ impl Endpoint {
     /// Admit complete recovery bytes only after carrier integrity/replay checks.
     /// Retryable pressure leaves ownership of the exact input with the caller.
     pub fn receive_authenticated(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
+        if self.receive_config.compact {
+            return self.receive_authenticated_at(packet, now, now);
+        }
         self.advance(now)?;
         let result = self.recovery.receive(packet, now).map_err(Error::Recovery);
         self.recovery_result(result)?;
@@ -934,6 +936,16 @@ impl Endpoint {
         }
     }
 
+    /// Actual selected feedback deadline and current complete recovery bytes.
+    pub fn feedback_opportunity(&self) -> Result<Option<(Duration, usize)>, Error> {
+        if self.failure.is_some() {
+            return Ok(None);
+        }
+        self.recovery
+            .feedback_opportunity()
+            .map_err(Error::Recovery)
+    }
+
     /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         if self.failure.is_some() {
@@ -1010,6 +1022,10 @@ impl Endpoint {
             && status.retained_sources == 0
             && status.pending_bytes.is_none()
     }
+    /// Exact configured external wire charge of this actual sending owner.
+    pub fn outer_overhead_bytes(&self) -> usize {
+        self.config.outer_overhead_bytes
+    }
     /// Exact maximum complete recovery output, excluding configured carrier overhead.
     pub fn max_packet_bytes(&self) -> usize {
         self.recovery.max_packet_bytes()
@@ -1081,7 +1097,7 @@ impl Endpoint {
             self.terminal_result(result)?;
             return self.submit_packed();
         }
-        for _ in 0..self.config.recovery.arq.send_records {
+        for _ in 0..self.config.send_records {
             if !self.sender.is_pending() {
                 break;
             }
@@ -1125,7 +1141,7 @@ impl Endpoint {
     }
     fn pump_receive(&mut self) -> Result<(), Error> {
         self.preview_receive()?;
-        for _ in 0..self.receive_config.recovery.arq.receive_records {
+        for _ in 0..self.receive_config.receive_records {
             if self.handoff.is_none() {
                 let result = self
                     .recovery
@@ -1441,16 +1457,15 @@ impl Endpoint {
 #[allow(clippy::too_many_arguments)] // Explicit existing owners and borrowed caller scratch.
 fn packed_inputs<'a>(
     options: packed::Options,
-    config: Config,
+    config: compact::BodyConfig,
     scope: receiver::Scope,
     source: u64,
     packet: &[u8],
     scratch: &'a mut [u8],
     output: &mut [receiver::AuthenticatedSymbol<'a>; 255],
 ) -> Result<(receiver::SourceId, usize), Error> {
-    let view =
-        l2tunnel_codec::packed_envelope::decode(options.config(config).envelope(), scope, packet)
-            .map_err(Error::PackedEnvelope)?;
+    let view = l2tunnel_codec::packed_envelope::decode(options.envelope(config), scope, packet)
+        .map_err(Error::PackedEnvelope)?;
     if view.identity().source.0 != source {
         return Err(Error::Identity);
     }
@@ -1481,7 +1496,8 @@ fn packed_inputs<'a>(
     Ok((first, count))
 }
 
-fn sender_config(config: Config) -> sender::Config {
+fn sender_config(config: impl Into<compact::BodyConfig>) -> sender::Config {
+    let config = config.into();
     sender::Config {
         body: config.receiver.body,
         channels: config.receiver.channels,
@@ -1507,6 +1523,8 @@ fn duration(output: &mut Vec<u8>, value: Duration) {
     number(output, u64::from(value.subsec_nanos()));
 }
 
+#[cfg(test)]
+mod compact_tests;
 #[cfg(test)]
 mod directional_tests;
 #[cfg(test)]

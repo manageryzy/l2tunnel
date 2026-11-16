@@ -4,7 +4,25 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
-The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
+The [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
+installs explicit AlignedCompact/PackedCompact policies through actual reserved
+Engine owners and the original UDP Driver. Finite integration covers lossy source
+and feedback, retained authenticated feedback across delayed physical receipts,
+L3 TCP context/delta/replay, exact native bytes and negotiated record switching.
+All16 affected Common cases pass. Both Compact forms refuse unsupported physical
+copy counts before provisioning while retaining the complete requested policy.
+
+The full check passed workspace Clippy and formatting, with1,739 passing Rust cases
+in successful targets plus522 runtime passes; one legacy Packed pressure case
+failed. Its production staging loop now stops retrying unchanged sealed work in
+the same burst: all22 affected Aligned/Packed cases pass with original limits and
+timeouts. The two Compact endpoint/capability cases and affected strict checks
+also pass. Earlier failures remain preserved; these continuations are not a full
+check pass, and later full-check stages were not reached. Genuine new-profile
+service setup, complete named Python topologies, native/platform/resource/
+performance, all47 and full SW-11 remain open. See [actual composition](modules/compact-endpoint.md).
+
+The preceding [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
 implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
 Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
 [explicit short-source copy selection](modules/source-copy-policy.md), and

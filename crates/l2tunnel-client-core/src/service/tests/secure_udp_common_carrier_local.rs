@@ -14,6 +14,8 @@ fn arq_only_descriptor(value: common::Descriptor) -> Result<common::Descriptor> 
             reverse.base.recovery.repair_symbols = 0;
         }
         common::Profile::Swift { .. }
+        | common::Profile::AlignedCompact { .. }
+        | common::Profile::PackedCompact { .. }
         | common::Profile::Rolling { .. }
         | common::Profile::RollingCopies { .. } => return Ok(value),
     }
@@ -119,6 +121,8 @@ fn assert_arq_only(value: common::Configuration) {
             assert_eq!(reverse.base.recovery.repair_symbols, 0);
         }
         common::Profile::Swift { .. }
+        | common::Profile::AlignedCompact { .. }
+        | common::Profile::PackedCompact { .. }
         | common::Profile::Rolling { .. }
         | common::Profile::RollingCopies { .. } => {}
     }

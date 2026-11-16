@@ -2,7 +2,9 @@
 
 Status: implemented and protocol-tested in finite focused and Python-derived
 behavioral differential cases. The actual Reliable Compact R0 consumer also
-passes focused protocol cases; selected Common/runtime installation remains open.
+passes focused protocol cases. Selected Common UDP integration now has finite
+evidence in [the actual composition](compact-endpoint.md); full service/native
+and named Python topology acceptance remains open.
 This is an engineering implementation contract, not an owner default decision.
 Historical simulator observations and receipts remain unchanged.
 
@@ -148,3 +150,7 @@ actual lossy feedback carrier, reverse affinity, per-connection/shared recovery
 topologies, full8192/128 native/copies/ACK coalescing, TCP ownership, all47 modes,
 SW-11, RLNC/parity/rolling/packed/proxy and platform/resource/performance gates
 remain fully required and open. The reverse-affinity proposal is separate.
+
+The [actual Compact codec/Engine composition](compact-endpoint.md) tracks the
+follow-on consumers and complete tags6/7. Its finite endpoint evidence does not
+complete CAR-06 or the named Python topology/native gates.

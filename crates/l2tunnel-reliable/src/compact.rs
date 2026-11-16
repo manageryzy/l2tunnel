@@ -55,6 +55,27 @@ pub(super) enum Policies {
     },
 }
 impl Reliable {
+    /// Borrow the actual maintained v1/v2 output fields without admitting data,
+    /// minting a physical receipt or granting authentication to parser metadata.
+    pub fn inspect_output_record<'a>(
+        &self,
+        packet: &'a [u8],
+    ) -> Result<StructuralRecord<'a>, Error> {
+        self.inspect_output(packet)?;
+        if self.arq.is_compact() {
+            return self.compact_inspect(packet, true);
+        }
+        let config = self.legacy_send()?;
+        inspect_record_view(
+            packet,
+            self.maximum_packet,
+            config.arq.max_source_bytes,
+            config.fec.block,
+            opposite_context(self.context),
+            self.send_fec,
+        )
+    }
+
     pub(super) fn legacy_send(&self) -> Result<&ReliableConfig, Error> {
         match &self.policies {
             Policies::Legacy { send, .. } => Ok(send),

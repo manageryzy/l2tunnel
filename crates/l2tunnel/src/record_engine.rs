@@ -171,6 +171,8 @@ pub enum Error {
     Storage(swift::storage::Error),
     /// Actual Aligned/Packed record failure.
     Aligned(aligned::Error),
+    /// Actual selected Compact Aligned/Packed construction or reservation failure.
+    AlignedStorage(aligned::storage::Error),
     /// Actual compact-record/rolling composition or backing failure.
     Rolling(rolling_records::Error),
 }
@@ -331,7 +333,7 @@ impl Engine {
         )
         .map_err(Error::Pipeline)?;
         let mut owner = Owner::new(&configuration, context)?;
-        owner.enable_carrier_confirmation()?;
+        owner.enable_carrier_confirmation(&configuration)?;
         Ok(Self::assemble(
             configuration,
             context,
@@ -565,11 +567,31 @@ impl Engine {
         kind: EmissionKind,
         body: &mut [u8],
     ) -> Result<(), Error> {
+        self.accept_authenticated_at(now, now, security_number, kind, body)
+    }
+
+    /// Apply already authenticated plaintext with its original arrival time.
+    /// Retrying physical-feedback pressure never reopens Records or renews time.
+    /// Legacy families retain observation-time behavior; Compact samples arrival.
+    pub fn accept_authenticated_at(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        security_number: u64,
+        kind: EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        if received > now {
+            return Err(Error::Time);
+        }
         self.advance(now)?;
         if body.is_empty() || body.len() > self.receive_max {
             return self.fail(Error::PacketSize);
         }
-        match self.owner.accept(now, security_number, kind, body) {
+        match self
+            .owner
+            .accept_at(received, now, security_number, kind, body)
+        {
             Ok(()) => Ok(()),
             Err(Error::Aligned(error)) if error.is_backpressure() => Err(Error::Aligned(error)),
             Err(Error::Rolling(error)) if error.is_backpressure() => Err(Error::Rolling(error)),
@@ -747,7 +769,8 @@ fn parameters(
         ) {
             return Err(Error::Unsupported(Capability::NativeWindow));
         }
-        let (maximum, _, charge) = dimensions(view.profile())?;
+        let opposite = descriptor.local(role).receive();
+        let (maximum, _, charge) = dimensions(view.profile(), opposite.profile())?;
         let wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
         if charge.is_some_and(|actual| actual != overhead)
             || wire > descriptor.path_mtu()
@@ -757,8 +780,8 @@ fn parameters(
         }
     }
     let local = descriptor.local(context.role);
-    let (send_max, witnesses, _) = dimensions(local.send().profile())?;
-    let (receive_max, _, _) = dimensions(local.receive().profile())?;
+    let (send_max, witnesses, _) = dimensions(local.send().profile(), local.receive().profile())?;
+    let (receive_max, _, _) = dimensions(local.receive().profile(), local.send().profile())?;
     let native_max = local.receive().max_native();
     let receive_channels = local.receive().channels();
     let digest = configuration.digest().map_err(|_| Error::Configuration)?;
@@ -783,6 +806,7 @@ fn duration(now: Tick) -> Duration {
 
 fn dimensions(
     profile: configuration::DirectionProfile<'_>,
+    opposite: configuration::DirectionProfile<'_>,
 ) -> Result<(usize, usize, Option<usize>), Error> {
     Ok(match profile {
         configuration::DirectionProfile::Swift(config) => (config.codec.datagram_bytes, 0, None),
@@ -803,6 +827,30 @@ fn dimensions(
             usize::from(config.max_units),
             Some(config.base.recovery.outer_overhead_bytes),
         ),
+        configuration::DirectionProfile::AlignedCompact(config) => {
+            let configuration::DirectionProfile::AlignedCompact(peer) = opposite else {
+                return Err(Error::Configuration);
+            };
+            let plan = aligned::compact_storage::Plan::for_duplex(*config, *peer)
+                .map_err(Error::AlignedStorage)?;
+            (
+                plan.reliable_plan().send_max_packet_bytes(),
+                1,
+                Some(config.recovery.outer_overhead_bytes()),
+            )
+        }
+        configuration::DirectionProfile::PackedCompact(config) => {
+            let configuration::DirectionProfile::PackedCompact(peer) = opposite else {
+                return Err(Error::Configuration);
+            };
+            let plan = aligned::compact_storage::Plan::for_packed_duplex(*config, *peer)
+                .map_err(Error::AlignedStorage)?;
+            (
+                plan.reliable_plan().send_max_packet_bytes(),
+                usize::from(config.max_units),
+                Some(config.base.recovery.outer_overhead_bytes()),
+            )
+        }
         configuration::DirectionProfile::Rolling {
             config,
             overhead_bytes,

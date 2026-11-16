@@ -299,8 +299,13 @@ impl State {
     fn rto(&self) -> Result<Duration, RecoveryError> {
         self.rto_with(self.srtt, self.rttvar)
     }
-    pub(super) fn has_fast_retry(&self) -> bool {
-        self.metadata.iter().any(|entry| entry.fast)
+    fn history_slot(&self, serial: u64) -> Result<usize, RecoveryError> {
+        let index = (serial % self.history.len() as u64) as usize;
+        if self.history[index].is_some() {
+            Err(RecoveryError::HistoryCapacity)
+        } else {
+            Ok(index)
+        }
     }
     pub(super) fn confirm(
         &mut self,
@@ -478,12 +483,17 @@ impl CompactRepeat {
             .confirm_transmission_at(observed, accepted, token)
     }
     /// Exact due source packet length from the same selection used by emission.
+    /// A full next history slot is not a source opportunity. Direct poll_source
+    /// still returns its typed refusal; feedback and fatal attempt checks remain.
     /// Observation changes no clock, attempt, history, output or feedback cursor.
     pub fn source_packet_bytes(&self, now: Duration) -> Result<Option<usize>, RecoveryError> {
-        Ok(self
-            .engine
-            .compact_selection(now, false, true)?
-            .map(Selection::bytes))
+        let selected = self.engine.compact_selection(now, false, true)?;
+        if let Some(Selection::Source { source, .. }) = selected
+            && self.engine.compact_source_blocked(source)?
+        {
+            return Ok(None);
+        }
+        Ok(selected.map(Selection::bytes))
     }
     /// Exact due feedback length, including its actual rotating bitmap.
     /// Observation changes no clock, serial, repeat count or feedback cursor.
@@ -745,6 +755,46 @@ impl Selection {
 }
 
 impl Engine {
+    fn compact_source_blocked(&self, source: SourceId) -> Result<bool, RecoveryError> {
+        let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
+        let flight = self
+            .sent
+            .get(&source)
+            .ok_or(RecoveryError::MalformedPacket)?;
+        // Capacity cannot conceal the selected source's finite attempt failure.
+        if flight.attempts >= state.send.maximum_attempts {
+            return Ok(false);
+        }
+        let serial = self
+            .next_transmission
+            .checked_add(1)
+            .ok_or(RecoveryError::CounterExhausted)?;
+        Ok(matches!(
+            state.history_slot(serial),
+            Err(RecoveryError::HistoryCapacity)
+        ))
+    }
+
+    pub(super) fn compact_source_deadline(&self) -> Option<Duration> {
+        let state = self.compact.as_ref()?;
+        self.sent
+            .iter()
+            .filter(|(_, flight)| !flight.acknowledged && flight.transmission == 0)
+            // No local timer frees a history slot: real peer feedback does.
+            // Errors remain actionable so normal polling exposes fatal limits.
+            .filter(|(source, _)| !self.compact_source_blocked(**source).unwrap_or(false))
+            .filter_map(|(source, flight)| {
+                if state.meta(*source).fast {
+                    Some(self.last_now)
+                } else {
+                    flight
+                        .retry_at
+                        .or_else(|| (flight.attempts == 0).then_some(self.last_now))
+                }
+            })
+            .min()
+    }
+
     pub(super) fn compact_receive(
         &mut self,
         bytes: &[u8],
@@ -1130,10 +1180,7 @@ impl Engine {
             .next_transmission
             .checked_add(1)
             .ok_or(RecoveryError::CounterExhausted)?;
-        let history_index = (serial % state.history.len() as u64) as usize;
-        if state.history[history_index].is_some() {
-            return Err(RecoveryError::HistoryCapacity);
-        }
+        let history_index = state.history_slot(serial)?;
         let rto = state.rto()?;
         now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?;
         common(output, self.context, state.send.recovery, 1);

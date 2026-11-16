@@ -411,3 +411,92 @@ fn delayed_completion_observation_arms_actual_acceptance_time_and_rejects_imposs
     }
     Ok(())
 }
+
+#[test]
+fn continuously_due_retries_cannot_starve_first_sends_or_renew_original_deadlines() -> TestResult {
+    for reserved in [false, true] {
+        let mut sender = make(EndpointRole::Initiator, reserved, true)?;
+        let mut receiver = make(EndpointRole::Responder, reserved, true)?;
+        let zero = [0x91, 0, 0xf1];
+        let one = [0xa2, 0, 0xff, 1];
+        let two = [0xb3, 0, 0xf3, 2, 0];
+        assert_eq!(sender.submit(&zero, ms(0))?, 0);
+        let original = emit_source(&mut sender, ms(0))?;
+        let output = token(&sender, 0)?;
+        sender.confirm_transmission(ms(0), output)?;
+        // The actual first transmission is lost after physical acceptance.
+        assert_eq!(sender.submit(&one, ms(0))?, 1);
+        let retry = emit_source(&mut sender, ms(10))?;
+        assert_eq!(retry, original);
+        let output = token(&sender, 0)?;
+        sender.confirm_transmission(ms(10), output)?;
+        receiver.receive(&retry, ms(10))?;
+        assert_eq!(sender.source_deadline(), Some(ms(10)));
+        assert_eq!(
+            sender
+                .0
+                .sent
+                .get(&SourceId(0))
+                .and_then(|flight| flight.retry_at),
+            Some(ms(30))
+        );
+
+        // Old source zero is due again at this delayed carrier opportunity.
+        // One failed output preflight cannot consume the fresh source's turn.
+        let before = sender.statistics();
+        let retained = sender.retained();
+        let mut short = [0xa5; DATA_HEADER_BYTES + 3];
+        assert_eq!(
+            sender.poll_source(ms(30), &mut short),
+            Err(RecoveryError::OutputTooSmall {
+                required: DATA_HEADER_BYTES + one.len()
+            })
+        );
+        assert_eq!(short, [0xa5; DATA_HEADER_BYTES + 3]);
+        assert_eq!(sender.statistics(), before);
+        assert_eq!(sender.retained(), retained);
+        let fresh = emit_source(&mut sender, ms(30))?;
+        assert_eq!(
+            inspect_packet(&fresh, context(EndpointRole::Responder), 16)?,
+            PacketView::Data {
+                source: SourceId(1),
+                payload: &one
+            }
+        );
+        let output = token(&sender, 1)?;
+        sender.confirm_transmission(ms(30), output)?;
+        receiver.receive(&fresh, ms(30))?;
+        assert_eq!(sender.source_deadline(), Some(ms(30)));
+        assert_eq!(sender.submit(&two, ms(30))?, 2);
+
+        let retry = emit_source(&mut sender, ms(50))?;
+        assert_eq!(retry, original);
+        let output = token(&sender, 0)?;
+        sender.confirm_transmission(ms(50), output)?;
+        receiver.receive(&retry, ms(50))?;
+        // Both old sources have overdue retry debt at the next opportunity.
+        let fresh = emit_source(&mut sender, ms(100))?;
+        assert_eq!(
+            inspect_packet(&fresh, context(EndpointRole::Responder), 16)?,
+            PacketView::Data {
+                source: SourceId(2),
+                payload: &two
+            }
+        );
+        let output = token(&sender, 2)?;
+        sender.confirm_transmission(ms(100), output)?;
+        receiver.receive(&fresh, ms(100))?;
+        // Fresh service has not moved source one's original 40ms retry deadline.
+        assert_eq!(sender.source_deadline(), Some(ms(40)));
+        assert_eq!(sender.statistics().transmissions, 5);
+        assert_eq!(sender.statistics().retransmissions, 2);
+        assert_eq!(receiver.statistics().received_unique, 3);
+        assert_eq!(receiver.statistics().duplicates, 1);
+        let ack = emit_ack(&mut receiver, ms(100))?;
+        sender.receive(&ack, ms(100))?;
+        assert!(sender.drained());
+        assert_eq!(sender.retained().send_bytes, 0);
+        assert_eq!(sender.failure(), None);
+    }
+    Ok(())
+}

@@ -106,6 +106,18 @@ of recovery support, retained sources, actual short-source physical copies and
 installed ACK coalescing in one selected client profile. Codec copy selection or
 an eight-byte-symbol component witness cannot close that end-to-end requirement.
 
+The named CompactWire source fixes1460-byte symbols and MTU1500. Current Rust
+Packed metadata and actual cryptographic/carrier overhead cannot fit that same
+symbol into one MTU1500 datagram. Preserve the coding width and network MTU:
+complete alignment needs a versioned source/repair fragmentation and bounded
+reassembly composition, with original identities/deadlines and each physical
+fragment charged/authenticated. A changed-MTU experiment must have a distinct
+configuration label. Full8192 also requires bounded authenticated ingress separate
+from recovery support so multi-turn GF work does not discard every later arrival
+as local Busy. Neither requirement is satisfied by the small-symbol component
+witness; exact source findings remain in the
+[source-bound integration audit](../../work/parallel-features-20261115/python-parity-staging/full-packed-common/contract-v0.md).
+
 ## Parallel implementation and acceptance ledger
 
 The integrator owns common configuration, authenticated wire revisions, profile

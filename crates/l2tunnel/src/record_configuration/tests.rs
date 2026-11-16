@@ -537,3 +537,6 @@ fn existing_swift_v1_domain_wire_and_digest_remain_available() -> Result {
     assert!(<legacy::Configuration as Canonical>::decode(&encoded(&fixture("swift")?)?).is_err());
     Ok(())
 }
+
+#[path = "compact_tests.rs"]
+mod compact;

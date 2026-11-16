@@ -325,6 +325,13 @@ fn all_native_carrier_plans_validate_four_full_families_and_both_roles_before_ex
                         common::Profile::Swift { .. } => 0,
                         common::Profile::Aligned { .. } => 1,
                         common::Profile::Packed { .. } => 2,
+                        common::Profile::AlignedCompact { .. }
+                        | common::Profile::PackedCompact { .. } => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "native export fixture requires its original four-family catalog",
+                            ));
+                        }
                         common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. } => {
                             3
                         }

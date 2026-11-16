@@ -816,14 +816,21 @@ where
         for _ in 0..selection.burst_limit() {
             let mut progress = ingress_step(&mut device, &mut pipeline, &mut ingress,
                 &mut packet, runtime, config, started.elapsed())?;
-            let mut staged = false;
             for state in states.iter_mut().filter(|state| state.outbound.is_some()) {
-                staged |= state.endpoint.status().staged_frame;
+                let before = state.endpoint.status();
                 state.endpoint.tick(started.elapsed()).map_err(io::Error::other)?;
                 state.check_retention(runtime)?;
+                let after = state.endpoint.status();
+                // A staged frame may make bounded unit progress. A sealed source
+                // waiting on the same recovery capacity is not such progress.
+                progress |= before.staged_frame != after.staged_frame
+                    || before.packing != after.packing;
                 progress |= admit_native(state, &mut pipeline, &mut selected, started.elapsed())?;
             }
-            if !progress && !staged { break; }
+            // This ends only the ingress/staging burst. Receiver preparation,
+            // native attempts and both recovery lanes still run below in this
+            // turn; the unchanged ticker/I/O wakes retain future bounded work.
+            if !progress { break; }
         }
         let now = started.elapsed();
         for state in &mut states {

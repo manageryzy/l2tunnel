@@ -48,6 +48,13 @@ state; ACK claims still require the actual engine's send ledger in `receive`.
   fresh ACK, recovering a lost final ACK through the sender's timeout. Due ACKs
   and data alternate when both are ready, preventing a perpetual feedback stream
   from starving the data queue. Outer admission still accounts every packet.
+- Eligible first sends and retries alternate after successful source emission.
+  Each class retains its own lowest source or earliest due deadline. Failed
+  output preflight does not consume the turn, and fresh service does not move
+  an old source's retry deadline. This prevents continuous due retries from
+  starving originals already admitted to the finite send window. Compact uses
+  its separate selected algorithm. This finite fairness correction is not proof
+  that the legacy Packed runtime pressure timeout is resolved.
 - Timeout retries use injected monotonic time, exponential backoff and configured
   maximum RTO. Retry counts are finite. Exhaustion reports a sticky terminal
   `RetryExhausted` error; no silent drop or false drain is allowed.
@@ -108,6 +115,8 @@ protocol decisions.
 - [ ] [MOD-REC-15] Implement real GF(256) FEC and all remaining block/sliding/hybrid/research families.
 - [ ] [MOD-REC-16] Integrate authenticated datagram carriers, negotiated peer source/window budgets, shared QoS/credit budgets and real namespace/netem receipts.
 - [x] [MOD-REC-17] Expose separately pollable source/feedback and authoritative borrowed packet inspection for bounded FEC composition. Evidence: [engine APIs](../../crates/l2tunnel-recovery/src/arq.rs), [split-poll ownership and inspection regression](../../crates/l2tunnel-recovery/src/arq/tests.rs).
+
+- [x] [MOD-REC-18] Bound first-send service when retries stay continuously due, preserving original retry deadlines and transactional output preflight. Evidence: [Cases16](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-16/validation.json) passes all nine physical-custody cases, including real allocated/reserved owners and genuine peer ACK release. The enclosing build failed in unrelated fixture borrow checks; only its completed immutable recovery artifact was executed.
 
 ## Verification scope
 

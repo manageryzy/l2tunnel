@@ -726,7 +726,11 @@ impl Driver {
                 "whole carrier write crossed original cap",
             ));
         }
-        self.check_expiry(at)
+        if !self.check_expiry(at)? {
+            return Ok(false);
+        }
+        self.retry_common_feedback(at)?;
+        Ok(true)
     }
     #[cfg(test)]
     pub(super) fn flush_common_wire_with(
@@ -812,7 +816,11 @@ impl Driver {
                         "whole Common write crossed its original cap",
                     ));
                 }
-                self.check_expiry(completed)
+                if !self.check_expiry(completed)? {
+                    return Ok(false);
+                }
+                self.retry_common_feedback(completed)?;
+                Ok(true)
             }
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -841,6 +849,18 @@ impl Driver {
         opened: record::Opened,
         now: u64,
     ) -> io::Result<()> {
+        self.retry_common_feedback(now)?;
+        if self
+            .common
+            .as_ref()
+            .is_some_and(|runtime| runtime.pending_feedback.is_some())
+        {
+            // Only one exact input is retained. Continue Control/Liveness reads;
+            // additional lossy User packets cannot overwrite the retained ACK.
+            self.counters.native_backpressure_drops =
+                self.counters.native_backpressure_drops.saturating_add(1);
+            return Ok(());
+        }
         let epoch = core::Epoch(opened.scope.epoch.0);
         let state = self.common_state()?;
         let Some(reader) = state.peer().reader(epoch) else {
@@ -872,6 +892,25 @@ impl Driver {
             }
             configuration::DirectionProfile::Packed(config) => {
                 classify(body, config.base.recovery, self.info.role)?
+            }
+            configuration::DirectionProfile::AlignedCompact(receive) => {
+                let configuration::DirectionProfile::AlignedCompact(send) = local.send().profile()
+                else {
+                    return Err(protocol("compact directional family mismatch"));
+                };
+                classify_compact(body, send.recovery, receive.recovery, self.info.role)?
+            }
+            configuration::DirectionProfile::PackedCompact(receive) => {
+                let configuration::DirectionProfile::PackedCompact(send) = local.send().profile()
+                else {
+                    return Err(protocol("packed compact directional family mismatch"));
+                };
+                classify_compact(
+                    body,
+                    send.base.recovery,
+                    receive.base.recovery,
+                    self.info.role,
+                )?
             }
             configuration::DirectionProfile::Rolling { config, .. } => {
                 let recovery = config.scheduler.recovery;
@@ -917,13 +956,19 @@ impl Driver {
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("common receive owner"));
         };
-        match state.entry(epoch)?.accept_authenticated(
+        match state.entry(epoch)?.accept_authenticated_at(
+            engine::Tick(now),
             engine::Tick(now),
             opened.number.0,
             kind,
             &mut self.buffers.plain[..opened.bytes],
         ) {
             Ok(()) => Ok(()),
+            Err(record_bank::Error::Engine(engine::Error::Aligned(
+                l2tunnel_aligned::Error::RecoveryPressure(l2tunnel_reliable::Error::Arq(
+                    recovery::RecoveryError::FeedbackAwaitingPhysical,
+                )),
+            ))) => self.retain_common_feedback(opened, kind, now),
             Err(record_bank::Error::Engine(engine::Error::Aligned(error)))
                 if error.is_backpressure() =>
             {
@@ -951,6 +996,13 @@ impl Driver {
         held_control: bool,
     ) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if let Some(pending) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.pending_feedback)
+        {
+            wake = wake.min(pending.deadline);
+        }
         if !held_user
             && let Some(pending) = self
                 .common
@@ -1050,7 +1102,7 @@ impl Driver {
             if epoch.0 != self.source_scope.epoch.0 || engine.drained().map_err(protocol)? {
                 continue;
             }
-            let required = common_contract::maximum_body(local.send())?
+            let required = common_contract::maximum_body(local.send(), local.receive())?
                 .checked_add(overhead)
                 .and_then(|v| v.checked_add(self.reserve))
                 .ok_or_else(exhausted)?;
@@ -1119,4 +1171,160 @@ fn classify(
         RecordKind::Repair => engine::EmissionKind::Repair,
         RecordKind::Feedback => engine::EmissionKind::Feedback,
     })
+}
+
+// Classification observes actual v2 source/feedback structure after the sole
+// Records opener authenticated it. It creates no new admission or replay proof.
+fn classify_compact(
+    body: &[u8],
+    send: l2tunnel_reliable::CompactReliableConfig,
+    receive: l2tunnel_reliable::CompactReliableConfig,
+    role: security::Role,
+) -> io::Result<engine::EmissionKind> {
+    let sender = if role == security::Role::Initiator {
+        recovery::EndpointRole::Responder
+    } else {
+        recovery::EndpointRole::Initiator
+    };
+    let plan =
+        l2tunnel_reliable::storage::CompactPlan::for_duplex(send, receive).map_err(protocol)?;
+    let view = l2tunnel_reliable::inspect_compact_structural(
+        body,
+        sender,
+        plan.receive_max_packet_bytes(),
+        receive.arq(),
+        send.arq(),
+    )
+    .map_err(protocol)?;
+    match view.kind {
+        RecordKind::Source => Ok(engine::EmissionKind::Source(engine::SourceForm::DirectArq)),
+        RecordKind::Feedback => Ok(engine::EmissionKind::Feedback),
+        RecordKind::Systematic | RecordKind::Repair => Err(protocol("unexpected compact FEC body")),
+    }
+}
+
+impl Driver {
+    fn retain_common_feedback(
+        &mut self,
+        opened: record::Opened,
+        kind: engine::EmissionKind,
+        received: u64,
+    ) -> io::Result<()> {
+        if kind != engine::EmissionKind::Feedback {
+            return Err(protocol("physical feedback pressure on non-feedback body"));
+        }
+        let runtime = self
+            .common
+            .as_ref()
+            .ok_or_else(|| protocol("common feedback owner"))?;
+        let output = runtime
+            .sealed
+            .as_ref()
+            .ok_or_else(|| protocol("feedback lost physical dependency"))?;
+        if output.scope != opened.scope
+            || output.carrier.as_ref().is_none_or(|token| {
+                token.emission().kind != engine::EmissionKind::Source(engine::SourceForm::DirectArq)
+            })
+            || runtime.pending_feedback.is_some()
+        {
+            return Err(protocol("feedback physical dependency differs"));
+        }
+        let mut deadline = output.deadline.min(self.lease);
+        if let Some(cap) = self
+            .common_state()?
+            .operation_deadline()
+            .into_iter()
+            .chain(runtime.outcome.map(common_actions::outcome_deadline))
+            .min()
+        {
+            deadline = deadline.min(u64::try_from(cap.as_micros()).map_err(invalid)?);
+        }
+        if received >= deadline {
+            self.terminal = Some(StopReason::PolicyTimeout);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original retained feedback cap",
+            ));
+        }
+        let runtime = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("common feedback owner"))?;
+        runtime
+            .feedback_input
+            .get_mut(..opened.bytes)
+            .ok_or_else(|| protocol("retained feedback payload capacity"))?
+            .copy_from_slice(
+                self.buffers
+                    .plain
+                    .get(..opened.bytes)
+                    .ok_or_else(|| protocol("authenticated feedback plaintext length"))?,
+            );
+        runtime.pending_feedback = Some(common::PendingFeedback {
+            scope: opened.scope,
+            number: opened.number.0,
+            bytes: opened.bytes,
+            received,
+            deadline,
+        });
+        runtime.observation_dirty = true;
+        Ok(())
+    }
+
+    pub(super) fn retry_common_feedback(&mut self, now: u64) -> io::Result<bool> {
+        let Some(pending) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.pending_feedback)
+        else {
+            return Ok(true);
+        };
+        if !self.check_expiry(now)? {
+            return Ok(false);
+        }
+        if !self.scope_registered(pending.scope) {
+            return Err(protocol(
+                "retained feedback scope retired before completion",
+            ));
+        }
+        let epoch = core::Epoch(pending.scope.epoch.0);
+        let state = self.common_state()?;
+        let reader = state
+            .peer()
+            .reader(epoch)
+            .ok_or_else(|| protocol("retained feedback reader missing"))?;
+        if common_actions::common_scope(epoch, reader.config)? != pending.scope {
+            return Err(protocol("retained feedback reader changed"));
+        }
+        let owner::DataOwner::Common(state) = &mut self.owner else {
+            return Err(protocol("retained feedback Bank missing"));
+        };
+        let runtime = self
+            .common
+            .as_mut()
+            .ok_or_else(|| protocol("retained feedback runtime missing"))?;
+        let result = state.entry(epoch)?.accept_authenticated_at(
+            engine::Tick(pending.received),
+            engine::Tick(now),
+            pending.number,
+            engine::EmissionKind::Feedback,
+            runtime
+                .feedback_input
+                .get_mut(..pending.bytes)
+                .ok_or_else(|| protocol("retained feedback length changed"))?,
+        );
+        match result {
+            Ok(()) => {
+                runtime.pending_feedback = None;
+                runtime.observation_dirty = true;
+                Ok(true)
+            }
+            Err(record_bank::Error::Engine(engine::Error::Aligned(
+                l2tunnel_aligned::Error::RecoveryPressure(l2tunnel_reliable::Error::Arq(
+                    recovery::RecoveryError::FeedbackAwaitingPhysical,
+                )),
+            ))) => Ok(false),
+            Err(error) => Err(protocol(error)),
+        }
+    }
 }

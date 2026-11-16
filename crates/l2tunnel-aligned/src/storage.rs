@@ -210,6 +210,19 @@ impl Allocation {
             trace: None,
         })
     }
+    pub(super) fn for_wrapper(wrapper: usize) -> Self {
+        Self {
+            limit: wrapper,
+            used: 0,
+            count: 0,
+            #[cfg(test)]
+            fail_at: None,
+            #[cfg(test)]
+            attempts: 0,
+            #[cfg(test)]
+            trace: None,
+        }
+    }
     pub(super) fn vec<T>(&mut self, n: usize) -> Result<Vec<T>, Error> {
         let used = sum(&[self.used, array_bytes::<T>(n)?])?;
         if used > self.limit {

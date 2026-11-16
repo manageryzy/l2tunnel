@@ -137,6 +137,16 @@ pub(super) struct PendingWire {
     pub(super) deadline: u64,
     pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
 }
+// Created only after the sole Records opener commits this exact User record.
+// Public copied metadata cannot install or reconstruct this retained authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingFeedback {
+    pub(super) scope: Scope,
+    pub(super) number: u64,
+    pub(super) bytes: usize,
+    pub(super) received: u64,
+    pub(super) deadline: u64,
+}
 pub(super) struct Runtime {
     pub(super) contract: CommonTransactionContract,
     pub(super) action: Option<ActionWork>,
@@ -145,6 +155,8 @@ pub(super) struct Runtime {
     pub(super) native_work: [usize; 2],
     pub(super) sealed: Option<PendingWire>,
     pub(super) wire: Vec<u8>,
+    pub(super) pending_feedback: Option<PendingFeedback>,
+    pub(super) feedback_input: Vec<u8>,
     pub(super) outcome: Option<transactions::Outcome>,
     pub(super) completion: Option<(TransactionReply, Result<core::Epoch, SwitchError>)>,
     pub(super) observation_dirty: bool,
@@ -505,6 +517,9 @@ impl Driver {
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(witness_bytes))
             .and_then(|v| v.checked_add(input.cover.limits().max_packet_bytes))
+            // The inline Vec/metadata headers are already in Driver; this is
+            // the one actual retained authenticated-feedback payload capacity.
+            .and_then(|v| v.checked_add(config.security.max_body_bytes))
             .ok_or_else(exhausted)?;
         let initial_plan = engine::storage::Plan::for_engine(
             contract.initial(),
@@ -557,6 +572,14 @@ impl Driver {
             return Err(invalid("common sealed wire capacity differs"));
         }
         wire.resize(wire.capacity(), 0);
+        let mut feedback_input = Vec::new();
+        feedback_input
+            .try_reserve_exact(config.security.max_body_bytes)
+            .map_err(io::Error::other)?;
+        if feedback_input.capacity() != config.security.max_body_bytes {
+            return Err(invalid("common retained feedback capacity differs"));
+        }
+        feedback_input.resize(config.security.max_body_bytes, 0);
         let owner = reserve_common_state(
             &contract,
             identity,
@@ -600,6 +623,8 @@ impl Driver {
                     native_work: [0; 2],
                     sealed: None,
                     wire,
+                    pending_feedback: None,
+                    feedback_input,
                     outcome: None,
                     completion: None,
                     observation_dirty: false,

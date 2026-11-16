@@ -16,7 +16,29 @@ pub(super) enum Owner {
 }
 
 impl Owner {
-    pub(super) fn enable_carrier_confirmation(&mut self) -> Result<(), Error> {
+    pub(super) fn enable_carrier_confirmation(
+        &mut self,
+        configuration: &configuration::Configuration,
+    ) -> Result<(), Error> {
+        // Compact constructors always enable physical custody before publishing
+        // the owner. Legacy constructors require this explicit selection once.
+        match configuration.descriptor().profile() {
+            configuration::Profile::AlignedCompact { .. } => {
+                return if matches!(self, Self::Aligned(_)) {
+                    Ok(())
+                } else {
+                    Err(Error::Invariant)
+                };
+            }
+            configuration::Profile::PackedCompact { .. } => {
+                return if matches!(self, Self::Packed(_)) {
+                    Ok(())
+                } else {
+                    Err(Error::Invariant)
+                };
+            }
+            _ => {}
+        }
         match self {
             Self::Aligned(endpoint) => endpoint
                 .enable_physical_send_confirmation()
@@ -99,6 +121,40 @@ impl Owner {
             ) => aligned::packed::Endpoint::new_duplex(*send, *receive, recovery)
                 .map(Self::Packed)
                 .map_err(Error::Aligned),
+            (
+                configuration::DirectionProfile::AlignedCompact(send),
+                configuration::DirectionProfile::AlignedCompact(receive),
+            ) => {
+                let plan = aligned::compact_storage::Plan::for_duplex(*send, *receive)
+                    .map_err(Error::AlignedStorage)?;
+                aligned::Endpoint::new_compact_duplex_reserved(
+                    *send,
+                    *receive,
+                    recovery,
+                    aligned::storage::Limits {
+                        capacity_bytes: plan.capacity_bytes(),
+                    },
+                )
+                .map(Self::Aligned)
+                .map_err(Error::AlignedStorage)
+            }
+            (
+                configuration::DirectionProfile::PackedCompact(send),
+                configuration::DirectionProfile::PackedCompact(receive),
+            ) => {
+                let plan = aligned::compact_storage::Plan::for_packed_duplex(*send, *receive)
+                    .map_err(Error::AlignedStorage)?;
+                aligned::packed::Endpoint::new_compact_duplex_reserved(
+                    *send,
+                    *receive,
+                    recovery,
+                    aligned::storage::Limits {
+                        capacity_bytes: plan.capacity_bytes(),
+                    },
+                )
+                .map(Self::Packed)
+                .map_err(Error::AlignedStorage)
+            }
             _ => Err(Error::Configuration),
         }
     }
@@ -254,8 +310,9 @@ impl Owner {
         }
     }
 
-    pub(super) fn accept(
+    pub(super) fn accept_at(
         &mut self,
+        received: Tick,
         now: Tick,
         number: u64,
         kind: EmissionKind,
@@ -282,7 +339,7 @@ impl Owner {
                     return Err(Error::Kind);
                 }
                 endpoint
-                    .receive_authenticated(body, duration(now))
+                    .receive_authenticated_at(body, duration(received), duration(now))
                     .map_err(Error::Aligned)
             }
             Self::Packed(endpoint) => {
@@ -290,7 +347,7 @@ impl Owner {
                     return Err(Error::Kind);
                 }
                 endpoint
-                    .receive_authenticated(body, duration(now))
+                    .receive_authenticated_at(body, duration(received), duration(now))
                     .map_err(Error::Aligned)
             }
             Self::Rolling(endpoint) => endpoint
@@ -398,14 +455,20 @@ impl Owner {
                     .feedback_opportunity()
                     .map(|(at, bytes)| (Tick(at), bytes)));
             }
-            Self::Aligned(endpoint) => (
-                endpoint.feedback_deadline(),
-                l2tunnel_reliable::ENVELOPE_BYTES + l2tunnel_recovery::ACK_PACKET_BYTES,
-            ),
-            Self::Packed(endpoint) => (
-                endpoint.feedback_deadline(),
-                l2tunnel_reliable::ENVELOPE_BYTES + l2tunnel_recovery::ACK_PACKET_BYTES,
-            ),
+            Self::Aligned(endpoint) => {
+                let Some((at, bytes)) = endpoint.feedback_opportunity().map_err(Error::Aligned)?
+                else {
+                    return Ok(None);
+                };
+                (Some(at), bytes)
+            }
+            Self::Packed(endpoint) => {
+                let Some((at, bytes)) = endpoint.feedback_opportunity().map_err(Error::Aligned)?
+                else {
+                    return Ok(None);
+                };
+                (Some(at), bytes)
+            }
             Self::Rolling(endpoint) => return Ok(endpoint.feedback_opportunity()),
         };
         at.map(|at| {

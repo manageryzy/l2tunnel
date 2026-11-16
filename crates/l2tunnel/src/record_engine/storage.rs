@@ -64,6 +64,8 @@ enum RecordPlan {
     Swift(swift::storage::Plan),
     Aligned(aligned::storage::Plan),
     Packed(aligned::storage::Plan),
+    AlignedCompact(aligned::compact_storage::Plan),
+    PackedCompact(aligned::compact_storage::Plan),
     Rolling(rolling_records::storage::Plan),
 }
 impl RecordPlan {
@@ -114,6 +116,18 @@ impl RecordPlan {
             ) => aligned::storage::Plan::for_packed_duplex(*send, *receive)
                 .map(Self::Packed)
                 .map_err(Error::Aligned),
+            (
+                configuration::DirectionProfile::AlignedCompact(send),
+                configuration::DirectionProfile::AlignedCompact(receive),
+            ) => aligned::compact_storage::Plan::for_duplex(*send, *receive)
+                .map(Self::AlignedCompact)
+                .map_err(Error::Aligned),
+            (
+                configuration::DirectionProfile::PackedCompact(send),
+                configuration::DirectionProfile::PackedCompact(receive),
+            ) => aligned::compact_storage::Plan::for_packed_duplex(*send, *receive)
+                .map(Self::PackedCompact)
+                .map_err(Error::Aligned),
             _ => Err(Error::Engine(super::Error::Configuration)),
         }
     }
@@ -121,6 +135,7 @@ impl RecordPlan {
         match self {
             Self::Swift(plan) => plan.capacity_bytes(),
             Self::Aligned(plan) | Self::Packed(plan) => plan.capacity_bytes(),
+            Self::AlignedCompact(plan) | Self::PackedCompact(plan) => plan.capacity_bytes(),
             Self::Rolling(plan) => plan.capacity_bytes(),
         }
     }
@@ -146,6 +161,26 @@ impl RecordPlan {
             .map(Owner::Aligned)
             .map_err(Error::Aligned),
             Self::Packed(plan) => aligned::packed::Endpoint::new_duplex_reserved(
+                plan.send_packed().ok_or(Error::Invariant)?,
+                plan.receive_packed().ok_or(Error::Invariant)?,
+                recovery,
+                aligned::storage::Limits {
+                    capacity_bytes: plan.capacity_bytes(),
+                },
+            )
+            .map(Owner::Packed)
+            .map_err(Error::Aligned),
+            Self::AlignedCompact(plan) => aligned::Endpoint::new_compact_duplex_reserved(
+                plan.send_config(),
+                plan.receive_config(),
+                recovery,
+                aligned::storage::Limits {
+                    capacity_bytes: plan.capacity_bytes(),
+                },
+            )
+            .map(Owner::Aligned)
+            .map_err(Error::Aligned),
+            Self::PackedCompact(plan) => aligned::packed::Endpoint::new_compact_duplex_reserved(
                 plan.send_packed().ok_or(Error::Invariant)?,
                 plan.receive_packed().ok_or(Error::Invariant)?,
                 recovery,
@@ -259,7 +294,9 @@ impl Engine {
         )
         .map_err(Error::Pipeline)?;
         let mut owner = plan.record.construct(plan.context)?;
-        owner.enable_carrier_confirmation().map_err(Error::Engine)?;
+        owner
+            .enable_carrier_confirmation(&plan.configuration)
+            .map_err(Error::Engine)?;
         let p = pipeline.storage_usage().ok_or(Error::Invariant)?;
         let (record_bytes, record_allocations) = owner.storage_heap().ok_or(Error::Invariant)?;
         if p.capacity_bytes != plan.pipeline.capacity_bytes()

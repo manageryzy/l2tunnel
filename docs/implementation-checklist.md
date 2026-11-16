@@ -7,6 +7,24 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
+The [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
+installs explicit AlignedCompact/PackedCompact policies through actual reserved
+Engine owners and the original UDP Driver. Finite integration covers lossy source
+and feedback, retained authenticated feedback across delayed physical receipts,
+L3 TCP context/delta/replay, exact native bytes and negotiated record switching.
+All16 affected Common cases pass. Both Compact forms refuse unsupported physical
+copy counts before provisioning while retaining the complete requested policy.
+
+The full check passed workspace Clippy and formatting, with1,739 passing Rust cases
+in successful targets plus522 runtime passes; one legacy Packed pressure case
+failed. Its production staging loop now stops retrying unchanged sealed work in
+the same burst: all22 affected Aligned/Packed cases pass with original limits and
+timeouts. The two Compact endpoint/capability cases and affected strict checks
+also pass. Earlier failures remain preserved; these continuations are not a full
+check pass, and later full-check stages were not reached. Genuine new-profile
+service setup, complete named Python topologies, native/platform/resource/
+performance, all47 and full SW-11 remain open. See [actual composition](modules/compact-endpoint.md).
+
 The [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
 adds independent verified SNI, retained raw send observations, supported CLI naming
 and actual fixed/measured shared-service readiness/cleanup. Affected strict checks
@@ -15,7 +33,7 @@ proxy CLI migration, Python behavior alignment and complete native/platform/
 resource/performance gates remain open. See [naming](modules/tcp-carrier-naming.md),
 [proxy service](modules/tcp-proxy-service.md) and [Python alignment](modules/python-behavior-alignment.md).
 
-The current [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
+The preceding [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
 implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
 Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
 [explicit short-source copy selection](modules/source-copy-policy.md), and
@@ -218,7 +236,7 @@ remain evidence for their stated scope, not a percentage of product completion.
 
 - [ ] [FIX-14] Complete source/configuration-specific Python behavior alignment through the actual selected runtime, following [PBA-01..06](modules/python-behavior-alignment.md). Keep independent per-connection CompactARQ and shared directional Packed candidates distinct; replace wrong selected Rust recovery/feedback/retry behavior. Implement CompactARQ serial/RTT/receiver-delay/guarded fast retry, complete global8192/local128/every16 with physical short copies and ACK coalescing, and prioritize L3 TCP while preserving L2. Common migration and finite component tests do not close this gate; retain authentication, management, all47 modes and every existing full requirement.
 
-The [batch9 scoped checkpoint](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json) adds protocol-tested CompactARQ with actual Python event traces, explicit Reliable R0, protected Rolling source copies, shared proxy CLI lifecycle and native-IP TCP codec construction. Complete selected Compact configuration/runtime, named recovery topologies, full Packed composition and native performance remain open. The legacy Packed QUIC pressure failure is preserved; these finite leaves do not close FIX-14.
+The preceding [batch9 scoped checkpoint](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json) added protocol-tested CompactARQ with actual Python event traces, explicit Reliable R0, protected Rolling source copies, shared proxy CLI lifecycle and native-IP TCP codec construction. Complete selected Compact configuration/runtime, named recovery topologies, full Packed composition and native performance remain open. The legacy Packed QUIC pressure failure is preserved; these finite leaves do not close FIX-14.
 - [ ] [FIX-13] Replace the target Swift-specific TCP/TLS-bootstrap plus independent UDP path with the shared point-to-point secure session over the explicitly selected carrier. Preserve Swift's AEAD data behavior while moving authentication/key exchange, protection, replay, rekey and stable control behind reusable boundaries. Implement the owner-selected WireGuard-like direction through the [SEC-* gates](modules/secure-session.md), keeping original connection/socket/five-tuple continuity, HTTPS-like TLS-to-packet requirements, bounded default recovery and all record-profile functionality. No library, wire format, key migration or timeout value is selected by this documentation change; historical slices remain evidence for their original scope.
 - [ ] [FIX-09] Minimize packet-path copies through explicit bounded buffer ownership. Eliminate whole-history and whole-equation-bank transaction snapshots; reuse immutable payloads and transfer owned buffers across codec, recovery, carrier and native handoffs. Count allocations and copied bytes separately from necessary GF output and cryptographic writes. Preserve bounds, original deadlines, cancellation and exact bytes under loss/pressure; do not claim end-to-end zero copy without measurement. The [sparse rolling transaction](modules/local-global-rlnc.md) now copies only modified equation rows, with bounded preallocated versions and atomic commit/abort; rank-zero originals bypass empty algebra and window scans. Its focused before/after work and correctness checks do not qualify native throughput or remaining packet-path copies. The [Swift bulk-prefix correction](modules/swift-bulk-copy.md) preserves copied bytes with measured CPU savings; impaired 80 Mbit/s and clean native capture qualification remain open.
 - [ ] [FIX-01] Separate local storage from authenticated byte/record flight budgets in every packet runtime, including base UDP, its QUIC owner and raw; size delivery credit from bandwidth and causal feedback RTT. Rolling, aligned/packed and now base UDP/QUIC/raw have focused implementations; [shared packet delivery](modules/packet-delivery.md) and [raw integration](modules/raw-runtime.md) prove native flight larger than the local queue. The [source28 aggregate](../work/implementation-wave28/validation.json) passed; new native profile qualification remains open. Keep recovery retained-source byte/record limits a third independently configured and observed domain: the base ARQ default/cap of64 can remain an RTT bottleneck after native credit grows. Validate small local queues with larger real outstanding debt, exact mixed-size bytes, receiver pressure, original deadlines and full/half operation. Carry actual first-send and authenticated delivery timestamps through bounded queues; enqueue is not physical-send completion.

@@ -116,8 +116,7 @@ fn emit(
 fn allowance(endpoint: &Endpoint) -> OutboundBudget {
     OutboundBudget {
         packets: 64,
-        wire_bytes: 64
-            * (endpoint.max_packet_bytes() + endpoint.config.recovery.outer_overhead_bytes),
+        wire_bytes: 64 * (endpoint.max_packet_bytes() + endpoint.outer_overhead_bytes()),
     }
 }
 fn emissions(endpoint: &mut Endpoint, now: u64) -> Result<Vec<Vec<u8>>, Error> {

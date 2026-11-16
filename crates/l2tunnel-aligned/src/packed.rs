@@ -3,6 +3,9 @@ use super::*;
 use l2tunnel_codec::{packed as packing, packed_envelope, packed_sender};
 use std::mem::size_of;
 
+/// Complete Compact R0 packed direction without dummy legacy/FEC fields.
+pub use super::compact_packed::{CONFIG_BYTES as COMPACT_CONFIG_BYTES, Config as CompactConfig};
+
 /// Distinct authenticated packed profile; ordinary aligned wire is unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -147,6 +150,21 @@ struct LegacyEndpointLayout {
     failure: Option<Error>,
 }
 impl Options {
+    pub(super) fn sender(self, base: super::compact::BodyConfig) -> packed_sender::Config {
+        packed_sender::Config {
+            sender: super::sender_config(base),
+            packing: packing::Config {
+                symbol_bytes: base.receiver.body.symbol_bytes,
+                hold_micros: self.hold_micros,
+            },
+            max_units: self.max_units,
+            first_unit: base.receiver.first_source,
+            work_limit: self.work_limit,
+        }
+    }
+    pub(super) fn envelope(self, base: super::compact::BodyConfig) -> packed_envelope::Config {
+        self.sender(base).envelope()
+    }
     pub(super) fn config(self, base: super::Config) -> Config {
         Config {
             base,
@@ -258,6 +276,28 @@ impl Endpoint {
     ) -> Result<Self, storage::Error> {
         let plan = storage::Plan::for_packed_duplex(send, receive)?;
         super::Endpoint::new_reserved_profile(plan, context, limits).map(Self)
+    }
+    /// Reserve one actual symmetric Compact R0 packed owner; physical custody is enabled.
+    pub fn new_compact_reserved(
+        config: CompactConfig,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        Self::new_compact_duplex_reserved(config, config, context, limits)
+    }
+    /// Reserve independent actual Compact policies using the same packed lifecycle.
+    pub fn new_compact_duplex_reserved(
+        send: CompactConfig,
+        receive: CompactConfig,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        super::Endpoint::assemble_compact(
+            super::compact_storage::Plan::for_packed_duplex(send, receive)?,
+            context,
+            limits,
+        )
+        .map(Self)
     }
     /// Complete actual retained heap; allocating construction reports None.
     pub fn storage_usage(&self) -> Option<storage::Usage> {
@@ -396,6 +436,15 @@ impl Endpoint {
     pub fn receive_authenticated(&mut self, packet: &[u8], now: Duration) -> Result<(), Error> {
         self.0.receive_authenticated(packet, now)
     }
+    /// Preserve original authenticated arrival through selected physical feedback deferral.
+    pub fn receive_authenticated_at(
+        &mut self,
+        packet: &[u8],
+        received: Duration,
+        observed: Duration,
+    ) -> Result<(), Error> {
+        self.0.receive_authenticated_at(packet, received, observed)
+    }
     /// Prepare bounded work on the scheduler-selected ordinary channel.
     pub fn prepare(
         &mut self,
@@ -433,6 +482,10 @@ impl Endpoint {
     /// Actual next recovery ACK deadline, excluding data and native work.
     pub fn feedback_deadline(&self) -> Option<Duration> {
         self.0.feedback_deadline()
+    }
+    /// Actual selected feedback deadline and current complete recovery bytes.
+    pub fn feedback_opportunity(&self) -> Result<Option<(Duration, usize)>, Error> {
+        self.0.feedback_opportunity()
     }
 
     /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
