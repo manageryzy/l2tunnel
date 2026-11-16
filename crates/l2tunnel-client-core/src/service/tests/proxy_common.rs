@@ -9,6 +9,13 @@ fn fixture_selected(
     hosts: &[Arc<Host>; 2],
     retained_close: bool,
 ) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
+    fixture_profile(hosts, retained_close, false)
+}
+fn fixture_profile(
+    hosts: &[Arc<Host>; 2],
+    retained_close: bool,
+    measured: bool,
+) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
     let TransactionPlans {
         plans,
         profile: old,
@@ -110,7 +117,21 @@ fn fixture_selected(
         parameters,
         proxy.clone(),
     )?;
-    let profile = if retained_close {
+    let profile = if measured {
+        let selected = common_transaction_profile::Profile::new_proxy_measured_retained(
+            connection,
+            old.settings(),
+            old.peers(),
+            resources[0],
+            resources[1],
+            catalog,
+            parameters,
+            measured_common::config(proxy)?,
+        )?;
+        assert_ne!(selected.configuration()?, legacy.configuration()?);
+        assert!(selected.proxy_retirement());
+        selected
+    } else if retained_close {
         let selected = common_transaction_profile::Profile::new_proxy_retained(
             connection,
             old.settings(),
@@ -502,3 +523,9 @@ mod retirement;
 #[cfg(target_os = "linux")]
 #[path = "proxy_common_cli.rs"]
 mod cli;
+
+#[path = "proxy_common_measured.rs"]
+mod measured_common;
+
+#[path = "proxy_common_measured_policy.rs"]
+mod measured_policy;

@@ -1,38 +1,28 @@
-//! Windows-only startup; all packet forwarding and lifecycle state stay shared.
-use crate::{cli::Plan, diagnostics::Diagnostics, foreground, setup::Setup};
-use l2tunnel_client_core::service;
+//! Windows-only startup; packet forwarding and lifecycle state stay shared.
+use crate::{cli::Plan, diagnostics::Diagnostics, foreground, input, staging::Staging};
 use l2tunnel_device::PacketLayer;
 use l2tunnel_platform_windows::Device;
-use std::{
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{io, sync::Arc};
 
-/// Run one explicitly selected foreground connection. Ctrl+C cancels setup or
-/// aborts the connected generation; completion follows release of owned handles.
-/// Driver creation runs on a joined blocking worker. Cancellation during that OS
-/// call waits for it to return and releases its result, never detaches the worker.
+/// Run the explicit foreground connection with optional bounded stdin control.
+/// Ctrl+C and input closure release the actual shared owner and unused devices.
+/// Blocking driver creation is joined on cancellation, including a late success.
 pub async fn execute(plan: Plan) -> io::Result<()> {
     let connection = plan.connection;
+    let control_stdin = plan.control_stdin;
     let config = plan.device.clone();
-    let slot: Arc<Mutex<Option<Device>>> = Arc::new(Mutex::new(None));
-    let offered = slot.clone();
-    let attachment = service::Attachment::new(PacketLayer::Ip, move || {
-        let device = offered
-            .lock()
-            .map_err(|_| io::Error::other("device attachment lock failed"))?
-            .take()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "foreground device already consumed",
-                )
-            })?;
+    let diagnostics = Arc::new(Diagnostics::stderr()?);
+    let device_diagnostics = diagnostics.clone();
+    let staging = Staging::new(move || {
+        let device = Device::open(&config)?;
+        device_diagnostics.emit(format!(
+            "Owned Wintun adapter: {}; authentication pending",
+            device.name()
+        ));
         Ok(Box::new(device))
     });
-    // Validate credentials and the shared immutable plan before creating a device.
-    let prepared = plan.prepare(attachment)?;
-    let diagnostics = Diagnostics::stderr()?;
+    // Validate credentials and the immutable shared plan before any device work.
+    let prepared = plan.prepare(staging.attachment(PacketLayer::Ip))?;
     let mut interrupt = tokio::signal::windows::ctrl_c()?;
     let cancellation = async move {
         interrupt.recv().await.ok_or_else(|| {
@@ -42,58 +32,76 @@ pub async fn execute(plan: Plan) -> io::Result<()> {
             )
         })
     };
-    tokio::pin!(cancellation);
-    let mut worker = Setup::spawn(move || Device::open(&config))?;
-    let opened = tokio::select! {
-        biased;
-        cancelled = &mut cancellation => {
-            // A blocking native call cannot be safely aborted. Join and drop its
-            // owner before acknowledging cancellation, including a late success.
-            let result = worker.finish().await;
-            drop(result);
-            drop(prepared);
-            drop(slot);
-            cancelled?;
-            diagnostics.emit("Cancelled during device setup; setup worker joined and owned handles released".into());
-            return Ok(());
-        },
-        result = worker.finish() => result?,
+    let controls = if control_stdin {
+        Some(input::stdin()?)
+    } else {
+        None
     };
-    diagnostics.emit(format!(
-        "Owned Wintun adapter: {}; driver setup complete, authentication pending",
-        opened.name()
-    ));
-    *slot
-        .lock()
-        .map_err(|_| io::Error::other("device attachment lock failed"))? = Some(opened);
     diagnostics.emit("requested_carrier=tcp-tls requested_udp_cover=not_applicable traffic=system effective_carrier=unknown native_qualification=pending".into());
-    let result = foreground::run(prepared, connection, &mut cancellation, |event| {
-        // Only bounded copied text reaches the writer. It owns no device,
-        // credentials or service handles and cannot block this runtime thread.
-        match event {
-            foreground::Event::Requested(config) => {
-                diagnostics.emit(format!("Requested {config:?}"));
+    if control_stdin {
+        diagnostics.emit("Local stdin control: status, disconnect, reconnect (LF/CRLF). EOF ends foreground ownership; it does not wait for a queued reconnect to finish.".into());
+    }
+    let result = foreground::controlled(
+        prepared,
+        connection,
+        Some(staging),
+        controls,
+        cancellation,
+        |event| {
+            // Bounded copied text only. A blocked diagnostic consumer cannot retain
+            // a device, credential, service handle or the thread polling Run.
+            match event {
+                foreground::Event::Requested(config) => {
+                    diagnostics.emit(format!("Requested {config:?}"));
+                }
+                foreground::Event::Status(status) => {
+                    let effective = if status
+                        .managed
+                        .as_ref()
+                        .is_some_and(|managed| managed.running)
+                    {
+                        "tcp-tls"
+                    } else {
+                        "none"
+                    };
+                    diagnostics.emit(format!(
+                        "effective_carrier={effective} udp_cover=not_applicable {status:?}"
+                    ));
+                }
+                foreground::Event::Accepted { action, operation } => {
+                    diagnostics.emit(format!("Accepted action={action:?} operation={operation}"));
+                }
+                foreground::Event::Completed { operation, result } => {
+                    diagnostics.emit(format!("Completed operation={operation} result={result:?}"));
+                }
+                foreground::Event::Terminal { generation, result } => {
+                    diagnostics.emit(format!(
+                        "Released generation={generation} terminal={result:?}"
+                    ));
+                }
+                foreground::Event::DevicePreparing => {
+                    diagnostics.emit(
+                        "Creating owned Wintun adapter; no new service operation or generation yet"
+                            .into(),
+                    );
+                }
+                foreground::Event::DeviceReady => {
+                    diagnostics
+                        .emit("Device staged; authentication and service readiness pending".into());
+                }
+                foreground::Event::Failed { kind } => {
+                    diagnostics.emit(format!(
+                        "Local request failed kind={kind:?}; no automatic retry"
+                    ));
+                }
+                foreground::Event::Rejected { command, reason } => {
+                    diagnostics.emit(format!("Rejected command={command:?} reason={reason:?}"));
+                }
             }
-            foreground::Event::Status(status) => {
-                let effective = if status
-                    .managed
-                    .as_ref()
-                    .is_some_and(|managed| managed.running)
-                {
-                    "tcp-tls"
-                } else {
-                    "none"
-                };
-                diagnostics.emit(format!(
-                    "effective_carrier={effective} udp_cover=not_applicable {status:?}"
-                ));
-            }
-        }
-    })
+        },
+    )
     .await;
-    // On failed authentication/cancel-before-attachment the unused owner is here.
-    // The live runtime releases a consumed device before returning its result.
-    drop(slot);
-    diagnostics.emit("Foreground ended; owned device handles released locally".into());
+    diagnostics
+        .emit("Foreground ended; owned device and transport handles released locally".into());
     result.map(|_| ())
 }

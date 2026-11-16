@@ -1,4 +1,4 @@
-//! Fixed proxy actor on the original authenticated Common UDP owner.
+//! Explicit proxy actors on the original authenticated Common UDP owner.
 //!
 //! The actor remains the sole TCP Table, per-flow scheduler and drain owner.
 //! Its ordered records use an explicit one-channel Common adapter. Common native
@@ -7,22 +7,33 @@
 use super::*;
 use crate::secure_udp::{member, transport};
 use tokio::time::Instant;
+#[path = "common_measured.rs"]
+mod measured_profile;
+pub use measured_profile::{run_measured, validate_measured};
 
 /// Validate the finite fixed/full/one-channel composition before native I/O.
-/// Measured, multi-channel and live generation/endpoint changes remain unsupported.
+/// Multi-channel and live generation/endpoint changes remain unsupported.
 pub fn validate(
     config: &Config,
     contract: &transport::CommonTransactionContract,
 ) -> io::Result<()> {
     config.validate()?;
+    validate_binding(config, contract, session_config(config)?.digest)
+}
+
+fn validate_binding(
+    config: &Config,
+    contract: &transport::CommonTransactionContract,
+    binding: ConfigDigest,
+) -> io::Result<()> {
     if config.duplex != Duplex::Full
         || config.mux.channels != 1
-        || contract.proxy_binding() != Some(session_config(config)?.digest)
+        || contract.proxy_binding() != Some(binding)
         || contract.catalog().descriptors().len() != 1
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Common proxy requires bound fixed/full/one-channel policy",
+            "Common proxy requires bound full/one-channel policy",
         ));
     }
     let maximum = config
@@ -63,8 +74,33 @@ pub fn run<D>(
 where
     D: PacketDevice<Error = io::Error> + Send,
 {
+    run_selected(
+        device, parts, contract, config, control, None, requests, observe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected<D>(
+    device: D,
+    parts: member::Parts,
+    contract: transport::CommonTransactionContract,
+    config: Config,
+    control: Control,
+    measured_config: Option<measured::Config>,
+    requests: Option<transport::CommonControlRequests>,
+    observe: impl FnMut(&transport::CommonSnapshot) + Send,
+) -> impl std::future::Future<Output = io::Result<CloseReport>> + Send
+where
+    D: PacketDevice<Error = io::Error> + Send,
+{
     let prepared = (|| {
-        validate(&config, &contract)?;
+        let binding = if let Some(measured) = &measured_config {
+            validate_measured(measured, &contract)?;
+            measured::session_config(measured)?
+        } else {
+            validate(&config, &contract)?;
+            session_config(&config)?
+        };
         if device.layer() != PacketLayer::Ip {
             return Err(invalid("Common proxy requires an IP attachment"));
         }
@@ -107,16 +143,11 @@ where
                 send_session: logical,
                 layer: PacketLayer::Ip,
             },
-            binding: session_config(&config)?,
+            binding,
             originator: info.role == l2tunnel_security::Role::Initiator,
             logical,
         };
-        let readiness = match &control.status {
-            StatusSink::Fixed(sender) => sender.subscribe(),
-            StatusSink::Measured(_) => {
-                return Err(invalid("measured Common proxy is not installed"));
-            }
-        };
+        let readiness = measured_profile::Readiness::new(&control, measured_config.is_some())?;
         Ok((port, bridge, link, readiness, setup, retained))
     })();
     async move {
@@ -138,18 +169,14 @@ where
             link,
             config,
             control,
-            None,
+            measured_config,
             true,
             retained.then_some(bridge.clone()),
         );
         tokio::pin!(runtime, actor);
         let ready = async {
             loop {
-                if readiness
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|s| s.phase == Phase::Forwarding)
-                {
+                if readiness.forwarding() {
                     return if Instant::now() < setup {
                         Ok(())
                     } else {

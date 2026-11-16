@@ -6,6 +6,21 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
+The Batch15 checkpoint integrates the existing measured TCP proxy controller
+through retained Common original UDP and its explicit CLI/API1 presenter, bounded
+Windows foreground status/disconnect/reconnect, and pure legacy sliding/hybrid
+FEC components. See [the scoped Batch15 receipt](../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
+The five measured selection/service/CLI cases, 14 legacy recovery and three explicit
+coefficient cases, and 31 portable Windows cases pass. Required check stages and
+affected Windows GNU lint/link pass through preserved continuations. The aggregate
+QUIC timeout retains its passing same-binary retry with cause unqualified; optional
+configuration stack growth and a Unix helper guard were repaired. This is not a
+pristine single-invocation pass or native Windows execution. External receipts
+remain source-bound history.
+Legacy admission/packer timing still differs from the corresponding Python model
+and is an active correction, not a completed parity claim. Native Windows, full
+proxy/native-window, all47, SW-11, resource and performance gates remain open.
+
 The Batch14 checkpoint implements explicit retained proxy EOF/ARQ retirement
 and Common proxy CLI selection, plus actual Research Engine/Bank, original UDP
 runtime and shared-service composition. The private per-connection reuse

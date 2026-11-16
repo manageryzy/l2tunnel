@@ -41,6 +41,7 @@ pub struct Encoder {
     last: Tick,
     debt: Option<Tick>,
     terminal: Option<Error>,
+    explicit: Option<explicit::Row>,
 }
 impl Encoder {
     pub(crate) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
@@ -51,9 +52,29 @@ impl Encoder {
     }
 
     pub(crate) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
-        storage::Usage::vector(&self.vectors)?
+        let usage = storage::Usage::vector(&self.vectors)?
             .join(storage::Usage::vector(&self.ids)?)?
-            .join(storage::Usage::vector(&self.output)?)
+            .join(storage::Usage::vector(&self.output)?)?;
+        match &self.explicit {
+            Some(row) => usage.join(row.storage_usage()?),
+            None => Ok(usage),
+        }
+    }
+    pub(crate) fn explicit_requested_storage(
+        config: Config,
+    ) -> Result<storage::Usage, storage::Error> {
+        Self::requested_storage(config)?.join(explicit::Row::requested_storage()?)
+    }
+    pub(crate) fn explicit_memory_bound(config: Config) -> Result<usize, Error> {
+        add(Self::memory_bound(config)?, explicit::Row::memory_bound())
+    }
+    pub(crate) fn new_explicit(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
+        if Self::explicit_memory_bound(config)? > config.memory_bytes {
+            return Err(Error::Capacity);
+        }
+        let mut owner = Self::new(config, scope, now)?;
+        owner.explicit = Some(explicit::Row::new()?);
+        Ok(owner)
     }
 
     /// Conservative payload and metadata reservation before allocating.
@@ -90,6 +111,7 @@ impl Encoder {
             last: now,
             debt: None,
             terminal: None,
+            explicit: None,
         })
     }
     fn time(&mut self, now: Tick) -> Result<(), Error> {
@@ -182,6 +204,9 @@ impl Encoder {
     }
     /// Begin the next owned regular/tail equation. A failed call consumes no ID.
     pub fn begin_repair(&mut self, tail: bool, now: Tick) -> Result<RepairId, Error> {
+        if self.explicit.is_some() {
+            return Err(Error::Configuration);
+        }
         self.time(now)?;
         if self.job.is_some() {
             return Err(Error::Busy);
@@ -206,6 +231,9 @@ impl Encoder {
         profile: crate::research::Profile,
         now: Tick,
     ) -> Result<RepairId, Error> {
+        if self.explicit.is_some() {
+            return Err(Error::Configuration);
+        }
         profile.validate()?;
         if support.end == 0
             || support.end != self.next
@@ -222,6 +250,53 @@ impl Encoder {
         let id = RepairId(self.next_repair);
         self.start_repair(id, support, Some(profile), now)
     }
+    // Freeze a canonical sparse equation without requiring its newest source to
+    // be the newest admitted source. Queued owners must preserve referenced ring
+    // columns until this call; all actual source identities are checked here.
+    pub(crate) fn begin_explicit(
+        &mut self,
+        terms: &[explicit::Term],
+        feedback: bool,
+        queued: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<RepairId, Error> {
+        if self.explicit.is_none() {
+            return Err(Error::Configuration);
+        }
+        let support = explicit::support(terms, feedback, self.config.window)?;
+        if support.end > self.next {
+            return Err(Error::Identity);
+        }
+        self.time(now)?;
+        if queued > now {
+            self.terminal = Some(Error::TimeRegression);
+            return Err(Error::TimeRegression);
+        }
+        let end = self.expires(queued, self.config.job_ticks)?.min(cap);
+        if now >= end {
+            self.terminal = Some(Error::Expired);
+            return Err(Error::Expired);
+        }
+        if self.job.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.next_repair == u64::MAX {
+            self.terminal = Some(Error::Exhausted);
+            return Err(Error::Exhausted);
+        }
+        for term in terms {
+            if self.source(term.source).is_none() {
+                return Err(Error::Identity);
+            }
+        }
+        self.explicit
+            .as_mut()
+            .ok_or(Error::Configuration)?
+            .load(terms);
+        let id = RepairId(self.next_repair);
+        self.install_repair(id, support, None, end)
+    }
     fn start_repair(
         &mut self,
         id: RepairId,
@@ -230,6 +305,15 @@ impl Encoder {
         now: Tick,
     ) -> Result<RepairId, Error> {
         let deadline = self.expires(now, self.config.job_ticks)?;
+        self.install_repair(id, support, profile, deadline)
+    }
+    fn install_repair(
+        &mut self,
+        id: RepairId,
+        support: Support,
+        profile: Option<crate::research::Profile>,
+        deadline: Tick,
+    ) -> Result<RepairId, Error> {
         self.job = Some(Job {
             id,
             support,
@@ -275,12 +359,16 @@ impl Encoder {
                     // Research evaluation is bounded by its validated tap limit:
                     // one metadata visit performs at most sixteen single-block
                     // maintained SHA-256 evaluations, with no heap allocation.
-                    let value = match job.profile {
-                        Some(profile) => profile.coefficient(
-                            u32::try_from(job.id.0).map_err(|_| Error::Exhausted)?,
-                            job.source,
-                        )?,
-                        None => field::compact_coefficient(job.support.seed, job.source),
+                    let value = if let Some(row) = &self.explicit {
+                        row.coefficient(job.source)
+                    } else {
+                        match job.profile {
+                            Some(profile) => profile.coefficient(
+                                u32::try_from(job.id.0).map_err(|_| Error::Exhausted)?,
+                                job.source,
+                            )?,
+                            None => field::compact_coefficient(job.support.seed, job.source),
+                        }
                     };
                     job.factor = Some(value);
                     value

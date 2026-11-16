@@ -1,5 +1,9 @@
 # Measured TCP proxy runtime integration
 
+The additive [measured Common composition](common-tcp-proxy-measured.md) selects
+this same actor and controller over authenticated protected UDP. Its finite
+evidence is separate from the original TLS evidence and complete PCOM-02 gate.
+
 Status: the additive configuration, retained-link factories, version-2 framing,
 private handoff ledger and actual common-actor composition are implemented.
 Focused tests cover maintained native TCP endpoints over real authenticated TLS

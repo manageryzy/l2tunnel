@@ -335,6 +335,12 @@ pub struct Handle {
 }
 /// Runtime-owned command receiver; no second measurement command queue exists.
 pub struct Control(super::Control);
+impl Control {
+    #[cfg(unix)]
+    pub(super) fn into_control(self) -> super::Control {
+        self.0
+    }
+}
 impl Handle {
     /// Latest copied actual observation, with no network/measurement side effects.
     pub fn status(&self) -> Option<Status> {

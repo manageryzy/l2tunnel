@@ -419,3 +419,9 @@ async fn cancellation_source_error_still_releases_connected_device() -> TestResu
     assert_eq!(native.live.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+#[path = "termination_tests.rs"]
+mod termination;
+
+#[path = "lifecycle_tests.rs"]
+mod lifecycle;

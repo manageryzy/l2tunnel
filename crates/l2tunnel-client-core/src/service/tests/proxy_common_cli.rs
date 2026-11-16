@@ -150,3 +150,6 @@ async fn common_proxy_cli_presenter_uses_actual_proxy_status_and_observed_releas
     })
     .await?
 }
+
+#[path = "proxy_common_measured_cli.rs"]
+mod measured;

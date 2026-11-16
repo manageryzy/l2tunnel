@@ -342,7 +342,11 @@ pub(super) async fn common(
             "missing explicit Common proxy policy",
         )
     })?;
-    let digest = runtime::session_config(&config)?.digest;
+    let measured = profile.proxy_measured_config().cloned();
+    let digest = match &measured {
+        Some(config) => runtime::measured::session_config(config)?.digest,
+        None => runtime::session_config(&config)?.digest,
+    };
     let session =
         authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
     let info = session.info();
@@ -365,47 +369,72 @@ pub(super) async fn common(
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
     let device = plan.open()?;
     check(deadline)?;
-    let (handle, control) = crate::proxy::control_channel();
-    let backend = Arc::new(Backend::common(
-        handle,
-        digest,
-        &config,
-        ProxyCommonFrame {
-            requested_configuration: requested,
-            effective_configuration: l2tunnel_security::ConfigDigest(
-                info.authenticated.configuration,
-            ),
-            requested_carrier: carrier,
-            effective_carrier: info.authenticated.carrier,
-            requested_cover: profile.settings().cover.appearance,
-            effective_cover: None,
-            local_addr: info.local_addr,
-            peer_addr: info.peer_addr,
-            installed: false,
-            running: false,
-            epoch: None,
-            liveness: Default::default(),
-            hot_switch: false,
-            graceful_close: profile.proxy_retirement(),
-        },
-    ));
+    let frame = ProxyCommonFrame {
+        requested_configuration: requested,
+        effective_configuration: l2tunnel_security::ConfigDigest(info.authenticated.configuration),
+        requested_carrier: carrier,
+        effective_carrier: info.authenticated.carrier,
+        requested_cover: profile.settings().cover.appearance,
+        effective_cover: None,
+        local_addr: info.local_addr,
+        peer_addr: info.peer_addr,
+        installed: false,
+        running: false,
+        epoch: None,
+        liveness: Default::default(),
+        hot_switch: false,
+        socket_accepted_packets: 0,
+        socket_accepted_ip_bytes: 0,
+        graceful_close: profile.proxy_retirement(),
+    };
+    let observe = |backend: &Arc<Backend>| {
+        let sink = backend.clone();
+        let changed = shared.clone();
+        move |snapshot: &l2tunnel_runtime::secure_udp::transport::CommonSnapshot| {
+            sink.observe_common(snapshot);
+            changed.changed();
+        }
+    };
+    type Driver =
+        Pin<Box<dyn std::future::Future<Output = io::Result<runtime::CloseReport>> + Send>>;
+    let (backend, driver): (Arc<Backend>, Driver) = match measured {
+        Some(config) => {
+            let (handle, control) = crate::proxy_measured::control_channel();
+            let backend = Arc::new(Backend::common_measured(
+                handle,
+                digest,
+                &config.fixed,
+                frame,
+            ));
+            let driver = runtime::common::run_measured(
+                device,
+                parts,
+                contract,
+                config,
+                control,
+                None,
+                observe(&backend),
+            );
+            (backend, Box::pin(driver))
+        }
+        None => {
+            let (handle, control) = crate::proxy::control_channel();
+            let backend = Arc::new(Backend::common(handle, digest, &config, frame));
+            let driver = runtime::common::run(
+                device,
+                parts,
+                contract,
+                config,
+                control,
+                None,
+                observe(&backend),
+            );
+            (backend, Box::pin(driver))
+        }
+    };
     let observed = backend.clone();
-    let sink = backend.clone();
-    let changed = shared.clone();
     let runtime = Box::pin(async move {
-        let result = runtime::common::run(
-            device,
-            parts,
-            contract,
-            config,
-            control,
-            None,
-            move |snapshot| {
-                sink.observe_common(snapshot);
-                changed.changed();
-            },
-        )
-        .await;
+        let result = driver.await;
         observed.finished(&result);
         result.map(|_| ())
     });

@@ -1,4 +1,4 @@
-# Explicit fixed TCP proxy through Common records
+# Explicit TCP proxy through Common records
 
 Status: implemented finite slice with current root Linux component and shared-service
 integration evidence in the [Batch13 receipt](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
@@ -16,7 +16,14 @@ Common configuration, admission, Noise and member authentication. Explicit
 owner, readiness, keyed operations, abort, release and reconnect machinery.
 The preexisting TLS fixed/measured constructors and CLI keep their original
 selections. Their external checkpoint did not include the explicit Common CLI
-slice staged below.
+slice implemented below.
+
+The additive measured composition uses `Profile::new_proxy_measured_retained`
+and the same service/controller. Its source-bound external evidence and remaining
+requirements are recorded in [the measured slice](common-tcp-proxy-measured.md).
+Its actual measured runtime and CLI cases pass in
+[Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
+Fixed-only results remain separate.
 
 The actual call chain is:
 
@@ -63,7 +70,7 @@ startup and shutdown semantics; fixed mode does not gain a new pre-stream queue-
 cap. Common's lease and physical output caps can only shorten the write cap. Startup remains bounded by the original
 membership/setup deadline through actual mutual proxy readiness. Terminal carrier
 failure wakes the same actor and awaits its owned child cleanup. Graceful stream
-shutdown waits any pending physical completion, then explicitly fails with
+shutdown in the old `new_proxy`/v1 selection waits any pending physical completion, then explicitly fails with
 `Unsupported`: no reliable session-close retirement owner is installed. It emits
 no synthetic EOF and cannot produce a clean `CloseReport`. The existing actor
 performs its original failure cleanup and the shared service observes actual release.
@@ -83,6 +90,7 @@ Transparent TUN still owns no endpoint cwnd; `exact_tcp_rwnd_control` remains fa
 
 - [x] [PCOM-01] Integrate and execute the fixed/full/one-channel Aligned direct-ARQ slice through actual authenticated original UDP, shared service, maintained native TCP endpoints, exact bidirectional opaque bytes/FIN, transparent bypass, management liveness and owned cleanup. Include admission refusal and original physical-completion cap evidence. Evidence: [actual shared-service fixture](../../crates/l2tunnel-client-core/src/service/tests/proxy_common.rs), [typed record tests](../../crates/l2tunnel/src/record_engine/proxy_records_tests.rs), [physical bridge tests](../../crates/l2tunnel-runtime/src/proxy/common_bridge.rs), and [executed checks](#preserved-external-verification). Graceful close is explicitly refused and remains PCOM-09.
 - [ ] [PCOM-02] Integrate the existing measured controller without a second controller: preserve original measurement admission times, exact physical completion times and immutable token/ordinal callbacks; retain probe/report budgets, ACK provenance, growth/shrink and quiesce/drain semantics. Verify real ACK/window effects separately.
+- [x] [PCOM-02a] Verify the explicit measured/full/one-channel Aligned direct-ARQ composition through the shared service and original authenticated UDP owner, reusing the existing controller, immutable callbacks, actual-table observations and retained-close path. Source-bound external evidence: [measured slice](common-tcp-proxy-measured.md#preserved-external-finite-verification); root evidence: [Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json). Exact per-token physical timestamp retention, native window qualification and full PCOM-02 remain open.
 - [ ] [PCOM-03] Extend all required Common record families, codecs, FEC/repair/short/packed/rolling variants, configured multi-channel MUX and independent recovery owners. Map one logical proxy record to every actual physical fragment/copy and completion without early flush or duplicate debit; qualify mixed traffic/backpressure and finite resources.
 - [ ] [PCOM-04] Install paired-half and every required original carrier (including actual OpenVPN-like and raw TCP/HTTPS-like paths), retaining complete authentication/connection/five-tuple custody and platform constraints. Separate appearance parsing, interoperability and ISP behavior claims.
 - [ ] [PCOM-05] Implement authenticated epoch/digest transactions and idempotent drain barriers for proxy record changes while retaining old TCP flows, grants and readers. Define and implement explicitly permitted new-flow ownership transitions; no transparent-to-proxy local switch or config reload may seize existing TCP ownership. Preserve complete SW-11.
@@ -232,3 +240,38 @@ the unmodified dependency baseline. The new PCOM entries retain stable IDs and
 link their finite evidence. Per the parallel-work instruction, `tools/check.py`
 and full-workspace checks remain with the coordinator. Simulator and historical
 experiment receipts were not modified.
+
+## Explicit measured Common CLI consumer
+
+The measured consumer passes its two focused root cases in Batch15. The original
+[source-bound handoff](../../work/parallel-features-20261115/tcp-staging/common-measured-proxy-cli/handoff-v0.json) remains preserved.
+It depends on the separately supplied real measured Common runtime/shared-service
+implementation and its maintained status/retirement APIs; this CLI patch does not
+copy or reimplement that dependency.
+
+Selection requires --traffic proxy-measured --proxy-policy JSON_FILE plus
+--proxy-close retained, the explicit complete Common plan and original
+quic-like/media-like cover. Missing retained selection refuses before policy/plan
+files, socket or device startup. The existing strict measured Settings parser and
+runtime_config preserve every fixed, allocation, ownership, observation and service
+field. Profile::new_proxy_measured_retained and the existing
+Prepared::proxy_common_client/server retain the genuine authentication and owners.
+Fixed omitted/retained selections retain their existing behavior and wire bytes.
+
+Requested inspection distinguishes measured-relay-v1 and includes the complete
+measured policy, exact measured session digest and unchanged bounded fixed route
+pages. Authentication and effective observations remain absent. The same sole
+API1 proxy presenter uses actual MeasuredRelay observations, actual CommonUdp and
+selected cover, installed Common readiness and real maintained measured status.
+It does not route this backend through native-Common API4 or label it TCP/TLS.
+Exact native TCP RTT/cwnd/rwnd, qualification, reload and supported switches are
+not inferred from measured relay targets.
+
+Two focused cases pass: strict explicit retained selection and complete
+measured policy projection without fixed fallback; and an actual dependency
+shared-service fixture through the maintained presenter, bounded status and
+observed disconnect release. The latter does not claim clean graceful retirement
+or repeat the dependency's TCP pressure/measurement/final-source loss matrix.
+PCOM-06 and every other original PCOM definition remain unchanged and open where
+not separately qualified. Broader carriers, paired Half, channels/catalogs,
+failure/reconnect/native/platform/resource/performance gates remain required.

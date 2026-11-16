@@ -16,7 +16,7 @@ use std::{
 use zeroize::Zeroizing;
 
 /// Supported foreground invocation and explicit capability limits.
-pub const HELP: &str = "l2tunnel-windows connect --carrier tcp-tls --layer tun --remote IP:PORT --ca DER --server-name DNS --identity PKCS8 --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--mtu 1280..65519] [--duplex half|full] [--compression off|lz4] [--sni DNS] [--handshake-seconds 1..120]\nExplicit foreground Wintun L3 / retained TCP/TLS frame slice. Default half duplex, MTU 1500, compression off, no SNI. Ctrl+C cancels setup or aborts forwarding and releases owned handles. Requires a trusted, operator-pinned official Wintun DLL and permission to create an adapter. Only its unique adapter/address/MTU are owned; no default routes or DNS are changed. Windows service, named-pipe API, TAP L2, credential vault and other carriers are pending. Native Windows qualification is separate. Other commands: plan, --help, --version.";
+pub const HELP: &str = "l2tunnel-windows connect --carrier tcp-tls --layer tun --remote IP:PORT --ca DER --server-name DNS --identity PKCS8 --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--mtu 1280..65519] [--duplex half|full] [--compression off|lz4] [--sni DNS] [--handshake-seconds 1..120] [--control stdin]\nExplicit foreground Wintun L3 / retained TCP/TLS frame slice. Default half duplex, MTU 1500, compression off, no SNI. Ctrl+C cancels setup or aborts forwarding and releases owned handles. Optional --control stdin accepts exact status, disconnect and reconnect LF/CRLF lines, at most 32 bytes before LF; EOF or invalid input stops the foreground owner. The input-only thread may remain blocked on stdin until process exit and holds no tunnel owners. Requires a trusted, operator-pinned official Wintun DLL and permission to create an adapter. Only its unique adapter/address/MTU are owned; no default routes or DNS are changed. Windows service, named-pipe API, TAP L2, credential vault and other carriers are pending. Native Windows qualification is separate. Other commands: plan, --help, --version.";
 
 /// One parsed command; parsing opens no sockets, credentials or devices.
 pub enum Command {
@@ -36,6 +36,8 @@ pub struct Plan {
     pub connection: ConnectionConfig,
     /// Validated platform-specific device inputs.
     pub device: Config,
+    /// Explicit process stdin control; disabled unless --control stdin is selected.
+    pub control_stdin: bool,
     remote: SocketAddr,
     ca: PathBuf,
     identity: PathBuf,
@@ -79,6 +81,7 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
         "--compression",
         "--sni",
         "--handshake-seconds",
+        "--control",
     ];
     for pair in args[1..].chunks(2) {
         if pair.len() != 2
@@ -104,6 +107,15 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
             "this foreground slice requires explicit tcp-tls and tun; no fallback",
         ));
     }
+    let control_stdin = match values.get("--control").copied() {
+        None => false,
+        Some("stdin") => true,
+        Some(_) => {
+            return Err(invalid(
+                "control requires explicit stdin; other transports are unsupported",
+            ));
+        }
+    };
     let remote: SocketAddr = get("--remote")?
         .parse()
         .map_err(|_| invalid("remote requires IP:PORT"))?;
@@ -178,6 +190,7 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
     Ok(Command::Connect(Box::new(Plan {
         connection,
         device,
+        control_stdin,
         remote,
         ca: get("--ca")?.into(),
         identity: get("--identity")?.into(),
@@ -306,6 +319,27 @@ mod tests {
             arguments.extend(pair.map(str::to_owned));
             assert!(parse(&arguments).is_err());
         }
+    }
+    #[test]
+    fn stdin_control_is_explicit_and_other_transports_are_rejected() -> io::Result<()> {
+        let Command::Connect(plan) = parse(&args())? else {
+            return Err(invalid("plan"));
+        };
+        assert!(!plan.control_stdin);
+        let mut arguments = args();
+        arguments.extend(["--control".into(), "stdin".into()]);
+        let Command::Connect(plan) = parse(&arguments)? else {
+            return Err(invalid("plan"));
+        };
+        assert!(plan.control_stdin);
+        for value in ["pipe", "auto", "off", "STDIN"] {
+            let mut arguments = args();
+            arguments.extend(["--control".into(), value.into()]);
+            assert!(parse(&arguments).is_err());
+        }
+        arguments.extend(["--control".into(), "stdin".into()]);
+        assert!(parse(&arguments).is_err());
+        Ok(())
     }
     #[test]
     fn credentials_never_open_attachment_on_parse_failure() -> io::Result<()> {

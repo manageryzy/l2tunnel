@@ -13,3 +13,9 @@ mod setup;
 
 #[cfg(any(windows, test))]
 mod diagnostics;
+
+#[cfg(any(windows, test))]
+mod staging;
+
+#[cfg(any(windows, test))]
+mod input;

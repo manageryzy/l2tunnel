@@ -30,6 +30,8 @@ pub struct Profile {
     requested_catalog: Option<Catalog>,
     proxy: Option<l2tunnel_runtime::proxy::Config>,
     proxy_retirement: bool,
+    // Keep an absent optional policy from enlarging every carrier setup future.
+    proxy_measured: Option<Box<l2tunnel_runtime::proxy::measured::Config>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,11 +124,50 @@ impl Profile {
         result.proxy_retirement = true;
         Ok(result)
     }
+    /// Explicit measured controller with retained Common retirement. The complete
+    /// existing measured policy is bound before the same admission/Noise/member H0.
+    /// Fixed constructors and their authenticated selections remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_measured_retained(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::measured::Config,
+    ) -> io::Result<Self> {
+        let binding = l2tunnel_runtime::proxy::measured::session_config(&proxy)?;
+        let mut application = digest::Context::new(&digest::SHA256);
+        application.update(b"l2tunnel/shared-client/common-proxy-measured/v1\0");
+        application.update(&settings.application.0);
+        application.update(&binding.digest.0);
+        settings.application = ConfigDigest(super::finish(application));
+        let mut result = Self::new_proxy_retained(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            proxy.fixed.clone(),
+        )?;
+        result.proxy_measured = Some(Box::new(proxy));
+        result.runtime_contract(security::Role::Initiator)?;
+        result.runtime_contract(security::Role::Responder)?;
+        Ok(result)
+    }
+    /// Exact selected measured policy, absent for fixed and transparent Common.
+    pub fn proxy_measured_config(&self) -> Option<&l2tunnel_runtime::proxy::measured::Config> {
+        self.proxy_measured.as_deref()
+    }
     /// Explicit immutable close capability, bound to this plan's authenticated H0.
     pub const fn proxy_retirement(&self) -> bool {
         self.proxy_retirement
     }
-    /// The exact selected fixed policy, absent for all transparent Common plans.
+    /// Exact fixed base policy for either proxy family; absent for transparent Common.
     pub fn proxy_config(&self) -> Option<&l2tunnel_runtime::proxy::Config> {
         self.proxy.as_ref()
     }
@@ -277,6 +318,7 @@ impl Profile {
             requested_catalog: None,
             proxy,
             proxy_retirement: false,
+            proxy_measured: None,
         };
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
@@ -326,7 +368,7 @@ impl Profile {
         if self.proxy.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "fixed Common proxy supports only its original protected UDP owner",
+                "explicit Common proxy supports only its original protected UDP owner",
             ));
         }
         if self.carrier.is_some() || self.raw.is_some() {
@@ -496,12 +538,22 @@ impl Profile {
         )?;
         match &self.proxy {
             Some(proxy) => {
-                let mut contract = contract
-                    .with_proxy_binding(l2tunnel_runtime::proxy::session_config(proxy)?.digest)?;
+                let digest = match &self.proxy_measured {
+                    Some(measured) => {
+                        l2tunnel_runtime::proxy::measured::session_config(measured)?.digest
+                    }
+                    None => l2tunnel_runtime::proxy::session_config(proxy)?.digest,
+                };
+                let mut contract = contract.with_proxy_binding(digest)?;
                 if self.proxy_retirement {
                     contract = contract.with_proxy_retirement()?;
                 }
-                l2tunnel_runtime::proxy::common::validate(proxy, &contract)?;
+                match &self.proxy_measured {
+                    Some(measured) => {
+                        l2tunnel_runtime::proxy::common::validate_measured(measured, &contract)?
+                    }
+                    None => l2tunnel_runtime::proxy::common::validate(proxy, &contract)?,
+                }
                 Ok(contract)
             }
             None => Ok(contract),

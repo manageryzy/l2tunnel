@@ -6,6 +6,7 @@ use std::fmt;
 
 mod decoder;
 pub mod field;
+pub mod legacy_sliding;
 pub mod research;
 pub mod rolling;
 pub mod storage;

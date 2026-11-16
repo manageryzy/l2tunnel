@@ -226,6 +226,7 @@ pub struct Decoder {
     debt: Option<Tick>,
     delivery: Option<Tick>,
     terminal: Option<Error>,
+    explicit: Option<explicit::DecoderState>,
 }
 enum Action {
     Continue,
@@ -264,7 +265,7 @@ impl Decoder {
     }
 
     pub(crate) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
-        storage::Usage::vector(&self.data[0])?
+        let usage = storage::Usage::vector(&self.data[0])?
             .join(storage::Usage::vector(&self.data[1])?)?
             .join(storage::Usage::vector(&self.known)?)?
             .join(storage::Usage::vector(&self.pivots)?)?
@@ -275,7 +276,32 @@ impl Decoder {
             .join(storage::Usage::vector(&self.input)?)?
             .join(storage::Usage::vector(&self.candidate)?)?
             .join(storage::Usage::vector(&self.history)?)?
-            .join(storage::Usage::vector(&self.history_meta)?)
+            .join(storage::Usage::vector(&self.history_meta)?)?;
+        match &self.explicit {
+            Some(state) => usage.join(state.storage_usage()?),
+            None => Ok(usage),
+        }
+    }
+    pub(crate) fn explicit_requested_storage(
+        config: Config,
+    ) -> Result<storage::Usage, storage::Error> {
+        Self::requested_storage(config)?.join(explicit::DecoderState::requested_storage(
+            config.repair_history,
+        )?)
+    }
+    pub(crate) fn explicit_memory_bound(config: Config) -> Result<usize, Error> {
+        add(
+            Self::memory_bound(config)?,
+            explicit::DecoderState::memory_bound(config.repair_history)?,
+        )
+    }
+    pub(crate) fn new_explicit(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
+        if Self::explicit_memory_bound(config)? > config.memory_bytes {
+            return Err(Error::Capacity);
+        }
+        let mut owner = Self::new(config, scope, now)?;
+        owner.explicit = Some(explicit::DecoderState::new(config.repair_history)?);
+        Ok(owner)
     }
 
     /// Fixed equation versions, metadata decisions and history, checked before allocation.
@@ -348,6 +374,7 @@ impl Decoder {
             debt: None,
             delivery: None,
             terminal: None,
+            explicit: None,
         })
     }
     fn time(&mut self, now: Tick) -> Result<(), Error> {
@@ -530,6 +557,9 @@ impl Decoder {
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        if self.explicit.is_some() {
+            return Err(Error::Configuration);
+        }
         if repair.scope != self.scope {
             return Err(Error::Scope);
         }
@@ -558,6 +588,9 @@ impl Decoder {
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        if self.explicit.is_some() {
+            return Err(Error::Configuration);
+        }
         profile.validate()?;
         if repair.scope != self.scope {
             return Err(Error::Scope);
@@ -582,6 +615,47 @@ impl Decoder {
             now,
             original_deadline,
         )
+    }
+    // An explicit-only owner shares the exact same transactional GF solver.
+    // Canonical terms are copied only for a newly staged job; duplicates compare
+    // the complete retained coefficient row, without a digest or allocation.
+    pub(crate) fn begin_explicit_until(
+        &mut self,
+        repair: Repair<'_>,
+        terms: &[explicit::Term],
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<Begin, Error> {
+        if self.explicit.is_none() {
+            return Err(Error::Configuration);
+        }
+        if repair.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        if repair.bytes.len() != self.width {
+            return Err(Error::Length);
+        }
+        if repair.id.0 == 0 || repair.id.0 == u64::MAX || repair.support.seed > 1 {
+            return Err(Error::Identity);
+        }
+        let support = explicit::support(terms, repair.support.seed == 1, self.config.window)?;
+        if support != repair.support {
+            return Err(Error::Identity);
+        }
+        let begin = self.stage_repair(repair, None, 0, received, now, cap)?;
+        let state = self.explicit.as_mut().ok_or(Error::Configuration)?;
+        match begin {
+            Begin::Staged => state.input.load(terms),
+            Begin::Duplicate => {
+                let slot = (repair.id.0 % self.config.repair_history as u64) as usize;
+                if !state.matches(slot, terms) {
+                    return self.fail(Error::Conflict);
+                }
+            }
+            Begin::Stale => {}
+        }
+        Ok(begin)
     }
     fn stage_repair(
         &mut self,
@@ -783,7 +857,14 @@ impl Decoder {
                 } else {
                     // A research metadata visit includes at most sixteen
                     // single-block SHA-256 evaluations, bounded by Profile.
-                    let factor = job.input.coefficient(id)?;
+                    let factor = if matches!(job.input, Input::Repair(_)) {
+                        match &self.explicit {
+                            Some(state) => state.input.coefficient(id),
+                            None => job.input.coefficient(id)?,
+                        }
+                    } else {
+                        job.input.coefficient(id)?
+                    };
                     if factor == 0 {
                         job.phase = Phase::Support(id + 1);
                     } else if self.known(id)?.is_some() {
@@ -1240,14 +1321,19 @@ impl Decoder {
             }
             Phase::History(i) => {
                 if let Input::Repair(d) = job.input {
-                    if i == width {
+                    let term_bytes = self.explicit.as_ref().map_or(0, |state| state.input.len());
+                    if i == width + term_bytes {
                         job.phase = Phase::Commit;
                     } else {
                         if !spend(&mut budget.copies) {
                             return Ok(Action::Paused);
                         }
                         let slot = (d.id.0 % self.config.repair_history as u64) as usize;
-                        self.history[slot * width + i] = self.input[i];
+                        if i < width {
+                            self.history[slot * width + i] = self.input[i];
+                        } else if let Some(state) = &mut self.explicit {
+                            state.copy_history_byte(slot, i - width);
+                        }
                         job.phase = Phase::History(i + 1);
                     }
                 } else {
@@ -1266,6 +1352,9 @@ impl Decoder {
                 if let Input::Repair(d) = job.input {
                     let slot = (d.id.0 % self.config.repair_history as u64) as usize;
                     self.history_meta[slot] = Some(d);
+                    if let Some(state) = &mut self.explicit {
+                        state.commit(slot);
+                    }
                     self.highest_repair = self.highest_repair.max(d.id.0);
                     self.history_floor = self
                         .highest_repair

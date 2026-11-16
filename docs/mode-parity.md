@@ -4,6 +4,21 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
+The Batch15 checkpoint integrates the existing measured TCP proxy controller
+through retained Common original UDP and its explicit CLI/API1 presenter, bounded
+Windows foreground status/disconnect/reconnect, and pure legacy sliding/hybrid
+FEC components. See [the scoped Batch15 receipt](../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
+The five measured selection/service/CLI cases, 14 legacy recovery and three explicit
+coefficient cases, and 31 portable Windows cases pass. Required check stages and
+affected Windows GNU lint/link pass through preserved continuations. The aggregate
+QUIC timeout retains its passing same-binary retry with cause unqualified; optional
+configuration stack growth and a Unix helper guard were repaired. This is not a
+pristine single-invocation pass or native Windows execution. External receipts
+remain source-bound history.
+Legacy admission/packer timing still differs from the corresponding Python model
+and is an active correction, not a completed parity claim. Native Windows, full
+proxy/native-window, all47, SW-11, resource and performance gates remain open.
+
 The Batch14 checkpoint implements explicit retained proxy EOF/ARQ retirement
 and Common proxy CLI selection, plus actual Research Engine/Bank, original UDP
 runtime and shared-service composition. The private per-connection reuse
@@ -245,6 +260,12 @@ L2 and all existing entries retain their full scope.
 | `path-scheduling` | `model.py:Simulation.send`; `multiflow.py:MultiFlow` | Earliest estimated arrival over reserved FIFO paths, forward/reverse rates and RTT factors; application pacing; independent sessions sharing service. `flow_count` differs from ordering lanes and MUX channels. Preserve fixed-total and per-flow window policies. | M3 |
 
 `coding.py:Decoder` performs coefficient/rank recovery. Bulk simulator repairs generally do **not** multiply and transmit actual payload bytes. `compact_wire.py` explicitly uses zero repair payload placeholders and a source ledger. The Rust FEC gate therefore requires real vector arithmetic and recovery from received bytes only, including nonzero/random payloads, partial symbols, lost contexts, and malformed coefficients. Passing the Python throughput experiment cannot satisfy this gate.
+
+The additive [legacy sliding/hybrid protocol component](modules/legacy-sliding.md)
+implements real-byte equations, causal feedback and residual ARQ in a pure library.
+It uses a new explicit-coefficient wire format and physical-send credit boundary;
+the documented packing, Common, carrier, platform and performance gaps keep both
+complete legacy P-* gates open. The contracts in the table are unchanged.
 
 ## Records, compression, wire framing, and MUX
 

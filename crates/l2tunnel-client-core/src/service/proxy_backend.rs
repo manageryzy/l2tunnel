@@ -11,7 +11,7 @@ pub enum ProxyProfile {
     /// Measured relay targets over the same maintained native TCP legs.
     MeasuredRelay,
 }
-/// Bounded copied facts for the explicit fixed Common composition. No Common
+/// Bounded copied facts for the explicit proxy Common composition. No Common
 /// control sender, credential, packet buffer or lifecycle authority escapes.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
@@ -42,7 +42,12 @@ pub struct ProxyCommonFrame {
     pub liveness: l2tunnel_runtime::secure_udp::transport::Liveness,
     /// False for the initial immutable single-descriptor composition.
     pub hot_switch: bool,
-    /// False until Common ARQ and feedback custody can prove final peer drain.
+    /// Cumulative original-carrier whole-packet acceptance across Common scopes.
+    /// This is not a measurement-token callback, peer ACK or network-delivery count.
+    pub socket_accepted_packets: u64,
+    /// Cumulative IP bytes accepted by the original carrier, not application delivery.
+    pub socket_accepted_ip_bytes: u64,
+    /// True only for an explicitly authenticated retained-retirement selection.
     pub graceful_close: bool,
 }
 /// Copied facts from the actual fixed/measured owner; no control sender escapes.
@@ -214,6 +219,17 @@ impl Backend {
         backend
     }
     #[cfg(unix)]
+    pub(super) fn common_measured(
+        handle: crate::proxy_measured::Handle,
+        digest: l2tunnel_core::ConfigDigest,
+        config: &runtime::Config,
+        frame: ProxyCommonFrame,
+    ) -> Self {
+        let mut backend = Self::measured(handle, digest, digest, config);
+        backend.common = Mutex::new(Some(frame));
+        backend
+    }
+    #[cfg(unix)]
     pub(super) fn observe_common(
         &self,
         snapshot: &l2tunnel_runtime::secure_udp::transport::CommonSnapshot,
@@ -227,6 +243,8 @@ impl Backend {
             frame.running = snapshot.running;
             frame.epoch = Some(snapshot.epoch);
             frame.liveness = snapshot.liveness;
+            frame.socket_accepted_packets = snapshot.counters.socket_accepted_packets;
+            frame.socket_accepted_ip_bytes = snapshot.counters.socket_accepted_ip_bytes;
             if snapshot.running {
                 frame.effective_cover = Some(frame.requested_cover);
             }
@@ -257,15 +275,28 @@ impl Backend {
         }
     }
     pub(super) fn observe(&self) -> ProxyFrame {
+        #[cfg(unix)]
+        let common = *self
+            .common
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (runtime, measured) = match &self.control {
             Control::Fixed(handle) => (handle.status(), None),
             Control::Measured(handle) => {
                 let value = handle.status();
                 #[cfg(unix)]
-                let measured = Some(crate::proxy_measured::LocalSnapshot::observed(
-                    self.duplex,
-                    value.as_ref().map(|s| &s.measurement),
-                ));
+                let measured = Some(match common {
+                    Some(frame) => crate::proxy_measured::LocalSnapshot::observed_common(
+                        self.duplex,
+                        value.as_ref().map(|s| &s.measurement),
+                        frame.requested_cover,
+                        frame.effective_cover,
+                    ),
+                    None => crate::proxy_measured::LocalSnapshot::observed(
+                        self.duplex,
+                        value.as_ref().map(|s| &s.measurement),
+                    ),
+                });
                 #[cfg(not(unix))]
                 let measured: Option<()> = None;
                 (value.map(|s| s.runtime), measured)
@@ -273,11 +304,6 @@ impl Backend {
         };
         #[cfg(not(unix))]
         let _ = (measured, self.duplex);
-        #[cfg(unix)]
-        let common = *self
-            .common
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(unix)]
         let common_record_composition = common.is_some_and(|frame| frame.installed);
         #[cfg(not(unix))]

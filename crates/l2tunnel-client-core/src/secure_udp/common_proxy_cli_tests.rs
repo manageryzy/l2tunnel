@@ -218,6 +218,8 @@ fn frame() -> io::Result<ProxyFrame> {
                 ..Default::default()
             },
             hot_switch: false,
+            socket_accepted_packets: 0,
+            socket_accepted_ip_bytes: 0,
             graceful_close: false,
         }),
     })
@@ -269,3 +271,6 @@ fn proxy_common_projection_preserves_actual_distinctions_and_legacy_omission_byt
     );
     Ok(())
 }
+
+#[path = "common_proxy_measured_cli_tests.rs"]
+mod measured;

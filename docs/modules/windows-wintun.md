@@ -16,6 +16,27 @@ authentication, reconnect or service state machine. Its owning application
 must create the device on a blocking worker and supply it to the same shared
 client/service runtime used by other clients.
 
+## Explicit foreground lifecycle controls
+
+The additive `--control-stdin` selection accepts bounded exact `status`,
+`disconnect` and `reconnect` commands through the existing shared service. It
+retains one service owner and one request continuation. Reconnect first observes
+old-generation/device release, then stages a fresh device and submits the next
+shared operation. Requested settings and actual generation/status remain separate.
+Input closure and Ctrl+C stop ownership; a blocked stdin reader holds no tunnel
+owner. Commands do not trigger automatic retry or acquire native privileges.
+
+A retained Staging guard owns blocking device creation until its actual worker
+returns. Cancellation joins it, including late successful creation, before final
+release. There is no fabricated hard cancellation for an unresponsive driver;
+status remains pollable while the worker completes. Portable fake-device and
+real TLS/service evidence from external commit `c7935d9` is preserved in the
+[delivery receipt](../../work/parallel-features-20261115/batch15-staging/external-windows/validation.json).
+Current root [Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json)
+passes all 31 portable application cases and affected GNU cross-target lint/link.
+Its initial unrelated Unix-helper cross-compile error and repair remain preserved.
+Windows driver/device execution remains unqualified.
+
 ## Dependency and safety decision
 
 The implementation uses the safe synchronous API of exactly `tun-rs 2.8.18`

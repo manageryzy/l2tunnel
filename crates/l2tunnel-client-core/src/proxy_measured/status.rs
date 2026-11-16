@@ -24,15 +24,21 @@ pub enum LaneMode {
 pub enum Carrier {
     /// Original authenticated ordinary TCP/TLS lanes.
     TcpTls,
+    /// Original authenticated UDP owner with the explicit Common record adapter.
+    CommonUdp,
 }
-/// UDP cover applicability on this TCP profile.
+/// Explicit UDP appearance, or its absence on retained TCP/TLS lanes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UdpCover {
     /// No UDP carrier is selected.
     NotApplicable,
+    /// Selected QUIC-like framing on the original Common UDP socket.
+    QuicLike,
+    /// Selected media-like framing on the original Common UDP socket.
+    MediaLike,
 }
-/// Capabilities of this explicit TUN/TCP/TLS implementation, not native evidence.
+/// Capabilities of the selected explicit measured composition, not native evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -42,11 +48,11 @@ pub struct Capabilities {
     pub effective: Option<Profile>,
     /// Exact retained lane topology.
     pub lanes: LaneMode,
-    /// Explicit requested ordinary TCP/TLS carrier.
+    /// Explicit requested retained carrier.
     pub requested_carrier: Carrier,
     /// Absent before the real runtime publishes status.
     pub effective_carrier: Option<Carrier>,
-    /// Explicit absence of UDP cover on this profile.
+    /// Explicit requested appearance, or absence for TCP/TLS.
     pub requested_udp_cover: UdpCover,
     /// Absent before the real runtime publishes status.
     pub effective_udp_cover: Option<UdpCover>,
@@ -212,6 +218,27 @@ impl LocalSnapshot {
             },
             aggregate: snapshot.map(Aggregate::from),
         }
+    }
+}
+impl LocalSnapshot {
+    #[cfg(unix)]
+    pub(crate) fn observed_common(
+        lanes: Duplex,
+        snapshot: Option<&Snapshot>,
+        requested_cover: l2tunnel_cover::Appearance,
+        effective_cover: Option<l2tunnel_cover::Appearance>,
+    ) -> Self {
+        let cover = |value| match value {
+            l2tunnel_cover::Appearance::QuicLike => UdpCover::QuicLike,
+            l2tunnel_cover::Appearance::MediaLike => UdpCover::MediaLike,
+        };
+        let mut value = Self::observed(lanes, snapshot);
+        value.capabilities.requested_carrier = Carrier::CommonUdp;
+        value.capabilities.effective_carrier =
+            (snapshot.is_some() && effective_cover.is_some()).then_some(Carrier::CommonUdp);
+        value.capabilities.requested_udp_cover = cover(requested_cover);
+        value.capabilities.effective_udp_cover = snapshot.and(effective_cover).map(cover);
+        value
     }
 }
 impl From<&Snapshot> for Aggregate {

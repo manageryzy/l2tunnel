@@ -139,6 +139,7 @@ impl Plan {
             overhead,
             None,
             None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -158,6 +159,7 @@ impl Plan {
             maximum_body,
             overhead,
             Some(policy),
+            None,
             None,
         )
     }
@@ -181,6 +183,29 @@ impl Plan {
             overhead,
             None,
             Some((proxy, retained)),
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_proxy_measured(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        overhead: usize,
+        proxy: l2tunnel_runtime::proxy::measured::Config,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.validate_carrier(false)?;
+        self.build_selected(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            overhead,
+            None,
+            None,
+            Some(proxy),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -193,6 +218,7 @@ impl Plan {
         overhead: usize,
         raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
+        measured: Option<l2tunnel_runtime::proxy::measured::Config>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
@@ -263,6 +289,18 @@ impl Plan {
                 self.catalog.clone(),
                 self.parameters,
                 policy,
+            );
+        }
+        if let Some(proxy) = measured {
+            return secure_udp::common_transaction_profile::Profile::new_proxy_measured_retained(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                proxy,
             );
         }
         if let Some((proxy, retained)) = proxy {

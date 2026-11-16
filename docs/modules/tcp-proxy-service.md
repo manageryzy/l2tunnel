@@ -1,9 +1,10 @@
 # Fixed and measured TCP proxy through the shared service
 
-The additive [explicit Common fixed-proxy slice](common-tcp-proxy.md) now reuses
+The additive [explicit Common proxy slices](common-tcp-proxy.md) now reuse
 this service and actor through a bounded record adapter. The TLS evidence below
-retains its original scope; measured Common composition and the complete PCOM
-follow-up remain separate.
+retains its original scope. The explicitly selected
+[measured retained composition](common-tcp-proxy-measured.md) uses the same
+controller and service; the complete PCOM follow-up remains open.
 
 Status: actual fixed/measured shared service is implemented and finite full-mode
 TLS/Unix-device integration cases pass, with affected strict checks. The existing

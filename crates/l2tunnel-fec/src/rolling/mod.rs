@@ -7,6 +7,7 @@ use std::fmt;
 
 mod decoder;
 mod encoder;
+pub(crate) mod explicit;
 pub mod scheduler;
 pub mod storage;
 pub mod wire;

@@ -7,6 +7,21 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
+The Batch15 checkpoint integrates the existing measured TCP proxy controller
+through retained Common original UDP and its explicit CLI/API1 presenter, bounded
+Windows foreground status/disconnect/reconnect, and pure legacy sliding/hybrid
+FEC components. See [the scoped Batch15 receipt](../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
+The five measured selection/service/CLI cases, 14 legacy recovery and three explicit
+coefficient cases, and 31 portable Windows cases pass. Required check stages and
+affected Windows GNU lint/link pass through preserved continuations. The aggregate
+QUIC timeout retains its passing same-binary retry with cause unqualified; optional
+configuration stack growth and a Unix helper guard were repaired. This is not a
+pristine single-invocation pass or native Windows execution. External receipts
+remain source-bound history.
+Legacy admission/packer timing still differs from the corresponding Python model
+and is an active correction, not a completed parity claim. Native Windows, full
+proxy/native-window, all47, SW-11, resource and performance gates remain open.
+
 The Batch14 checkpoint implements explicit retained proxy EOF/ARQ retirement
 and Common proxy CLI selection, plus actual Research Engine/Bank, original UDP
 runtime and shared-service composition. The private per-connection reuse
@@ -325,6 +340,11 @@ The preceding [batch9 scoped checkpoint](../work/parallel-features-20261115/para
 - [x] [FIX-08] Reject packed MUX channel256 at composition setup, before any flow is created; preserve packed255/unpacked256 delivery and correct the documented Python integer repair-credit behavior. Evidence must include the formerly accepted invalid composition and valid boundary transfers. Evidence: [composition regressions](../simulator/tests/test_mux_tcp.py) reject packed256 before flow construction and confirm packed255/unpacked256 both-direction delivery; [corrected repair-credit description](modules/local-global-rlnc.md), [complete source27e check](../work/implementation-wave27e/validation.json).
 
 ## Reading order and detailed task lists
+
+The explicit fixed and measured Common proxy slices retain complete follow-up in
+[PCOM-01..PCOM-09](modules/common-tcp-proxy.md), including the finite
+[measured retained composition](modules/common-tcp-proxy-measured.md). Parent proxy,
+switching and platform gates retain their definitions.
 
 The current behavior-alignment work is tracked in
 [named Python compositions](modules/python-behavior-alignment.md), alongside
@@ -749,8 +769,8 @@ planned. New mode IDs require new checklist entries automatically.
 
 - [ ] [P-legacy-arq] Implement and validate `legacy-arq` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-legacy-block-fec] Implement and validate `legacy-block-fec` (M3); preserve its [parity contract](mode-parity.md).
-- [ ] [P-legacy-sliding-fec] Implement and validate `legacy-sliding-fec` (M3); preserve its [parity contract](mode-parity.md).
-- [ ] [P-legacy-hybrid-fec] Implement and validate `legacy-hybrid-fec` (M3); preserve its [parity contract](mode-parity.md).
+- [ ] [P-legacy-sliding-fec] Implement and validate `legacy-sliding-fec` (M3); preserve its [parity contract](mode-parity.md). Additive real-byte protocol component: [legacy scheduling, wire and integration limits](modules/legacy-sliding.md); complete Common/runtime/platform/performance gates remain open.
+- [ ] [P-legacy-hybrid-fec] Implement and validate `legacy-hybrid-fec` (M3); preserve its [parity contract](mode-parity.md). Additive real-byte protocol component: [legacy scheduling, wire and integration limits](modules/legacy-sliding.md); complete Common/runtime/platform/performance gates remain open.
 - [ ] [P-compact-rlnc] Implement and validate `compact-rlnc` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-compact-arq] Implement and validate `compact-arq` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-first-flight-arq] Implement and validate `first-flight-arq` (M3); preserve its [parity contract](mode-parity.md).
