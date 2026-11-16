@@ -56,14 +56,21 @@ pub use performance::Performance;
 pub use transaction_contract::TransactionContract;
 #[path = "transport_carrier.rs"]
 mod carrier;
+#[path = "transport_common_research_order.rs"]
+mod common_research_order;
 use super::raw_carrier_io as raw_carrier;
 #[path = "transport_common.rs"]
 mod common;
-pub(crate) use common::run_common_proxy_records;
+pub(crate) use common::{run_common_proxy_records, run_common_proxy_records_on_raw};
 #[path = "transport_common_actions.rs"]
 mod common_actions;
 #[path = "transport_common_connections.rs"]
 mod common_connections;
+#[path = "transport_common_reuse.rs"]
+mod common_reuse;
+pub use common_reuse::{
+    ConnectionReuseError, ConnectionReuseOutcome, ConnectionReusePhase, ConnectionReuseSnapshot,
+};
 #[path = "transport_common_contract.rs"]
 mod common_contract;
 #[path = "transport_common_fragments.rs"]
@@ -95,14 +102,14 @@ pub use generic::{
 #[allow(clippy::large_enum_variant)]
 enum Start {
     Legacy(security::ConfigDigest, Config),
+    #[cfg(test)]
     Transaction(TransactionContract),
 }
-// Bounded final observations stay inline; this output retains no runtime owner.
-#[allow(clippy::large_enum_variant)]
-enum SelectedStopped {
-    Legacy(Stopped),
-    Transaction(TransactionStopped),
-    Common(CommonStopped),
+// The sole loop returns no backend snapshot. In particular, Common observations
+// must not enlarge the legacy/generic constructor and readiness poll frames.
+struct LoopCompletion {
+    reason: StopReason,
+    at: u64,
 }
 enum Requests {
     Legacy(Option<ControlRequests>),
@@ -117,10 +124,7 @@ enum Request {
         l2tunnel::swift_configuration::Configuration,
         generic::TransactionReply,
     ),
-    Common(
-        l2tunnel::record_configuration::Configuration,
-        generic::TransactionReply,
-    ),
+    Common(common::Command),
 }
 impl Requests {
     fn enabled(&self) -> bool {
@@ -141,10 +145,74 @@ impl Requests {
 
 /// Run the explicitly selected generic transaction backend on the original socket.
 /// Resource preallocation limitations remain visible in every snapshot.
-pub async fn run_transaction<D>(
+/// Construction completes before this function returns its sole I/O future;
+/// errors are returned when awaited. Delayed polling never renews the setup cap.
+pub fn run_transaction<D>(
     device: D,
     parts: member::Parts,
     contract: TransactionContract,
+    requests: Option<TransactionControlRequests>,
+    shutdown: impl Future<Output = ()> + Send,
+    observe: impl FnMut(&TransactionSnapshot) + Send,
+) -> impl Future<Output = io::Result<TransactionStopped>> + Send
+where
+    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+{
+    run_prepared_transaction(
+        prepare_transaction_runtime(device, parts, contract),
+        requests,
+        shutdown,
+        observe,
+    )
+}
+
+struct PreparedTransaction<D> {
+    device: D,
+    socket: tokio::net::UdpSocket,
+    driver: owner::StateCell<Driver>,
+    setup_deadline: Instant,
+}
+
+// Keep actual construction out of the readiness future's nested poll frames.
+#[inline(never)]
+fn prepare_transaction_runtime<D>(
+    device: D,
+    parts: member::Parts,
+    contract: TransactionContract,
+) -> io::Result<PreparedTransaction<D>>
+where
+    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+{
+    let layer = match contract.config().send.records.layer {
+        records::Layer::Ethernet => PacketLayer::Ethernet,
+        records::Layer::Ip => PacketLayer::Ip,
+    };
+    if device.layer() != layer {
+        return Err(invalid(
+            "authenticated native layer differs from actual device",
+        ));
+    }
+    let setup_deadline = parts.deadline;
+    let (socket, driver) =
+        Driver::new_transaction_with(parts, contract, Instant::now(), true, |socket, driver| {
+            Ok((socket, owner::StateCell::new(driver)?))
+        })?;
+    if Instant::now() >= setup_deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original setup deadline after generic construction",
+        ));
+    }
+    Ok(PreparedTransaction {
+        device,
+        socket,
+        driver,
+        setup_deadline,
+    })
+}
+
+async fn run_prepared_transaction<D>(
+    prepared: io::Result<PreparedTransaction<D>>,
     requests: Option<TransactionControlRequests>,
     shutdown: impl Future<Output = ()> + Send,
     mut observe: impl FnMut(&TransactionSnapshot) + Send,
@@ -152,10 +220,17 @@ pub async fn run_transaction<D>(
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
-    let stopped = run_selected_clock(
+    let PreparedTransaction {
         device,
-        parts,
-        Start::Transaction(contract),
+        socket,
+        mut driver,
+        setup_deadline,
+    } = prepared?;
+    let completion = run_driver_clock(
+        device,
+        socket.into(),
+        &mut driver,
+        setup_deadline,
         Requests::Transaction(requests),
         None,
         shutdown,
@@ -166,12 +241,13 @@ where
         Instant::now,
     )
     .await?;
-    match stopped {
-        SelectedStopped::Transaction(stopped) => Ok(stopped),
-        SelectedStopped::Legacy(_) | SelectedStopped::Common(_) => {
-            Err(protocol("generic loop returned another backend status"))
-        }
+    if driver.common.is_some() || driver.generic.is_none() {
+        return Err(protocol("generic loop returned another backend status"));
     }
+    Ok(TransactionStopped {
+        reason: completion.reason,
+        snapshot: driver.snapshot_transaction(completion.at, false)?,
+    })
 }
 
 /// Immutable authenticated full-wire bucket, including control and feedback.
@@ -233,7 +309,7 @@ async fn run_clock<D>(
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
-    let stopped = run_selected_clock(
+    run_selected_clock(
         device,
         parts,
         Start::Legacy(expected_configuration, config),
@@ -245,18 +321,21 @@ where
             Ok(())
         },
         sample,
+        |driver, completion| {
+            if driver.common.is_some() || driver.generic.is_some() {
+                return Err(protocol("legacy loop returned generic status"));
+            }
+            Ok(Stopped {
+                reason: completion.reason,
+                snapshot: driver.snapshot(completion.at, false)?,
+            })
+        },
     )
-    .await?;
-    match stopped {
-        SelectedStopped::Legacy(stopped) => Ok(stopped),
-        SelectedStopped::Transaction(_) | SelectedStopped::Common(_) => {
-            Err(protocol("legacy loop returned generic status"))
-        }
-    }
+    .await
 }
 
 #[allow(clippy::too_many_arguments)] // One I/O loop owns either explicitly selected backend.
-async fn run_selected_clock<D>(
+async fn run_selected_clock<D, T>(
     device: D,
     parts: member::Parts,
     start: Start,
@@ -265,12 +344,14 @@ async fn run_selected_clock<D>(
     shutdown: impl Future<Output = ()> + Send,
     observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
     mut sample: impl FnMut() -> Instant + Send,
-) -> io::Result<SelectedStopped>
+    finish: impl FnOnce(&Driver, LoopCompletion) -> io::Result<T> + Send,
+) -> io::Result<T>
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
     let config = match &start {
         Start::Legacy(_, config) => *config,
+        #[cfg(test)]
         Start::Transaction(contract) => contract.config(),
     };
     let layer = match config.send.records.layer {
@@ -286,9 +367,10 @@ where
     let origin = sample();
     let (socket, mut driver) = match start {
         Start::Legacy(expected, config) => Driver::new(parts, expected, config, origin)?,
+        #[cfg(test)]
         Start::Transaction(contract) => Driver::new_transaction(parts, contract, origin)?,
     };
-    run_driver_clock(
+    let completion = run_driver_clock(
         device,
         socket.into(),
         &mut driver,
@@ -299,7 +381,8 @@ where
         observe,
         sample,
     )
-    .await
+    .await?;
+    finish(&driver, completion)
 }
 
 // The one existing loop borrows its actual Driver. Common constructs its cell
@@ -315,7 +398,7 @@ async fn run_driver_clock<D, R: raw_carrier::RawBacking>(
     shutdown: impl Future<Output = ()> + Send,
     mut observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
     mut sample: impl FnMut() -> Instant + Send,
-) -> io::Result<SelectedStopped>
+) -> io::Result<LoopCompletion>
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
@@ -397,7 +480,8 @@ where
                     match request {
                         Some(Request::Legacy(requested,reply))=>driver.request(clock(origin,sample())?,requested,reply,resolve.as_ref().ok_or_else(||protocol("legacy resolver missing"))?)?,
                         Some(Request::Transaction(configuration,reply))=>driver.request_transaction(clock(origin,sample())?,configuration,reply)?,
-                        Some(Request::Common(configuration,reply))=>driver.request_common(clock(origin,sample())?,configuration,reply)?,
+                        Some(Request::Common(common::Command::Switch(configuration,reply)))=>driver.request_common(clock(origin,sample())?,configuration,reply)?,
+                        Some(Request::Common(common::Command::Reuse(request,reply)))=>driver.request_connection_reuse(clock(origin,sample())?,request,reply)?,
                         None=>requests.close(),
                     }
                 },
@@ -419,7 +503,7 @@ where
                                 }
                                 let at=sample();let time=clock(origin,at)?;
                                 if !driver.check_expiry(time)? {break;}
-                                if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive_selected_at(&inputs.datagram[..length],received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time),time,at,resolve.as_ref())?;}
+                                if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive_selected_with_arrival(&inputs.datagram[..length],received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time),time,received.unwrap_or(at),at,resolve.as_ref())?;}
                             },
                             Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
                             Err(error) if establish::path_loss(&error)=>{driver.counters.socket_receive_errors=driver.counters.socket_receive_errors.saturating_add(1);break;},
@@ -453,6 +537,17 @@ where
             }
         }
     }.await;
+    // On a Research refusal/cancellation, retain every already observed physical
+    // fact before dropping its exact carrier witness. This performs no I/O poll.
+    let result = if socket.is_carrier() && driver.research_carrier_selected() {
+        let facts = driver.complete_carrier_io_terminal(&mut socket, &mut sample);
+        match result {
+            Err(error) => Err(error),
+            Ok(reason) => facts.map(|()| reason),
+        }
+    } else {
+        result
+    };
     let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {
         Ok(reason) => *reason,
@@ -489,24 +584,7 @@ where
         }
     }
     observe(driver, now, false)?;
-    result.and_then(|reason| {
-        if driver.common.is_some() {
-            Ok(SelectedStopped::Common(CommonStopped {
-                reason,
-                snapshot: driver.snapshot_common(now, false)?,
-            }))
-        } else if driver.generic.is_some() {
-            Ok(SelectedStopped::Transaction(TransactionStopped {
-                reason,
-                snapshot: driver.snapshot_transaction(now, false)?,
-            }))
-        } else {
-            Ok(SelectedStopped::Legacy(Stopped {
-                reason,
-                snapshot: driver.snapshot(now, false)?,
-            }))
-        }
-    })
+    result.map(|reason| LoopCompletion { reason, at: now })
 }
 
 enum IoEvent<'a, D: AsRawFd> {
@@ -555,11 +633,7 @@ async fn next_selected_request(requests: &mut Requests) -> Option<Request> {
             .recv()
             .await
             .map(|(value, reply)| Request::Transaction(value, reply)),
-        Requests::Common(Some(requests)) => requests
-            .0
-            .recv()
-            .await
-            .map(|(value, reply)| Request::Common(value, reply)),
+        Requests::Common(Some(requests)) => requests.0.recv().await.map(Request::Common),
         _ => std::future::pending().await,
     }
 }
@@ -2510,10 +2584,12 @@ impl Driver {
                 epoch: security::Epoch(binding.scope.epoch.0),
                 configuration: security::ConfigDigest(binding.scope.digest.0),
             };
+            #[allow(clippy::large_enum_variant)] // Bounded stack parsing avoids allocating per control packet.
             enum Command {
                 Ping(u64),
                 Pong(u64),
                 Profile(swift::control::Message),
+                Reuse(l2tunnel::connection_records::retirement::command::Command),
             }
             let command = match envelope.body {
                 control::Body::Ping { nonce } if scope == self.records.control_scope() => {
@@ -2522,6 +2598,10 @@ impl Driver {
                 control::Body::Pong { nonce } if scope == self.records.control_scope() => {
                     Command::Pong(nonce)
                 }
+                control::Body::ProfileControl {
+                    tag: control::ProfileTag::SlotReuseV1,
+                    ..
+                } => Command::Reuse(self.admit_connection_reuse(now, envelope)?),
                 control::Body::ProfileControl {
                     tag: control::ProfileTag::SwiftPolicyV1,
                     bytes,
@@ -2565,6 +2645,7 @@ impl Driver {
                         self.next_ping = add(now, self.config.lifetime.ping_interval)?;
                     }
                 }
+                Command::Reuse(command) => self.receive_connection_reuse(now, command)?,
                 Command::Profile(message) => self.profile(
                     now,
                     scope,
@@ -2600,11 +2681,43 @@ impl Driver {
     ) -> io::Result<()> {
         self.receive_selected_at(packet, now, now, instant, resolve)
     }
+    #[cfg(test)]
     fn receive_selected_at(
         &mut self,
         packet: &[u8],
         received: u64,
         now: u64,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+    ) -> io::Result<()> {
+        let original = self
+            .origin
+            .checked_add(duration(received))
+            .ok_or_else(exhausted)?;
+        // Legacy deterministic fixtures inject coarse time independently from
+        // the runtime Instant. Real arrivals use the checked wrapper below.
+        self.receive_selected_inner(packet, received, now, original, instant, resolve)
+    }
+    fn receive_selected_with_arrival(
+        &mut self,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        original: Instant,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+    ) -> io::Result<()> {
+        if received > now || original > instant || clock(self.origin, original)? != received {
+            return Err(invalid("authenticated input arrived after observation"));
+        }
+        self.receive_selected_inner(packet, received, now, original, instant, resolve)
+    }
+    fn receive_selected_inner(
+        &mut self,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        original: Instant,
         instant: Instant,
         resolve: Option<&Resolver>,
     ) -> io::Result<()> {
@@ -2702,7 +2815,11 @@ impl Driver {
             }
             Class::User => {
                 if self.common.is_some() {
-                    return self.receive_common_user_at(opened, received, now);
+                    return if self.research_physical_output(opened.scope)? {
+                        self.receive_common_user_observed(opened, received, now, original)
+                    } else {
+                        self.receive_common_user_at(opened, received, now)
+                    };
                 }
                 let lead = self
                     .buffers

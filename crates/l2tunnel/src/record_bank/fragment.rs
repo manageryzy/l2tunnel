@@ -107,6 +107,21 @@ impl Entry<'_> {
             .confirm_fragment_at(now, accepted, token.token)
             .map_err(Error::Engine)
     }
+    /// Forward exact original clock precision without changing physical custody.
+    pub fn confirm_fragment_ordered_at(
+        &mut self,
+        now: engine::Tick,
+        accepted: engine::Tick,
+        order: crate::codec::CausalTime,
+        token: FragmentOutputToken,
+    ) -> Result<engine::FragmentReceipt, Error> {
+        if token.generation != self.generation {
+            return Err(Error::Stale);
+        }
+        self.engine
+            .confirm_fragment_ordered_at(now, accepted, order, token.token)
+            .map_err(Error::Engine)
+    }
     /// Derive kind from every authenticated LX fragment under exact selected labels.
     pub fn inspect_fragment_kind(&self, bytes: &[u8]) -> Result<engine::EmissionKind, Error> {
         self.engine
@@ -124,6 +139,21 @@ impl Entry<'_> {
     ) -> Result<engine::FragmentAdmission, Error> {
         self.engine
             .accept_fragment_authenticated_until(received, now, cap, number, bytes)
+            .map_err(Error::Engine)
+    }
+    /// Preserve precise complete-body causal order through the same reassembler.
+    #[allow(clippy::too_many_arguments)] // Exact arrival order extends the established age/cap inputs.
+    pub fn accept_fragment_authenticated_ordered_until(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        cap: engine::Tick,
+        number: u64,
+        order: crate::codec::CausalTime,
+        bytes: &[u8],
+    ) -> Result<engine::FragmentAdmission, Error> {
+        self.engine
+            .accept_fragment_authenticated_ordered_until(received, now, cap, number, order, bytes)
             .map_err(Error::Engine)
     }
     /// Retry only the three actual retained completion slots; feedback goes first.

@@ -45,6 +45,73 @@ impl Profile {
             None,
         )
     }
+    /// Explicit fixed/full proxy on the maintained original raw TCP carrier.
+    /// Complete raw geometry is requested upfront; no descriptor/body is clamped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_raw(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+        packet: PacketPolicy,
+    ) -> io::Result<Self> {
+        let binding = l2tunnel_runtime::proxy::session_config(&proxy)?;
+        l2tunnel_runtime::proxy::common::validate_catalog(&proxy, &catalog)?;
+        if connection.duplex != Duplex::Full
+            || connection.layer != PacketLayer::Ip
+            || proxy.runtime.layer != PacketLayer::Ip
+            || proxy.runtime.max_packet != connection.max_packet
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "raw Common proxy requires fixed Full TUN policy",
+            ));
+        }
+        let mut application = digest::Context::new(&digest::SHA256);
+        application.update(b"l2tunnel/shared-client/common-proxy/v1\0");
+        application.update(&settings.application.0);
+        application.update(&binding.digest.0);
+        settings.application = ConfigDigest(crate::secure_udp::finish(application));
+        Self::new_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            Some(packet),
+            Some(proxy),
+        )
+    }
+    /// Same fixed raw proxy with explicitly authenticated retained final ARQ debt.
+    /// Existing v1/raw/native selections and defaults remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_raw_retained(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+        packet: PacketPolicy,
+    ) -> io::Result<Self> {
+        let mut application = digest::Context::new(&digest::SHA256);
+        application.update(b"l2tunnel/shared-client/common-proxy-retirement/v1\0");
+        application.update(&settings.application.0);
+        settings.application = ConfigDigest(crate::secure_udp::finish(application));
+        let mut result = Self::new_proxy_raw(
+            connection, settings, peers, initiator, responder, catalog, parameters, proxy, packet,
+        )?;
+        result.proxy_retirement = true;
+        Ok(result)
+    }
     pub(super) fn select_raw(mut self, policy: PacketPolicy) -> io::Result<Self> {
         if self.settings.gate.path.client.is_ipv6() || self.settings.gate.path.server.is_ipv6() {
             return Err(invalid(
@@ -168,7 +235,7 @@ impl Profile {
         outer: AuthenticatedRaw,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        transport::CommonTransactionContract::new_on_raw_paired(
+        let contract = transport::CommonTransactionContract::new_on_raw_paired(
             raw.base,
             role,
             [self.initiator, self.responder],
@@ -180,7 +247,8 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
             outer,
-        )
+        )?;
+        self.complete_proxy_contract(contract)
     }
     pub(super) fn establish_raw(
         &self,

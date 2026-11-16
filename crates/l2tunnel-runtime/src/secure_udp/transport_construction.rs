@@ -82,6 +82,18 @@ impl Plan {
         })
     }
 
+    /// Moving the already charged Driver into one real cell adds only its header.
+    /// Validate the cell layout and total charge before any selected allocation.
+    pub(super) fn with_driver_cell(mut self, initial: C, role: mg::Role) -> io::Result<Self> {
+        std::alloc::Layout::array::<Driver>(1).map_err(io::Error::other)?;
+        self.external_bytes = self
+            .external_bytes
+            .checked_add(std::mem::size_of::<owner::StateCell<Driver>>())
+            .ok_or_else(exhausted)?;
+        self.required_bytes = engines::Bank::required_capacity(initial, role, self.external_bytes)?;
+        Ok(self)
+    }
+
     /// The real provisioning closure is never called after a known budget refusal.
     pub(super) fn provision<T>(
         self,

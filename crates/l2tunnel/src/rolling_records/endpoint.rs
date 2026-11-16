@@ -974,8 +974,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         match kind {
             EmissionKind::Feedback => {
-                P::receive_feedback(&mut self.sender, bytes, rolling_tick(now))
-                    .map_err(Error::Rolling)?;
+                P::receive_feedback(
+                    &mut self.sender,
+                    bytes,
+                    rolling_tick(received),
+                    rolling_tick(now),
+                )
+                .map_err(Error::Rolling)?;
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
                 let (observed, scope) = match self
@@ -1019,6 +1024,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                                 kind,
                                 number: security_number,
                                 received,
+                                order: None,
                                 original_cap: original_deadline,
                                 deadline,
                             },
@@ -1050,6 +1056,38 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return Ok(());
         };
         let input = *front.metadata();
+        if input.kind == EmissionKind::Feedback {
+            // Only physical completion may order this retained feedback around
+            // a pending source/repair. Other ingress keeps its bounded service.
+            if self.prepared_output.is_some_and(|pending| {
+                matches!(pending.kind, EmissionKind::Source(_) | EmissionKind::Repair)
+            }) {
+                let count = owner.queue.len();
+                for _ in 0..count {
+                    if owner
+                        .queue
+                        .front()
+                        .is_some_and(|front| front.metadata().kind != EmissionKind::Feedback)
+                    {
+                        break;
+                    }
+                    owner.queue.rotate_front().map_err(Error::Ingress)?;
+                }
+                return Ok(());
+            }
+            let result = P::receive_feedback(
+                &mut self.sender,
+                front.bytes(),
+                rolling_tick(input.received),
+                rolling_tick(now),
+            )
+            .map_err(Error::Rolling);
+            if let Err(error) = result {
+                return self.fail(error);
+            }
+            owner.queue.complete_front().map_err(Error::Ingress)?;
+            return Ok(());
+        }
         if !matches!(
             input.kind,
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair
@@ -1161,10 +1199,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     pub fn work_pending(&self) -> bool {
         let send = P::send_state(&self.sender);
         let receive = P::receive_state(&self.incoming, rolling_tick(self.now));
-        self.ingress
-            .as_ref()
-            .is_some_and(|owner| !owner.queue.is_empty())
-            || send.work_pending
+        self.ingress.as_ref().is_some_and(|owner| {
+            owner.queue.iter().any(|input| {
+                input.metadata().kind != EmissionKind::Feedback
+                    || !self.prepared_output.is_some_and(|pending| {
+                        matches!(pending.kind, EmissionKind::Source(_) | EmissionKind::Repair)
+                    })
+            })
+        }) || send.work_pending
             || receive.decoder.pending_job
             || receive.feedback_building
             || receive.work_pending

@@ -41,9 +41,27 @@ impl Writer {
 #[cfg(unix)]
 pub(super) type CommonRetirement = super::common_bridge::Bridge;
 #[cfg(not(unix))]
+#[derive(Clone)]
 pub(super) enum CommonRetirement {}
 #[cfg(not(unix))]
 impl CommonRetirement {
+    pub(super) async fn prepare_user_receipt(&self, _ordinal: u64) -> io::Result<()> {
+        match *self {}
+    }
+    pub(super) fn take_physical_receipt(&self) -> io::Result<super::transport::PhysicalWrite> {
+        match *self {}
+    }
+    fn acknowledge_user_receipts(&self, _count: u64) -> io::Result<()> {
+        match *self {}
+    }
+    fn retained_user_receipts(
+        &self,
+    ) -> io::Result<(
+        u64,
+        [Option<super::transport::PhysicalWrite>; super::transport::PHYSICAL_SLOTS],
+    )> {
+        match *self {}
+    }
     fn set_drain_cap(&self, _cap: Instant) -> io::Result<()> {
         match *self {}
     }
@@ -477,12 +495,48 @@ impl Actor {
         }
         Ok(())
     }
+    // Fact import has no Controller callback, semantic flush, or slot release.
+    // Terminal import reads the actual fixed Bridge ring atomically even when
+    // the original cleanup cap cannot wait for an aborted writer to join.
+    fn observe_measured_physical(&mut self, terminal: bool) -> io::Result<Progress> {
+        let mut progress = *self.writers[0].progress.borrow();
+        let Some(bridge) = &self.retirement else {
+            return Ok(progress);
+        };
+        let Some(state) = &mut self.measured else {
+            return Ok(progress);
+        };
+        if terminal {
+            let (count, physical) = bridge.retained_user_receipts()?;
+            progress.users = count;
+            progress.physical = physical;
+        }
+        state.observe_physical(
+            progress.users,
+            progress.physical,
+            self.start,
+            Instant::now(),
+        )?;
+        Ok(progress)
+    }
     fn measured_callbacks(&mut self) -> io::Result<()> {
+        // Use the same copied watermark for import and semantic callback; a new
+        // watch value may arrive concurrently after this bounded observation.
+        let progress = self.observe_measured_physical(false)?;
         self.measured_deadlines(Instant::now())?;
         let now = self.micros()?;
-        let count = self.writers[0].progress.borrow().users;
         if let Some(state) = &mut self.measured {
-            state.callbacks(&self.table, count, now)?;
+            if let Some(bridge) = &self.retirement {
+                state.callbacks_physical(
+                    &self.table,
+                    progress.users,
+                    self.start,
+                    Instant::now(),
+                )?;
+                bridge.acknowledge_user_receipts(progress.users)?;
+            } else {
+                state.callbacks(&self.table, progress.users, now)?;
+            }
         }
         Ok(())
     }
@@ -1138,10 +1192,15 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
     let (quiesce_tx, quiesce) = watch::channel(None);
     let table = session::Table::new(config.table(link.logical, link.originator, seed), Millis(0))
         .map_err(error)?;
-    let measured = measured_config
+    let mut measured = measured_config
         .as_ref()
         .map(|config| measured::State::new(config.clone(), &table))
         .transpose()?;
+    if retirement.is_some()
+        && let Some(state) = &mut measured
+    {
+        state.enable_physical_receipts()?;
+    }
     let wire = Arbiter::new(&config, false)?;
     let native = Arbiter::new(&config, true)?;
     let is_measured = measured_config.is_some();
@@ -1201,7 +1260,7 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
         };
         ctx.try_send(Output::Control(Frame::Start(hello)))
             .map_err(error)?;
-        pending_writers.push(transport::writer(
+        pending_writers.push(transport::writer_selected(
             writer,
             direction,
             config.control_rate,
@@ -1209,6 +1268,10 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             urx,
             ptx,
             events_tx.clone(),
+            retirement
+                .as_ref()
+                .filter(|_| is_measured && direction.bulk)
+                .cloned(),
         ));
         writers.push(Writer {
             control: ctx,
@@ -1331,6 +1394,9 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             } else {
                 tick.tick().await;
             }
+            // Keep already completed physical facts before abort, expiry, or any
+            // other terminal branch can bypass the semantic callback phase.
+            actor.observe_measured_physical(false)?;
             actor.measured_deadlines(Instant::now())?;
             if let Some(at) = *quiesce.borrow() {
                 actor.drain(at)?;
@@ -1438,6 +1504,10 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             let end = actor.deadline.unwrap_or_else(Instant::now);
             let _ = timeout_at(end, async { while tasks.join_next().await.is_some() {} }).await;
         }
+        // The Bridge ring retains exact facts across writer transfer, including
+        // when an already expired original cleanup cap cannot await child joins.
+        // Observation failure must never replace the original terminal error.
+        let _ = actor.observe_measured_physical(true);
     }
     // Common EOF physical completion is not peer receipt. Keep the actual
     // Common receiver alive under the same drain cap before publishing Closed

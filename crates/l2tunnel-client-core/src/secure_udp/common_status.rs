@@ -32,6 +32,13 @@ pub use fragments::{
     FragmentStatus, ReassemblyLimits, RollingFragments,
 };
 
+#[path = "common_reuse_status.rs"]
+mod reuse;
+pub use reuse::{
+    ConnectionReuseConfirmation, ConnectionReuseOperation, ConnectionReuseOutcome,
+    ConnectionReusePhase, ConnectionReuseResult, ConnectionReuseStatus,
+};
+
 /// Exact length of the lowercase hexadecimal complete configuration value.
 pub const CANONICAL_CHARACTERS: usize = CONFIGURATION_BYTES * 2;
 
@@ -329,6 +336,12 @@ pub struct Status {
     /// Actual independent recovery cohort, absent for other active profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<ConnectionRecovery>,
+    /// Explicit negotiated flow-reuse selection and actual controller/capability facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_reuse: Option<Box<ConnectionReuseStatus>>,
+    /// Retained keyed reuse completion, independent of the current selection/generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_reuse_result: Option<Box<ConnectionReuseResult>>,
     /// Complete fragment request and actual current Engine selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling_fragments: Option<FragmentStatus>,
@@ -679,6 +692,9 @@ mod observe {
                 connections: snapshot
                     .and_then(|v| v.connections)
                     .map(ConnectionRecovery::observe),
+                connection_reuse: ConnectionReuseStatus::observe(profile, info, snapshot)?
+                    .map(Box::new),
+                connection_reuse_result: None,
                 rolling_fragments: profile
                     .rolling_fragments()
                     .map(|requested| FragmentStatus::observe(requested, snapshot))

@@ -22,8 +22,8 @@ impl Plan {
         let per_slot = array_bytes::<u8>(config.max_message_bytes)?
             .checked_add(array_bytes::<u8>(presence)?)
             .ok_or(Error::Layout)?;
-        // Actual slot layout includes original first-arrival and deadline metadata
-        // once. No separate scalar charge or additional reservation represents it.
+        // Actual slot layout includes first/complete arrival, precise local order
+        // and deadline metadata once. No separate scalar reservation represents it.
         let capacity_bytes = array_bytes::<PendingSlot>(config.max_messages)?
             .checked_add(
                 per_slot

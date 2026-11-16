@@ -340,3 +340,6 @@ fn actual_shared_pipeline_keeps_independent_loss_and_raw_ack_physical_custody_di
     );
     Ok(())
 }
+
+#[path = "reuse_control_tests.rs"]
+mod reuse_control;

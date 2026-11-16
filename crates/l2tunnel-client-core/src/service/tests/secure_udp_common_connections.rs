@@ -11,6 +11,10 @@ struct Selected {
 }
 #[inline(never)]
 fn selected(hosts: &[Arc<Host>; 2]) -> Result<Selected> {
+    selected_reuse(hosts, false)
+}
+#[inline(never)]
+fn selected_reuse(hosts: &[Arc<Host>; 2], reuse: bool) -> Result<Selected> {
     let CommonPlans {
         plans,
         addresses,
@@ -97,7 +101,12 @@ fn selected(hosts: &[Arc<Host>; 2]) -> Result<Selected> {
         },
     )?;
     let catalog = common::Catalog::new(descriptor, &[descriptor])?;
-    let profile = Arc::new(common_transaction_profile::Profile::new(
+    let construct = if reuse {
+        common_transaction_profile::Profile::new_with_connection_reuse
+    } else {
+        common_transaction_profile::Profile::new
+    };
+    let profile = Arc::new(construct(
         original.connection(),
         original.settings(),
         original.peers(),
@@ -388,3 +397,6 @@ async fn actual_tag8_prepared_service_authenticates_catalog_delivers_tcp_and_rep
     })
     .await?
 }
+
+#[path = "secure_udp_common_reuse.rs"]
+mod reuse;

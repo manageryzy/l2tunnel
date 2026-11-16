@@ -12,7 +12,12 @@ impl Driver {
         if !self.check_expiry(now)? {
             return Ok(());
         }
-        let draining = !self.common_state()?.can_admit_data();
+        let draining = !self.common_state()?.can_admit_data()
+            || self
+                .common
+                .as_ref()
+                .and_then(|r| r.reuse_controller())
+                .is_some_and(super::common_reuse::Controller::active);
         let work = self.config.work.native_read_batch;
         for epoch in self.common_epochs().into_iter().flatten() {
             match self.common_state_mut()?.entry(epoch)?.service_ingress(
@@ -79,6 +84,10 @@ impl Driver {
         };
         if bytes == 0 || bytes > maximum || bytes > output.len() {
             self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
+            return Ok(true);
+        }
+        if self.reject_retired_connection_native(epoch, &output[..bytes])? {
+            self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(true);
         }
         let deadline = add(before, self.config.native.stall_timeout)?.min(self.lease);

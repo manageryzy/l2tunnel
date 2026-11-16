@@ -1,0 +1,21 @@
+# Actual unchanged Python Tunnel/Packer; microsecond input.
+# Header88/packed-item4 are analytical, not L2LB wire charges.
+# q time periodic support coefficients; t time kind supports analytical_bytes planned_finish
+# sha256 simulator/src/l2tunnel_sim/model.py 5694670e336cc71d04c47d6b25b8b3b7c8cc6dce0a1adbe0cd823ce89053b73f
+a 0 0
+z 0 1 2 0 0
+a 1 1
+t 1 source 0,1 96 350
+z 1 2 4 0 0
+a 2 2
+t 2 source 2 90 450
+q 2 1 0,1,2 2bc335
+z 2 0 1 1 1
+a 3 3
+z 3 1 3 1 1
+a 4 4
+t 4 source 3,4 96 550
+q 4 2 0,1,2,3,4 c3695e4fb4
+z 4 0 0 2 2
+t 5 repair 0,1,2;0,1,2,3,4 96 650
+z 20 0 0 2 2

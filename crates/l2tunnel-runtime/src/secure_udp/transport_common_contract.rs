@@ -14,6 +14,7 @@ pub struct CommonTransactionContract {
     expected: security::ConfigDigest,
     proxy_binding: Option<core::ConfigDigest>,
     proxy_retirement: bool,
+    connection_reuse: bool,
     role: security::Role,
     resources: Config,
     cover: cover::Config,
@@ -436,6 +437,7 @@ impl CommonTransactionContract {
             expected,
             proxy_binding: None,
             proxy_retirement: false,
+            connection_reuse: false,
             role,
             resources,
             cover,
@@ -460,11 +462,25 @@ impl CommonTransactionContract {
     /// Bind trusted construction metadata to an explicitly selected fixed proxy.
     /// The caller must include this complete policy digest in authenticated H0.
     /// This marker neither creates authentication nor permits native-IP ingress.
-    pub fn with_proxy_binding(mut self, binding: core::ConfigDigest) -> io::Result<Self> {
+    pub fn with_proxy_binding(self, binding: core::ConfigDigest) -> io::Result<Self> {
+        self.with_proxy_binding_selected(binding, false)
+    }
+    /// Explicit fixed proxy marker on a genuine completed raw Full contract.
+    /// The complete proxy digest must already precede authenticated H0. This
+    /// marker grants no root/I/O authority and cannot upgrade a public Info.
+    pub fn with_proxy_raw_binding(self, binding: core::ConfigDigest) -> io::Result<Self> {
+        self.with_proxy_binding_selected(binding, true)
+    }
+    fn with_proxy_binding_selected(
+        mut self,
+        binding: core::ConfigDigest,
+        raw: bool,
+    ) -> io::Result<Self> {
         use l2tunnel_core::traffic::TcpControl;
         if self.catalog.descriptors().len() != 1
             || self.outer.is_some()
-            || self.raw.is_some()
+            || self.raw.is_some() != raw
+            || self.initial.descriptor().duplex() != core::Duplex::Full
             || self.managed.is_some()
             || [mg::Role::Client, mg::Role::Server]
                 .into_iter()
@@ -479,7 +495,7 @@ impl CommonTransactionContract {
                 })
         {
             return Err(invalid(
-                "fixed Common proxy requires one explicit initial UDP profile",
+                "fixed Common proxy requires one explicit matching Full profile",
             ));
         }
         self.proxy_binding = Some(binding);
@@ -499,6 +515,30 @@ impl CommonTransactionContract {
     /// True only for explicitly selected retained proxy retirement.
     pub const fn proxy_retirement(&self) -> bool {
         self.proxy_retirement
+    }
+    /// Trusted selected construction binds this grammar/version before actual H0.
+    pub fn with_connection_reuse(mut self) -> io::Result<Self> {
+        if self.proxy_binding.is_some()
+            || self.extra_wire_bytes != 0
+            || self.raw.is_some()
+            || self.native_layer() != PacketLayer::Ip
+            || self.initial.descriptor().duplex() != core::Duplex::Full
+            || !self
+                .catalog
+                .descriptors()
+                .iter()
+                .any(|d| matches!(d.profile(), common::Profile::PerConnectionCompact { .. }))
+        {
+            return Err(invalid(
+                "slot reuse requires explicit native-IP original Common catalog",
+            ));
+        }
+        self.connection_reuse = true;
+        Ok(self)
+    }
+    /// True only for the explicit immutable SlotReuseV1 contract selection.
+    pub const fn connection_reuse(&self) -> bool {
+        self.connection_reuse
     }
     /// Complete fixed proxy policy included by the constructing authenticated plan.
     pub fn proxy_binding(&self) -> Option<core::ConfigDigest> {
@@ -626,18 +666,6 @@ impl CommonTransactionContract {
             || value.descriptor().duplex() != self.initial.descriptor().duplex()
         {
             return Err(invalid("common value outside exact authenticated catalog"));
-        }
-        // Original UDP confirms a whole write inline. Async carriers need a
-        // bounded retained-arrival/receipt merge before freezing Research support.
-        if matches!(
-            value.descriptor().profile(),
-            common::Profile::Research { .. }
-        ) && (self.outer.is_some() || self.raw.is_some())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "research async carriers require authenticated arrival/receipt ordering",
-            ));
         }
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);

@@ -930,3 +930,7 @@ async fn measured_idle_native_zero_window_without_pending_send_is_not_receiver_p
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[path = "measured_common_physical_tests.rs"]
+mod common_physical;

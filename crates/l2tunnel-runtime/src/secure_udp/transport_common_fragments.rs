@@ -98,6 +98,7 @@ impl Driver {
         scope: Scope,
         observed: u64,
         accepted: u64,
+        order: Option<l2tunnel::codec::CausalTime>,
         carrier: Option<record_bank::CarrierOutputToken>,
         fragment: Option<record_bank::FragmentOutputToken>,
     ) -> io::Result<()> {
@@ -111,13 +112,33 @@ impl Driver {
         }
         let mut entry = self.common_state_mut()?.entry(core::Epoch(scope.epoch.0))?;
         if let Some(token) = fragment {
-            entry
-                .confirm_fragment_at(engine::Tick(observed), engine::Tick(accepted), token)
-                .map_err(protocol)?;
+            match order {
+                Some(order) => entry.confirm_fragment_ordered_at(
+                    engine::Tick(observed),
+                    engine::Tick(accepted),
+                    order,
+                    token,
+                ),
+                None => {
+                    entry.confirm_fragment_at(engine::Tick(observed), engine::Tick(accepted), token)
+                }
+            }
+            .map_err(protocol)?;
         } else if let Some(token) = carrier {
-            entry
-                .confirm_carrier_output_at(engine::Tick(observed), engine::Tick(accepted), token)
-                .map_err(protocol)?;
+            match order {
+                Some(order) => entry.confirm_carrier_output_ordered_at(
+                    engine::Tick(observed),
+                    engine::Tick(accepted),
+                    order,
+                    token,
+                ),
+                None => entry.confirm_carrier_output_at(
+                    engine::Tick(observed),
+                    engine::Tick(accepted),
+                    token,
+                ),
+            }
+            .map_err(protocol)?;
         }
         Ok(())
     }
@@ -128,7 +149,9 @@ impl Driver {
         opened: record::Opened,
         received: u64,
         now: u64,
+        original: Instant,
     ) -> io::Result<bool> {
+        let order = self.causal_time(original)?;
         let epoch = core::Epoch(opened.scope.epoch.0);
         let state = self.common_state()?;
         let Some(reader) = state.peer().reader(epoch) else {
@@ -170,13 +193,16 @@ impl Driver {
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("fragment receive Bank missing"));
         };
-        let accepted = state.entry(epoch)?.accept_fragment_authenticated_until(
-            engine::Tick(received),
-            engine::Tick(now),
-            engine::Tick(cap),
-            opened.number.0,
-            &self.buffers.plain[..opened.bytes],
-        );
+        let accepted = state
+            .entry(epoch)?
+            .accept_fragment_authenticated_ordered_until(
+                engine::Tick(received),
+                engine::Tick(now),
+                engine::Tick(cap),
+                opened.number.0,
+                order,
+                &self.buffers.plain[..opened.bytes],
+            );
         match accepted {
             Ok(status) => {
                 let runtime = self
@@ -194,7 +220,7 @@ impl Driver {
             }
             Err(record_bank::Error::Engine(engine::Error::FragmentBusy)) => {
                 if kind == engine::EmissionKind::Feedback {
-                    self.retain_common_fragment_feedback(opened, received, now, cap)?;
+                    self.retain_common_fragment_feedback(opened, received, now, cap, original)?;
                 } else {
                     // The new fragment was not consumed. Existing complete-body
                     // and Rolling queue custody remain exact; the carrier is lossy.
@@ -219,6 +245,7 @@ impl Driver {
         received: u64,
         now: u64,
         cap: u64,
+        original: Instant,
     ) -> io::Result<()> {
         let policy = self
             .common_state()?
@@ -237,6 +264,16 @@ impl Driver {
         if received > now || now >= deadline {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(());
+        }
+        if self.research_physical_output(opened.scope)?
+            && self
+                .common
+                .as_ref()
+                .is_some_and(|r| r.pending_feedback.is_some())
+        {
+            return Err(protocol(
+                "bounded Research fragment feedback custody is full",
+            ));
         }
         let runtime = self
             .common
@@ -266,6 +303,8 @@ impl Driver {
             received,
             deadline,
             encoding: FeedbackEncoding::Fragment,
+            physical_dependency: None,
+            physical_arrival: Some(original),
         });
         runtime.observation_dirty = true;
         Ok(())

@@ -1,5 +1,9 @@
 //! Existing strict local control DTOs, independent of socket/OS transport.
 use serde::{Deserialize, Serialize};
+
+#[path = "schema/connection_reuse.rs"]
+mod connection_reuse;
+pub use connection_reuse::{CanonicalFlowKey, ConnectionReuseRequest};
 #[path = "schema/proxy_common.rs"]
 mod proxy_common;
 pub use proxy_common::{ProxyCommonCover, ProxyCommonStatus};
@@ -67,6 +71,14 @@ pub enum Action {
         /// Explicit nonzero service idempotency key, retained across retries.
         request_key: u64,
     },
+    /// Retire one claimed owner through the selected authenticated reuse protocol.
+    /// This action is additive API4; no default profile is changed.
+    ReuseConnection {
+        /// Exact owner and distinct canonical old/replacement keys.
+        request: ConnectionReuseRequest,
+        /// Exact nonzero retained service idempotency key.
+        request_key: u64,
+    },
     /// Read one bounded page without consuming a service operation key.
     CommonCatalog {
         /// Exact service generation, preventing cross-reconnect page mixing.
@@ -127,7 +139,9 @@ impl TryFrom<RequestWire> for Request {
     fn try_from(value: RequestWire) -> Result<Self, Self::Error> {
         if matches!(
             value.action,
-            Action::SwitchCommonConfiguration { .. } | Action::CommonCatalog { .. }
+            Action::SwitchCommonConfiguration { .. }
+                | Action::CommonCatalog { .. }
+                | Action::ReuseConnection { .. }
         ) && value.version != COMMON_VERSION
         {
             return Err("Common actions require explicit API version4");

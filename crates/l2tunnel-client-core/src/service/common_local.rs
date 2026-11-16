@@ -62,6 +62,12 @@ impl Handle {
     pub(super) async fn common_request(&self, request: local::Request) -> local::Response {
         let refusal = |code| Self::common_status_from(self.snapshot(), false, code);
         match request.action {
+            local::Action::ReuseConnection {
+                request,
+                request_key,
+            } => {
+                return self.common_reuse_request(request, request_key).await;
+            }
             local::Action::CommonCatalog {
                 generation,
                 catalog,

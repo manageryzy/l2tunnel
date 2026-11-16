@@ -1,5 +1,7 @@
 use super::*;
+use crate::proxy::transport::{PHYSICAL_SLOTS, PhysicalWrite};
 use l2tunnel_tcp_proxy::{adaptive, measurement::Micros};
+use tokio::time::Instant;
 
 /// Actual bounded state of one lifetime proxy owner, including terminal snapshots.
 #[derive(Clone, Copy, Debug)]
@@ -8,6 +10,31 @@ pub struct FlowSnapshot {
     pub flow: session::FlowStatus,
     /// Current or frozen terminal authoritative incoming credit.
     pub credit: Option<session::CreditSnapshot>,
+}
+/// Exact successful callback provenance; cloning the opaque token grants no I/O.
+/// The retained marker has no backend, control sender or cancellation lifetime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalCallback {
+    /// Exact opaque Controller token whose single callback succeeded.
+    pub token: measurement::OutputId,
+    /// Actual immutable lifetime flow owner.
+    pub flow: u64,
+    /// Original successful MUX channel.
+    pub channel: u16,
+    /// Monotonic ordinal among ALL writer Data frames, including nonmeasurement.
+    pub ordinal: u64,
+    /// Original successful measurement MUX admission in the Controller clock.
+    pub admitted_at: Micros,
+    /// Actual existing Bridge write generation.
+    pub common_generation: u64,
+    /// Actual admitted Common record identity whose physical output completed.
+    pub common_record: l2tunnel_codec::aligned_receiver::RecordIdentity,
+    /// Exact whole-frame physical acceptance time, not peer/native delivery.
+    pub accepted_at: Instant,
+    /// Exact Common receipt observation, separate from physical acceptance.
+    pub physical_observed_at: Instant,
+    /// Fresh actor callback expiry watermark; never backdated to acceptance.
+    pub callback_observed_at: Instant,
 }
 /// Copied current facts; inspecting this does not create a measurement or plan.
 #[derive(Clone, Debug)]
@@ -22,6 +49,9 @@ pub struct Snapshot {
     pub queued: usize,
     /// Immutable records sent to the writer, awaiting successful C callback.
     pub awaiting_callback: usize,
+    /// At most two recent successful callbacks with exact physical provenance.
+    /// Retained snapshots are bounded observations, not an archival receipt log.
+    pub physical_callbacks: [Option<PhysicalCallback>; PHYSICAL_SLOTS],
     /// Actual admitted Demand, EchoRequest, EchoReply counts, respectively.
     pub admitted_by_kind: [u64; 3],
     /// Actual charged measurement bytes, including user and outer framing.
@@ -33,6 +63,7 @@ pub(in crate::proxy) struct State {
     pub config: Config,
     pub controller: measurement::Controller,
     pub ledger: Ledger,
+    physical_callbacks: [Option<PhysicalCallback>; PHYSICAL_SLOTS],
     report_due: Box<[Micros]>,
     report_cursor: usize,
     probe_cursor: usize,
@@ -70,11 +101,25 @@ impl State {
         .ok_or_else(|| invalid("measured service storage overflow"))
     }
     pub fn new(config: Config, table: &session::Table) -> io::Result<Self> {
+        Self::new_with_clock(config, table, Micros(0))
+    }
+    // A focused fixture may attach a fresh Controller to an already advanced
+    // actual Table; use its retained clock rather than resetting logical time.
+    #[cfg(test)]
+    pub(in crate::proxy) fn new_at(
+        config: Config,
+        table: &session::Table,
+        now: Micros,
+    ) -> io::Result<Self> {
+        Self::new_with_clock(config, table, now)
+    }
+    fn new_with_clock(config: Config, table: &session::Table, now: Micros) -> io::Result<Self> {
         let bound = config.validate()?;
         Ok(Self {
-            controller: measurement::Controller::new(config.measured, table, Micros(0))
+            controller: measurement::Controller::new(config.measured, table, now)
                 .map_err(io::Error::other)?,
             ledger: Ledger::new(bound.token_slots)?,
+            physical_callbacks: std::array::from_fn(|_| None),
             report_due: vec![Micros(0); config.fixed.relay.max_flows].into_boxed_slice(),
             report_cursor: 0,
             probe_cursor: 0,
@@ -92,7 +137,42 @@ impl State {
             config,
         })
     }
+    pub fn enable_physical_receipts(&mut self) -> io::Result<()> {
+        self.ledger.enable_physical_receipts()
+    }
+    pub fn observe_physical(
+        &mut self,
+        count: u64,
+        receipts: [Option<PhysicalWrite>; PHYSICAL_SLOTS],
+        origin: Instant,
+        observed: Instant,
+    ) -> io::Result<()> {
+        self.ledger
+            .observe_physical(count, receipts, origin, observed)
+    }
+    pub fn callbacks_physical(
+        &mut self,
+        table: &session::Table,
+        count: u64,
+        origin: Instant,
+        observed: Instant,
+    ) -> io::Result<()> {
+        let elapsed = observed
+            .checked_duration_since(origin)
+            .ok_or_else(|| invalid("measured callback clock regressed"))?;
+        let now = Micros(u64::try_from(elapsed.as_micros()).map_err(io::Error::other)?);
+        self.callbacks_inner(table, count, now, Some(observed))
+    }
     pub fn callbacks(&mut self, table: &session::Table, count: u64, now: Micros) -> io::Result<()> {
+        self.callbacks_inner(table, count, now, None)
+    }
+    fn callbacks_inner(
+        &mut self,
+        table: &session::Table,
+        count: u64,
+        now: Micros,
+        observed: Option<Instant>,
+    ) -> io::Result<()> {
         // Deadline validation must precede any release, even for already flushed bytes.
         self.controller.tick(table, now).map_err(io::Error::other)?;
         self.ledger.observe_flushed(count)?;
@@ -100,10 +180,33 @@ impl State {
             let Some(next) = self.ledger.next_completed() else {
                 break;
             };
+            if next
+                .physical
+                .is_some_and(|physical| observed.is_none_or(|now| now < physical.observed_at))
+            {
+                return Err(invalid("measured callback preceded physical observation"));
+            }
             self.controller
-                .confirm_written(table, next.token, now)
+                .confirm_written(table, next.token.clone(), now)
                 .map_err(io::Error::other)?;
             self.ledger.confirmed(next.id)?;
+            if let Some(physical) = next.physical {
+                let callback =
+                    observed.ok_or_else(|| invalid("physical callback watermark missing"))?;
+                self.physical_callbacks[((next.ordinal - 1) % PHYSICAL_SLOTS as u64) as usize] =
+                    Some(PhysicalCallback {
+                        token: next.token,
+                        flow: next.flow,
+                        channel: next.channel,
+                        ordinal: next.ordinal,
+                        admitted_at: next.admitted,
+                        common_generation: physical.generation,
+                        common_record: physical.identity,
+                        accepted_at: physical.accepted_at,
+                        physical_observed_at: physical.observed_at,
+                        callback_observed_at: callback,
+                    });
+            }
         }
         Ok(())
     }
@@ -215,6 +318,7 @@ impl State {
             pressure: self.pressure,
             queued,
             awaiting_callback,
+            physical_callbacks: self.physical_callbacks.clone(),
             admitted_by_kind: self.admitted,
             admitted_framed_bytes: self.framed_bytes,
             flows: (1..=table.status().flows as u64)

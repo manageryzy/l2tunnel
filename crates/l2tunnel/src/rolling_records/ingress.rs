@@ -15,6 +15,7 @@ pub(super) struct Input {
     pub(super) kind: record_engine::EmissionKind,
     pub(super) number: Option<u64>,
     pub(super) received: Tick,
+    pub(super) order: Option<codec::CausalTime>,
     pub(super) original_cap: Tick,
     pub(super) deadline: Tick,
 }

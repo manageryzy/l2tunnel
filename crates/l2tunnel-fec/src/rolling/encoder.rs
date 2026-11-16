@@ -141,11 +141,32 @@ impl Encoder {
     /// Admit one exact source. A pending encoding job freezes its support.
     /// This performs at most two fixed-width copies/clears, each <=4098 bytes.
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
+        self.admit_source_in(original, now, false)
+    }
+    // The legacy admission owner pins every queued/unsent column before calling
+    // this opt-in path. A frozen explicit equation permits later non-overwriting
+    // columns; the ordinary rolling and Research admission boundary is unchanged.
+    pub(crate) fn admit_source_while_explicit(
+        &mut self,
+        original: &[u8],
+        now: Tick,
+    ) -> Result<SourceId, Error> {
+        if self.explicit.is_none() {
+            return Err(Error::Configuration);
+        }
+        self.admit_source_in(original, now, true)
+    }
+    fn admit_source_in(
+        &mut self,
+        original: &[u8],
+        now: Tick,
+        explicit_admission: bool,
+    ) -> Result<SourceId, Error> {
         if original.is_empty() || original.len() > self.config.max_payload {
             return Err(Error::Length);
         }
         self.time(now)?;
-        if self.job.is_some() {
+        if self.job.is_some() && !explicit_admission {
             return Err(Error::Busy);
         }
         if self.next == u32::MAX {
@@ -163,7 +184,12 @@ impl Encoder {
         };
         let index = self.next as usize % self.config.window;
         if let Some(old) = self.ids[index]
-            && (old >= self.confirmed || old >= end.saturating_sub(self.config.window as u32))
+            && (old >= self.confirmed
+                || old >= end.saturating_sub(self.config.window as u32)
+                || self
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| (job.support.start..job.support.end).contains(&old)))
         {
             return Err(Error::Capacity);
         }

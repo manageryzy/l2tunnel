@@ -481,17 +481,47 @@ pub enum ReassemblyStatus {
     },
 }
 
+/// Precise local causal observation, injected by one retained caller clock origin.
+/// This is neither wire data nor authentication authority. All values compared
+/// within a context must use the same origin and nanosecond unit. Tick-based
+/// lifetime and monotonic service checks remain independent and unchanged.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CausalTime(u128);
+impl CausalTime {
+    /// Preserve the caller's original clock precision without reading a clock.
+    pub const fn from_nanos(nanoseconds: u128) -> Self {
+        Self(nanoseconds)
+    }
+    /// Exact local duration from that same retained origin.
+    pub const fn as_nanos(self) -> u128 {
+        self.0
+    }
+}
+
 /// Original accepted input age and effective lifetime/caller cap of completed bytes.
 /// This is local owner metadata, never authentication or physical-delivery proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReassemblyTiming {
     first_received_ticks: u64,
+    complete_received_ticks: u64,
+    complete_order: Option<CausalTime>,
     deadline_ticks: u64,
 }
 impl ReassemblyTiming {
     /// Earliest original arrival among successfully accepted distinct fragments.
     pub const fn first_received_ticks(self) -> u64 {
         self.first_received_ticks
+    }
+    /// Latest original arrival among accepted distinct fragments. This is the
+    /// complete body's arrival, independent from first-arrival lifetime.
+    pub const fn complete_received_ticks(self) -> u64 {
+        self.complete_received_ticks
+    }
+    /// Precise maximum distinct-fragment arrival, only when every accepted
+    /// fragment carried a value from the same caller origin. Legacy callers
+    /// return None; duplicates/refusals cannot change this observation.
+    pub const fn complete_order(self) -> Option<CausalTime> {
+        self.complete_order
     }
     /// Earliest accepted original lifetime/caller cap, never renewed by observation.
     pub const fn deadline_ticks(self) -> u64 {
@@ -559,6 +589,8 @@ struct Pending {
     present: Vec<u8>,
     buffer: Vec<u8>,
     first_received: u64,
+    latest_received: u64,
+    latest_order: Option<CausalTime>,
     deadline: u64,
 }
 
@@ -686,7 +718,7 @@ impl Reassembler {
         now_ticks: u64,
         output: &mut [u8],
     ) -> Result<ReassemblyStatus, FragmentError> {
-        self.accept_inner(fragment, now_ticks, now_ticks, None, output)
+        self.accept_inner(fragment, now_ticks, now_ticks, None, None, output)
             .map(TimedReassemblyStatus::legacy)
     }
 
@@ -702,7 +734,34 @@ impl Reassembler {
         original_cap: u64,
         output: &mut [u8],
     ) -> Result<TimedReassemblyStatus, FragmentError> {
-        self.accept_inner(fragment, received, observed, Some(original_cap), output)
+        self.accept_inner(
+            fragment,
+            received,
+            observed,
+            Some(original_cap),
+            None,
+            output,
+        )
+    }
+    /// Preserve exact local arrival order independently from first-arrival age.
+    /// Values use one caller origin and never affect wire bytes or lifetime.
+    pub fn accept_ordered_at_until(
+        &mut self,
+        fragment: &[u8],
+        received: u64,
+        observed: u64,
+        original_cap: u64,
+        order: CausalTime,
+        output: &mut [u8],
+    ) -> Result<TimedReassemblyStatus, FragmentError> {
+        self.accept_inner(
+            fragment,
+            received,
+            observed,
+            Some(original_cap),
+            Some(order),
+            output,
+        )
     }
     fn accept_inner(
         &mut self,
@@ -710,6 +769,7 @@ impl Reassembler {
         received: u64,
         observed: u64,
         original_cap: Option<u64>,
+        order: Option<CausalTime>,
         output: &mut [u8],
     ) -> Result<TimedReassemblyStatus, FragmentError> {
         let parsed = self.parse(fragment)?;
@@ -733,6 +793,8 @@ impl Reassembler {
             return self.accept_existing(
                 parsed,
                 original_cap.map(|cap| (received, observed, cap)),
+                received,
+                order,
                 output,
             );
         }
@@ -773,6 +835,8 @@ impl Reassembler {
                 length: parsed.length,
                 timing: ReassemblyTiming {
                     first_received_ticks: received,
+                    complete_received_ticks: received,
+                    complete_order: order,
                     deadline_ticks: deadline,
                 },
             });
@@ -784,7 +848,7 @@ impl Reassembler {
                 message: parsed.message,
             });
         }
-        self.pending.insert(&parsed, received, deadline)?;
+        self.pending.insert(&parsed, received, deadline, order)?;
         self.advance_window(high);
         self.reserved_bytes = reserved_bytes;
         self.reserved_fragments = reserved_fragments;
@@ -911,6 +975,8 @@ impl Reassembler {
         &mut self,
         parsed: ParsedFragment<'_>,
         input_time: Option<(u64, u64, u64)>,
+        original_received: u64,
+        order: Option<CausalTime>,
         output: &mut [u8],
     ) -> Result<TimedReassemblyStatus, FragmentError> {
         let pending = self
@@ -948,6 +1014,10 @@ impl Reassembler {
         if complete && output.len() < parsed.length {
             return Err(FragmentError::OutputTooSmall);
         }
+        let complete_order = match (pending.latest_order, order) {
+            (Some(earlier), Some(current)) => Some(earlier.max(current)),
+            _ => None,
+        };
         // Legacy existing-message admission must not add a new now+lifetime:
         // that sum may overflow while the original retained deadline is valid.
         let timing = match input_time {
@@ -972,17 +1042,23 @@ impl Reassembler {
                 }
                 ReassemblyTiming {
                     first_received_ticks: pending.first_received.min(arrival),
+                    complete_received_ticks: pending.latest_received.max(original_received),
+                    complete_order,
                     deadline_ticks: deadline,
                 }
             }
             None => ReassemblyTiming {
                 first_received_ticks: pending.first_received,
+                complete_received_ticks: pending.latest_received.max(original_received),
+                complete_order,
                 deadline_ticks: pending.deadline,
             },
         };
         write_fragment(pending, &parsed)?;
         pending.received = received;
         pending.first_received = timing.first_received_ticks;
+        pending.latest_received = timing.complete_received_ticks;
+        pending.latest_order = timing.complete_order;
         pending.deadline = timing.deadline_ticks;
         if !complete {
             return Ok(TimedReassemblyStatus::Pending {

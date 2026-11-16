@@ -1504,6 +1504,25 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             None
         }
     }
+    /// Earliest already authenticated upper-record arrival still owned locally.
+    /// Includes bounded lane cells not yet exposed by fair progress. This is not
+    /// a timestamp for unread kernel/network input and performs no I/O.
+    pub fn earliest_authenticated_record_at(&self) -> Result<Option<Instant>, Error> {
+        let mut earliest = self.records.iter().map(|r| r.received_at).min();
+        for lane in self.lanes.iter().flatten() {
+            if let Some(cell) = &lane.early
+                && matches!(cell.header.kind, wire::Kind::Data | wire::Kind::Feedback)
+            {
+                earliest = Some(earliest.map_or(cell.received_at, |old| old.min(cell.received_at)));
+            }
+            let state = lock(&lane.io.state)?;
+            if let Some(at) = state.earliest_authenticated_upper_at() {
+                earliest = Some(earliest.map_or(at, |old| old.min(at)));
+            }
+        }
+        Ok(earliest)
+    }
+
     /// Release one local carrier delivery cell, never native delivery credit.
     pub fn consume_record(&mut self) -> Result<(), Error> {
         if let Err(e) = self.check() {

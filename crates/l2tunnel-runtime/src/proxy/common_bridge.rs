@@ -8,7 +8,8 @@
 //! must never pass through a native IP parser. No TCP, authentication, ordering,
 //! or recovery state machine lives here.
 
-use l2tunnel_codec::aligned_receiver::RecordIdentity;
+use super::transport::PhysicalWrite;
+use l2tunnel_codec::aligned_receiver::{RecordIdentity, UnitWitness};
 use l2tunnel_device::{PacketDevice, PacketLayer};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -31,6 +32,38 @@ impl Failure {
         io::Error::new(self.kind, self.message)
     }
 }
+// The maintained aligned grammar permits at most 65,535 units per record.
+// These are the existing slot's physical receipt bits, never another payload queue.
+const MAX_UNITS: usize = 65_535;
+const UNIT_WORDS: usize = MAX_UNITS.div_ceil(64);
+struct UnitReceipts {
+    bits: [u64; UNIT_WORDS],
+    count: Option<usize>,
+    received: usize,
+    accepted_at: Option<Instant>,
+    observed_at: Option<Instant>,
+}
+impl UnitReceipts {
+    fn new() -> Self {
+        Self {
+            bits: [0; UNIT_WORDS],
+            count: None,
+            received: 0,
+            accepted_at: None,
+            observed_at: None,
+        }
+    }
+}
+/// Actual unique-unit physical receipt progress; never peer acknowledgment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnitCompletion {
+    /// At least one actual unit still has no physical receipt.
+    Pending,
+    /// This unit was already counted; no time, count or deadline changed.
+    Duplicate,
+    /// Every actual unit has a physical receipt within the original write cap.
+    Complete,
+}
 struct Pending {
     generation: u64,
     arrived: Instant,
@@ -38,6 +71,8 @@ struct Pending {
     sent: bool,
     identity: Option<RecordIdentity>,
     completed: bool,
+    physical: Option<PhysicalWrite>,
+    units: UnitReceipts,
     final_record: bool,
 }
 struct Retirement {
@@ -51,7 +86,16 @@ struct Retirement {
     retired: bool,
     waiter: Option<Waker>,
 }
+struct Receipts {
+    prepared_user: Option<u64>,
+    written_users: u64,
+    acknowledged_users: u64,
+    physical_users: u64,
+    physical: [Option<PhysicalWrite>; super::transport::PHYSICAL_SLOTS],
+    completed: Option<PhysicalWrite>,
+}
 struct State {
+    receipts: Option<Receipts>,
     retirement: Option<Retirement>,
     generation: u64,
     pending: Option<Pending>,
@@ -85,6 +129,140 @@ impl State {
 #[derive(Clone)]
 pub(crate) struct Bridge(Arc<Mutex<State>>);
 impl Bridge {
+    /// Actual single Bridge metadata owner, including Pending and both optional
+    /// receipt/retirement states once. Arc bookkeeping and allocator overhead are
+    /// outside this component extent; no payload storage or extra queue is added.
+    pub(crate) fn metadata_bytes() -> usize {
+        std::mem::size_of::<Mutex<State>>()
+    }
+    /// Instrument the actual measured Common writer before any original write.
+    pub(crate) fn enable_physical_receipts(&self) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.check()?;
+        if state.generation != 0 || state.pending.is_some() {
+            return Err(state.fail(io::ErrorKind::InvalidData, "late Common receipt selection"));
+        }
+        if state.receipts.is_none() {
+            state.receipts = Some(Receipts {
+                prepared_user: None,
+                written_users: 0,
+                acknowledged_users: 0,
+                physical_users: 0,
+                physical: [None; super::transport::PHYSICAL_SLOTS],
+                completed: None,
+            });
+        }
+        Ok(())
+    }
+    /// Reserve ALL-Data ordinal provenance before writing bytes. The same writer
+    /// waits before a third unacknowledged fact could overwrite the fixed ring.
+    pub(crate) async fn prepare_user_receipt(&self, ordinal: u64) -> io::Result<()> {
+        std::future::poll_fn(|cx| {
+            let mut state = self.lock()?;
+            state.check()?;
+            let Some(receipts) = state.receipts.as_ref() else {
+                return Poll::Ready(Err(io::Error::other("Common receipts not selected")));
+            };
+            if receipts.written_users.checked_add(1) != Some(ordinal)
+                || receipts.prepared_user.is_some()
+                || receipts.completed.is_some()
+            {
+                return Poll::Ready(Err(
+                    state.fail(io::ErrorKind::InvalidData, "Common user receipt ordinal")
+                ));
+            }
+            let held = receipts
+                .written_users
+                .checked_sub(receipts.acknowledged_users)
+                .ok_or_else(|| io::Error::other("Common receipt watermark"))?;
+            if held >= 2 {
+                state.writer = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            state
+                .receipts
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Common receipt owner"))?
+                .prepared_user = Some(ordinal);
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+    /// Transfer one exact completed frame once, after the actual Stream flush.
+    pub(crate) fn take_physical_receipt(&self) -> io::Result<PhysicalWrite> {
+        let mut state = self.lock()?;
+        state.check()?;
+        let receipts = state
+            .receipts
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Common receipts not selected"))?;
+        let receipt = receipts
+            .completed
+            .ok_or_else(|| io::Error::other("Common physical receipt missing"))?;
+        if receipt.ordinal != receipts.prepared_user
+            || receipt
+                .ordinal
+                .is_some_and(|n| receipts.written_users.checked_add(1) != Some(n))
+        {
+            return Err(state.fail(
+                io::ErrorKind::InvalidData,
+                "Common physical receipt provenance",
+            ));
+        }
+        let receipts = state
+            .receipts
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Common receipt owner"))?;
+        receipts.completed = None;
+        receipts.prepared_user = None;
+        if let Some(ordinal) = receipt.ordinal {
+            receipts.written_users = ordinal;
+        }
+        Ok(receipt)
+    }
+    /// Facts already copied into the actual ledger may release fixed ring space.
+    /// This is local metadata custody, never peer or native-delivery confirmation.
+    pub(crate) fn acknowledge_user_receipts(&self, count: u64) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.check()?;
+        let receipts = state
+            .receipts
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Common receipts not selected"))?;
+        if count < receipts.acknowledged_users || count > receipts.written_users {
+            return Err(state.fail(io::ErrorKind::InvalidData, "Common receipt acknowledgement"));
+        }
+        receipts.acknowledged_users = count;
+        if let Some(waker) = state.writer.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+    /// Atomically copy all unacknowledged Data facts even after failure. The
+    /// fixed ring remains owned here across Stream-to-watch receipt transfer;
+    /// reading it requires no writer join and grants no semantic release.
+    pub(crate) fn retained_user_receipts(
+        &self,
+    ) -> io::Result<(
+        u64,
+        [Option<PhysicalWrite>; super::transport::PHYSICAL_SLOTS],
+    )> {
+        let state = self.lock()?;
+        let receipts = state
+            .receipts
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Common receipts not selected"))?;
+        Ok((receipts.physical_users, receipts.physical))
+    }
+    /// Preserve exact valid physical facts even if a late observation fails cap.
+    #[cfg(test)]
+    pub(in crate::proxy) fn pending_physical_receipt(&self) -> io::Result<Option<PhysicalWrite>> {
+        Ok(self
+            .lock()?
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.physical))
+    }
     fn lock(&self) -> io::Result<MutexGuard<'_, State>> {
         self.0
             .lock()
@@ -301,24 +479,63 @@ impl Bridge {
             .filter(|pending| !pending.completed)
             .and_then(|pending| pending.identity)
     }
-    /// Release a writer only for its exact physical completion before its cap.
-    /// Queue admission, a different identity, or an observation after the original
-    /// deadline cannot advance the existing proxy writer's counters or fences.
+    /// Compatibility whole-record callback for existing one-unit component tests.
+    #[cfg(test)]
     pub(crate) fn complete(
         &self,
         identity: RecordIdentity,
         accepted_at: Instant,
         observed_at: Instant,
     ) -> io::Result<()> {
+        match self.complete_unit(
+            UnitWitness {
+                identity,
+                index: 0,
+                count: 1,
+            },
+            accepted_at,
+            observed_at,
+        )? {
+            UnitCompletion::Complete => Ok(()),
+            _ => Err(io::Error::other(
+                "Common whole-record completion incomplete",
+            )),
+        }
+    }
+    /// Latch the actual runtime rejection before retaining an irreversible unit
+    /// fact. A narrower Common cap or semantic failure cannot release this
+    /// writer merely because its own stall cap is later. First failure wins.
+    pub(crate) fn reject_completion(&self, kind: io::ErrorKind) -> io::Result<()> {
         let mut state = self.lock()?;
-        state.check()?;
+        state.fail(kind, "proxy Common physical completion not eligible");
+        Ok(())
+    }
+    /// Count one actual aligned-unit physical receipt. A whole proxy write is
+    /// released only after every unique unit; reordered receipts retain the max
+    /// actual acceptance and observation times without renewing the original cap.
+    /// Matching late facts remain retained even after the stream already failed.
+    pub(crate) fn complete_unit(
+        &self,
+        unit: UnitWitness,
+        accepted_at: Instant,
+        observed_at: Instant,
+    ) -> io::Result<UnitCompletion> {
+        let mut state = self.lock()?;
+        let original_failure = state.failure;
+        let ordinal = state.receipts.as_ref().and_then(|r| r.prepared_user);
         let Some(pending) = state.pending.as_mut() else {
             return Err(state.fail(
                 io::ErrorKind::InvalidData,
                 "proxy Common completion without slot",
             ));
         };
-        if !pending.sent || pending.completed || pending.identity != Some(identity) {
+        if !pending.sent
+            || pending.completed
+            || pending.identity != Some(unit.identity)
+            || !(1..=MAX_UNITS).contains(&unit.count)
+            || unit.index >= unit.count
+            || pending.units.count.is_some_and(|count| count != unit.count)
+        {
             return Err(state.fail(
                 io::ErrorKind::InvalidData,
                 "proxy Common completion mismatch",
@@ -330,14 +547,115 @@ impl Bridge {
                 "proxy Common completion time order",
             ));
         }
-        if observed_at >= pending.deadline {
+        let word = unit.index / 64;
+        let mask = 1u64 << (unit.index % 64);
+        if pending.units.bits[word] & mask != 0 {
+            return match original_failure {
+                Some(failure) => Err(failure.error()),
+                None => Ok(UnitCompletion::Duplicate),
+            };
+        }
+        // The validated count bounds make this checked slot update infallible.
+        // No duplicate can replace a timestamp or contribute another unit.
+        pending.units.bits[word] |= mask;
+        pending.units.count = Some(unit.count);
+        pending.units.received = pending
+            .units
+            .received
+            .checked_add(1)
+            .filter(|received| *received <= unit.count)
+            .ok_or_else(|| io::Error::other("Common unit receipt count overflow"))?;
+        pending.units.accepted_at = Some(
+            pending
+                .units
+                .accepted_at
+                .map_or(accepted_at, |old| old.max(accepted_at)),
+        );
+        pending.units.observed_at = Some(
+            pending
+                .units
+                .observed_at
+                .map_or(observed_at, |old| old.max(observed_at)),
+        );
+        let accepted_at = pending
+            .units
+            .accepted_at
+            .ok_or_else(|| io::Error::other("Common unit acceptance"))?;
+        let observed_at = pending
+            .units
+            .observed_at
+            .ok_or_else(|| io::Error::other("Common unit observation"))?;
+        if pending.units.received != unit.count {
+            if let Some(failure) = original_failure {
+                return Err(failure.error());
+            }
+            if observed_at >= pending.deadline {
+                return Err(state.fail(
+                    io::ErrorKind::TimedOut,
+                    "proxy Common physical completion deadline",
+                ));
+            }
+            return Ok(UnitCompletion::Pending);
+        }
+        // Real physical success is retained independently of any earlier terminal
+        // observation. It cannot release the failed stream or replace its error.
+        let physical = PhysicalWrite {
+            ordinal,
+            generation: pending.generation,
+            identity: unit.identity,
+            accepted_at,
+            observed_at,
+        };
+        if pending.physical.is_some_and(|old| old != physical) {
+            return Err(state.fail(
+                io::ErrorKind::InvalidData,
+                "Common physical receipt changed",
+            ));
+        }
+        let deadline = pending.deadline;
+        let final_record = pending.final_record;
+        pending.physical = Some(physical);
+        // Keep the true whole-write fact before transfer or any terminal return.
+        // Acknowledgement is the sole authority for reusing these two cells.
+        if let Some(ordinal) = ordinal {
+            let receipts = state
+                .receipts
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Common receipt owner"))?;
+            let index = ((ordinal - 1) % super::transport::PHYSICAL_SLOTS as u64) as usize;
+            let repeated =
+                receipts.physical_users == ordinal && receipts.physical[index] == Some(physical);
+            if !repeated
+                && (receipts.physical_users.checked_add(1) != Some(ordinal)
+                    || ordinal
+                        .checked_sub(receipts.acknowledged_users)
+                        .is_none_or(|held| held > super::transport::PHYSICAL_SLOTS as u64))
+            {
+                return Err(state.fail(
+                    io::ErrorKind::InvalidData,
+                    "Common retained physical ordinal",
+                ));
+            }
+            if !repeated {
+                receipts.physical[index] = Some(physical);
+                receipts.physical_users = ordinal;
+            }
+        }
+        if let Some(failure) = original_failure {
+            return Err(failure.error());
+        }
+        if observed_at >= deadline {
             return Err(state.fail(
                 io::ErrorKind::TimedOut,
                 "proxy Common physical completion deadline",
             ));
         }
-        pending.completed = true;
-        if pending.final_record {
+        state
+            .pending
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Common physical pending owner"))?
+            .completed = true;
+        if final_record {
             let retirement = state.retirement.as_mut().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -349,7 +667,7 @@ impl Bridge {
         if let Some(waker) = state.writer.take() {
             waker.wake();
         }
-        Ok(())
+        Ok(UnitCompletion::Complete)
     }
     /// Terminal failure wakes both stream directions and never fabricates EOF.
     pub(crate) fn fail(&self) {
@@ -468,6 +786,7 @@ fn pair_selected(
     port.set_nonblocking(true)?;
     stream.set_nonblocking(true)?;
     let bridge = Bridge(Arc::new(Mutex::new(State {
+        receipts: None,
         retirement: retained.then_some(Retirement {
             cap: None,
             identity: None,
@@ -567,6 +886,8 @@ impl Stream {
             sent: false,
             identity: None,
             completed: false,
+            physical: None,
+            units: UnitReceipts::new(),
             final_record: false,
         });
         self.generation = Some(generation);
@@ -602,6 +923,17 @@ impl Stream {
             ));
         }
         if pending.completed {
+            let physical = pending
+                .physical
+                .ok_or_else(|| io::Error::other("Common completed receipt missing"))?;
+            if let Some(receipts) = state.receipts.as_mut() {
+                if receipts.completed.is_some() {
+                    return Poll::Ready(Err(
+                        state.fail(io::ErrorKind::InvalidData, "unconsumed Common receipt")
+                    ));
+                }
+                receipts.completed = Some(physical);
+            }
             state.pending = None;
             state.writer = None;
             self.output.clear();
@@ -946,3 +1278,7 @@ mod tests {
 #[cfg(test)]
 #[path = "common_retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "common_bridge_unit_tests.rs"]
+mod unit_tests;

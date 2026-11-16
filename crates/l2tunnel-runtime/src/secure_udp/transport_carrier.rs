@@ -291,9 +291,30 @@ impl<R: RawBacking> IoOwner<R> {
         identity: UserIdentity,
         bytes: &[u8],
     ) -> io::Result<SendProgress> {
+        self.try_user_inner(identity, bytes, false)
+    }
+    pub(super) fn try_user_held(
+        &mut self,
+        identity: UserIdentity,
+        bytes: &[u8],
+    ) -> io::Result<SendProgress> {
+        self.try_user_inner(identity, bytes, true)
+    }
+    fn try_user_inner(
+        &mut self,
+        identity: UserIdentity,
+        bytes: &[u8],
+        hold: bool,
+    ) -> io::Result<SendProgress> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, identity.deadline),
-            Self::Raw(values) => values[0].try_user(identity, bytes),
+            Self::Raw(values) => {
+                if hold {
+                    values[0].try_user_held(identity, bytes)
+                } else {
+                    values[0].try_user(identity, bytes)
+                }
+            }
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 if bytes.len() != identity.bytes {
@@ -319,6 +340,9 @@ impl<R: RawBacking> IoOwner<R> {
                     .as_mut()
                     .ok_or_else(|| protocol("missing user custody"))?;
                 begin(&value.datagram, &mut user.pending, SendClass::User, bytes)?;
+                if hold {
+                    return Ok(SendProgress::Pending);
+                }
                 if let Some(result) = user.pending.result.take() {
                     value.user = None;
                     complete(result)
@@ -326,6 +350,34 @@ impl<R: RawBacking> IoOwner<R> {
                     Ok(SendProgress::Pending)
                 }
             }
+        }
+    }
+    pub(super) fn user_accepted_at(&self) -> Option<Instant> {
+        match self {
+            Self::Udp(_) => None,
+            Self::Raw(values) => values[0].user_accepted_at(),
+            Self::Carrier(values) => values[0]
+                .user
+                .as_ref()
+                .and_then(|u| u.pending.result.as_ref())
+                .and_then(|r| match r {
+                    Ok(receipt)
+                    | Err(SendFailure::Expired {
+                        accepted: Some(receipt),
+                    }) => Some(receipt.accepted_at),
+                    _ => None,
+                }),
+        }
+    }
+    pub(super) fn authenticated_input_before(&self, accepted: Instant) -> io::Result<bool> {
+        match self {
+            Self::Raw(values) => Ok(values[0]
+                .earliest_authenticated_input_at()?
+                .is_some_and(|at| at <= accepted)),
+            // OpenVPN payloads have not passed Records yet. Their inner
+            // authenticated observation is assigned at the sole opener, not
+            // inferred from an unobservable OS/network queue timestamp.
+            Self::Udp(_) | Self::Carrier(_) => Ok(false),
         }
     }
     pub(super) fn stage_control(
@@ -596,9 +648,46 @@ impl Driver {
         socket: &mut IoOwner<R>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
-        // Complete both independent physical facts before propagating either error.
+        self.complete_carrier_io_inner(socket, false, &mut sample)
+    }
+    pub(super) fn complete_carrier_io_terminal<R: RawBacking>(
+        &mut self,
+        socket: &mut IoOwner<R>,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<()> {
+        self.complete_carrier_io_inner(socket, true, &mut sample)
+    }
+    fn complete_carrier_io_inner<R: RawBacking>(
+        &mut self,
+        socket: &mut IoOwner<R>,
+        terminal: bool,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<()> {
+        // Both physical facts survive errors. Only the Research User receipt
+        // may wait for already authenticated older bounded raw input.
         let control = socket.take_control();
-        let user = socket.take_user();
+        let ordering = (|| -> io::Result<bool> {
+            let Some(accepted) = socket.user_accepted_at() else {
+                return Ok(false);
+            };
+            let pending = self.common.as_ref().and_then(|r| r.sealed.as_ref());
+            let Some(pending) = pending else {
+                return Ok(false);
+            };
+            let now = clock(self.origin, sample())?;
+            if terminal
+                || now >= pending.deadline
+                || !self.research_physical_output(pending.scope)?
+            {
+                return Ok(false);
+            }
+            socket.authenticated_input_before(accepted)
+        })();
+        let user = if ordering.as_ref().is_ok_and(|held| *held) {
+            Ok(None)
+        } else {
+            socket.take_user()
+        };
         let control = control.and_then(|value| {
             if let Some((SendProgress::Whole { receipt, late }, cost)) = value {
                 self.counters.socket_accepted_packets =
@@ -633,6 +722,7 @@ impl Driver {
         });
         control?;
         user?;
+        ordering?;
         socket.check_physical_failure()?;
         let observed = sample();
         clock(self.origin, observed)?;

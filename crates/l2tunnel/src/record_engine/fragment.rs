@@ -329,6 +329,8 @@ fn slab(length: usize) -> Result<Vec<u8>, FragmentStorageError> {
 #[derive(Clone, Copy)]
 struct Input {
     received: Tick,
+    completed: Tick,
+    completed_order: Option<codec::CausalTime>,
     cap: Tick,
     number: u64,
     kind: EmissionKind,
@@ -368,6 +370,7 @@ struct Group {
     next: usize,
     pending: Option<FragmentEmission>,
     accepted: Option<Tick>,
+    accepted_order: Option<codec::CausalTime>,
 }
 pub(super) struct State {
     plan: Plan,
@@ -683,6 +686,7 @@ impl Engine {
             next: 0,
             pending: None,
             accepted: None,
+            accepted_order: None,
         });
         state.statistics.groups_reserved = groups;
         self.statistics.emitted = emitted;
@@ -760,6 +764,25 @@ impl Engine {
         accepted: Tick,
         token: FragmentOutputToken,
     ) -> Result<FragmentReceipt, Error> {
+        self.confirm_fragment_inner(now, accepted, None, token)
+    }
+    /// Preserve the same clock origin's precise whole-send acceptance order.
+    pub fn confirm_fragment_ordered_at(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        order: codec::CausalTime,
+        token: FragmentOutputToken,
+    ) -> Result<FragmentReceipt, Error> {
+        self.confirm_fragment_inner(now, accepted, Some(order), token)
+    }
+    fn confirm_fragment_inner(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        order: Option<codec::CausalTime>,
+        token: FragmentOutputToken,
+    ) -> Result<FragmentReceipt, Error> {
         if self.pending_fragment_output().as_ref() != Some(&token) {
             return Err(Error::Token);
         }
@@ -774,6 +797,11 @@ impl Engine {
         let group = state.group.as_mut().ok_or(Error::Invariant)?;
         group.pending = None;
         group.next = group.next.checked_add(1).ok_or(Error::Arithmetic)?;
+        group.accepted_order = match (group.accepted, group.accepted_order, order) {
+            (None, _, current) => current,
+            (Some(_), Some(previous), Some(current)) => Some(previous.max(current)),
+            _ => None,
+        };
         group.accepted = Some(group.accepted.map_or(accepted, |at| at.max(accepted)));
         state.statistics.packets_written = state
             .statistics
@@ -801,6 +829,7 @@ impl Engine {
         let result = self.confirm_whole_carrier_output_at(
             now,
             group.accepted.ok_or(Error::Invariant)?,
+            group.accepted_order,
             group.token,
         );
         timing?;
@@ -840,6 +869,29 @@ impl Engine {
         number: u64,
         fragment: &[u8],
     ) -> Result<FragmentAdmission, Error> {
+        self.accept_fragment_inner(received, now, original_cap, number, None, fragment)
+    }
+    /// Preserve precise authenticated observation alongside unchanged arrival age.
+    pub fn accept_fragment_authenticated_ordered_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_cap: Tick,
+        number: u64,
+        order: codec::CausalTime,
+        fragment: &[u8],
+    ) -> Result<FragmentAdmission, Error> {
+        self.accept_fragment_inner(received, now, original_cap, number, Some(order), fragment)
+    }
+    fn accept_fragment_inner(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_cap: Tick,
+        number: u64,
+        order: Option<codec::CausalTime>,
+        fragment: &[u8],
+    ) -> Result<FragmentAdmission, Error> {
         if self.fragments.is_none() {
             return Err(Error::FragmentPolicy);
         }
@@ -862,16 +914,24 @@ impl Engine {
         if lane.held.is_some() {
             return Err(Error::FragmentBusy);
         }
-        let status = lane
-            .receiver
-            .accept_at_until(
+        let status = match order {
+            Some(order) => lane.receiver.accept_ordered_at_until(
+                fragment,
+                received.0,
+                now.0,
+                original_cap.0,
+                order,
+                &mut lane.complete,
+            ),
+            None => lane.receiver.accept_at_until(
                 fragment,
                 received.0,
                 now.0,
                 original_cap.0,
                 &mut lane.complete,
-            )
-            .map_err(Error::Fragment)?;
+            ),
+        }
+        .map_err(Error::Fragment)?;
         match status {
             codec::TimedReassemblyStatus::Pending { .. } => Ok(FragmentAdmission::Pending),
             codec::TimedReassemblyStatus::Duplicate { .. } => Ok(FragmentAdmission::Duplicate),
@@ -879,6 +939,8 @@ impl Engine {
             codec::TimedReassemblyStatus::Complete { length, timing, .. } => {
                 lane.held = Some(Input {
                     received: Tick(timing.first_received_ticks()),
+                    completed: Tick(timing.complete_received_ticks()),
+                    completed_order: timing.complete_order(),
                     cap: Tick(timing.deadline_ticks()),
                     number,
                     kind,
@@ -892,6 +954,41 @@ impl Engine {
         }
     }
     fn retry_fragment_lane(&mut self, now: Tick, index: usize) -> Result<bool, Error> {
+        // Research support is frozen at actual complete send acceptance. Its
+        // already complete feedback body must wait until that receipt orders it.
+        if index == 2
+            && matches!(&self.owner, Owner::Research(_))
+            && self.pending_whole_carrier_output().is_some_and(|p| {
+                matches!(
+                    p.emission().kind,
+                    EmissionKind::Source(_) | EmissionKind::Repair
+                )
+            })
+        {
+            let state = self.fragments.as_mut().ok_or(Error::FragmentPolicy)?;
+            let lane = &mut state.lanes[index];
+            let Some(input) = lane.held else {
+                return Ok(false);
+            };
+            let Owner::Research(endpoint) = &mut self.owner else {
+                return Err(Error::Invariant);
+            };
+            match endpoint.retain_feedback_until(
+                input.completed,
+                now,
+                input.cap,
+                input.number,
+                input.completed_order,
+                &lane.complete[..input.length],
+            ) {
+                Ok(true) => {
+                    lane.held = None;
+                    return Ok(true);
+                }
+                Ok(false) | Err(crate::rolling_records::Error::Busy) => return Ok(false),
+                Err(error) => return self.fail(Error::Rolling(error)),
+            }
+        }
         let state = self.fragments.as_mut().ok_or(Error::FragmentPolicy)?;
         let lane = &mut state.lanes[index];
         let Some(input) = lane.held else {
@@ -900,8 +997,14 @@ impl Engine {
         if now >= input.cap {
             return self.fail(Error::Expired);
         }
+        let received =
+            if input.kind == EmissionKind::Feedback && matches!(&self.owner, Owner::Research(_)) {
+                input.completed
+            } else {
+                input.received
+            };
         let result = self.owner.accept_until(
-            input.received,
+            received,
             now,
             input.cap,
             input.number,
@@ -917,6 +1020,58 @@ impl Engine {
             Err(error) => self.fail(error),
         }
     }
+    // The actual whole-output witness was checked by carrier.rs. No new
+    // authority or queue is created: consume the existing complete-body slot.
+    pub(super) fn research_fragment_feedback_at_completion(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        order: Option<codec::CausalTime>,
+        before: bool,
+    ) -> Result<(), Error> {
+        if let Owner::Research(endpoint) = &mut self.owner {
+            endpoint
+                .feedback_at_completion(now, accepted, order, before)
+                .map_err(Error::Rolling)?;
+        } else {
+            return Ok(());
+        }
+        let Some(state) = &mut self.fragments else {
+            return Ok(());
+        };
+        let lane = &mut state.lanes[2];
+        let Some(input) = lane.held else {
+            return Ok(());
+        };
+        let earlier = match (input.completed_order, order) {
+            (Some(arrived), Some(sent)) => arrived <= sent,
+            // Existing tick-only APIs retain their caller ordering convention.
+            // Actual async carriers always supply precise observations above.
+            _ => input.completed <= accepted,
+        };
+        if earlier != before {
+            return Ok(());
+        }
+        if now >= input.cap {
+            return self.fail(Error::Expired);
+        }
+        let result = self.owner.accept_until(
+            input.completed,
+            now,
+            input.cap,
+            input.number,
+            input.kind,
+            &mut lane.complete[..input.length],
+        );
+        match result {
+            Ok(()) => {
+                lane.held = None;
+                Ok(())
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
     /// Retry at most the three existing completion slots, feedback first.
     /// No authentication, replay commit, received age or caller cap is renewed.
     pub fn retry_fragment_inputs(&mut self, now: Tick) -> Result<usize, Error> {

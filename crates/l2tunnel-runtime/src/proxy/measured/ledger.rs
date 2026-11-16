@@ -1,7 +1,9 @@
 //! Local bookkeeping only. C owns expiry and the caller owns actual I/O evidence.
 use super::invalid;
+use crate::proxy::transport::{PHYSICAL_SLOTS, PhysicalWrite};
 use l2tunnel_tcp_proxy::measurement::{self, Micros, OutputId, Pending};
 use std::{io, mem::size_of, sync::Arc};
+use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::proxy) struct Id(u64);
@@ -74,6 +76,7 @@ struct Entry {
     bytes: [u8; measurement::wire::MAX_RECORD_BYTES],
     admitted: Micros,
     ordinal: Option<u64>,
+    physical: Option<PhysicalWrite>,
 }
 #[derive(Clone, Copy)]
 struct Flight {
@@ -86,12 +89,20 @@ pub(in crate::proxy) struct Ledger {
     next: u64,
     sent: u64,
     flushed: u64,
+    physical_selected: bool,
+    physical_observed: u64,
+    physical_generation: u64,
     entries: Box<[Option<Entry>]>,
     flights: [Option<Flight>; 2],
 }
 pub(in crate::proxy) struct Completion {
     pub id: Id,
     pub token: OutputId,
+    pub flow: u64,
+    pub channel: u16,
+    pub admitted: Micros,
+    pub ordinal: u64,
+    pub physical: Option<PhysicalWrite>,
 }
 impl Ledger {
     pub fn bytes(slots: usize) -> io::Result<usize> {
@@ -110,6 +121,9 @@ impl Ledger {
             next: 1,
             sent: 0,
             flushed: 0,
+            physical_selected: false,
+            physical_observed: 0,
+            physical_generation: 0,
             entries: (0..slots).map(|_| None).collect(),
             flights: [None; 2],
         })
@@ -150,6 +164,7 @@ impl Ledger {
                 bytes,
                 admitted: now,
                 ordinal: None,
+                physical: None,
             },
         }))
     }
@@ -239,8 +254,94 @@ impl Ledger {
         self.revision = revision;
         Ok(self.sent)
     }
+    pub fn enable_physical_receipts(&mut self) -> io::Result<()> {
+        if self.sent != 0 || self.flushed != 0 {
+            return Err(invalid("late measured physical selection"));
+        }
+        self.physical_selected = true;
+        Ok(())
+    }
+    /// Import exact local facts before expiry processing, without releasing any
+    /// Flight/token or advancing semantic flush. Includes every Data ordinal.
+    pub fn observe_physical(
+        &mut self,
+        count: u64,
+        receipts: [Option<PhysicalWrite>; PHYSICAL_SLOTS],
+        origin: Instant,
+        observed: Instant,
+    ) -> io::Result<()> {
+        if !self.physical_selected
+            || count < self.physical_observed
+            || count > self.sent
+            || count
+                .checked_sub(self.physical_observed)
+                .is_none_or(|n| n > PHYSICAL_SLOTS as u64)
+        {
+            return Err(invalid("measured physical ordinal outside handed range"));
+        }
+        if count == self.physical_observed {
+            return Ok(());
+        }
+        let first = self
+            .physical_observed
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical ordinal exhausted"))?;
+        let mut generation = self.physical_generation;
+        // Complete preflight before retaining even the first fact.
+        for ordinal in first..=count {
+            let index = ((ordinal - 1) % PHYSICAL_SLOTS as u64) as usize;
+            let receipt =
+                receipts[index].ok_or_else(|| invalid("missing coalesced physical receipt"))?;
+            let flight = self
+                .flights
+                .iter()
+                .flatten()
+                .find(|f| f.ordinal == ordinal)
+                .ok_or_else(|| invalid("physical receipt lacks actual all-user handoff"))?;
+            let handed = origin
+                .checked_add(std::time::Duration::from_micros(flight.at.0))
+                .ok_or_else(|| invalid("physical handoff time overflow"))?;
+            if receipt.ordinal != Some(ordinal)
+                || receipt.generation <= generation
+                || receipt.accepted_at < handed
+                || receipt.observed_at < receipt.accepted_at
+                || observed < receipt.observed_at
+            {
+                return Err(invalid("measured physical token/time provenance"));
+            }
+            for entry in self
+                .entries
+                .iter()
+                .flatten()
+                .filter(|entry| entry.ordinal == Some(ordinal))
+            {
+                if entry.physical.is_some_and(|old| old != receipt) {
+                    return Err(invalid("measured immutable physical receipt changed"));
+                }
+            }
+            generation = receipt.generation;
+        }
+        for ordinal in first..=count {
+            let receipt = receipts[((ordinal - 1) % PHYSICAL_SLOTS as u64) as usize]
+                .ok_or_else(|| invalid("physical preflight changed"))?;
+            for entry in self
+                .entries
+                .iter_mut()
+                .flatten()
+                .filter(|entry| entry.ordinal == Some(ordinal))
+            {
+                entry.physical = Some(receipt);
+            }
+        }
+        self.physical_generation = generation;
+        self.physical_observed = count;
+        Ok(())
+    }
     pub fn observe_flushed(&mut self, count: u64) -> io::Result<()> {
-        if count < self.flushed || count > self.sent {
+        if count < self.flushed
+            || count > self.sent
+            || (self.physical_selected && count > self.physical_observed)
+        {
             return Err(invalid("measured flushed ordinal outside handed range"));
         }
         if count == self.flushed {
@@ -260,15 +361,21 @@ impl Ledger {
         Ok(())
     }
     pub fn next_completed(&self) -> Option<Completion> {
-        self.entries
+        let e = self
+            .entries
             .iter()
             .flatten()
             .filter(|e| e.ordinal.is_some_and(|n| n <= self.flushed))
-            .min_by_key(|e| e.ordinal)
-            .map(|e| Completion {
-                id: e.id,
-                token: e.token.clone(),
-            })
+            .min_by_key(|e| e.ordinal)?;
+        Some(Completion {
+            id: e.id,
+            token: e.token.clone(),
+            flow: e.flow,
+            channel: e.channel,
+            admitted: e.admitted,
+            ordinal: e.ordinal?,
+            physical: e.physical,
+        })
     }
     // Call only after the actual C confirm_written returned success.
     pub fn confirmed(&mut self, id: Id) -> io::Result<()> {
@@ -310,6 +417,10 @@ impl Ledger {
                     .ok_or_else(|| invalid("measured writer clock regressed"))
             })
             .try_fold(0, |a, b| Ok(a.max(b?)))
+    }
+    #[cfg(test)]
+    pub(in crate::proxy) fn retained_physical(&self, id: Id) -> io::Result<Option<PhysicalWrite>> {
+        Ok(self.entry(id)?.physical)
     }
     fn entry(&self, id: Id) -> io::Result<&Entry> {
         self.entries

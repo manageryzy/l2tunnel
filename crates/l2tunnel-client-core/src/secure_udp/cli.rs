@@ -1350,7 +1350,7 @@ pub(super) async fn execute(
                             }
                             live = None;
                         }
-                        Completed::Applied(_) | Completed::Rejected(_) | Completed::Common { .. } | Completed::OutcomeUnknown => {}
+                        Completed::Applied(_) | Completed::Rejected(_) | Completed::Common { .. } | Completed::ConnectionReuse { .. } | Completed::OutcomeUnknown => {}
                     }
                 }
                 _ = report_tick.tick(), if report_interval.is_some() => {

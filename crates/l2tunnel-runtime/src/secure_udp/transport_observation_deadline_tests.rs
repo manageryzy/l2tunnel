@@ -145,6 +145,7 @@ async fn callback_crosses_actual_cap(kind: cover::Appearance) -> Result {
                 Ok(())
             },
             move || base + Duration::from_micros(sampled.load(Ordering::SeqCst)),
+            |_, completion| Ok(completion),
         )),
     )
     .await?;

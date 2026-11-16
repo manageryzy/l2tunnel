@@ -12,7 +12,7 @@ pub use config::{
     decode_mode, encode_mode, maximum_prepare_bytes, mode_digest,
 };
 use config::{decode_configuration, encode_configuration};
-pub use lease::{CachedRetryAuthority, LeaseSettings, Operation, OutboundContext};
+pub use lease::{CachedRetryAuthority, LeaseSettings, Operation, OperationKind, OutboundContext};
 pub use preparation::Preparation;
 
 use std::fmt;

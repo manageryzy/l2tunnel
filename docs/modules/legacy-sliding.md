@@ -4,14 +4,15 @@ Status: **implemented pure component with root finite protocol evidence**.
 [Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json)
 passes all 14 legacy cases and three affected explicit-coefficient cases.
 The [frozen delivery](../../work/parallel-features-20261115/batch15-staging/external-legacy-fec/final-manifest.json)
-retains the external commit and results. Admission/packing timing alignment is
-still required and does not close either complete P-* definition.
+retains the external commit and results. Explicit admission-aligned and actual
+source/repair batch owners are now integrated. Their finite closeout passes are
+recorded below; complete feedback-trace and end-to-end P-* alignment remain open.
 This additive component targets real-byte legacy sliding/hybrid recovery with
 periodic and causal feedback repairs plus residual selective ARQ. The public boundary is
 [`l2tunnel_fec::legacy_sliding`](../../crates/l2tunnel-fec/src/legacy_sliding/mod.rs);
 actual validation commands and results belong to the integrating change.
 The complete `P-legacy-sliding-fec` and `P-legacy-hybrid-fec` tasks remain unchecked;
-this component does not install Common, native packing, a carrier or a default.
+this component does not install Common/native runtime, a carrier or a default.
 See the unchanged [mode contract](../mode-parity.md#recovery-and-scheduling).
 
 ## Exact Python reference semantics
@@ -122,13 +123,33 @@ must not pretend that an original or retry has physically departed. Rational RTO
 factors use checked arithmetic and round upward to the caller's integer tick;
 `5/2` exactly represents the Python default factor 2.5 before tick quantization.
 
-The production first-send credit boundary differs from Python's admission/packer
-boundary. This component earns integer repair credit only after complete first-send
-custody; the group count, coding history and original group timer start at admission.
-Only one immutable output is owned at once, so timer flush waits for the admitted
-source to finish. Python may add credit while its source packer still holds it. Exact packed,
-congested admission/timer traces therefore remain an integration gap. An
-unqualified constructor or enum must not hide that difference or close a P-* gate.
+The compatibility constructor retains its historical physical first-send credit
+boundary and is not a Python-alignment selection. The explicit
+`Sender::new_admission` / `new_reserved_admission` owner instead uses
+`admit_source_with_coefficients`: source credit, periodic group readiness and
+frozen coefficients/support are published at coding admission, before physical
+completion. Its original first-group timer can flush while an earlier source or
+repair output remains immutable. The selected owner admits additional originals
+into a fixed metadata-only unsent queue; actual source bytes remain single-owned
+in the existing encoder. Every unsent source retains its original creation-based
+output cap, and requested/observed storage includes the queue exactly once.
+Coefficient or capacity refusal before publication consumes no source ID or row.
+
+The explicit encoder path can add a later source during a frozen repair only
+when it cannot overwrite any active or queued equation column or unsent original.
+Ordinary rolling/Research admission behavior is unchanged. A new admission,
+WouldBlock, retry or duplicate completion never changes the held packet bytes,
+earliest debt, timer generation or physical source-attempt count. Authenticated
+feedback may retire an original only after its systematic output, or an equation
+actually covering it, has physically completed; local coding admission is not
+receipt authority.
+
+The admission owner is implemented and its three finite admission cases passed
+in the first closeout check. Compatibility L2LS v1 remains one record per physical
+output. The separately selected batch owner below implements actual source/repair
+packet custody, first-item timers, shared packet loss and exact framing charges;
+metadata readiness alone is not its completion criterion. Full Python feedback
+trace and runtime/native compositions remain unqualified.
 
 ## Actual bytes, bounds and integration limits
 
@@ -204,7 +225,8 @@ by the configured attempt and original-age limits.
 The caller authenticates/replay-checks whole incoming records and binds the
 complete immutable configuration to its session/epoch. Public libraries retain no
 Tokio dependency, OS handles or real clock. Common Engine/Bank/capability wiring,
-frame fragmentation/reassembly and packing, ordered lanes, selected-carrier loss,
+native frame fragmentation/reassembly and end-to-end batch installation, ordered
+lanes, selected-carrier loss,
 full resource/fault/native/platform qualification and all end-to-end P-* gates
 remain open.
 
@@ -260,3 +282,102 @@ and encoder SHA-256 is
 Reconcile these narrow hooks with any later parallel decoder work; do not replace
 the decoder wholesale. `research/*`, `rolling_records/*`, Engine/config/Common,
 the simulator and prior receipts are unchanged.
+
+## Admission alignment follow-up ledger
+
+- [x] [LAA-01] Implement and validate admission-time source credit, immutable periodic coefficient/support snapshots and original FEC timers under held physical output, with bounded single-owned unsent originals, exact storage refusal/reuse, causal feedback and unchanged v1 compatibility behavior. Evidence: [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+- [x] [LAA-02] Implement and validate real source and repair batch packing and physical custody matching the Python first-item timer, size/count flush, source-before-repair ordering and spacing. Charge every actual versioned header/item byte once and retain one physical receipt per represented batch. Evidence: [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+- [ ] [LAA-03] Compare a source-bound actual Python congested/packed admission,
+  FEC/packer timer and feedback trace; preserve explicit analytical-wire,
+  native/runtime/auth/resource/platform and full P-* gaps.
+
+The three finite admission cases passed: held original with later admission and
+timer snapshots; atomic invalid coefficient refusal; and admission while a real
+frozen repair is held with unsent-feedback rejection. Evidence is the
+[first closeout check log](../../work/parallel-features-20261115/closeout-batch-check-1/check.log).
+The [aggregate receipt](../../work/parallel-features-20261115/closeout-batch-check-1/validation.json)
+remains failed; focused continuation passes LAA-01/02, while LAA-03 stays open.
+
+## Explicit actual batch extension
+
+Status: **implemented pure owner with finite admission, actual batch and
+held-retry custody checks passed**. The explicit
+`legacy_sliding::batch::BatchSender` owns the same admission-aligned Sender
+and reserves real packet slabs, per-packet token metadata and two packer cursors.
+It does not install a Common profile or change default L2LS-v1 parsing/encoding.
+`Packing` selects source/repair counts, the original pack wait, analytical MTU,
+actual packet ceiling, slot count and full owner allowance.
+
+Source additions obey the Python count/size flush and retain the first-item timer.
+FEC flush closes the source packer before repair output is eligible. Repair
+cohorts reserve their exact slab positions at original queued due/order events
+before incremental GF finishes, so work pressure cannot move an equation into
+a later cohort. A closed packet remains unavailable until every reserved payload
+is complete. One pinned active packet keeps its ID and complete bytes immutable
+while other admissions, timers or GF turns progress. Original source/job caps
+remain active; packet waits, retries and timer polls do not renew them. Callers
+service due timer events through `step`; equal-tick input ordering is explicit
+call ordering, rather than an implicit real clock or an old callback identity.
+
+The new L2LB-v1 wire grammar is an eight-byte magic/version/class/count envelope
+plus a two-byte length and unchanged L2LS-v1 record for every represented item.
+The parser validates the entire bounded envelope and every inner record using
+the maintained canonical parser before iteration; it grants no authentication.
+`PacketOutput::charge` includes every actual framing byte and the caller's real
+outer overhead. Analytical 88-byte/four-byte costs only decide Python grouping;
+actual capacity must independently fit that cohort. No record is cropped and no
+analytical cost substitutes for real traffic. Reverse feedback remains a separate
+authenticated, reverse-budgeted record. Common/native/carrier batching and its
+original-arrival input custody remain full required integration work.
+
+Encoder scratch transfer into a packet is not a physical send: sources retain
+unsent/attempt custody and repairs retain their actual jobs until the whole packet
+receipt. `BatchSender::confirm_output(id, accepted, observed, rtt)` needs no RNG.
+It consumes every represented source/repair physical fact exactly once, even if
+the first item or callback is late, then latches the first timing failure. Real
+physical counters and the whole-packet Receipt survive that failure; output cannot
+be reissued. First-send RTO derives from actual acceptance. Feedback that could
+refer to a locally held physical receipt returns Busy without ACK mutation;
+`receive_feedback_at` retains original authenticated arrival for later retry and
+rejects an arrival before any physical source/equation supporting its claim.
+It never turns a claimed source ID into authentication or a clock/cap extension.
+
+The exact Plan/Usage includes the existing source/GF owner once, one fixed packet
+byte slab, packet metadata and per-item custody tokens. Packet paths allocate no
+backing. Wrapper fixed size and nested heaps are compared to the explicit complete
+allowance; allocator/RSS, caller buffers and full runtime external inventory are
+not covered. Incremental GF work uses WorkBudget. Packet serialization and
+cohort reservations are separately bounded metadata/copy operations: at most1024
+repair assignments per call, each scanning at most1024 jobs and255 terms, plus
+scans bounded by configured packet_slots and one actual record copy. WorkUsed
+does not claim to meter those parser/packing CPU operations.
+
+The source-pinned [congestion oracle](../../crates/l2tunnel-fec/tests/generate_legacy_admission_vectors.py)
+uses actual unchanged Python Packer/Tunnel methods and Random(7349), a250-us
+existing link reservation,100-us serialization and1000-us RTT. Its 21-line
+[fixture](../../crates/l2tunnel-fec/tests/fixtures/legacy-admission-packing.txt)
+captures admission credit/generations, periodic support/coefficients, source
+cohorts and a two-equation repair cohort before any physical completion. The Rust
+case compares those snapshots and immutable actual packets, drops one entire
+source packet, recovers exact trailing-zero original bytes from the real equations
+and applies actual receiver feedback. Separate cases cover original pack timer,
+exact wire/storage refusal, accepted-versus-observed RTO, malformed batch refusal,
+foreign/duplicate receipts and all-item physical facts on late source/repair
+packets. All three cases passed in the
+[first closeout check log](../../work/parallel-features-20261115/closeout-batch-check-1/check.log),
+and `generate_legacy_admission_vectors.py --check` verified all 21 rows. The oracle
+stops before the first physical completion: it contains no delivered feedback,
+feedback loss, late ACK or timeout/retry ordering trace. The Rust loss/recovery
+and actual feedback assertions are finite component evidence, not an executed
+Python feedback differential. LAA-03 therefore remains open.
+
+An additional acknowledged-held-retry/selective-ACK case failed in that first
+check because its selective-only profile was given a cumulative ACK. The
+correct selective ACK now passes the same held-slot regression in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+The failed aggregate is retained and must not be described as passed.
+
+LAA-01/02 are finite completed leaves; LAA-03 and both full legacy P-* gates
+retain their complete definitions and remain unchecked. Actual selected Common/config/management/authentication, reverse
+MUX loss, native fragmentation/ordered lanes, platforms, full resources and
+performance remain open. Historical component receipts and simulated throughput
+are unchanged; they do not validate this extension.

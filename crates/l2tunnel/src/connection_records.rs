@@ -13,9 +13,8 @@ use std::{
 
 mod configuration;
 mod observers;
-// Private until actual selected-control ingress supplies operation provenance.
-#[allow(dead_code)]
-pub(crate) mod retirement;
+/// Exact selected-control commands; opaque fences retain private construction.
+pub mod retirement;
 /// Exact versioned route grammar, without authentication authority.
 pub mod route;
 /// Actual fixed, vector and nested heap inventory.

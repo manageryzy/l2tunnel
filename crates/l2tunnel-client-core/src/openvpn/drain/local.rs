@@ -20,6 +20,7 @@ pub(super) fn action(
         | local::Action::SwitchSwiftConfiguration { .. }
         | local::Action::SwitchCommonConfiguration { .. }
         | local::Action::CommonCatalog { .. }
+        | local::Action::ReuseConnection { .. }
         | local::Action::Disconnect {}
         | local::Action::Reconnect {}
         | local::Action::SwitchCompression { .. }

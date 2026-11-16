@@ -947,7 +947,16 @@ impl Owner {
             Backend::Streamed(streamed) => {
                 let streamed = &mut **streamed;
                 let stream = outgoing_stream(body)?;
-                if streamed.leased && stream == streams::Stream::Transaction {
+                if streamed.leased
+                    && stream == streams::Stream::Transaction
+                    && !matches!(
+                        body,
+                        sc::Body::ProfileControl {
+                            tag: sc::ProfileTag::SlotReuseV1,
+                            ..
+                        }
+                    )
+                {
                     return Err(invalid("leased Management requires frozen Peer output"));
                 }
                 let i = index(stream);
@@ -1125,7 +1134,16 @@ impl Owner {
                     if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
                         return Err(protocol("control body was substituted across streams"));
                     }
-                    if streamed.leased && stream == streams::Stream::Transaction {
+                    if streamed.leased
+                        && stream == streams::Stream::Transaction
+                        && !matches!(
+                            envelope.body,
+                            sc::Body::ProfileControl {
+                                tag: sc::ProfileTag::SlotReuseV1,
+                                ..
+                            }
+                        )
+                    {
                         continue;
                     }
                     let scope = envelope.binding.scope;
@@ -1211,7 +1229,7 @@ impl Owner {
         let Backend::Streamed(streamed) = &self.backend else {
             return Ok(false);
         };
-        for i in 1..streamed.owners.len() {
+        for i in 0..streamed.owners.len() {
             let stream = streamed.stream(i)?;
             if streamed.held[i].is_some() {
                 continue;
@@ -1219,13 +1237,29 @@ impl Owner {
             let Some(delivery) = streamed.owners[i].pending() else {
                 continue;
             };
-            let envelope = sc::Envelope::decode(
+            let envelope = match sc::Envelope::decode(
                 delivery.bytes(),
                 envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
-            )
-            .map_err(protocol)?;
+            ) {
+                Ok(envelope) => envelope,
+                // Joint transaction preview owns malformed transaction bytes.
+                // A readiness hint must neither consume them nor steal errors.
+                Err(_) if stream == streams::Stream::Transaction => continue,
+                Err(error) => return Err(protocol(error)),
+            };
             if leased::incoming_stream(envelope.body, streamed.leased)? != stream {
                 return Err(protocol("control body was substituted across streams"));
+            }
+            if stream == streams::Stream::Transaction
+                && !matches!(
+                    envelope.body,
+                    sc::Body::ProfileControl {
+                        tag: sc::ProfileTag::SlotReuseV1,
+                        ..
+                    }
+                )
+            {
+                continue;
             }
             return Ok(true);
         }
@@ -1624,7 +1658,7 @@ fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
     match body {
         sc::Body::Ping { .. } | sc::Body::Pong { .. } => Ok(streams::Stream::Liveness),
         sc::Body::ProfileControl {
-            tag: sc::ProfileTag::SwiftPolicyV1,
+            tag: sc::ProfileTag::SwiftPolicyV1 | sc::ProfileTag::SlotReuseV1,
             ..
         } => Ok(streams::Stream::Transaction),
         sc::Body::ProfileControl {

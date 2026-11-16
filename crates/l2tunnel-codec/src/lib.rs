@@ -18,10 +18,10 @@ mod frame;
 
 pub use fragment::storage as fragment_storage;
 pub use fragment::{
-    FRAGMENT_HEADER_BYTES, FragmentBatch, FragmentBatchView, FragmentConfig, FragmentContext,
-    FragmentError, FragmentGeometry, FragmentLayout, Fragmenter, MessageId, Reassembler,
-    ReassemblyConfig, ReassemblyStatus, ReassemblyTiming, SessionId, TimedReassemblyStatus,
-    inspect_fragment_context,
+    CausalTime, FRAGMENT_HEADER_BYTES, FragmentBatch, FragmentBatchView, FragmentConfig,
+    FragmentContext, FragmentError, FragmentGeometry, FragmentLayout, Fragmenter, MessageId,
+    Reassembler, ReassemblyConfig, ReassemblyStatus, ReassemblyTiming, SessionId,
+    TimedReassemblyStatus, inspect_fragment_context,
 };
 pub use frame::{
     CodecConfig, CodecError, Compression, FRAME_HEADER_BYTES, FrameCodec, FrameLayer,

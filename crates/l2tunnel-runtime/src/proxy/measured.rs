@@ -18,7 +18,7 @@ mod ledger;
 mod state;
 pub(super) use ledger::{Id, Ledger};
 pub(super) use state::State;
-pub use state::{FlowSnapshot, Snapshot};
+pub use state::{FlowSnapshot, PhysicalCallback, Snapshot};
 
 const DOMAIN: &[u8] = b"l2tunnel/tun-tcp-proxy-adaptive/v1/fixed-rings/measured-relay\0";
 const MAX_MICROS: u64 = 120_000_000;
@@ -65,6 +65,9 @@ pub struct MemoryBound {
     pub handoff_bytes: usize,
     /// Bounded service timers and copied lifetime snapshot rows.
     pub service_bytes: usize,
+    /// Fixed writer/watch/actor receipt metadata for selected Common;
+    /// not extra payload credit or a universal allocator/resource claim.
+    pub common_physical_metadata_bytes: usize,
     /// Base, Controller, handoff and service storage.
     pub base_and_controller_bytes: usize,
 }
@@ -136,13 +139,16 @@ impl Config {
             .ok_or_else(|| invalid("measured proof arithmetic"))?;
         let handoff_bytes = Ledger::bytes(slots)?;
         let service_bytes = State::storage_bytes(n)?;
+        let common_physical_metadata_bytes = super::transport::physical_metadata_bytes()?;
         let base_and_controller_bytes = fixed
             .payload_bytes
-            .checked_add(controller.retained_bytes)
+            .checked_add(fixed.common_bridge_metadata_bytes)
+            .and_then(|v| v.checked_add(controller.retained_bytes))
             .and_then(|v| v.checked_add(controller.scratch_bytes))
             .and_then(|v| v.checked_add(controller.view_bytes))
             .and_then(|v| v.checked_add(handoff_bytes))
             .and_then(|v| v.checked_add(service_bytes))
+            .and_then(|v| v.checked_add(common_physical_metadata_bytes))
             .filter(|v| *v <= 268_435_456)
             .ok_or_else(|| invalid("measured aggregate memory bound"))?;
         Ok(MemoryBound {
@@ -153,6 +159,7 @@ impl Config {
             immutable_proof_bytes,
             handoff_bytes,
             service_bytes,
+            common_physical_metadata_bytes,
             base_and_controller_bytes,
         })
     }

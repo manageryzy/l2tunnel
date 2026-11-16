@@ -82,6 +82,9 @@ pub(in crate::secure_udp) trait RawBacking: Send {
     ) -> io::Result<SendProgress>;
     fn take_control(&mut self) -> io::Result<Option<(SendProgress, usize)>>;
     fn take_user(&mut self) -> io::Result<Option<(UserIdentity, SendProgress)>>;
+    fn user_accepted_at(&self) -> Option<Instant>;
+    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>>;
+    fn try_user_held(&mut self, identity: UserIdentity, bytes: &[u8]) -> io::Result<SendProgress>;
     fn try_receive(&mut self, output: &mut [u8]) -> io::Result<(usize, Instant)>;
     fn poll_ready(&mut self, cx: &mut Context<'_>, receive: bool) -> Poll<io::Result<()>>;
     fn poll_setup_send(
@@ -138,6 +141,15 @@ impl RawBacking for NoRaw {
         match *self {}
     }
     fn take_user(&mut self) -> io::Result<Option<(UserIdentity, SendProgress)>> {
+        match *self {}
+    }
+    fn user_accepted_at(&self) -> Option<Instant> {
+        match *self {}
+    }
+    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>> {
+        match *self {}
+    }
+    fn try_user_held(&mut self, _: UserIdentity, _: &[u8]) -> io::Result<SendProgress> {
         match *self {}
     }
     fn try_receive(&mut self, _: &mut [u8]) -> io::Result<(usize, Instant)> {
@@ -213,6 +225,60 @@ pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     polled: bool,
 }
 impl<I: PacketIo + Send + 'static> RawAdapter<I> {
+    fn try_user_inner(
+        &mut self,
+        identity: UserIdentity,
+        bytes: &[u8],
+        hold: bool,
+    ) -> io::Result<SendProgress> {
+        if let Some(user) = &self.user {
+            if user.identity != identity {
+                return Err(protocol("raw User identity changed while pending"));
+            }
+        } else {
+            let pending = self.pending(self.data_lane(), bytes.len(), identity.deadline)?;
+            if identity.bytes != bytes.len() {
+                return Err(protocol("raw User byte identity differs"));
+            }
+            self.user = Some(User { identity, pending });
+        }
+        let user = self
+            .user
+            .as_mut()
+            .ok_or_else(|| protocol("raw User custody missing"))?;
+        if user.pending.receipt.is_none() {
+            // Retain the exact User identity and original cap while an older
+            // Control owns this lane. The Driver now observes waiting custody
+            // and cannot repeatedly replace that Control ahead of this User.
+            // Half's distinct data lane remains independently admissible.
+            if user.pending.token.is_none()
+                && self
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| control.lane == user.pending.lane)
+            {
+                return Ok(SendProgress::Pending);
+            }
+            Self::stage(
+                &mut self.carrier,
+                &mut user.pending,
+                raw::RecordKind::Data,
+                bytes,
+            )?;
+            self.fail()?;
+            return Ok(SendProgress::Pending);
+        }
+        if hold {
+            return Ok(SendProgress::Pending);
+        }
+        Self::result(
+            self.user
+                .take()
+                .ok_or_else(|| protocol("raw User custody missing"))?
+                .pending,
+        )
+    }
+
     pub(in crate::secure_udp) fn new(mut carrier: PacketCarrier<I>) -> io::Result<Self> {
         carrier.check_live().map_err(raw_error)?;
         let plan = Plan::for_packet(&carrier)?;
@@ -471,49 +537,29 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .min()
     }
     fn try_user(&mut self, identity: UserIdentity, bytes: &[u8]) -> io::Result<SendProgress> {
-        if let Some(user) = &self.user {
-            if user.identity != identity {
-                return Err(protocol("raw User identity changed while pending"));
-            }
-        } else {
-            let pending = self.pending(self.data_lane(), bytes.len(), identity.deadline)?;
-            if identity.bytes != bytes.len() {
-                return Err(protocol("raw User byte identity differs"));
-            }
-            self.user = Some(User { identity, pending });
-        }
-        let user = self
-            .user
-            .as_mut()
-            .ok_or_else(|| protocol("raw User custody missing"))?;
-        if user.pending.receipt.is_none() {
-            // Retain the exact User identity and original cap while an older
-            // Control owns this lane. The Driver now observes waiting custody
-            // and cannot repeatedly replace that Control ahead of this User.
-            // Half's distinct data lane remains independently admissible.
-            if user.pending.token.is_none()
-                && self
-                    .control
-                    .as_ref()
-                    .is_some_and(|control| control.lane == user.pending.lane)
-            {
-                return Ok(SendProgress::Pending);
-            }
-            Self::stage(
-                &mut self.carrier,
-                &mut user.pending,
-                raw::RecordKind::Data,
-                bytes,
-            )?;
-            self.fail()?;
-            return Ok(SendProgress::Pending);
-        }
-        Self::result(
-            self.user
-                .take()
-                .ok_or_else(|| protocol("raw User custody missing"))?
-                .pending,
-        )
+        self.try_user_inner(identity, bytes, false)
+    }
+    fn try_user_held(&mut self, identity: UserIdentity, bytes: &[u8]) -> io::Result<SendProgress> {
+        self.try_user_inner(identity, bytes, true)
+    }
+    fn user_accepted_at(&self) -> Option<Instant> {
+        self.user
+            .as_ref()
+            .and_then(|u| u.pending.receipt)
+            .map(|r| r.accepted_at)
+    }
+    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>> {
+        Ok(self
+            .input
+            .as_ref()
+            .map(|i| i.received)
+            .into_iter()
+            .chain(
+                self.carrier
+                    .earliest_authenticated_record_at()
+                    .map_err(raw_error)?,
+            )
+            .min())
     }
     fn stage_control(
         &mut self,

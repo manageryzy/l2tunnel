@@ -300,7 +300,7 @@ pub(crate) async fn serve(
                         }
                         Completed::Applied(_) | Completed::Rejected(_) | Completed::OutcomeUnknown => {},
                         #[cfg(unix)]
-                        Completed::Common { .. } => {},
+                        Completed::Common { .. } | Completed::ConnectionReuse { .. } => {},
                     }
                 }
                 Err(error) => {

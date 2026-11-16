@@ -3,7 +3,9 @@
 Status: **implemented pure components and original-UDP Common composition with finite protocol and runtime integration evidence**.
 The [Batch14 receipt](../../work/parallel-features-20261115/parallel-batch14-scoped-validation.json)
 adds Engine/Bank, protected original UDP and catalog-bound shared-service cases.
-Asynchronous carrier ordering and complete named Python acceptance remain open.
+The closeout integrates bounded asynchronous ordering and passes finite original
+OpenVPN and injected raw shared-service cases; see [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+Complete named Python acceptance remains open.
 The [Batch13 receipt](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json)
 records the affected research/shared-rolling cases, unchanged Python oracle check,
 and first full-check failures/continuations separately from external history.
@@ -189,7 +191,8 @@ owner. The focused delayed-receipt/late-feedback case passes in Batch14.
 
 The pure candidate alone left runtime/shared-service/carrier/CLI selection
 unsupported. The dependent original-UDP candidate below removes only its actual
-installed branches; asynchronous carriers remain refused. Caller-authenticated
+installed branches; the subsequent asynchronous composition below removes its
+actual OpenVPN/raw selection refusal while retaining separate integration gates. Caller-authenticated
 pure fixtures establish no production Noise/TLS/native lab qualification. RRP-03 and all
 three original P-* gates remain fully open until their complete runtime,
 feedback-loss/resource/failure and native acceptance requirements pass. The new
@@ -209,8 +212,9 @@ Original UDP confirms its whole physical send synchronously before subsequently
 opening another authenticated input. Already authenticated feedback remains in
 its observed order. An unread OS packet has no known physical network arrival
 here: this is not exact network-clock/Python event equivalence. Asynchronous
-OpenVPN/raw Research selection remains explicitly unsupported until bounded
-retained-arrival/physical-receipt ordering is installed. Blindly polling receipts
+OpenVPN/raw Research selection was refused at the Batch14 checkpoint until bounded
+retained-arrival/physical-receipt ordering. The Batch16 composition below installs
+that ordering, with finite root execution in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json). Blindly polling receipts
 before input would also invert valid earlier-feedback order and is not a fix.
 
 Three finite root cases pass in Batch14:
@@ -274,3 +278,32 @@ shared admission/pacing, production feedback loss, resource/fault behavior and
 native execution remains open beyond the finite authored candidates. The three full P-* tasks and their end-to-end acceptance definitions are
 unchanged. The draft wire requires explicit future integration; no default or
 existing mode is switched by adding these components.
+
+
+## Asynchronous carrier ordering composition
+
+The source-bound [ordering handoff](../../work/parallel-features-20261115/python-parity-staging/research-async-order/handoff-v0.json)
+now reaches the actual Sender, Engine/Bank, Common Driver and maintained carriers.
+The public `CausalTime` is caller-injected local nanoseconds, not a clock or wire
+authenticator. Complete feedback availability is the maximum accepted distinct
+fragment arrival; lifetime still starts at the minimum original arrival and keeps
+its existing cap. Runtime derives precision from its retained Instant origin,
+including distinct events inside one microsecond. Old coarse APIs remain wrappers.
+
+The selected generation's existing bounded ingress slots retain authenticated
+feedback with original precise arrival and cap while a physical output is held.
+A bounded initial-cohort scan preserves the relative FIFO of other inputs. Earlier
+feedback is applied before source confirmation; later feedback follows it.
+No new payload queue or capacity increase is introduced. Unselected/no-ingress
+paths retain their existing single pending feedback limit. Full custody exhaustion
+is an explicit bounded refusal, never silent feedback loss. One physical receipt
+is consumed once even if later validation fails. Common control remains independent.
+Raw receipt publication first serves older authenticated input already in its
+bounded inventory; unread kernel queues are not physical arrival observations.
+
+Finite cases pass actual multi-fragment equal-tick ordering, two genuine retained
+feedbacks around one physical receipt, original initial-only OpenVPN bytes and
+liveness for all three policies, and an injected raw Half shared-service switch
+through those policies. Evidence: [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json). These cases do not close complete
+pressure/failure/native/platform/resource, Python byte/performance, RRP-03 or any
+full P-* gate. Public time remains caller injected and simulator history is intact.

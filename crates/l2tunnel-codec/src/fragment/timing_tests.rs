@@ -332,3 +332,89 @@ fn legacy_and_timed_existing_completion_near_clock_limit_do_not_add_new_lifetime
     }
     Ok(())
 }
+
+#[test]
+fn complete_arrival_is_maximum_distinct_input_while_first_arrival_keeps_original_cap() -> Result {
+    for reserved_backing in [false, true] {
+        let mut owner = owner(reserved_backing, 64)?;
+        let usage = owner.storage_usage();
+        let pointers_before = pointers(&owner)?;
+        let original = [0x71; 48];
+        let fragments = batch(9, &original)?.fragments;
+        let mut output = [0; 48];
+        owner.accept_at_until(&fragments[2], 20, 22, 100, &mut output)?;
+        owner.accept_at_until(&fragments[0], 18, 24, 100, &mut output)?;
+        // Duplicate time is not a new whole-body arrival and cannot renew age.
+        owner.accept_at_until(&fragments[0], 25, 25, 100, &mut output)?;
+        let TimedReassemblyStatus::Complete { timing, .. } =
+            owner.accept_at_until(&fragments[1], 19, 26, 100, &mut output)?
+        else {
+            return Err("real complete body missing".into());
+        };
+        assert_eq!(timing.first_received_ticks(), 18);
+        assert_eq!(timing.complete_received_ticks(), 20);
+        assert_eq!(timing.deadline_ticks(), 28);
+        assert_eq!(output, original);
+        assert_eq!(owner.storage_usage(), usage);
+        assert_eq!(pointers(&owner)?, pointers_before);
+    }
+    Ok(())
+}
+
+#[test]
+fn precise_complete_arrival_orders_equal_ticks_without_changing_first_arrival_cap() -> Result {
+    for reserved_backing in [false, true] {
+        for after in [false, true] {
+            let mut owner = owner(reserved_backing, 64)?;
+            let usage = owner.storage_usage();
+            let before = pointers(&owner)?;
+            let fragments = batch(1, &[0x63; 48])?.fragments;
+            let mut output = [0xa5; 128];
+            let order = |n| CausalTime::from_nanos(n);
+            owner.accept_ordered_at_until(&fragments[2], 20, 22, 28, order(20_200), &mut output)?;
+            owner.accept_ordered_at_until(&fragments[0], 20, 23, 28, order(20_100), &mut output)?;
+            // A duplicate observed later cannot acquire causal or lifetime custody.
+            assert!(matches!(
+                owner.accept_ordered_at_until(
+                    &fragments[2],
+                    20,
+                    24,
+                    28,
+                    order(20_999),
+                    &mut output
+                )?,
+                TimedReassemblyStatus::Duplicate { .. }
+            ));
+            let final_arrival = if after { 20_800 } else { 20_300 };
+            let TimedReassemblyStatus::Complete { timing, length, .. } = owner
+                .accept_ordered_at_until(
+                    &fragments[1],
+                    20,
+                    25,
+                    28,
+                    order(final_arrival),
+                    &mut output,
+                )?
+            else {
+                return Err("actual complete body".into());
+            };
+            assert_eq!(
+                (
+                    timing.first_received_ticks(),
+                    timing.complete_received_ticks(),
+                    timing.deadline_ticks()
+                ),
+                (20, 20, 28)
+            );
+            assert_eq!(timing.complete_order(), Some(order(final_arrival)));
+            assert_eq!(
+                timing.complete_order().ok_or("exact arrival")? <= order(20_500),
+                !after
+            );
+            assert_eq!(&output[..length], &[0x63; 48]);
+            assert_eq!(owner.storage_usage(), usage);
+            assert_eq!(pointers(&owner)?, before);
+        }
+    }
+    Ok(())
+}

@@ -214,6 +214,21 @@ impl<'a> Entry<'a> {
             .accept_authenticated_at(received, now, security_number, kind, body)
             .map_err(Error::Engine)
     }
+    /// Retain Research feedback in the issuing generation's actual input queue.
+    #[allow(clippy::too_many_arguments)] // Preserve original authenticated and causal facts.
+    pub fn retain_research_feedback_authenticated_until(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        cap: engine::Tick,
+        number: u64,
+        order: Option<crate::codec::CausalTime>,
+        bytes: &[u8],
+    ) -> Result<bool, Error> {
+        self.engine
+            .retain_research_feedback_authenticated_until(received, now, cap, number, order, bytes)
+            .map_err(Error::Engine)
+    }
     /// Preserve the authenticated input's original operation/session deadline.
     pub fn accept_authenticated_until(
         &mut self,
@@ -272,6 +287,21 @@ impl<'a> Entry<'a> {
             .confirm_carrier_output_at(now, accepted, token.token)
             .map_err(Error::Engine)
     }
+    /// Preserve exact local receipt order for the same actual Engine witness.
+    pub fn confirm_carrier_output_ordered_at(
+        &mut self,
+        now: engine::Tick,
+        accepted: engine::Tick,
+        order: crate::codec::CausalTime,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
+        if token.generation != self.generation {
+            return Err(Error::Stale);
+        }
+        self.engine
+            .confirm_carrier_output_ordered_at(now, accepted, order, token.token)
+            .map_err(Error::Engine)
+    }
     /// Advance actual rolling work only within the caller's explicit GF/copy/visit caps.
     /// Other profile families return no rolling result and retain their own service.
     pub fn step(
@@ -328,5 +358,16 @@ impl<'a> Entry<'a> {
         self.engine
             .commit_native(now, token.token)
             .map_err(Error::Engine)
+    }
+}
+
+impl Entry<'_> {
+    /// Drive the exact retained same-generation operation on this actual Engine.
+    pub fn progress_connection_reuse(
+        &mut self,
+        state: &mut engine::connection_reuse::ConnectionReuse,
+        now: engine::Tick,
+    ) -> Result<(), Error> {
+        state.progress(self.engine, now).map_err(Error::Engine)
     }
 }

@@ -90,6 +90,33 @@ impl Engine {
             prepared,
         })
     }
+    /// Retain genuine Research feedback in this generation's already selected
+    /// ingress queue. False means that optional queue was not provisioned.
+    #[allow(clippy::too_many_arguments)] // Exact authenticated input facts stay separate.
+    pub fn retain_research_feedback_authenticated_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+        number: u64,
+        order: Option<crate::codec::CausalTime>,
+        bytes: &[u8],
+    ) -> Result<bool, Error> {
+        self.advance(now)?;
+        if received > now {
+            return Err(Error::Time);
+        }
+        if bytes.is_empty() || bytes.len() > self.receive_max {
+            return self.fail(Error::PacketSize);
+        }
+        match &mut self.owner {
+            Owner::Research(endpoint) => endpoint
+                .retain_feedback_until(received, now, cap, number, order, bytes)
+                .map_err(Error::Rolling),
+            _ => Ok(false),
+        }
+    }
+
     /// Consume a matching witness after caller-observed whole carrier ownership.
     /// Encoding, sealing, local enqueue and partial writes cannot acknowledge it.
     pub fn confirm_carrier_output(
@@ -109,17 +136,33 @@ impl Engine {
         if self.fragments.is_some() {
             return Err(Error::FragmentPolicy);
         }
-        self.confirm_whole_carrier_output_at(now, accepted, token)
+        self.confirm_whole_carrier_output_at(now, accepted, None, token)
+    }
+    /// Preserve the retained caller clock precision for causal feedback order.
+    pub fn confirm_carrier_output_ordered_at(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        order: crate::codec::CausalTime,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
+        if self.fragments.is_some() {
+            return Err(Error::FragmentPolicy);
+        }
+        self.confirm_whole_carrier_output_at(now, accepted, Some(order), token)
     }
     pub(super) fn confirm_whole_carrier_output_at(
         &mut self,
         now: Tick,
         accepted: Tick,
+        order: Option<crate::codec::CausalTime>,
         token: CarrierOutputToken,
     ) -> Result<(), Error> {
         if self.pending_whole_carrier_output().as_ref() != Some(&token) {
             return Err(Error::Token);
         }
+        let early_feedback =
+            self.research_fragment_feedback_at_completion(now, accepted, order, true);
         let timing = self.advance(now);
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
@@ -147,9 +190,12 @@ impl Engine {
             }
             _ => Err(Error::Invariant),
         };
+        let later_feedback =
+            self.research_fragment_feedback_at_completion(now, accepted, order, false);
         timing?;
+        early_feedback?;
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => later_feedback,
             Err(error) => self.fail(error),
         }
     }

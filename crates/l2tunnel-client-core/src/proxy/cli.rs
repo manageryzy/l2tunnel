@@ -192,6 +192,7 @@ mod service {
                 | Action::SwitchSwiftConfiguration { .. }
                 | Action::SwitchCommonConfiguration { .. }
                 | Action::CommonCatalog { .. }
+                | Action::ReuseConnection { .. }
                 | Action::Disconnect {}
                 | Action::Reconnect {}
                 | Action::DrainOpenVpn {} => Err("unsupported"),

@@ -75,6 +75,7 @@ async fn local_action(
         | Action::SwitchSwiftConfiguration { .. }
         | Action::SwitchCommonConfiguration { .. }
         | Action::CommonCatalog { .. }
+        | Action::ReuseConnection { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}
@@ -123,6 +124,7 @@ async fn active_local_action(
         | Action::SwitchSwiftConfiguration { .. }
         | Action::SwitchCommonConfiguration { .. }
         | Action::CommonCatalog { .. }
+        | Action::ReuseConnection { .. }
         | Action::DrainProxy {}
         | Action::DrainOpenVpn {}
         | Action::Disconnect {}

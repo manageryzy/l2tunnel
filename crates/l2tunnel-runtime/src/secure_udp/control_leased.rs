@@ -334,6 +334,20 @@ impl Owner {
         let Some(delivery) = streamed.owners[i].pending() else {
             return Ok(None);
         };
+        let envelope = sc::Envelope::decode(
+            delivery.bytes(),
+            envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
+        )
+        .map_err(protocol)?;
+        if matches!(
+            envelope.body,
+            sc::Body::ProfileControl {
+                tag: sc::ProfileTag::SlotReuseV1,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
         let preparation = streamed
             .gate
             .preview_transaction(

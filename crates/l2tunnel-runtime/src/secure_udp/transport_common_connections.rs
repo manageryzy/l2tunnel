@@ -161,14 +161,15 @@ pub(super) fn maximum_body(
         .map_err(invalid)
 }
 
-pub(super) fn classify(
+pub(super) fn classify_incarnation(
     body: &[u8],
     send: connections::Direction,
     receive: connections::Direction,
     role: security::Role,
+    incarnation: u64,
 ) -> io::Result<engine::EmissionKind> {
     let (header, inner) = connections::route::decode(body).map_err(protocol)?;
-    if header.owner.index() >= receive.owners || header.incarnation != receive.incarnation {
+    if header.owner.index() >= receive.owners || header.incarnation != incarnation {
         return Err(protocol(
             "connection input route differs from actual cohort",
         ));

@@ -146,6 +146,12 @@ pub(super) enum Transport {
     ProxyMeasured(Arc<crate::proxy_measured::Settings>),
     #[cfg(unix)]
     ProxyCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
+    #[cfg(unix)]
+    ProxyCommonRaw {
+        profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+        raw: Arc<crate::raw_packet::common::Settings>,
+        opener: crate::raw_packet::common::PacketOpener,
+    },
     UdpFrame {
         settings: crate::udp::Settings,
         delivery: managed::DeliveryConfig,
@@ -275,6 +281,54 @@ impl Prepared {
             })),
             attachment,
             Transport::ProxyCommon(Arc::new(profile)),
+        )
+    }
+    /// Explicit fixed/full proxy over genuine original raw TLS/packet owners.
+    /// All original I/O and native attachment remain deferred to the sole Run.
+    #[cfg(unix)]
+    pub fn proxy_common_raw_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        raw: crate::raw_packet::common::Settings,
+        outer: Client,
+        inner: crate::secure_udp::credentials::Client,
+        opener: crate::raw_packet::common::PacketOpener,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&outer)?;
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonRawClient { outer, inner },
+            attachment,
+            Transport::ProxyCommonRaw {
+                profile: Arc::new(profile),
+                raw: Arc::new(raw),
+                opener,
+            },
+        )
+    }
+    /// Matching fixed raw proxy acceptor with real independent TLS/Noise trust.
+    #[cfg(unix)]
+    pub fn proxy_common_raw_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        raw: crate::raw_packet::common::Settings,
+        outer: Server,
+        inner: crate::secure_udp::credentials::Server,
+        opener: crate::raw_packet::common::PacketOpener,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonRawServer(Box::new(CommonRawServer {
+                outer,
+                inner,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::ProxyCommonRaw {
+                profile: Arc::new(profile),
+                raw: Arc::new(raw),
+                opener,
+            },
         )
     }
     /// Explicit same-socket Noise/member/Swift client, with deferred device work.
@@ -467,6 +521,7 @@ impl Prepared {
             &self.data.transport,
             Transport::SecureUdpSwift(_)
                 | Transport::ProxyCommon(_)
+                | Transport::ProxyCommonRaw { .. }
                 | Transport::SecureUdpTransaction(_)
                 | Transport::SecureUdpCommon(_)
                 | Transport::SecureUdpCommonCarrier { .. }
@@ -778,7 +833,26 @@ impl Prepared {
                 None
             }
             #[cfg(unix)]
-            Transport::SecureUdpCommonRaw { profile, raw, .. } => {
+            Transport::SecureUdpCommonRaw { profile, raw, .. }
+            | Transport::ProxyCommonRaw { profile, raw, .. } => {
+                let proxy = matches!(&transport, Transport::ProxyCommonRaw { .. });
+                if proxy != profile.proxy_config().is_some()
+                    || (proxy && profile.proxy_measured_config().is_some())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "raw Common proxy requires its explicit fixed service selection",
+                    ));
+                }
+                if proxy
+                    && (profile.connection().duplex != l2tunnel_core::Duplex::Full
+                        || raw.duplex() != l2tunnel_core::Duplex::Full)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "raw Common proxy currently requires Full",
+                    ));
+                }
                 let session = profile.settings();
                 let (noise, role) = match &endpoint {
                     Endpoint::CommonRawClient { outer, inner } => {
@@ -823,7 +897,7 @@ impl Prepared {
                     || profile.raw_binding().is_some()
                     || profile.carrier_binding().is_some()
                     || noise.profile() != session.profile
-                    || !attachment.readable_kind()
+                    || (!proxy && !attachment.readable_kind())
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,

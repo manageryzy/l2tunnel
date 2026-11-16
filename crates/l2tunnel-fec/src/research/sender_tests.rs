@@ -303,3 +303,86 @@ fn missing_feedback_backpressures_instead_of_truncating_global_support() -> Test
     assert_eq!(sender.status().terminal, None);
     Ok(())
 }
+
+#[test]
+fn actual_feedback_arrival_orders_repair_prefix_without_clock_rewind_or_renewed_cap() -> TestResult
+{
+    let setup = || -> Result<(Sender, Feedback), Error> {
+        let config = accumulator();
+        let mut sender = Sender::new(config, scope(), Tick(0))?;
+        let mut receiver = super::super::Receiver::new(config, scope(), Tick(0))?;
+        for id in 0..4 {
+            sender.admit_source(&[id as u8, 0], Tick(id), Tick(id))?;
+            let mut wire = [0; 128];
+            let length = sender.encode_pending(&mut wire)?;
+            sender.confirm_output(OutputId::Source(SourceId(id as u32)), Tick(id))?;
+            if id == 0 {
+                receiver.receive_wire(&wire[..length], Tick(1))?;
+                receiver.step(
+                    Tick(1),
+                    WorkBudget {
+                        field: 1024,
+                        copies: 1024,
+                        metadata: 1024,
+                    },
+                )?;
+            }
+        }
+        let feedback = receiver.pending_feedback().ok_or(Error::Busy)?;
+        assert_eq!(feedback.prefix, 1);
+        sender.admit_source(&[4, 0], Tick(10), Tick(10))?;
+        Ok((sender, feedback))
+    };
+    for (early, equal_tick) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (mut sender, feedback) = setup()?;
+        let original_cap = sender.deadline();
+        if early {
+            sender.receive_feedback_at(
+                feedback,
+                Tick(if equal_tick { 12 } else { 11 }),
+                Tick(15),
+            )?;
+        }
+        sender.confirm_output_at(OutputId::Source(SourceId(4)), Tick(12), Tick(15))?;
+        if !early {
+            sender.receive_feedback_at(
+                feedback,
+                Tick(if equal_tick { 12 } else { 13 }),
+                Tick(15),
+            )?;
+        }
+        finish(&mut sender, Tick(15), 1024)?;
+        let Output::Repair(repair) = sender.pending_output().ok_or(Error::Busy)? else {
+            return Err("real earned repair missing".into());
+        };
+        assert_eq!(repair.confirmed, if early { 1 } else { 0 });
+        assert_eq!(sender.status().sent_sources, 5);
+        assert_eq!(sender.deadline(), original_cap);
+        assert_eq!(
+            sender.step(Tick(14), WorkBudget::default()),
+            Err(Error::TimeRegression)
+        );
+    }
+    let (mut sender, feedback) = setup()?;
+    sender.receive_feedback_at(feedback, Tick(11), Tick(15))?;
+    let cap = sender.deadline().ok_or(Error::Expired)?;
+    assert_eq!(
+        sender.confirm_output_at(OutputId::Source(SourceId(4)), Tick(12), cap),
+        Err(Error::Expired)
+    );
+    assert_eq!(sender.status().sent_sources, 5);
+    assert!(sender.pending_output().is_none());
+    assert!(
+        sender
+            .confirm_output_at(OutputId::Source(SourceId(4)), Tick(12), cap)
+            .is_err()
+    );
+    let mut unsent = Sender::new(accumulator(), scope(), Tick(0))?;
+    unsent.admit_source(&[0, 0], Tick(0), Tick(0))?;
+    assert_eq!(
+        unsent.receive_feedback_at(feedback, Tick(1), Tick(1)),
+        Err(Error::Identity)
+    );
+    assert_eq!(unsent.status().sent_sources, 0);
+    Ok(())
+}

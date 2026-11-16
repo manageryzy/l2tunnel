@@ -87,6 +87,8 @@ pub(super) fn reserved(
                 present: std::mem::take(&mut construction.present),
                 buffer: std::mem::take(&mut construction.buffer),
                 first_received: 0,
+                latest_received: 0,
+                latest_order: None,
                 deadline: 0,
             },
         });
@@ -146,6 +148,7 @@ impl PendingStore {
         parsed: &ParsedFragment<'_>,
         first_received: u64,
         deadline: u64,
+        order: Option<super::CausalTime>,
     ) -> Result<(), FragmentError> {
         match self {
             Self::Legacy(values) => {
@@ -156,6 +159,8 @@ impl PendingStore {
                     present: vec![0; usize::from(parsed.count)],
                     buffer: vec![0; parsed.length],
                     first_received,
+                    latest_received: first_received,
+                    latest_order: order,
                     deadline,
                 };
                 write_fragment(&mut pending, parsed)?;
@@ -179,6 +184,8 @@ impl PendingStore {
                 slot.pending.count = parsed.count;
                 slot.pending.received = 1;
                 slot.pending.first_received = first_received;
+                slot.pending.latest_received = first_received;
+                slot.pending.latest_order = order;
                 slot.pending.deadline = deadline;
                 write_fragment(&mut slot.pending, parsed)?;
                 slot.message = Some(parsed.message);

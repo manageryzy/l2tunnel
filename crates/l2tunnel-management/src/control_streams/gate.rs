@@ -187,7 +187,7 @@ impl Gate {
                 Stream::Transaction,
                 Body::Management(_)
                 | Body::ProfileControl {
-                    tag: ProfileTag::SwiftPolicyV1,
+                    tag: ProfileTag::SwiftPolicyV1 | ProfileTag::SlotReuseV1,
                     ..
                 },
             ) => {

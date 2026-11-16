@@ -19,12 +19,16 @@ use tokio::{
     sync::{Notify, watch},
     time::Instant,
 };
+#[cfg(unix)]
+mod connection_reuse;
 mod prepared;
 #[cfg(unix)]
 pub use prepared::SWIFT_LISTEN;
 pub use prepared::{Attachment, Client, Options, Prepared, Server};
 #[cfg(unix)]
 mod common_local;
+#[cfg(unix)]
+mod common_reuse_local;
 mod owner;
 mod proxy_backend;
 #[cfg(unix)]
@@ -120,6 +124,19 @@ pub enum Completed {
         configuration: l2tunnel::record_configuration::Configuration,
         /// Confirmed epoch or definitive runtime refusal.
         outcome: Result<l2tunnel_core::Epoch, l2tunnel_runtime::secure_udp::transport::SwitchError>,
+    },
+    /// Exact result of the selected reuse protocol on this same runtime owner.
+    #[cfg(unix)]
+    ConnectionReuse {
+        /// Original bounded owner/flow request retained for exact replay.
+        request: local::ConnectionReuseRequest,
+        /// Original actual service generation owning this runtime request.
+        generation: u64,
+        /// Actual protocol confirmation/refusal; no timeout implies rollback.
+        outcome: Result<
+            l2tunnel_runtime::secure_udp::transport::ConnectionReuseOutcome,
+            l2tunnel_runtime::secure_udp::transport::ConnectionReuseError,
+        >,
     },
     /// Setup was explicitly cancelled before becoming live.
     Cancelled,
@@ -602,6 +619,8 @@ enum Fingerprint {
     Transaction(l2tunnel::swift_configuration::Configuration),
     #[cfg(unix)]
     Common(l2tunnel::record_configuration::Configuration),
+    #[cfg(unix)]
+    ConnectionReuse(local::ConnectionReuseRequest),
 }
 impl Fingerprint {
     fn is_apply(&self) -> bool {
@@ -611,6 +630,8 @@ impl Fingerprint {
             Self::Transaction(_) => true,
             #[cfg(unix)]
             Self::Common(_) => true,
+            #[cfg(unix)]
+            Self::ConnectionReuse(_) => true,
             _ => false,
         }
     }
@@ -625,6 +646,8 @@ impl Fingerprint {
             (Self::Transaction(a), Self::Transaction(b)) => a == b,
             #[cfg(unix)]
             (Self::Common(a), Self::Common(b)) => a == b,
+            #[cfg(unix)]
+            (Self::ConnectionReuse(a), Self::ConnectionReuse(b)) => a == b,
             _ => false,
         }
     }
@@ -648,6 +671,8 @@ enum Command {
     Transaction(l2tunnel::swift_configuration::Configuration),
     #[cfg(unix)]
     Common(l2tunnel::record_configuration::Configuration),
+    #[cfg(unix)]
+    ConnectionReuse(local::ConnectionReuseRequest),
 }
 struct Job {
     accepted: Accepted,
@@ -935,6 +960,12 @@ impl Handle {
                 .and_then(|contract| contract.resolve(*configuration))
                 .map_err(|_| SubmitError::InvalidConfiguration)?;
         }
+        #[cfg(unix)]
+        let reuse_timeout = if let Command::ConnectionReuse(request) = &command {
+            Some(connection_reuse::validate(&state, *request)?)
+        } else {
+            None
+        };
         // Each apply action belongs to one backend; any other pairing is
         // refused without consuming the key or sending anything.
         if let Command::Apply(request) = &command
@@ -978,6 +1009,12 @@ impl Handle {
             Command::Connect(p) | Command::Reconnect(p) => Some(
                 accepted_at
                     .checked_add(p.setup_timeout())
+                    .ok_or(SubmitError::Closed)?,
+            ),
+            #[cfg(unix)]
+            Command::ConnectionReuse(_) => Some(
+                accepted_at
+                    .checked_add(reuse_timeout.ok_or(SubmitError::State)?)
                     .ok_or(SubmitError::Closed)?,
             ),
             Command::Disconnect => match &state.backend {
@@ -1025,6 +1062,8 @@ impl Handle {
             Command::Transaction(_) => Phase::Applying,
             #[cfg(unix)]
             Command::Common(_) => Phase::Applying,
+            #[cfg(unix)]
+            Command::ConnectionReuse(_) => Phase::Applying,
             _ => Phase::Stopping,
         };
         state.queued = Some(Job { accepted, command });
@@ -1170,7 +1209,9 @@ impl Handle {
         #[cfg(unix)]
         if matches!(
             &request.action,
-            local::Action::SwitchCommonConfiguration { .. } | local::Action::CommonCatalog { .. }
+            local::Action::SwitchCommonConfiguration { .. }
+                | local::Action::CommonCatalog { .. }
+                | local::Action::ReuseConnection { .. }
         ) {
             let mut response = self.common_request(request).await;
             self.common_reply_key(&mut response);
@@ -1221,7 +1262,11 @@ impl Handle {
                 Some(_) => local::VERSION,
                 None => match &state.plan {
                     Some(plan)
-                        if matches!(&plan.data.transport, prepared::Transport::ProxyCommon(_)) =>
+                        if matches!(
+                            &plan.data.transport,
+                            prepared::Transport::ProxyCommon(_)
+                                | prepared::Transport::ProxyCommonRaw { .. }
+                        ) =>
                     {
                         local::VERSION
                     }

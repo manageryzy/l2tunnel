@@ -22,6 +22,7 @@ fn allocate_instance() -> Result<u64, Error> {
 
 mod config;
 mod copies;
+mod deferred_feedback;
 mod endpoint;
 mod ingress;
 mod native;

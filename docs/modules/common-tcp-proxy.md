@@ -37,9 +37,9 @@ The actual call chain is:
    `record_bank::Entry::enqueue_proxy_borrowed` -> the same reserved Pipeline ->
    Aligned/direct ARQ -> existing Common security and original UDP socket.
 5. Actual admission returns an Aligned record identity. The emitted original
-   `UnitWitness` must match that identity, index zero and count one. Only the
-   existing whole-carrier confirmation of that retained ciphertext can complete
-   the bridge writer. Enqueue, sealing, partial writes and WouldBlock do not flush.
+   `UnitWitness` must match that identity and the maintained unit count/index.
+   Only whole-carrier receipts for every unique actual unit can complete the
+   bridge writer; the implemented multi-unit correction preserves the old one-unit path. Enqueue, sealing, partial writes and WouldBlock do not flush.
 6. Common's existing authenticated management/liveness owners continue independently
    of the bounded user stream. Peer data traverses the existing Common receiver,
    then the record port and the same proxy reader/Table. A user record never
@@ -47,8 +47,8 @@ The actual call chain is:
 
 The narrow selection requires full duplex, TUN, fixed credit, one actor/Common
 channel, one immutable catalog descriptor, Aligned raw bodies, no native header
-coding, no independent short path, no FEC repairs and exactly one coding unit per
-proxy frame. The actor already arbitrates original flows; Common supplies one
+coding, no independent short path and no FEC repairs. The implemented multi-unit
+correction uses the existing bounded Aligned fragmentation per proxy frame. The actor already arbitrates original flows; Common supplies one
 bounded aggregate ordered-record queue and actual wire accounting. A typed flow
 namespace distinguishes this queue from native IP/Ethernet classification. No
 synthetic IP header or privileged Ethernet identifier is used.
@@ -275,3 +275,61 @@ or repeat the dependency's TCP pressure/measurement/final-source loss matrix.
 PCOM-06 and every other original PCOM definition remain unchanged and open where
 not separately qualified. Broader carriers, paired Half, channels/catalogs,
 failure/reconnect/native/platform/resource/performance gates remain required.
+
+
+## Implemented original raw Full proxy composition
+
+The [source-bound raw follow-up](../../work/parallel-features-20261115/tcp-staging/proxy-common-raw/handoff-v0.json)
+has finite shared-service evidence in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json). Explicit `Profile::new_proxy_raw` and
+`new_proxy_raw_retained`, with `Prepared::proxy_common_raw_client/server`, retain
+the actual original TLS/member, raw Full sequence/protection owner and subsequent
+Noise/member handoff. The same Common Driver/Records/Bank/Control, proxy
+Table/flow MUX, record Bridge and original setup/write/drain caps remain the
+actual owners. Public Info and offline requested policy create no authority.
+
+One shared preparation/readiness/actor-join implementation consumes either the
+existing genuine UDP Parts or genuine `RawInitialParts`; no UDP Parts, second TCP,
+recovery/controller or new crypto/default is introduced. The explicit raw proxy
+contract marker requires an actual raw Full contract. Native raw entrypoints
+continue to reject proxy traffic. Requested pre-TLS and effective post-proof
+configuration, actual original endpoints, liveness and physical accepted counters
+use the same API1 Proxy observation; raw proxy is never projected as native API4.
+
+Selected retained retirement preserves the existing final-source ACK, any held
+physical retry, real actor/native/fence/EOF/child-join prerequisites and original
+cap. Initial physical acceptance or local Engine drain alone cannot publish clean
+peer closure. Setup cancellation and terminal failure use the same service Run,
+active generation and owned release/unknown-outcome semantics. Old constructors,
+canonical bytes and retained/default choices remain unchanged.
+
+- [x] [PCOM-04a] Execute the explicit fixed/full/one-channel/direct-ARQ raw proxy shared-service slice using the actual TLS-to-raw/Noise/member factory, exact bidirectional native TCP bytes, same original tuples and physical receipts, independent Common liveness, retained retirement and observed owned release. The first focused run refused its invalid native MTU1024 before setup; that failed receipt is preserved. The necessary multi-unit correction and actual shared-service case pass root validation: owned injected PacketIo uses explicit physical MTU1500/native MTU1280/opaque maximum1600/symbol1024 and the maintained Aligned fragmentation. It must not be reported as kernel raw/TUN, every proxy fragmentation variant, Half, measured, other-family, native-window or complete PCOM-04 qualification. Evidence: [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+
+The maintained raw MTU1500 and proxy native MTU1280 minimum guards remain
+unchanged. The failed compact fixture could not satisfy both; no scalar limit
+was loosened. The correction uses each actual Aligned `UnitWitness` and the same
+Bridge slot's fixed65,535-unit bitmap. It releases a writer/all-user ordinal only
+after every unique unit has an actual physical receipt. Duplicate indices do not
+change its count/times/cap, and foreign/conflicting grammar is refused. Aggregate
+acceptance/observation are the maxima of actual unit facts; matching late facts
+remain retained without flush success. Final EOF remains one real unit bound to
+its maintained ARQ SourceId and the existing peer-confirmed retirement proof.
+
+The actual `Mutex<State>` extent, including inline Pending/bitmap/optional receipt
+and retirement metadata, is exposed as `common_bridge_metadata_bytes` and counted
+once in selected fixed and measured component bounds. Writer/watch/actor copies
+are separate; no second payload queue, recovery owner or allocator guarantee is
+introduced. Existing payload/scalar limits and canonical policy bytes stay
+unchanged. Complete PCOM-03/04 multi-profile, multi-channel and fragmentation
+acceptance remains open. The source-bound correction and two focused Bridge
+cases are [source-bound](../../work/parallel-features-20261115/tcp-staging/proxy-common-raw-units-v2/handoff-v2.json).
+All complete PCOM-02..09, paired Half, other carriers/record families, SW-11/all47,
+native/platform/resource/performance requirements retain their original scope.
+
+The v2 receipt correction evaluates Common/record confirmation and
+original cap/expiry eligibility before any successful Bridge publication. A
+rejected callback latches its actual bounded error category first, then retains
+the immutable unique-unit fact without releasing a writer or all-user ordinal.
+The original Driver error/stop reason keeps its precedence, including an earlier
+Common cap while the Bridge's own stall cap is still healthy. The focused Bridge
+and actual raw shared-service cases pass in the [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json);
+the prior v1 handoff remains preserved.

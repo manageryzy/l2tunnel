@@ -116,12 +116,8 @@ fn explicit_proxy_records_retain_actual_queue_timing_and_reject_native_admission
 }
 
 #[test]
-fn proxy_profile_refuses_unordered_fec_fragmenting_and_unselected_paths() -> TestResult {
-    for config in [
-        configuration(2, 0, 96)?,
-        configuration(1, 1, 96)?,
-        configuration(1, 0, 123)?,
-    ] {
+fn proxy_profile_refuses_unordered_fec_and_unselected_paths() -> TestResult {
+    for config in [configuration(2, 0, 96)?, configuration(1, 1, 96)?] {
         assert!(matches!(
             Engine::new_functional(
                 config,
@@ -134,6 +130,10 @@ fn proxy_profile_refuses_unordered_fec_fragmenting_and_unselected_paths() -> Tes
             Err(Error::Unsupported(Capability::TcpProxy))
         ));
     }
+    let mut fragmented = reserved(configuration(1, 0, 123)?, Role::Client)?;
+    assert!(fragmented.proxy_records());
+    fragmented.enqueue_proxy_borrowed(Tick(0), Tick(0), &[7; 123], Tick(100_000))?;
+    assert!(fragmented.admit_borrowed(Tick(1))?.is_some());
     let mut native = reserved(fixture(Family::Aligned, true)?, Role::Client)?;
     assert_eq!(
         native.enqueue_proxy_borrowed(Tick(0), Tick(0), b"opaque", Tick(100)),

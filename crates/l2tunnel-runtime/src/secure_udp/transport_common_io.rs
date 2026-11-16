@@ -155,6 +155,14 @@ impl Driver {
         result
     }
     pub(super) fn can_admit_common_native(&self) -> io::Result<bool> {
+        if self
+            .common
+            .as_ref()
+            .and_then(|r| r.reuse_controller())
+            .is_some_and(super::common_reuse::Controller::active)
+        {
+            return Ok(false);
+        }
         let state = self.common_state()?;
         let engine = state.engine(core::Epoch(self.source_scope.epoch.0))?;
         let policy = engine
@@ -238,6 +246,10 @@ impl Driver {
             .max_native();
         if length == 0 || length > maximum || length > output.len() {
             self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
+            return Ok(true);
+        }
+        if self.reject_retired_connection_native(epoch, &output[..length])? {
+            self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(true);
         }
         let connection_cap = if self.connection_scope(self.source_scope)? {
@@ -697,15 +709,13 @@ impl Driver {
                 .ok_or_else(|| protocol("common sealed capacity"))?
                 .copy_from_slice(&self.buffers.wire[..sealed.bytes]);
             let proxy_record = runtime.proxy_bridge.as_ref().and_then(|bridge| {
-                bridge.pending_identity().filter(|identity| {
-                    runtime
-                        .witnesses
-                        .iter()
-                        .take(emission.witnesses)
-                        .any(|unit| {
-                            unit.identity == *identity && unit.index == 0 && unit.count == 1
-                        })
-                })
+                let identity = bridge.pending_identity()?;
+                runtime
+                    .witnesses
+                    .iter()
+                    .take(emission.witnesses)
+                    .find(|unit| unit.identity == identity)
+                    .copied()
             });
             if proxy_record.is_some() {
                 let (_, cap) = runtime
@@ -715,10 +725,13 @@ impl Driver {
                     .timing()?;
                 deadline = deadline.min(clock(self.origin, cap)?);
             }
-            if let Some(identity) = proxy_record
+            if let Some(unit) = proxy_record
                 && let Some(bridge) = &runtime.proxy_bridge
-                && bridge.final_identity()? == Some(identity)
+                && bridge.final_identity()? == Some(unit.identity)
             {
+                if unit.index != 0 || unit.count != 1 {
+                    return Err(protocol("Common final EOF is not one actual unit"));
+                }
                 let owner::DataOwner::Common(state) = &self.owner else {
                     return Err(protocol("Common final record lost actual Bank"));
                 };
@@ -727,7 +740,7 @@ impl Driver {
                     .proxy_output_source(&self.buffers.frame[..emission.bytes])
                     .map_err(protocol)?
                     .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
-                bridge.bind_final_source(identity, source)?;
+                bridge.bind_final_source(unit.identity, source)?;
             }
             runtime.sealed = Some(common::PendingWire {
                 proxy_record,
@@ -774,7 +787,13 @@ impl Driver {
                     .checked_add(duration(pending.deadline))
                     .ok_or_else(exhausted)?,
             };
-            match socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])? {
+            let ordering = self.research_physical_output(pending.scope)?;
+            let progress = if ordering {
+                socket.try_user_held(identity, &runtime.wire[..pending.sealed.bytes])?
+            } else {
+                socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])?
+            };
+            match progress {
                 carrier::SendProgress::Pending => Ok(false),
                 carrier::SendProgress::Whole { receipt, late } => {
                     self.complete_common_carrier(identity, receipt, late, &mut sample)
@@ -834,36 +853,63 @@ impl Driver {
         let accepted = clock(self.origin, receipt.accepted_at);
         let at = completed.as_ref().copied().unwrap_or(u64::MAX);
         let physical_at = accepted.as_ref().copied().unwrap_or(u64::MAX);
+        let early_feedback = self.research_feedback_before_receipt(
+            pending.scope,
+            pending.sealed.number.0,
+            receipt.accepted_at,
+            physical_at,
+            at,
+        );
         let confirmation = self.confirm_common_output(
             pending.scope,
             at,
             physical_at,
+            self.causal_time(receipt.accepted_at).ok(),
             pending.carrier,
             pending.fragment,
         );
-        completed?;
-        accepted?;
-        confirmation?;
-        if late
-            || receipt.accepted_at >= receipt.deadline
-            || observed >= receipt.deadline
-            || at >= pending.deadline
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "whole carrier write crossed original cap",
-            ));
-        }
-        if !self.check_expiry(at)? {
+        // Evaluate semantic eligibility once in its original precedence before
+        // a last-unit receipt is allowed to release the independent Bridge.
+        let eligibility = (|| {
+            completed?;
+            accepted?;
+            confirmation?;
+            early_feedback?;
+            if late
+                || receipt.accepted_at >= receipt.deadline
+                || observed >= receipt.deadline
+                || at >= pending.deadline
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "whole carrier write crossed original cap",
+                ));
+            }
+            self.check_expiry(at)
+        })();
+        let rejected = eligibility.as_ref().err().map(io::Error::kind).or_else(|| {
+            matches!(&eligibility, Ok(false)).then(|| proxy_stopped_kind(self.terminal))
+        });
+        // Preserve the real fact even after an earlier error, but latch that
+        // error first so this call cannot publish successful flush/ordinal.
+        let proxy_completion = (|| {
+            if let Some(unit) = pending.proxy_record {
+                let bridge = self
+                    .common
+                    .as_ref()
+                    .and_then(|runtime| runtime.proxy_bridge.as_ref())
+                    .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?;
+                if let Some(kind) = rejected {
+                    bridge.reject_completion(kind)?;
+                }
+                bridge.complete_unit(unit, receipt.accepted_at, observed)?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        if !eligibility? {
             return Ok(false);
         }
-        if let Some(identity) = pending.proxy_record {
-            self.common
-                .as_ref()
-                .and_then(|runtime| runtime.proxy_bridge.as_ref())
-                .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?
-                .complete(identity, receipt.accepted_at, observed)?;
-        }
+        proxy_completion?;
         self.retry_common_feedback(at)?;
         Ok(true)
     }
@@ -937,33 +983,49 @@ impl Driver {
                     pending.scope,
                     completed,
                     completed,
+                    None,
                     pending.carrier,
                     pending.fragment,
                 );
-                // Whole physical ownership is permanent even if the post-write
-                // sample or original cap makes the connection terminal.
-                sampled?;
-                confirmation?;
-                if completed >= pending.deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "whole Common write crossed its original cap",
-                    ));
-                }
-                if !self.check_expiry(completed)? {
+                let physical_time = sampled.as_ref().ok().copied();
+                let eligibility = (|| {
+                    sampled?;
+                    confirmation?;
+                    if completed >= pending.deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "whole Common write crossed its original cap",
+                        ));
+                    }
+                    self.check_expiry(completed)
+                })();
+                let rejected = eligibility.as_ref().err().map(io::Error::kind).or_else(|| {
+                    matches!(&eligibility, Ok(false)).then(|| proxy_stopped_kind(self.terminal))
+                });
+                let proxy_completion = (|| {
+                    if let Some(unit) = pending.proxy_record {
+                        let bridge = self
+                            .common
+                            .as_ref()
+                            .and_then(|runtime| runtime.proxy_bridge.as_ref())
+                            .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?;
+                        if let Some(kind) = rejected {
+                            bridge.reject_completion(kind)?;
+                        }
+                        if let Some(physical_time) = physical_time {
+                            let accepted = self
+                                .origin
+                                .checked_add(duration(physical_time))
+                                .ok_or_else(exhausted)?;
+                            bridge.complete_unit(unit, accepted, accepted)?;
+                        }
+                    }
+                    Ok::<(), io::Error>(())
+                })();
+                if !eligibility? {
                     return Ok(false);
                 }
-                if let Some(identity) = pending.proxy_record {
-                    let accepted = self
-                        .origin
-                        .checked_add(duration(completed))
-                        .ok_or_else(exhausted)?;
-                    self.common
-                        .as_ref()
-                        .and_then(|runtime| runtime.proxy_bridge.as_ref())
-                        .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?
-                        .complete(identity, accepted, accepted)?;
-                }
+                proxy_completion?;
                 self.retry_common_feedback(completed)?;
                 Ok(true)
             }
@@ -995,16 +1057,29 @@ impl Driver {
         received: u64,
         now: u64,
     ) -> io::Result<()> {
+        let original = self
+            .origin
+            .checked_add(duration(received))
+            .ok_or_else(exhausted)?;
+        self.receive_common_user_observed(opened, received, now, original)
+    }
+    pub(super) fn receive_common_user_observed(
+        &mut self,
+        opened: record::Opened,
+        received: u64,
+        now: u64,
+        original: Instant,
+    ) -> io::Result<()> {
         self.retry_common_feedback(now)?;
         self.retry_common_connection_input(now)?;
-        if self.receive_common_fragment_at(opened, received, now)? {
+        if self.receive_common_fragment_at(opened, received, now, original)? {
             return Ok(());
         }
-        if self
-            .common
-            .as_ref()
-            .is_some_and(|runtime| runtime.pending_feedback.is_some())
-            && !self.connection_scope(opened.scope)?
+        if self.common.as_ref().is_some_and(|runtime| {
+            runtime
+                .pending_feedback
+                .is_some_and(|p| p.physical_dependency.is_none())
+        }) && !self.connection_scope(opened.scope)?
         {
             // Only one exact input is retained. Continue Control/Liveness reads;
             // additional lossy User packets cannot overwrite the retained ACK.
@@ -1098,7 +1173,26 @@ impl Driver {
                 else {
                     return Err(protocol("connection directional family mismatch"));
                 };
-                common_connections::classify(body, *send, *receive, self.info.role)?
+                {
+                    let (route, _) =
+                        l2tunnel::connection_records::route::decode(body).map_err(protocol)?;
+                    let actual = state
+                        .engine(epoch)?
+                        .connection_route_incarnation(route.owner.index())
+                        .map_err(protocol)?;
+                    if route.incarnation != actual {
+                        self.counters.rejected_packets =
+                            self.counters.rejected_packets.saturating_add(1);
+                        return Ok(());
+                    }
+                    common_connections::classify_incarnation(
+                        body,
+                        *send,
+                        *receive,
+                        self.info.role,
+                        actual,
+                    )?
+                }
             }
             configuration::DirectionProfile::Rolling { config, .. } => {
                 let recovery = config.scheduler.recovery;
@@ -1129,6 +1223,20 @@ impl Driver {
                 }
             }
         };
+        let staged_reader = reader.disposition == transaction::ReadDisposition::Staged;
+        let queued_rolling_input = self.config.rolling_ingress.is_some()
+            && matches!(
+                local.receive().profile(),
+                configuration::DirectionProfile::Rolling { .. }
+                    | configuration::DirectionProfile::Research { .. }
+            )
+            && kind != engine::EmissionKind::Feedback;
+        let width = usize::from(local.receive().channels());
+        if kind == engine::EmissionKind::Feedback
+            && self.retain_research_feedback(opened, received, now, original)?
+        {
+            return Ok(());
+        }
         if kind == engine::EmissionKind::Feedback
             && self
                 .common
@@ -1139,21 +1247,11 @@ impl Driver {
                 self.counters.native_backpressure_drops.saturating_add(1);
             return Ok(());
         }
-        if reader.disposition == transaction::ReadDisposition::Staged
-            && kind != engine::EmissionKind::Feedback
-        {
+        if staged_reader && kind != engine::EmissionKind::Feedback {
             return Err(protocol(
                 "staged common generation cannot admit native-producing data",
             ));
         }
-        let queued_rolling_input = self.config.rolling_ingress.is_some()
-            && matches!(
-                local.receive().profile(),
-                configuration::DirectionProfile::Rolling { .. }
-                    | configuration::DirectionProfile::Research { .. }
-            )
-            && kind != engine::EmissionKind::Feedback;
-        let width = usize::from(local.receive().channels());
         self.common
             .as_mut()
             .ok_or_else(|| protocol("common scan contract"))?
@@ -1249,6 +1347,16 @@ impl Driver {
         held_control: bool,
     ) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if let Some(state) = self
+            .common
+            .as_ref()
+            .and_then(|r| r.reuse_controller())
+            .filter(|r| r.active())
+        {
+            wake = wake
+                .min(state.deadline())
+                .min(add(now, self.config.work.receive_interval)?);
+        }
         if let Some(cap) = self
             .common
             .as_ref()
@@ -1570,6 +1678,8 @@ impl Driver {
             received,
             deadline,
             encoding: common_fragments::FeedbackEncoding::Record,
+            physical_dependency: None,
+            physical_arrival: None,
         });
         runtime.observation_dirty = true;
         Ok(())
@@ -1583,6 +1693,14 @@ impl Driver {
         else {
             return Ok(true);
         };
+        if let Some(dependency) = pending.physical_dependency
+            && let Some(output) = self.common.as_ref().and_then(|r| r.sealed.as_ref())
+        {
+            if output.scope != pending.scope || output.sealed.number.0 != dependency {
+                return Err(protocol("Research feedback physical dependency changed"));
+            }
+            return Ok(false);
+        }
         if !self.check_expiry(now)? {
             return Ok(false);
         }
@@ -1600,6 +1718,10 @@ impl Driver {
         if common_actions::common_scope(epoch, reader.config)? != pending.scope {
             return Err(protocol("retained feedback reader changed"));
         }
+        let order = pending
+            .physical_arrival
+            .map(|at| self.causal_time(at))
+            .transpose()?;
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("retained feedback Bank missing"));
         };
@@ -1621,16 +1743,27 @@ impl Driver {
                     bytes,
                 )
             }
-            common_fragments::FeedbackEncoding::Fragment => state
-                .entry(epoch)?
-                .accept_fragment_authenticated_until(
-                    engine::Tick(pending.received),
-                    engine::Tick(now),
-                    engine::Tick(pending.deadline),
-                    pending.number,
-                    bytes,
-                )
-                .map(|_| ()),
+            common_fragments::FeedbackEncoding::Fragment => {
+                let mut entry = state.entry(epoch)?;
+                match order {
+                    Some(order) => entry.accept_fragment_authenticated_ordered_until(
+                        engine::Tick(pending.received),
+                        engine::Tick(now),
+                        engine::Tick(pending.deadline),
+                        pending.number,
+                        order,
+                        bytes,
+                    ),
+                    None => entry.accept_fragment_authenticated_until(
+                        engine::Tick(pending.received),
+                        engine::Tick(now),
+                        engine::Tick(pending.deadline),
+                        pending.number,
+                        bytes,
+                    ),
+                }
+                .map(|_| ())
+            }
         };
         match result {
             Ok(()) => {
@@ -1646,5 +1779,22 @@ impl Driver {
             Err(error) if common_connections::feedback_awaiting_physical(&error) => Ok(false),
             Err(error) => Err(protocol(error)),
         }
+    }
+}
+
+// A stopped Driver cannot grant a successful Bridge completion. This projection
+// preserves the Driver's actual stop reason; it never changes that reason or cap.
+fn proxy_stopped_kind(reason: Option<StopReason>) -> io::ErrorKind {
+    match reason {
+        Some(StopReason::Io(kind)) => kind,
+        Some(
+            StopReason::LeaseExpired
+            | StopReason::PeerTimeout
+            | StopReason::NativeStall
+            | StopReason::PolicyTimeout,
+        ) => io::ErrorKind::TimedOut,
+        Some(StopReason::Protocol) => io::ErrorKind::InvalidData,
+        Some(StopReason::CounterExhausted) => io::ErrorKind::Other,
+        Some(StopReason::Cancelled) | None => io::ErrorKind::Interrupted,
     }
 }

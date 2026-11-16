@@ -10,6 +10,9 @@ use tokio::time::Instant;
 #[path = "common_measured.rs"]
 mod measured_profile;
 pub use measured_profile::{run_measured, validate_measured};
+#[path = "common_raw.rs"]
+mod raw_profile;
+pub use raw_profile::run_on_raw;
 
 /// Validate the finite fixed/full/one-channel composition before native I/O.
 /// Multi-channel and live generation/endpoint changes remain unsupported.
@@ -26,26 +29,45 @@ fn validate_binding(
     contract: &transport::CommonTransactionContract,
     binding: ConfigDigest,
 ) -> io::Result<()> {
-    if config.duplex != Duplex::Full
-        || config.mux.channels != 1
-        || contract.proxy_binding() != Some(binding)
-        || contract.catalog().descriptors().len() != 1
+    if contract.proxy_binding() != Some(binding) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Common proxy lacks its exact bound policy",
+        ));
+    }
+    validate_catalog(config, contract.catalog())
+}
+
+/// Validate the exact fixed actor/catalog capacities without creating authority.
+/// This pure preflight is shared by requested raw plans before original I/O and
+/// effective contracts after genuine member/outer authentication.
+pub fn validate_catalog(
+    config: &Config,
+    catalog: &l2tunnel::record_configuration::Catalog,
+) -> io::Result<()> {
+    let memory = config.validate()?;
+    memory
+        .payload_bytes
+        .checked_add(memory.common_bridge_metadata_bytes)
+        .filter(|bytes| *bytes <= 268_435_456)
+        .ok_or_else(|| invalid("Common proxy aggregate memory bound"))?;
+    if config.duplex != Duplex::Full || config.mux.channels != 1 || catalog.descriptors().len() != 1
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Common proxy requires bound full/one-channel policy",
+            "Common proxy requires full/one-channel policy",
         ));
     }
     let maximum = config
         .max_user()?
         .checked_add(48)
         .ok_or_else(|| invalid("proxy frame maximum"))?;
-    let initial = contract.initial();
+    let initial = catalog.initial();
     for role in [
         l2tunnel_management::Role::Client,
         l2tunnel_management::Role::Server,
     ] {
-        let direction = initial.descriptor().direction(role);
+        let direction = initial.direction(role);
         if direction.common().traffic().tcp != l2tunnel_core::traffic::TcpControl::SplitTcpProxy
             || direction.max_native() < maximum
         {
@@ -93,6 +115,54 @@ fn run_selected<D>(
 where
     D: PacketDevice<Error = io::Error> + Send,
 {
+    let info = parts.info;
+    let setup = parts.deadline;
+    run_selected_io(
+        device,
+        info,
+        setup,
+        contract,
+        config,
+        control,
+        measured_config,
+        move |port, bridge, contract, stopped| {
+            transport::run_common_proxy_records(
+                port,
+                bridge,
+                parts,
+                contract,
+                requests,
+                async move {
+                    let _ = stopped.await;
+                },
+                observe,
+            )
+        },
+    )
+}
+
+// Both call sites still transfer genuine member-owned Parts into the actual
+// Driver. Info is copied observation only and cannot create a root or I/O owner.
+#[allow(clippy::too_many_arguments)]
+fn run_selected_io<D, R>(
+    device: D,
+    info: member::Info,
+    setup: Instant,
+    contract: transport::CommonTransactionContract,
+    config: Config,
+    control: Control,
+    measured_config: Option<measured::Config>,
+    prepare_runtime: impl FnOnce(
+        super::common_bridge::RecordPort,
+        super::common_bridge::Bridge,
+        transport::CommonTransactionContract,
+        tokio::sync::oneshot::Receiver<()>,
+    ) -> R,
+) -> impl std::future::Future<Output = io::Result<CloseReport>> + Send
+where
+    D: PacketDevice<Error = io::Error> + Send,
+    R: std::future::Future<Output = io::Result<transport::CommonStopped>> + Send,
+{
     let prepared = (|| {
         let binding = if let Some(measured) = &measured_config {
             validate_measured(measured, &contract)?;
@@ -104,14 +174,12 @@ where
         if device.layer() != PacketLayer::Ip {
             return Err(invalid("Common proxy requires an IP attachment"));
         }
-        if Instant::now() >= parts.deadline {
+        if Instant::now() >= setup {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original Common proxy setup cap",
             ));
         }
-        let info = parts.info;
-        let setup = parts.deadline;
         let logical = info.binding.session.0;
         let maximum = contract
             .initial()
@@ -131,6 +199,9 @@ where
         } else {
             super::common_bridge::pair(maximum, contract.resources().native.stall_timeout)?
         };
+        if measured_config.is_some() {
+            bridge.enable_physical_receipts()?;
+        }
         let (reader, writer) = tokio::io::split(stream);
         let link = Link {
             inner: crate::Link {
@@ -148,22 +219,14 @@ where
             logical,
         };
         let readiness = measured_profile::Readiness::new(&control, measured_config.is_some())?;
-        Ok((port, bridge, link, readiness, setup, retained))
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        // Eager fallible Driver preparation finishes before the returned service
+        // future is polled; it starts no child task or physical packet I/O.
+        let runtime = prepare_runtime(port, bridge.clone(), contract, stopped);
+        Ok((bridge, link, readiness, setup, retained, stop, runtime))
     })();
     async move {
-        let (port, bridge, link, mut readiness, setup, retained) = prepared?;
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let runtime = transport::run_common_proxy_records(
-            port,
-            bridge.clone(),
-            parts,
-            contract,
-            requests,
-            async {
-                let _ = stopped.await;
-            },
-            observe,
-        );
+        let (bridge, link, mut readiness, setup, retained, stop, runtime) = prepared?;
         let actor = actor::run_profile_selected(
             device,
             link,

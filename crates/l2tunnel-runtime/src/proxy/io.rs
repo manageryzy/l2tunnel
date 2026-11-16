@@ -14,10 +14,30 @@ pub(super) enum Output {
     Control(ControlFrame),
     Close,
 }
+/// Exact local whole-frame fact; ordinal is bound before any Data bytes write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PhysicalWrite {
+    pub(crate) ordinal: Option<u64>,
+    pub(crate) generation: u64,
+    pub(crate) identity: l2tunnel_codec::aligned_receiver::RecordIdentity,
+    pub(crate) accepted_at: Instant,
+    pub(crate) observed_at: Instant,
+}
+/// Two actual unobserved all-user writes, not two measurement-only tokens.
+pub(super) const PHYSICAL_SLOTS: usize = 2;
+pub(super) fn physical_metadata_bytes() -> io::Result<usize> {
+    // Actual writer state, watch value and one actor observation copy.
+    let bytes = std::mem::size_of::<[Option<PhysicalWrite>; PHYSICAL_SLOTS]>()
+        .checked_mul(3)
+        .ok_or_else(|| invalid("physical progress metadata overflow"))?;
+    // The fixed Common bound already counts its entire Bridge metadata owner.
+    Ok(bytes)
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Progress {
     pub ready: bool,
     pub users: u64,
+    pub physical: [Option<PhysicalWrite>; PHYSICAL_SLOTS],
     pub quiesce: bool,
     pub barrier: Option<Fence>,
     pub ack: Option<Fence>,
@@ -149,7 +169,31 @@ pub(crate) fn control_interval(rate: usize) -> io::Result<Duration> {
     Ok(Duration::from_nanos(1_000_000_000_u64.div_ceil(rate)))
 }
 
+#[cfg(test)]
 pub(super) async fn writer<W: AsyncWrite + Unpin>(
+    stream: W,
+    direction: Direction,
+    control_rate: usize,
+    controls: mpsc::Receiver<Output>,
+    users: mpsc::Receiver<Vec<u8>>,
+    progress: watch::Sender<Progress>,
+    events: mpsc::Sender<Event>,
+) -> io::Result<()> {
+    writer_selected(
+        stream,
+        direction,
+        control_rate,
+        controls,
+        users,
+        progress,
+        events,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
     mut stream: W,
     direction: Direction,
     control_rate: usize,
@@ -157,6 +201,7 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
     mut users: mpsc::Receiver<Vec<u8>>,
     progress: watch::Sender<Progress>,
     events: mpsc::Sender<Event>,
+    receipts: Option<super::actor::CommonRetirement>,
 ) -> io::Result<()> {
     let mut sequence = 0u64;
     let mut state = Progress::default();
@@ -233,7 +278,14 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
                         &user,
                     )
                     .map_err(wire_error)?;
-                    write_frame(&mut stream, &bytes).await?;
+                    let ordinal = state
+                        .users
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("proxy user counter exhausted"))?;
+                    let physical =
+                        write_selected_frame(&mut stream, &bytes, receipts.as_ref(), Some(ordinal))
+                            .await?;
+                    publish_physical(&mut state, ordinal, physical)?;
                     sequence = sequence
                         .checked_add(1)
                         .ok_or_else(|| invalid("proxy sequence exhausted"))?;
@@ -264,15 +316,31 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
             &body,
         )
         .map_err(wire_error)?;
-        write_frame(&mut stream, &bytes).await?;
+        // Refuse exhaustion before a physical write can consume its Bridge fact.
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("proxy sequence exhausted"))?;
+        let ordinal = if control.is_none() {
+            Some(
+                state
+                    .users
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("proxy user counter exhausted"))?,
+            )
+        } else {
+            None
+        };
+        let physical =
+            write_selected_frame(&mut stream, &bytes, receipts.as_ref(), ordinal).await?;
+        if let Some(ordinal) = ordinal {
+            publish_physical(&mut state, ordinal, physical)?;
+        }
         if control.is_some() {
             control_due = Instant::now()
                 .checked_add(control_interval)
                 .ok_or_else(|| invalid("proxy control pacing deadline overflow"))?;
         }
-        sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("proxy sequence exhausted"))?;
+        sequence = next_sequence;
         match control {
             None => {
                 state.users = state
@@ -290,6 +358,41 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
         }
         progress.send_replace(state);
     }
+}
+fn publish_physical(
+    state: &mut Progress,
+    ordinal: u64,
+    receipt: Option<PhysicalWrite>,
+) -> io::Result<()> {
+    if let Some(receipt) = receipt {
+        if receipt.ordinal != Some(ordinal) {
+            return Err(invalid("proxy physical user provenance"));
+        }
+        let index =
+            usize::try_from((ordinal - 1) % PHYSICAL_SLOTS as u64).map_err(io::Error::other)?;
+        state.physical[index] = Some(receipt);
+    }
+    Ok(())
+}
+async fn write_selected_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    bytes: &[u8],
+    source: Option<&super::actor::CommonRetirement>,
+    ordinal: Option<u64>,
+) -> io::Result<Option<PhysicalWrite>> {
+    if let Some(source) = source
+        && let Some(ordinal) = ordinal
+    {
+        source.prepare_user_receipt(ordinal).await?;
+    }
+    write_frame(stream, bytes).await?;
+    let receipt = source
+        .map(|source| source.take_physical_receipt())
+        .transpose()?;
+    if receipt.is_some_and(|receipt| receipt.ordinal != ordinal) {
+        return Err(invalid("proxy frame physical provenance"));
+    }
+    Ok(receipt)
 }
 async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, bytes: &[u8]) -> io::Result<()> {
     stream

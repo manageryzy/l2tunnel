@@ -4,6 +4,22 @@ Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
 
+The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
+precise Research feedback/physical ordering on original carriers, legacy
+admission-time repair credit and actual source/repair batch packing, measured
+Common physical receipt retention, and fixed/full raw TCP proxy composition with
+bounded Aligned units. See [the closeout receipt](../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+Finite component and authenticated shared-service cases pass through preserved
+scoped continuations. Raw cases use owned injected PacketIo; they do not qualify
+kernel raw/TUN behavior. The required batch check and remaining stages are retained,
+including 1,658 simulator passes. Its existing standalone OpenVPN impaired-close
+failure remains open; no pristine full-suite result is claimed. Default-stack
+construction and new fixture errors were repaired without renewing original caps.
+The legacy 21-row oracle stops before physical completion, so its complete
+feedback differential remains LAA-03. Full PCOR/PCO/PBA/RRP/PCOM, all47, SW-11,
+native/platform/resource/performance gates retain their complete definitions.
+Prior numbered checkpoint descriptions below retain their historical scope.
+
 The Batch15 checkpoint integrates the existing measured TCP proxy controller
 through retained Common original UDP and its explicit CLI/API1 presenter, bounded
 Windows foreground status/disconnect/reconnect, and pure legacy sliding/hybrid

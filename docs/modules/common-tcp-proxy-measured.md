@@ -3,8 +3,9 @@
 Status: implemented finite composition with current root integration evidence
 (PCOM-02a) in [Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
 External results below remain separately source-bound. Full
-PCOM-02 remains open for exact per-token physical timestamp retention, native
-ACK/window qualification and the remaining complete acceptance requirements.
+PCOM-02 remains open: exact per-token physical timestamp retention is now
+implemented and its corrected finite cases pass in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json). Native
+ACK/window qualification and the remaining complete acceptance requirements stay open.
 The earlier fixed Common and measured TLS results are separate evidence.
 
 ## Selection and actual call chain
@@ -47,9 +48,11 @@ The production path is:
    acquire measurement or Common management authority.
 
 The finite selection is full duplex, TUN, one actor/Common channel, one immutable
-catalog descriptor and uncompressed Aligned raw bodies with direct ARQ and one
-coding unit per record. Native header codecs, independent short paths, FEC repairs
-and fragments remain unsupported. Common uses the existing typed aggregate
+catalog descriptor and uncompressed Aligned raw bodies with direct ARQ. The same
+Bridge now supports existing bounded Aligned fragmentation; the new raw service
+case qualifies only its fixed/full MTU1500/native1280/opaque1600/symbol1024 slice.
+Native header codecs, independent short paths, FEC and all broader profile and
+fragmentation acceptance remain open. Common uses the existing typed aggregate
 ordered-record flow; the actor still arbitrates original flows. It does not wrap
 the records in fabricated native IP/Ethernet packets or install another TCP,
 measurement, authentication or recovery state machine.
@@ -68,10 +71,13 @@ The [existing ledger](../../crates/l2tunnel-runtime/src/proxy/measured/ledger.rs
 retains each opaque `OutputId`, immutable canonical body, channel and all-user
 ordinal. The single bulk writer advances cumulative `Progress.users` only after
 complete framing and flush, including the branch that drains queued users ahead
-of Quiesce. Common bridge flush requires the admitted record's exact
-`UnitWitness` identity, index zero and count one, followed by the actual whole
-retained-ciphertext receipt. Enqueue, sealing, partial writes, WouldBlock and ARQ
-retries cannot advance that writer ordinal.
+of Quiesce. Common flush requires the admitted record identity and physical
+receipts for every unique actual Aligned unit. One whole-record/all-user fact
+uses the maximum actual acceptance and observation timestamps. Duplicate units
+cannot advance counts, timestamps, caps or writer ordinals. Semantic failure or
+an earlier Common cap is latched before retaining the matching physical fact;
+that fact cannot authorize a successful flush or measurement callback. Enqueue,
+sealing, partial writes, WouldBlock and ARQ retries are not whole-record completion.
 
 The actor validates cumulative progress against handed ordinals, invokes each
 retained token's callback once and frees it only after Controller success.
@@ -81,10 +87,11 @@ checks original expiry first and supplies fresh actor time to
 `Controller::confirm_written`. A receipt observed too late remains a failure;
 backdating the callback to socket acceptance must not bypass that watermark.
 
-The physical receipt carries independent acceptance and observation times, which
-the bridge checks against its original first-write cap. Those exact times are
-currently discarded after completion; they are not retained for each measurement
-token. `ProxyCommonFrame.socket_accepted_packets` and
+The earlier finite baseline checked independent physical acceptance and
+observation times against the original Bridge first-write cap, then discarded them.
+The current implementation retains exact per-token facts through callbacks and
+terminal ordering, with passing finite component cases in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
+`ProxyCommonFrame.socket_accepted_packets` and
 `socket_accepted_ip_bytes` are bounded cumulative facts from the actual Common
 carrier counters across scopes. They include more than measurement traffic and
 are neither per-token receipts nor peer ACK, native delivery or application
@@ -217,3 +224,62 @@ two denied unwraps in imported retirement tests and two new style warnings;
 those were repaired without weakening lint settings. No full-workspace check,
 `tools/check.py`, kernel TUN lab, Windows/Android build, device or performance
 qualification was run; those gates remain with the coordinator.
+
+
+## Implemented exact physical callback provenance
+
+The [source-bound timestamp change](../../work/parallel-features-20261115/tcp-staging/measured-common-physical/handoff-v0.json)
+and its [terminal-order correction](../../work/parallel-features-20261115/tcp-staging/measured-common-physical/correction-v2/handoff-v2.json)
+are integrated implementation. Original MUX admission, actual Common acceptance,
+physical observation and fresh actor callback Instants remain separate. The
+maintained Controller receives current actor time; earlier physical acceptance
+cannot backdate or bypass original expiry. Protocol bytes, crypto, TCP state,
+native window and selection/default identities are unchanged.
+
+The actual Bridge Pending retains a matching immutable physical fact even when
+an original failure was already latched, then returns that original error without
+successful flush or release. A fixed two-all-Data fact ring and checked high
+watermark remain in the same Bridge across Stream-to-watch transfer. Terminal
+actor import atomically reads that ring under the existing mutex even when the
+original cleanup cap is already expired and cannot await writer joins. It does
+not renew the cap, infer release or run a successful Controller callback.
+
+The existing writer binds each all-Data ordinal before writing. Every actor Data
+handoff, including a nonmeasurement None-token handoff, reserves one of the two
+Ledger Flight cells. The Bridge refuses a third unacknowledged Data start before
+any bytes write. Control has no all-Data ordinal and uses no receipt-ring cell.
+The checked next outer sequence is preflighted before the physical write too.
+These are local custody facts, never peer ACK or native delivery authority.
+
+Successful callback processing imports one consistent copied watch watermark
+before expiry/release. Each measurement Entry retains the exact physical fact
+through bounded callback work and subsequent ring reuse. Only a successful
+fresh-time Controller callback frees that token. Snapshot retains at most two
+recent successful callback views with token, flow/channel, ordinal, original
+admission, actual Common generation/record and all three observation times.
+This is a bounded current view, not an archival receipt log; cloned OutputIds
+retain no backend/control ownership.
+
+Actual Entry/State/Snapshot layouts account for added metadata. The fixed
+component reports the exact `Mutex<State>` Bridge extent once, including its
+Pending unit bitmap and optional receipt/retirement storage. Measured totals add
+that extent once, with writer/watch/actor copies counted separately. This is a
+conservative component allowance on Unix even for unselected TLS; it does not
+claim that TLS allocated a Common Bridge. No second payload queue or receipt
+heap is introduced. Arc bookkeeping, allocator/RSS and complete resource
+qualification remain outside this subtotal.
+
+The two focused cases were executed in the
+[first closeout check](../../work/parallel-features-20261115/closeout-batch-check-1/validation.json),
+which remains failed. Both stopped with Record(Time) before the new receipt
+assertions: the fixture constructed a fresh Controller at zero after its actual
+Table had advanced. A [test-only explicit-clock correction](../../work/parallel-features-20261115/tcp-staging/measured-common-physical/clock-fixture-v1/handoff-v1.json)
+preserves the original actor clock, receipt times, caps and assertions; its
+two corrected cases now pass in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json). The failed first attempt is preserved.
+
+The cases cover coalesced all-Data provenance with intervening nonmeasurement
+traffic, callback pressure, wrong-ordinal refusal and once-only callbacks; and
+terminal-first Bridge expiry plus exact fact import without a prerequisite writer
+join at an already expired cap. Physical I/O/authentication is injected in these
+component fixtures. Actual authenticated service evidence remains separate.
+Full PCOM-02/03/09 and native/platform/resource/performance gates remain open.

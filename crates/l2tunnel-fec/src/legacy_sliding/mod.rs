@@ -10,6 +10,8 @@ pub use rolling::{
     Begin, DecodeStep, Error, RepairId, Scope, SourceId, Tick, WorkBudget, WorkUsed,
 };
 
+pub mod batch;
+pub mod batch_wire;
 mod receiver;
 mod sender;
 pub mod storage;

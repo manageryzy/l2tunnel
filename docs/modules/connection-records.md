@@ -206,3 +206,55 @@ PCO-05/06 and full PBA-03/all47 remain required and open regardless of the finit
 component tests. Native8192/P, full resource totals, platform and performance gates
 are unchanged. This module does not implement endpoint CUBIC/window ownership in
 transparent TUN or claim exact serialized Python wire parity.
+
+
+## Selected SlotReuseV1 composition
+
+The additive implementation is source-bound in
+[the ignored source binding](../../work/parallel-features-20261115/tcp-staging/connection-reuse/handoff-v0.json).
+Finite protocol/runtime/shared-service checks pass in [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json);
+PCOR-03 and PCO-05/06 remain open.
+`Profile::new_with_connection_reuse` explicitly commits grammar/version, bounded
+history and immutable retry/operation policy into H0; legacy constructors/canonical
+tag8 bytes remain unchanged. The same authenticated reliable Transaction stream
+carries opaque STOP totals, actual crossed native fences, closed installation,
+peer installation and activation/done messages. Reuse creates no data epoch,
+replacement Engine, recovery owner, device queue or key exchange. A live reuse
+and ordinary epoch switch are explicitly serialized; SW-11 remains required.
+
+The initiator keeps its original accepted local cap; the responder freezes its
+first authenticated arrival plus the immutable duration in its own clock domain.
+No absolute peer time is compared locally and no retry renews a cap. Existing
+old source, feedback, raw, deferred input and native writes remain serviceable
+while fresh native admission conservatively pauses. Installation retires exactly
+the old Pipeline/passive-ACK binding, preinstalls the explicit next key while
+closed, and advances only that slot's incarnation. Source/native/raw counters and
+the actual reserved endpoint survive. Physical acceptance alone is not reliable
+peer delivery. Late old routes and retired native keys cannot silently reclaim
+that owner. Partial post-retirement installation errors fail closed.
+
+Exactly32 completed tombstones retain full operation identity, old key and
+the actual confirmed semantic reply. Exhaustion rejects before STOP. Current
+exact duplicate phase replies use the same Control owner before the original cap;
+expired or older completed operations cannot reopen admission or gain a new cap.
+Actual runtime status exposes the local original operation/phase/result, and
+`flow_reuse` is availability of the authenticated installed controller with an
+actual per-connection Engine. Pure Engine/collection observation alone remains
+false; availability is not delayed until first exercise. Completed provenance is
+retained honestly across later ordinary mode epochs.
+
+The supported first path is Full/TUN over original authenticated UDP with both
+actual peers already claiming the old native flow. Two focused pure composition
+cases and the actual shared-service consumer pass root validation. Full carrier/layer/platform/resource/native/performance and all
+original PCOR-03/PCO-05/06/PBA acceptance remain open.
+
+The runtime installs one fallible `StateCell<Installed>` only when explicitly
+selected, after checked total memory admission. Its actual payload contains the
+controller and all32 tombstones; that payload is charged once in external bytes.
+The Driver already charges the cell header. Unselected profiles allocate none of
+this payload. Actual status distinguishes selected reserved bytes/allocation from
+incomplete whole-service resource qualification.
+
+The [shared-service API4](connection-reuse-service.md) uses the same runtime owner
+and original accepted cap. Root [closeout evidence](../../work/parallel-features-20261115/parallel-closeout-scoped-validation.json) preserves the failed attempts
+and passing continuations; these finite cases do not qualify native behavior.

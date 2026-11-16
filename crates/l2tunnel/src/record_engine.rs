@@ -22,9 +22,8 @@ pub mod storage;
 
 mod affinity;
 mod connection_ingress;
-// Await actual selected-control provenance before exposing flow reuse.
-#[allow(dead_code)]
-mod connection_reuse;
+/// Same-owner retirement driven by opaque authenticated selected commands.
+pub mod connection_reuse;
 mod connections;
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
@@ -721,6 +720,11 @@ impl Engine {
             Err(Error::Connections(error)) if error.is_backpressure() => {
                 Err(Error::Connections(error))
             }
+            // A delayed authenticated route from an old incarnation is rejected
+            // before nested mutation; it cannot poison the current flow owner.
+            Err(Error::Connections(crate::connection_records::Error::Incarnation)) => Err(
+                Error::Connections(crate::connection_records::Error::Incarnation),
+            ),
             Err(error) => self.fail(error),
         }
     }

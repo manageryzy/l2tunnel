@@ -47,13 +47,14 @@ pub(in crate::service::owner) async fn establish(
 
 // Separate authentication polling from runtime construction. Their large owned
 // setup/Engine scratch values must not occupy the same service poll stack.
-struct Authenticated {
-    effective: Arc<crate::secure_udp::common_transaction_profile::Profile>,
-    parts: member::raw_carrier::RawInitialParts<PacketOwner>,
-    contract: transport::CommonTransactionContract,
+pub(in crate::service::owner) struct Authenticated {
+    pub(in crate::service::owner) effective:
+        Arc<crate::secure_udp::common_transaction_profile::Profile>,
+    pub(in crate::service::owner) parts: member::raw_carrier::RawInitialParts<PacketOwner>,
+    pub(in crate::service::owner) contract: transport::CommonTransactionContract,
 }
 
-fn authenticate<'a>(
+pub(in crate::service::owner) fn authenticate<'a>(
     shared: &'a Arc<Shared>,
     plan: &'a Prepared,
     accepted: Accepted,

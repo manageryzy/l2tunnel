@@ -160,6 +160,15 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             proxy::common(&shared, &plan, accepted, deadline, profile)
         ),
+        #[cfg(unix)]
+        Transport::ProxyCommonRaw {
+            profile,
+            raw,
+            opener,
+        } => selected!(
+            deadline,
+            proxy::raw::common(&shared, &plan, accepted, deadline, profile, raw, opener)
+        ),
         Transport::UdpFrame { settings, delivery } => selected!(
             deadline,
             establish_udp(&shared, &plan, accepted, deadline, settings, delivery)
@@ -732,22 +741,22 @@ async fn establish_secure_udp_transaction(
     });
     let sink = backend.clone();
     let changed = shared.clone();
+    let running = transport::run_transaction(
+        device,
+        parts,
+        contract,
+        Some(requests),
+        std::future::pending::<()>(),
+        move |snapshot| {
+            *sink
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+            changed.changed();
+        },
+    );
     let mut runtime: RunFuture = Box::pin(async move {
-        let stopped = transport::run_transaction(
-            device,
-            parts,
-            contract,
-            Some(requests),
-            std::future::pending::<()>(),
-            move |snapshot| {
-                *sink
-                    .counters
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
-                changed.changed();
-            },
-        )
-        .await?;
+        let stopped = running.await?;
         Err(secure_udp_termination(stopped.reason))
     });
     setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
@@ -1138,6 +1147,35 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     };
                     let backend = backend.clone();
                     let apply = common::apply(&backend, configuration);
+                    tokio::pin!(apply);
+                    let result = tokio::select! {
+                        result = &mut apply => result,
+                        result = &mut session.runtime => {
+                            let failure = Failure {
+                                kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()),
+                            };
+                            stopped(&shared, &mut active, Terminal::Failed(failure));
+                            Completed::OutcomeUnknown
+                        }
+                    };
+                    finish(&shared, accepted.operation, result);
+                }
+                #[cfg(unix)]
+                Command::ConnectionReuse(request) => {
+                    let Some(session) = active.as_mut() else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let ObservedBackend::SecureUdpCommon(backend) = &session.backend else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let backend = backend.clone();
+                    let Some(deadline) = accepted.deadline else {
+                        finish(&shared, accepted.operation, Completed::OutcomeUnknown);
+                        continue;
+                    };
+                    let apply = connection_reuse::apply(&backend, request, deadline);
                     tokio::pin!(apply);
                     let result = tokio::select! {
                         result = &mut apply => result,

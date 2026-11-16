@@ -139,11 +139,24 @@ impl Driver {
         )))
     }
 
+    #[cfg(test)]
     pub(super) fn new_transaction(
         parts: member::Parts,
         contract: TransactionContract,
         origin: Instant,
     ) -> io::Result<(tokio::net::UdpSocket, Self)> {
+        Self::new_transaction_with(parts, contract, origin, false, |socket, driver| {
+            Ok((socket, driver))
+        })
+    }
+
+    pub(super) fn new_transaction_with<T>(
+        parts: member::Parts,
+        contract: TransactionContract,
+        origin: Instant,
+        driver_cell: bool,
+        finish: impl FnOnce(tokio::net::UdpSocket, Self) -> io::Result<T>,
+    ) -> io::Result<T> {
         if origin >= parts.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -226,6 +239,16 @@ impl Driver {
             contract.initial(),
             role,
         )?;
+        let plan = if driver_cell {
+            plan.with_driver_cell(contract.initial(), role)?
+        } else {
+            plan
+        };
+        let cell_header = if driver_cell {
+            std::mem::size_of::<owner::StateCell<Driver>>()
+        } else {
+            0
+        };
         let required_bytes = plan.required_bytes;
         let (control, buffers, native, inputs, external) =
             plan.provision(contract.settings().retained_bytes, |plan| {
@@ -295,7 +318,9 @@ impl Driver {
                     native.capacity_bytes(),
                     message_capacity,
                     wrapper_capacity,
-                )?;
+                )?
+                .checked_add(cell_header)
+                .ok_or_else(exhausted)?;
                 if external != plan.external_bytes {
                     return Err(protocol(
                         "actual generic external storage differs from its plan",
@@ -349,7 +374,7 @@ impl Driver {
             .report_interval
             .map(|interval| add(0, interval))
             .transpose()?;
-        Ok((
+        finish(
             parts.socket,
             Self {
                 config,
@@ -417,7 +442,7 @@ impl Driver {
                 next_report,
                 terminal: None,
             },
-        ))
+        )
     }
 
     pub(super) fn snapshot_transaction(

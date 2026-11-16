@@ -108,6 +108,7 @@ pub struct Sender {
     credit: u32,
     feedback: Option<Feedback>,
     feedback_at: Option<Tick>,
+    last_source_accepted: Option<Tick>,
     last: Tick,
     terminal: Option<Error>,
 }
@@ -157,6 +158,7 @@ impl Sender {
             credit: 0,
             feedback: None,
             feedback_at: None,
+            last_source_accepted: None,
             last: now,
             terminal: None,
         })
@@ -326,6 +328,9 @@ impl Sender {
         let causal = self.available_at.is_some_and(|at| at <= accepted)
             && accepted <= now
             && (!freezes_repair || self.feedback_at.is_none_or(|at| at <= accepted));
+        if matches!(id, OutputId::Source(_)) {
+            self.last_source_accepted = Some(accepted);
+        }
         let result = if causal {
             self.confirm_current(id, now)
         } else {
@@ -420,6 +425,21 @@ impl Sender {
         feedback: Feedback,
         now: Tick,
     ) -> Result<FeedbackDisposition, Error> {
+        self.receive_feedback_at(feedback, now, now)
+    }
+
+    /// Preserve the original authenticated arrival while advancing service time.
+    /// A fresh snapshot older than an already completed source cannot rewrite
+    /// its frozen support. The caller must merge those genuine events first.
+    pub fn receive_feedback_at(
+        &mut self,
+        feedback: Feedback,
+        received: Tick,
+        now: Tick,
+    ) -> Result<FeedbackDisposition, Error> {
+        if received > now {
+            return Err(Error::TimeRegression);
+        }
         feedback.validate(self.config)?;
         if feedback.scope != self.scope {
             return Err(Error::Scope);
@@ -446,11 +466,14 @@ impl Sender {
                 return Err(Error::Identity);
             }
         }
+        if self.last_source_accepted.is_some_and(|at| received < at) {
+            return self.fail(Error::TimeRegression);
+        }
         self.encoder
             .confirm_prefix(feedback.prefix, now)
             .or_else(|error| self.fail(error))?;
         self.feedback = Some(feedback);
-        self.feedback_at = Some(now);
+        self.feedback_at = Some(received);
         if feedback.prefix == self.encoder.status().next_source {
             self.debt_end = None;
         }
@@ -463,8 +486,17 @@ impl Sender {
         bytes: &[u8],
         now: Tick,
     ) -> Result<FeedbackDisposition, Error> {
+        self.receive_feedback_wire_at(bytes, now, now)
+    }
+    /// Parse exactly one authenticated receipt with its unchanged arrival time.
+    pub fn receive_feedback_wire_at(
+        &mut self,
+        bytes: &[u8],
+        received: Tick,
+        now: Tick,
+    ) -> Result<FeedbackDisposition, Error> {
         match wire::inspect(self.config, bytes)? {
-            wire::View::Feedback(feedback) => self.receive_feedback(feedback, now),
+            wire::View::Feedback(feedback) => self.receive_feedback_at(feedback, received, now),
             _ => Err(Error::Format),
         }
     }

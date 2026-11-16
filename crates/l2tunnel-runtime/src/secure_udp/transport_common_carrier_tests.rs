@@ -196,3 +196,6 @@ async fn actual_initial_only_openvpn_common_loop_delivers_both_directions_and_li
     }
     Ok(())
 }
+
+#[path = "transport_common_carrier_research_tests.rs"]
+mod research;

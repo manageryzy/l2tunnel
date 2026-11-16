@@ -174,6 +174,15 @@ async fn early_data_does_not_block_commitack_after_ready_follower_loses_first_ac
         client.record().ok_or("early record")?.bytes,
         b"early authenticated recovery"
     );
+    let arrival = client
+        .record()
+        .ok_or("actual authenticated raw input")?
+        .received_at;
+    let earliest = client
+        .earliest_authenticated_record_at()?
+        .ok_or("retained raw arrival")?;
+    assert!(earliest <= arrival);
+    assert_eq!(client.earliest_authenticated_record_at()?, Some(earliest));
     client.consume_record()?;
     client.abort();
     server.abort();

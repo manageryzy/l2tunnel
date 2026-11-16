@@ -21,12 +21,15 @@ pub enum ProfileTag {
     SwiftPolicyV1 = 1,
     /// Explicit v2 Lifecycle grammar; legacy and v1 stream gates reject it.
     SessionRefreshV1 = 2,
+    /// Explicit same-generation independent-owner reuse grammar v1.
+    SlotReuseV1 = 3,
 }
 impl ProfileTag {
     fn decode(value: u16) -> Result<Self, Error> {
         match value {
             1 => Ok(Self::SwiftPolicyV1),
             2 => Ok(Self::SessionRefreshV1),
+            3 => Ok(Self::SlotReuseV1),
             _ => Err(Error::ProfileTag),
         }
     }
@@ -284,10 +287,10 @@ impl<'a> Envelope<'a> {
                 }
             }
             6 => {
-                let maximum = if bytes.get(..2) == Some(&[0, 2]) {
-                    MAX_LIFECYCLE_BYTES
-                } else {
-                    MAX_PROFILE_CONTROL_BYTES
+                let maximum = match bytes.get(..2) {
+                    Some([0, 2]) => MAX_LIFECYCLE_BYTES,
+                    Some([0, 3]) => 288,
+                    _ => MAX_PROFILE_CONTROL_BYTES,
                 };
                 if bytes.len() <= 4 || bytes.len() > 4 + maximum {
                     return Err(Error::Length);
@@ -337,6 +340,7 @@ impl<'a> Envelope<'a> {
                         > match tag {
                             ProfileTag::SwiftPolicyV1 => MAX_PROFILE_CONTROL_BYTES,
                             ProfileTag::SessionRefreshV1 => MAX_LIFECYCLE_BYTES,
+                            ProfileTag::SlotReuseV1 => 288,
                         } =>
             {
                 return Err(Error::Length);

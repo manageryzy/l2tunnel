@@ -534,3 +534,6 @@ fn later_feedback_cannot_rewrite_delayed_source_completion_and_physical_token_re
     assert_eq!(a.storage_usage(), usage);
     Ok(())
 }
+
+#[path = "research_order_tests.rs"]
+mod precise_order;

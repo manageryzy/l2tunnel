@@ -54,6 +54,13 @@ impl Driver {
             let _ = reply.send(Err(SwitchError::Invalid));
             return Err(protocol("generic request on legacy runtime"));
         };
+        if runtime
+            .reuse_controller()
+            .is_some_and(super::common_reuse::Controller::active)
+        {
+            let _ = reply.send(Err(SwitchError::Busy));
+            return Ok(());
+        }
         if runtime.contract.proxy_binding().is_some() {
             // The initial proxy composition has no generation-handoff contract.
             let _ = reply.send(Err(SwitchError::Invalid));
@@ -218,7 +225,10 @@ impl Driver {
         }
         state.dispatch_preparations(
             &mut self.control,
-            runtime.contract.proxy_binding().is_none(),
+            runtime.contract.proxy_binding().is_none()
+                && !runtime
+                    .reuse_controller()
+                    .is_some_and(super::common_reuse::Controller::active),
             &mut sample,
         )?;
         Ok(())
@@ -248,6 +258,7 @@ impl Driver {
 
     fn progress_common_inner(&mut self, runtime: &mut common::Runtime, now: u64) -> io::Result<()> {
         self.observe_proxy_retirement(runtime)?;
+        self.progress_connection_reuse(runtime, now)?;
         self.validate_common_fence()?;
         self.service_common_state(now)?;
         if runtime.action.is_none() {

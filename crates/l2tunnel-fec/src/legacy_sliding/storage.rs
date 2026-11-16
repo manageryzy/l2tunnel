@@ -23,6 +23,20 @@ impl Plan {
             usage: Sender::requested_storage(config)?,
         })
     }
+    /// Plan the selected sender including its finite metadata-only unsent queue.
+    pub fn for_sender_admission(config: Config) -> Result<Self, Error> {
+        config.validate()?;
+        if Sender::memory_bound_admission(config)? > config.memory_bytes
+            || rolling::Encoder::explicit_memory_bound(config.recovery)?
+                > config.recovery.memory_bytes
+        {
+            return Err(Error::Capacity);
+        }
+        Ok(Self {
+            config,
+            usage: Sender::requested_storage_in(config, true)?,
+        })
+    }
     /// Plan all decoder banks, exact coefficient history and receipt buffers.
     pub fn for_receiver(config: Config) -> Result<Self, Error> {
         config.validate()?;

@@ -278,6 +278,15 @@ impl<T> Queue<T> {
     pub fn iter(&self) -> impl Iterator<Item = &Packet<T>> {
         self.ready.iter()
     }
+    /// Move the retained head to the tail without completing or copying it.
+    /// A caller may scan at most its initial length to service independent work.
+    pub fn rotate_front(&mut self) -> Result<(), Error> {
+        if self.ready.is_empty() {
+            return Err(Error::Invariant);
+        }
+        self.ready.rotate_left(1);
+        Ok(())
+    }
     /// Recycle exactly one complete packet after caller-observed physical acceptance.
     /// Every fallible accounting check precedes FIFO/free-pool mutation.
     pub fn complete_front(&mut self) -> Result<(), Error> {

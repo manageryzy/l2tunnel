@@ -175,6 +175,24 @@ pub(super) struct GateState {
     ranges: Ranges,
 }
 impl GateState {
+    pub(super) fn earliest_authenticated_upper_at(&self) -> Option<Instant> {
+        self.incoming
+            .iter()
+            .filter(|cell| matches!(cell.header.kind, wire::Kind::Data | wire::Kind::Feedback))
+            .map(|cell| cell.received_at)
+            .chain(
+                self.early
+                    .as_ref()
+                    .filter(|early| {
+                        matches!(
+                            early.cell.header.kind,
+                            wire::Kind::Data | wire::Kind::Feedback
+                        )
+                    })
+                    .map(|early| early.cell.received_at),
+            )
+            .min()
+    }
     fn new(config: Config, policy: PacketPolicy, deadline: Instant) -> Self {
         Self {
             config,

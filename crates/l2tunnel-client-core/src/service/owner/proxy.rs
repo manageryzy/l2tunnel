@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub(super) mod raw;
 use super::super::proxy_backend::Backend;
 use super::*;
 use l2tunnel_runtime::proxy as runtime;
@@ -347,25 +349,13 @@ pub(super) async fn common(
         Some(config) => runtime::measured::session_config(config)?.digest,
         None => runtime::session_config(&config)?.digest,
     };
-    let session =
-        authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
-    let info = session.info();
-    setup::stage(shared, accepted.operation, SetupStage::Configuration);
-    let contract = profile.runtime_contract(info.role)?;
-    let requested = profile.configuration()?;
-    let carrier = profile.establish_config(info.role)?.binding.carrier;
-    if info.peers != profile.peers()
-        || info.authenticated.configuration != requested.0
-        || info.authenticated.configuration != contract.expected_configuration().0
-        || info.authenticated.carrier != carrier
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "actual Common authentication differs from explicit proxy plan",
-        ));
-    }
-    check(deadline)?;
-    let parts = session.into_parts();
+    let CommonAuthenticated {
+        parts,
+        info,
+        contract,
+        requested,
+        carrier,
+    } = authenticate_common(shared, plan, accepted, deadline, &profile).await?;
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
     let device = plan.open()?;
     check(deadline)?;
@@ -442,5 +432,54 @@ pub(super) async fn common(
         runtime,
         backend: ObservedBackend::Proxy(backend),
         generation: accepted.operation,
+    })
+}
+
+// Release authentication polling and its large setup scratch before the same
+// eager Common/Engine constructor runs. No new Driver, task or protocol owner.
+#[cfg(unix)]
+struct CommonAuthenticated {
+    parts: l2tunnel_runtime::secure_udp::member::Parts,
+    info: l2tunnel_runtime::secure_udp::member::Info,
+    contract: l2tunnel_runtime::secure_udp::transport::CommonTransactionContract,
+    requested: l2tunnel_security::ConfigDigest,
+    carrier: [u8; 32],
+}
+
+#[cfg(unix)]
+fn authenticate_common<'a>(
+    shared: &'a Arc<Shared>,
+    plan: &'a Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    profile: &'a crate::secure_udp::common_transaction_profile::Profile,
+) -> Pin<Box<dyn std::future::Future<Output = io::Result<CommonAuthenticated>> + Send + 'a>> {
+    Box::pin(async move {
+        let session =
+            authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
+        let info = session.info();
+        setup::stage(shared, accepted.operation, SetupStage::Configuration);
+        let contract = profile.runtime_contract(info.role)?;
+        let requested = profile.configuration()?;
+        let carrier = profile.establish_config(info.role)?.binding.carrier;
+        if info.peers != profile.peers()
+            || info.authenticated.configuration != requested.0
+            || info.authenticated.configuration != contract.expected_configuration().0
+            || info.authenticated.carrier != carrier
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "actual Common authentication differs from explicit proxy plan",
+            ));
+        }
+        check(deadline)?;
+        let parts = session.into_parts();
+        Ok(CommonAuthenticated {
+            parts,
+            info,
+            contract,
+            requested,
+            carrier,
+        })
     })
 }

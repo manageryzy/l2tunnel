@@ -32,6 +32,7 @@ pub struct Profile {
     proxy_retirement: bool,
     // Keep an absent optional policy from enlarging every carrier setup future.
     proxy_measured: Option<Box<l2tunnel_runtime::proxy::measured::Config>>,
+    connection_reuse: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,6 +168,43 @@ impl Profile {
     pub const fn proxy_retirement(&self) -> bool {
         self.proxy_retirement
     }
+    /// Explicit immutable same-owner reuse selection; old constructors remain fixed-cohort.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_connection_reuse(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+    ) -> io::Result<Self> {
+        let mut hash = digest::Context::new(&digest::SHA256);
+        hash.update(b"l2tunnel/shared-client/slot-reuse/v1\0");
+        hash.update(&settings.application.0);
+        for value in [
+            3,
+            1,
+            32,
+            parameters.protocol.retry_ms,
+            parameters.max_operation_ms,
+        ] {
+            hash.update(&value.to_be_bytes());
+        }
+        settings.application = ConfigDigest(super::finish(hash));
+        let mut profile = Self::new(
+            connection, settings, peers, initiator, responder, catalog, parameters,
+        )?;
+        profile.connection_reuse = true;
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            profile.runtime_contract(role)?;
+        }
+        Ok(profile)
+    }
+    /// True only for the explicit immutable SlotReuseV1 contract selection.
+    pub const fn connection_reuse(&self) -> bool {
+        self.connection_reuse
+    }
     /// Exact fixed base policy for either proxy family; absent for transparent Common.
     pub fn proxy_config(&self) -> Option<&l2tunnel_runtime::proxy::Config> {
         self.proxy.as_ref()
@@ -184,18 +222,6 @@ impl Profile {
         proxy: Option<l2tunnel_runtime::proxy::Config>,
     ) -> io::Result<Self> {
         let base = connection.session()?;
-        if raw_policy.is_some()
-            && catalog
-                .descriptors()
-                .iter()
-                .any(|descriptor| matches!(descriptor.profile(), common::Profile::Research { .. }))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "research raw carriers require authenticated arrival/receipt ordering",
-            ));
-        }
-
         if initiator.rolling_fragments != responder.rolling_fragments {
             return Err(invalid(
                 "both roles must select the same complete directional fragment policy",
@@ -319,6 +345,7 @@ impl Profile {
             proxy,
             proxy_retirement: false,
             proxy_measured: None,
+            connection_reuse: false,
         };
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
@@ -365,7 +392,7 @@ impl Profile {
     /// Derive an effective plan only from a genuine completed outer proof.
     /// The original settings/catalog/resources remain retained and unchanged.
     pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
-        if self.proxy.is_some() {
+        if self.proxy.is_some() || self.connection_reuse {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "explicit Common proxy supports only its original protected UDP owner",
@@ -536,6 +563,14 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
         )?;
+        self.complete_proxy_contract(contract)
+    }
+    // Both callers already constructed their actual original carrier contract.
+    // This metadata cannot upgrade an observation into member/root authority.
+    fn complete_proxy_contract(
+        &self,
+        contract: transport::CommonTransactionContract,
+    ) -> io::Result<transport::CommonTransactionContract> {
         match &self.proxy {
             Some(proxy) => {
                 let digest = match &self.proxy_measured {
@@ -544,7 +579,11 @@ impl Profile {
                     }
                     None => l2tunnel_runtime::proxy::session_config(proxy)?.digest,
                 };
-                let mut contract = contract.with_proxy_binding(digest)?;
+                let mut contract = if self.raw.is_some() {
+                    contract.with_proxy_raw_binding(digest)?
+                } else {
+                    contract.with_proxy_binding(digest)?
+                };
                 if self.proxy_retirement {
                     contract = contract.with_proxy_retirement()?;
                 }
@@ -556,9 +595,16 @@ impl Profile {
                 }
                 Ok(contract)
             }
-            None => Ok(contract),
+            None => {
+                if self.connection_reuse {
+                    contract.with_connection_reuse()
+                } else {
+                    Ok(contract)
+                }
+            }
         }
     }
+
     fn carrier_contract(
         &self,
         binding: CarrierBinding,
@@ -595,11 +641,11 @@ fn carrier_catalog(catalog: &Catalog) -> io::Result<Catalog> {
 fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Descriptor> {
     let mut profile = *descriptor.profile();
     match &mut profile {
-        common::Profile::Research { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "research record carrier binding is not installed",
-            ));
+        common::Profile::Research { config, .. } => {
+            config.geometry.forward_overhead_bytes =
+                extra_byte(config.geometry.forward_overhead_bytes)?;
+            config.geometry.reverse_overhead_bytes =
+                extra_byte(config.geometry.reverse_overhead_bytes)?;
         }
         common::Profile::Swift { .. } => {}
         common::Profile::Aligned { forward, reverse } => {

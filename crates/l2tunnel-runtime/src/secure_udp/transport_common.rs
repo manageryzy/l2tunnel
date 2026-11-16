@@ -12,7 +12,7 @@ mod provision;
 #[path = "transport_common_proxy.rs"]
 mod proxy_records;
 pub use managed::run_common_on_carrier;
-pub(crate) use proxy_records::run_common_proxy_records;
+pub(crate) use proxy_records::{run_common_proxy_records, run_common_proxy_records_on_raw};
 #[path = "transport_common_raw.rs"]
 mod raw;
 pub use raw::run_common_on_raw;
@@ -97,6 +97,14 @@ pub struct CommonSnapshot {
     pub connections: Option<engine::ConnectionSnapshot>,
     /// Actual separate deferred raw input owner, not a reliable delivery ledger.
     pub connection_input: Option<ConnectionIngressSnapshot>,
+    /// Actual selected controller, distinct from finite qualification/capability.
+    pub connection_reuse_selected: bool,
+    /// Actual immutable operation/cap and current semantic progress.
+    pub connection_reuse: Option<super::common_reuse::ConnectionReuseSnapshot>,
+    /// Actual fixed selected reuse payload; included once in external capacity.
+    pub connection_reuse_reserved_bytes: usize,
+    /// Actual fixed reuse allocation count, separate from nested protocol totals.
+    pub connection_reuse_allocations: usize,
     /// Actual held native read awaiting typed ingress admission.
     pub pending_ingress_bytes: Option<usize>,
     /// First actual read time, not a TCP creation timestamp.
@@ -130,10 +138,15 @@ pub(super) type TransactionReply = oneshot::Sender<Result<core::Epoch, SwitchErr
 
 /// Shared producer of complete supported generic configurations.
 #[derive(Clone)]
-pub struct CommonControlHandle(mpsc::Sender<(C, TransactionReply)>);
+pub struct CommonControlHandle(pub(super) mpsc::Sender<Command>);
 
 /// Unique bounded complete-configuration request receiver.
-pub struct CommonControlRequests(pub(super) mpsc::Receiver<(C, TransactionReply)>);
+pub struct CommonControlRequests(pub(super) mpsc::Receiver<Command>);
+#[allow(clippy::large_enum_variant)] // The single bounded slot already owns the complete inline configuration.
+pub(super) enum Command {
+    Switch(C, TransactionReply),
+    Reuse(super::common_reuse::Request, super::common_reuse::Reply),
+}
 
 /// Allocate exactly one queued request; dropping a waiter never cancels custody.
 pub fn common_channel() -> (CommonControlHandle, CommonControlRequests) {
@@ -146,7 +159,7 @@ impl CommonControlHandle {
     pub async fn switch(&self, configuration: C) -> Result<core::Epoch, SwitchError> {
         let (sender, receiver) = oneshot::channel();
         self.0
-            .try_send((configuration, sender))
+            .try_send(Command::Switch(configuration, sender))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => SwitchError::Busy,
                 mpsc::error::TrySendError::Closed(_) => SwitchError::Closed,
@@ -169,13 +182,16 @@ pub(super) struct PendingWire {
     pub(super) deadline: u64,
     pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
     pub(super) fragment: Option<l2tunnel::record_bank::FragmentOutputToken>,
-    pub(super) proxy_record: Option<l2tunnel_codec::aligned_receiver::RecordIdentity>,
+    pub(super) proxy_record: Option<l2tunnel_codec::aligned_receiver::UnitWitness>,
 }
 // Created only after the sole Records opener commits this exact User record.
 // Public copied metadata cannot install or reconstruct this retained authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PendingFeedback {
     pub(super) encoding: common_fragments::FeedbackEncoding,
+    // Exact pending physical User number; Some only for causal Research input.
+    pub(super) physical_dependency: Option<u64>,
+    pub(super) physical_arrival: Option<Instant>,
     pub(super) scope: Scope,
     pub(super) number: u64,
     pub(super) bytes: usize,
@@ -193,6 +209,7 @@ pub(super) struct PendingIngress {
 }
 pub(super) struct Runtime {
     pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
+    pub(super) reuse_owner: Option<owner::StateCell<super::common_reuse::Installed>>,
     pub(super) contract: CommonTransactionContract,
     pub(super) action: Option<ActionWork>,
     pub(super) request: Option<PendingRequest>,
@@ -260,7 +277,7 @@ where
         mut driver,
         setup_deadline,
     } = prepared?;
-    match run_driver_clock(
+    let completion = run_driver_clock(
         device,
         socket,
         &mut driver,
@@ -274,11 +291,14 @@ where
         },
         Instant::now,
     )
-    .await?
-    {
-        SelectedStopped::Common(stopped) => Ok(stopped),
-        _ => Err(protocol("common loop returned another backend")),
+    .await?;
+    if driver.common.is_none() {
+        return Err(protocol("common loop returned another backend"));
     }
+    Ok(CommonStopped {
+        reason: completion.reason,
+        snapshot: driver.snapshot_common(completion.at, false)?,
+    })
 }
 
 struct PreparedRuntime<D, R: super::raw_carrier::RawBacking = super::raw_carrier::NoRaw> {
@@ -367,6 +387,15 @@ fn reserve_common_state(
         bank,
     )?;
     owner::ReservedCommonState::new(state)
+}
+
+// Keep final Driver scratch off the stack while the Bank constructs its actual
+// reserved Engines. This continuation starts only after reservation returns and
+// moves the same Driver into the caller's existing charged owner; it allocates
+// no temporary or durable owner and preserves the original construction order.
+#[inline(never)]
+fn assemble_common_driver<T>(assemble: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    assemble()
 }
 
 // Only actual accepted membership handoffs enter this shared constructor.
@@ -565,6 +594,11 @@ impl Driver {
             .ok_or_else(exhausted)?;
         // The State stores only the fallible Bank cell header. The actual Bank
         // (including both inline Engine extents) is charged by its own Plan.
+        let reuse_bytes = if contract.connection_reuse() {
+            super::common_reuse::Installed::capacity_bytes()?
+        } else {
+            0
+        };
         let external = std::mem::size_of::<Driver>()
             .checked_add(std::mem::size_of::<owner::StateCell<Driver>>())
             .and_then(|v| v.checked_add(std::mem::size_of::<transactions::CommonState>()))
@@ -579,6 +613,7 @@ impl Driver {
                         .map_or(0, |plan| plan.capacity_bytes()),
                 )
             })
+            .and_then(|v| v.checked_add(reuse_bytes))
             .and_then(|v| v.checked_add(message_bytes))
             .and_then(|v| v.checked_add(input.io_capacity))
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
@@ -615,6 +650,12 @@ impl Driver {
                 },
             ));
         }
+        // Allocate only after the complete external subtotal passed its admission.
+        let reuse_owner = if contract.connection_reuse() {
+            Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
+        } else {
+            None
+        };
         let control = plans.construct(config, binding, control_scope, data_scope, wrapper_plan)?;
         let buffers = buffers::Buffers::with_plan(buffer_plan)?;
         let inputs = buffers::Inputs::with_plan(input_plan)?;
@@ -664,110 +705,117 @@ impl Driver {
             control.transaction_binding()?,
             external,
         )?;
-        let reserve = contract.reserve()?;
-        let current = contract.initial();
-        let local_policy = current.descriptor().local(role);
-        let send_rate = local_policy.send().common().bytes_per_second();
-        let burst = local_policy.send().common().burst_bytes();
-        let lease = add(0, config.lifetime.lease)?;
-        origin
-            .checked_add(config.lifetime.lease)
-            .ok_or_else(|| invalid("generic lease exceeds runtime clock"))?;
-        let next_report = config
-            .report_interval
-            .map(|interval| add(0, interval))
-            .transpose()?;
-        // Complete ownership here. The carrier moves this same Driver into its
-        // existing cell without retaining additional inline Driver return slots
-        // in callers while the reserved Bank is being constructed.
-        finish(
-            companion,
-            Self {
-                config,
-                info: input.info,
-                cover: input.cover,
-                origin,
-                bootstrap: input.bootstrap,
-                joining: input.joining,
-                outer: input.next_outer,
-                records,
-                owner: owner::DataOwner::Common(owner),
-                generic: None,
-                common: Some(Runtime {
-                    proxy_bridge: None,
-                    contract,
-                    action: None,
-                    request: None,
-                    cursor: false,
-                    native_work: [0; 2],
-                    sealed: None,
-                    wire,
-                    pending_feedback: None,
-                    pending_ingress: None,
-                    feedback_input,
-                    connection_input,
-                    outcome: None,
-                    completion: None,
-                    observation_dirty: false,
-                    witnesses,
-                    sent: None,
-                    delivered: None,
-                    rolling_scheduler_steps: 0,
-                    rolling_work_used: [0; 3],
-                    fragment_data_drops: 0,
-                    fragment_feedback_drops: 0,
-                    path: SameFlowRecovery::default(),
-                }),
-                send: config.send,
-                receive: config.receive,
-                source_scope: data_scope,
-                feedback_scope: data_scope,
-                target: None,
-                transaction_origin: None,
-                resolved: None,
-                control,
-                policy_source: None,
-                policy_cap: None,
-                pending_outcome: None,
-                control_work: false,
-                waiting: None,
-                buffers,
-                inputs: Some(inputs),
-                envelope_rx: 1,
-                native: common_native::OutputQueue::Common(native),
-                // Inactive compatibility storage: width zero cannot authorize a
-                // Swift completion. Common uses its actual Engine tokens/counts.
-                written: NativeWritten {
-                    origin: NativeOrigin::new(&input.info, data_scope, records::Direction::Receive),
-                    channels: 0,
-                    counts: [0; swift::MAX_CHANNELS],
+        assemble_common_driver(move || {
+            let reserve = contract.reserve()?;
+            let current = contract.initial();
+            let local_policy = current.descriptor().local(role);
+            let send_rate = local_policy.send().common().bytes_per_second();
+            let burst = local_policy.send().common().burst_bytes();
+            let lease = add(0, config.lifetime.lease)?;
+            origin
+                .checked_add(config.lifetime.lease)
+                .ok_or_else(|| invalid("generic lease exceeds runtime clock"))?;
+            let next_report = config
+                .report_interval
+                .map(|interval| add(0, interval))
+                .transpose()?;
+            // Complete ownership here. The carrier moves this same Driver into its
+            // existing cell without retaining additional inline Driver return slots
+            // in callers while the reserved Bank is being constructed.
+            finish(
+                companion,
+                Self {
+                    config,
+                    info: input.info,
+                    cover: input.cover,
+                    origin,
+                    bootstrap: input.bootstrap,
+                    joining: input.joining,
+                    outer: input.next_outer,
+                    records,
+                    owner: owner::DataOwner::Common(owner),
+                    generic: None,
+                    common: Some(Runtime {
+                        proxy_bridge: None,
+                        reuse_owner,
+                        contract,
+                        action: None,
+                        request: None,
+                        cursor: false,
+                        native_work: [0; 2],
+                        sealed: None,
+                        wire,
+                        pending_feedback: None,
+                        pending_ingress: None,
+                        feedback_input,
+                        connection_input,
+                        outcome: None,
+                        completion: None,
+                        observation_dirty: false,
+                        witnesses,
+                        sent: None,
+                        delivered: None,
+                        rolling_scheduler_steps: 0,
+                        rolling_work_used: [0; 3],
+                        fragment_data_drops: 0,
+                        fragment_feedback_drops: 0,
+                        path: SameFlowRecovery::default(),
+                    }),
+                    send: config.send,
+                    receive: config.receive,
+                    source_scope: data_scope,
+                    feedback_scope: data_scope,
+                    target: None,
+                    transaction_origin: None,
+                    resolved: None,
+                    control,
+                    policy_source: None,
+                    policy_cap: None,
+                    pending_outcome: None,
+                    control_work: false,
+                    waiting: None,
+                    buffers,
+                    inputs: Some(inputs),
+                    envelope_rx: 1,
+                    native: common_native::OutputQueue::Common(native),
+                    // Inactive compatibility storage: width zero cannot authorize a
+                    // Swift completion. Common uses its actual Engine tokens/counts.
+                    written: NativeWritten {
+                        origin: NativeOrigin::new(
+                            &input.info,
+                            data_scope,
+                            records::Direction::Receive,
+                        ),
+                        channels: 0,
+                        counts: [0; swift::MAX_CHANNELS],
+                    },
+                    retired_send: None,
+                    retired_receive: None,
+                    bucket: Bucket::new(send_rate, burst),
+                    reserve,
+                    ip,
+                    ingress: IngressBudget {
+                        left: config.work.receive_packets,
+                        refill: add(0, config.work.receive_interval)?,
+                    },
+                    counters: Counters {
+                        loop_input_capacity_bytes: input_capacity,
+                        ..Counters::default()
+                    },
+                    performance: performance::State::default(),
+                    live: Liveness::default(),
+                    challenge: None,
+                    pong: None,
+                    pong_deadline: None,
+                    remote_ping: 0,
+                    next_nonce: 1,
+                    next_ping: add(0, config.lifetime.ping_interval)?,
+                    lease,
+                    next_report,
+                    terminal: None,
                 },
-                retired_send: None,
-                retired_receive: None,
-                bucket: Bucket::new(send_rate, burst),
-                reserve,
-                ip,
-                ingress: IngressBudget {
-                    left: config.work.receive_packets,
-                    refill: add(0, config.work.receive_interval)?,
-                },
-                counters: Counters {
-                    loop_input_capacity_bytes: input_capacity,
-                    ..Counters::default()
-                },
-                performance: performance::State::default(),
-                live: Liveness::default(),
-                challenge: None,
-                pong: None,
-                pong_deadline: None,
-                remote_ping: 0,
-                next_nonce: 1,
-                next_ping: add(0, config.lifetime.ping_interval)?,
-                lease,
-                next_report,
-                terminal: None,
-            },
-        )
+            )
+        })
     }
 
     pub(super) fn snapshot_common(&self, now: u64, running: bool) -> io::Result<CommonSnapshot> {
@@ -817,7 +865,20 @@ impl Driver {
             fragment_data_drops: runtime.fragment_data_drops,
             fragment_feedback_drops: runtime.fragment_feedback_drops,
             ack_ingress: state.engine(state.epoch())?.ingress_snapshot(),
-            connections: state.engine(state.epoch())?.connection_snapshot(),
+            connections: state
+                .engine(state.epoch())?
+                .connection_snapshot()
+                .map(|mut actual| {
+                    actual.flow_reuse = runtime.contract.connection_reuse();
+                    actual
+                }),
+            connection_reuse_selected: runtime.contract.connection_reuse(),
+            connection_reuse: runtime.reuse_controller().map(|state| state.snapshot()),
+            connection_reuse_reserved_bytes: runtime
+                .reuse_owner
+                .as_ref()
+                .map_or(Ok(0), |_| super::common_reuse::Installed::capacity_bytes())?,
+            connection_reuse_allocations: usize::from(runtime.reuse_owner.is_some()),
             connection_input: runtime
                 .connection_input
                 .as_ref()
@@ -834,5 +895,13 @@ impl Driver {
             path_recovery: runtime.path,
             terminal: self.terminal,
         })
+    }
+}
+
+impl Runtime {
+    pub(super) fn reuse_controller(&self) -> Option<&super::common_reuse::Controller> {
+        self.reuse_owner
+            .as_ref()
+            .and_then(|owner| owner.controller())
     }
 }

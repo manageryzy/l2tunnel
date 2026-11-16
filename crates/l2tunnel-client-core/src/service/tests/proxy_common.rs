@@ -5,7 +5,7 @@ use super::*;
 fn fixture(hosts: &[Arc<Host>; 2]) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
     fixture_selected(hosts, false)
 }
-fn fixture_selected(
+pub(super) fn fixture_selected(
     hosts: &[Arc<Host>; 2],
     retained_close: bool,
 ) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
@@ -172,7 +172,7 @@ fn fixture_profile(
     let [a, b] = plans;
     Ok(([convert(a)?, convert(b)?], profile))
 }
-fn proxy_frame(handle: &Handle) -> Result<ProxyFrame> {
+pub(super) fn proxy_frame(handle: &Handle) -> Result<ProxyFrame> {
     handle
         .snapshot()
         .runtime
@@ -355,7 +355,14 @@ async fn actual_common_proxy_shared_service_retains_bytes_liveness_and_release()
 
 // Independent maintained native endpoints drive the real packet attachment.
 // This is test orchestration only; production still owns exactly one proxy Table.
-async fn exchange_native_tcp(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> Result {
+pub(super) async fn exchange_native_tcp(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> Result {
+    exchange_native_tcp_mtu(hosts, handles, 1280).await
+}
+pub(super) async fn exchange_native_tcp_mtu(
+    hosts: &[Arc<Host>; 2],
+    handles: &[Handle; 2],
+    mtu: usize,
+) -> Result {
     use l2tunnel_raw_tcp::{Error as TcpError, ReadOutcome, TcpEngine};
     use l2tunnel_tcp_proxy::{Millis, Role as TcpRole, TcpIpConfig};
     let local: std::net::SocketAddr = ([10, 112, 0, 1], 32001).into();
@@ -365,7 +372,7 @@ async fn exchange_native_tcp(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> R
             TcpIpConfig {
                 local: if server { peer } else { local },
                 peer: if server { local } else { peer },
-                mtu: 1280,
+                mtu,
                 send_bytes: 4096,
                 receive_bytes: 4096,
                 packet_slots: 8,

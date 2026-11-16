@@ -22,15 +22,85 @@ pub struct LeaseSettings {
     pub transaction_epoch: u64,
 }
 
+/// Disjoint semantic identity within the same authenticated management session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+    /// Existing whole-generation configuration transaction.
+    ModeSwitch,
+    /// Explicit same-generation independent-owner retirement grammar v1.
+    SlotReuseV1,
+}
+
 /// Opaque original operation identity, retained even after local retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Operation {
     identity: Identity,
+    kind: OperationKind,
     ticket: Ticket,
     origin: session_control::Scope,
     expires: Tick,
 }
 impl Operation {
+    /// Exact operation grammar; a slot command cannot alias a mode transaction.
+    pub const fn kind(self) -> OperationKind {
+        self.kind
+    }
+    /// Construct a bounded selected-control identity, without authenticating input.
+    /// Only an actual authenticated command gateway may use peer-supplied values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn slot_reuse(
+        identity: Identity,
+        origin: crate::session_control::Scope,
+        attempt: u64,
+        target: l2tunnel_core::ConfigDigest,
+        now: Tick,
+        expires: Tick,
+        session_expires: Tick,
+        maximum_ms: u64,
+    ) -> Result<Self, Error> {
+        if identity.session.0 == [0; 16]
+            || origin.epoch.0 == 0
+            || attempt == 0
+            || maximum_ms == 0
+            || expires <= now
+            || expires > session_expires
+            || expires
+                .0
+                .checked_sub(now.0)
+                .is_none_or(|remaining| remaining > maximum_ms)
+        {
+            return Err(Error::LeaseExpired);
+        }
+        Ok(Self {
+            identity,
+            kind: OperationKind::SlotReuseV1,
+            ticket: Ticket {
+                attempt,
+                epoch: origin.epoch,
+                digest: target,
+            },
+            origin,
+            expires,
+        })
+    }
+
+    /// Counterpart identity of this exact selected operation, with unchanged cap.
+    /// This is not peer authentication or a peer installation receipt.
+    pub fn mirror_slot_reuse(self) -> Result<Self, Error> {
+        if self.kind != OperationKind::SlotReuseV1 {
+            return Err(Error::LeaseRequired);
+        }
+        let id = self.identity;
+        Ok(Self {
+            identity: Identity {
+                role: opposite(id.role),
+                local: id.remote,
+                remote: id.local,
+                ..id
+            },
+            ..self
+        })
+    }
     /// Full authenticated session, role, lane and logical endpoints.
     pub fn identity(self) -> Identity {
         self.identity
@@ -506,6 +576,7 @@ impl<C: Configuration> Peer<C> {
         let expires = lease.candidate.ok_or(Error::LeaseRequired)?;
         lease.operation = Some(Operation {
             identity: self.identity,
+            kind: OperationKind::ModeSwitch,
             ticket,
             origin,
             expires,

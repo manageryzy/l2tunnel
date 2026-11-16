@@ -126,6 +126,7 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn receive_feedback(
         sender: &mut Self::Sender,
         bytes: &[u8],
+        received: rolling::Tick,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error>;
     fn feedback(receiver: &Self::Receiver) -> Option<scheduler::FeedbackId>;
@@ -357,6 +358,7 @@ impl RecoveryPolicy for scheduler::Policy {
     fn receive_feedback(
         s: &mut Self::Sender,
         b: &[u8],
+        _received: rolling::Tick,
         n: rolling::Tick,
     ) -> Result<(), rolling::Error> {
         s.receive_feedback_wire(b, n).map(|_| ())
@@ -642,9 +644,10 @@ impl RecoveryPolicy for research::Config {
     fn receive_feedback(
         s: &mut Self::Sender,
         b: &[u8],
+        received: rolling::Tick,
         n: rolling::Tick,
     ) -> Result<(), rolling::Error> {
-        s.receive_feedback_wire(b, n).map(|_| ())
+        s.receive_feedback_wire_at(b, received, n).map(|_| ())
     }
     fn feedback(r: &Self::Receiver) -> Option<scheduler::FeedbackId> {
         r.pending_feedback().map(|f| f.id)

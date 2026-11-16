@@ -12,6 +12,9 @@ struct Probe {
     syns: AtomicUsize,
     dropped: AtomicUsize,
     io_polls: AtomicUsize,
+    blocked: std::sync::atomic::AtomicBool,
+    blocked_attempts: AtomicUsize,
+    held: std::sync::Mutex<Option<Vec<u8>>>,
 }
 struct Link {
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -34,6 +37,23 @@ impl PacketIo for Link {
     }
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.probe.io_polls.fetch_add(1, Ordering::SeqCst);
+        let mut held = self
+            .probe
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(original) = held.as_ref() {
+            assert_eq!(original.as_slice(), bytes);
+        }
+        if self.probe.blocked.load(Ordering::SeqCst) {
+            if held.is_none() {
+                *held = Some(bytes.to_vec());
+            }
+            self.probe.blocked_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        held.take();
+        drop(held);
         self.outgoing
             .try_send(bytes.to_vec())
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
@@ -485,3 +505,9 @@ mod reconnect;
 
 #[path = "secure_udp_common_raw_setup_cap.rs"]
 mod setup_cap;
+
+#[path = "secure_udp_common_raw_research.rs"]
+mod research;
+
+#[path = "proxy_common_raw.rs"]
+mod proxy_common;

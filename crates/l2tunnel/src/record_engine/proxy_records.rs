@@ -36,10 +36,6 @@ pub(super) fn supported(configuration: &configuration::Configuration) -> bool {
             && !body.predictive
             && !body.timestamp_pair_dictionary
             && body.independent_short_frame_bytes == 0
-            && body
-                .max_frame_bytes
-                .checked_add(6)
-                .is_some_and(|length| length <= body.symbol_bytes)
     })
 }
 

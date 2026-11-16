@@ -176,8 +176,9 @@ async fn case(kind: cover::Appearance, blocked: bool, native_input: bool) -> Res
         tokio::try_join!(runtime, producer)
     })
     .await??;
-    let SelectedStopped::Legacy(stopped) = stopped else {
-        return Err("fairness loop returned a different selected backend".into());
+    let stopped = Stopped {
+        reason: stopped.reason,
+        snapshot: local.snapshot(stopped.at, false)?,
     };
     assert_eq!(stopped.reason, StopReason::Cancelled);
     assert!(!stopped.snapshot.running);

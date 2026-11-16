@@ -212,6 +212,10 @@ pub struct MemoryBound {
     pub payload_bytes: usize,
     /// Finite queue/table metadata entries.
     pub metadata_slots: usize,
+    /// Actual selected Common Bridge metadata owner, including its bounded unit
+    /// receipt bitmap. This is separate from payload credit and counted once;
+    /// Arc bookkeeping, TLS and allocator overhead remain outside this extent.
+    pub common_bridge_metadata_bytes: usize,
 }
 impl Config {
     /// Conservative finite initial policy; no route is implicitly authorized.
@@ -431,6 +435,16 @@ impl Config {
             .ok_or_else(|| invalid("proxy aggregate memory bound"))?;
         Ok(MemoryBound {
             payload_bytes: bound,
+            common_bridge_metadata_bytes: {
+                #[cfg(unix)]
+                {
+                    super::common_bridge::Bridge::metadata_bytes()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            },
             metadata_slots: self.mux.max_flow_bindings * 4
                 + self.mux.queue_records * 4
                 + self.relay.max_policies

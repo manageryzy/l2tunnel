@@ -203,6 +203,32 @@ impl Collection {
             serial,
         })
     }
+    /// Actual monotonic whole-native totals; this observation is not a fence.
+    pub(crate) fn retirement_counts(&self, token: &Retirement) -> Result<(u64, u64), Error> {
+        self.retirement_state(token)?;
+        let slot = self.slot(token.owner)?;
+        Ok((slot.admitted_native, slot.written_native))
+    }
+    /// Reserve the exact next flow while the actual slot remains admission-closed.
+    pub(crate) fn install_reuse_named(
+        &mut self,
+        now: Duration,
+        token: &Retirement,
+        next: crate::packet::FlowKey,
+    ) -> Result<Installed, Error> {
+        let state = self.retirement_state(token)?;
+        if state.key == next {
+            return Err(Error::RetirementConflict);
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if index != usize::from(token.owner.index()) && slot.claim == Some(next) {
+                return Err(Error::Binding);
+            }
+        }
+        let installed = self.install_reuse(now, token)?;
+        self.slot_mut(token.owner)?.claim = Some(next);
+        Ok(installed)
+    }
     /// Snapshot actual whole-native counters only after this owner's actual drain.
     pub(crate) fn retirement_fence(
         &self,
@@ -333,3 +359,24 @@ impl Collection {
 #[cfg(test)]
 #[path = "retirement_tests.rs"]
 mod tests;
+
+/// Strict selected-control grammar and authenticated admission boundary.
+pub mod command;
+
+impl Fence {
+    pub(crate) fn admitted(self) -> u64 {
+        self.admitted
+    }
+    pub(crate) fn written(self) -> u64 {
+        self.written
+    }
+}
+
+impl Collection {
+    pub(crate) fn owner_key(&self, id: OwnerId) -> Result<Option<crate::packet::FlowKey>, Error> {
+        Ok(self.slot(id)?.claim)
+    }
+    pub(crate) fn claims_key(&self, key: crate::packet::FlowKey) -> bool {
+        self.slots.iter().any(|slot| slot.claim == Some(key))
+    }
+}

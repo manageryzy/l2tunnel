@@ -178,27 +178,34 @@ fn one_short_known_budget_refuses_before_the_actual_owner_factory_for_both_cover
 -> Result {
     for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
         for contract in contracts(kind)? {
-            let plan = plan(&contract)?;
-            let limit = plan
-                .required_bytes
-                .checked_sub(1)
-                .ok_or("empty construction plan")?;
-            let entered = Cell::new(false);
-            let error = plan
-                .provision(limit, |_| {
-                    entered.set(true);
-                    Err::<Known, _>(io::Error::other("owner factory should not run"))
-                })
-                .err()
-                .ok_or("one-short construction was admitted")?;
-            assert_eq!(error.kind(), io::ErrorKind::Other);
-            assert!(matches!(
-                error
-                    .get_ref()
-                    .and_then(|cause| cause.downcast_ref::<swift::storage::Error>()),
-                Some(swift::storage::Error::Budget)
-            ));
-            assert!(!entered.get());
+            for driver_cell in [false, true] {
+                let plan = plan(&contract)?;
+                let plan = if driver_cell {
+                    plan.with_driver_cell(contract.initial(), identity(&contract).role)?
+                } else {
+                    plan
+                };
+                let limit = plan
+                    .required_bytes
+                    .checked_sub(1)
+                    .ok_or("empty construction plan")?;
+                let entered = Cell::new(false);
+                let error = plan
+                    .provision(limit, |_| {
+                        entered.set(true);
+                        Err::<Known, _>(io::Error::other("owner factory should not run"))
+                    })
+                    .err()
+                    .ok_or("one-short construction was admitted")?;
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert!(matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<swift::storage::Error>()),
+                    Some(swift::storage::Error::Budget)
+                ));
+                assert!(!entered.get());
+            }
         }
     }
     Ok(())

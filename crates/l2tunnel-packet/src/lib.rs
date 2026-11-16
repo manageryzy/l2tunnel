@@ -336,7 +336,139 @@ impl KeyBytes {
     }
 }
 
+/// Invalid/noncanonical bounded flow-key encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyDecodeError;
+impl std::fmt::Display for KeyDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid canonical flow key")
+    }
+}
+impl std::error::Error for KeyDecodeError {}
+
 impl FlowKey {
+    /// Strict inverse of the maintained canonical key; no packet is classified or changed.
+    pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, KeyDecodeError> {
+        fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], KeyDecodeError> {
+            let value = input.get(..n).ok_or(KeyDecodeError)?;
+            *input = input.get(n..).ok_or(KeyDecodeError)?;
+            Ok(value)
+        }
+        fn byte(input: &mut &[u8]) -> Result<u8, KeyDecodeError> {
+            Ok(take(input, 1)?[0])
+        }
+        fn word(input: &mut &[u8]) -> Result<u16, KeyDecodeError> {
+            Ok(u16::from_be_bytes(
+                take(input, 2)?.try_into().map_err(|_| KeyDecodeError)?,
+            ))
+        }
+        fn address(input: &mut &[u8]) -> Result<Address, KeyDecodeError> {
+            match byte(input)? {
+                4 => Ok(Address::V4(
+                    take(input, 4)?.try_into().map_err(|_| KeyDecodeError)?,
+                )),
+                6 => Ok(Address::V6(
+                    take(input, 16)?.try_into().map_err(|_| KeyDecodeError)?,
+                )),
+                _ => Err(KeyDecodeError),
+            }
+        }
+        fn endpoint(input: &mut &[u8]) -> Result<Endpoint, KeyDecodeError> {
+            Ok(Endpoint {
+                address: address(input)?,
+                port: word(input)?,
+            })
+        }
+        if input.len() > 62 {
+            return Err(KeyDecodeError);
+        }
+        let original = input;
+        let mut input = input;
+        if take(&mut input, 5)? != b"L2FK\x01" {
+            return Err(KeyDecodeError);
+        }
+        let count = byte(&mut input)?;
+        if usize::from(count) > MAX_VLAN_TAGS {
+            return Err(KeyDecodeError);
+        }
+        let mut domain = Domain {
+            count,
+            ..Domain::default()
+        };
+        for tag in domain.tags.iter_mut().take(usize::from(count)) {
+            *tag = (word(&mut input)?, word(&mut input)?);
+            if tag.1 > 4095 {
+                return Err(KeyDecodeError);
+            }
+        }
+        let tuple = match byte(&mut input)? {
+            1 => {
+                let p = byte(&mut input)?;
+                let a = endpoint(&mut input)?;
+                let b = endpoint(&mut input)?;
+                if a > b {
+                    return Err(KeyDecodeError);
+                }
+                Tuple::Transport(p, a, b)
+            }
+            2 => {
+                let p = byte(&mut input)?;
+                let a = address(&mut input)?;
+                let b = address(&mut input)?;
+                if a > b {
+                    return Err(KeyDecodeError);
+                }
+                Tuple::Ip(p, a, b)
+            }
+            3 => {
+                let p = byte(&mut input)?;
+                let id = u32::from_be_bytes(
+                    take(&mut input, 4)?
+                        .try_into()
+                        .map_err(|_| KeyDecodeError)?,
+                );
+                let a = address(&mut input)?;
+                let b = address(&mut input)?;
+                if a > b {
+                    return Err(KeyDecodeError);
+                }
+                Tuple::Fragment(p, id, a, b)
+            }
+            4 => {
+                let a = take(&mut input, 4)?
+                    .try_into()
+                    .map_err(|_| KeyDecodeError)?;
+                let b = take(&mut input, 4)?
+                    .try_into()
+                    .map_err(|_| KeyDecodeError)?;
+                if a > b {
+                    return Err(KeyDecodeError);
+                }
+                Tuple::Arp(a, b)
+            }
+            5 => {
+                let p = word(&mut input)?;
+                let a = take(&mut input, 6)?
+                    .try_into()
+                    .map_err(|_| KeyDecodeError)?;
+                let b = take(&mut input, 6)?
+                    .try_into()
+                    .map_err(|_| KeyDecodeError)?;
+                if a > b {
+                    return Err(KeyDecodeError);
+                }
+                Tuple::Ethernet(p, a, b)
+            }
+            6 => Tuple::ProxyRecords,
+            _ => return Err(KeyDecodeError),
+        };
+        let result = Self { domain, tuple };
+        if !input.is_empty() || result.canonical_bytes().as_slice() != original {
+            return Err(KeyDecodeError);
+        }
+        Ok(result)
+    }
+
     /// One ordered proxy-record namespace, distinct from every native packet key.
     /// The caller must already arbitrate the original TCP flows before this lane.
     pub fn proxy_records() -> Self {
