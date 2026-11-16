@@ -791,6 +791,7 @@ dependencies = [
  "l2tunnel-mux",
  "l2tunnel-packet",
  "l2tunnel-qos",
+ "smoltcp",
 ]
 
 [[package]]

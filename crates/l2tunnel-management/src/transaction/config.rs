@@ -146,6 +146,11 @@ impl Configuration for ModeConfig {
     const DIGEST_DOMAIN: &'static [u8] = b"l2tunnel/mode-config/v1\0";
 
     fn validate(&self) -> Result<(), Error> {
+        if self.mapping == Mapping::ConnectionRoundRobinLearned {
+            return Err(Error::Configuration(
+                "learned affinity requires complete configuration",
+            ));
+        }
         ModeConfig::validate(self).map_err(Error::Configuration)
     }
     fn encode_into(&self, output: &mut [u8]) -> Result<(), Error> {
@@ -178,6 +183,11 @@ pub fn encode_mode(mode: &ModeConfig) -> Result<[u8; MODE_BYTES], Error> {
     bytes[2] = match mode.mapping {
         Mapping::Crc32 => 1,
         Mapping::ConnectionRoundRobin => 2,
+        Mapping::ConnectionRoundRobinLearned => {
+            return Err(Error::Configuration(
+                "learned affinity requires complete configuration",
+            ));
+        }
     };
     bytes[3] = match mode.recovery {
         Recovery::CarrierOnly => 1,

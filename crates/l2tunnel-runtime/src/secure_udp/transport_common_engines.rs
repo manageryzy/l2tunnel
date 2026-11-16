@@ -111,6 +111,7 @@ pub(super) struct Bank {
     next_serial: u64,
     geometry: records::Geometry,
     native: records::NativeLimits,
+    ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     // One actual Bank in a fallibly reserved cell keeps its two inline Engine
     // extents out of the retained State. The selected Common entry constructs
     // this owner before polling its I/O continuation.
@@ -129,11 +130,33 @@ impl Bank {
         limits: storage::storage::Limits,
         external_bytes: usize,
     ) -> io::Result<Self> {
+        Self::new_with_ingress(
+            identity,
+            epoch,
+            initial,
+            geometry,
+            native,
+            limits,
+            external_bytes,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Existing exact owners plus explicit local ingress policy.
+    pub(super) fn new_with_ingress(
+        identity: tx::Identity,
+        epoch: Epoch,
+        initial: C,
+        geometry: records::Geometry,
+        native: records::NativeLimits,
+        limits: storage::storage::Limits,
+        external_bytes: usize,
+        ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+    ) -> io::Result<Self> {
         if epoch.0 == 0 || identity.session.0 == [0; 16] || identity.local == identity.remote {
             return Err(invalid("invalid actual common engine Bank identity"));
         }
         tx::configuration_digest(&initial).map_err(io::Error::other)?;
-        let plan = plan(initial, identity, epoch, geometry, native)?;
+        let plan = plan_with_ingress(initial, identity, epoch, geometry, native, ingress)?;
         let plan =
             storage::storage::Plan::for_bank(plan, external_bytes).map_err(io::Error::other)?;
         let owner = NEXT_OWNER
@@ -157,6 +180,7 @@ impl Bank {
             next_serial: 1,
             geometry,
             native,
+            ingress,
             storage,
         })
     }
@@ -271,12 +295,13 @@ impl Backend<C> for Bank {
             .next_serial
             .checked_add(1)
             .ok_or_else(|| invalid("common reservation serial exhausted"))?;
-        let plan = plan(
+        let plan = plan_with_ingress(
             exact.config,
             self.identity,
             exact.ticket.epoch,
             self.geometry,
             self.native,
+            self.ingress,
         )?;
         let storage = self.storage.prepare(plan).map_err(io::Error::other)?;
         let serial = self.next_serial;
@@ -403,6 +428,7 @@ impl Backend<C> for Bank {
     }
 }
 
+#[cfg(test)]
 fn plan(
     config: C,
     identity: tx::Identity,
@@ -410,7 +436,17 @@ fn plan(
     geometry: records::Geometry,
     native: records::NativeLimits,
 ) -> io::Result<records::storage::Plan> {
-    records::storage::Plan::for_engine(
+    plan_with_ingress(config, identity, epoch, geometry, native, None)
+}
+fn plan_with_ingress(
+    config: C,
+    identity: tx::Identity,
+    epoch: Epoch,
+    geometry: records::Geometry,
+    native: records::NativeLimits,
+    ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+) -> io::Result<records::storage::Plan> {
+    records::storage::Plan::for_engine_with_ingress(
         config,
         records::Context {
             session: u128::from_be_bytes(identity.session.0),
@@ -419,6 +455,7 @@ fn plan(
         },
         geometry,
         native,
+        ingress,
     )
     .map_err(io::Error::other)
 }

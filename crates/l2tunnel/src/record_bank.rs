@@ -303,10 +303,15 @@ impl Bank {
 fn observed(actual: &engine::Engine, plan: &engine::storage::Plan) -> Result<usize, Error> {
     let usage = actual.storage_usage().ok_or(Error::Invariant)?;
     if usage.fixed_bytes != size_of::<engine::Engine>()
-        || usage.pipeline_bytes.checked_add(usage.record_bytes) != Some(plan.heap_bytes())
+        || usage
+            .pipeline_bytes
+            .checked_add(usage.record_bytes)
+            .and_then(|bytes| bytes.checked_add(usage.ingress_bytes))
+            != Some(plan.heap_bytes())
         || usage.fixed_bytes.checked_add(plan.heap_bytes()) != Some(usage.capacity_bytes)
         || usage.capacity_bytes != plan.capacity_bytes()
         || usage.limit_bytes != plan.capacity_bytes()
+        || actual.ingress_snapshot().map(|owner| owner.policy) != plan.ingress_policy()
         || actual.configuration() != plan.configuration()
         || actual.qualification() != engine::Qualification::Reserved
     {

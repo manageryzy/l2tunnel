@@ -118,6 +118,18 @@ as local Busy. Neither requirement is satisfied by the small-symbol component
 witness; exact source findings remain in the
 [source-bound integration audit](../../work/parallel-features-20261115/python-parity-staging/full-packed-common/contract-v0.md).
 
+The current learned mapping is an explicit CompleteV2 mapping code3. It learns
+from the actual authenticated decoded native channel into the same outbound
+Pipeline, without advancing its local connection-RR cursor. Conflicts are explicit;
+a bounded idle scan retires a binding and passive ACK history only after actual
+Engine drain. Both directions require matching channel width/native layer and
+learned selection. Legacy v1 configuration explicitly refuses this new mapping;
+its original bytes/defaults are unchanged. The actual paired Packed Engine case
+passes in [Cases21](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-21/validation.json); its combined ACK-history retirement correction passes
+[Cases22](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-22/validation.json). This is not the complete independent recovery topology.
+See [independent-owner prerequisite](connection-records.md) and
+[actual ACK ingress](common-ack-ingress.md).
+
 ## Parallel implementation and acceptance ledger
 
 The integrator owns common configuration, authenticated wire revisions, profile

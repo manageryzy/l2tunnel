@@ -29,6 +29,14 @@ Read the [architecture](../architecture.md), [plan](../implementation-plan.md),
 [common Engine](common-record-engine.md), [record configuration](record-configuration.md)
 and [common Engine backing](common-engine-storage.md) with this module.
 
+A subsequent silent-tail correction reports `Step.native_progress` only when
+bounded short preview has actually admitted native records. The existing Common
+loop rearms native scanning on that event even when no further UDP packet arrives;
+GF work alone does not advertise native output. The component event case passes
+[Cases22](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-22/validation.json) and the real protected UDP/Unix silent-tail case passes
+[Cases21](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-21/validation.json) with work1, a lost older source and exact-once native delivery.
+This finite symbol256 case does not close full8192/native acceptance.
+
 ## Actual owners and delivered source scope
 
 The new pure `l2tunnel::rolling_records::Endpoint` owns one actual reserved

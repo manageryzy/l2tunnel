@@ -90,6 +90,7 @@ fn inputs(kind: cover::Appearance) -> Result<Inputs> {
             native_write_batch: 16,
         },
         rolling_work: None,
+        ack_coalescing: None,
         native: NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,

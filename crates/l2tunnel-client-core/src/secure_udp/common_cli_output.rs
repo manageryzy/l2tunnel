@@ -47,6 +47,12 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
             "reconcile_timeout_ms":parameters.protocol.reconcile_timeout_ms,"max_operation_ms":parameters.max_operation_ms,
             "retained_bytes":parameters.retained_bytes},
     }))?);
+    if let Some(requested) =
+        crate::secure_udp::common_status::AckPolicies::from_policies(profile.ack_coalescing())?
+    {
+        output[0]["ack_coalescing"] = json!({"requested":requested,"effective":null,"observation":null,"pending_read":null,"policy_switching":false});
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
     for (index, page) in profile.catalog().descriptors().chunks(4).enumerate() {
         let configurations = page
             .iter()

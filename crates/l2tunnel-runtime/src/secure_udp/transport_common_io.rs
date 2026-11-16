@@ -85,7 +85,7 @@ impl Driver {
                         .saturating_add(sent as u64)
                         .saturating_add(received as u64);
                 }
-                if step.source_handed {
+                if step.source_handed || step.native_progress {
                     runtime.native_work[(epoch.0 % 2) as usize] = width;
                 }
             }
@@ -161,6 +161,11 @@ impl Driver {
             .send()
             .common()
             .pipeline();
+        if self.config.ack_coalescing.is_some() {
+            return Ok(!self.common.as_ref().is_some_and(|runtime| {
+                runtime.path.unavailable || runtime.pending_ingress.is_some()
+            }) && state.can_admit_data());
+        }
         let usage = engine.queue_usage();
         Ok(!self
             .common
@@ -182,6 +187,9 @@ impl Driver {
         output: &mut [u8],
         mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
+        if self.config.ack_coalescing.is_some() {
+            return self.read_common_coalesced(ready, output, sample);
+        }
         let before = sample()?;
         self.progress_common(before)?;
         if !self.check_expiry(before)? || !self.can_admit_common_native()? {
@@ -996,6 +1004,25 @@ impl Driver {
         held_control: bool,
     ) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if let Some(pending) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.pending_ingress)
+        {
+            wake = wake
+                .min(pending.deadline)
+                .min(add(now, self.config.work.receive_interval)?);
+        }
+        for epoch in self.common_epochs().into_iter().flatten() {
+            if let Some(at) = self
+                .common_state()?
+                .engine(epoch)?
+                .ingress_wake_at(engine::Tick(now), self.config.work.receive_interval)
+                .map_err(protocol)?
+            {
+                wake = wake.min(at.0);
+            }
+        }
         if let Some(pending) = self
             .common
             .as_ref()

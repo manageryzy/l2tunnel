@@ -32,6 +32,8 @@ use l2tunnel_mux::Mux;
 use l2tunnel_packet::{FlowTable, classify};
 use l2tunnel_qos::{ClassConfig, ClassId, FlowConfig, Scheduler, SchedulerConfig};
 
+/// Explicit owned/benchmark ACK custody before ordinary Pipeline admission.
+pub mod ack_coalescing;
 mod backing;
 /// Complete checked fallible Pipeline backing and actual retained capacity.
 pub mod storage;
@@ -592,6 +594,27 @@ impl Pipeline {
             .last_activity = now;
         self.by_id.insert(binding.id, key)?;
         Ok(binding)
+    }
+
+    /// Learn from an already classified decoded packet only when explicitly selected.
+    /// The caller authenticates the actual owner/channel; metadata grants no control
+    /// authority. Existing trusted weights remain fixed and new flows use weight1.
+    /// This reuses the same bounded flow table without enqueueing original bytes.
+    pub fn learn_classified(
+        &mut self,
+        classification: Classification,
+        channel: u16,
+        now: Duration,
+    ) -> Result<Option<Binding>, PipelineError> {
+        if self.config.flows.mapping != Mapping::ConnectionRoundRobinLearned {
+            return Ok(None);
+        }
+        let weight = self
+            .states
+            .get(&classification.key)
+            .map_or(1, |state| state.snapshot.weight);
+        self.learn(classification.key, channel, weight, now)
+            .map(Some)
     }
 
     /// Hand off one packet when the caller has aggregate downstream capacity.

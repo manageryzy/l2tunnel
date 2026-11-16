@@ -315,3 +315,50 @@ fn rolling_late_earlier_source_rescans_after_retained_later_preview_with_work_on
     assert_eq!(receiver.failure(), None);
     Ok(())
 }
+
+#[test]
+fn preview_reports_native_progress_only_after_actual_short_admission() -> TestResult {
+    let config = short_config(64, rolling::wire::SourceWire::Exact);
+    let (_, short_wire, _, short_id, _, short) = originals(config)?;
+    let mut receiver = make_receiver(config, true)?;
+    receiver.accept_authenticated(Tick(6), short_wire.kind, &short_wire.bytes)?;
+    let zero = receiver.step(Tick(6), rolling::WorkBudget::default())?;
+    assert!(!zero.source_handed && !zero.native_progress);
+    let budget = rolling::WorkBudget {
+        field: 1,
+        copies: 1,
+        metadata: 1,
+    };
+    let mut reported = false;
+    let mut partial_turns = 0;
+    for _ in 0..20_000 {
+        let step = receiver.step(Tick(6), budget)?;
+        assert!(!step.source_handed);
+        assert!(
+            step.receive.work.field <= 1
+                && step.receive.work.copies <= 1
+                && step.receive.work.metadata <= 1
+        );
+        if step.native_progress {
+            assert!(receiver.record_status().retained_records > 0);
+            reported = true;
+            break;
+        }
+        assert_eq!(receiver.record_status().retained_records, 0);
+        partial_turns += 1;
+    }
+    assert!(reported && partial_turns > 1);
+    assert_eq!(receiver.receiver_status().decoder.handoff_prefix, 0);
+    let mut output = [0; 1024];
+    let native = ready(&mut receiver, Tick(6), &mut output)?;
+    assert!(native.early());
+    assert_eq!(native.identity(), short_id);
+    assert_eq!(&output[..native.bytes()], short);
+    for _ in 0..64 {
+        let step = receiver.step(Tick(6), budget)?;
+        assert!(!step.source_handed && !step.native_progress);
+    }
+    receiver.commit_native(Tick(6), native.token())?;
+    assert_eq!(receiver.statistics().committed, 1);
+    Ok(())
+}

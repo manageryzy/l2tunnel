@@ -94,6 +94,54 @@ impl<'a> Entry<'a> {
         Self { generation, engine }
     }
 
+    /// Exact issuing Bank generation; a copied ID confers no physical authority.
+    pub const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+    /// Typed optional ingress admission through this generation's actual Pipeline.
+    pub fn ingest_borrowed(
+        &mut self,
+        now: engine::Tick,
+        bytes: &[u8],
+        original_cap: engine::Tick,
+    ) -> Result<engine::IngressAdmission, Error> {
+        self.engine
+            .ingest_borrowed(now, bytes, original_cap)
+            .map_err(Error::Engine)
+    }
+    /// Retain the original input observation through delayed same-owner admission.
+    pub fn ingest_borrowed_at(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        bytes: &[u8],
+        original_cap: engine::Tick,
+    ) -> Result<engine::IngressAdmission, Error> {
+        self.engine
+            .ingest_borrowed_at(received, now, bytes, original_cap)
+            .map_err(Error::Engine)
+    }
+    /// Bounded optional ingress work against this exact generation's Pipeline.
+    pub fn service_ingress(
+        &mut self,
+        now: engine::Tick,
+        draining: bool,
+        work: usize,
+    ) -> Result<l2tunnel_pipeline::ack_coalescing::Progress, Error> {
+        self.engine
+            .service_ingress(now, draining, work)
+            .map_err(Error::Engine)
+    }
+    /// Retire an actual drained flow and its matching optional ingress history.
+    pub fn retire_ingress_flow(
+        &mut self,
+        now: engine::Tick,
+        key: &l2tunnel_pipeline::FlowKey,
+    ) -> Result<l2tunnel_pipeline::Binding, Error> {
+        self.engine
+            .retire_ingress_flow(now, key)
+            .map_err(Error::Engine)
+    }
     /// Borrow original input through the actual reserved common queue policy.
     pub fn enqueue_borrowed(
         &mut self,

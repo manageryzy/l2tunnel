@@ -477,3 +477,6 @@ async fn v4_carrier_socket_keeps_full_effective_catalog_keyed_switches_and_relea
     })
     .await?
 }
+
+#[path = "secure_udp_common_carrier_compact.rs"]
+mod compact;

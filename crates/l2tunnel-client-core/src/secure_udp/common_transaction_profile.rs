@@ -139,6 +139,10 @@ impl Profile {
         result.runtime_contract(security::Role::Responder)?;
         Ok(result)
     }
+    /// Exact requested directional ACK policies, unchanged by genuine outer binding.
+    pub fn ack_coalescing(&self) -> [Option<l2tunnel::pipeline::ack_coalescing::Policy>; 2] {
+        [self.initiator.ack_coalescing, self.responder.ack_coalescing]
+    }
     /// Exact shared native attachment contract.
     pub fn connection(&self) -> ConnectionConfig {
         self.connection

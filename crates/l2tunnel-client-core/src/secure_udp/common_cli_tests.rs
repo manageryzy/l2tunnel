@@ -310,3 +310,6 @@ fn actual_common_profile_inspection_keeps64_full_members_in_bounded_pages() -> i
     }
     Ok(())
 }
+
+#[path = "common_cli_ack_tests.rs"]
+mod ack_ingress;

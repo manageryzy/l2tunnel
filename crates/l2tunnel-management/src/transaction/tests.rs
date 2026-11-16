@@ -169,6 +169,19 @@ fn canonical_mode_has_exact_fixed_bytes_and_rejects_malformed_values() -> Result
     };
     assert_ne!(mode_digest(&mode)?, mode_digest(&next)?);
     assert_eq!(mode_digest(&mode)?, mode_digest(&decode_mode(&golden)?)?);
+    // Learned affinity has actual consumers only in complete configurations.
+    let learned = ModeConfig {
+        mapping: Mapping::ConnectionRoundRobinLearned,
+        ..mode
+    };
+    assert!(Configuration::validate(&learned).is_err());
+    assert!(encode_mode(&learned).is_err());
+    let mut output = [0xa5; MODE_BYTES];
+    assert!(Configuration::encode_into(&learned, &mut output).is_err());
+    assert_eq!(output, [0xa5; MODE_BYTES]);
+    let mut unsupported = golden;
+    unsupported[2] = 3;
+    assert!(decode_mode(&unsupported).is_err());
     Ok(())
 }
 

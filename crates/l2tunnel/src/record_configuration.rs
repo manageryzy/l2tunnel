@@ -500,6 +500,18 @@ impl Descriptor {
         {
             return Err(Error::Relation);
         }
+        // Reply affinity copies the actual decoded channel without modulo or a
+        // hidden mapping between independently configured direction widths.
+        let learned = Mapping::ConnectionRoundRobinLearned;
+        if (self.forward.pipeline.flows.mapping == learned
+            || self.reverse.pipeline.flows.mapping == learned)
+            && (self.forward.pipeline.flows.mapping != learned
+                || self.reverse.pipeline.flows.mapping != learned
+                || forward.channels() != reverse.channels()
+                || forward.profile.layer() != reverse.profile.layer())
+        {
+            return Err(Error::Relation);
+        }
         for view in [forward, reverse] {
             let common = view.common;
             if view.channels() != common.pipeline.flows.channels
@@ -985,6 +997,7 @@ fn encode_common(config: CommonDirection, output: &mut [u8]) -> Result<(), Error
         match pipeline.flows.mapping {
             Mapping::Crc32 => 1,
             Mapping::ConnectionRoundRobin => 2,
+            Mapping::ConnectionRoundRobinLearned => 3,
         },
         integer(pipeline.flows.capacity)?,
         u64::from(pipeline.flows.channels),
@@ -1033,6 +1046,7 @@ fn decode_common(input: &[u8]) -> Result<CommonDirection, Error> {
     let mapping = match reader.number()? {
         1 => Mapping::Crc32,
         2 => Mapping::ConnectionRoundRobin,
+        3 => Mapping::ConnectionRoundRobinLearned,
         _ => return Err(Error::Prefix),
     };
     let capacity = reader.size()?;

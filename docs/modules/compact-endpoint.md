@@ -4,7 +4,13 @@ Status: implemented actual codec/recovery/Engine consumers with finite protocol
 and protected UDP integration evidence. Cases14 passes canonical policy and
 actual lossy Compact switching; Cases15 passes retained feedback with a genuine
 physical receipt. Cases18 passes the actual L3 case after eliminating a redundant nested
-fixture future. These fixtures do not qualify a new catalog-bound TLS/Noise handshake or native TUN.
+fixture future. Those fixtures do not qualify a new catalog-bound TLS/Noise
+handshake or native TUN.
+The subsequent Cases21 service case performs genuine outer TLS/member and inner
+Noise/member establishment for the actual Compact catalog, then switches
+AlignedCompact to PackedCompact through shared APIv4 while preserving exact
+bidirectional Unix-device bytes, requested/effective binding and liveness on the
+same ports/device generation. Native TUN and complete Python profiles remain open.
 Legacy constructors, wire, digest and profile defaults remain unchanged.
 
 Actual public types are aligned::CompactConfig and packed::CompactConfig. The
@@ -62,8 +68,7 @@ not share source sizes, feedback ceilings, windows or timing.
 
 - [x] [CCE-01] Actual reserved Compact Aligned/Packed endpoint and exact nested storage with independent directional geometry and physical custody. Evidence: [Cases13](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-13/validation.json) contains the passing actual reserved endpoint source-loss case; two unrelated new cases failed and remain preserved.
 - [x] [CCE-02] Complete strict249/273-byte grammars and explicit tags6/7 with canonical padding, full policy binding and unchanged old vectors/defaults. Evidence: [Cases14](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-14/validation.json), including the complete-policy case and existing canonical vectors; its failed runtime fixtures remain preserved separately.
-- [ ] [CCE-03] Actual Engine/catalog/Driver/service and lossy feedback integration,
-  including retained original arrival/cap through physical feedback deferral.
+- [x] [CCE-03] Actual Engine/catalog/Driver/service and lossy feedback integration, including retained original arrival/cap through physical feedback deferral. Evidence: [Batch10 finite UDP/feedback checks](../../work/parallel-features-20261115/parallel-batch10-scoped-validation.json) and [Cases21 genuine Compact service setup/switch](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-21/validation.json).
 - [ ] [CCE-04] Full configured physical copies, Python differential behavior,
   native8192/128, resource, TCP ownership, all47 and platform/performance gates.
 

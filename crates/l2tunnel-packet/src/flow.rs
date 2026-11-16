@@ -23,7 +23,7 @@ pub struct FlowTableConfig {
     pub capacity: usize,
     /// Negotiated channel count, from one through 256.
     pub channels: u16,
-    /// Deterministic CRC affinity or learned connection-round-robin.
+    /// Deterministic CRC, local RR, or explicit decoded-channel RR affinity.
     pub mapping: Mapping,
     /// Nonzero inactivity period before an entry becomes a retirement candidate.
     pub idle_timeout: Duration,
@@ -202,7 +202,12 @@ impl PreparedAssignment<'_> {
         );
         if !self.existed {
             self.table.next_id = self.binding.id.0.checked_add(1);
-            if !self.learned && self.table.config.mapping == Mapping::ConnectionRoundRobin {
+            if !self.learned
+                && matches!(
+                    self.table.config.mapping,
+                    Mapping::ConnectionRoundRobin | Mapping::ConnectionRoundRobinLearned
+                )
+            {
                 self.table.next_channel =
                     (self.table.next_channel + 1) % self.table.config.channels;
             }
@@ -281,7 +286,9 @@ impl FlowTable {
         }
         let channel = match self.config.mapping {
             Mapping::Crc32 => self.crc_channel(key),
-            Mapping::ConnectionRoundRobin => self.next_channel,
+            Mapping::ConnectionRoundRobin | Mapping::ConnectionRoundRobinLearned => {
+                self.next_channel
+            }
         };
         self.preview_insert(channel)
     }

@@ -79,3 +79,6 @@ pub use l2tunnel_tcp_proxy as tcp_proxy;
 pub use l2tunnel_udp_control as udp_control;
 /// Base VXLAN framing and explicit VNI/domain admission.
 pub use l2tunnel_vxlan as vxlan;
+
+/// Bounded independent connection record owners over actual Compact endpoints.
+pub mod connection_records;

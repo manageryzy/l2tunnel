@@ -13,5 +13,7 @@ l2tunnel-packet = { path = "../l2tunnel-packet" }
 l2tunnel-qos = { path = "../l2tunnel-qos" }
 l2tunnel-mux = { path = "../l2tunnel-mux" }
 
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno"] }
+
 [dev-dependencies]
 l2tunnel-flow-control = { path = "../l2tunnel-flow-control" }

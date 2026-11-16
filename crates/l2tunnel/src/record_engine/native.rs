@@ -97,6 +97,13 @@ impl Engine {
                     early,
                     deadline,
                 };
+                if let Err(error) = self.learn_reverse_affinity(
+                    now,
+                    identity,
+                    output.get(..bytes).ok_or(Error::Invariant)?,
+                ) {
+                    return self.fail(error);
+                }
                 if let Err(error) = self.native_counts.prepare(identity, self.receive_channels) {
                     return self.fail(error);
                 }

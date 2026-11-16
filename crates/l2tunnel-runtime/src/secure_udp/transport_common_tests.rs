@@ -159,8 +159,9 @@ struct Fixture<D: AsRawFd = Device> {
 }
 
 impl Fixture {
-    async fn new(kind: cover::Appearance) -> Result<Self> {
-        Self::from_contracts(kind, contracts(kind)?).await
+    fn new(kind: cover::Appearance) -> Result<impl std::future::Future<Output = Result<Self>>> {
+        // Keep the constructor's large state in one future at the call site.
+        Ok(Self::from_contracts(kind, contracts(kind)?))
     }
 
     fn from_contracts(
@@ -182,7 +183,10 @@ impl Fixture {
         let origin = Instant::now();
         let make = |parts: member::Parts, contract| -> Result<Endpoint> {
             let original = (parts.socket.local_addr()?, parts.socket.peer_addr()?);
-            let (socket, mut driver) = Driver::new_common(parts, contract, origin)?;
+            let (socket, mut driver) =
+                Driver::new_common(parts, contract, origin, |socket, driver| {
+                    Ok((socket, Box::new(driver)))
+                })?;
             driver.bucket.tokens = 0;
             if retire_at_deadline {
                 assert!(driver.tail(setup_end)?.is_none());
@@ -200,7 +204,7 @@ impl Fixture {
             )?;
             Ok(Endpoint {
                 socket,
-                driver: Box::new(driver),
+                driver,
                 device,
                 host,
                 original,
@@ -442,7 +446,7 @@ fn original_udp_nonempty_swift_aligned_packed_switches_preserve_physical_native_
         .build()?
         .block_on(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-                let mut fixture = Fixture::new(kind).await?;
+                let mut fixture = Fixture::new(kind)?.await?;
                 let contract = fixture.endpoints[0]
                     .driver
                     .common
@@ -511,7 +515,7 @@ fn held_common_physical_token_blocks_real_switch_and_preserves_original_native_a
         .build()?
         .block_on(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-                let mut fixture = Fixture::new(kind).await?;
+                let mut fixture = Fixture::new(kind)?.await?;
                 let packet = frame(40000, 71);
                 fixture.admit(0, &packet).await?;
                 let mut held = None;
@@ -587,7 +591,7 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
         .build()?
         .block_on(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-                let mut fixture = Fixture::new(kind).await?;
+                let mut fixture = Fixture::new(kind)?.await?;
                 let packet = frame(40000, 83);
                 fixture.admit(0, &packet).await?;
                 let now = fixture.now;
@@ -853,7 +857,7 @@ fn common_original_operation_cap_guards_physical_write_and_preserves_late_succes
         .block_on(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
                 for late_success in [false, true] {
-                    let mut fixture = Fixture::new(kind).await?;
+                    let mut fixture = Fixture::new(kind)?.await?;
                     let packet = frame(40000, 101);
                     fixture.admit(0, &packet).await?;
                     for _ in 0..100 {
@@ -975,3 +979,6 @@ mod compact;
 
 #[path = "transport_common_feedback_input_tests.rs"]
 mod compact_feedback_input;
+
+#[path = "transport_common_ingress_tests.rs"]
+mod ack_ingress;

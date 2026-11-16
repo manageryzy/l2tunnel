@@ -99,7 +99,7 @@ impl Counts {
     }
 }
 
-fn identity_channel(identity: ProfileIdentity) -> usize {
+pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index(),
         ProfileIdentity::Aligned(identity)

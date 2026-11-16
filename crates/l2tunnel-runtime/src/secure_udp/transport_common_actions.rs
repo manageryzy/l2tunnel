@@ -402,11 +402,18 @@ impl Driver {
                         return Err(protocol("common Stage original scopes"));
                     }
                     runtime.contract.resolve(*config)?;
-                    if runtime.pending_feedback.is_some() {
+                    if runtime.pending_feedback.is_some() || runtime.pending_ingress.is_some() {
                         return Ok(false);
                     }
                     // Queued originals predate the stopped-ingress barrier. They
                     // must reach their real codecs before its admitted fence.
+                    if !self
+                        .common_state()?
+                        .engine(operation.origin().epoch)?
+                        .ingress_empty()
+                    {
+                        return Ok(false);
+                    }
                     if self
                         .common_state()?
                         .engine(operation.origin().epoch)?
@@ -451,6 +458,7 @@ impl Driver {
                         || !self.native.is_empty()
                         || runtime.sealed.is_some()
                         || runtime.pending_feedback.is_some()
+                        || runtime.pending_ingress.is_some()
                     {
                         return Ok(false);
                     }
@@ -600,7 +608,10 @@ impl Driver {
         )? == transactions::Progress::Advanced)
     }
     fn common_barrier_ready(&self, runtime: &common::Runtime, old: Scope) -> io::Result<bool> {
-        if !self.native.is_empty() || runtime.sealed.is_some() || runtime.pending_feedback.is_some()
+        if !self.native.is_empty()
+            || runtime.sealed.is_some()
+            || runtime.pending_feedback.is_some()
+            || runtime.pending_ingress.is_some()
         {
             return Ok(false);
         }

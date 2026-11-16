@@ -57,6 +57,9 @@ pub struct Step {
     pub receive: scheduler::ReceiverStep,
     /// A decoded compact source atomically entered the record receiver.
     pub source_handed: bool,
+    /// Atomic preview admission accepted at least one independent record unit.
+    /// Work alone and duplicate/stale-only admissions do not report progress.
+    pub native_progress: bool,
 }
 #[derive(Clone, Copy)]
 struct PreviewUnit {
@@ -484,7 +487,7 @@ impl Endpoint {
         &mut self,
         now: Tick,
         budget: &mut rolling::WorkBudget,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if self
             .receive_config
             .receiver
@@ -494,10 +497,11 @@ impl Endpoint {
             || self.incoming.status().feedback_building
             || self.preview_blocked
         {
-            return Ok(());
+            return Ok(false);
         }
         let config = self.receive_config;
         let width = config.receiver.body.symbol_bytes;
+        let mut native_progress = false;
         let mut visits = 0;
         while visits < config.packing.work_limit && budget.metadata > 0 {
             if self.preview.is_none() {
@@ -573,7 +577,11 @@ impl Endpoint {
                                             | receiver::Admission::Duplicate
                                             | receiver::Admission::StaleSource
                                     )
-                                }) => {}
+                                }) =>
+                        {
+                            native_progress |=
+                                outcomes[..count].contains(&receiver::Admission::Accepted);
+                        }
                         Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
                             self.preview = Some(preview);
                             self.preview_blocked = true;
@@ -671,7 +679,7 @@ impl Endpoint {
             preview.current = None;
             self.preview = Some(preview);
         }
-        Ok(())
+        Ok(native_progress)
     }
     /// Service each actual scheduler under the supplied independent work cap.
     /// One call hands at most one source to the compact record receiver.
@@ -695,6 +703,7 @@ impl Endpoint {
             self.request_preview_scan();
         }
         let source_handed = self.pump_receive(now)?;
+        let mut native_progress = false;
         if !source_handed {
             let mut remaining = rolling::WorkBudget {
                 field: work.field - receive.work.field,
@@ -702,10 +711,10 @@ impl Endpoint {
                 metadata: work.metadata - receive.work.metadata,
             };
             let before = remaining;
-            let result = self.preview_receive(now, &mut remaining);
-            if let Err(error) = result {
-                return self.fail(error);
-            }
+            native_progress = match self.preview_receive(now, &mut remaining) {
+                Ok(progress) => progress,
+                Err(error) => return self.fail(error),
+            };
             receive.work.copies += before.copies - remaining.copies;
             receive.work.metadata += before.metadata - remaining.metadata;
         }
@@ -714,6 +723,7 @@ impl Endpoint {
             send,
             receive,
             source_handed,
+            native_progress,
         })
     }
     /// Prepare one actual immutable output and reserve its exact wire debit once.

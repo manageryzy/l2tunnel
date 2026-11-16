@@ -4,7 +4,27 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
-The [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
+The current Batch11 implementation adds explicit bounded benchmark ACK ingress
+through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and
+paired resource binding; decoded-channel reverse learning in the same Pipeline;
+and a pure fixed-cohort collection of independently reserved Compact owners.
+Finite cases pass actual ACK backpressure and record switching, independent-owner
+source/feedback loss, genuine catalog-bound Compact service setup/switching and
+Rolling silent-tail native progress. These are distinct compositions: the complete
+independent16 profile, raw TCP/Common installation and named8192/128/copies/ACK
+profile remain open. See [ACK ingress](modules/common-ack-ingress.md),
+[independent owners](modules/connection-records.md) and
+[Compact composition](modules/compact-endpoint.md).
+
+The [Batch11 scoped receipt](../work/parallel-features-20261115/parallel-batch11-scoped-validation.json)
+retains109 distinct focused passing leaves and the exact failed attempts. Full
+workspace formatting and Clippy pass; successful Rust targets/doctests total1,750,
+with524 additional runtime passes and one streamed UDP WouldBlock failure. That
+unchanged case passes an isolated rerun; its concurrent failure cause remains
+unresolved. Affected rustdoc passes. The full check remains failed and its later
+stages were not reached. This is not full Python, native or throughput acceptance.
+
+The preceding [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
 installs explicit AlignedCompact/PackedCompact policies through actual reserved
 Engine owners and the original UDP Driver. Finite integration covers lossy source
 and feedback, retained authenticated feedback across delayed physical receipts,

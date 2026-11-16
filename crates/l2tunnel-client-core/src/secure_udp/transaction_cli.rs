@@ -376,6 +376,7 @@ impl RuntimeDto {
                 pong_timeout: Duration::from_micros(self.lifetime.pong_timeout_micros),
             },
             rolling_work: None,
+            ack_coalescing: None,
             report_interval: self.report_interval_micros.0.map(Duration::from_micros),
         };
         Ok([

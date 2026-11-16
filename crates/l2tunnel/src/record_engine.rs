@@ -20,6 +20,9 @@ mod errors_tests;
 /// Complete actual reserved backing of one common record Engine.
 pub mod storage;
 
+mod affinity;
+mod ingress;
+pub use ingress::{IngressAdmission, IngressSnapshot};
 mod carrier;
 mod native;
 pub use carrier::CarrierOutputToken;
@@ -165,6 +168,10 @@ pub enum Error {
     Invariant,
     /// Actual common queue failure.
     Pipeline(pipeline::PipelineError),
+    /// Actual selected bounded ACK-ingress failure.
+    Ingress(pipeline::ack_coalescing::Error),
+    /// The selected ingress path must not be bypassed by a compatibility enqueue.
+    IngressPolicy,
     /// Actual maintained Swift record failure.
     Swift(swift::records::Error),
     /// Actual Swift backing failure.
@@ -293,6 +300,7 @@ pub struct Engine {
     context: Context,
     digest: ConfigDigest,
     pipeline: pipeline::Pipeline,
+    ingress: Option<pipeline::ack_coalescing::Ingress>,
     owner: Owner,
     send_max: usize,
     receive_max: usize,
@@ -342,9 +350,11 @@ impl Engine {
             pipeline,
             owner,
             None,
+            None,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing actual owners plus the optional real ingress owner.
     fn assemble(
         configuration: configuration::Configuration,
         context: Context,
@@ -352,6 +362,7 @@ impl Engine {
         parameters: Parameters,
         pipeline: pipeline::Pipeline,
         owner: Owner,
+        ingress: Option<pipeline::ack_coalescing::Ingress>,
         usage: Option<storage::Usage>,
     ) -> Self {
         let Parameters {
@@ -368,6 +379,7 @@ impl Engine {
             context,
             digest,
             pipeline,
+            ingress,
             owner,
             send_max,
             receive_max,
@@ -393,6 +405,12 @@ impl Engine {
         now: Tick,
         payload: Vec<u8>,
     ) -> Result<pipeline::PacketMetadata, EnqueueError> {
+        if self.ingress.is_some() {
+            return Err(EnqueueError {
+                kind: Error::IngressPolicy,
+                payload,
+            });
+        }
         if let Err(kind) = self.advance(now) {
             return Err(EnqueueError { kind, payload });
         }
@@ -449,6 +467,9 @@ impl Engine {
         now: Tick,
         bytes: &[u8],
     ) -> Result<pipeline::PacketMetadata, Error> {
+        if self.ingress.is_some() {
+            return Err(Error::IngressPolicy);
+        }
         self.advance(now)?;
         self.pipeline
             .enqueue_borrowed(bytes, duration(now))
@@ -649,6 +670,7 @@ impl Engine {
             .deadline()?
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
+            .chain(self.ingress_expiry())
             .min())
     }
 
@@ -661,6 +683,7 @@ impl Engine {
             .expiry_deadline()?
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
+            .chain(self.ingress_expiry())
             .min())
     }
 
@@ -675,7 +698,10 @@ impl Engine {
     /// True only when actual queue, profile and native custody all drain.
     pub fn drained(&self) -> Result<bool, Error> {
         self.healthy()?;
-        Ok(self.pipeline.usage().packets == 0 && self.pending.is_none() && self.owner.drained()?)
+        Ok(self.pipeline.usage().packets == 0
+            && self.ingress_empty()
+            && self.pending.is_none()
+            && self.owner.drained()?)
     }
 
     /// Exact complete requested policy, without clamping rates or directions.
@@ -713,6 +739,12 @@ impl Engine {
         }
         if self.pending.is_some_and(|pending| now >= pending.deadline) {
             return self.fail(Error::Expired);
+        }
+        if self
+            .ingress_expiry()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return self.fail(Error::Ingress(pipeline::ack_coalescing::Error::Expired));
         }
         self.last = Some(now);
         Ok(())

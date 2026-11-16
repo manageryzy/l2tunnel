@@ -13,6 +13,7 @@ pub(super) struct Plan {
     runtime: RuntimeDto,
     rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
     outer_carrier: Option<OuterCarrierDto>,
+    ack_coalescing: Option<crate::secure_udp::common_status::AckPolicies>,
 }
 impl Plan {
     pub(super) fn read(path: &Path) -> io::Result<Self> {
@@ -39,6 +40,7 @@ impl Plan {
             runtime: dto.runtime,
             rolling_work: dto.rolling_work.0.map(|value| value.build()).transpose()?,
             outer_carrier: dto.outer_carrier,
+            ack_coalescing: dto.ack_coalescing,
         })
     }
     pub(super) fn initial(&self) -> Descriptor {
@@ -154,8 +156,14 @@ impl Plan {
             maximum_body,
             overhead,
         )?;
-        for config in &mut configs {
+        let ack = self
+            .ack_coalescing
+            .map(|policy| policy.build())
+            .transpose()?
+            .unwrap_or([None, None]);
+        for (config, ack) in configs.iter_mut().zip(ack) {
             config.rolling_work = self.rolling_work;
+            config.ack_coalescing = ack;
         }
         secure_udp::common_transaction_profile::Profile::new(
             connection,
@@ -180,6 +188,13 @@ struct PlanDto {
     rolling_work: RequiredWork,
     #[serde(default)]
     outer_carrier: Option<OuterCarrierDto>,
+    #[serde(default, deserialize_with = "selected_ack")]
+    ack_coalescing: Option<crate::secure_udp::common_status::AckPolicies>,
+}
+fn selected_ack<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::AckPolicies>, D::Error> {
+    crate::secure_udp::common_status::AckPolicies::deserialize(deserializer).map(Some)
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

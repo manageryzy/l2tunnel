@@ -26,9 +26,11 @@ pub enum Duplex {
 pub enum Mapping {
     /// Symmetric endpoint CRC32, matching the simulator's IPv4/TCP profile.
     Crc32,
-    /// Assign new connections to successive channels with coordinated reverse affinity.
+    /// Assign new connections locally to successive channels.
     #[default]
     ConnectionRoundRobin,
+    /// Explicit decoded-channel reply affinity over the same local RR flow owner.
+    ConnectionRoundRobinLearned,
 }
 
 /// Planned recovery engines; enum presence does not indicate implementation.

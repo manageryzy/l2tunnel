@@ -37,7 +37,7 @@ fn same_flow_retry_retains_actual_packed_token_native_debt_and_leased_operation(
         .build()?
         .block_on(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-                let mut fixture = Fixture::new(kind).await?;
+                let mut fixture = Fixture::new(kind)?.await?;
                 let contract = fixture.endpoints[0]
                     .driver
                     .common
@@ -321,7 +321,7 @@ fn same_flow_retry_keeps_original_cap_and_permanent_error_is_terminal() -> Resul
                 io::ErrorKind::HostUnreachable,
                 io::ErrorKind::NetworkUnreachable,
             ] {
-                let mut fixture = Fixture::new(cover::Appearance::QuicLike).await?;
+                let mut fixture = Fixture::new(cover::Appearance::QuicLike)?.await?;
                 fixture.admit(0, &frame(40_000, 83)).await?;
                 let now = fixture.now;
                 let driver = &mut fixture.endpoints[0].driver;

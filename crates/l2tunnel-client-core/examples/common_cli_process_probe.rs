@@ -400,6 +400,7 @@ mod probe {
                 native_write_batch: 64,
             },
             rolling_work: Some(rolling_work()),
+            ack_coalescing: None,
             native: transport::NativeBudget {
                 pending_packets: 64,
                 pending_bytes: 102_400,

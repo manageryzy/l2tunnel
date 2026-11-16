@@ -62,6 +62,8 @@ mod common;
 mod common_actions;
 #[path = "transport_common_contract.rs"]
 mod common_contract;
+#[path = "transport_common_ingress.rs"]
+mod common_ingress;
 #[path = "transport_common_io.rs"]
 mod common_io;
 #[path = "transport_common_native.rs"]
@@ -339,6 +341,7 @@ where
             let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+            driver.service_common_ingress(now, &mut inputs.native)?;
             driver.collect_native(now)?;
             driver.progress(now)?;
             driver.service_common_rolling(now)?;
@@ -672,6 +675,9 @@ pub struct Config {
     /// Two retained generations can service at most four directional schedulers.
     /// None preserves legacy policy and cannot select a rolling record catalog.
     pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    /// Explicit local Benchmark ACK ingress, immutable in the authenticated Common envelope.
+    /// None preserves transparent behavior and all legacy resource digest bytes.
+    pub ack_coalescing: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     /// Independent retained native output bounds.
     pub native: NativeBudget,
     /// Explicit active lease and authenticated round-trip timers.
@@ -683,6 +689,11 @@ impl Config {
     /// Validate finite scalar/algorithm bounds without network, keys or clocks.
     pub fn validate(&self) -> io::Result<()> {
         self.validate_rolling_work()?;
+        if self.ack_coalescing.is_some() {
+            return Err(invalid(
+                "ACK coalescing requires an explicit Common Benchmark selection",
+            ));
+        }
         if self.rolling_work.is_some() {
             return Err(invalid(
                 "rolling work is selected only by the common record contract",
@@ -2003,6 +2014,18 @@ impl Driver {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "authenticated liveness challenge expired",
+            ));
+        }
+        if self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.pending_ingress)
+            .is_some_and(|pending| now >= pending.deadline)
+        {
+            self.terminal = Some(StopReason::NativeStall);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original native ingress custody deadline",
             ));
         }
         if native_deadline.is_some_and(|deadline| now >= deadline)

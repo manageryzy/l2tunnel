@@ -20,6 +20,8 @@ pub struct Usage {
     pub pipeline_bytes: usize,
     /// Actual selected record heap, excluding its already inline header.
     pub record_bytes: usize,
+    /// Actual optional ACK-ingress heap, excluding its already inline header.
+    pub ingress_bytes: usize,
     /// Exact fixed plus nested heap layouts.
     pub capacity_bytes: usize,
     /// Explicit successful nonzero constructor reservations.
@@ -39,6 +41,8 @@ pub enum Error {
     Aligned(aligned::storage::Error),
     /// Actual complete codec/rolling/scratch backing refused.
     Rolling(rolling_records::Error),
+    /// Actual bounded optional ACK-ingress plan or construction refused.
+    Ingress(pipeline::ack_coalescing::Error),
     /// A complete layout or allocation count cannot be represented.
     Layout,
     /// Complete actual owner exceeds its explicit allowance.
@@ -212,6 +216,7 @@ pub struct Plan {
     parameters: Parameters,
     pipeline: pipeline::storage::Plan,
     record: RecordPlan,
+    ingress: Option<pipeline::ack_coalescing::Plan>,
     heap_bytes: usize,
     capacity_bytes: usize,
 }
@@ -223,15 +228,47 @@ impl Plan {
         geometry: Geometry,
         native_limits: NativeLimits,
     ) -> Result<Self, Error> {
+        Self::for_engine_with_ingress(configuration, context, geometry, native_limits, None)
+    }
+    /// Bind optional Benchmark ingress to the actual issuing Pipeline before allocation.
+    /// An owned-TCP label cannot install a missing TCP endpoint owner.
+    pub fn for_engine_with_ingress(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+    ) -> Result<Self, Error> {
         let parameters =
             parameters(&configuration, context, geometry, native_limits).map_err(Error::Engine)?;
+        if let Some(policy) = ingress {
+            for value in [policy.interval, policy.max_hold] {
+                let micros = u64::try_from(value.as_micros())
+                    .map_err(|_| Error::Engine(super::Error::Time))?;
+                if Duration::from_micros(micros) != value {
+                    return Err(Error::Engine(super::Error::Time));
+                }
+            }
+        }
+        if ingress.is_some_and(|p| p.selection != pipeline::ack_coalescing::Selection::Benchmark) {
+            return Err(Error::Engine(super::Error::Unsupported(
+                Capability::TcpProxy,
+            )));
+        }
         let local = configuration.descriptor().local(context.role);
         let pipeline = pipeline::storage::Plan::for_pipeline(local.send().common().pipeline())
             .map_err(Error::Pipeline)?;
         let record = RecordPlan::for_engine(&configuration, context)?;
+        let ingress = ingress
+            .map(|policy| {
+                pipeline::ack_coalescing::Plan::for_pipeline(pipeline.config(), policy)
+                    .map_err(Error::Ingress)
+            })
+            .transpose()?;
         let heap_bytes = pipeline
             .capacity_bytes()
             .checked_add(record.heap_bytes())
+            .and_then(|bytes| bytes.checked_add(ingress.map_or(0, |plan| plan.capacity_bytes())))
             .ok_or(Error::Layout)?;
         let capacity_bytes = size_of::<Engine>()
             .checked_add(heap_bytes)
@@ -244,6 +281,7 @@ impl Plan {
             parameters,
             pipeline,
             record,
+            ingress,
             heap_bytes,
             capacity_bytes,
         })
@@ -263,6 +301,10 @@ impl Plan {
     /// Exact external native custody policy.
     pub const fn native_limits(&self) -> NativeLimits {
         self.native_limits
+    }
+    /// Exact optional local ingress selection, immutable for this Engine generation.
+    pub fn ingress_policy(&self) -> Option<pipeline::ack_coalescing::Policy> {
+        self.ingress.map(|plan| plan.policy())
     }
     /// Complete actual nested heap, excluding the outer inline Engine.
     pub const fn heap_bytes(&self) -> usize {
@@ -293,6 +335,18 @@ impl Engine {
             },
         )
         .map_err(Error::Pipeline)?;
+        let ingress = plan
+            .ingress
+            .map(|ingress| {
+                pipeline::ack_coalescing::Ingress::new(
+                    ingress,
+                    pipeline::ack_coalescing::Limits {
+                        capacity_bytes: ingress.capacity_bytes(),
+                    },
+                )
+                .map_err(Error::Ingress)
+            })
+            .transpose()?;
         let mut owner = plan.record.construct(plan.context)?;
         owner
             .enable_carrier_confirmation(&plan.configuration)
@@ -304,15 +358,29 @@ impl Engine {
         {
             return Err(Error::Invariant);
         }
+        let ingress_bytes = ingress
+            .as_ref()
+            .map_or(0, |owner| owner.usage().capacity_bytes);
+        if ingress_bytes != plan.ingress.map_or(0, |plan| plan.capacity_bytes()) {
+            return Err(Error::Invariant);
+        }
         let allocations = p
             .allocations
             .checked_add(record_allocations)
+            .and_then(|count| {
+                count.checked_add(
+                    ingress
+                        .as_ref()
+                        .map_or(0, |owner| owner.usage().allocations),
+                )
+            })
             .ok_or(Error::Layout)?;
         let usage = Usage {
             limit_bytes: limits.capacity_bytes,
             fixed_bytes: size_of::<Self>(),
             pipeline_bytes: p.capacity_bytes,
             record_bytes,
+            ingress_bytes,
             capacity_bytes: plan.capacity_bytes,
             allocations,
         };
@@ -323,6 +391,7 @@ impl Engine {
             plan.parameters,
             pipeline,
             owner,
+            ingress,
             Some(usage),
         ))
     }

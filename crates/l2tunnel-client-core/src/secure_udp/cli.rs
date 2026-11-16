@@ -767,6 +767,7 @@ impl Selection {
                 pong_timeout: Duration::from_secs(5),
             },
             rolling_work: None,
+            ack_coalescing: None,
             report_interval: Some(self.report.unwrap_or(Duration::from_secs(1))),
         };
         let responder = transport::Config {

@@ -42,6 +42,21 @@ impl Config {
     /// Common C supplies native geometry, rates, burst, queues and record policy.
     pub fn validate_common_resources(&self, max_native: usize) -> io::Result<()> {
         self.validate_rolling_work()?;
+        if let Some(policy) = self.ack_coalescing {
+            use l2tunnel_pipeline::ack_coalescing::Selection;
+            if policy.selection != Selection::Benchmark {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Common ACK ingress does not own TCP endpoints",
+                ));
+            }
+            for value in [policy.interval, policy.max_hold] {
+                let micros = u64::try_from(value.as_micros()).map_err(invalid)?;
+                if Duration::from_micros(micros) != value {
+                    return Err(invalid("ACK ingress timers require exact microseconds"));
+                }
+            }
+        }
         if !(1..=65_535).contains(&max_native)
             || !(256..=65_535).contains(&self.path_mtu)
             || self.control_epoch.0 == 0
@@ -201,6 +216,20 @@ impl Config {
             hash.update(b"l2tunnel/common-resources/rolling-work/v1\0");
             for value in [work.field, work.copies, work.metadata, 2, 2] {
                 hash.update(&(value as u64).to_be_bytes());
+            }
+        }
+        if let Some(policy) = self.ack_coalescing {
+            hash.update(b"l2tunnel/common-resources/ack-coalescing/v1\0");
+            for value in [
+                2,
+                policy.interval.as_secs(),
+                u64::from(policy.interval.subsec_nanos()),
+                policy.max_hold.as_secs(),
+                u64::from(policy.max_hold.subsec_nanos()),
+                u64::try_from(policy.max_flows).map_err(invalid)?,
+                u64::try_from(policy.max_ack_bytes).map_err(invalid)?,
+            ] {
+                hash.update(&value.to_be_bytes());
             }
         }
         let mut bytes = [0; 32];
@@ -446,7 +475,7 @@ impl CommonTransactionContract {
                 return Err(invalid("common data/control/burst geometry"));
             }
         }
-        engine::storage::Plan::for_engine(
+        engine::storage::Plan::for_engine_with_ingress(
             value,
             engine::Context {
                 session: 1,
@@ -455,6 +484,7 @@ impl CommonTransactionContract {
             },
             self.geometry,
             self.native_limits()?,
+            self.resources.ack_coalescing,
         )
         .map_err(invalid)?;
         Ok(value)

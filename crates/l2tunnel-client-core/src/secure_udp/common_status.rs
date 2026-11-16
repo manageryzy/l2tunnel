@@ -4,6 +4,10 @@ use l2tunnel::record_configuration::{CONFIGURATION_BYTES, Configuration};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, io};
 
+#[path = "common_ack.rs"]
+mod ack;
+pub use ack::{AckObservation, AckPolicies, AckPolicy, AckRead, AckSelection, AckStatus};
+
 /// Exact length of the lowercase hexadecimal complete configuration value.
 pub const CANONICAL_CHARACTERS: usize = CONFIGURATION_BYTES * 2;
 
@@ -286,6 +290,9 @@ pub struct Status {
     /// Actual optional authenticated work policy. Each step caps send and receive
     /// independently; at most two live epochs produce four directional caps/turn.
     pub rolling_work: Option<RollingWork>,
+    /// Explicit immutable Benchmark policy and actual Engine ingress observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_coalescing: Option<AckStatus>,
     /// Actual directional scheduler step count, never inferred from packet count.
     pub rolling_scheduler_steps: Option<u64>,
     /// Actual cumulative GF/copy/metadata work consumed.
@@ -348,6 +355,18 @@ mod observe {
             {
                 return Err(invalid(
                     "transaction observation differs from retained authenticated plan",
+                ));
+            }
+            let requested_ack = AckPolicies::from_policies(profile.ack_coalescing())?;
+            let expected_ack = profile
+                .runtime_contract(info.role)?
+                .resources()
+                .ack_coalescing;
+            if snapshot.is_some_and(|value| {
+                value.ack_ingress.map(|ingress| ingress.policy) != expected_ack
+            }) {
+                return Err(invalid(
+                    "actual ACK ingress differs from retained authenticated policy",
                 ));
             }
             if let Some(value) = snapshot {
@@ -545,6 +564,9 @@ mod observe {
                             metadata: number(work.metadata)?,
                         })
                     })
+                    .transpose()?,
+                ack_coalescing: requested_ack
+                    .map(|requested| AckStatus::observe(requested, snapshot))
                     .transpose()?,
                 rolling_scheduler_steps: snapshot.map(|value| value.rolling_scheduler_steps),
                 rolling_work_used: snapshot.map(|value| value.rolling_work_used),

@@ -71,6 +71,14 @@ pub struct CommonSnapshot {
     pub rolling_scheduler_steps: u64,
     /// Actual cumulative GF, copy and metadata work, respectively.
     pub rolling_work_used: [u64; 3],
+    /// Actual current Engine-owned optional ACK ingress, not a requested-as-effective projection.
+    pub ack_ingress: Option<engine::IngressSnapshot>,
+    /// Actual held native read awaiting typed ingress admission.
+    pub pending_ingress_bytes: Option<usize>,
+    /// First actual read time, not a TCP creation timestamp.
+    pub pending_ingress_since_micros: Option<u64>,
+    /// Original retained read cap; replacement or retry never renews it.
+    pub pending_ingress_deadline_micros: Option<u64>,
     /// Sole-loop scheduling, wire credit and native-pressure observations.
     pub performance: Performance,
     /// Actual fixed Control retained custody.
@@ -147,6 +155,15 @@ pub(super) struct PendingFeedback {
     pub(super) received: u64,
     pub(super) deadline: u64,
 }
+/// Metadata for the one actual packet retained in the existing Inputs.native slab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingIngress {
+    pub(super) generation: l2tunnel::record_bank::GenerationId,
+    pub(super) epoch: core::Epoch,
+    pub(super) bytes: usize,
+    pub(super) received: u64,
+    pub(super) deadline: u64,
+}
 pub(super) struct Runtime {
     pub(super) contract: CommonTransactionContract,
     pub(super) action: Option<ActionWork>,
@@ -156,6 +173,7 @@ pub(super) struct Runtime {
     pub(super) sealed: Option<PendingWire>,
     pub(super) wire: Vec<u8>,
     pub(super) pending_feedback: Option<PendingFeedback>,
+    pub(super) pending_ingress: Option<PendingIngress>,
     pub(super) feedback_input: Vec<u8>,
     pub(super) outcome: Option<transactions::Outcome>,
     pub(super) completion: Option<(TransactionReply, Result<core::Epoch, SwitchError>)>,
@@ -260,8 +278,9 @@ where
     if origin >= setup_deadline {
         return Err(common_setup_expired());
     }
-    let (socket, driver) = Driver::new_common(parts, contract, origin)?;
-    let driver = owner::StateCell::new(driver)?;
+    let (socket, driver) = Driver::new_common(parts, contract, origin, |socket, driver| {
+        Ok((socket, owner::StateCell::new(driver)?))
+    })?;
     if Instant::now() >= setup_deadline {
         return Err(common_setup_expired());
     }
@@ -290,7 +309,7 @@ fn reserve_common_state(
     external: usize,
 ) -> io::Result<owner::ReservedCommonState> {
     let config = contract.resources();
-    let bank = common_engines::Bank::new(
+    let bank = common_engines::Bank::new_with_ingress(
         identity,
         core::Epoch(config.data_epoch.0),
         contract.initial(),
@@ -300,6 +319,7 @@ fn reserve_common_state(
             capacity_bytes: contract.settings().retained_bytes,
         },
         external,
+        config.ack_coalescing,
     )?;
     let state = transactions::CommonState::new(
         identity,
@@ -329,11 +349,14 @@ struct CommonInput {
 }
 
 impl Driver {
-    pub(super) fn new_common(
+    // Place the completed Driver directly in its caller's retained owner. Returning
+    // it inline through both constructors multiplies debug scratch-stack extent.
+    pub(super) fn new_common<T>(
         parts: member::Parts,
         contract: CommonTransactionContract,
         origin: Instant,
-    ) -> io::Result<(tokio::net::UdpSocket, Self)> {
+        finish: impl FnOnce(tokio::net::UdpSocket, Self) -> io::Result<T>,
+    ) -> io::Result<T> {
         if contract.refresh_selection().is_some() || contract.extra_wire_bytes() != 0 {
             return Err(invalid("legacy Common requires unselected legacy contract"));
         }
@@ -350,9 +373,7 @@ impl Driver {
             addresses,
             io_capacity: 0,
         };
-        Self::new_common_input(input, contract, origin, parts.socket, |socket, driver| {
-            Ok((socket, driver))
-        })
+        Self::new_common_input(input, contract, origin, parts.socket, finish)
     }
 
     fn new_common_input<S, T>(
@@ -521,7 +542,7 @@ impl Driver {
             // the one actual retained authenticated-feedback payload capacity.
             .and_then(|v| v.checked_add(config.security.max_body_bytes))
             .ok_or_else(exhausted)?;
-        let initial_plan = engine::storage::Plan::for_engine(
+        let initial_plan = engine::storage::Plan::for_engine_with_ingress(
             contract.initial(),
             engine::Context {
                 session: u128::from_be_bytes(identity.session.0),
@@ -530,6 +551,7 @@ impl Driver {
             },
             contract.geometry(),
             contract.native_limits()?,
+            config.ack_coalescing,
         )
         .map_err(invalid)?;
         let bank_plan = l2tunnel::record_bank::storage::Plan::for_bank(initial_plan, external)
@@ -624,6 +646,7 @@ impl Driver {
                     sealed: None,
                     wire,
                     pending_feedback: None,
+                    pending_ingress: None,
                     feedback_input,
                     outcome: None,
                     completion: None,
@@ -726,6 +749,12 @@ impl Driver {
             rolling_work: self.config.rolling_work,
             rolling_scheduler_steps: runtime.rolling_scheduler_steps,
             rolling_work_used: runtime.rolling_work_used,
+            ack_ingress: state.engine(state.epoch())?.ingress_snapshot(),
+            pending_ingress_bytes: runtime.pending_ingress.map(|pending| pending.bytes),
+            pending_ingress_since_micros: runtime.pending_ingress.map(|pending| pending.received),
+            pending_ingress_deadline_micros: runtime
+                .pending_ingress
+                .map(|pending| pending.deadline),
             performance: self.performance.snapshot(now, &self.bucket),
             control: self.control.retained(),
             counters,
