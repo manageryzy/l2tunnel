@@ -33,6 +33,7 @@ pub struct Profile {
     // Keep an absent optional policy from enlarging every carrier setup future.
     proxy_measured: Option<Box<l2tunnel_runtime::proxy::measured::Config>>,
     connection_reuse: bool,
+    compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +58,40 @@ impl Profile {
     ) -> io::Result<Self> {
         Self::new_selected(
             connection, settings, peers, initiator, responder, catalog, parameters, None, None,
+            None,
         )
+    }
+    /// Explicit compact v3 on the original UDP socket, selected before Noise/member
+    /// authentication. The actual runtime validates the complete supported catalog.
+    /// No legacy default or copied public observation installs this selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_compact(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        selection: l2tunnel::secure_record::compact::Selection,
+    ) -> io::Result<Self> {
+        selection.validate().map_err(io::Error::other)?;
+        Self::new_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            None,
+            None,
+            Some(selection),
+        )
+    }
+    /// Exact establishment-bound compact request, absent for legacy constructors.
+    pub const fn compact_wire(&self) -> Option<l2tunnel::secure_record::compact::Selection> {
+        self.compact_wire
     }
     /// Explicit fixed TCP proxy on the initial Common record profile. The complete
     /// maintained proxy policy is bound before admission/Noise/member hashing.
@@ -100,6 +134,7 @@ impl Profile {
             parameters,
             None,
             Some(proxy),
+            None,
         )
     }
     /// Explicit retained graceful retirement. The existing v1 constructor and
@@ -220,6 +255,7 @@ impl Profile {
         parameters: transport::TransactionSettings,
         raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
         proxy: Option<l2tunnel_runtime::proxy::Config>,
+        compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
     ) -> io::Result<Self> {
         let base = connection.session()?;
         if initiator.rolling_fragments != responder.rolling_fragments {
@@ -346,6 +382,7 @@ impl Profile {
             proxy_retirement: false,
             proxy_measured: None,
             connection_reuse: false,
+            compact_wire,
         };
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
@@ -392,6 +429,12 @@ impl Profile {
     /// Derive an effective plan only from a genuine completed outer proof.
     /// The original settings/catalog/resources remain retained and unchanged.
     pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
+        if self.compact_wire.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compact v3 currently supports the original UDP carrier only",
+            ));
+        }
         if self.proxy.is_some() || self.connection_reuse {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -482,6 +525,9 @@ impl Profile {
     /// Bound profiles carry the actual extra opcode and effective setup identity.
     pub fn establish_config(&self, role: security::Role) -> io::Result<establish::Config> {
         let mut config = self.settings.runtime(role, self.peers)?;
+        if self.compact_wire.is_some() {
+            config.binding.configuration = self.compact_contract(role)?.expected_configuration().0;
+        }
         if self.raw.is_some() {
             return self.establish_raw(config, role);
         }
@@ -525,6 +571,11 @@ impl Profile {
     }
     /// Actual setup/Control digest consumed by the maintained authentication factories.
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
+        if self.compact_wire.is_some() {
+            return Ok(self
+                .compact_contract(security::Role::Initiator)?
+                .expected_configuration());
+        }
         if let Some(raw) = self.raw {
             return Ok(raw.configuration);
         }
@@ -538,6 +589,9 @@ impl Profile {
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if self.compact_wire.is_some() {
+            return self.compact_contract(role);
+        }
         if self.raw.is_some() {
             return self.raw_contract(role);
         }
@@ -564,6 +618,36 @@ impl Profile {
             self.parameters,
         )?;
         self.complete_proxy_contract(contract)
+    }
+    fn compact_contract(
+        &self,
+        role: security::Role,
+    ) -> io::Result<transport::CommonTransactionContract> {
+        let selection = self
+            .compact_wire
+            .ok_or_else(|| invalid("compact selection absent"))?;
+        if self.raw.is_some()
+            || self.carrier.is_some()
+            || self.proxy.is_some()
+            || self.proxy_measured.is_some()
+            || self.connection_reuse
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compact v3 currently requires the original UDP native Common backend",
+            ));
+        }
+        transport::CommonTransactionContract::new_compact_wire(
+            self.settings.configuration(self.peers)?,
+            role,
+            [self.initiator, self.responder],
+            self.settings.cover.config(role)?,
+            self.settings.gate.path.client.is_ipv6(),
+            self.envelope,
+            self.catalog.clone(),
+            self.parameters,
+            selection,
+        )
     }
     // Both callers already constructed their actual original carrier contract.
     // This metadata cannot upgrade an observation into member/root authority.

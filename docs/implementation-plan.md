@@ -8,12 +8,20 @@ All requirements remain tracked until their acceptance gates are met.
 
 The [compact-wire workstream](modules/compact-wire-cleanup.md) now tracks CWC-01
 through CWC-18: one typed variable-length encoding, initial-only appearance,
-explicit data-check candidates, authenticated control and complete native/raw
+explicit selected data-check profiles, authenticated control and complete native/raw
 ownership. Its ordinary 24-byte target (20-byte optimization) is unqualified.
 The actual-call-site structural prerequisite is implemented with passing protocol
 regressions; full runtime qualification remains open in the
 [first checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
-Install and validate compact runtime separately, retaining all 47/full SW-11 requirements.
+The selected implementation below retains all 47/full SW-11 requirements.
+
+The [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
+implements the explicit AES-CCM4 and ChaCha20/CRC32C data profiles, independent
+strong feedback/control, typed CompactARQ final encoding and a selected original
+UDP Swift runtime route. Data outer framing is 9 bytes; strong feedback/control
+is 21 bytes, before algorithm and packing metadata. Validation is scoped to the
+recorded paths; raw TCP, remaining algorithm migration, full SW-11/all47 and
+native/platform/performance gates stay open at their complete definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

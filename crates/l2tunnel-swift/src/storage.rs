@@ -532,6 +532,24 @@ impl Entry<'_> {
             .poll_emission_bounded(now, number, allow_data, body_limit)
     }
 
+    /// Exact per-kind outer credit through the same selected record owner.
+    pub fn poll_emission_with_limits(
+        &mut self,
+        now: u64,
+        number: records::RecordNumber,
+        allow_data: bool,
+        data_body_limit: usize,
+        feedback_body_limit: usize,
+    ) -> Result<Option<records::Emission<'_>>, records::Error> {
+        self.engine.poll_emission_with_limits(
+            now,
+            number,
+            allow_data,
+            data_body_limit,
+            feedback_body_limit,
+        )
+    }
+
     /// Produce an existing numbered body without allocation or ownership escape.
     pub fn poll(
         &mut self,

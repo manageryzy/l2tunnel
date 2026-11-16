@@ -8,6 +8,29 @@ and named Python topology acceptance remains open.
 This is an engineering implementation contract, not an owner default decision.
 Historical simulator observations and receipts remain unchanged.
 
+## Additive direct compact body
+
+The 2026-11-16 selected `CompactPacketView` output callback exposes the actual
+source/feedback union before attempt or feedback custody commits. Canonical u64
+varints encode source identity and transmission serial independently; the final
+Data/Feedback route supplies the kind. Source metadata starts at 2 bytes and can
+reach 20; feedback scalars can reach 53 bytes plus the exact bitmap. There is no
+fixed maximum-arm padding or repeated L2AR context in this selected body.
+
+`poll_with`, `poll_source_with` and `poll_feedback_with` reuse the original
+prepare/commit path; encoder refusal or `None` does not commit an attempt.
+`receive_view_at` retains the same physical-observation and RTT semantics.
+Reliable preflights distinct data/strong-feedback overheads and retains its
+original physical-confirmation slots. Its final encoder consumes the borrowed
+view once, rather than serializing and reparsing the legacy body.
+
+Recovery (57 cases), Reliable (40 cases) and final-record composition cover the
+new path, including bidirectional UDP loss/retry and strongly authenticated
+retiring feedback. This is not yet native Common Compact/Aligned integration;
+the first selected compact runtime route is Swift-only. See the
+[complete checkpoint and remaining scope](compact-wire-cleanup.md#selected-compact-implementation-checkpoint).
+The L2ARv2 wire description below remains the explicit compatibility format.
+
 ## Exact selected API
 
 The recovery crate reexports CompactRecovery::{Guarded,FirstFlight,BoundedGap},

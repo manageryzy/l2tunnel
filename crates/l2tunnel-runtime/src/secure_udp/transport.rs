@@ -2728,17 +2728,29 @@ impl Driver {
             self.progress(now)?;
         }
         self.counters.received_packets = self.counters.received_packets.saturating_add(1);
-        let decoded = match self.cover.decode(packet) {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+        if self.records.is_compact() {
+            // The authenticated selection uses appearance only for setup tails;
+            // ordinary established compact records have no cover envelope.
+            if let Ok(decoded) = self.cover.decode(packet)
+                && (self.bootstrap.receive(decoded, instant).map_err(protocol)?
+                    || self.joining.receive(decoded, instant)?)
+            {
                 return Ok(());
             }
-        };
-        if self.bootstrap.receive(decoded, instant).map_err(protocol)?
-            || self.joining.receive(decoded, instant)?
-        {
-            return Ok(());
+        } else {
+            let decoded = match self.cover.decode(packet) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    self.counters.rejected_packets =
+                        self.counters.rejected_packets.saturating_add(1);
+                    return Ok(());
+                }
+            };
+            if self.bootstrap.receive(decoded, instant).map_err(protocol)?
+                || self.joining.receive(decoded, instant)?
+            {
+                return Ok(());
+            }
         }
         let opened = if self.records.key_epoch().is_ok() {
             self.records
@@ -2789,10 +2801,16 @@ impl Driver {
                 return Ok(());
             }
         };
-        self.live.last_verified_micros = Some(now);
-        // This opener already checked the actual session keys and replay owner.
-        // Setup tails, rejected tags and replay cannot restore path availability.
-        self.restore_common_path();
+        if !self.validate_common_compact_route(opened)? {
+            self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+            return Ok(());
+        }
+        if opened.authenticated {
+            self.live.last_verified_micros = Some(now);
+            // A CRC-selected data check never restores an authenticated path or
+            // satisfies liveness; strong Control/Feedback retain those rights.
+            self.restore_common_path();
+        }
         match opened.class {
             Class::Control => {
                 if opened.scope != self.records.control_scope() {

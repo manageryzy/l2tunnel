@@ -6,6 +6,8 @@ use l2tunnel_security::Role;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+#[path = "common_cli_compact_tests.rs"]
+mod compact_wire;
 #[path = "common_cli_native_fixtures.rs"]
 mod native_fixtures;
 fn hex(descriptor: Descriptor) -> io::Result<String> {

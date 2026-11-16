@@ -4,6 +4,67 @@ use l2tunnel::{record_bank, record_configuration as configuration, record_engine
 use l2tunnel_reliable::{OutboundBudget, RecordKind};
 
 impl Driver {
+    /// Check the selected strong-feedback boundary before liveness or codec
+    /// mutation. Public algorithm kind bytes cannot upgrade short-check Data.
+    pub(super) fn validate_common_compact_route(&self, opened: record::Opened) -> io::Result<bool> {
+        if !self.records.is_compact() {
+            return Ok(true);
+        }
+        if opened.class == Class::Control {
+            return Ok(opened.authenticated && !opened.feedback);
+        }
+        let state = self.common_state()?;
+        let Some(reader) = state.peer().reader(core::Epoch(opened.scope.epoch.0)) else {
+            return Ok(false);
+        };
+        if common_actions::common_scope(core::Epoch(opened.scope.epoch.0), reader.config)?
+            != opened.scope
+        {
+            return Ok(false);
+        }
+        let local = reader
+            .config
+            .descriptor()
+            .local(common_contract::mg_role(self.info.role));
+        if !matches!(
+            local.receive().profile(),
+            configuration::DirectionProfile::Swift(_)
+        ) {
+            return Ok(false);
+        }
+        let body = &self.buffers.plain[..opened.bytes];
+        if !opened.feedback {
+            return Ok(matches!(
+                body.first().map(|lead| lead & swift::KIND_MASK),
+                Some(swift::KIND_SOURCE | swift::KIND_REPAIR)
+            ));
+        }
+        if !opened.authenticated || body.is_empty() {
+            return Ok(false);
+        }
+        // Validate every complete block before any reliable-retiring body can
+        // reach the actual owner. Sender-dependent sequence checks stay there.
+        let mut rest = body;
+        while !rest.is_empty() {
+            if rest.len() < swift::FEEDBACK_HEADER
+                || rest[0] & swift::KIND_MASK != swift::KIND_FEEDBACK
+                || u16::from(rest[0] >> 2) >= local.send().channels()
+            {
+                return Ok(false);
+            }
+            let requests = usize::from(rest[swift::FEEDBACK_HEADER - 1]);
+            if requests > swift::MAX_REQUESTS {
+                return Ok(false);
+            }
+            let length = swift::FEEDBACK_HEADER + 2 * requests;
+            let Some(tail) = rest.get(length..) else {
+                return Ok(false);
+            };
+            rest = tail;
+        }
+        Ok(true)
+    }
+
     pub(super) fn restore_common_path(&mut self) {
         if let Some(runtime) = &mut self.common
             && runtime.path.unavailable
@@ -613,13 +674,14 @@ impl Driver {
                 };
                 let mut entry = state.entry(epoch)?;
                 let Some(emission) = entry
-                    .poll(
+                    .poll_with_feedback_overhead(
                         engine::Tick(now),
                         number.0,
                         allow_data,
                         &mut self.buffers.frame,
                         &mut budget,
                         &mut runtime.witnesses,
+                        runtime.contract.feedback_overhead_bytes()?,
                     )
                     .map_err(protocol)?
                 else {
@@ -636,7 +698,17 @@ impl Driver {
                 }
                 (emission, carrier, None, None)
             };
-            let sealed = if self.records.key_epoch().is_ok() {
+            let compact_feedback =
+                self.records.is_compact() && emission.kind == engine::EmissionKind::Feedback;
+            let sealed = if compact_feedback {
+                self.records.seal_feedback_in(
+                    scope,
+                    meta(self.outer, cover::Phase::Established),
+                    &self.buffers.frame[..emission.bytes],
+                    &mut self.buffers.seal,
+                    &mut self.buffers.wire,
+                )
+            } else if self.records.key_epoch().is_ok() {
                 self.records
                     .seal_user_in_at(
                         l2tunnel::handshake::Time(now),
@@ -657,13 +729,20 @@ impl Driver {
                 )
             }
             .map_err(record_error)?;
-            if sealed.number != number
+            if (!compact_feedback && sealed.number != number)
                 || sealed.bytes.checked_add(self.ip) != Some(emission.wire_bytes)
             {
                 return Err(protocol("common exact security number/wire charge differs"));
             }
-            self.counters.user_number = Some(sealed.number);
-            self.counters.user_generation = Some(sealed.generation);
+            if compact_feedback {
+                self.common
+                    .as_mut()
+                    .ok_or_else(|| protocol("compact feedback owner"))?
+                    .compact_feedback_number = Some(sealed.number);
+            } else {
+                self.counters.user_number = Some(sealed.number);
+                self.counters.user_generation = Some(sealed.generation);
+            }
             let mut deadline = self
                 .common_state()?
                 .operation_deadline()
@@ -746,6 +825,7 @@ impl Driver {
                 proxy_record,
                 scope,
                 sealed,
+                feedback: compact_feedback,
                 cost,
                 deadline,
                 carrier,
@@ -945,9 +1025,12 @@ impl Driver {
             pending.cost,
             pending.deadline,
         );
-        if !self.scope_registered(scope)
-            || self.records.next_number(Class::User).0 <= sealed.number.0
-        {
+        let next = if pending.feedback {
+            self.records.next_feedback_number().map_err(record_error)?
+        } else {
+            self.records.next_number(Class::User)
+        };
+        if !self.scope_registered(scope) || next.0 <= sealed.number.0 {
             return Err(protocol(
                 "retained Common wire lost its original security scope/number",
             ));
@@ -1499,9 +1582,16 @@ impl Driver {
             // Drain excludes user-data custody, not later duplicate-triggered
             // feedback. Every retained reader keeps its actual small ACK wake.
             if let Some((at, bytes)) = engine.feedback_opportunity().map_err(protocol)? {
-                let cost = self
-                    .common_fragment_wire_cost(epoch, bytes)?
-                    .map_or_else(|| bytes.checked_add(overhead).ok_or_else(exhausted), Ok)?;
+                let feedback_overhead = self
+                    .common
+                    .as_ref()
+                    .ok_or_else(|| protocol("common feedback wake contract"))?
+                    .contract
+                    .feedback_overhead_bytes()?;
+                let cost = self.common_fragment_wire_cost(epoch, bytes)?.map_or_else(
+                    || bytes.checked_add(feedback_overhead).ok_or_else(exhausted),
+                    Ok,
+                )?;
                 let required = cost.checked_add(self.reserve).ok_or_else(exhausted)?;
                 wake = wake.min(at.0.max(self.bucket.ready_at(required)?));
             }

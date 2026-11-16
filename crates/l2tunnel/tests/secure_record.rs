@@ -12,6 +12,11 @@ use zeroize::Zeroizing;
 
 type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
+#[path = "secure_record/compact.rs"]
+mod compact;
+#[path = "secure_record/compact_arq.rs"]
+mod compact_arq;
+
 fn scope(epoch: u64, digest: u8) -> Scope {
     Scope {
         epoch: security::Epoch(epoch),

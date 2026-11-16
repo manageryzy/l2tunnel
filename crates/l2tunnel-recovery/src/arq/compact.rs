@@ -202,7 +202,8 @@ impl CompactFeedback<'_> {
 /// Borrowed source or feedback fields for transmission and parsed reception.
 ///
 /// The descriptor carries no authentication, replay or physical-send authority.
-/// Its current serializer preserves L2ARv2, separate from legacy L2ARv1.
+/// The legacy serializer preserves L2ARv2; the context-free body serializer is
+/// selected explicitly by an enclosing authenticated format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactPacketView<'a> {
     /// Stable source identity, unique attempt serial and exact opaque payload.
@@ -218,6 +219,44 @@ pub enum CompactPacketView<'a> {
     Feedback(CompactFeedback<'a>),
 }
 
+/// Algorithm branch supplied by the enclosing authenticated packet union.
+/// This value alone establishes no authentication or recovery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactPacketKind {
+    /// One unchanged source payload and its distinct attempt serial.
+    Data,
+    /// One receipt bitmap and RTT/receiver-delay observation.
+    Feedback,
+}
+
+/// Recovery preflight or caller encoder refusal; neither commits an output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactPollError<E> {
+    /// The actual selected recovery owner refused the operation.
+    Recovery(RecoveryError),
+    /// The enclosing encoder refused before accepting the borrowed output.
+    Encode(E),
+}
+impl<E> From<RecoveryError> for CompactPollError<E> {
+    fn from(error: RecoveryError) -> Self {
+        Self::Recovery(error)
+    }
+}
+impl<E: fmt::Display> fmt::Display for CompactPollError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recovery(error) => fmt::Display::fmt(error, f),
+            Self::Encode(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for CompactPollError<E> {}
+
+mod body;
+pub use body::{
+    COMPACT_BODY_DATA_MAX_HEADER_BYTES, COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES,
+    inspect_compact_body,
+};
 mod wire;
 use wire::parse_compact;
 /// Validate encoding/context/profile only; caller supplies authentication and replay.
@@ -466,6 +505,53 @@ impl CompactRepeat {
     ) -> Result<(), RecoveryError> {
         self.engine.compact_receive(packet, received, observed)
     }
+    /// Admit an already authenticated context-free descriptor through the same
+    /// recovery transition, preserving original arrival and observation times.
+    pub fn receive_view_at(
+        &mut self,
+        view: CompactPacketView<'_>,
+        received: Duration,
+        observed: Duration,
+    ) -> Result<(), RecoveryError> {
+        self.engine.compact_receive_view(view, received, observed)
+    }
+
+    /// Offer one actual selected body to a final encoder. The caller provides
+    /// feedback bitmap scratch (at most the negotiated bitmap byte capacity).
+    /// None or encoder error commits no output; scratch may be overwritten.
+    pub fn poll_with<T, E>(
+        &mut self,
+        now: Duration,
+        bitmap: &mut [u8],
+        encode: impl FnOnce(CompactPacketView<'_>) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, CompactPollError<E>> {
+        let selected = self.engine.compact_selection(now, true, true)?;
+        self.engine
+            .compact_emit_with(now, selected, bitmap, true, encode)
+    }
+
+    /// Offer only a source from the same source/retry/history selection.
+    pub fn poll_source_with<T, E>(
+        &mut self,
+        now: Duration,
+        encode: impl FnOnce(CompactPacketView<'_>) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, CompactPollError<E>> {
+        let selected = self.engine.compact_selection(now, false, true)?;
+        self.engine
+            .compact_emit_with(now, selected, &mut [], true, encode)
+    }
+
+    /// Offer only due feedback with the same bounded bitmap cursor and repeats.
+    pub fn poll_feedback_with<T, E>(
+        &mut self,
+        now: Duration,
+        bitmap: &mut [u8],
+        encode: impl FnOnce(CompactPacketView<'_>) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, CompactPollError<E>> {
+        let selected = self.engine.compact_selection(now, true, false)?;
+        self.engine
+            .compact_emit_with(now, selected, bitmap, true, encode)
+    }
     /// Actual source attempt awaiting local whole-carrier acceptance.
     pub fn pending_transmission(&self, source: SourceId) -> Option<PhysicalTransmission> {
         self.engine.pending_transmission(source)
@@ -508,6 +594,49 @@ impl CompactRepeat {
             .engine
             .compact_selection(now, true, false)?
             .map(Selection::bytes))
+    }
+    /// Exact context-free source opportunity from the same current selection.
+    pub fn source_body_bytes(&self, now: Duration) -> Result<Option<usize>, RecoveryError> {
+        let selected = self.engine.compact_selection(now, false, true)?;
+        if let Some(Selection::Source { source, .. }) = selected
+            && self.engine.compact_source_blocked(source)?
+        {
+            return Ok(None);
+        }
+        self.engine.compact_body_bytes(now, selected)
+    }
+    /// Exact context-free feedback opportunity, including current delay varint.
+    pub fn feedback_body_bytes(&self, now: Duration) -> Result<Option<usize>, RecoveryError> {
+        let selected = self.engine.compact_selection(now, true, false)?;
+        self.engine.compact_body_bytes(now, selected)
+    }
+    /// Conservative full-counter context-free local maximum; no wire context.
+    pub fn send_max_body_bytes(&self) -> Result<usize, RecoveryError> {
+        let state = self
+            .engine
+            .compact
+            .as_ref()
+            .ok_or(RecoveryError::InvalidConfig)?;
+        Ok(
+            (COMPACT_BODY_DATA_MAX_HEADER_BYTES + state.send.bounds.max_source_bytes).max(
+                COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES + state.receive.maximum_feedback_bytes
+                    - COMPACT_FEEDBACK_HEADER_BYTES,
+            ),
+        )
+    }
+    /// Conservative full-counter context-free peer maximum.
+    pub fn receive_max_body_bytes(&self) -> Result<usize, RecoveryError> {
+        let state = self
+            .engine
+            .compact
+            .as_ref()
+            .ok_or(RecoveryError::InvalidConfig)?;
+        Ok(
+            (COMPACT_BODY_DATA_MAX_HEADER_BYTES + state.receive.bounds.max_source_bytes).max(
+                COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES + state.send.maximum_feedback_bytes
+                    - COMPACT_FEEDBACK_HEADER_BYTES,
+            ),
+        )
     }
     /// Emit due feedback without emitting a source.
     pub fn poll_feedback(
@@ -740,7 +869,26 @@ impl Engine {
         } else {
             state.receive
         };
-        match parse_compact(bytes, self.context, policy)? {
+        let view = parse_compact(bytes, self.context, policy)?;
+        self.compact_receive_view(view, received, observed)
+    }
+
+    fn compact_receive_view(
+        &mut self,
+        view: CompactPacketView<'_>,
+        received: Duration,
+        observed: Duration,
+    ) -> Result<(), RecoveryError> {
+        self.check_time(observed)?;
+        if received > observed {
+            return Err(RecoveryError::NonMonotonicTime);
+        }
+        let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
+        view.validate_policy(match view {
+            CompactPacketView::Data { .. } => state.receive,
+            CompactPacketView::Feedback(_) => state.send,
+        })?;
+        match view {
             CompactPacketView::Data {
                 source,
                 serial,
@@ -1022,6 +1170,52 @@ impl Engine {
         Ok(Some(Selection::Source { source, required }))
     }
 
+    fn compact_body_bytes(
+        &self,
+        now: Duration,
+        selected: Option<Selection>,
+    ) -> Result<Option<usize>, RecoveryError> {
+        let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
+        match selected {
+            Some(Selection::Source { source, .. }) => {
+                let flight = self
+                    .sent
+                    .get(&source)
+                    .ok_or(RecoveryError::MalformedPacket)?;
+                let serial = self
+                    .next_transmission
+                    .checked_add(1)
+                    .ok_or(RecoveryError::CounterExhausted)?;
+                CompactPacketView::Data {
+                    source,
+                    serial,
+                    payload: &flight.payload,
+                }
+                .compact_encoded_len()
+                .map(Some)
+            }
+            Some(Selection::Feedback { start, count, .. }) => {
+                let serial = state
+                    .feedback_serial
+                    .checked_add(1)
+                    .ok_or(RecoveryError::CounterExhausted)?;
+                let delay = delay_micros(
+                    now.checked_sub(state.last_received_at)
+                        .ok_or(RecoveryError::NonMonotonicTime)?,
+                )?;
+                Ok(Some(body::feedback_body_len(
+                    self.receive_prefix,
+                    start,
+                    count,
+                    state.last_received_serial,
+                    delay,
+                    serial,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn compact_poll(
         &mut self,
         now: Duration,
@@ -1031,17 +1225,66 @@ impl Engine {
     ) -> Result<Option<usize>, RecoveryError> {
         let selected = self.compact_selection(now, allow_feedback, allow_sources)?;
         let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
-        if let Some(Selection::Feedback {
-            start,
-            count,
-            required,
-        }) = selected
-        {
+        let context = self.context;
+        let result = match selected {
+            Some(Selection::Feedback { required, .. }) => {
+                // Preserve the legacy serial/output/time error precedence.
+                state
+                    .feedback_serial
+                    .checked_add(1)
+                    .ok_or(RecoveryError::CounterExhausted)?;
+                ensure_output(output, required)?;
+                let mode = state.receive.recovery;
+                let (header, bitmap) =
+                    output[..required].split_at_mut(COMPACT_FEEDBACK_HEADER_BYTES);
+                self.compact_emit_with(now, selected, bitmap, false, |view| {
+                    view.encode_legacy_header(context, mode, header)?;
+                    Ok(Some(required))
+                })
+            }
+            Some(Selection::Source { source, required }) => {
+                let flight = self
+                    .sent
+                    .get(&source)
+                    .ok_or(RecoveryError::MalformedPacket)?;
+                if flight.attempts >= state.send.maximum_attempts {
+                    let error = RecoveryError::RetryExhausted { source };
+                    self.failure = Some(error);
+                    return Err(error);
+                }
+                ensure_output(output, required)?;
+                let mode = state.send.recovery;
+                self.compact_emit_with(now, selected, &mut [], false, |view| {
+                    view.encode_legacy_into(context, mode, output).map(Some)
+                })
+            }
+            None => {
+                self.last_now = now;
+                return Ok(None);
+            }
+        };
+        result.map_err(|error| match error {
+            CompactPollError::Recovery(error) | CompactPollError::Encode(error) => error,
+        })
+    }
+
+    // The callback sees the actual borrowed source/bitmap. Its Some result is
+    // the only output commit point for both serializers; None/errors preserve
+    // attempt, history, feedback cursor and physical custody.
+    fn compact_emit_with<T, E>(
+        &mut self,
+        now: Duration,
+        selected: Option<Selection>,
+        bitmap: &mut [u8],
+        compact_body: bool,
+        encode: impl FnOnce(CompactPacketView<'_>) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, CompactPollError<E>> {
+        let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
+        if let Some(Selection::Feedback { start, count, .. }) = selected {
             let serial = state
                 .feedback_serial
                 .checked_add(1)
                 .ok_or(RecoveryError::CounterExhausted)?;
-            ensure_output(output, required)?;
             let delay = delay_micros(
                 now.checked_sub(state.last_received_at)
                     .ok_or(RecoveryError::NonMonotonicTime)?,
@@ -1054,14 +1297,16 @@ impl Engine {
             } else {
                 None
             };
-            let (header, bitmap) = output[..required].split_at_mut(COMPACT_FEEDBACK_HEADER_BYTES);
+            let bitmap_bytes = usize::from(count).div_ceil(8);
+            ensure_output(bitmap, bitmap_bytes)?;
+            let bitmap = &mut bitmap[..bitmap_bytes];
             bitmap.fill(0);
             for offset in 0..usize::from(count) {
                 if self.received.contains_key(&SourceId(start + offset as u64)) {
                     bitmap[offset / 8] |= 1 << (offset % 8);
                 }
             }
-            CompactPacketView::Feedback(CompactFeedback {
+            let view = CompactPacketView::Feedback(CompactFeedback {
                 prefix: self.receive_prefix,
                 start,
                 count,
@@ -1069,8 +1314,15 @@ impl Engine {
                 receiver_delay_us: delay,
                 serial,
                 bitmap,
-            })
-            .encode_legacy_header(self.context, state.receive.recovery, header)?;
+            });
+            let required = if compact_body {
+                view.compact_encoded_len()?
+            } else {
+                view.legacy_encoded_len()?
+            };
+            let Some(result) = encode(view).map_err(CompactPollError::Encode)? else {
+                return Ok(None);
+            };
             let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
             state.bitmap_cursor = start + u64::from(count);
             if state
@@ -1091,9 +1343,9 @@ impl Engine {
                 .statistics
                 .wire_bytes_emitted
                 .saturating_add(required as u64);
-            return Ok(Some(required));
+            return Ok(Some(result));
         }
-        let Some(Selection::Source { source, required }) = selected else {
+        let Some(Selection::Source { source, .. }) = selected else {
             self.last_now = now;
             return Ok(None);
         };
@@ -1104,9 +1356,8 @@ impl Engine {
         if flight.attempts >= state.send.maximum_attempts {
             let error = RecoveryError::RetryExhausted { source };
             self.failure = Some(error);
-            return Err(error);
+            return Err(error.into());
         }
-        ensure_output(output, required)?;
         let serial = self
             .next_transmission
             .checked_add(1)
@@ -1114,12 +1365,19 @@ impl Engine {
         let history_index = state.history_slot(serial)?;
         let rto = state.rto()?;
         now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?;
-        CompactPacketView::Data {
+        let view = CompactPacketView::Data {
             source,
             serial,
             payload: &flight.payload,
-        }
-        .encode_legacy_into(self.context, state.send.recovery, output)?;
+        };
+        let required = if compact_body {
+            view.compact_encoded_len()?
+        } else {
+            view.legacy_encoded_len()?
+        };
+        let Some(result) = encode(view).map_err(CompactPollError::Encode)? else {
+            return Ok(None);
+        };
         let flight = self
             .sent
             .get_mut(&source)
@@ -1159,7 +1417,7 @@ impl Engine {
             .statistics
             .wire_bytes_emitted
             .saturating_add(required as u64);
-        Ok(Some(required))
+        Ok(Some(result))
     }
 }
 

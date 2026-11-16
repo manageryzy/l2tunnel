@@ -51,6 +51,15 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
             "reconcile_timeout_ms":parameters.protocol.reconcile_timeout_ms,"max_operation_ms":parameters.max_operation_ms,
             "retained_bytes":parameters.retained_bytes},
     }))?);
+    if let Some(requested) = profile.compact_wire() {
+        output[0]["compact_wire"] = json!({
+            "requested":crate::secure_udp::common_status::CompactWireSelection::from_selection(requested)?,
+            "effective":null,"checks":null,"feedback_packet_number":null,
+            "appearance":"initial-only","established_mimic":false,
+            "control_protection":"chacha20-poly1305","retiring_feedback_protection":"chacha20-poly1305"
+        });
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
     if let Some(requested) =
         crate::secure_udp::common_status::AckPolicies::from_policies(profile.ack_coalescing())?
     {

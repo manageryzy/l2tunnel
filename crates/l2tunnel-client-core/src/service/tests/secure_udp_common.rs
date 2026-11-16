@@ -505,3 +505,6 @@ mod independent_connections;
 
 #[path = "secure_udp_common_research.rs"]
 mod research_common;
+
+#[path = "secure_udp_common_wire.rs"]
+mod compact_wire;

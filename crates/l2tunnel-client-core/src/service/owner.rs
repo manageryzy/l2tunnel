@@ -512,12 +512,24 @@ async fn establish_swift(
 }
 /// Shared original-socket authentication; the selected profile owns all settings.
 #[cfg(unix)]
-async fn authenticate_secure_udp(
+fn authenticate_secure_udp<'a>(
+    shared: &'a Arc<Shared>,
+    plan: &'a Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    selected: crate::secure_udp::Settings,
+) -> impl Future<Output = io::Result<crate::secure_udp::Session>> + Send + 'a {
+    // Return the same selected setup future without another large poll frame.
+    authenticate_selected_secure_udp(shared, plan, accepted, deadline, selected, None)
+}
+#[cfg(unix)]
+async fn authenticate_selected_secure_udp(
     shared: &Arc<Shared>,
     plan: &Prepared,
     accepted: Accepted,
     deadline: Instant,
     selected: crate::secure_udp::Settings,
+    common: Option<&crate::secure_udp::common_transaction_profile::Profile>,
 ) -> io::Result<crate::secure_udp::Session> {
     use l2tunnel_runtime::secure_udp::establish;
     use l2tunnel_security::Role;
@@ -556,17 +568,31 @@ async fn authenticate_secure_udp(
     let mut observe = |value| setup::runtime(shared, accepted.operation, value);
     let session = match &plan.data.endpoint {
         Endpoint::SecureClient(credentials) => {
-            crate::secure_udp::connect_observed(
-                socket,
-                selected,
-                credentials.noise().attempt(),
-                credentials.member(),
-                credentials.admission(),
-                deadline,
-                &mut entropy,
-                &mut observe,
-            )
-            .await?
+            if let Some(profile) = common {
+                crate::secure_udp::connect_common_observed(
+                    socket,
+                    profile,
+                    credentials.noise().attempt(),
+                    credentials.member(),
+                    credentials.admission(),
+                    deadline,
+                    &mut entropy,
+                    &mut observe,
+                )
+                .await?
+            } else {
+                crate::secure_udp::connect_observed(
+                    socket,
+                    selected,
+                    credentials.noise().attempt(),
+                    credentials.member(),
+                    credentials.admission(),
+                    deadline,
+                    &mut entropy,
+                    &mut observe,
+                )
+                .await?
+            }
         }
         Endpoint::SecureServer(server) => {
             // This owner survives cancellation and every reconnect of this plan.
@@ -575,13 +601,23 @@ async fn authenticate_secure_udp(
             check(deadline)?;
             if admission.is_none() {
                 setup::stage(shared, accepted.operation, SetupStage::Configuration);
-                *admission = Some(crate::secure_udp::Server::new(
-                    selected,
-                    server.credentials.noise().peers(role),
-                    server.credentials.admission(),
-                    server.credentials.cookie(),
-                    Instant::now(),
-                )?);
+                *admission = Some(if let Some(profile) = common {
+                    crate::secure_udp::Server::new_common(
+                        profile,
+                        server.credentials.noise().peers(role),
+                        server.credentials.admission(),
+                        server.credentials.cookie(),
+                        Instant::now(),
+                    )?
+                } else {
+                    crate::secure_udp::Server::new(
+                        selected,
+                        server.credentials.noise().peers(role),
+                        server.credentials.admission(),
+                        server.credentials.cookie(),
+                        Instant::now(),
+                    )?
+                });
             }
             admission
                 .as_mut()

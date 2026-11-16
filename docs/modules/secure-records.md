@@ -1,4 +1,4 @@
-# Pure authenticated record and cover composition
+# Pure record protection and cover composition
 
 Status: **implemented, protocol-tested and finite local UDP composition-tested**,
 2026-11-13. The initial 41-byte draft passed its original 15-test run; the revised
@@ -8,6 +8,30 @@ accepted in parent implementation review. This module composes the existing
 [packet protection](packet-security.md) and [appearance codecs](carrier-appearance.md)
 under the [common session contract](secure-session.md). It does not complete the
 handshake, negotiation, client/service API, native forwarding or mode-switch gates.
+
+## Explicit compact extension
+
+The 2026-11-16 additive `Records::new_compact` path has six purpose-separated
+owners: Data, Feedback and Control in each direction. Its final packet is
+`[kind/reader: 1][low packet number: 4][algorithm body][check: 4 or 16]`.
+Data costs 9 outer bytes; strong feedback and management cost 21. Initial
+appearance is not repeated on this selected established UDP path. Algorithm
+metadata, packing and base IP/UDP/TCP bytes are additional costs.
+
+Full scope/configuration remain local protection context. Registered reader
+slots follow the same stage/activate/retire lifecycle without resetting packet
+or replay owners. `Opened` explicitly reports `feedback` and `authenticated`;
+CRC data grants no control, retiring-feedback or authenticated liveness rights.
+`capacity_for` reports the exact selected kind cost, while `capacity` conservatively
+uses the strong cost. `seal_compact_arq_in` consumes the actual borrowed algorithm
+union directly without a legacy recovery or Reliable envelope.
+
+The 23-case final-record suite includes both selected data profiles, exact sizes,
+scope-slot reuse, failed-output custody and a real-UDP CompactARQ composition.
+The [compact checkpoint](compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
+separately records genuine Swift UDP establishment and shared-service evidence.
+Other algorithm/runtime and raw TCP migration gates remain open. The ownership,
+API excerpt and framing descriptions below document the preserved legacy route.
 
 ## Scope and ownership
 

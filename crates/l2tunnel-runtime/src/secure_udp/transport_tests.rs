@@ -258,12 +258,29 @@ fn context(established: &establish::Established) -> member::Settings {
         receive_packets_per_interval: 64,
     }
 }
-async fn authenticated(
+fn authenticated(
     socket: StdUdp,
     path: gate::Path,
     kind: cover::Appearance,
     client: bool,
     selected_cover: Option<cover::Config>,
+) -> impl std::future::Future<Output = Result<member::Parts>> {
+    authenticated_for_configuration(
+        socket,
+        path,
+        kind,
+        client,
+        selected_cover,
+        security::ConfigDigest([3; 32]),
+    )
+}
+async fn authenticated_for_configuration(
+    socket: StdUdp,
+    path: gate::Path,
+    kind: cover::Appearance,
+    client: bool,
+    selected_cover: Option<cover::Config>,
+    configuration: security::ConfigDigest,
 ) -> Result<member::Parts> {
     let local = hs::LocalSecret::new(Zeroizing::new(if client { [11; 32] } else { [22; 32] }));
     let initiator = hs::LocalSecret::new(Zeroizing::new([11; 32])).public_key();
@@ -300,7 +317,7 @@ async fn authenticated(
         },
         profile: hs::Profile::Ik,
         binding: establish::Binding {
-            configuration: [3; 32],
+            configuration: configuration.0,
             carrier: [4; 32],
             outer: [5; 32],
             member: [6; 32],
@@ -957,9 +974,16 @@ fn parts_pair(
     parts_pair_with_covers(kind, None)
 }
 
-async fn parts_pair_with_covers(
+fn parts_pair_with_covers(
     kind: cover::Appearance,
     selected: Option<[cover::Config; 2]>,
+) -> impl std::future::Future<Output = Result<(member::Parts, member::Parts)>> {
+    parts_pair_with_configuration(kind, selected, security::ConfigDigest([3; 32]))
+}
+async fn parts_pair_with_configuration(
+    kind: cover::Appearance,
+    selected: Option<[cover::Config; 2]>,
+    configuration: security::ConfigDigest,
 ) -> Result<(member::Parts, member::Parts)> {
     let a = StdUdp::bind("127.0.0.1:0")?;
     let b = StdUdp::bind("127.0.0.1:0")?;
@@ -975,8 +999,8 @@ async fn parts_pair_with_covers(
         [Some(client), Some(server)]
     });
     tokio::try_join!(
-        authenticated(a, path, kind, true, client_cover),
-        authenticated(b, path, kind, false, server_cover)
+        authenticated_for_configuration(a, path, kind, true, client_cover, configuration),
+        authenticated_for_configuration(b, path, kind, false, server_cover, configuration)
     )
 }
 fn source(driver: &mut Driver, now: u64, number: u8) -> Result<Vec<u8>> {

@@ -7,6 +7,17 @@ block/sliding/hybrid families in [mode parity](../mode-parity.md). The
 [architecture](../architecture.md) and [implementation plan](../implementation-plan.md)
 remain authoritative. No socket, clock or cryptographic implementation is added.
 
+The additive selected CompactARQ path also accepts an encoder of the actual
+borrowed `CompactPacketView` through `poll_compact_with` and its data/feedback
+variants. `CompactOverheads` separates data from strongly authenticated feedback
+cost before an attempt is committed. Encoder error or `None` retains original
+custody; accepted output retains the existing physical witness until confirmation.
+This path omits the eight-byte Reliable envelope and exposes `receive_compact_view_at`
+without reparsing a private legacy wrapper. The 40-case suite and direct final
+record/UDP composition are recorded in the [compact checkpoint](compact-wire-cleanup.md#selected-checkpoint-evidence).
+The configuration and envelope costs below describe preserved compatibility
+paths; this addition does not migrate Aligned/Packed or the other FEC profiles.
+
 ## Canonical configuration and API
 
 `Reliable::new(config: ReliableConfig, context: RecoveryContext)` owns one ARQ

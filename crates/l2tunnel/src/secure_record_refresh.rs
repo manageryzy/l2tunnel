@@ -93,13 +93,13 @@ impl Records {
     fn refreshed(&self) -> Result<&sec::Owners, Error> {
         match &self.owners {
             Owners::Refreshable(owners) => Ok(&owners[0]),
-            Owners::Legacy { .. } => Err(sec::Error::Mode.into()),
+            Owners::Legacy { .. } | Owners::Compact(_) => Err(sec::Error::Mode.into()),
         }
     }
     fn refreshed_mut(&mut self) -> Result<&mut sec::Owners, Error> {
         match &mut self.owners {
             Owners::Refreshable(owners) => Ok(&mut owners[0]),
-            Owners::Legacy { .. } => Err(sec::Error::Mode.into()),
+            Owners::Legacy { .. } | Owners::Compact(_) => Err(sec::Error::Mode.into()),
         }
     }
     /// Actual local crypto selector; never a setter or an authentication proof.
@@ -242,6 +242,8 @@ impl Records {
                 number: opened.record.number,
                 generation: opened.record.generation,
                 bytes: opened.record.bytes,
+                feedback: false,
+                authenticated: true,
             },
             key_epoch: opened.key_epoch,
             ratchet_base: opened.ratchet_base,

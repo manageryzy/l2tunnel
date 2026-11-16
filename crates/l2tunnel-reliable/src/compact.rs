@@ -3,6 +3,8 @@ use super::*;
 use l2tunnel_recovery::{
     CompactArqConfig, CompactPacketView, CompactRepeat, inspect_compact_packet,
 };
+mod output;
+pub use output::{CompactOutput, CompactOutputError, CompactOverheads};
 
 /// Complete R0 data-direction policy, with no unused FEC configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

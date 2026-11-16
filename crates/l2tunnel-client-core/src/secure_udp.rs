@@ -370,6 +370,59 @@ pub async fn connect_observed(
     let effective = settings
         .runtime(security::Role::Initiator, peers)
         .inspect_err(|_| configuration_failure(observe))?;
+    connect_effective_observed(
+        socket, settings, effective, identity, member, admission, deadline, entropy, observe,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_common_observed(
+    socket: UdpSocket,
+    profile: &common_transaction_profile::Profile,
+    identity: establish::Identity,
+    member: &identity::IdentityKey,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+) -> io::Result<Session> {
+    observe(diagnostics::Observation::new(
+        diagnostics::Stage::Configuration,
+    ));
+    let settings = profile.settings();
+    if member.public_key() != settings.member
+        || identity.local.public_key() != profile.peers().initiator
+        || identity.peer != profile.peers().responder
+    {
+        configuration_failure(observe);
+        return Err(invalid(
+            "Common client credentials differ from the configured trust",
+        ));
+    }
+    let effective = profile
+        .establish_config(security::Role::Initiator)
+        .inspect_err(|_| configuration_failure(observe))?;
+    connect_effective_observed(
+        socket, settings, effective, identity, member, admission, deadline, entropy, observe,
+    )
+    .await
+}
+
+// Both factories consume an actual typed selection before the same Noise/member
+// exchange. No public digest setter, copied Info or independent setup loop exists.
+#[allow(clippy::too_many_arguments)]
+async fn connect_effective_observed(
+    socket: UdpSocket,
+    settings: Settings,
+    effective: establish::Config,
+    identity: establish::Identity,
+    member: &identity::IdentityKey,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+) -> io::Result<Session> {
     let established = establish::connect_observed(
         socket, effective, identity, admission, deadline, entropy, observe,
     )
@@ -408,6 +461,37 @@ impl Server {
         origin: Instant,
     ) -> io::Result<Self> {
         let effective = settings.runtime(security::Role::Responder, peers)?;
+        Self::from_effective(settings, peers, effective, admission, cookie, origin)
+    }
+    pub(crate) fn new_common(
+        profile: &common_transaction_profile::Profile,
+        peers: establish::Peers,
+        admission: gate::Secret,
+        cookie: gate::Secret,
+        origin: Instant,
+    ) -> io::Result<Self> {
+        if peers != profile.peers() {
+            return Err(invalid(
+                "Common server credentials differ from configured pins",
+            ));
+        }
+        Self::from_effective(
+            profile.settings(),
+            peers,
+            profile.establish_config(security::Role::Responder)?,
+            admission,
+            cookie,
+            origin,
+        )
+    }
+    fn from_effective(
+        settings: Settings,
+        peers: establish::Peers,
+        effective: establish::Config,
+        admission: gate::Secret,
+        cookie: gate::Secret,
+        origin: Instant,
+    ) -> io::Result<Self> {
         let admission =
             establish::ServerAdmission::new(effective, peers, admission, cookie, origin)
                 .map_err(runtime_error)?;

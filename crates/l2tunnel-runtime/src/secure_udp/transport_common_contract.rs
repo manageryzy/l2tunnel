@@ -29,8 +29,11 @@ pub struct CommonTransactionContract {
     extra_wire_bytes: usize,
     outer: Option<establish::carrier::AuthenticatedOuter>,
     raw: Option<establish::raw_carrier::AuthenticatedRaw>,
+    compact_wire: Option<record::compact::Selection>,
 }
 
+#[path = "transport_common_wire_contract.rs"]
+mod compact_wire;
 #[path = "transport_common_fragment_policy.rs"]
 mod fragments;
 
@@ -365,6 +368,42 @@ impl CommonTransactionContract {
         raw: Option<establish::raw_carrier::AuthenticatedRaw>,
         duplex: core::Duplex,
     ) -> io::Result<Self> {
+        Self::construct_physical_selected(
+            expected,
+            role,
+            resources,
+            cover,
+            ipv6,
+            envelope,
+            catalog,
+            settings,
+            managed,
+            extra_wire_bytes,
+            outer,
+            physical,
+            raw,
+            duplex,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn construct_physical_selected(
+        expected: security::ConfigDigest,
+        role: security::Role,
+        resources: Config,
+        cover: cover::Config,
+        ipv6: bool,
+        envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        managed: Option<managed::Managed>,
+        extra_wire_bytes: usize,
+        outer: Option<establish::carrier::AuthenticatedOuter>,
+        physical: usize,
+        raw: Option<establish::raw_carrier::AuthenticatedRaw>,
+        duplex: core::Duplex,
+        compact_wire: Option<record::compact::Selection>,
+    ) -> io::Result<Self> {
         let initial = common::Configuration::new(envelope, catalog.initial()).map_err(invalid)?;
         if initial.descriptor().duplex() != duplex {
             if duplex == core::Duplex::Full {
@@ -387,45 +426,71 @@ impl CommonTransactionContract {
         if resources.path_mtu != initial.descriptor().path_mtu() {
             return Err(invalid("initial common MTU differs from resource template"));
         }
-        let protected = resources
-            .security
-            .max_body_bytes
-            .checked_add(record::ROUTE_BYTES)
-            .and_then(|value| {
-                value.checked_add(security::Protection::ChaCha20Poly1305.overhead_bytes())
-            })
-            .and_then(|value| {
-                value.checked_add(if managed.is_some() {
+        let (overhead, control_overhead) = if let Some(selection) = compact_wire {
+            selection.validate().map_err(invalid)?;
+            if managed.is_some() || outer.is_some() || raw.is_some() || extra_wire_bytes != 0 {
+                return Err(invalid(
+                    "compact wire requires the explicitly selected original UDP path",
+                ));
+            }
+            if resources
+                .security
+                .max_body_bytes
+                .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+                .is_none_or(|bytes| bytes > cover.limits().max_packet_bytes)
+            {
+                return Err(invalid("compact security exceeds packet storage capacity"));
+            }
+            (
+                physical
+                    .checked_add(record::compact::DATA_OVERHEAD)
+                    .ok_or_else(exhausted)?,
+                physical
+                    .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+                    .ok_or_else(exhausted)?,
+            )
+        } else {
+            let protected = resources
+                .security
+                .max_body_bytes
+                .checked_add(record::ROUTE_BYTES)
+                .and_then(|value| {
+                    value.checked_add(security::Protection::ChaCha20Poly1305.overhead_bytes())
+                })
+                .and_then(|value| {
+                    value.checked_add(if managed.is_some() {
+                        security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
+                    } else {
+                        0
+                    })
+                })
+                .ok_or_else(exhausted)?;
+            if managed.is_some() && protected > cover.limits().max_protected_bytes {
+                return Err(invalid(
+                    "managed security exceeds covered protected capacity",
+                ));
+            }
+            let header = cover
+                .overhead(cover::Phase::Established, protected)
+                .map_err(invalid)?;
+            if protected
+                .checked_add(header)
+                .is_none_or(|bytes| bytes > cover.limits().max_packet_bytes)
+            {
+                return Err(invalid("common security exceeds covered storage capacity"));
+            }
+            let overhead = record::ROUTE_BYTES
+                + security::Protection::ChaCha20Poly1305.overhead_bytes()
+                + header
+                + physical
+                + if managed.is_some() {
                     security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
                 } else {
                     0
-                })
-            })
-            .ok_or_else(exhausted)?;
-        if managed.is_some() && protected > cover.limits().max_protected_bytes {
-            return Err(invalid(
-                "managed security exceeds covered protected capacity",
-            ));
-        }
-        let header = cover
-            .overhead(cover::Phase::Established, protected)
-            .map_err(invalid)?;
-        if protected
-            .checked_add(header)
-            .is_none_or(|bytes| bytes > cover.limits().max_packet_bytes)
-        {
-            return Err(invalid("common security exceeds covered storage capacity"));
-        }
-        let overhead = record::ROUTE_BYTES
-            + security::Protection::ChaCha20Poly1305.overhead_bytes()
-            + header
-            + physical
-            + if managed.is_some() {
-                security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
-            } else {
-                0
-            };
-        if resources.control.wire_overhead != overhead {
+                };
+            (overhead, overhead)
+        };
+        if resources.control.wire_overhead != control_overhead {
             return Err(invalid("common control wire charge differs"));
         }
         let geometry = engine::Geometry {
@@ -452,6 +517,7 @@ impl CommonTransactionContract {
             extra_wire_bytes,
             outer,
             raw,
+            compact_wire,
         };
         for value in result.catalog.configurations(envelope).map_err(invalid)? {
             result.resolve(value)?;
@@ -667,6 +733,14 @@ impl CommonTransactionContract {
         {
             return Err(invalid("common value outside exact authenticated catalog"));
         }
+        if self.compact_wire.is_some()
+            && !matches!(value.descriptor().profile(), common::Profile::Swift { .. })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compact wire currently requires an actual Swift record owner",
+            ));
+        }
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);
             let view = value.descriptor().direction(sender);
@@ -712,10 +786,17 @@ impl CommonTransactionContract {
                 };
                 (
                     maximum,
-                    maximum.checked_add(overhead).ok_or_else(exhausted)?,
+                    maximum
+                        .checked_add(if self.compact_wire.is_some() {
+                            self.feedback_overhead_bytes()?
+                        } else {
+                            overhead
+                        })
+                        .ok_or_else(exhausted)?,
                 )
             };
             if physical_body > self.resources.security.max_body_bytes
+                || (self.compact_wire.is_some() && wire > value.descriptor().path_mtu())
                 || value.descriptor().path_mtu() < self.control_maximum()?
                 || wire
                     .checked_add(self.reserve()?)
@@ -748,7 +829,7 @@ impl CommonTransactionContract {
             .checked_add(recovery::DATA_HEADER_BYTES + recovery::ACK_PACKET_BYTES)
             .and_then(|bytes| {
                 bytes
-                    .checked_add(2 * (self.geometry.forward_overhead_bytes + streams::HEADER_BYTES))
+                    .checked_add(2 * (self.resources.control.wire_overhead + streams::HEADER_BYTES))
             })
             .ok_or_else(exhausted)
     }
@@ -758,7 +839,7 @@ impl CommonTransactionContract {
             .recovery
             .max_source_bytes
             .checked_add(recovery::DATA_HEADER_BYTES + streams::HEADER_BYTES)
-            .and_then(|bytes| bytes.checked_add(self.geometry.forward_overhead_bytes))
+            .and_then(|bytes| bytes.checked_add(self.resources.control.wire_overhead))
             .ok_or_else(exhausted)
     }
     fn validate_message_capacity(&self) -> io::Result<()> {

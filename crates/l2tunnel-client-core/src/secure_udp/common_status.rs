@@ -4,6 +4,12 @@ use l2tunnel::record_configuration::{CONFIGURATION_BYTES, Configuration};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, io};
 
+#[path = "common_compact_status.rs"]
+mod compact_wire;
+pub use compact_wire::{
+    CompactCheckCounts, CompactDataProtection, CompactWireSelection, CompactWireStatus,
+};
+
 #[path = "common_ack.rs"]
 mod ack;
 pub use ack::{AckObservation, AckPolicies, AckPolicy, AckRead, AckSelection, AckStatus};
@@ -232,6 +238,10 @@ pub struct Status {
     pub algorithm: String,
     /// Actual required integrity/confidentiality profile.
     pub protection: String,
+    /// Explicit compact request and actual installed state; absent for legacy bytes.
+    /// Heap-held so this optional observation does not inflate legacy response futures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_wire: Option<Box<CompactWireStatus>>,
     /// Explicit complete Common backend contract identifier.
     pub backend: String,
     /// Actual readiness, optionally overlaid false by service termination.
@@ -406,8 +416,11 @@ mod observe {
                 || info.member != settings.member
                 || info.local_addr != local
                 || info.peer_addr != peer
-                || snapshot
-                    .is_some_and(|value| value.info != info || value.configuration != configuration)
+                || snapshot.is_some_and(|value| {
+                    value.info != info
+                        || value.configuration != configuration
+                        || value.compact_wire != profile.compact_wire()
+                })
             {
                 return Err(invalid(
                     "transaction observation differs from retained authenticated plan",
@@ -543,7 +556,17 @@ mod observe {
                 original_carrier,
                 raw_carrier,
                 algorithm: "common-records".into(),
-                protection: "chacha20-poly1305".into(),
+                protection: profile
+                    .compact_wire()
+                    .map(CompactWireSelection::from_selection)
+                    .transpose()?
+                    .map_or("chacha20-poly1305", |value| value.data_protection.name())
+                    .into(),
+                compact_wire: profile
+                    .compact_wire()
+                    .map(|requested| CompactWireStatus::observe(requested, snapshot))
+                    .transpose()?
+                    .map(Box::new),
                 backend: "common_records_v2".into(),
                 running: snapshot.is_some_and(|value| value.running),
                 elapsed_micros: snapshot.map(|value| value.elapsed_micros),
@@ -660,7 +683,7 @@ mod observe {
                 configuration_change: true,
                 coordinator: info.role == Role::Initiator,
                 reconnect: true,
-                cross_profile_switching: true,
+                cross_profile_switching: profile.compact_wire().is_none(),
                 retained_state_recovery: false,
                 fresh_rekey: false,
                 rolling_work: profile

@@ -160,6 +160,52 @@ pub struct SessionRoot {
     owners: Vec<Domain>,
 }
 impl SessionRoot {
+    pub(crate) fn derive_compact(
+        &mut self,
+        purpose: Purpose,
+        direction: Direction,
+        lane: LaneId,
+        limits: Limits,
+        protection: crate::compact::Protection,
+        selection: crate::compact::Selection,
+    ) -> Result<(Zeroizing<[u8; 32]>, [u8; 88]), Error> {
+        selection.validate(limits)?;
+        if purpose != Purpose::Data && !protection.authenticated_control() {
+            return Err(Error::ContextMismatch);
+        }
+        let domain = Domain {
+            purpose,
+            direction,
+            lane,
+        };
+        if self.owners.contains(&domain) {
+            return Err(Error::DomainInUse);
+        }
+        if self.owners.len() == MAX_DOMAINS {
+            return Err(Error::DomainCapacity);
+        }
+        let mut context = [0; 88];
+        context[..4].copy_from_slice(&[
+            crate::compact::VERSION,
+            protection as u8,
+            purpose as u8,
+            direction as u8,
+        ]);
+        context[4..8].copy_from_slice(&lane.0.to_be_bytes());
+        context[8..24].copy_from_slice(&self.binding.session.0);
+        context[24..56].copy_from_slice(&self.binding.transcript);
+        context[56..64].copy_from_slice(&(limits.max_body_bytes as u64).to_be_bytes());
+        context[64..72].copy_from_slice(&limits.packets_per_key.to_be_bytes());
+        context[72..80].copy_from_slice(&limits.max_body_bytes_per_key.to_be_bytes());
+        context[80..84].copy_from_slice(&selection.max_forward_packets.to_be_bytes());
+        context[84..88].copy_from_slice(&selection.max_failed_checks.to_be_bytes());
+        let root = keys::expand(
+            &hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.root[..]),
+            &[b"l2tunnel/packet/v3/compact-domain\0", &context],
+        )?;
+        self.owners.push(domain);
+        Ok((root, context))
+    }
     pub(crate) fn managed_registry(&self, lane: LaneId, retired_joining: bool) -> bool {
         if !retired_joining {
             return self.owners.is_empty();

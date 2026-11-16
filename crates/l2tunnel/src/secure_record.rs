@@ -14,6 +14,10 @@ use framing::{Format, Route};
 #[path = "secure_record_refresh.rs"]
 pub mod refresh;
 
+/// Explicit compact packet selection with short data checks and authenticated feedback.
+#[path = "secure_record_compact.rs"]
+pub mod compact;
+
 /// Public route bytes before the complete common packet-security record.
 pub const ROUTE_BYTES: usize = 9;
 
@@ -55,7 +59,7 @@ pub struct DataReader {
     pub state: ReaderState,
 }
 
-/// Exact caller capacities for an opaque plaintext length.
+/// Checked caller capacities for an opaque plaintext length and selected framing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capacity {
     /// Plaintext bytes returned after successful opening.
@@ -92,6 +96,11 @@ pub struct Opened {
     pub generation: security::KeyGeneration,
     /// Plaintext bytes at the start of caller output.
     pub bytes: usize,
+    /// True for a compact Feedback branch protected by the separate strong owner.
+    /// Legacy User bodies retain their existing algorithm-level classification.
+    pub feedback: bool,
+    /// False only for explicitly selected compact ChaCha20/CRC32C data.
+    pub authenticated: bool,
 }
 
 /// Structural, local-state, capacity or maintained-protection rejection.
@@ -109,6 +118,8 @@ pub enum Error {
     TooLarge,
     /// Workspace or final output cannot hold the complete result.
     OutputTooSmall,
+    /// The bounded selected owner backing could not be reserved.
+    Allocation,
     /// The selected structural cover rejected the packet or capacity.
     Cover(cover::Error),
     /// The maintained common security owner rejected the operation.
@@ -150,6 +161,7 @@ enum Owners {
         control_receiver: security::Receiver,
     },
     Refreshable(Vec<security::refresh::Owners>),
+    Compact(Vec<compact::Owners>),
 }
 
 /// Fixed-domain secure records, without clocks, I/O or per-packet allocations.
@@ -203,8 +215,13 @@ impl Records {
         })
     }
 
-    /// Exact checked capacities before reserving a sending packet number.
+    /// Checked maximum class capacity before reserving a sending packet number.
+    /// Legacy formats are class-independent. Compact callers use `capacity_for`
+    /// for exact wire charging; this method reserves the larger strong check.
     pub fn capacity(&self, plaintext_bytes: usize) -> Result<Capacity, Error> {
+        if self.is_compact() {
+            return self.capacity_for(compact::Kind::Control, plaintext_bytes);
+        }
         self.format()
             .capacity(self.cover, self.limits, self.protection, plaintext_bytes)
     }
@@ -222,6 +239,10 @@ impl Records {
             },
             // The private constructor retains exactly one immutable cell.
             Owners::Refreshable(owners) => owners[0].next_number(refresh::class(class)),
+            Owners::Compact(owners) => match class {
+                Class::User => owners[0].data_sender.next_number(),
+                Class::Control => owners[0].control_sender.next_number(),
+            },
         }
     }
 
@@ -254,6 +275,9 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = Some(requested);
+        if let Owners::Compact(owners) = &mut self.owners {
+            owners[0].additional_slot = Some((owners[0].data_slot + 1) & 0x3f);
+        }
         Ok(())
     }
 
@@ -268,6 +292,9 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = None;
+        if let Owners::Compact(owners) = &mut self.owners {
+            owners[0].additional_slot = None;
+        }
         Ok(())
     }
 
@@ -284,6 +311,11 @@ impl Records {
             })
         {
             return Err(Error::ScopeState);
+        }
+        if let Owners::Compact(owners) = &mut self.owners {
+            let next_slot = owners[0].additional_slot.ok_or(Error::ScopeState)?;
+            owners[0].additional_slot = Some(owners[0].data_slot);
+            owners[0].data_slot = next_slot;
         }
         self.additional = Some(DataReader {
             scope: self.data,
@@ -304,6 +336,9 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = None;
+        if let Owners::Compact(owners) = &mut self.owners {
+            owners[0].additional_slot = None;
+        }
         Ok(())
     }
 
@@ -351,6 +386,19 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
+        if self.is_compact() {
+            return self.seal_compact(
+                match class {
+                    Class::User => compact::Kind::Data,
+                    Class::Control => compact::Kind::Control,
+                },
+                scope,
+                outer,
+                plaintext,
+                workspace,
+                output,
+            );
+        }
         if matches!(self.owners, Owners::Refreshable(_)) {
             return Err(security::refresh::Error::Mode.into());
         }
@@ -381,6 +429,9 @@ impl Records {
         workspace: &mut [u8],
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
+        if self.is_compact() {
+            return self.open_compact(packet, workspace, plaintext);
+        }
         if matches!(self.owners, Owners::Refreshable(_)) {
             return Err(security::refresh::Error::Mode.into());
         }
@@ -407,6 +458,8 @@ impl Records {
             number: opened.number,
             generation: opened.generation,
             bytes: opened.bytes,
+            feedback: false,
+            authenticated: true,
         })
     }
 

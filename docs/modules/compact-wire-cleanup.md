@@ -1,12 +1,12 @@
 # Compact final wire format and implementation cleanup
 
-Status: **structural prerequisite implemented; regression qualification remains
-open; compact format planned**. The owner authorized implementation after
-reviewing the current encapsulation costs. The first batch consolidates actual
-codec, recovery, security and facade call sites while preserving existing wire
-bytes. It does not install or qualify the compact format described here. Two
-runtime regression gates remain unresolved below, so CWC-02 and every other CWC
-task remain unchecked. Existing receipts and formats remain historical evidence.
+Status: **selected compact format implemented and finite original-UDP/shared-service
+integration-tested; full migration open**. The owner authorized implementation after
+reviewing encapsulation costs. The first structural checkpoint preserves legacy
+bytes and its retained regression failures. The additive selected-format
+checkpoint below installs real compact protection/encoding and original-UDP
+runtime paths; its validation remains explicitly scoped. Existing receipts,
+formats, every P-* requirement and all CWC acceptance definitions remain intact.
 
 ## Accepted direction and open engineering choices
 
@@ -30,18 +30,16 @@ overhead separately. A branch that does not fit must report its concrete limit
 or required design change; it cannot silently truncate, reduce functionality or
 invent an unchecked exception.
 
-The four-byte data-check candidates discussed are **AES-CCM with a four-byte
-tag** and **ChaCha20 with CRC32C**. Neither a dependency/provider, exact primitive
-API, wire bit assignment, nonce layout nor default has been selected by this
-document. These candidates have different security properties: CRC32C is an
-unkeyed corruption check, not authentication, and ChaCha20 plus CRC32C must not be
-described as AEAD or as satisfying the existing authenticated-packet contract.
-The chosen threat, forgery/replay, key-use and failure bounds require an explicit
-contract before data-path installation. Use maintained implementations; do not
-invent a primitive or truncate a provider's tag without supported semantics.
-Management and acknowledgments that retire reliable debt remain authenticated
-and replay-protected, including when carried by a lossy feedback stream. A
-four-byte data-check proposal does not reduce their authentication contract.
+The owner selected two explicit four-byte data profiles in the original design
+review: **AES-CCM with a four-byte tag** and **ChaCha20 with CRC32C**. Neither
+becomes an implicit default. CRC32C is an unkeyed corruption check, not
+authentication; its successful verification cannot authorize management or
+reliable-retiring feedback. Both keep bounded replay and parser/state handling.
+The implementation choices below are engineering choices, not additional owner
+decisions. Maintained providers implement the selected primitives; the CCM tag
+uses its native four-byte parameter rather than truncating a ChaCha tag.
+Management and acknowledgments that retire reliable debt retain independent
+strong authentication, including feedback carried by the same lossy data path.
 
 The typed Rust union and the wire format are distinct. An engineering proposal is
 a discriminated enum of typed source, repair and feedback views whose serializer
@@ -200,6 +198,142 @@ CWC-17 applies to every batch. Run affected regressions in bounded parallel,
 reuse unchanged source-bound evidence explicitly and complete the required
 `tools/check.py` stages. Preserve failures and unrun gates.
 
+## Selected compact implementation checkpoint
+
+The additive `security::compact` v3 owners and `secure_record::compact` facade
+implement the selected data checks with one final protection operation. The
+wire has one kind/registered-reader byte, a four-byte low packet number, the
+selected algorithm body and its check. Data adds **9 bytes** outside the
+algorithm body; authenticated feedback and management add **21 bytes**. Neither
+number includes algorithm metadata, symbol-internal packing/context bytes or
+base IP/UDP/TCP headers. Existing v1/v2 and Swift compatibility bytes remain
+separately selectable.
+
+Engineering choices are pinned RustCrypto AES/CCM, ChaCha20 and CRC32C providers,
+and maintained ring ChaCha20-Poly1305 for strong feedback/management. Full packet
+numbers remain u64, with bounded nearest reconstruction of the low32 wire word,
+the existing 4096-packet replay window and adjacent symmetric key generations.
+Each selected receiver has an explicit lifetime failed-check allowance and
+forward-gap bound. Successful opens and data-scope switches do not reset these
+allowances. These bounds introduce no periodic DH exchange or reconnect timer.
+Complete session, direction, lane, suite, limits, epoch and configuration remain
+bound by the selected key/AAD context. CRC success remains a corruption check.
+
+Data, retiring feedback and management have independent packet/key/replay owners.
+The final route selects only registered data readers or the fixed management
+scope. Reader slots are assigned by the existing stage/activate/retire lifecycle,
+not by truncating the full epoch; full scope metadata is checked even when a
+slot is later reused. The selected runtime rejects a feedback body arriving
+under a short-check Data route before recovery or liveness changes. CRC data
+cannot satisfy authenticated liveness or restore an unavailable path.
+
+CompactARQ now offers its actual borrowed `CompactPacketView` union to an encoder
+callback before committing the existing attempt/feedback custody. Canonical u64
+varints preserve source identity and attempt serial independently; the selected
+body omits L2AR context and the Reliable wrapper. The final Records encoder
+consumes that view directly. Reliable keeps its original physical confirmation
+slots, preflights the exact selected Data/Feedback charge before the callback,
+and commits one debit with the accepted output.
+Source metadata uses 2 bytes for initial small identities and at most 20 bytes for
+full-width values; feedback has up to 53 scalar bytes plus its exact bitmap.
+These are variable costs, not a universal 24-byte guarantee.
+
+The first runtime route selects compact framing explicitly before genuine
+Noise/member establishment and binds both resource inventories, the entire
+catalog and the wire selection into H0. It reuses the original UDP driver,
+Engine/Bank, management and physical output custody. Its current accepted
+catalog contains Swift profiles only; unsupported profiles are refused without
+catalog pruning or fallback. Swift's existing 5-byte source header makes its
+source overhead 14 bytes before packing/context metadata and base IP/UDP.
+A distinct strong-feedback allowance is checked before producing feedback;
+WouldBlock retains the same complete ciphertext and original deadline.
+
+This checkpoint does **not** complete Aligned/Packed identity elision, compact
+Common runtime for the other algorithms, raw TCP bootstrap-to-single-protection,
+full SW-11/all47 migration, or fixed1460/MTU1500/global8192/local128 qualification.
+The current low32 packet prefix itself does not prove the original 1460-byte
+repair geometry fits; that remains an explicit CWC-11 acceptance obligation.
+No existing scope or P-* definition is reduced by the first selected route.
+Validation and shared API/CLI evidence are recorded in the
+[selected checkpoint evidence](#selected-checkpoint-evidence).
+
+### Explicit shared API/CLI selection
+
+The shared client/service `Profile::new_compact` constructor and the existing
+`--record-profile common --common-transaction-plan PATH` selector install the
+same compact contract. Add this optional object to the complete version 1
+`common_records_v2` plan:
+
+```json
+"compact_wire": {
+  "version": 3,
+  "data_protection": "aes-ccm-4",
+  "max_forward_packets": 8192,
+  "max_failed_checks": 64
+}
+```
+
+`chacha20-crc32c` is the other explicit data selection. The example limits are
+fixture values, not defaults. Omitting the object preserves legacy selection;
+null, missing/unknown fields and unsupported versions or suites are refused.
+The forward allowance must be 1 through 2147483647 and is also bounded by the
+configured `packets_per_key`; the positive u32 failed-check limit applies to each
+receiving owner's lifetime. No successful packet or data switch renews it.
+
+Current installation accepts full-duplex original UDP with complete Swift-only
+catalogs and initial-only QUIC-like or media-like appearance. Unsupported
+catalogs, OpenVPN, raw TCP and proxy selections are refused without pruning or
+fallback; they remain migration obligations. The selected H0 reaches the actual
+Noise/member establishment factory before the session is released. Offline
+inspection reports the requested selection with `effective: null`; API4 reports
+the effective selection, independent feedback number and failed-check counts
+from an actual matching runtime snapshot. CRC data is never reported as
+authenticated data. Management, Pong and retiring feedback keep their separate
+strong protection domains.
+
+### Selected checkpoint evidence
+
+The [batch aggregate](../../work/compact-wire-v3-20261116/batch-summary.json)
+links exact commands, source hashes and retained attempts. This is a scoped
+composition of checks and follow-ups, not a pristine single `check.py` run.
+
+- Security (26), recovery (57), Reliable (40) and final Records (23) cases pass,
+  including the new short-check/domain/counter vectors and actual UDP
+  CompactARQ source loss, retry, feedback authentication and physical charging.
+- The selected runtime case performs genuine H0-bound Noise/member setup on
+  the original UDP sockets for both appearances and both data profiles. It
+  checks actual 9/21-byte framing, held ciphertext/debit, corruption, replay,
+  feedback authority, bidirectional delivery, authenticated liveness and two
+  negotiated Swift configurations. It is not full cross-profile SW-11 evidence.
+- The actual shared-service case authenticates that same selected H0, transfers
+  bidirectional Unix-device bytes, observes newer authenticated Pong and API4
+  requested/effective state, and releases the original owners. The complete
+  affected client library passes **372 cases**, including strict CLI inspection
+  and the earlier measured-proxy case. These are user-space integration cases,
+  not privileged TAP/TUN or native platform qualification.
+- The required check first found a test-module import error, then the resumed
+  workspace run retained three runtime failures and an aborted client binary.
+  Each failed runtime case passed one bounded, parallel, unchanged-binary
+  recheck. The earlier Packed flight/pressure case passed in the workspace run.
+  These later passes do not establish the causes of the earlier timing failures.
+- GDB reproduced the client stack overflow during paired OpenVPN TLS setup.
+  Heap-holding the new optional compact status alone was insufficient. The
+  existing setup operation is now pinned outside nested timeout poll frames;
+  both original deadline checks and cancellation remain. The unchanged
+  default-stack OpenVPN/API regression and complete client library then pass.
+  Both failed attempts and debugger traces remain retained.
+- Workspace Clippy, affected client Clippy, codec no-default-features (109),
+  strict rustdoc, CLI plan/refusal, actual external UDP/CLI processes, **421
+  Python tooling cases** and **1,658 simulator cases** pass in their recorded
+  stages. A rustdoc comment-link correction is documentation-only; its failed
+  attempt is retained. The aggregate contains passing evidence for **2,458
+  workspace Rust cases**, assembled from the completed workspace targets,
+  affected client run and three runtime rechecks, with their distinct scopes.
+
+No new privileged lab, capture, ISP/QoS measurement, throughput result or native
+Windows/Android execution is claimed. The full CWC acceptance definitions below
+remain unchanged; this checkpoint does not close the complete migration.
+
 ## First structural checkpoint evidence
 
 The actual Compact source/feedback emitters and parser now share the borrowed
@@ -238,7 +372,10 @@ and its source hashes, commands and linked logs:
   flow. Total bytes, original caps and all final acceptance assertions remain
   unchanged. Its affected Clippy/build passed; its single-case regression did not.
 
-Two runtime gates remain open and prevent CWC-02 regression qualification:
+At this historical checkpoint, two runtime gates remained open and prevented
+CWC-02 regression qualification. Both subsequently pass in the selected batch
+above; the failed observations below remain historical evidence, not reclassified
+successes or an established root-cause diagnosis:
 
 - `measured_common_real_udp_native_pressure_measurements_and_retained_close` now
   delivers both exact streams (32,769 and 16,387 bytes) and clears pressure. The

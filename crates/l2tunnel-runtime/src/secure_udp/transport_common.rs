@@ -37,6 +37,12 @@ pub struct SameFlowRecovery {
 /// Actual generic transaction state, separate from legacy Swift policy status.
 #[derive(Clone, Debug)]
 pub struct CommonSnapshot {
+    /// Explicit selected final record format; None preserves legacy framing.
+    pub compact_wire: Option<record::compact::Selection>,
+    /// Last actual strong feedback PN, independent from the Data repair seed.
+    pub compact_feedback_number: Option<security::PacketNumber>,
+    /// Actual sticky per-domain check failures under the original selected cap.
+    pub compact_check_status: Option<record::compact::CheckStatus>,
     /// True only after the sole native runtime publishes readiness.
     pub running: bool,
     /// Injected microseconds since the original driver origin.
@@ -178,6 +184,7 @@ pub(super) struct PendingRequest {
 pub(super) struct PendingWire {
     pub(super) scope: Scope,
     pub(super) sealed: record::Sealed,
+    pub(super) feedback: bool,
     pub(super) cost: usize,
     pub(super) deadline: u64,
     pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
@@ -218,6 +225,7 @@ pub(super) struct Runtime {
     pub(super) sealed: Option<PendingWire>,
     pub(super) wire: Vec<u8>,
     pub(super) pending_feedback: Option<PendingFeedback>,
+    pub(super) compact_feedback_number: Option<security::PacketNumber>,
     pub(super) pending_ingress: Option<PendingIngress>,
     pub(super) feedback_input: Vec<u8>,
     pub(super) connection_input: Option<common_connections::Input>,
@@ -500,15 +508,27 @@ impl Driver {
                 if contract.refresh_selection().is_some() {
                     return Err(invalid("legacy material cannot install managed Records"));
                 }
-                record::Records::new(
-                    root,
-                    security::LaneId(LANE),
-                    config.security,
-                    security::Protection::ChaCha20Poly1305,
-                    input.cover,
-                    control_scope,
-                    data_scope,
-                )
+                if let Some(selection) = contract.compact_wire() {
+                    record::Records::new_compact(
+                        root,
+                        security::LaneId(LANE),
+                        config.security,
+                        input.cover,
+                        control_scope,
+                        data_scope,
+                        selection,
+                    )
+                } else {
+                    record::Records::new(
+                        root,
+                        security::LaneId(LANE),
+                        config.security,
+                        security::Protection::ChaCha20Poly1305,
+                        input.cover,
+                        control_scope,
+                        data_scope,
+                    )
+                }
             }
             establish::InitialMaterial::Managed(initial) => {
                 if Some(initial.selection()) != contract.refresh_selection()
@@ -614,6 +634,7 @@ impl Driver {
                 )
             })
             .and_then(|v| v.checked_add(reuse_bytes))
+            .and_then(|v| v.checked_add(records.compact_owner_bytes()))
             .and_then(|v| v.checked_add(message_bytes))
             .and_then(|v| v.checked_add(input.io_capacity))
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
@@ -746,6 +767,7 @@ impl Driver {
                         sealed: None,
                         wire,
                         pending_feedback: None,
+                        compact_feedback_number: None,
                         pending_ingress: None,
                         feedback_input,
                         connection_input,
@@ -834,6 +856,9 @@ impl Driver {
         counters.native_storage_capacity_bytes = self.native.capacity_bytes();
         counters.workspace_capacity_bytes = self.buffers.capacity_bytes();
         Ok(CommonSnapshot {
+            compact_wire: runtime.contract.compact_wire(),
+            compact_check_status: self.records.compact_check_status(),
+            compact_feedback_number: runtime.compact_feedback_number,
             running,
             elapsed_micros: now,
             info: self.info,

@@ -10,12 +10,14 @@ use crate::{cover, security};
 pub(super) enum Format {
     Initial,
     Refreshable,
+    Compact,
 }
 impl Format {
     pub(super) const fn prefix_bytes(self) -> usize {
         match self {
             Self::Initial => security::COMMON_PREFIX_BYTES,
             Self::Refreshable => security::refresh::PREFIX_BYTES,
+            Self::Compact => 4,
         }
     }
 
@@ -26,6 +28,9 @@ impl Format {
         protection: security::Protection,
         plaintext_bytes: usize,
     ) -> Result<Capacity, Error> {
+        if matches!(self, Self::Compact) {
+            return super::compact::capacity(cover, limits, 16, plaintext_bytes);
+        }
         if plaintext_bytes > limits.max_body_bytes {
             return Err(Error::TooLarge);
         }
@@ -88,6 +93,7 @@ impl Records {
         match self.owners {
             Owners::Legacy { .. } => Format::Initial,
             Owners::Refreshable(_) => Format::Refreshable,
+            Owners::Compact(_) => Format::Compact,
         }
     }
 

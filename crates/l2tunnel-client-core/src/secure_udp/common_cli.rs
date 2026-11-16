@@ -17,6 +17,7 @@ pub(super) struct Plan {
     rolling_ingress: Option<crate::secure_udp::common_status::RollingIngressPolicies>,
     connection_ingress: Option<crate::secure_udp::common_status::ConnectionIngressPolicies>,
     rolling_fragments: Option<crate::secure_udp::common_status::RollingFragments>,
+    compact_wire: Option<crate::secure_udp::common_status::CompactWireSelection>,
 }
 impl Plan {
     pub(super) fn read(path: &Path) -> io::Result<Self> {
@@ -37,6 +38,15 @@ impl Plan {
             .get(usize::from(dto.initial_index))
             .copied()
             .ok_or_else(|| invalid("initial index outside catalog"))?;
+        if let Some(value) = dto.compact_wire {
+            value.build()?;
+            if dto.outer_carrier.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "compact v3 currently requires the original UDP carrier",
+                ));
+            }
+        }
         Ok(Self {
             catalog: Catalog::new(initial, &dto.catalog.0).map_err(io::Error::other)?,
             parameters: dto.transaction.build(),
@@ -47,6 +57,7 @@ impl Plan {
             rolling_ingress: dto.rolling_ingress,
             connection_ingress: dto.connection_ingress,
             rolling_fragments: dto.rolling_fragments,
+            compact_wire: dto.compact_wire,
         })
     }
     pub(super) fn initial(&self) -> Descriptor {
@@ -220,6 +231,12 @@ impl Plan {
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        if self.compact_wire.is_some() && (raw.is_some() || proxy.is_some() || measured.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compact v3 currently requires the native Common original UDP backend",
+            ));
+        }
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
         let inert = l2tunnel_swift::policy::Direction {
@@ -243,6 +260,18 @@ impl Plan {
                     max_rto_micros: 1,
                 },
             },
+        };
+        let overhead = if self.compact_wire.is_some() {
+            let physical: usize = if settings.gate.path.client.is_ipv6() {
+                48
+            } else {
+                28
+            };
+            physical
+                .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+                .ok_or_else(|| invalid("compact control wire geometry overflow"))?
+        } else {
+            overhead
         };
         let mut configs = self.runtime.templates_for(
             self.initial().path_mtu(),
@@ -278,6 +307,18 @@ impl Plan {
             config.rolling_work = self.rolling_work;
             config.ack_coalescing = ack;
             config.rolling_ingress = rolling;
+        }
+        if let Some(selection) = self.compact_wire {
+            return secure_udp::common_transaction_profile::Profile::new_compact(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                selection.build()?,
+            );
         }
         if let Some(policy) = raw {
             return secure_udp::common_transaction_profile::Profile::new_raw(
@@ -341,6 +382,8 @@ struct PlanDto {
     transaction: TransactionDto,
     runtime: RuntimeDto,
     rolling_work: RequiredWork,
+    #[serde(default, deserialize_with = "selected_compact_wire")]
+    compact_wire: Option<crate::secure_udp::common_status::CompactWireSelection>,
     #[serde(default)]
     outer_carrier: Option<OuterCarrierDto>,
     #[serde(default, deserialize_with = "selected_ack")]
@@ -351,6 +394,11 @@ struct PlanDto {
     connection_ingress: Option<crate::secure_udp::common_status::ConnectionIngressPolicies>,
     #[serde(default, deserialize_with = "selected_fragments")]
     rolling_fragments: Option<crate::secure_udp::common_status::RollingFragments>,
+}
+fn selected_compact_wire<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::CompactWireSelection>, D::Error> {
+    crate::secure_udp::common_status::CompactWireSelection::deserialize(deserializer).map(Some)
 }
 fn selected_fragments<'de, D: Deserializer<'de>>(
     deserializer: D,

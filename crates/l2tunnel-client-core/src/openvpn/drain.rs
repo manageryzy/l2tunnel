@@ -61,21 +61,27 @@ fn check_deadline(expires: Instant) -> io::Result<()> {
         Ok(())
     }
 }
-async fn within<T>(
+fn within<T>(
     expires: Instant,
     operation: impl Future<Output = io::Result<T>>,
-) -> io::Result<T> {
-    check_deadline(expires)?;
-    let value = tokio::time::timeout_at(expires, operation)
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "native client original setup deadline",
-            )
-        })??;
-    check_deadline(expires)?;
-    Ok(value)
+) -> impl Future<Output = io::Result<T>> {
+    // Paired TLS setup retains large lane states. Keep one pinned operation
+    // outside the nested caller/timeout poll frames, including before first poll.
+    // Allocation does not poll it or move either original deadline check.
+    let operation = Box::pin(operation);
+    async move {
+        check_deadline(expires)?;
+        let value = tokio::time::timeout_at(expires, operation)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native client original setup deadline",
+                )
+            })??;
+        check_deadline(expires)?;
+        Ok(value)
+    }
 }
 fn native_config(
     config: carrier::Config,

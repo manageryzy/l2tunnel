@@ -7,6 +7,18 @@ Work now follows the blocking behavior corrections at
 The checked module tasks are individual deliverables, not a product completion
 percentage. All 47 complete Python mode gates remain open.
 
+The 2026-11-16 [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-checkpoint-evidence)
+implements actual 9-byte data / 21-byte strong feedback-control outer framing,
+explicit AES-CCM4 or ChaCha20/CRC32C data selection, and direct CompactARQ union
+encoding. Genuine original-UDP Swift and shared-service/CLI cases pass, including
+the selected H0, both directions, authenticated liveness and observed release.
+The complete affected client library passes 372 cases; required check stages and
+1,658 simulator cases have retained evidence, including initial failures and
+scoped follow-ups. This is not a pristine single full-suite run. The new format
+is opt-in and currently accepts Swift-only full-duplex UDP catalogs; Aligned,
+Packed, other algorithms, raw TCP single protection, full SW-11/all47 and the
+original MTU/repair/performance gates remain open without reduced definitions.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

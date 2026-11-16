@@ -184,15 +184,29 @@ impl Fixture {
         Self::from_contracts_with_tail(kind, contracts, true)
     }
 
-    async fn from_contracts_with_tail(
+    fn from_contracts_with_tail(
         kind: cover::Appearance,
         contracts: [CommonTransactionContract; 2],
         retire_at_deadline: bool,
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        Self::from_contracts_setup(kind, contracts, retire_at_deadline, None)
+    }
+
+    async fn from_contracts_setup(
+        kind: cover::Appearance,
+        contracts: [CommonTransactionContract; 2],
+        retire_at_deadline: bool,
+        configuration: Option<security::ConfigDigest>,
     ) -> Result<Self> {
         let [client, server] = contracts;
         // Authenticate the requested role-local cover from the first actual
         // setup flight; changing copied Parts afterward would not be authority.
-        let (a, b) = parts_pair_with_covers(kind, Some([client.cover(), server.cover()])).await?;
+        let covers = Some([client.cover(), server.cover()]);
+        let (a, b) = if let Some(configuration) = configuration {
+            parts_pair_with_configuration(kind, covers, configuration).await?
+        } else {
+            parts_pair_with_covers(kind, covers).await?
+        };
         let setup_end = a.deadline.max(b.deadline);
         let origin = Instant::now();
         let make = |parts: member::Parts, contract| -> Result<Endpoint> {
@@ -627,6 +641,7 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                     .ok_or("real Common seal not retained")?;
                 assert!(retained.carrier.is_none());
                 let pending = common::PendingWire {
+                    feedback: false,
                     scope: retained.scope,
                     sealed: retained.sealed,
                     cost: retained.cost,
@@ -1005,3 +1020,6 @@ mod connections;
 
 #[path = "transport_common_proxy_guard_tests.rs"]
 mod proxy_guards;
+
+#[path = "transport_common_wire_tests.rs"]
+mod compact_wire;

@@ -14,6 +14,29 @@ new owner-approved wire or handshake decision. This is a packet primitive beneat
 data algorithms, not a carrier, reliable control service or completed SEC-05/SEC-06.
 The [common session contract](secure-session.md) retains those broader gates.
 
+## Explicit compact v3 extension
+
+The 2026-11-16 additive `security::compact` owners implement the explicitly
+selected AES-128-CCM-4 and ChaCha20/CRC32C data profiles using maintained
+RustCrypto providers. Strong feedback and management use ring
+ChaCha20-Poly1305. CRC is an unkeyed corruption check, not authentication;
+four-byte suites cannot obtain management or recovery-control purpose owners.
+The original v1 and Swift v2 APIs and bytes described below remain unchanged.
+
+Only the low four bytes of the packet number travel in the security prefix.
+The full u64 number remains the nonce identity, with bounded reconstruction,
+the existing replay window and adjacent-generation machinery. Complete domain,
+suite, negotiated limits and metadata remain in the key/AAD context. Explicit
+forward-gap and lifetime failed-check limits do not reset on success or epoch
+switch and add no clock or fresh-DH exchange. Short CCM tags retain their actual
+32-bit authentication strength. Domain reservation excludes a second legacy or
+compact owner for the same purpose/direction/lane.
+
+The current 26-case security suite includes maintained-provider known-answer,
+full-counter wrap/reorder, replay, context separation, failure-budget and legacy
+byte regressions. Runtime/service evidence and exact outer costs are separately
+qualified in the [compact implementation checkpoint](compact-wire-cleanup.md#selected-compact-implementation-checkpoint).
+
 ## Boundary and ownership
 
 The integration exposes `SessionRoot::binding(&self) -> SessionBinding`

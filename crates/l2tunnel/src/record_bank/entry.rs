@@ -188,6 +188,30 @@ impl<'a> Entry<'a> {
             .poll(now, security_number, allow_data, output, budget, witnesses)
             .map_err(Error::Engine)
     }
+    /// Forward exact selected feedback overhead through the same generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_with_feedback_overhead(
+        &mut self,
+        now: engine::Tick,
+        security_number: u64,
+        allow_data: bool,
+        output: &mut [u8],
+        budget: &mut OutboundBudget,
+        witnesses: &mut [UnitWitness],
+        feedback_overhead: usize,
+    ) -> Result<Option<engine::Emission>, Error> {
+        self.engine
+            .poll_with_feedback_overhead(
+                now,
+                security_number,
+                allow_data,
+                output,
+                budget,
+                witnesses,
+                feedback_overhead,
+            )
+            .map_err(Error::Engine)
+    }
     /// Apply exact externally authenticated, replay-checked and scoped plaintext.
     pub fn accept_authenticated(
         &mut self,

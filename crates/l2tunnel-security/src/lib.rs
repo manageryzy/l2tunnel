@@ -5,6 +5,8 @@
 //! authenticated metadata, replay and adjacent key generations protect records.
 //! [`swift_v2`] preserves the existing Swift packet format explicitly.
 
+/// Explicit compact v3 packet protection, with separate negotiated data checks.
+pub mod compact;
 mod context;
 mod keys;
 mod record;

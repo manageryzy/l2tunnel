@@ -22,6 +22,7 @@ pub(crate) enum Labels {
     Common,
     SwiftV2,
     RefreshV2,
+    CompactV3,
 }
 impl Labels {
     fn key(self, protection: Protection) -> &'static [u8] {
@@ -31,6 +32,7 @@ impl Labels {
             (Self::Common, Protection::HmacSha256) => b"l2tunnel packet security v1 MAC key",
             (Self::RefreshV2, Protection::ChaCha20Poly1305) => b"l2tunnel/packet/v2/aead-key\0",
             (Self::RefreshV2, Protection::HmacSha256) => b"l2tunnel/packet/v2/mac-key\0",
+            (Self::CompactV3, _) => b"l2tunnel/packet/v3/compact-key\0",
         }
     }
     fn next(self) -> &'static [u8] {
@@ -38,6 +40,7 @@ impl Labels {
             Self::SwiftV2 => b"l2tunnel swift v2 next secret",
             Self::Common => b"l2tunnel packet security v1 next secret",
             Self::RefreshV2 => b"l2tunnel/packet/v2/next-secret\0",
+            Self::CompactV3 => b"l2tunnel/packet/v3/next-secret\0",
         }
     }
 }
@@ -81,6 +84,9 @@ impl Chain {
             Protection::HmacSha256 => Ok(Key::Mac(hmac::Key::new(hmac::HMAC_SHA256, &secret[..]))),
         }
     }
+    pub(crate) fn compact_secret(&self) -> Result<Zeroizing<[u8; 32]>, Error> {
+        self.expand(b"l2tunnel/packet/v3/compact-key\0")
+    }
     pub(crate) fn next(&self) -> Result<Self, Error> {
         Ok(Self {
             secret: self.expand(self.labels.next())?,
@@ -95,30 +101,41 @@ impl Chain {
     }
 }
 
-pub(crate) struct ReceivingKey {
+pub(crate) trait KeyMaterial: Sized {
+    type Selection: Copy;
+    fn derive(chain: &Chain, selection: Self::Selection) -> Result<Self, Error>;
+}
+impl KeyMaterial for Key {
+    type Selection = Protection;
+    fn derive(chain: &Chain, selection: Protection) -> Result<Self, Error> {
+        chain.key(selection)
+    }
+}
+
+pub(crate) struct ReceivingKey<K = Key> {
     pub(crate) generation: KeyGeneration,
-    pub(crate) key: Key,
+    pub(crate) key: K,
     pub(crate) body_bytes: u64,
 }
-impl ReceivingKey {
-    fn new(chain: &Chain, protection: Protection) -> Result<Self, Error> {
+impl<K: KeyMaterial> ReceivingKey<K> {
+    fn new(chain: &Chain, protection: K::Selection) -> Result<Self, Error> {
         Ok(Self {
             generation: chain.generation,
-            key: chain.key(protection)?,
+            key: K::derive(chain, protection)?,
             body_bytes: 0,
         })
     }
 }
 
-pub(crate) struct Opening {
+pub(crate) struct Opening<K: KeyMaterial = Key> {
     chain: Chain,
-    current: ReceivingKey,
-    previous: Option<ReceivingKey>,
-    next: Option<(Chain, ReceivingKey)>,
-    protection: Protection,
+    current: ReceivingKey<K>,
+    previous: Option<ReceivingKey<K>>,
+    next: Option<(Chain, ReceivingKey<K>)>,
+    protection: K::Selection,
 }
-impl Opening {
-    pub(crate) fn new(chain: Chain, protection: Protection) -> Result<Self, Error> {
+impl<K: KeyMaterial> Opening<K> {
+    pub(crate) fn new(chain: Chain, protection: K::Selection) -> Result<Self, Error> {
         Ok(Self {
             current: ReceivingKey::new(&chain, protection)?,
             chain,
@@ -136,7 +153,7 @@ impl Opening {
     pub(crate) fn candidate(
         &mut self,
         generation: KeyGeneration,
-    ) -> Result<&mut ReceivingKey, Error> {
+    ) -> Result<&mut ReceivingKey<K>, Error> {
         let current = self.chain.generation.0;
         if generation.0 == current {
             return Ok(&mut self.current);

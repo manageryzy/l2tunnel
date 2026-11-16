@@ -279,6 +279,7 @@ impl Owner {
         budget: &mut OutboundBudget,
         witnesses: &mut [receiver::UnitWitness],
         overhead: usize,
+        feedback_overhead: usize,
     ) -> Result<Option<Emission>, Error> {
         match self {
             Self::Connections(owner) => owner.poll(now, number, allow_data, out, budget, witnesses),
@@ -287,26 +288,31 @@ impl Owner {
                 if out.len() < maximum {
                     return Err(Error::Output { required: maximum });
                 }
-                let Some(body_limit) = budget.wire_bytes.checked_sub(overhead) else {
-                    return Ok(None);
-                };
+                let body_limit = budget.wire_bytes.saturating_sub(overhead);
+                let feedback_limit = budget.wire_bytes.saturating_sub(feedback_overhead);
                 if budget.packets == 0 {
                     return Ok(None);
                 }
                 let mut entry = owned.entry();
                 let Some(emission) = entry
-                    .poll_emission_bounded(
+                    .poll_emission_with_limits(
                         now.0,
                         records::RecordNumber(number),
                         allow_data,
                         body_limit,
+                        feedback_limit,
                     )
                     .map_err(Error::Swift)?
                 else {
                     return Ok(None);
                 };
                 let bytes = emission.body().len();
-                if bytes > maximum || bytes > body_limit {
+                let selected_overhead = if emission.kind() == records::EmissionKind::Feedback {
+                    feedback_overhead
+                } else {
+                    overhead
+                };
+                if bytes > maximum || bytes > budget.wire_bytes.saturating_sub(selected_overhead) {
                     return Err(Error::Invariant);
                 }
                 let kind = match emission.kind() {
@@ -316,7 +322,9 @@ impl Owner {
                 };
                 // The actual complete body fit was checked before feedback or
                 // sender state committed, using the one shared wire allowance.
-                let wire_bytes = bytes + overhead;
+                let wire_bytes = bytes
+                    .checked_add(selected_overhead)
+                    .ok_or(Error::Arithmetic)?;
                 out[..bytes].copy_from_slice(emission.body());
                 budget.packets -= 1;
                 budget.wire_bytes -= wire_bytes;

@@ -7,14 +7,22 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
-The planned [CWC-01..CWC-18 compact-wire ledger](modules/compact-wire-cleanup.md)
+The [CWC-01..CWC-18 compact-wire ledger](modules/compact-wire-cleanup.md)
 keeps every task unchecked. The first batch implements actual codec, recovery,
 security and facade boundary cleanup while preserving legacy bytes; its full
 runtime regression qualification remains open in the
 [checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence). The new
-union, ordinary 24-byte/20-byte targets, protection choice, raw handoff and actual
+union, ordinary 24-byte/20-byte targets, selected protection, raw handoff and actual
 runtime/API/native qualification require their own evidence; no existing P-*,
 47-mode or SW-11 parent deliverable is reduced or completed by that cleanup.
+
+The [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
+implements the explicit AES-CCM4 and ChaCha20/CRC32C data profiles, independent
+strong feedback/control, typed CompactARQ final encoding and a selected original
+UDP Swift runtime route. Data outer framing is 9 bytes; strong feedback/control
+is 21 bytes, before algorithm and packing metadata. Validation is scoped to the
+recorded paths; raw TCP, remaining algorithm migration, full SW-11/all47 and
+native/platform/performance gates stay open at their complete definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

@@ -14,8 +14,15 @@ pub(super) async fn establish(
     deadline: Instant,
     profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
 ) -> io::Result<Active> {
-    let session =
-        authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
+    let session = authenticate_selected_secure_udp(
+        shared,
+        plan,
+        accepted,
+        deadline,
+        profile.settings(),
+        profile.compact_wire().map(|_| profile.as_ref()),
+    )
+    .await?;
     let info = session.info();
     setup::stage(shared, accepted.operation, SetupStage::Configuration);
     let contract = profile.runtime_contract(info.role)?;

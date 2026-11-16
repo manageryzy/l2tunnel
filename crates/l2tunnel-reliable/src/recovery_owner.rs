@@ -15,6 +15,18 @@ macro_rules! dispatch {
     };
 }
 impl Owner {
+    pub fn compact(&self) -> Result<&CompactRepeat, RecoveryError> {
+        match self {
+            Self::Compact(owner) => Ok(owner),
+            Self::Legacy(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
+    pub fn compact_mut(&mut self) -> Result<&mut CompactRepeat, RecoveryError> {
+        match self {
+            Self::Compact(owner) => Ok(owner),
+            Self::Legacy(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
     pub fn is_compact(&self) -> bool {
         matches!(self, Self::Compact(_))
     }

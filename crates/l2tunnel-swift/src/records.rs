@@ -667,10 +667,25 @@ impl Engine {
         allow_data: bool,
         body_limit: usize,
     ) -> Result<Option<Emission<'_>>, Error> {
-        let limit = body_limit.min(self.send.codec.datagram_bytes);
-        let kind = if self.feedback_bounded(now, limit) {
+        self.poll_emission_with_limits(now, number, allow_data, body_limit, body_limit)
+    }
+
+    /// Poll the same feedback/data transitions with exact per-kind body credit.
+    /// This supports a stronger outer check for debt-retiring feedback without
+    /// reserving that overhead for ordinary data or consuming uncharged debt.
+    pub fn poll_emission_with_limits(
+        &mut self,
+        now: u64,
+        number: RecordNumber,
+        allow_data: bool,
+        data_body_limit: usize,
+        feedback_body_limit: usize,
+    ) -> Result<Option<Emission<'_>>, Error> {
+        let maximum = self.send.codec.datagram_bytes;
+        let feedback_limit = feedback_body_limit.min(maximum);
+        let kind = if self.feedback_bounded(now, feedback_limit) {
             Some(EmissionKind::Feedback)
-        } else if allow_data && limit == self.send.codec.datagram_bytes {
+        } else if allow_data && data_body_limit >= maximum {
             self.data(now, number)?
         } else {
             None

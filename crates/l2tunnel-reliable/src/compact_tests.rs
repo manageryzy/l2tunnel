@@ -2,6 +2,137 @@
 use super::*;
 use l2tunnel_recovery::{CompactArqConfig, CompactBounds, CompactRecovery, CompactTiming};
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[test]
+fn compact_final_body_actual_duplex_custody_independent_feedback_and_exact_selected_charge()
+-> Result {
+    use l2tunnel_recovery::{CompactPacketKind, inspect_compact_body};
+    let (mut a, mut b) = pair()?;
+    let forward = policy(32, CompactRecovery::Guarded, 70)?.arq();
+    let reverse = policy(64, CompactRecovery::FirstFlight, 90)?.arq();
+    let overheads = CompactOverheads {
+        data: 9,
+        feedback: 21,
+    };
+    a.submit(b"real", ms(0))?;
+    let mut output = [0xaa; 256];
+    let original = output;
+    let before = a.arq_statistics();
+    let mut short = OutboundBudget {
+        packets: 1,
+        wire_bytes: 14,
+    };
+    let mut called = false;
+    assert!(
+        a.poll_compact_data_with(ms(0), &mut short, overheads, |_| {
+            called = true;
+            Ok::<_, Error>(Some(()))
+        })?
+        .is_none()
+    );
+    assert!(!called);
+    assert_eq!(output, original);
+    assert_eq!(a.arq_statistics(), before);
+    assert_eq!(
+        short,
+        OutboundBudget {
+            packets: 1,
+            wire_bytes: 14
+        }
+    );
+    let mut allowance = budget();
+    let initial = allowance;
+    let sent = a
+        .poll_compact_data_with(ms(0), &mut allowance, overheads, |view| {
+            view.encode_compact_into(&mut output).map(Some)
+        })?
+        .ok_or("source")?;
+    assert_eq!(sent.value, 6);
+    assert_eq!(&output[..sent.value], b"\0\x01real");
+    assert_eq!(sent.prepared.bytes, 6);
+    assert_eq!(sent.prepared.wire_bytes, 15);
+    assert_eq!(a.pending_data_output(), Some(sent.prepared));
+    b.receive_compact_view_at(
+        inspect_compact_body(CompactPacketKind::Data, &output[..sent.value], forward)?,
+        ms(10),
+        ms(10),
+    )?;
+    b.submit(b"reverse", ms(10))?;
+    let reverse_sent = b
+        .poll_compact_data_with(ms(10), &mut budget(), overheads, |view| {
+            view.encode_compact_into(&mut output).map(Some)
+        })?
+        .ok_or("reverse source")?;
+    a.receive_compact_view_at(
+        inspect_compact_body(
+            CompactPacketKind::Data,
+            &output[..reverse_sent.value],
+            reverse,
+        )?,
+        ms(12),
+        ms(12),
+    )?;
+    let opportunity = a
+        .compact_feedback_opportunity()?
+        .ok_or("independent feedback")?;
+    assert_eq!(opportunity.0, ms(17));
+    let ack = a
+        .poll_compact_feedback_with(ms(17), &mut allowance, overheads, |view| {
+            view.encode_compact_into(&mut output).map(Some)
+        })?
+        .ok_or("feedback while data held")?;
+    assert_eq!(ack.value, opportunity.1);
+    assert_eq!(ack.prepared.wire_bytes, ack.value + 21);
+    assert_eq!(a.pending_data_output(), Some(sent.prepared));
+    b.confirm_output_at(ms(18), ms(11), reverse_sent.prepared)?;
+    b.receive_compact_view_at(
+        inspect_compact_body(CompactPacketKind::Feedback, &output[..ack.value], reverse)?,
+        ms(18),
+        ms(18),
+    )?;
+    let reply = b
+        .poll_compact_feedback_with(ms(18), &mut budget(), overheads, |view| {
+            view.encode_compact_into(&mut output).map(Some)
+        })?
+        .ok_or("actual reply")?;
+    let reply_view =
+        inspect_compact_body(CompactPacketKind::Feedback, &output[..reply.value], forward)?;
+    let before = a.arq_statistics();
+    assert_eq!(
+        a.receive_compact_view_at(reply_view, ms(20), ms(20)),
+        Err(Error::Arq(RecoveryError::FeedbackAwaitingPhysical))
+    );
+    assert_eq!(a.arq_statistics(), before);
+    a.confirm_output_at(ms(22), ms(1), sent.prepared)?;
+    a.receive_compact_view_at(reply_view, ms(20), ms(22))?;
+    a.confirm_output_at(ms(22), ms(18), ack.prepared)?;
+    assert_eq!(
+        a.confirm_output_at(ms(22), ms(18), ack.prepared),
+        Err(Error::OutputToken)
+    );
+    b.confirm_output_at(ms(22), ms(19), reply.prepared)?;
+    assert_eq!(allowance.packets, initial.packets - 2);
+    assert_eq!(
+        initial.wire_bytes - allowance.wire_bytes,
+        sent.prepared.wire_bytes + ack.prepared.wire_bytes
+    );
+    assert_eq!(
+        a.statistics().emitted_wire_bytes,
+        (sent.prepared.wire_bytes + ack.prepared.wire_bytes) as u64
+    );
+    assert_eq!(
+        a.arq_statistics().wire_bytes_emitted,
+        (sent.value + ack.value) as u64
+    );
+    let mut native = [0; 64];
+    assert_eq!(b.poll_delivered(&mut native)?, Some((0, 4)));
+    assert_eq!(&native[..4], b"real");
+    assert_eq!(a.poll_delivered(&mut native)?, Some((0, 7)));
+    assert_eq!(&native[..7], b"reverse");
+    assert_eq!(b.poll_delivered(&mut native)?, None);
+    assert_eq!(a.poll_delivered(&mut native)?, None);
+    Ok(())
+}
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
 }

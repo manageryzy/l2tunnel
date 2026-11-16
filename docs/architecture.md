@@ -7,12 +7,20 @@ coverage remains unfinished. See [current evidence](implementation-status.md).
 The new [compact-wire cleanup plan](modules/compact-wire-cleanup.md) targets one
 typed, variable-length final encoding and selected protection, initial-only
 appearance and an ordinary 24-byte overhead target, with 20 bytes an optimization
-target. The first batch is structural actual-call-site deduplication preserving
-legacy bytes; compact runtime, crypto/provider choices and size qualification
-remain planned. Full context/control/raw ownership, all 47 modes and SW-11 remain intact.
+target. The historical first batch performs structural actual-call-site
+deduplication preserving legacy bytes; the selected implementation follows below.
+Full context/control/raw ownership, all 47 modes and SW-11 remain intact.
 The structural prerequisite is implemented with passing protocol regressions;
 full runtime regression qualification remains open. See the plan's
 [first checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
+
+The [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
+implements the explicit AES-CCM4 and ChaCha20/CRC32C data profiles, independent
+strong feedback/control, typed CompactARQ final encoding and a selected original
+UDP Swift runtime route. Data outer framing is 9 bytes; strong feedback/control
+is 21 bytes, before algorithm and packing metadata. Validation is scoped to the
+recorded paths; raw TCP, remaining algorithm migration, full SW-11/all47 and
+native/platform/performance gates stay open at their complete definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
@@ -677,6 +685,14 @@ the preceding authentication/carrier layer. The generic authenticated-cleartext
 requirement above remains tracked, not inferred away. A WireGuard-like extension
 for it needs a reviewed supported secret/protection interface. No private-state
 export, altered cryptographic primitive or unmodified-WireGuard claim is permitted.
+
+The subsequent explicitly selected compact-wire design adds AES-CCM with a
+four-byte data tag or ChaCha20 with CRC32C. This is an explicit data-profile
+exception to the legacy all-payload authentication policy above, not a new
+default or an authentication claim for CRC. Management and retiring feedback
+keep separate full-tag protection. The [compact contract](modules/compact-wire-cleanup.md)
+records the approved options, their actual guarantees, negotiated limits and
+remaining migration scope; existing authenticated formats remain selectable.
 
 ## Half duplex and full duplex
 

@@ -562,6 +562,33 @@ impl Engine {
         shared_budget: &mut OutboundBudget,
         unit_witnesses: &mut [receiver::UnitWitness],
     ) -> Result<Option<Emission>, Error> {
+        self.poll_with_feedback_overhead(
+            now,
+            security_number,
+            allow_data,
+            output,
+            shared_budget,
+            unit_witnesses,
+            self.overhead,
+        )
+    }
+
+    /// Poll with an exact stronger feedback overhead on an explicitly selected
+    /// Swift outer format. Existing callers retain their uniform wire charge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_with_feedback_overhead(
+        &mut self,
+        now: Tick,
+        security_number: u64,
+        allow_data: bool,
+        output: &mut [u8],
+        shared_budget: &mut OutboundBudget,
+        unit_witnesses: &mut [receiver::UnitWitness],
+        feedback_overhead: usize,
+    ) -> Result<Option<Emission>, Error> {
+        if feedback_overhead != self.overhead && !matches!(&self.owner, Owner::Swift(_)) {
+            return Err(Error::Geometry);
+        }
         if self.fragments.is_some() {
             return Err(Error::FragmentPolicy);
         }
@@ -600,6 +627,7 @@ impl Engine {
             shared_budget,
             unit_witnesses,
             self.overhead,
+            feedback_overhead,
         ) {
             Ok(Some(emission)) => {
                 let pending = match &self.owner {

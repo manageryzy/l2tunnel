@@ -11,7 +11,10 @@ use l2tunnel_recovery::{
 mod backing;
 mod compact;
 mod recovery_owner;
-pub use compact::{CompactReliableConfig, inspect_compact_structural};
+pub use compact::{
+    CompactOutput, CompactOutputError, CompactOverheads, CompactReliableConfig,
+    inspect_compact_structural,
+};
 mod legacy_layout;
 pub mod storage;
 use std::fmt;
@@ -77,7 +80,8 @@ pub struct PreparedOutput {
     serial: u64,
     transmission: Option<PhysicalTransmission>,
     prepared_at: Duration,
-    /// Exact initialized packet bytes retained in caller storage.
+    /// Exact initialized bytes in the selected output representation: a legacy
+    /// Reliable packet, or a context-free algorithm body from typed polling.
     pub bytes: usize,
     /// Already reserved complete wire charge, including outer overhead once.
     pub wire_bytes: usize,
@@ -1558,6 +1562,15 @@ impl Reliable {
         let charge = bytes
             .checked_add(self.outer_overhead())
             .ok_or(Error::Exhausted)?;
+        self.charge_exact(charge, emission, budget)
+    }
+
+    fn charge_exact(
+        &mut self,
+        charge: usize,
+        emission: Emission,
+        budget: &mut OutboundBudget,
+    ) -> Result<(), Error> {
         if budget.packets == 0 || budget.wire_bytes < charge {
             return Err(Error::Exhausted);
         }

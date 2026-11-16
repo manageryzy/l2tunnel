@@ -96,6 +96,15 @@ and the final return checks that same original deadline; `timeout_at` by itself
 is insufficient for an already-ready future. Failure or cancellation drops all
 original owners. Opening a native device stays after actual authentication.
 
+The 2026-11-16 compact-wire regression exposed a default-stack overflow during
+paired TLS setup. The existing operation is now boxed/pinned before constructing
+its timeout future, keeping the large lane state outside nested poll frames.
+This adds one setup allocation, no task or protocol owner. Both deadline checks
+remain inside the returned future, preserving first-poll, late-ready and
+cancellation behavior. The unchanged private-API/grace test and complete
+372-case client suite pass; see the [retained compact checkpoint](compact-wire-cleanup.md#selected-checkpoint-evidence)
+for failed attempts and debugger evidence. No stack size or deadline was raised.
+
 `Session::into_run` validates the device layer and exact stored policy before
 creating the one runtime request channel. It returns a manually retained future,
 not a detached task or an auto-started background service. Its single boxed/pinned

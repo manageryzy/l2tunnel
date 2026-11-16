@@ -9,9 +9,11 @@ mod compact;
 pub(crate) use backing::{ReceiveSlot, SendSlot};
 use backing::{Received, Sent};
 pub use compact::{
+    COMPACT_BODY_DATA_MAX_HEADER_BYTES, COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES,
     COMPACT_DATA_HEADER_BYTES, COMPACT_FEEDBACK_HEADER_BYTES, CompactArqConfig, CompactBounds,
-    CompactFeedback, CompactPacketView, CompactRecovery, CompactRepeat, CompactTiming,
-    CompactTimingSnapshot, inspect_compact_packet,
+    CompactFeedback, CompactPacketKind, CompactPacketView, CompactPollError, CompactRecovery,
+    CompactRepeat, CompactTiming, CompactTimingSnapshot, inspect_compact_body,
+    inspect_compact_packet,
 };
 pub(crate) use compact::{History as CompactHistory, Meta as CompactMeta, State as CompactState};
 
