@@ -1,5 +1,6 @@
 //! Additive tag4/tag5 inside the unchanged CompleteV2 fixed directional slot.
 use super::*;
+use crate::rolling_records::recovery::RecoveryPolicy;
 use crate::{
     codec::{aligned_sender, packed, packed_sender},
     record_engine::Geometry,
@@ -7,8 +8,8 @@ use crate::{
 
 pub(super) const ACTIVE_BYTES: usize = 352;
 
-pub(super) fn encode(
-    config: rolling_records::DirectionConfig,
+pub(super) fn encode<P: RecoveryPolicy>(
+    config: rolling_records::DirectionConfig<P>,
     overhead: usize,
     stall: u64,
     stream: u32,
@@ -20,7 +21,6 @@ pub(super) fn encode(
     let b = r.body;
     let p = config.packing;
     let s = config.scheduler;
-    let f = s.recovery;
     for value in [
         match config.native_policy {
             aligned::NativePolicy::EthernetHeaders => 1,
@@ -49,28 +49,13 @@ pub(super) fn encode(
         p.first_unit.0,
         integer(p.work_limit)?,
         config.codec_stage_micros,
-        integer(f.window)?,
-        integer(f.local_window)?,
-        u64::from(f.global_every),
-        integer(f.max_payload)?,
-        integer(f.max_rows)?,
-        integer(f.repair_history)?,
-        integer(f.handoff_sources)?,
-        f.job_ticks,
-        f.debt_ticks,
-        f.handoff_ticks,
-        integer(f.memory_bytes)?,
-        u64::from(s.repair_numerator),
-        u64::from(s.repair_denominator),
-        s.tail_ticks,
-        s.feedback_ticks,
-        u64::from(s.feedback_packets),
-        integer(s.memory_bytes)?,
-        u64::from(s.source_wire.version()),
-        integer(overhead)?,
-        stall,
-        u64::from(stream),
     ] {
+        writer.number(value)?;
+    }
+    for value in s.words() {
+        writer.number(value)?;
+    }
+    for value in [integer(overhead)?, stall, u64::from(stream)] {
         writer.number(value)?;
     }
     writer.finish()

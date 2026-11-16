@@ -49,6 +49,9 @@ pub mod native_storage;
 /// Actual compact record units over the existing local/global rolling scheduler.
 pub mod rolling_records;
 
+/// Actual selected recursive/fallback/accumulator recovery over the shared record body.
+pub mod research_records;
+
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;
 /// Authenticated aligned-symbol composition; clocks and native I/O stay external.

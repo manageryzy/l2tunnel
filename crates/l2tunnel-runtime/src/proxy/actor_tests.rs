@@ -53,6 +53,7 @@ fn actor(originator: bool) -> io::Result<(Actor, mpsc::Receiver<Vec<u8>>, mpsc::
     };
     Ok((
         Actor {
+            retirement: None,
             measured: None,
             logical,
             originator,

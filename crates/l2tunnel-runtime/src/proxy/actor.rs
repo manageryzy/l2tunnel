@@ -38,7 +38,21 @@ impl Writer {
         }
     }
 }
+#[cfg(unix)]
+pub(super) type CommonRetirement = super::common_bridge::Bridge;
+#[cfg(not(unix))]
+pub(super) enum CommonRetirement {}
+#[cfg(not(unix))]
+impl CommonRetirement {
+    fn set_drain_cap(&self, _cap: Instant) -> io::Result<()> {
+        match *self {}
+    }
+    async fn wait_retired(&self) -> io::Result<()> {
+        match *self {}
+    }
+}
 struct Actor {
+    retirement: Option<CommonRetirement>,
     config: Config,
     logical: [u8; 16],
     originator: bool,
@@ -163,6 +177,12 @@ impl Actor {
             .checked_add(self.config.timeouts.shutdown)
             .ok_or_else(|| invalid("proxy shutdown deadline overflow"))?;
         self.deadline = Some(self.deadline.map_or(end, |old| old.min(end)));
+        if let Some(retirement) = &self.retirement {
+            retirement.set_drain_cap(
+                self.deadline
+                    .ok_or_else(|| invalid("proxy drain cap missing"))?,
+            )?;
+        }
         let now = self.micros()?;
         if let Some(state) = &mut self.measured {
             state.controller.quiesce(now).map_err(error)?;
@@ -1062,13 +1082,32 @@ pub(super) async fn run_profile<D: PacketDevice<Error = io::Error>>(
 ) -> io::Result<CloseReport> {
     run_profile_owned(device, link, config, control, measured_config, false).await
 }
-pub(super) async fn run_profile_owned<D: PacketDevice<Error = io::Error>>(
+pub(super) fn run_profile_owned<D: PacketDevice<Error = io::Error>>(
+    device: D,
+    link: Link,
+    config: Config,
+    control: Control,
+    measured_config: Option<measured::Config>,
+    owned_cleanup: bool,
+) -> impl std::future::Future<Output = io::Result<CloseReport>> {
+    run_profile_selected(
+        device,
+        link,
+        config,
+        control,
+        measured_config,
+        owned_cleanup,
+        None,
+    )
+}
+pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
     mut device: D,
     link: Link,
     config: Config,
     mut control: Control,
     measured_config: Option<measured::Config>,
     owned_cleanup: bool,
+    retirement: Option<CommonRetirement>,
 ) -> io::Result<CloseReport> {
     config.validate()?;
     let binding = measured_config
@@ -1211,6 +1250,7 @@ pub(super) async fn run_profile_owned<D: PacketDevice<Error = io::Error>>(
     drop(users_tx);
     drop(quiesce_tx);
     let mut actor = Actor {
+        retirement,
         logical: link.logical,
         originator: link.originator,
         table,
@@ -1397,6 +1437,21 @@ pub(super) async fn run_profile_owned<D: PacketDevice<Error = io::Error>>(
         } else {
             let end = actor.deadline.unwrap_or_else(Instant::now);
             let _ = timeout_at(end, async { while tasks.join_next().await.is_some() {} }).await;
+        }
+    }
+    // Common EOF physical completion is not peer receipt. Keep the actual
+    // Common receiver alive under the same drain cap before publishing Closed
+    // or replying to the administrative waiter. TLS/default owners skip this.
+    if outcome.is_ok()
+        && let Some(retirement) = &actor.retirement
+    {
+        match retirement.wait_retired().await {
+            Ok(()) => {
+                if let Ok(report) = &mut outcome {
+                    report.tls_lanes_closed = 0;
+                }
+            }
+            Err(error) => outcome = Err(error),
         }
     }
     if abort

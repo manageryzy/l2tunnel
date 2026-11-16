@@ -85,6 +85,7 @@ fn profile(
         Built::Transaction(value) => Ok(value),
         Built::Legacy(_) => Err(input("complete plan selected legacy backend")),
         Built::Records(_) => Err(input("Swift plan selected Common backend")),
+        Built::Proxy(_) => Err(input("Swift plan selected proxy backend")),
     }
 }
 

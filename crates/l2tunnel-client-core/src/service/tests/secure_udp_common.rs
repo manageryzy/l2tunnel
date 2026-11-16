@@ -502,3 +502,6 @@ mod original_carrier;
 
 #[path = "secure_udp_common_connections.rs"]
 mod independent_connections;
+
+#[path = "secure_udp_common_research.rs"]
+mod research_common;

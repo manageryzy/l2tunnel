@@ -637,6 +637,7 @@ fn proxy_schema_is_strict_and_absent_proxy_preserves_legacy_bytes() -> io::Resul
         assert!(serde_json::from_str::<ProxyTerminal>(bad).is_err());
     }
     let complete = ProxySnapshot {
+        common: None,
         measured: None,
         digest: "ab".repeat(32),
         drain_accepted: true,

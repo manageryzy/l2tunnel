@@ -14,6 +14,7 @@ pub(super) enum Owner {
     Aligned(aligned::Endpoint),
     Packed(aligned::packed::Endpoint),
     Rolling(rolling_records::Endpoint),
+    Research(crate::research_records::Endpoint),
     Connections(Connections),
 }
 
@@ -55,7 +56,7 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .enable_physical_send_confirmation()
                 .map_err(Error::Aligned),
-            Self::Swift(_) | Self::Rolling(_) | Self::Connections(_) => Ok(()),
+            Self::Swift(_) | Self::Rolling(_) | Self::Research(_) | Self::Connections(_) => Ok(()),
         }
     }
     pub(super) fn storage_heap(&self) -> Option<(usize, usize)> {
@@ -77,12 +78,22 @@ impl Owner {
             Self::Rolling(endpoint) => endpoint
                 .storage_usage()
                 .map(|u| (u.capacity_bytes, u.allocations)),
+            Self::Research(endpoint) => endpoint
+                .storage_usage()
+                .map(|u| (u.capacity_bytes, u.allocations)),
         }
     }
     pub(super) fn new(
         configuration: &configuration::Configuration,
         context: Context,
     ) -> Result<Self, Error> {
+        if let configuration::Profile::Research { config, stream } =
+            configuration.descriptor().profile()
+        {
+            return crate::research_records::Endpoint::new(*config, context, *stream, Tick(0))
+                .map(Self::Research)
+                .map_err(Error::Rolling);
+        }
         if let configuration::Profile::Rolling { config, stream } =
             configuration.descriptor().profile()
         {
@@ -251,6 +262,10 @@ impl Owner {
                 .enqueue_admitted_identified(now, channel, bytes)
                 .map(|identity| identity.map(ProfileIdentity::Rolling))
                 .map_err(Error::Rolling),
+            Self::Research(endpoint) => endpoint
+                .enqueue_admitted_identified(now, channel, bytes)
+                .map(|identity| identity.map(ProfileIdentity::Research))
+                .map_err(Error::Rolling),
         }
     }
 
@@ -356,6 +371,25 @@ impl Owner {
                     })
                     .map_err(Error::Rolling)
             }
+            Self::Research(endpoint) => {
+                // Only explicit Engine::step budgets perform GF work. This
+                // zero-work service pumps already-ready codec/source ownership.
+                endpoint
+                    .step(now, crate::fec::rolling::WorkBudget::default())
+                    .map_err(Error::Rolling)?;
+                endpoint
+                    .prepare_output(now, number, allow_data, out, budget, witnesses)
+                    .map(|prepared| {
+                        prepared.map(|p| Emission {
+                            bytes: p.bytes,
+                            kind: p.kind,
+                            wire_bytes: p.wire_bytes,
+                            security_number: p.security_number,
+                            witnesses: p.witnesses,
+                        })
+                    })
+                    .map_err(Error::Rolling)
+            }
         }
     }
 
@@ -403,6 +437,9 @@ impl Owner {
             Self::Rolling(endpoint) => endpoint
                 .accept_authenticated(now, kind, body)
                 .map_err(Error::Rolling),
+            Self::Research(endpoint) => endpoint
+                .accept_authenticated_at(received, now, kind, body)
+                .map_err(Error::Rolling),
         }
     }
 
@@ -416,6 +453,17 @@ impl Owner {
         body: &mut [u8],
     ) -> Result<(), Error> {
         if let Self::Rolling(endpoint) = self {
+            endpoint
+                .accept_authenticated_until(
+                    received,
+                    now,
+                    original_deadline,
+                    Some(number),
+                    kind,
+                    body,
+                )
+                .map_err(Error::Rolling)
+        } else if let Self::Research(endpoint) = self {
             endpoint
                 .accept_authenticated_until(
                     received,
@@ -484,6 +532,19 @@ impl Owner {
                 }),
                 rolling_records::NativePreparation::AlreadyPending(_) => Err(Error::Invariant),
             },
+            Self::Research(endpoint) => match endpoint
+                .prepare_native(now, work, original_deadline, out)
+                .map_err(Error::Rolling)?
+            {
+                rolling_records::NativePreparation::Idle => Ok(NativeStep::Idle),
+                rolling_records::NativePreparation::Progress => Ok(NativeStep::Progress),
+                rolling_records::NativePreparation::Ready(prepared) => Ok(NativeStep::Ready {
+                    identity: ProfileIdentity::Research(prepared.identity()),
+                    bytes: prepared.bytes(),
+                    early: prepared.early(),
+                }),
+                rolling_records::NativePreparation::AlreadyPending(_) => Err(Error::Invariant),
+            },
         }
     }
 
@@ -501,6 +562,10 @@ impl Owner {
                 let token = endpoint.pending_native().ok_or(Error::Invariant)?.token();
                 endpoint.commit_native(now, token).map_err(Error::Rolling)
             }
+            Self::Research(endpoint) => {
+                let token = endpoint.pending_native().ok_or(Error::Invariant)?.token();
+                endpoint.commit_native(now, token).map_err(Error::Rolling)
+            }
         }
     }
 
@@ -513,6 +578,9 @@ impl Owner {
             Self::Rolling(endpoint) => endpoint
                 .pending_native()
                 .map(|pending| duration(pending.deadline())),
+            Self::Research(endpoint) => endpoint
+                .pending_native()
+                .map(|pending| duration(pending.deadline())),
         }
     }
 
@@ -523,6 +591,7 @@ impl Owner {
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Packed(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Rolling(endpoint) => endpoint.tick(now).map_err(Error::Rolling),
+            Self::Research(endpoint) => endpoint.tick(now).map_err(Error::Rolling),
         }
     }
 
@@ -559,6 +628,7 @@ impl Owner {
                 (Some(at), bytes)
             }
             Self::Rolling(endpoint) => return Ok(endpoint.feedback_opportunity()),
+            Self::Research(endpoint) => return Ok(endpoint.feedback_opportunity()),
         };
         at.map(|at| {
             u64::try_from(at.as_micros())
@@ -575,6 +645,7 @@ impl Owner {
             Self::Aligned(endpoint) => endpoint.expiry_deadline(),
             Self::Packed(endpoint) => endpoint.expiry_deadline(),
             Self::Rolling(endpoint) => return Ok(endpoint.deadline()),
+            Self::Research(endpoint) => return Ok(endpoint.deadline()),
         };
         at.map(|at| {
             u64::try_from(at.as_micros())
@@ -621,6 +692,7 @@ impl Owner {
                 })
                 .transpose(),
             Self::Rolling(endpoint) => Ok(endpoint.deadline()),
+            Self::Research(endpoint) => Ok(endpoint.deadline()),
         }
     }
 
@@ -634,6 +706,7 @@ impl Owner {
             Self::Aligned(endpoint) => Ok(endpoint.drained()),
             Self::Packed(endpoint) => Ok(endpoint.drained()),
             Self::Rolling(endpoint) => Ok(endpoint.drained()),
+            Self::Research(endpoint) => Ok(endpoint.drained()),
         }
     }
 }

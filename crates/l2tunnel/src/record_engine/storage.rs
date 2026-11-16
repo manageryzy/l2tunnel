@@ -75,6 +75,7 @@ enum RecordPlan {
     AlignedCompact(aligned::compact_storage::Plan),
     PackedCompact(aligned::compact_storage::Plan),
     Rolling(rolling_records::storage::Plan),
+    Research(crate::research_records::storage::Plan),
     Connections(crate::connection_records::storage::Plan),
 }
 impl RecordPlan {
@@ -84,6 +85,19 @@ impl RecordPlan {
         ingress: Option<rolling_records::IngressLimits>,
         framing: Option<rolling_records::OutputFraming>,
     ) -> Result<Self, Error> {
+        if let configuration::Profile::Research { config, stream } = config.descriptor().profile() {
+            return crate::research_records::storage::Plan::for_endpoint_with_output_framing(
+                *config,
+                context,
+                *stream,
+                Tick(0),
+                rolling_records::CopyPolicies::ONE,
+                ingress,
+                framing,
+            )
+            .map(Self::Research)
+            .map_err(Error::Rolling);
+        }
         if let configuration::Profile::Rolling { config, stream } = config.descriptor().profile() {
             return rolling_records::storage::Plan::for_endpoint_with_output_framing(
                 *config,
@@ -165,6 +179,7 @@ impl RecordPlan {
             Self::Aligned(plan) | Self::Packed(plan) => plan.capacity_bytes(),
             Self::AlignedCompact(plan) | Self::PackedCompact(plan) => plan.capacity_bytes(),
             Self::Rolling(plan) => plan.capacity_bytes(),
+            Self::Research(plan) => plan.capacity_bytes(),
             Self::Connections(plan) => plan.heap_bytes(),
         }
     }
@@ -229,6 +244,14 @@ impl RecordPlan {
                 },
             )
             .map(Owner::Rolling)
+            .map_err(Error::Rolling),
+            Self::Research(plan) => crate::research_records::Endpoint::new_reserved_with_copies(
+                plan,
+                rolling_records::storage::Limits {
+                    capacity_bytes: plan.capacity_bytes(),
+                },
+            )
+            .map(Owner::Research)
             .map_err(Error::Rolling),
         }
     }
@@ -403,6 +426,7 @@ impl Plan {
     pub fn rolling_ingress_policy(&self) -> Option<rolling_records::IngressLimits> {
         match self.record {
             RecordPlan::Rolling(plan) => plan.ingress_limits(),
+            RecordPlan::Research(plan) => plan.ingress_limits(),
             _ => None,
         }
     }

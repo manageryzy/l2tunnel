@@ -90,6 +90,9 @@ impl Engine {
                             Owner::Rolling(endpoint) => {
                                 Some(endpoint.pending_native().ok_or(Error::Invariant)?.token())
                             }
+                            Owner::Research(endpoint) => {
+                                Some(endpoint.pending_native().ok_or(Error::Invariant)?.token())
+                            }
                             _ => None,
                         },
                     },
@@ -150,7 +153,10 @@ impl Engine {
             self.native_counts.commit(channel, committed);
         }
         self.pending = None;
-        if matches!(&self.owner, Owner::Rolling(_) | Owner::Connections(_)) {
+        if matches!(
+            &self.owner,
+            Owner::Rolling(_) | Owner::Research(_) | Owner::Connections(_)
+        ) {
             let result = self.owner.commit(now);
             timing?;
             return match result {

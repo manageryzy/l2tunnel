@@ -31,7 +31,8 @@ fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
             | c::Profile::RollingCopies { .. }
             | c::Profile::AlignedCompact { .. }
             | c::Profile::PackedCompact { .. }
-            | c::Profile::PerConnectionCompact { .. } => {
+            | c::Profile::PerConnectionCompact { .. }
+            | c::Profile::Research { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "legacy three-family fixture does not select this profile",

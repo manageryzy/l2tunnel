@@ -82,6 +82,77 @@ pub struct ProxyFrame {
     pub common: Option<ProxyCommonFrame>,
 }
 
+impl ProxyFrame {
+    /// One maintained portable proxy observation; Common is absent for legacy TLS.
+    pub fn status(&self) -> local::ProxySnapshot {
+        local::ProxySnapshot {
+            common: self.common_status().map(Box::new),
+            digest: self
+                .effective_digest
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            drain_accepted: self.drain_accepted,
+            runtime: self.runtime.as_ref().map(|status| local::ProxyStatus {
+                phase: format!("{:?}", status.phase),
+                flows: status.flows,
+                active: status.active,
+                stopped: status.stopped,
+                retired: status.retired,
+                queued_bytes: status.queued_bytes,
+                queued_records: status.queued_records,
+                transparent_admitted_bytes: status.transparent_admitted_bytes,
+                transparent_admitted_packets: status.transparent_admitted_packets,
+                native_confirmed_packets: status.native_confirmed_packets,
+            }),
+            terminal: self.terminal.clone(),
+            #[cfg(unix)]
+            measured: self.measured.clone(),
+            #[cfg(not(unix))]
+            measured: None,
+        }
+    }
+    /// Bounded copied facts from the actual backend, without handles or credentials.
+    #[cfg(unix)]
+    pub fn common_status(&self) -> Option<local::ProxyCommonStatus> {
+        let frame = self.common?;
+        let cover = |appearance| match appearance {
+            l2tunnel_cover::Appearance::QuicLike => local::ProxyCommonCover::QuicLike,
+            l2tunnel_cover::Appearance::MediaLike => local::ProxyCommonCover::MediaLike,
+        };
+        Some(local::ProxyCommonStatus {
+            requested_proxy_digest: self.requested_digest.0,
+            effective_proxy_digest: self.effective_digest.0,
+            requested_configuration: frame.requested_configuration.0,
+            effective_configuration: frame.effective_configuration.0,
+            requested_carrier: frame.requested_carrier,
+            effective_carrier: frame.effective_carrier,
+            requested_cover: cover(frame.requested_cover),
+            effective_cover: frame.effective_cover.map(cover),
+            local_addr: frame.local_addr,
+            peer_addr: frame.peer_addr,
+            installed: frame.installed,
+            running: frame.running,
+            epoch: frame.epoch.map(|epoch| epoch.0),
+            outstanding_ping: frame.liveness.outstanding,
+            original_ping_deadline_micros: frame.liveness.deadline_micros,
+            last_verified_micros: frame.liveness.last_verified_micros,
+            last_pong_micros: frame.liveness.last_pong_micros,
+            hot_switch: frame.hot_switch,
+            graceful_close: frame.graceful_close,
+            exact_tcp_rwnd_control: self.exact_tcp_rwnd_control,
+            releasing: self.releasing,
+            released: self.released,
+        })
+    }
+    /// No Common proxy backend is installed on non-Unix targets.
+    #[cfg(not(unix))]
+    pub fn common_status(&self) -> Option<local::ProxyCommonStatus> {
+        None
+    }
+}
+
 enum Control {
     Fixed(crate::proxy::Handle),
     Measured(crate::proxy_measured::Handle),
@@ -389,32 +460,7 @@ impl Handle {
                 secure_udp: None,
                 transaction: None,
                 common: None,
-                proxy: proxy.map(|frame| local::ProxySnapshot {
-                    digest: frame
-                        .effective_digest
-                        .0
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect(),
-                    drain_accepted: frame.drain_accepted,
-                    runtime: frame.runtime.as_ref().map(|status| local::ProxyStatus {
-                        phase: format!("{:?}", status.phase),
-                        flows: status.flows,
-                        active: status.active,
-                        stopped: status.stopped,
-                        retired: status.retired,
-                        queued_bytes: status.queued_bytes,
-                        queued_records: status.queued_records,
-                        transparent_admitted_bytes: status.transparent_admitted_bytes,
-                        transparent_admitted_packets: status.transparent_admitted_packets,
-                        native_confirmed_packets: status.native_confirmed_packets,
-                    }),
-                    terminal: frame.terminal.clone(),
-                    #[cfg(unix)]
-                    measured: frame.measured.clone(),
-                    #[cfg(not(unix))]
-                    measured: None,
-                }),
+                proxy: proxy.map(ProxyFrame::status),
             }),
         }
     }

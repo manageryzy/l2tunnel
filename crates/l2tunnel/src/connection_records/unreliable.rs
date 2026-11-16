@@ -171,6 +171,14 @@ impl Collection {
     /// Bind only after the caller's actual reverse-affinity learn has succeeded.
     /// No owner can ever be rebound or recycled by this fixed-cohort API.
     pub fn bind_received_owner(&mut self, id: OwnerId, key: FlowKey) -> Result<(), Error> {
+        if self
+            .slot(id)?
+            .retirement
+            .as_ref()
+            .is_some_and(retirement::State::installed)
+        {
+            return Err(Error::Retiring);
+        }
         self.check_owner_claim(id, key)?;
         self.slot_mut(id)?.claim = Some(key);
         Ok(())
@@ -185,7 +193,15 @@ impl Collection {
         bytes: &[u8],
     ) -> Result<Option<Identity>, Error> {
         self.check_owner_claim(id, key)?;
-        let incarnation = self.plan.config().incarnation;
+        if !self.admission_open(id)? {
+            return Ok(None);
+        }
+        let incarnation = self.slot(id)?.incarnation;
+        let admitted = self
+            .slot(id)?
+            .admitted_native
+            .checked_add(1)
+            .ok_or(Error::Arithmetic)?;
         let slot = self.slot_mut(id)?;
         if let Some(error) = slot.native_failure {
             return Err(Error::Endpoint(error));
@@ -202,6 +218,7 @@ impl Collection {
             Err(error) => return Err(Error::Endpoint(error)),
         };
         slot.claim = Some(key);
+        slot.admitted_native = admitted;
         Ok(Some(Identity {
             owner: id,
             incarnation,
@@ -233,6 +250,9 @@ impl Collection {
         let config = self.plan.config();
         let policy = config.send_unreliable.ok_or(Error::UnsupportedUnreliable)?;
         self.check_owner_claim(id, class.key)?;
+        if !self.admission_open(id)? {
+            return Ok(None);
+        }
         self.check_unreliable_time(id, now)?;
         let slot = self.slot(id)?;
         if let Some(error) = slot.native_failure {
@@ -261,7 +281,7 @@ impl Collection {
         target.copy_from_slice(bytes);
         let identity = UnreliableIdentity {
             owner: id,
-            incarnation: config.incarnation,
+            incarnation: self.slot(id)?.incarnation,
             serial,
         };
         let slot = self.slot_mut(id)?;
@@ -328,7 +348,7 @@ impl Collection {
         let mut header = [0; route::HEADER_BYTES];
         route::Header {
             owner: id,
-            incarnation: config.incarnation,
+            incarnation: inner.identity.incarnation,
             class: route::Class::UnreliableNative,
             unreliable_serial: inner.identity.serial,
         }
@@ -408,8 +428,16 @@ impl Collection {
             return self.accept_authenticated_at(received, observed, packet);
         }
         let config = self.plan.config();
-        if header.incarnation != config.incarnation {
+        if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
+        }
+        if self
+            .slot(header.owner)?
+            .retirement
+            .as_ref()
+            .is_some_and(retirement::State::installed)
+        {
+            return Err(Error::Retiring);
         }
         let policy = config
             .receive_unreliable

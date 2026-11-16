@@ -3,7 +3,7 @@ use crate::{core::ConfigDigest, management::Role};
 
 /// Complete policy for one global direction, preserving independent maxima.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectionConfig {
+pub struct DirectionConfig<P: RecoveryPolicy = scheduler::Policy> {
     /// Explicit body interpretation, without inferring a native device.
     pub native_policy: NativePolicy,
     /// Actual codec, channel, replay, body, context and native lifetime limits.
@@ -13,9 +13,9 @@ pub struct DirectionConfig {
     /// Positive first-native-admission age for codec work not yet owned by recovery.
     pub codec_stage_micros: u64,
     /// Actual fixed-window local/global scheduling and bounded work ownership.
-    pub scheduler: scheduler::Policy,
+    pub scheduler: P,
 }
-impl DirectionConfig {
+impl<P: RecoveryPolicy> DirectionConfig<P> {
     pub(super) fn packing_plan(self) -> Result<codec::aligned_storage::PackedSenderPlan, Error> {
         (if self.native_policy == NativePolicy::IpHeaders {
             codec::aligned_storage::PackedSenderPlan::for_ip_config
@@ -55,7 +55,7 @@ impl DirectionConfig {
                 < (self.receiver.body.max_frame_bytes + 29)
                     .clamp(69, 65535)
                     .div_ceil(self.receiver.body.symbol_bytes - 8)
-            || source > self.scheduler.recovery.max_payload
+            || source > self.scheduler.recovery().max_payload
             || (self.native_policy == NativePolicy::RawIp
                 && (self.receiver.body.predictive
                     || self.receiver.body.elide_payload_length
@@ -63,37 +63,31 @@ impl DirectionConfig {
         {
             return Err(Error::Configuration);
         }
-        if scheduler::Sender::memory_bound(self.scheduler).map_err(Error::Rolling)?
-            > self.scheduler.memory_bytes
-            || scheduler::Receiver::memory_bound(self.scheduler).map_err(Error::Rolling)?
-                > self.scheduler.memory_bytes
-        {
-            return Err(Error::Rolling(rolling::Error::Capacity));
-        }
+        self.scheduler.validate_owner_bounds()?;
         Ok(())
     }
     /// Actual full inner data record ceiling, excluding carrier protection.
     pub fn maximum_packet_bytes(self) -> Result<usize, Error> {
         self.validate()?;
-        rolling::wire::HEADER_BYTES
-            .checked_add(self.scheduler.recovery.width().map_err(Error::Rolling)?)
+        P::HEADER_BYTES
+            .checked_add(self.scheduler.recovery().width().map_err(Error::Rolling)?)
             .ok_or(Error::Arithmetic)
     }
 }
 
 /// Both complete global policies; no absent fields or symmetric fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Config {
+pub struct Config<P: RecoveryPolicy = scheduler::Policy> {
     /// Client-to-server records, coding, timing and limits.
-    pub forward: DirectionConfig,
+    pub forward: DirectionConfig<P>,
     /// Server-to-client records, coding, timing and limits.
-    pub reverse: DirectionConfig,
+    pub reverse: DirectionConfig<P>,
     /// Exact complete carrier/protection/underlay bytes charged once per record.
     pub geometry: Geometry,
     /// Positive original native custody cap, in injected microseconds.
     pub native_stall_micros: u64,
 }
-impl Config {
+impl<P: RecoveryPolicy> Config<P> {
     /// Validate both directions before allocating any selected owner.
     pub fn validate(self) -> Result<(), Error> {
         self.forward.validate()?;
@@ -109,7 +103,7 @@ impl Config {
                 .maximum_packet_bytes()?
                 .checked_add(overhead)
                 .ok_or(Error::Arithmetic)?;
-            scheduler::FEEDBACK_BYTES
+            P::FEEDBACK_BYTES
                 .checked_add(overhead)
                 .ok_or(Error::Arithmetic)?;
             direction
@@ -126,7 +120,7 @@ impl Config {
     pub fn binding_digest(self, stream: u32) -> Result<ConfigDigest, Error> {
         let policy = self.digest()?;
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        hash.update(b"l2tunnel/packed-records/local-global-rolling/stream-binding/v1\0");
+        hash.update(P::STREAM_DOMAIN);
         hash.update(&policy.0);
         hash.update(&stream.to_be_bytes());
         Ok(ConfigDigest(
@@ -136,7 +130,7 @@ impl Config {
                 .map_err(|_| Error::Arithmetic)?,
         ))
     }
-    pub(super) fn local(self, role: Role) -> (DirectionConfig, DirectionConfig, usize) {
+    pub(super) fn local(self, role: Role) -> (DirectionConfig<P>, DirectionConfig<P>, usize) {
         match role {
             Role::Client => (
                 self.forward,
@@ -155,13 +149,12 @@ impl Config {
     pub fn digest(self) -> Result<ConfigDigest, Error> {
         self.validate()?;
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        hash.update(b"l2tunnel/packed-records/local-global-rolling/v1/microsecond-ticks\0");
+        hash.update(P::DOMAIN);
         for c in [self.forward, self.reverse] {
             let r = c.receiver;
             let b = r.body;
             let p = c.packing;
             let s = c.scheduler;
-            let f = s.recovery;
             for value in [
                 match c.native_policy {
                     NativePolicy::EthernetHeaders => 1,
@@ -190,25 +183,10 @@ impl Config {
                 p.first_unit.0,
                 p.work_limit as u64,
                 c.codec_stage_micros,
-                f.window as u64,
-                f.local_window as u64,
-                u64::from(f.global_every),
-                f.max_payload as u64,
-                f.max_rows as u64,
-                f.repair_history as u64,
-                f.handoff_sources as u64,
-                f.job_ticks,
-                f.debt_ticks,
-                f.handoff_ticks,
-                f.memory_bytes as u64,
-                u64::from(s.repair_numerator),
-                u64::from(s.repair_denominator),
-                s.tail_ticks,
-                s.feedback_ticks,
-                u64::from(s.feedback_packets),
-                s.memory_bytes as u64,
-                u64::from(s.source_wire.version()),
             ] {
+                hash.update(&value.to_be_bytes());
+            }
+            for value in s.words() {
                 hash.update(&value.to_be_bytes());
             }
         }
@@ -237,7 +215,7 @@ pub struct OutputFraming {
 }
 impl OutputFraming {
     /// Check every actual data and opposite-driven feedback output before allocation.
-    pub fn validate(self, config: Config) -> Result<(), Error> {
+    pub fn validate<P: RecoveryPolicy>(self, config: Config<P>) -> Result<(), Error> {
         config.validate()?;
         for (direction, fragment, overhead) in [
             (
@@ -258,7 +236,7 @@ impl OutputFraming {
                 .geometry(direction.maximum_packet_bytes()?)
                 .map_err(Error::Fragment)?;
             fragment
-                .geometry(scheduler::FEEDBACK_BYTES)
+                .geometry(P::FEEDBACK_BYTES)
                 .map_err(Error::Fragment)?;
         }
         Ok(())
@@ -271,9 +249,9 @@ impl OutputFraming {
     }
     /// Complete explicit framing commitment, not proof of peer authentication.
     /// The parent binds this selection before installing a framed endpoint.
-    pub fn binding_digest(
+    pub fn binding_digest<P: RecoveryPolicy>(
         self,
-        config: Config,
+        config: Config<P>,
         copies: CopyPolicies,
         stream: u32,
     ) -> Result<ConfigDigest, Error> {

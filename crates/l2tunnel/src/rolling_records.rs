@@ -25,6 +25,9 @@ mod copies;
 mod endpoint;
 mod ingress;
 mod native;
+#[doc(hidden)]
+pub mod recovery;
+use recovery::RecoveryPolicy;
 /// Exact backing of the actual codec, rolling schedulers and scratch owners.
 pub mod storage;
 #[cfg(test)]

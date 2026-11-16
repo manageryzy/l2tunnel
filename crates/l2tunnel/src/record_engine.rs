@@ -22,6 +22,9 @@ pub mod storage;
 
 mod affinity;
 mod connection_ingress;
+// Await actual selected-control provenance before exposing flow reuse.
+#[allow(dead_code)]
+mod connection_reuse;
 mod connections;
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
@@ -89,6 +92,8 @@ pub enum ProfileIdentity {
     Packed(receiver::RecordIdentity),
     /// Compact rolling body identity, separate from recovery source/repair IDs.
     Rolling(receiver::RecordIdentity),
+    /// Actual packed-record identity from the selected research recovery owner.
+    Research(receiver::RecordIdentity),
     /// Actual independently recovered connection body, retaining owner/incarnation.
     Connection(crate::connection_records::Identity),
     /// Source-free native ACK event, outside reliable native-prefix accounting.
@@ -720,10 +725,27 @@ impl Engine {
         }
     }
 
+    /// Actual selected research owner status; absent for every other family.
+    /// These committed local observations grant no peer authentication or drain authority.
+    pub fn research_status(
+        &self,
+    ) -> Option<(
+        crate::fec::research::SenderStatus,
+        crate::fec::research::ReceiverStatus,
+    )> {
+        match &self.owner {
+            Owner::Research(endpoint) => {
+                Some((endpoint.sender_status(), endpoint.receiver_status()))
+            }
+            _ => None,
+        }
+    }
+
     /// Actual generation-owned Rolling input custody, absent for other families.
     pub fn rolling_ingress_status(&self) -> Option<rolling_records::IngressStatus> {
         match &self.owner {
             Owner::Rolling(endpoint) => endpoint.ingress_status(),
+            Owner::Research(endpoint) => endpoint.ingress_status(),
             _ => None,
         }
     }
@@ -747,6 +769,7 @@ impl Engine {
         self.advance(now)?;
         let result = match &mut self.owner {
             Owner::Rolling(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
+            Owner::Research(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
             owner => owner.tick(now).map(|()| None),
         };
         match result {
@@ -760,6 +783,7 @@ impl Engine {
         let deadline = self.deadline()?;
         Ok(match &self.owner {
             Owner::Rolling(endpoint) => deadline.into_iter().chain(endpoint.wake_at()).min(),
+            Owner::Research(endpoint) => deadline.into_iter().chain(endpoint.wake_at()).min(),
             _ => deadline,
         })
     }
@@ -767,7 +791,11 @@ impl Engine {
     /// Actual resumable rolling computation, separate from immutable I/O output.
     pub fn work_pending(&self) -> Result<bool, Error> {
         self.healthy()?;
-        Ok(matches!(&self.owner, Owner::Rolling(endpoint) if endpoint.work_pending()))
+        Ok(match &self.owner {
+            Owner::Rolling(endpoint) => endpoint.work_pending(),
+            Owner::Research(endpoint) => endpoint.work_pending(),
+            _ => false,
+        })
     }
 
     /// Earliest actual owner or retained native deadline, without reading a clock.
@@ -911,6 +939,11 @@ fn parameters_with_fragmentation(
     {
         return Err(Error::Geometry);
     }
+    if let configuration::Profile::Research { config, .. } = descriptor.profile()
+        && (config.geometry != geometry || config.native_stall_micros != native_limits.stall_micros)
+    {
+        return Err(Error::Geometry);
+    }
     for (role, overhead) in [
         (Role::Client, geometry.forward_overhead_bytes),
         (Role::Server, geometry.reverse_overhead_bytes),
@@ -1050,6 +1083,18 @@ fn dimensions(
             usize::from(config.packing.max_units),
             Some(overhead_bytes),
         ),
+        configuration::DirectionProfile::Research {
+            config,
+            overhead_bytes,
+            ..
+        } => (
+            config
+                .maximum_packet_bytes()
+                .map_err(Error::Rolling)?
+                .max(crate::fec::research::wire::HEADER_BYTES),
+            usize::from(config.packing.max_units),
+            Some(overhead_bytes),
+        ),
     })
 }
 
@@ -1058,3 +1103,6 @@ mod bounded_feedback_tests;
 
 #[cfg(test)]
 mod fragment_tests;
+
+#[cfg(test)]
+mod research_tests;

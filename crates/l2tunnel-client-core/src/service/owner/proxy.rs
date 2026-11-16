@@ -386,7 +386,7 @@ pub(super) async fn common(
             epoch: None,
             liveness: Default::default(),
             hot_switch: false,
-            graceful_close: false,
+            graceful_close: profile.proxy_retirement(),
         },
     ));
     let observed = backend.clone();

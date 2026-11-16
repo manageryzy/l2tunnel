@@ -14,8 +14,9 @@ fixed proxy `session_config` digest into the application input before the existi
 Common configuration, admission, Noise and member authentication. Explicit
 `service::Prepared::proxy_common_client/server` use the existing shared service
 owner, readiness, keyed operations, abort, release and reconnect machinery.
-The preexisting TLS fixed/measured constructors and production CLI keep their
-original selections. There is no new proxy CLI mode in this checkpoint.
+The preexisting TLS fixed/measured constructors and CLI keep their original
+selections. Their external checkpoint did not include the explicit Common CLI
+slice staged below.
 
 The actual call chain is:
 
@@ -98,6 +99,90 @@ Local switch requests return `Invalid`; a validated fresh peer PREPARE terminate
 with `Unsupported` before new storage or epoch admission. Existing management has
 no follower policy-rejection response for that case; this slice does not add one.
 
+
+## Selected retained-close implementation (finite integration evidence)
+
+An additive `Profile::new_proxy_retained` binds an explicit application/H0 domain
+before the existing immutable proxy commitment. `Profile::new_proxy` and its old
+wire/default selection remain unchanged and still refuse graceful close. No new
+CLI default or periodic key exchange is selected. The [Batch14 receipt](../../work/parallel-features-20261115/parallel-batch14-scoped-validation.json)
+records two actual protocol/Bridge cases and the protected-UDP shared-service case;
+full PCOM-09 acceptance remains open.
+
+The existing actor passes its original minimum drain cap to the same bounded
+Bridge. Its single-byte EOF uses the same Pipeline and Aligned/direct ARQ. The
+maintained Reliable parser identifies the actual EOF `SourceId`; the code never
+converts a native record or physical packet ID into that source. A real peer ACK
+must retire the final source, including any exact physically held retry. Actual
+peer EOF, actor native/fence completion and child joins remain separate mandatory
+conditions. The same Driver retains duplicate-triggered feedback until the cap,
+then checks relevant user/record custody before waking the actor. Only afterward
+may the actor publish Closed or complete its administrative drain waiter.
+`Engine::drained()` is one local custody conjunct, never a peer-close proof, and
+unrelated periodic management/liveness output need not become globally empty.
+
+At the original cap, incomplete relevant output fails. Physical acceptance alone,
+ACK receipt with a still-held retry, local timeout, or cancelling ciphertext
+cannot produce clean closure. An explicit terminal failure wakes the actor and
+performs owned cleanup. Each peer's result is local; loss through the entire cap
+can yield different honest outcomes. Common reports no fabricated closed TLS lane.
+
+Two passing component cases use actual reserved Reliable senders/receivers and
+real Bridge EOF ports for final-source loss, first-final-feedback loss,
+duplicate-triggered ACKs, held retries, original-cap expiry and late receipt. A
+third passing case uses the actual shared service/original UDP/Noise/member path,
+maintained native TCP endpoints and existing quiesce/fence/join machinery. This is finite local Linux integration evidence. End-to-end final-record/final-feedback loss, full selection,
+native/platform/resource/performance and complete PCOM-09 remain required.
+
+## Explicit fixed CLI and portable observations
+
+The implemented CLI slice passes its strict-selection, portable-projection and
+actual shared-service presentation cases in the Batch14 receipt. The original
+[source-bound handoff](../../work/parallel-features-20261115/common-proxy-cli-v0/handoff.json)
+remains preserved.
+It explicitly selects --traffic proxy --proxy-policy JSON_FILE together with
+--record-profile common --common-transaction-plan PATH and original
+--carrier quic-like|media-like. It reads the maintained strict fixed policy,
+uses runtime_config/Profile::new_proxy/Prepared::proxy_common_client/server,
+and reuses the sole existing proxy shared-service presenter. No proxy, TCP,
+recovery, authentication or lifecycle state machine is duplicated.
+
+The finite selection remains full/TUN/no compression, fixed one channel and one
+immutable compatible Aligned/direct-ARQ descriptor. Measured, raw/OpenVPN, Half,
+multiple channels/catalog members and incompatible record geometry are rejected
+before network/device startup. Settings and trust file reads are ordinary bounded
+preflight; native attachment remains deferred until the actual service owns it.
+There is no silent catalog/body clamp, family conversion, policy fallback or
+retained-close default.
+
+inspect-common-transaction-plan includes requested-only fixed proxy policy and
+complete bounded route pages with the authenticated policy digest. Actual setup
+uses Observation::Proxy with embedded Common facts, not native-Common API4 event
+projection. The maintained proxy local API1 exposes status, drain-proxy,
+disconnect and explicit fresh reconnect. It does not enable native-Common API4
+catalog/switch operations. Omitting --proxy-close preserves the existing v1
+graceful_close=false selection. Explicit --proxy-close retained uses
+Profile::new_proxy_retained and binds that selection into authenticated H0;
+both peers must select it. Inspection names common_proxy_fixed_retained_v1,
+and effective observations copy the actual selected close capability. Closure
+keeps the original actor drain cap and the same reliable EOF/feedback owners.
+
+Portable ProxySnapshot.common is optional and omitted for legacy TLS proxy
+observations, preserving their old serialized bytes. For the explicit Common
+selection it carries bounded actual requested/effective policy/configuration,
+carrier/cover/original endpoints, liveness, installation/capability and release
+facts from ProxyCommonFrame. It carries no credentials or packet bytes. Older
+strict clients may reject this explicit-mode field instead of silently reporting
+a different backend. Requested inspection is not an effective runtime observation.
+Common record-port counters remain distinct from actual native TCP/TUN writes.
+
+Focused parser, legacy omission, bounded requested/effective projection and one
+genuine shared-service presentation regression pass. The optional Common status
+is boxed in-process to bound legacy async frames; its serialized representation
+and omission remain unchanged. Full
+PCOM-06 (including measured paging, supported switching and every lifecycle
+failure/reconnect path), PCOM-02..05/07..09, native/platform/performance and all
+other original mode requirements remain unchanged and open.
 
 ## Preserved external verification
 

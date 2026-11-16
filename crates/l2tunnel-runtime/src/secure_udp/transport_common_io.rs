@@ -715,6 +715,20 @@ impl Driver {
                     .timing()?;
                 deadline = deadline.min(clock(self.origin, cap)?);
             }
+            if let Some(identity) = proxy_record
+                && let Some(bridge) = &runtime.proxy_bridge
+                && bridge.final_identity()? == Some(identity)
+            {
+                let owner::DataOwner::Common(state) = &self.owner else {
+                    return Err(protocol("Common final record lost actual Bank"));
+                };
+                let source = state
+                    .engine(epoch)?
+                    .proxy_output_source(&self.buffers.frame[..emission.bytes])
+                    .map_err(protocol)?
+                    .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
+                bridge.bind_final_source(identity, source)?;
+            }
             runtime.sealed = Some(common::PendingWire {
                 proxy_record,
                 scope,
@@ -1015,6 +1029,35 @@ impl Driver {
             .local(common_contract::mg_role(self.info.role));
         let body = &self.buffers.plain[..opened.bytes];
         let kind = match local.receive().profile() {
+            configuration::DirectionProfile::Research { config, .. } => {
+                let configuration::DirectionProfile::Research { config: send, .. } =
+                    local.send().profile()
+                else {
+                    return Err(protocol("research directional family mismatch"));
+                };
+                // Reverse feedback describes our actual sender's negotiated policy;
+                // source/repair records describe the peer's independent policy.
+                if matches!(
+                    l2tunnel_fec::research::wire::inspect(send.scheduler, body),
+                    Ok(l2tunnel_fec::research::wire::View::Feedback(_))
+                ) {
+                    engine::EmissionKind::Feedback
+                } else {
+                    match l2tunnel_fec::research::wire::inspect(config.scheduler, body)
+                        .map_err(protocol)?
+                    {
+                        l2tunnel_fec::research::wire::View::Source { .. } => {
+                            engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
+                        }
+                        l2tunnel_fec::research::wire::View::Repair(_) => {
+                            engine::EmissionKind::Repair
+                        }
+                        l2tunnel_fec::research::wire::View::Feedback(_) => {
+                            return Err(protocol("research feedback policy differs from sender"));
+                        }
+                    }
+                }
+            }
             configuration::DirectionProfile::Swift(_) => match body
                 .first()
                 .map(|lead| lead & swift::KIND_MASK)
@@ -1107,6 +1150,7 @@ impl Driver {
             && matches!(
                 local.receive().profile(),
                 configuration::DirectionProfile::Rolling { .. }
+                    | configuration::DirectionProfile::Research { .. }
             )
             && kind != engine::EmissionKind::Feedback;
         let width = usize::from(local.receive().channels());
@@ -1205,6 +1249,16 @@ impl Driver {
         held_control: bool,
     ) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if let Some(cap) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.proxy_bridge.as_ref())
+            .map(|bridge| bridge.retirement_deadline())
+            .transpose()?
+            .flatten()
+        {
+            wake = wake.min(clock(self.origin, cap)?);
+        }
         if let Some(input) = self
             .common
             .as_ref()

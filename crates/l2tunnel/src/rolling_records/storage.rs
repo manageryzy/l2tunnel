@@ -21,14 +21,14 @@ pub struct Usage {
 
 /// Complete allocation-free preflight of exactly the owners constructed below.
 #[derive(Clone, Copy)]
-pub struct Plan {
-    config: Config,
+pub struct Plan<P: RecoveryPolicy = scheduler::Policy> {
+    config: Config<P>,
     copies: CopyPolicies,
     context: Context,
     stream: u32,
     now: Tick,
-    pub(super) sender: rolling::storage::Plan,
-    pub(super) incoming: rolling::storage::Plan,
+    pub(super) sender: recovery::OwnerPlan,
+    pub(super) incoming: recovery::OwnerPlan,
     packing: codec::aligned_storage::PackedSenderPlan,
     receiver: codec::aligned_storage::ReceiverPlan,
     source_bytes: usize,
@@ -38,10 +38,10 @@ pub struct Plan {
     ingress_bytes: usize,
     capacity_bytes: usize,
 }
-impl Plan {
+impl<P: RecoveryPolicy> Plan<P> {
     /// Validate both complete directions, every original time addition and layout.
     pub fn for_endpoint(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -50,7 +50,7 @@ impl Plan {
     }
     /// Plan the same actual heap owners with exact selected directional policies.
     pub fn for_endpoint_with_copies(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -60,7 +60,7 @@ impl Plan {
     }
     /// Plan the same actual owners plus optional independently bounded input custody.
     pub fn for_endpoint_with_options(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -71,7 +71,7 @@ impl Plan {
     }
     /// Plan exact optional physical fragmentation without adding a payload owner.
     pub fn for_endpoint_with_output_framing(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -90,24 +90,30 @@ impl Plan {
         }
         for direction in [config.forward, config.reverse] {
             let s = direction.scheduler;
+            let recovery = s.recovery();
+            let intervals = s.intervals();
             for interval in [
                 direction.packing.packing.hold_micros,
                 direction.receiver.lifetime_ticks,
                 direction.codec_stage_micros,
-                s.recovery.job_ticks,
-                s.recovery.debt_ticks,
-                s.recovery.handoff_ticks,
-                s.tail_ticks,
-                s.feedback_ticks,
+                recovery.job_ticks,
+                recovery.debt_ticks,
+                recovery.handoff_ticks,
+                intervals[0],
+                intervals[1],
                 config.native_stall_micros,
             ] {
                 now.0.checked_add(interval).ok_or(Error::Arithmetic)?;
             }
         }
         let (send, receive, _) = config.local(context.role);
-        let sender =
-            rolling::storage::Plan::for_sender(send.scheduler).map_err(Error::RollingStorage)?;
-        let incoming = rolling::storage::Plan::for_receiver(receive.scheduler)
+        let sender = send
+            .scheduler
+            .sender_plan()
+            .map_err(Error::RollingStorage)?;
+        let incoming = receive
+            .scheduler
+            .receiver_plan()
             .map_err(Error::RollingStorage)?;
         let packing = send.packing_plan()?;
         let receiver = receive.receiver_plan()?;
@@ -130,8 +136,8 @@ impl Plan {
             .transpose()?
             .unwrap_or(0);
         let capacity_bytes = [
-            sender.capacity_bytes(),
-            incoming.capacity_bytes(),
+            sender.capacity_bytes,
+            incoming.capacity_bytes,
             packing.capacity_bytes(),
             receiver.capacity_bytes(),
             source_bytes,
@@ -161,7 +167,7 @@ impl Plan {
         })
     }
     /// Both complete globally ordered policies, unchanged.
-    pub const fn config(&self) -> Config {
+    pub const fn config(&self) -> Config<P> {
         self.config
     }
     /// Exact complete global policies retained for actual construction.
@@ -193,16 +199,16 @@ impl Plan {
         self.capacity_bytes
     }
 }
-impl Endpoint {
+impl<P: RecoveryPolicy> Endpoint<P> {
     /// Construct the same actual owners only after complete heap admission.
-    pub fn new_reserved(plan: Plan, limits: Limits) -> Result<Self, Error> {
+    pub fn new_reserved(plan: Plan<P>, limits: Limits) -> Result<Self, Error> {
         if plan.copies != CopyPolicies::ONE {
             return Err(Error::Configuration);
         }
         Self::new_reserved_with_copies(plan, limits)
     }
     /// Construct selected copy policies from their exact admitted complete plan.
-    pub fn new_reserved_with_copies(plan: Plan, limits: Limits) -> Result<Self, Error> {
+    pub fn new_reserved_with_copies(plan: Plan<P>, limits: Limits) -> Result<Self, Error> {
         if plan.capacity_bytes > limits.capacity_bytes {
             return Err(Error::Capacity {
                 required: plan.capacity_bytes,
@@ -229,20 +235,14 @@ impl Endpoint {
             .records
             .storage_usage()
             .ok_or(Error::StorageInvariant)?;
-        let sender = endpoint
-            .sender
-            .storage_usage()
-            .map_err(Error::RollingStorage)?;
-        let incoming = endpoint
-            .incoming
-            .storage_usage()
-            .map_err(Error::RollingStorage)?;
+        let sender = P::sender_usage(&endpoint.sender).map_err(Error::RollingStorage)?;
+        let incoming = P::receiver_usage(&endpoint.incoming).map_err(Error::RollingStorage)?;
         if packing.capacity_bytes != plan.packing.capacity_bytes()
             || receiver.capacity_bytes != plan.receiver.capacity_bytes()
-            || sender.capacity_bytes != plan.sender.capacity_bytes()
-            || incoming.capacity_bytes != plan.incoming.capacity_bytes()
-            || sender.allocations != plan.sender.allocations()
-            || incoming.allocations != plan.incoming.allocations()
+            || sender.capacity_bytes != plan.sender.capacity_bytes
+            || incoming.capacity_bytes != plan.incoming.capacity_bytes
+            || sender.allocations != plan.sender.allocations
+            || incoming.allocations != plan.incoming.allocations
             || endpoint.source.capacity() != plan.source_bytes
             || endpoint.symbols.capacity() != plan.symbol_bytes
             || endpoint

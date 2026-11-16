@@ -109,7 +109,8 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
         ProfileIdentity::UnreliableNative(identity) => usize::from(identity.owner.index()),
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
-        | ProfileIdentity::Rolling(identity) => usize::from(identity.channel.0),
+        | ProfileIdentity::Rolling(identity)
+        | ProfileIdentity::Research(identity) => usize::from(identity.channel.0),
     }
 }
 

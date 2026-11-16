@@ -6,12 +6,12 @@ use l2tunnel_recovery::{
 };
 use l2tunnel_reliable::CompactReliableConfig;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-fn ms(value: u64) -> Duration {
+pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+pub(super) fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
 }
 
-fn config(owners: u16) -> TestResult<Config> {
+pub(super) fn config(owners: u16) -> TestResult<Config> {
     let symbol = 128;
     let source = aligned_envelope::HEADER_BYTES + symbol;
     let policy = aligned::CompactConfig {
@@ -71,14 +71,14 @@ fn config(owners: u16) -> TestResult<Config> {
         receive_unreliable: None,
     })
 }
-fn context(role: EndpointRole) -> RecoveryContext {
+pub(super) fn context(role: EndpointRole) -> RecoveryContext {
     RecoveryContext {
         session: 0x1020,
         epoch: 7,
         role,
     }
 }
-fn construct(config: Config, role: EndpointRole) -> TestResult<Collection> {
+pub(super) fn construct(config: Config, role: EndpointRole) -> TestResult<Collection> {
     let plan = storage::Plan::for_collection(config)?;
     Ok(Collection::new_reserved(
         plan,
@@ -88,7 +88,7 @@ fn construct(config: Config, role: EndpointRole) -> TestResult<Collection> {
         },
     )?)
 }
-fn frame(marker: u8) -> Vec<u8> {
+pub(super) fn frame(marker: u8) -> Vec<u8> {
     let mut bytes = vec![marker; 100];
     bytes[0] = 0x45;
     bytes[1] = 0;
@@ -219,7 +219,7 @@ fn sixteen_actual_reserved_owners_require_the_complete_fixed_and_nested_allowanc
     Ok(())
 }
 
-fn collect(
+pub(super) fn collect(
     collection: &mut Collection,
     id: OwnerId,
     now: Duration,

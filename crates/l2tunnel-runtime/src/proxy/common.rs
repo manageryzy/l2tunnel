@@ -89,8 +89,12 @@ where
                     .direction(l2tunnel_management::Role::Server)
                     .max_native(),
             );
-        let (port, stream, bridge) =
-            super::common_bridge::pair(maximum, contract.resources().native.stall_timeout)?;
+        let retained = contract.proxy_retirement();
+        let (port, stream, bridge) = if retained {
+            super::common_bridge::pair_retained(maximum, contract.resources().native.stall_timeout)?
+        } else {
+            super::common_bridge::pair(maximum, contract.resources().native.stall_timeout)?
+        };
         let (reader, writer) = tokio::io::split(stream);
         let link = Link {
             inner: crate::Link {
@@ -113,10 +117,10 @@ where
                 return Err(invalid("measured Common proxy is not installed"));
             }
         };
-        Ok((port, bridge, link, readiness, setup))
+        Ok((port, bridge, link, readiness, setup, retained))
     })();
     async move {
-        let (port, bridge, link, mut readiness, setup) = prepared?;
+        let (port, bridge, link, mut readiness, setup, retained) = prepared?;
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let runtime = transport::run_common_proxy_records(
             port,
@@ -129,7 +133,15 @@ where
             },
             observe,
         );
-        let actor = actor::run_profile_owned(device, link, config, control, None, true);
+        let actor = actor::run_profile_selected(
+            device,
+            link,
+            config,
+            control,
+            None,
+            true,
+            retained.then_some(bridge.clone()),
+        );
         tokio::pin!(runtime, actor);
         let ready = async {
             loop {
@@ -163,13 +175,17 @@ where
                     let _ = stop.send(());
                     let common = runtime.await;
                     bridge.fail();
-                    result?;
+                    let report = result?;
                     let stopped = common?;
                     if stopped.reason != transport::StopReason::Cancelled {
                         return Err(io::Error::other(format!("Common proxy ended before local close: {:?}", stopped.reason)));
                     }
-                    return Err(io::Error::new(io::ErrorKind::Unsupported,
-                        "Common proxy graceful close has no retained reliable retirement owner"));
+                    return if retained {
+                        Ok(report)
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::Unsupported,
+                            "Common proxy graceful close has no retained reliable retirement owner"))
+                    };
                 }
                 result = &mut runtime => {
                     bridge.fail();

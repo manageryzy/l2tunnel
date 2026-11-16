@@ -213,6 +213,12 @@ impl Collection {
                 .ok_or(Error::Arithmetic)?;
             slots.push(Slot {
                 endpoint,
+                incarnation: plan.config.incarnation,
+                admitted_native: 0,
+                written_native: 0,
+                retirement: None,
+                retirement_serial: 0,
+                highest_retirement_attempt: 0,
                 native: None,
                 next_native: 0,
                 native_failure: None,
@@ -270,6 +276,7 @@ impl Collection {
         Ok(Self {
             plan,
             instance,
+            context,
             slots,
             usage,
             raw_send,

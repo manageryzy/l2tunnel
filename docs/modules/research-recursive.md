@@ -1,13 +1,17 @@
 # Recursive parity and rolling-accumulator protocol components
 
-Status: **implemented pure components with current root finite protocol evidence**.
+Status: **implemented pure components and original-UDP Common composition with finite protocol and runtime integration evidence**.
+The [Batch14 receipt](../../work/parallel-features-20261115/parallel-batch14-scoped-validation.json)
+adds Engine/Bank, protected original UDP and catalog-bound shared-service cases.
+Asynchronous carrier ordering and complete named Python acceptance remain open.
 The [Batch13 receipt](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json)
 records the affected research/shared-rolling cases, unchanged Python oracle check,
 and first full-check failures/continuations separately from external history.
 The isolated feature checkpoint is `a8da1e2154c58c9da652630da3049708a9db8a06`; its preserved passing and failed receipts below describe that external source, not a new check of this integration. The new `l2tunnel_fec::research` owners encode actual arbitrary source bytes,
 recover from received bytes, schedule charged repairs and emit cumulative receipt
-feedback. They do not install a Common record family, carrier, CLI capability or
-native mode. The complete `P-research-recursive-parity`,
+feedback. Those standalone owners supply no runtime authority. The selected composition
+below installs the actual Common family and original-UDP shared service; native
+mode qualification remains separate. The complete `P-research-recursive-parity`,
 `P-research-recursive-fallback` and `P-research-rolling-accumulator` definitions
 remain required and unchecked in the [main ledger](../implementation-checklist.md).
 
@@ -153,12 +157,78 @@ original-arrival deadline prerequisite as separate commit
 The additive equation hooks depend on that exact prerequisite; they are not a
 replacement for other concurrent rolling decoder/scheduler work.
 
+## Selected pure record composition (protocol-tested)
+
+The additive `research_records` selection instantiates the maintained packed
+record body with the actual research Sender/Receiver. The existing rolling codec,
+native custody, bounded ingress and optional fragment/reassembly transitions are
+shared through a sealed typed recovery policy. The old default selection remains
+the actual rolling scheduler; research observations have their own real status.
+CompleteV2 tag9 commits both full directions, all codec/source/native/time/memory
+bounds, the maintained12-byte algorithm descriptor, exact outer geometry and
+coding stream. Tags1..8 and their existing bytes are preserved.
+
+The actual reserved Engine/Bank path owns these research backings and charges
+L2RS source, repair and feedback through the shared Pipeline/output budget.
+Physical output and whole fragment-group tokens are retained until matching
+complete custody, without recharging a held output. Source/stage/input/debt/native
+caps remain original. The staged finite cases exchange native bytes with real
+source and feedback loss for recursive/fallback/accumulator policies, exercise
+an actual fallback repair, exact canonical/storage admission and real Bank output
+custody. These three cases pass in the root Batch14 check/continuations. Existing
+external component receipts above remain historical finite evidence.
+
+A delayed physical completion cannot use feedback that arrived after its actual
+acceptance to choose repair support. The actual research completion helper checks
+accepted versus observed time and the latest applied feedback time. A noncausal
+ordering explicitly terminates the owner and retires the irreversible physical
+token/count exactly once; it invents no past receipt prefix, clock rewind or cap
+extension. The selected runtime must process genuine completion receipts before
+later authenticated feedback, or install a bounded authenticated arrival-order
+owner. The focused delayed-receipt/late-feedback case passes in Batch14.
+
+The pure candidate alone left runtime/shared-service/carrier/CLI selection
+unsupported. The dependent original-UDP candidate below removes only its actual
+installed branches; asynchronous carriers remain refused. Caller-authenticated
+pure fixtures establish no production Noise/TLS/native lab qualification. RRP-03 and all
+three original P-* gates remain fully open until their complete runtime,
+feedback-loss/resource/failure and native acceptance requirements pass. The new
+L2RS80-byte wire does not establish Python analytical byte/performance parity.
+
+## Original-UDP runtime composition
+
+The separate dependent candidate installs tag9 in the same Common Driver,
+Bank, Records, Control and shared-service path. The exact Research send policy
+parses reverse feedback; the independent receive policy parses source/repair.
+Both roles require explicit authenticated bounded scheduler work. The existing
+reserved ingress queue and fragment policy also select the actual Research owner;
+there is no alternate queue, recovery algorithm or default. Canonical catalog
+and v4 requested/effective observations retain the complete tag9 descriptor.
+
+Original UDP confirms its whole physical send synchronously before subsequently
+opening another authenticated input. Already authenticated feedback remains in
+its observed order. An unread OS packet has no known physical network arrival
+here: this is not exact network-clock/Python event equivalence. Asynchronous
+OpenVPN/raw Research selection remains explicitly unsupported until bounded
+retained-arrival/physical-receipt ordering is installed. Blindly polling receipts
+before input would also invert valid earlier-feedback order and is not a fix.
+
+Three finite root cases pass in Batch14:
+actual protected UDP loss/reorder, native pressure and switches for all three
+Research policies; retained sealed bytes/PN/token/debit and original-cap whole
+write; and genuine catalog-bound initial Noise/member shared service followed by
+all three Research selections and Swift return on the original sockets. The
+first two use imported actual secure test Parts and do not claim a new initial
+catalog-bound handshake. RRP-03, all original P-* definitions, the asynchronous
+carrier ordering requirement, complete native/platform/failure/resource and
+Python wire-byte/throughput gates remain open pending their full acceptance.
+
 ## Component ledger
 
 These component gates do not complete or narrow the parent P-* mode tasks.
 
-- [x] [RRP-01] Implement full-payload recursive taps/reset, periodic fresh-prefix fallback and repeated-lane accumulator using existing GF/storage/decoder capabilities; validate exact Python policy and coded-byte vectors. Evidence: [external scoped receipt](../../work/parallel-features-20261115/batch13-staging/recursive-fec/external-evidence/attempt-2/validation.json); current root validation pending.
-- [x] [RRP-02] Implement charged 26/125 source-completion scheduling, immutable output/feedback custody, bounded original deadlines, exact replay checks and actual heap admission; validate loss, reorder, reset and failure paths. Evidence: [external scoped receipt](../../work/parallel-features-20261115/batch13-staging/recursive-fec/external-evidence/attempt-2/validation.json); current root validation pending.
+- [x] [RRP-01] Implement full-payload recursive taps/reset, periodic fresh-prefix fallback and repeated-lane accumulator using existing GF/storage/decoder capabilities; validate exact Python policy and coded-byte vectors. Evidence: [external scoped receipt](../../work/parallel-features-20261115/batch13-staging/recursive-fec/external-evidence/attempt-2/validation.json); root component validation passes in [Batch13](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
+- [x] [RRP-02] Implement charged 26/125 source-completion scheduling, immutable output/feedback custody, bounded original deadlines, exact replay checks and actual heap admission; validate loss, reorder, reset and failure paths. Evidence: [external scoped receipt](../../work/parallel-features-20261115/batch13-staging/recursive-fec/external-evidence/attempt-2/validation.json); root component validation passes in [Batch13](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
 - [ ] [RRP-03] Integrate the selected profiles with Common Engine/Bank/configuration, authenticated carrier/MUX accounting and completion callbacks; preserve all full P-* acceptance requirements.
 
 ## Scoped verification and remaining integration
@@ -198,9 +268,9 @@ argument after the descriptor API change. Per the task's scoped-check instructio
 No whole-repository, privileged, native, Windows/Android, CI or performance
 acceptance is implied by this component checkpoint.
 
-Common configuration/capability binding, record Engine/Bank installation,
-authenticated selected-carrier dispatch, shared admission/pacing, production
-feedback loss, complete resource/fault qualification and native execution remain
-open. The three full P-* tasks and their end-to-end acceptance definitions are
+Complete qualification of Common configuration/capability binding, actual
+Engine/Bank/runtime/shared-service consumption, every authenticated carrier,
+shared admission/pacing, production feedback loss, resource/fault behavior and
+native execution remains open beyond the finite authored candidates. The three full P-* tasks and their end-to-end acceptance definitions are
 unchanged. The draft wire requires explicit future integration; no default or
 existing mode is switched by adding these components.

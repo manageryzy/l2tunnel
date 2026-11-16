@@ -21,8 +21,11 @@ impl CopyPolicies {
         reverse: Policy::ONE,
     };
     /// Validate against each actual directional packer's meaningful symbol width.
-    pub fn validate(self, config: Config) -> Result<(), Error> {
+    pub fn validate<P: RecoveryPolicy>(self, config: Config<P>) -> Result<(), Error> {
         config.validate()?;
+        if !P::COPIES && self != Self::ONE {
+            return Err(Error::Configuration);
+        }
         for (policy, direction) in [
             (self.forward, config.forward),
             (self.reverse, config.reverse),
@@ -57,7 +60,11 @@ impl CopyPolicies {
     }
     /// Preserve the exact legacy binding for ONE; commit both selected policies otherwise.
     /// An enclosing authenticated configuration must also select this policy.
-    pub fn binding_digest(self, config: Config, stream: u32) -> Result<ConfigDigest, Error> {
+    pub fn binding_digest<P: RecoveryPolicy>(
+        self,
+        config: Config<P>,
+        stream: u32,
+    ) -> Result<ConfigDigest, Error> {
         self.validate(config)?;
         let base = config.binding_digest(stream)?;
         if self == Self::ONE {

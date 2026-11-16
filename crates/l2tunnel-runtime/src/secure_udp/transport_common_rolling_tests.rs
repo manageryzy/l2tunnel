@@ -404,3 +404,6 @@ mod raw_common;
 
 #[path = "transport_common_fragment_tests.rs"]
 mod fragments;
+
+#[path = "transport_common_research_tests.rs"]
+mod research_common;

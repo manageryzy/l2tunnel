@@ -29,6 +29,7 @@ pub struct Profile {
     raw: Option<raw::RawSelection>,
     requested_catalog: Option<Catalog>,
     proxy: Option<l2tunnel_runtime::proxy::Config>,
+    proxy_retirement: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +99,33 @@ impl Profile {
             Some(proxy),
         )
     }
+    /// Explicit retained graceful retirement. The existing v1 constructor and
+    /// defaults remain unchanged; this domain is included before Noise/member H0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_retained(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+    ) -> io::Result<Self> {
+        let mut application = digest::Context::new(&digest::SHA256);
+        application.update(b"l2tunnel/shared-client/common-proxy-retirement/v1\0");
+        application.update(&settings.application.0);
+        settings.application = ConfigDigest(super::finish(application));
+        let mut result = Self::new_proxy(
+            connection, settings, peers, initiator, responder, catalog, parameters, proxy,
+        )?;
+        result.proxy_retirement = true;
+        Ok(result)
+    }
+    /// Explicit immutable close capability, bound to this plan's authenticated H0.
+    pub const fn proxy_retirement(&self) -> bool {
+        self.proxy_retirement
+    }
     /// The exact selected fixed policy, absent for all transparent Common plans.
     pub fn proxy_config(&self) -> Option<&l2tunnel_runtime::proxy::Config> {
         self.proxy.as_ref()
@@ -115,6 +143,18 @@ impl Profile {
         proxy: Option<l2tunnel_runtime::proxy::Config>,
     ) -> io::Result<Self> {
         let base = connection.session()?;
+        if raw_policy.is_some()
+            && catalog
+                .descriptors()
+                .iter()
+                .any(|descriptor| matches!(descriptor.profile(), common::Profile::Research { .. }))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "research raw carriers require authenticated arrival/receipt ordering",
+            ));
+        }
+
         if initiator.rolling_fragments != responder.rolling_fragments {
             return Err(invalid(
                 "both roles must select the same complete directional fragment policy",
@@ -124,12 +164,14 @@ impl Profile {
             && !catalog.descriptors().iter().any(|descriptor| {
                 matches!(
                     descriptor.profile(),
-                    common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. }
+                    common::Profile::Rolling { .. }
+                        | common::Profile::RollingCopies { .. }
+                        | common::Profile::Research { .. }
                 )
             })
         {
             return Err(invalid(
-                "fragment selection requires a Rolling catalog member",
+                "fragment selection requires a coded catalog member",
             ));
         }
         if (raw_policy.is_none() && connection.duplex != Duplex::Full)
@@ -234,6 +276,7 @@ impl Profile {
             raw: None,
             requested_catalog: None,
             proxy,
+            proxy_retirement: false,
         };
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
@@ -453,8 +496,11 @@ impl Profile {
         )?;
         match &self.proxy {
             Some(proxy) => {
-                let contract = contract
+                let mut contract = contract
                     .with_proxy_binding(l2tunnel_runtime::proxy::session_config(proxy)?.digest)?;
+                if self.proxy_retirement {
+                    contract = contract.with_proxy_retirement()?;
+                }
                 l2tunnel_runtime::proxy::common::validate(proxy, &contract)?;
                 Ok(contract)
             }
@@ -497,6 +543,12 @@ fn carrier_catalog(catalog: &Catalog) -> io::Result<Catalog> {
 fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Descriptor> {
     let mut profile = *descriptor.profile();
     match &mut profile {
+        common::Profile::Research { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "research record carrier binding is not installed",
+            ));
+        }
         common::Profile::Swift { .. } => {}
         common::Profile::Aligned { forward, reverse } => {
             for value in [forward, reverse] {

@@ -270,6 +270,13 @@ impl Receiver {
             self.decoder.pending_source()
         }
     }
+    /// Borrow one actual committed source for bounded record preview without consuming handoff.
+    pub fn decoded_source(&self, id: SourceId) -> Result<Option<&[u8]>, Error> {
+        if self.terminal.is_some() {
+            return Err(Error::Terminal);
+        }
+        self.decoder.decoded_source(id)
+    }
     /// Confirm only the current contiguous recovery handoff; no native receipt is implied.
     pub fn confirm_handoff(&mut self, id: SourceId, now: Tick) -> Result<(), Error> {
         self.time(now)?;

@@ -43,3 +43,28 @@ pub(crate) fn run_common_proxy_records(
     })();
     run_prepared_common(prepared, requests, shutdown, observe)
 }
+
+impl Driver {
+    pub(in super::super) fn observe_proxy_retirement(
+        &self,
+        runtime: &common::Runtime,
+    ) -> io::Result<()> {
+        let Some(bridge) = &runtime.proxy_bridge else {
+            return Ok(());
+        };
+        let source = bridge.final_source()?;
+        let engine = self
+            .common_state()?
+            .engine(core::Epoch(self.source_scope.epoch.0))?;
+        let retired = source
+            .map(|source| engine.proxy_source_retired(source).map_err(protocol))
+            .transpose()?
+            .unwrap_or(false);
+        let drained = runtime.sealed.is_none()
+            && runtime.pending_feedback.is_none()
+            && runtime.pending_ingress.is_none()
+            && self.native.is_empty()
+            && engine.drained().map_err(protocol)?;
+        bridge.advance_retirement(source, retired, drained)
+    }
+}

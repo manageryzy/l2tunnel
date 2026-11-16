@@ -101,6 +101,13 @@ impl Connections {
             .collection
             .owner(metadata.binding.channel)
             .map_err(Error::Connections)?;
+        if !self
+            .collection
+            .admission_open(id)
+            .map_err(Error::Connections)?
+        {
+            return Ok(None);
+        }
         if self
             .collection
             .unreliable_eligible(metadata.classification, bytes)

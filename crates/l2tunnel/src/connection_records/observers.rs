@@ -12,7 +12,7 @@ impl Collection {
     /// Raw eligibility still requires classification of its complete native body.
     pub fn inspect_authenticated(&self, packet: &[u8]) -> Result<route::Class, Error> {
         let (header, body) = route::decode(packet).map_err(Error::Route)?;
-        if header.incarnation != self.plan.config().incarnation {
+        if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
         }
         let slot = self.slot(header.owner)?;
@@ -40,7 +40,7 @@ impl Collection {
         witnesses: &mut [UnitWitness],
     ) -> Result<usize, Error> {
         let (header, body) = route::decode(packet).map_err(Error::Route)?;
-        if header.incarnation != self.plan.config().incarnation {
+        if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
         }
         if header.class == route::Class::UnreliableNative {

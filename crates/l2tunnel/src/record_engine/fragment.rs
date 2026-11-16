@@ -57,7 +57,22 @@ impl FragmentPolicy {
         c: &configuration::Configuration,
         geometry: Geometry,
     ) -> Result<(), Error> {
-        let (config, _) = rolling_policy(c)?;
+        match c.descriptor().profile() {
+            configuration::Profile::Research { config, .. } => {
+                self.validate_records(*config, c, geometry)
+            }
+            _ => {
+                let (config, _) = rolling_policy(c)?;
+                self.validate_records(config, c, geometry)
+            }
+        }
+    }
+    fn validate_records<P: rolling_records::recovery::RecoveryPolicy>(
+        self,
+        config: rolling_records::Config<P>,
+        c: &configuration::Configuration,
+        geometry: Geometry,
+    ) -> Result<(), Error> {
         if config.geometry != geometry {
             return Err(Error::Geometry);
         }
@@ -87,7 +102,7 @@ impl FragmentPolicy {
                 codec::fragment_storage::Plan::for_reassembly(limits)
                     .map_err(|_| Error::Configuration)?;
                 let required = if index == 2 {
-                    crate::fec::rolling::scheduler::FEEDBACK_BYTES
+                    P::FEEDBACK_BYTES
                 } else {
                     maximum
                 };
@@ -582,24 +597,47 @@ impl Engine {
             .groups_written
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
-        let Owner::Rolling(endpoint) = &mut self.owner else {
-            return Err(Error::FragmentPolicy);
-        };
-        endpoint
-            .step(now, crate::fec::rolling::WorkBudget::default())
-            .map_err(Error::Rolling)?;
         let before = *budget;
-        let Some(prepared) = endpoint
-            .prepare_output(
-                now,
-                prospective_number,
-                allow_data,
-                &mut state.logical,
-                budget,
-                witnesses,
-            )
-            .map_err(Error::Rolling)?
-        else {
+        let (prepared, owner_deadline) = match &mut self.owner {
+            Owner::Rolling(endpoint) => {
+                endpoint
+                    .step(now, crate::fec::rolling::WorkBudget::default())
+                    .map_err(Error::Rolling)?;
+                (
+                    endpoint
+                        .prepare_output(
+                            now,
+                            prospective_number,
+                            allow_data,
+                            &mut state.logical,
+                            budget,
+                            witnesses,
+                        )
+                        .map_err(Error::Rolling)?,
+                    endpoint.deadline(),
+                )
+            }
+            Owner::Research(endpoint) => {
+                endpoint
+                    .step(now, crate::fec::rolling::WorkBudget::default())
+                    .map_err(Error::Rolling)?;
+                (
+                    endpoint
+                        .prepare_output(
+                            now,
+                            prospective_number,
+                            allow_data,
+                            &mut state.logical,
+                            budget,
+                            witnesses,
+                        )
+                        .map_err(Error::Rolling)?,
+                    endpoint.deadline(),
+                )
+            }
+            _ => return Err(Error::FragmentPolicy),
+        };
+        let Some(prepared) = prepared else {
             if *budget != before {
                 return self.fail(Error::Invariant);
             }
@@ -616,10 +654,7 @@ impl Engine {
         {
             return self.fail(Error::Invariant);
         }
-        let owner_cap = endpoint
-            .deadline()
-            .unwrap_or(original_cap)
-            .min(original_cap);
+        let owner_cap = owner_deadline.unwrap_or(original_cap).min(original_cap);
         if now >= owner_cap {
             return self.fail(Error::Expired);
         }

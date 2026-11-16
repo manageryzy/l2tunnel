@@ -228,6 +228,7 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> u16 {
         ProfileIdentity::UnreliableNative(identity) => identity.owner.index(),
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
+        | ProfileIdentity::Research(identity)
         | ProfileIdentity::Rolling(identity) => u16::from(identity.channel.0),
     }
 }
@@ -298,6 +299,11 @@ impl Link {
             configuration::DirectionProfile::PackedCompact(config) => (
                 config.base.max_recovery_packet_bytes,
                 usize::from(config.max_units),
+                false,
+            ),
+            configuration::DirectionProfile::Research { config, .. } => (
+                configuration.descriptor().path_mtu(),
+                usize::from(config.packing.max_units),
                 false,
             ),
             configuration::DirectionProfile::Rolling { config, .. } => (
@@ -650,6 +656,7 @@ fn roundtrip(
             ProfileIdentity::Swift(_) => assert!(data.units.is_empty()),
             ProfileIdentity::Aligned(identity)
             | ProfileIdentity::Packed(identity)
+            | ProfileIdentity::Research(identity)
             | ProfileIdentity::Rolling(identity) => {
                 assert!(data.units.contains(&identity))
             }
@@ -838,6 +845,7 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
             configuration::Profile::Swift { .. }
             | configuration::Profile::AlignedCompact { .. }
             | configuration::Profile::PackedCompact { .. }
+            | configuration::Profile::Research { .. }
             | configuration::Profile::Rolling { .. }
             | configuration::Profile::RollingCopies { .. }
             | configuration::Profile::PerConnectionCompact { .. } => {
@@ -866,6 +874,7 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 configuration::DirectionProfile::Swift(_)
                 | configuration::DirectionProfile::AlignedCompact(_)
                 | configuration::DirectionProfile::PackedCompact(_)
+                | configuration::DirectionProfile::Research { .. }
                 | configuration::DirectionProfile::Rolling { .. }
                 | configuration::DirectionProfile::PerConnectionCompact(_) => {
                     return Err("aligned-family direction".into());
@@ -1017,6 +1026,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
             configuration::DirectionProfile::Swift(_)
             | configuration::DirectionProfile::AlignedCompact(_)
             | configuration::DirectionProfile::PackedCompact(_)
+            | configuration::DirectionProfile::Research { .. }
             | configuration::DirectionProfile::Rolling { .. }
             | configuration::DirectionProfile::PerConnectionCompact(_) => {
                 return Err("aligned-family lifetime".into());

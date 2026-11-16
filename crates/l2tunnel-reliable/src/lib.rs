@@ -878,6 +878,39 @@ impl Reliable {
         self.poll_selected_scoped(now, output, budget, false, true, OutputScope::Data)
     }
 
+    /// Observe actual peer ARQ receipt for an allocated source. Physical output
+    /// alone is never confirmation; a held retry may still own its exact bytes.
+    pub fn source_confirmed(&self, source: l2tunnel_recovery::SourceId) -> Result<bool, Error> {
+        self.running()?;
+        Ok(self.arq.source_confirmed(source)?)
+    }
+
+    /// Confirmed source with no remaining exact physical retry custody.
+    pub fn source_retired(&self, source: l2tunnel_recovery::SourceId) -> Result<bool, Error> {
+        Ok(self.source_confirmed(source)? && self.arq.pending_transmission(source).is_none())
+    }
+
+    /// Inspect the actual source identity with the maintained output grammar.
+    /// This is structural observation, never an authentication or receipt proof.
+    pub fn inspect_output_source(
+        &self,
+        packet: &[u8],
+    ) -> Result<Option<l2tunnel_recovery::SourceId>, Error> {
+        let view = if self.arq.is_compact() {
+            self.compact_inspect(packet, true)?
+        } else {
+            inspect_record_view(
+                packet,
+                self.maximum_packet,
+                self.legacy_send()?.arq.max_source_bytes,
+                self.legacy_send()?.fec.block,
+                opposite_context(self.context),
+                self.send_fec,
+            )?
+        };
+        Ok(view.source.map(|(source, _)| source))
+    }
+
     /// Classify a complete outgoing record with the authoritative inner parsers.
     /// This checks local sending role/session/epoch and all encoding bounds; it
     /// neither authenticates bytes nor advances sender/receiver state.

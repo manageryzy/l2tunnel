@@ -1,5 +1,8 @@
 //! Existing strict local control DTOs, independent of socket/OS transport.
 use serde::{Deserialize, Serialize};
+#[path = "schema/proxy_common.rs"]
+mod proxy_common;
+pub use proxy_common::{ProxyCommonCover, ProxyCommonStatus};
 
 /// Current strict local protocol version.
 pub const VERSION: u16 = 1;
@@ -201,6 +204,10 @@ pub struct ProxySnapshot {
     /// Actual measured profile capabilities/aggregate; absent for fixed proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured: Option<crate::proxy_measured::LocalSnapshot>,
+    /// Explicit Common proxy observation; omitted for every legacy TLS proxy.
+    /// Heap-held so absent new observations do not enlarge every legacy API future.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common: Option<Box<ProxyCommonStatus>>,
 }
 /// Observed runtime counters without credentials or application payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

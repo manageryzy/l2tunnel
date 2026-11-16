@@ -1,8 +1,8 @@
 //! Bounded adaptation of the existing proxy byte stream to Common records.
 //!
 //! The internal datagram port carries one opaque, length-prefixed proxy frame.
-//! Incoming EOF syntax remains bounded, but graceful stream shutdown is refused
-//! until a reliable session-close retirement owner exists. Its `Ip` layer
+//! Legacy shutdown remains explicitly refused; retained-close selection keeps
+//! the actual Common recovery owner live through the actor's original cap. Its `Ip` layer
 //! describes the eventual proxy TUN
 //! attachment only: these bytes must enter Common's typed proxy-record API and
 //! must never pass through a native IP parser. No TCP, authentication, ordering,
@@ -38,8 +38,21 @@ struct Pending {
     sent: bool,
     identity: Option<RecordIdentity>,
     completed: bool,
+    final_record: bool,
+}
+struct Retirement {
+    cap: Option<Instant>,
+    identity: Option<RecordIdentity>,
+    source: Option<l2tunnel_recovery::SourceId>,
+    physical: bool,
+    confirmed: bool,
+    peer_eof: bool,
+    actor_joined: bool,
+    retired: bool,
+    waiter: Option<Waker>,
 }
 struct State {
+    retirement: Option<Retirement>,
     generation: u64,
     pending: Option<Pending>,
     failure: Option<Failure>,
@@ -55,6 +68,9 @@ impl State {
     }
     fn fail(&mut self, kind: io::ErrorKind, message: &'static str) -> io::Error {
         let failure = *self.failure.get_or_insert(Failure { kind, message });
+        if let Some(waker) = self.retirement.as_mut().and_then(|r| r.waiter.take()) {
+            waker.wake();
+        }
         if let Some(waker) = self.reader.take() {
             waker.wake();
         }
@@ -73,6 +89,159 @@ impl Bridge {
         self.0
             .lock()
             .map_err(|_| io::Error::other("proxy Common bridge lock poisoned"))
+    }
+    /// Preserve the existing actor's exact original drain cap.
+    pub(crate) fn set_drain_cap(&self, cap: Instant) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.check()?;
+        if Instant::now() >= cap {
+            return Err(state.fail(io::ErrorKind::TimedOut, "proxy Common original drain cap"));
+        }
+        let retirement = state.retirement.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Common retained close not selected",
+            )
+        })?;
+        retirement.cap = Some(retirement.cap.map_or(cap, |old| old.min(cap)));
+        Ok(())
+    }
+    /// Bind a final identity only to an actual maintained-parser source.
+    pub(crate) fn bind_final_source(
+        &self,
+        identity: RecordIdentity,
+        source: l2tunnel_recovery::SourceId,
+    ) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.check()?;
+        let retirement = state.retirement.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Common retained close not selected",
+            )
+        })?;
+        if retirement.identity != Some(identity)
+            || retirement.source.is_some_and(|old| old != source)
+        {
+            return Err(state.fail(io::ErrorKind::InvalidData, "Common final source mismatch"));
+        }
+        retirement.source = Some(source);
+        Ok(())
+    }
+    pub(crate) fn final_identity(&self) -> io::Result<Option<RecordIdentity>> {
+        let state = self.lock()?;
+        state.check()?;
+        Ok(state.retirement.as_ref().and_then(|r| r.identity))
+    }
+    pub(crate) fn final_source(&self) -> io::Result<Option<l2tunnel_recovery::SourceId>> {
+        let state = self.lock()?;
+        state.check()?;
+        Ok(state.retirement.as_ref().and_then(|r| r.source))
+    }
+    /// Same actor cap, for the sole Driver's existing wake calculation.
+    pub(crate) fn retirement_deadline(&self) -> io::Result<Option<Instant>> {
+        let state = self.lock()?;
+        state.check()?;
+        Ok(state
+            .retirement
+            .as_ref()
+            .filter(|r| !r.retired)
+            .and_then(|r| r.cap))
+    }
+    /// Observe exact final-source debt through the same issuing ARQ owner.
+    /// Engine drain is only local custody here; actor fences and peer EOF are
+    /// separate mandatory evidence, and no peer's own result is inferred.
+    pub(crate) fn advance_retirement(
+        &self,
+        source: Option<l2tunnel_recovery::SourceId>,
+        source_retired: bool,
+        custody_drained: bool,
+    ) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.check()?;
+        let Some(retirement) = state.retirement.as_mut() else {
+            return Ok(());
+        };
+        let Some(cap) = retirement.cap else {
+            return Ok(());
+        };
+        if retirement.retired {
+            return Ok(());
+        }
+        if source != retirement.source {
+            return Err(state.fail(
+                io::ErrorKind::InvalidData,
+                "Common final source observation mismatch",
+            ));
+        }
+        if Instant::now() < cap {
+            if source.is_some() && source_retired && retirement.physical {
+                retirement.confirmed = true;
+            }
+            return Ok(());
+        }
+        if retirement.confirmed
+            && source_retired
+            && retirement.physical
+            && retirement.peer_eof
+            && retirement.actor_joined
+            && custody_drained
+        {
+            retirement.retired = true;
+            if let Some(waker) = retirement.waiter.take() {
+                waker.wake();
+            }
+            Ok(())
+        } else {
+            Err(state.fail(
+                io::ErrorKind::TimedOut,
+                "Common final ARQ debt at original cap",
+            ))
+        }
+    }
+    /// Called only after this actor's actual fences, EOF events and child joins.
+    /// The same Driver certifies local retained custody at the original cap;
+    /// this wait never turns elapsed time or a physical write into peer receipt.
+    pub(crate) async fn wait_retired(&self) -> io::Result<()> {
+        let cap = {
+            let mut state = self.lock()?;
+            state.check()?;
+            let retirement = state.retirement.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Common retirement owner missing",
+                )
+            })?;
+            let cap = retirement.cap.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Common retirement lacks actor cap",
+                )
+            })?;
+            retirement.actor_joined = true;
+            cap
+        };
+        let timer = sleep_until(cap);
+        tokio::pin!(timer);
+        std::future::poll_fn(|cx| {
+            let mut state = self.lock()?;
+            state.check()?;
+            let retirement = state.retirement.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Common retirement owner missing",
+                )
+            })?;
+            if retirement.retired {
+                return Poll::Ready(Ok(()));
+            }
+            retirement.waiter = Some(cx.waker().clone());
+            // Register the original boundary once. Driver's independent exact
+            // cap wake performs the real ownership check, including held output.
+            let _ = timer.as_mut().poll(cx);
+            Poll::Pending
+        })
+        .await
     }
     /// Original first-write arrival and immutable transport deadline.
     pub(crate) fn timing(&self) -> io::Result<(Instant, Instant)> {
@@ -106,6 +275,18 @@ impl Bridge {
             return Err(state.fail(io::ErrorKind::TimedOut, "proxy Common admission deadline"));
         }
         pending.identity = Some(identity);
+        if pending.final_record {
+            let retirement = state.retirement.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Common final record not selected",
+                )
+            })?;
+            if retirement.identity.is_some_and(|old| old != identity) {
+                return Err(state.fail(io::ErrorKind::InvalidData, "Common final identity changed"));
+            }
+            retirement.identity = Some(identity);
+        }
         Ok(())
     }
     /// Exact unresolved Common record whose physical output is still required.
@@ -156,6 +337,15 @@ impl Bridge {
             ));
         }
         pending.completed = true;
+        if pending.final_record {
+            let retirement = state.retirement.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Common final physical owner missing",
+                )
+            })?;
+            retirement.physical = true;
+        }
         if let Some(waker) = state.writer.take() {
             waker.wake();
         }
@@ -226,6 +416,12 @@ impl PacketDevice for RecordPort {
             ));
         }
         self.transmit_closed = packet == [0];
+        if self.transmit_closed {
+            let mut state = self.bridge.lock()?;
+            if let Some(retirement) = &mut state.retirement {
+                retirement.peer_eof = true;
+            }
+        }
         Ok(())
     }
 }
@@ -243,10 +439,25 @@ pub(crate) struct Stream {
     input_size: usize,
     input_offset: usize,
     read_closed: bool,
+    shutdown_started: bool,
+    write_closed: bool,
 }
 
 /// Create bounded local adaptation; `maximum` includes the four-byte frame prefix.
 pub(crate) fn pair(maximum: usize, stall: Duration) -> io::Result<(RecordPort, Stream, Bridge)> {
+    pair_selected(maximum, stall, false)
+}
+pub(crate) fn pair_retained(
+    maximum: usize,
+    stall: Duration,
+) -> io::Result<(RecordPort, Stream, Bridge)> {
+    pair_selected(maximum, stall, true)
+}
+fn pair_selected(
+    maximum: usize,
+    stall: Duration,
+    retained: bool,
+) -> io::Result<(RecordPort, Stream, Bridge)> {
     if !(5..=65_535).contains(&maximum) || stall.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -257,6 +468,17 @@ pub(crate) fn pair(maximum: usize, stall: Duration) -> io::Result<(RecordPort, S
     port.set_nonblocking(true)?;
     stream.set_nonblocking(true)?;
     let bridge = Bridge(Arc::new(Mutex::new(State {
+        retirement: retained.then_some(Retirement {
+            cap: None,
+            identity: None,
+            source: None,
+            physical: false,
+            confirmed: false,
+            peer_eof: false,
+            actor_joined: false,
+            retired: false,
+            waiter: None,
+        }),
         generation: 0,
         pending: None,
         failure: None,
@@ -284,6 +506,8 @@ pub(crate) fn pair(maximum: usize, stall: Duration) -> io::Result<(RecordPort, S
             input_size: 0,
             input_offset: 0,
             read_closed: false,
+            shutdown_started: false,
+            write_closed: false,
         },
         bridge,
     ))
@@ -324,6 +548,11 @@ impl Stream {
                 "proxy Common deadline overflow",
             )
         })?;
+        let deadline = state
+            .retirement
+            .as_ref()
+            .and_then(|r| r.cap)
+            .map_or(deadline, |cap| deadline.min(cap));
         let generation = state.generation.checked_add(1).ok_or_else(|| {
             state.fail(
                 io::ErrorKind::InvalidData,
@@ -338,6 +567,7 @@ impl Stream {
             sent: false,
             identity: None,
             completed: false,
+            final_record: false,
         });
         self.generation = Some(generation);
         self.deadline = Some(Box::pin(sleep_until(deadline)));
@@ -421,6 +651,11 @@ impl AsyncWrite for Stream {
         let bridge = this.bridge.clone();
         let mut state = bridge.lock()?;
         state.check()?;
+        if this.shutdown_started || this.write_closed {
+            return Poll::Ready(Err(
+                state.fail(io::ErrorKind::BrokenPipe, "Common write after final record")
+            ));
+        }
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -460,20 +695,40 @@ impl AsyncWrite for Stream {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        match this.poll_flush_record(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(result) => result?,
+        if this.write_closed {
+            return Poll::Ready(Ok(()));
         }
-        // A physical EOF write would not prove that its reliable source and the
-        // peer's final feedback have retired. The first runnable Common slice
-        // has no session-close retirement owner, so never synthesize clean EOF
-        // or release the same carrier while a peer may still need its retries.
-        let mut state = this.bridge.lock()?;
-        state.check()?;
-        Poll::Ready(Err(state.fail(
-            io::ErrorKind::Unsupported,
-            "Common proxy graceful close requires retained reliable EOF retirement",
-        )))
+        if !this.shutdown_started {
+            match this.poll_flush_record(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result?,
+            }
+            let bridge = this.bridge.clone();
+            let mut state = bridge.lock()?;
+            state.check()?;
+            if state.retirement.as_ref().and_then(|r| r.cap).is_none() {
+                return Poll::Ready(Err(state.fail(
+                    io::ErrorKind::Unsupported,
+                    "Common proxy graceful close requires retained reliable EOF retirement",
+                )));
+            }
+            this.begin(&mut state)?;
+            state
+                .pending
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Common final slot missing"))?
+                .final_record = true;
+            this.output.push(0);
+            this.shutdown_started = true;
+        }
+        match this.poll_flush_record(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                result?;
+                this.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 }
 impl AsyncRead for Stream {
@@ -687,3 +942,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "common_retirement_tests.rs"]
+mod retirement_tests;

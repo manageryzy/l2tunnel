@@ -742,6 +742,36 @@ impl Endpoint {
             .enable_physical_send_confirmation()
             .map_err(Error::Recovery)
     }
+    /// Observe the same actual recovery owner's validated peer source receipt.
+    pub fn source_confirmed(&self, source: l2tunnel_recovery::SourceId) -> Result<bool, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.recovery
+            .source_confirmed(source)
+            .map_err(Error::Recovery)
+    }
+    /// A validated peer receipt with no retained physical retry for this source.
+    pub fn source_retired(&self, source: l2tunnel_recovery::SourceId) -> Result<bool, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.recovery
+            .source_retired(source)
+            .map_err(Error::Recovery)
+    }
+    /// Read an actual outgoing source identity through the maintained parser.
+    pub fn inspect_output_source(
+        &self,
+        packet: &[u8],
+    ) -> Result<Option<l2tunnel_recovery::SourceId>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.recovery
+            .inspect_output_source(packet)
+            .map_err(Error::Recovery)
+    }
     /// Observe the same actual caller-held output, including after terminal error.
     pub fn pending_output(&self) -> Option<PreparedOutput> {
         self.recovery.pending_output()

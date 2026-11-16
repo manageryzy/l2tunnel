@@ -3,6 +3,12 @@
 use super::*;
 
 fn fixture(hosts: &[Arc<Host>; 2]) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
+    fixture_selected(hosts, false)
+}
+fn fixture_selected(
+    hosts: &[Arc<Host>; 2],
+    retained_close: bool,
+) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
     let TransactionPlans {
         plans,
         profile: old,
@@ -86,18 +92,46 @@ fn fixture(hosts: &[Arc<Host>; 2]) -> Result<([Prepared; 2], common_transaction_
     };
     proxy.native.send_bytes = 4096;
     proxy.native.receive_bytes = 4096;
+    if retained_close {
+        // Explicit finite fixture policy, bound into the same authenticated H0;
+        // production defaults and the old v1 fixture remain unchanged.
+        proxy.timeouts.shutdown = Duration::from_secs(2);
+    }
     let mut parameters = old.parameters();
     parameters.retained_bytes = 64 * 1024 * 1024;
-    let profile = common_transaction_profile::Profile::new_proxy(
+    let catalog = common::Catalog::new(descriptor, &[descriptor])?;
+    let legacy = common_transaction_profile::Profile::new_proxy(
         connection,
         old.settings(),
         old.peers(),
         resources[0],
         resources[1],
-        common::Catalog::new(descriptor, &[descriptor])?,
+        catalog.clone(),
         parameters,
-        proxy,
+        proxy.clone(),
     )?;
+    let profile = if retained_close {
+        let selected = common_transaction_profile::Profile::new_proxy_retained(
+            connection,
+            old.settings(),
+            old.peers(),
+            resources[0],
+            resources[1],
+            catalog,
+            parameters,
+            proxy,
+        )?;
+        assert_ne!(
+            selected.configuration()?,
+            legacy.configuration()?,
+            "retained close must be selected before actual Noise/member admission"
+        );
+        assert!(!legacy.proxy_retirement());
+        assert!(selected.proxy_retirement());
+        selected
+    } else {
+        legacy
+    };
     let convert = |plan: Prepared| -> Result<Prepared> {
         let data = Arc::try_unwrap(plan.data).map_err(|_| "unstarted plan unexpectedly shared")?;
         match data.endpoint {
@@ -461,3 +495,10 @@ async fn common_proxy_abnormal_disconnect_observes_release_without_clean_close()
     .await??;
     Ok(())
 }
+
+#[path = "proxy_common_retirement.rs"]
+mod retirement;
+
+#[cfg(target_os = "linux")]
+#[path = "proxy_common_cli.rs"]
+mod cli;

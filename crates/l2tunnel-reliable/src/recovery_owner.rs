@@ -18,6 +18,12 @@ impl Owner {
     pub fn is_compact(&self) -> bool {
         matches!(self, Self::Compact(_))
     }
+    pub fn source_confirmed(&self, source: SourceId) -> Result<bool, RecoveryError> {
+        match self {
+            Self::Legacy(owner) => owner.source_confirmed(source),
+            Self::Compact(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
     pub fn next_source_id(&self) -> Result<SourceId, RecoveryError> {
         dispatch!(self, owner => owner.next_source_id())
     }

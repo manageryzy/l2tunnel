@@ -131,7 +131,15 @@ impl Plan {
         maximum_body: usize,
         overhead: usize,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
-        self.build_selected(connection, settings, peers, maximum_body, overhead, None)
+        self.build_selected(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            overhead,
+            None,
+            None,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_raw(
@@ -150,6 +158,29 @@ impl Plan {
             maximum_body,
             overhead,
             Some(policy),
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_proxy(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        overhead: usize,
+        proxy: l2tunnel_runtime::proxy::Config,
+        retained: bool,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.validate_carrier(false)?;
+        self.build_selected(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            overhead,
+            None,
+            Some((proxy, retained)),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -161,6 +192,7 @@ impl Plan {
         maximum_body: usize,
         overhead: usize,
         raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
@@ -231,6 +263,23 @@ impl Plan {
                 self.catalog.clone(),
                 self.parameters,
                 policy,
+            );
+        }
+        if let Some((proxy, retained)) = proxy {
+            let construct = if retained {
+                secure_udp::common_transaction_profile::Profile::new_proxy_retained
+            } else {
+                secure_udp::common_transaction_profile::Profile::new_proxy
+            };
+            return construct(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                proxy,
             );
         }
         secure_udp::common_transaction_profile::Profile::new(

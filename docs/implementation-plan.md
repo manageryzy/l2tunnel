@@ -6,7 +6,20 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
-The current Batch13 integration brings three reviewed feature deltas into this
+The Batch14 checkpoint implements explicit retained proxy EOF/ARQ retirement
+and Common proxy CLI selection, plus actual Research Engine/Bank, original UDP
+runtime and shared-service composition. The private per-connection reuse
+prerequisite is protocol-tested; authenticated runtime reuse remains unfinished
+and its capability stays false. See [the scoped Batch14 receipt](../work/parallel-features-20261115/parallel-batch14-scoped-validation.json).
+All 14 new focused cases pass, including actual protected-UDP/shared-service
+integration. The required full attempt and scoped continuations preserve initial
+integration errors, a drain-fixture repair and a default-stack API repair; the
+remaining required stages and affected Windows GNU lint/link pass. This is not
+a pristine single-invocation suite pass or native Windows execution. Async Research
+carrier ordering, complete PCOM/PCO/RRP deliverables, all47, SW-11 and full native,
+platform, resource and performance gates retain their original definitions.
+
+The preceding Batch13 integration brings three reviewed feature deltas into this
 checkout: the existing fixed/full single-channel TCP proxy actor through actual
 Common records and the shared service; the Windows foreground TCP/TLS TUN entry
 point with a safe-dependency Wintun device; and pure recursive parity, fallback
@@ -20,8 +33,8 @@ remaining required check stages. The first full attempt retains two existing
 runtime failures; each passed one same-binary recheck without a code change.
 Their causes remain unqualified, so this is not a pristine full-suite pass.
 Affected Windows GNU lint/link checks pass; native execution remains unverified. Windows native device
-execution, complete proxy/Common selection and graceful retirement, and research
-Engine/Bank/runtime installation remain open at their full existing definitions.
+execution and complete proxy/Common acceptance remain open at their full existing
+definitions. Batch14 above adds scoped retained close and Research runtime composition.
 No new default carrier, periodic key exchange or reduced parity gate is implied.
 
 The preceding Batch12 implementation installs the selected independent Compact

@@ -50,6 +50,36 @@ impl Engine {
         selected(&self.configuration)
     }
 
+    /// Observe actual source debt in the explicitly selected direct-ARQ owner.
+    pub fn proxy_source_retired(&self, source: l2tunnel_recovery::SourceId) -> Result<bool, Error> {
+        self.healthy()?;
+        if !self.proxy_records() || !supported(&self.configuration) {
+            return Err(Error::Unsupported(Capability::TcpProxy));
+        }
+        let Owner::Aligned(endpoint) = &self.owner else {
+            return Err(Error::Invariant);
+        };
+        endpoint.source_retired(source).map_err(Error::Aligned)
+    }
+
+    /// Inspect a source using this actual owner's complete maintained grammar.
+    /// The caller retains full Engine/Bank scope; record and ARQ IDs are distinct.
+    pub fn proxy_output_source(
+        &self,
+        packet: &[u8],
+    ) -> Result<Option<l2tunnel_recovery::SourceId>, Error> {
+        self.healthy()?;
+        if !self.proxy_records() || !supported(&self.configuration) {
+            return Err(Error::Unsupported(Capability::TcpProxy));
+        }
+        let Owner::Aligned(endpoint) = &self.owner else {
+            return Err(Error::Invariant);
+        };
+        endpoint
+            .inspect_output_source(packet)
+            .map_err(Error::Aligned)
+    }
+
     /// Copy one already-arbitrated proxy record into this actual bounded queue.
     /// Native IP parsing is intentionally absent. The original observation and
     /// absolute cap survive backpressure and cannot be renewed by a retry.

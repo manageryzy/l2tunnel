@@ -1370,6 +1370,9 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--limit",
         ],
         "inspect-swift-transaction-plan" | "inspect-common-transaction-plan" => vec![
+            "--traffic",
+            "--proxy-policy",
+            "--proxy-close",
             "--role",
             "--carrier",
             "--record-profile",

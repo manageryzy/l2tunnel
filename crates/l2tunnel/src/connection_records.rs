@@ -13,6 +13,9 @@ use std::{
 
 mod configuration;
 mod observers;
+// Private until actual selected-control ingress supplies operation provenance.
+#[allow(dead_code)]
+pub(crate) mod retirement;
 /// Exact versioned route grammar, without authentication authority.
 pub mod route;
 /// Actual fixed, vector and nested heap inventory.
@@ -84,8 +87,16 @@ pub enum Error {
     Class,
     /// Unreliable-native custody is not installed; no body was admitted.
     UnsupportedUnreliable,
-    /// Actual normalized flow conflicts with this immutable fixed owner claim.
+    /// Actual normalized flow conflicts with this owner claim.
     Binding,
+    /// New local admission is stopped by the original retirement operation.
+    Retiring,
+    /// Actual old custody or the crossed peer fence is not yet complete.
+    RetirementBusy,
+    /// Foreign, conflicting, stale or unbound retirement operation.
+    RetirementConflict,
+    /// The original retirement operation cap expired; admission stays closed.
+    RetirementExpired,
     /// Complete native bytes are not an eligible canonical pure TCP ACK.
     UnreliableEligibility,
     /// Retain exact authenticated input and original cap until raw receive custody frees.
@@ -124,8 +135,10 @@ pub enum Error {
 impl Error {
     /// Caller must retain authenticated plaintext, original arrival and cap on pressure.
     pub fn is_backpressure(self) -> bool {
-        matches!(self, Self::UnreliableBusy)
-            || matches!(self, Self::Endpoint(error) if error.is_backpressure())
+        matches!(
+            self,
+            Self::UnreliableBusy | Self::Retiring | Self::RetirementBusy
+        ) || matches!(self, Self::Endpoint(error) if error.is_backpressure())
     }
 }
 impl fmt::Display for Error {
@@ -203,6 +216,12 @@ pub struct PendingNative<'a> {
 
 struct Slot {
     endpoint: aligned::Endpoint,
+    incarnation: u64,
+    admitted_native: u64,
+    written_native: u64,
+    retirement: Option<retirement::State>,
+    retirement_serial: u64,
+    highest_retirement_attempt: u64,
     native: Option<(Identity, u64)>,
     next_native: u64,
     native_failure: Option<aligned::Error>,
@@ -219,6 +238,7 @@ struct Slot {
 pub struct Collection {
     plan: storage::Plan,
     instance: u64,
+    context: RecoveryContext,
     slots: Vec<Slot>,
     usage: storage::Usage,
     raw_send: Vec<u8>,
@@ -244,6 +264,9 @@ impl Collection {
 
     /// Stage only bytes already selected by the caller's sole common Pipeline.
     pub fn enqueue(&mut self, id: OwnerId, now: Duration, bytes: &[u8]) -> Result<Identity, Error> {
+        if !self.admission_open(id)? {
+            return Err(Error::Retiring);
+        }
         if self.slot(id)?.claim.is_some() {
             return Err(Error::Binding);
         }
@@ -253,12 +276,18 @@ impl Collection {
         if let Some(error) = self.slot(id)?.raw_failure {
             return Err(error);
         }
-        let incarnation = self.plan.config().incarnation;
+        let incarnation = self.slot(id)?.incarnation;
+        let admitted = self
+            .slot(id)?
+            .admitted_native
+            .checked_add(1)
+            .ok_or(Error::Arithmetic)?;
         let record = self
             .slot_mut(id)?
             .endpoint
             .enqueue_identified(aligned::ChannelId(0), bytes, now)
             .map_err(Error::Endpoint)?;
+        self.slot_mut(id)?.admitted_native = admitted;
         Ok(Identity {
             owner: id,
             incarnation,
@@ -266,30 +295,35 @@ impl Collection {
         })
     }
 
-    fn wrap(&self, id: OwnerId, inner: aligned::PreparedOutput) -> PreparedOutput {
+    fn wrap(
+        &self,
+        id: OwnerId,
+        incarnation: u64,
+        inner: aligned::PreparedOutput,
+    ) -> PreparedOutput {
         PreparedOutput {
             instance: self.instance,
             owner: id,
-            incarnation: self.plan.config().incarnation,
+            incarnation,
             inner,
         }
     }
 
     /// Observe actual data custody without polling, writing or debiting again.
     pub fn pending_data_output(&self, id: OwnerId) -> Result<Option<PreparedOutput>, Error> {
-        Ok(self
-            .slot(id)?
+        let slot = self.slot(id)?;
+        Ok(slot
             .endpoint
             .pending_data_output()
-            .map(|p| self.wrap(id, p)))
+            .map(|p| self.wrap(id, slot.incarnation, p)))
     }
     /// Observe the independently retained actual feedback output.
     pub fn pending_feedback_output(&self, id: OwnerId) -> Result<Option<PreparedOutput>, Error> {
-        Ok(self
-            .slot(id)?
+        let slot = self.slot(id)?;
+        Ok(slot
             .endpoint
             .pending_feedback_output()
-            .map(|p| self.wrap(id, p)))
+            .map(|p| self.wrap(id, slot.incarnation, p)))
     }
 
     /// Poll one selected owner's actual source/retry; no other owner is scanned.
@@ -336,7 +370,7 @@ impl Collection {
         };
         let header = route::Header {
             owner: id,
-            incarnation: self.plan.config().incarnation,
+            incarnation: self.slot(id)?.incarnation,
             class,
             unreliable_serial: 0,
         };
@@ -376,7 +410,7 @@ impl Collection {
             return Err(Error::Invariant);
         }
         output[..route::HEADER_BYTES].copy_from_slice(&encoded);
-        Ok(Some(self.wrap(id, inner)))
+        Ok(Some(self.wrap(id, header.incarnation, inner)))
     }
 
     /// Confirm an actual whole-carrier receipt, preserving original acceptance time.
@@ -386,7 +420,9 @@ impl Collection {
         accepted: Duration,
         token: PreparedOutput,
     ) -> Result<(), Error> {
-        if token.instance != self.instance || token.incarnation != self.plan.config().incarnation {
+        if token.instance != self.instance
+            || token.incarnation != self.slot(token.owner)?.incarnation
+        {
             return Err(Error::Token);
         }
         let endpoint = &mut self.slot_mut(token.owner)?.endpoint;
@@ -408,8 +444,16 @@ impl Collection {
         packet: &[u8],
     ) -> Result<(), Error> {
         let (header, body) = route::decode(packet).map_err(Error::Route)?;
-        if header.incarnation != self.plan.config().incarnation {
+        if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
+        }
+        if self
+            .slot(header.owner)?
+            .retirement
+            .as_ref()
+            .is_some_and(retirement::State::installed)
+        {
+            return Err(Error::Retiring);
         }
         let endpoint = &mut self.slot_mut(header.owner)?.endpoint;
         let expected = match header.class {
@@ -433,7 +477,7 @@ impl Collection {
         work: usize,
     ) -> Result<NativePreparation, Error> {
         let instance = self.instance;
-        let incarnation = self.plan.config().incarnation;
+        let incarnation = self.slot(id)?.incarnation;
         let slot = self.slot_mut(id)?;
         if let Some(error) = slot.raw_failure {
             return Err(error);
@@ -505,7 +549,7 @@ impl Collection {
     /// Consume the exact witness after a whole native write; a late failure is real.
     pub fn commit_native(&mut self, now: Duration, token: NativeToken) -> Result<(), Error> {
         if token.instance != self.instance
-            || token.identity.incarnation != self.plan.config().incarnation
+            || token.identity.incarnation != self.slot(token.identity.owner)?.incarnation
         {
             return Err(Error::Token);
         }
@@ -513,7 +557,12 @@ impl Collection {
         if slot.native != Some((token.identity, token.serial)) {
             return Err(Error::Token);
         }
+        let written = slot
+            .written_native
+            .checked_add(1)
+            .ok_or(Error::Arithmetic)?;
         slot.native = None;
+        slot.written_native = written;
         let completion = slot.endpoint.commit_delivery(now);
         if let Err(error) = completion {
             // Whole native acceptance cannot be undone. Keep this lane terminal
@@ -525,6 +574,9 @@ impl Collection {
 
     /// Service one selected owner's original endpoint deadlines without new timers.
     pub fn tick(&mut self, id: OwnerId, now: Duration) -> Result<(), Error> {
+        if let Some(state) = &self.slot(id)?.retirement {
+            state.check_time(now)?;
+        }
         if self.plan.config().send_unreliable.is_some() {
             self.tick_unreliable(id, now)?;
         }
@@ -543,6 +595,7 @@ impl Collection {
                     .into_iter()
                     .chain(s.raw_send.map(|r| r.deadline))
                     .chain(s.raw_receive.map(|r| r.deadline))
+                    .chain(s.retirement.as_ref().map(retirement::State::deadline))
                     .min()
             })
             .min()
@@ -557,6 +610,7 @@ impl Collection {
                     .into_iter()
                     .chain(s.raw_send.map(|r| r.deadline))
                     .chain(s.raw_receive.map(|r| r.deadline))
+                    .chain(s.retirement.as_ref().map(retirement::State::deadline))
                     .min()
             })
             .min()
@@ -569,6 +623,7 @@ impl Collection {
                 && s.raw_send.is_none()
                 && s.raw_receive.is_none()
                 && s.native.is_none()
+                && s.retirement.is_none()
                 && s.endpoint.drained()
         })
     }

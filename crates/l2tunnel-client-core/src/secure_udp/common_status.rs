@@ -410,6 +410,7 @@ mod observe {
                     value.current.descriptor().profile(),
                     l2tunnel::record_configuration::Profile::Rolling { .. }
                         | l2tunnel::record_configuration::Profile::RollingCopies { .. }
+                        | l2tunnel::record_configuration::Profile::Research { .. }
                 ) {
                     effective_resources.rolling_fragments
                 } else {
@@ -430,10 +431,11 @@ mod observe {
                         value.current.descriptor().profile(),
                         l2tunnel::record_configuration::Profile::Rolling { .. }
                             | l2tunnel::record_configuration::Profile::RollingCopies { .. }
+                            | l2tunnel::record_configuration::Profile::Research { .. }
                     ) && value.rolling_input.map(|input| input.limits) != expected_rolling
             }) {
                 return Err(invalid(
-                    "actual Rolling ingress differs from authenticated policy",
+                    "actual coded ingress differs from authenticated policy",
                 ));
             }
             let requested_connections =

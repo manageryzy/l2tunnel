@@ -23,7 +23,8 @@ pub enum View<'a> {
     /// Cumulative committed recovery receipt.
     Feedback(Feedback),
 }
-fn profile_bytes(profile: Profile) -> [u8; 12] {
+/// Exact maintained twelve-byte algorithm descriptor; no authority is inferred.
+pub fn profile_bytes(profile: Profile) -> [u8; 12] {
     let mut bytes = [0; 12];
     match profile {
         Profile::Recursive {

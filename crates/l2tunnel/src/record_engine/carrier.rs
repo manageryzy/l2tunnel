@@ -5,6 +5,7 @@ use super::*;
 enum Prepared {
     Connections(connections::OutputWitness),
     Rolling(rolling_records::PreparedOutput),
+    Research(rolling_records::PreparedOutput),
     Aligned(l2tunnel_reliable::PreparedOutput),
     Packed(l2tunnel_reliable::PreparedOutput),
 }
@@ -53,6 +54,19 @@ impl Engine {
                         witnesses: p.witnesses,
                     },
                     Prepared::Rolling(p),
+                )
+            }
+            Owner::Research(endpoint) => {
+                let p = endpoint.pending_output()?;
+                (
+                    Emission {
+                        bytes: p.bytes,
+                        kind: p.kind,
+                        wire_bytes: p.wire_bytes,
+                        security_number: p.security_number,
+                        witnesses: p.witnesses,
+                    },
+                    Prepared::Research(p),
                 )
             }
             Owner::Aligned(_) => {
@@ -114,6 +128,9 @@ impl Engine {
                 owner.confirm_output_at(now, accepted, witness)
             }
             (Owner::Rolling(endpoint), Prepared::Rolling(p)) => endpoint
+                .confirm_output_at(now, accepted, p)
+                .map_err(Error::Rolling),
+            (Owner::Research(endpoint), Prepared::Research(p)) => endpoint
                 .confirm_output_at(now, accepted, p)
                 .map_err(Error::Rolling),
             (Owner::Aligned(endpoint), Prepared::Aligned(p)) => {

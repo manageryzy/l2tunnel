@@ -13,6 +13,7 @@ mod raw;
 pub struct CommonTransactionContract {
     expected: security::ConfigDigest,
     proxy_binding: Option<core::ConfigDigest>,
+    proxy_retirement: bool,
     role: security::Role,
     resources: Config,
     cover: cover::Config,
@@ -38,7 +39,9 @@ pub(super) fn selected_fragment_policy(
 ) -> Option<engine::FragmentPolicy> {
     if matches!(
         value.descriptor().profile(),
-        common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. }
+        common::Profile::Rolling { .. }
+            | common::Profile::RollingCopies { .. }
+            | common::Profile::Research { .. }
     ) {
         policy
     } else {
@@ -432,6 +435,7 @@ impl CommonTransactionContract {
         let result = Self {
             expected,
             proxy_binding: None,
+            proxy_retirement: false,
             role,
             resources,
             cover,
@@ -480,6 +484,21 @@ impl CommonTransactionContract {
         }
         self.proxy_binding = Some(binding);
         Ok(self)
+    }
+    /// Explicit immutable retained-close capability. Trusted construction must
+    /// bind its selection to the initial application/H0 before authentication.
+    pub fn with_proxy_retirement(mut self) -> io::Result<Self> {
+        if self.proxy_binding.is_none() {
+            return Err(invalid(
+                "retained retirement requires the actual proxy binding",
+            ));
+        }
+        self.proxy_retirement = true;
+        Ok(self)
+    }
+    /// True only for explicitly selected retained proxy retirement.
+    pub const fn proxy_retirement(&self) -> bool {
+        self.proxy_retirement
     }
     /// Complete fixed proxy policy included by the constructing authenticated plan.
     pub fn proxy_binding(&self) -> Option<core::ConfigDigest> {
@@ -608,6 +627,18 @@ impl CommonTransactionContract {
         {
             return Err(invalid("common value outside exact authenticated catalog"));
         }
+        // Original UDP confirms a whole write inline. Async carriers need a
+        // bounded retained-arrival/receipt merge before freezing Research support.
+        if matches!(
+            value.descriptor().profile(),
+            common::Profile::Research { .. }
+        ) && (self.outer.is_some() || self.raw.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "research async carriers require authenticated arrival/receipt ordering",
+            ));
+        }
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);
             let view = value.descriptor().direction(sender);
@@ -619,12 +650,15 @@ impl CommonTransactionContract {
                     "raw per-connection catalog requires explicit authenticated input custody",
                 ));
             }
-            if matches!(view.profile(), common::DirectionProfile::Rolling { .. })
-                && self.resources.rolling_work.is_none()
+            if matches!(
+                view.profile(),
+                common::DirectionProfile::Rolling { .. }
+                    | common::DirectionProfile::Research { .. }
+            ) && self.resources.rolling_work.is_none()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "rolling catalog requires explicit bounded scheduler work",
+                    "coded catalog requires explicit bounded scheduler work",
                 ));
             }
             if view.max_native() != old.max_native()
@@ -768,6 +802,10 @@ pub(super) fn maximum_body(
     opposite: common::DirectionView<'_>,
 ) -> io::Result<usize> {
     match view.profile() {
+        common::DirectionProfile::Research { config, .. } => Ok(config
+            .maximum_packet_bytes()
+            .map_err(invalid)?
+            .max(l2tunnel_fec::research::wire::HEADER_BYTES)),
         common::DirectionProfile::Swift(config) => Ok(config.codec.datagram_bytes),
         common::DirectionProfile::Aligned(config) => {
             config.recovery.maximum_packet_bytes().map_err(invalid)

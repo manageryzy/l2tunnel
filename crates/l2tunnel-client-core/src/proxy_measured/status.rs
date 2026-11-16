@@ -311,6 +311,7 @@ mod tests {
                 transaction: None,
                 common: None,
                 proxy: Some(crate::local::ProxySnapshot {
+                    common: None,
                     digest: "ff".repeat(32),
                     drain_accepted: true,
                     runtime: Some(crate::local::ProxyStatus {

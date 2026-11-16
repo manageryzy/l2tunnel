@@ -90,20 +90,20 @@ pub(super) struct ConstructionOptions {
 /// Functional construction preserves the existing conservative contracts.
 /// Explicit reserved construction admits and observes the same actual nested
 /// codec/scheduler/scratch backing. Runtime and full shared resources stay separate.
-pub struct Endpoint {
+pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) instance: u64,
-    pub(super) config: Config,
+    pub(super) config: Config<P>,
     pub(super) copies: CopyPolicies,
     pub(super) digest: crate::core::ConfigDigest,
     pub(super) stream: u32,
     pub(super) send_rolling_scope: rolling::Scope,
     pub(super) stage_deadline: Option<Tick>,
-    pub(super) send_config: DirectionConfig,
-    pub(super) receive_config: DirectionConfig,
+    pub(super) send_config: DirectionConfig<P>,
+    pub(super) receive_config: DirectionConfig<P>,
     pub(super) send_scope: receiver::Scope,
     pub(super) receive_scope: receiver::Scope,
-    pub(super) sender: scheduler::Sender,
-    pub(super) incoming: scheduler::Receiver,
+    pub(super) sender: P::Sender,
+    pub(super) incoming: P::Receiver,
     pub(super) ingress: Option<ingress::Ingress>,
     pub(super) packing: packed_sender::Sender,
     pub(super) records: receiver::Receiver,
@@ -127,10 +127,10 @@ pub struct Endpoint {
     preview_rescan: bool,
     pub(super) usage: Option<storage::Usage>,
 }
-impl Endpoint {
+impl<P: RecoveryPolicy> Endpoint<P> {
     /// Construct real codec and rolling owners after complete scalar validation.
     /// Every tick in this composition is one injected microsecond.
-    pub fn new(config: Config, context: Context, stream: u32, now: Tick) -> Result<Self, Error> {
+    pub fn new(config: Config<P>, context: Context, stream: u32, now: Tick) -> Result<Self, Error> {
         Self::construct(
             config,
             context,
@@ -146,7 +146,7 @@ impl Endpoint {
     }
     /// Select complete caller-authenticated directional source-copy policies.
     pub fn new_with_copies(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -168,7 +168,7 @@ impl Endpoint {
     /// Construct the same actual owners with explicitly authenticated output framing.
     /// The caller still encodes and physically confirms every actual fragment.
     pub fn new_with_output_framing(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
@@ -197,11 +197,11 @@ impl Endpoint {
         self.copies
     }
     pub(super) fn construct(
-        config: Config,
+        config: Config<P>,
         context: Context,
         stream: u32,
         now: Tick,
-        reserved: Option<storage::Plan>,
+        reserved: Option<storage::Plan<P>>,
         options: ConstructionOptions,
     ) -> Result<Self, Error> {
         let ConstructionOptions {
@@ -259,15 +259,17 @@ impl Endpoint {
             .ok_or(Error::Arithmetic)?;
         for direction in [send_config, receive_config] {
             let c = direction.scheduler;
+            let recovery = c.recovery();
+            let intervals = c.intervals();
             for interval in [
                 direction.packing.packing.hold_micros,
                 direction.receiver.lifetime_ticks,
                 direction.codec_stage_micros,
-                c.recovery.job_ticks,
-                c.recovery.debt_ticks,
-                c.recovery.handoff_ticks,
-                c.tail_ticks,
-                c.feedback_ticks,
+                recovery.job_ticks,
+                recovery.debt_ticks,
+                recovery.handoff_ticks,
+                intervals[0],
+                intervals[1],
                 config.native_stall_micros,
             ] {
                 now.0.checked_add(interval).ok_or(Error::Arithmetic)?;
@@ -304,42 +306,16 @@ impl Endpoint {
             },
         )
         .map_err(Error::Storage)?;
-        let sender = if let Some(plan) = reserved {
-            scheduler::Sender::new_reserved(
-                send_config.scheduler,
-                rolling_scope(send_direction),
-                rolling_tick(now),
-                rolling::storage::Limits {
-                    capacity_bytes: plan.sender.capacity_bytes(),
-                },
-            )
-            .map_err(Error::RollingStorage)?
-        } else {
-            scheduler::Sender::new(
-                send_config.scheduler,
-                rolling_scope(send_direction),
-                rolling_tick(now),
-            )
-            .map_err(Error::Rolling)?
-        };
-        let incoming = if let Some(plan) = reserved {
-            scheduler::Receiver::new_reserved(
-                receive_config.scheduler,
-                rolling_scope(receive_direction),
-                rolling_tick(now),
-                rolling::storage::Limits {
-                    capacity_bytes: plan.incoming.capacity_bytes(),
-                },
-            )
-            .map_err(Error::RollingStorage)?
-        } else {
-            scheduler::Receiver::new(
-                receive_config.scheduler,
-                rolling_scope(receive_direction),
-                rolling_tick(now),
-            )
-            .map_err(Error::Rolling)?
-        };
+        let sender = send_config.scheduler.new_sender(
+            rolling_scope(send_direction),
+            rolling_tick(now),
+            reserved.map(|p| p.sender.capacity_bytes),
+        )?;
+        let incoming = receive_config.scheduler.new_receiver(
+            rolling_scope(receive_direction),
+            rolling_tick(now),
+            reserved.map(|p| p.incoming.capacity_bytes),
+        )?;
         let ingress = ingress_limits
             .map(|limits| ingress::Ingress::new(limits, receive_config.maximum_packet_bytes()?))
             .transpose()?;
@@ -410,12 +386,18 @@ impl Endpoint {
             return self.fail(Error::Expired);
         }
         let result = (|| {
-            self.sender
-                .step(rolling_tick(now), rolling::WorkBudget::default())
-                .map_err(Error::Rolling)?;
-            self.incoming
-                .step(rolling_tick(now), rolling::WorkBudget::default())
-                .map_err(Error::Rolling)?;
+            P::send_step(
+                &mut self.sender,
+                rolling_tick(now),
+                rolling::WorkBudget::default(),
+            )
+            .map_err(Error::Rolling)?;
+            P::receive_step(
+                &mut self.incoming,
+                rolling_tick(now),
+                rolling::WorkBudget::default(),
+            )
+            .map_err(Error::Rolling)?;
             self.records
                 .tick(receiver_tick(now))
                 .map_err(Error::Receiver)?;
@@ -495,14 +477,19 @@ impl Endpoint {
         if !self.packing.status().packing.sealed {
             return Ok(());
         }
-        let expected = rolling::SourceId(self.sender.status().encoder.next_source);
+        let expected = rolling::SourceId(P::send_state(&self.sender).encoder.next_source);
         let length = self
             .packing
             .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
             .map_err(Error::Sender)?;
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
-        match self.sender.admit_source_with_copies(
+        match P::admit(
+            &mut self.sender,
             &self.source[..length],
+            rolling::Tick(
+                self.stage_deadline
+                    .map_or(now.0, |end| end.0 - self.send_config.codec_stage_micros),
+            ),
             rolling_tick(now),
             copies,
         ) {
@@ -522,10 +509,10 @@ impl Endpoint {
         }
     }
     fn pump_receive(&mut self, now: Tick) -> Result<bool, Error> {
-        if self.incoming.status().feedback_building {
+        if P::receive_state(&self.incoming, rolling_tick(now)).feedback_building {
             return Ok(false);
         }
-        let Some((id, bytes)) = self.incoming.pending_source() else {
+        let Some((id, bytes)) = P::source(&self.incoming) else {
             return Ok(false);
         };
         // The same slab belongs to one actual ordered handoff or one bounded
@@ -543,10 +530,8 @@ impl Endpoint {
         );
         match result {
             Ok(()) => {
-                let result = self
-                    .incoming
-                    .confirm_handoff(id, rolling_tick(now))
-                    .map_err(Error::Rolling);
+                let result =
+                    P::handoff(&mut self.incoming, id, rolling_tick(now)).map_err(Error::Rolling);
                 if let Err(error) = result {
                     return self.fail(error);
                 }
@@ -579,7 +564,7 @@ impl Endpoint {
             .body
             .independent_short_frame_bytes
             == 0
-            || self.incoming.status().feedback_building
+            || P::receive_state(&self.incoming, rolling_tick(now)).feedback_building
             || self.preview_blocked
         {
             return Ok(false);
@@ -592,7 +577,7 @@ impl Endpoint {
             if self.preview.is_none() {
                 budget.metadata -= 1;
                 visits += 1;
-                let status = self.incoming.status().decoder;
+                let status = P::receive_state(&self.incoming, rolling_tick(now)).decoder;
                 // New committed availability may precede the retained cursor.
                 // Coalesce it without discarding an in-progress slab copy.
                 if self.preview_rescan {
@@ -605,10 +590,8 @@ impl Endpoint {
                 }
                 let source = rolling::SourceId(self.preview_next);
                 self.preview_next = self.preview_next.checked_add(1).ok_or(Error::Arithmetic)?;
-                let Some(bytes) = self
-                    .incoming
-                    .decoded_source(source)
-                    .map_err(Error::Rolling)?
+                let Some(bytes) =
+                    P::decoded_source(&self.incoming, source).map_err(Error::Rolling)?
                 else {
                     continue;
                 };
@@ -626,9 +609,7 @@ impl Endpoint {
             if preview.unit == preview.count {
                 budget.metadata -= 1;
                 visits += 1;
-                let bytes = self
-                    .incoming
-                    .decoded_source(preview.source)
+                let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
                 let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
@@ -681,9 +662,7 @@ impl Endpoint {
             if preview.current.is_none() {
                 budget.metadata -= 1;
                 visits += 1;
-                let bytes = self
-                    .incoming
-                    .decoded_source(preview.source)
+                let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
                 let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
@@ -733,9 +712,7 @@ impl Endpoint {
                 }
                 budget.metadata -= 1;
                 visits += 1;
-                let bytes = self
-                    .incoming
-                    .decoded_source(preview.source)
+                let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
                 let count = budget.copies.min(current.length - current.copied);
@@ -774,17 +751,13 @@ impl Endpoint {
         self.advance(now)?;
         self.pump_send(now)?;
         self.service_ingress(now)?;
-        let send = self
-            .sender
-            .step(rolling_tick(now), work)
-            .map_err(Error::Rolling)?;
+        let send =
+            P::send_step(&mut self.sender, rolling_tick(now), work).map_err(Error::Rolling)?;
         if self.receive_progress {
             self.request_preview_scan();
         }
-        let mut receive = self
-            .incoming
-            .step(rolling_tick(now), work)
-            .map_err(Error::Rolling)?;
+        let mut receive =
+            P::receive_step(&mut self.incoming, rolling_tick(now), work).map_err(Error::Rolling)?;
         if matches!(receive.decode, rolling::DecodeStep::Accepted { .. }) {
             self.request_preview_scan();
         }
@@ -828,26 +801,22 @@ impl Endpoint {
         if let Some(pending) = self.prepared_output {
             return Ok(Some(pending));
         }
-        let (id, kind, length) = if let Some(feedback) = self.incoming.pending_feedback() {
+        let (id, kind, length, source_copy) = if let Some(feedback) = P::feedback(&self.incoming) {
             (
-                OutputId::Feedback(feedback.id),
+                OutputId::Feedback(feedback),
                 EmissionKind::Feedback,
-                scheduler::FEEDBACK_BYTES,
+                P::FEEDBACK_BYTES,
+                None,
             )
         } else if allow_data {
-            let Some(pending) = self.sender.pending_output() else {
+            let Some(data) = P::pending_data(&self.sender).map_err(Error::Rolling)? else {
                 return Ok(None);
             };
-            let kind = match pending {
-                scheduler::Output::Source { .. } => EmissionKind::Source(SourceForm::SystematicFec),
-                scheduler::Output::Repair(_) => EmissionKind::Repair,
+            let kind = match data.id {
+                scheduler::OutputId::Source(_) => EmissionKind::Source(SourceForm::SystematicFec),
+                scheduler::OutputId::Repair(_) => EmissionKind::Repair,
             };
-            let length = self
-                .sender
-                .pending_wire_len()
-                .map_err(Error::Rolling)?
-                .ok_or(Error::Identity)?;
-            (OutputId::Data(pending.id()), kind, length)
+            (OutputId::Data(data.id), kind, data.bytes, data.source_copy)
         } else {
             return Ok(None);
         };
@@ -881,15 +850,13 @@ impl Endpoint {
             .ok_or(Error::Arithmetic)?;
         let count = match id {
             OutputId::Feedback(_) => {
-                output[..length].copy_from_slice(
-                    self.incoming
-                        .pending_feedback_wire()
-                        .ok_or(Error::Identity)?,
-                );
+                if P::encode_feedback(&self.incoming, output).map_err(Error::Rolling)? != length {
+                    return self.fail(Error::Identity);
+                }
                 0
             }
             OutputId::Data(_) => {
-                if self.sender.encode_pending(output).map_err(Error::Rolling)? != length {
+                if P::encode_data(&self.sender, output).map_err(Error::Rolling)? != length {
                     return self.fail(Error::Identity);
                 }
                 self.outgoing_units(&output[..length], witnesses)?
@@ -899,11 +866,7 @@ impl Endpoint {
             instance: self.instance,
             serial: self.next_output,
             prepared_at: now,
-            source_copy: if matches!(id, OutputId::Data(scheduler::OutputId::Source(_))) {
-                Some(self.sender.pending_source_copy().ok_or(Error::Identity)?)
-            } else {
-                None
-            },
+            source_copy,
             id,
             kind,
             security_number,
@@ -952,15 +915,17 @@ impl Endpoint {
         self.prepared_output = None;
         self.statistics.handed = handed;
         timing?;
-        let result = match (pending.id, pending.source_copy) {
-            (OutputId::Data(scheduler::OutputId::Source(id)), Some(copy))
-                if copy.source() == id =>
-            {
-                self.sender
-                    .confirm_source_copy(rolling_tick(now), rolling_tick(accepted), copy)
+        let result = match pending.id {
+            OutputId::Data(id) => P::confirm_data(
+                &mut self.sender,
+                id,
+                pending.source_copy,
+                rolling_tick(accepted),
+                rolling_tick(now),
+            ),
+            OutputId::Feedback(id) if pending.source_copy.is_none() => {
+                P::confirm_feedback(&mut self.incoming, id, rolling_tick(now))
             }
-            (OutputId::Data(id), None) => self.sender.confirm_output(id, rolling_tick(now)),
-            (OutputId::Feedback(id), None) => self.incoming.confirm_feedback(id, rolling_tick(now)),
             _ => Err(rolling::Error::Identity),
         }
         .map_err(Error::Rolling);
@@ -1009,22 +974,20 @@ impl Endpoint {
         }
         match kind {
             EmissionKind::Feedback => {
-                self.sender
-                    .receive_feedback_wire(bytes, rolling_tick(now))
+                P::receive_feedback(&mut self.sender, bytes, rolling_tick(now))
                     .map_err(Error::Rolling)?;
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
-                let (observed, scope) = match rolling::wire::inspect_with(
-                    self.receive_config.scheduler.recovery,
-                    self.receive_config.scheduler.source_wire,
-                    bytes,
-                )
-                .map_err(Error::Rolling)?
+                let (observed, scope) = match self
+                    .receive_config
+                    .scheduler
+                    .inspect(bytes)
+                    .map_err(Error::Rolling)?
                 {
-                    rolling::wire::View::Source { scope, .. } => {
+                    recovery::View::Source { scope, .. } => {
                         (EmissionKind::Source(SourceForm::SystematicFec), scope)
                     }
-                    rolling::wire::View::Repair(value) => (EmissionKind::Repair, value.scope),
+                    recovery::View::Repair { scope } => (EmissionKind::Repair, scope),
                 };
                 let expected = rolling::Scope {
                     direction: self.send_rolling_scope.direction ^ 1,
@@ -1034,7 +997,7 @@ impl Endpoint {
                     return Err(Error::Identity);
                 }
                 if let Some(owner) = &mut self.ingress {
-                    let policy = self.receive_config.scheduler.recovery;
+                    let policy = self.receive_config.scheduler.recovery();
                     let deadline = Tick(
                         received
                             .0
@@ -1064,14 +1027,14 @@ impl Endpoint {
                         )
                         .map_err(Error::Ingress)?;
                 } else {
-                    self.incoming
-                        .receive_wire_until(
-                            bytes,
-                            rolling_tick(received),
-                            rolling_tick(now),
-                            rolling_tick(original_deadline),
-                        )
-                        .map_err(Error::Rolling)?;
+                    P::receive(
+                        &mut self.incoming,
+                        bytes,
+                        rolling_tick(received),
+                        rolling_tick(now),
+                        rolling_tick(original_deadline),
+                    )
+                    .map_err(Error::Rolling)?;
                     self.request_preview_scan();
                 }
             }
@@ -1093,7 +1056,8 @@ impl Endpoint {
         ) {
             return self.fail(Error::Identity);
         }
-        let result = self.incoming.receive_wire_until(
+        let result = P::receive(
+            &mut self.incoming,
             front.bytes(),
             rolling_tick(input.received),
             rolling_tick(now),
@@ -1119,20 +1083,19 @@ impl Endpoint {
         packet: &[u8],
         output: &mut [receiver::UnitWitness],
     ) -> Result<usize, Error> {
-        let (scope, id, original) = match rolling::wire::inspect_with(
-            self.send_config.scheduler.recovery,
-            self.send_config.scheduler.source_wire,
-            packet,
-        )
-        .map_err(Error::Rolling)?
+        let (scope, id, original) = match self
+            .send_config
+            .scheduler
+            .inspect(packet)
+            .map_err(Error::Rolling)?
         {
-            rolling::wire::View::Source {
+            recovery::View::Source {
                 scope,
                 id,
                 original,
             } => (scope, id, original),
-            rolling::wire::View::Repair(repair) => {
-                if repair.scope != self.send_rolling_scope {
+            recovery::View::Repair { scope } => {
+                if scope != self.send_rolling_scope {
                     return Err(Error::Identity);
                 }
                 return Ok(0);
@@ -1175,13 +1138,12 @@ impl Endpoint {
     }
     /// Earliest actual original deadline; soft packing/tail triggers stay separate.
     pub fn deadline(&self) -> Option<Tick> {
-        self.sender
-            .deadline()
+        P::send_deadline(&self.sender)
             .map(|t| Tick(t.0))
             .into_iter()
             .chain(self.stage_deadline)
             .chain(self.ingress.as_ref().and_then(|owner| owner.deadline()))
-            .chain(self.incoming.deadline().map(|t| Tick(t.0)))
+            .chain(P::receive_deadline(&self.incoming).map(|t| Tick(t.0)))
             .chain(self.records.deadline().map(|t| Tick(t.0)))
             .chain(self.prepared_native.map(|native| native.deadline))
             .min()
@@ -1190,22 +1152,22 @@ impl Endpoint {
     pub fn wake_at(&self) -> Option<Tick> {
         self.deadline()
             .into_iter()
-            .chain(self.sender.wake_at().map(|t| Tick(t.0)))
-            .chain(self.incoming.wake_at().map(|t| Tick(t.0)))
+            .chain(P::send_wake(&self.sender).map(|t| Tick(t.0)))
+            .chain(P::receive_wake(&self.incoming, rolling_tick(self.now)).map(|t| Tick(t.0)))
             .chain(self.packing.deadline_micros().map(Tick))
             .min()
     }
     /// Actual resumable computation, excluding immutable output waiting for I/O.
     pub fn work_pending(&self) -> bool {
-        let send = self.sender.status();
-        let receive = self.incoming.status();
+        let send = P::send_state(&self.sender);
+        let receive = P::receive_state(&self.incoming, rolling_tick(self.now));
         self.ingress
             .as_ref()
             .is_some_and(|owner| !owner.queue.is_empty())
-            || (!send.output_ready
-                && (send.encoder.pending_repair || send.regular_due > 0 || send.tail_remaining > 0))
+            || send.work_pending
             || receive.decoder.pending_job
             || receive.feedback_building
+            || receive.work_pending
             || (self.receive_progress
                 && receive.decoder.decoded_prefix > receive.decoder.handoff_prefix)
             || (self
@@ -1225,22 +1187,22 @@ impl Endpoint {
     }
     /// Genuine pending/first-event feedback service requirement, not native delivery.
     pub fn feedback_opportunity(&self) -> Option<(Tick, usize)> {
-        let status = self.incoming.status();
+        let status = P::receive_state(&self.incoming, rolling_tick(self.now));
         if status.feedback_ready || status.feedback_building {
-            Some((self.now, scheduler::FEEDBACK_BYTES))
+            Some((self.now, P::FEEDBACK_BYTES))
         } else {
             status
                 .feedback_due
-                .map(|at| (Tick(at.0), scheduler::FEEDBACK_BYTES))
+                .map(|at| (Tick(at.0), P::FEEDBACK_BYTES))
         }
     }
     /// Actual retained directional scheduler state, without inferred capability.
-    pub fn sender_status(&self) -> scheduler::SenderStatus {
-        self.sender.status()
+    pub fn sender_status(&self) -> P::SenderStatus {
+        P::sender_status(&self.sender)
     }
     /// Actual decode/feedback state, without native-delivery inference.
-    pub fn receiver_status(&self) -> scheduler::ReceiverStatus {
-        self.incoming.status()
+    pub fn receiver_status(&self) -> P::ReceiverStatus {
+        P::receiver_status(&self.incoming)
     }
     /// Actual compact record/context/native custody state.
     pub fn record_status(&self) -> receiver::Status {
@@ -1256,8 +1218,8 @@ impl Endpoint {
     }
     /// Whether real local stages, confirmed debt and native custody are empty.
     pub fn drained(&self) -> bool {
-        let send = self.sender.status();
-        let receive = self.incoming.status();
+        let send = P::send_state(&self.sender);
+        let receive = P::receive_state(&self.incoming, rolling_tick(self.now));
         let records = self.records.status();
         self.failure.is_none()
             && self
@@ -1267,15 +1229,12 @@ impl Endpoint {
             && self.packing.is_idle()
             && self.prepared_output.is_none()
             && self.prepared_native.is_none()
-            && !send.output_ready
-            && send.regular_due == 0
-            && send.tail_remaining == 0
-            && send.encoder.confirmed_prefix == send.encoder.next_source
+            && send.drained
             && !receive.decoder.pending_job
             && receive.decoder.handoff_prefix == receive.decoder.observed_end
             && !receive.feedback_building
             && !receive.feedback_ready
-            && receive.feedback_events == 0
+            && !receive.feedback_events
             && receive.feedback_due.is_none()
             && records.retained_records == 0
             && records.retained_sources == 0
@@ -1285,10 +1244,10 @@ impl Endpoint {
 
 // The exact ordered unit cursor is separate from the previewable record ledger.
 #[allow(clippy::too_many_arguments)]
-fn admit_packed(
+fn admit_packed<P: RecoveryPolicy>(
     records: &mut receiver::Receiver,
     ordered_unit: &mut Option<receiver::SourceId>,
-    config: DirectionConfig,
+    config: DirectionConfig<P>,
     scope: receiver::Scope,
     id: rolling::SourceId,
     bytes: &[u8],
@@ -1370,8 +1329,8 @@ fn empty_inputs<'a>(scope: receiver::Scope) -> [receiver::AuthenticatedSymbol<'a
     })
 }
 
-fn packed_view(
-    config: DirectionConfig,
+fn packed_view<P: RecoveryPolicy>(
+    config: DirectionConfig<P>,
     scope: receiver::Scope,
     id: rolling::SourceId,
     bytes: &[u8],
@@ -1384,7 +1343,7 @@ fn packed_view(
     Ok(view)
 }
 
-fn check_policy(config: DirectionConfig, symbol: &[u8]) -> Result<(), Error> {
+fn check_policy<P: RecoveryPolicy>(config: DirectionConfig<P>, symbol: &[u8]) -> Result<(), Error> {
     if config.native_policy == NativePolicy::RawIp {
         let raw = symbol[3] == 2;
         let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);

@@ -58,7 +58,7 @@ pub enum NativePreparation {
     /// Same retained packet; caller output was not overwritten or deadline renewed.
     AlreadyPending(PreparedNative),
 }
-impl Endpoint {
+impl<P: RecoveryPolicy> Endpoint<P> {
     /// Prepare one real reconstructed native body directly into caller custody.
     /// Full configured queues remain separate from this one pending codec token.
     pub fn prepare_native(

@@ -247,6 +247,7 @@ impl Driver {
     }
 
     fn progress_common_inner(&mut self, runtime: &mut common::Runtime, now: u64) -> io::Result<()> {
+        self.observe_proxy_retirement(runtime)?;
         self.validate_common_fence()?;
         self.service_common_state(now)?;
         if runtime.action.is_none() {

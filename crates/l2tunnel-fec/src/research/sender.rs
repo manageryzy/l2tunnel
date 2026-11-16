@@ -101,11 +101,13 @@ pub struct Sender {
     encoder: rolling::Encoder,
     pending: Option<Pending>,
     output_end: Option<Tick>,
+    available_at: Option<Tick>,
     debt_end: Option<Tick>,
     sent: u32,
     repairs: u32,
     credit: u32,
     feedback: Option<Feedback>,
+    feedback_at: Option<Tick>,
     last: Tick,
     terminal: Option<Error>,
 }
@@ -148,11 +150,13 @@ impl Sender {
             scope,
             pending: None,
             output_end: None,
+            available_at: None,
             debt_end: None,
             sent: 0,
             repairs: 0,
             credit: 0,
             feedback: None,
+            feedback_at: None,
             last: now,
             terminal: None,
         })
@@ -180,8 +184,18 @@ impl Sender {
         if let Err(error) = self.encoder.step(now, WorkBudget::default()) {
             return self.fail(error);
         }
+        self.notice_availability(now);
         self.last = now;
         Ok(())
+    }
+
+    fn notice_availability(&mut self, now: Tick) {
+        if self.available_at.is_none()
+            && matches!(self.pending, Some(Pending::Repair { .. }))
+            && self.encoder.pending_repair().is_some()
+        {
+            self.available_at = Some(now);
+        }
     }
 
     /// Admit an original into the only output slot without earning repair credit.
@@ -221,6 +235,7 @@ impl Sender {
         }
         let id = self.encoder.admit_source(original, now)?;
         self.pending = Some(Pending::Source(id));
+        self.available_at = Some(now);
         self.output_end = Some(output_end);
         self.debt_end = Some(self.debt_end.map_or(debt_end, |old| old.min(debt_end)));
         Ok(id)
@@ -230,7 +245,10 @@ impl Sender {
     pub fn step(&mut self, now: Tick, budget: WorkBudget) -> Result<WorkUsed, Error> {
         self.time(now)?;
         match self.encoder.step(now, budget) {
-            Ok(used) => Ok(used),
+            Ok(used) => {
+                self.notice_availability(now);
+                Ok(used)
+            }
             Err(error @ Error::WorkLimit) => Err(error),
             Err(error) => self.fail(error),
         }
@@ -282,6 +300,58 @@ impl Sender {
     /// cancel an earned or pending repair. A failed support admission terminates
     /// this owner explicitly rather than shortening the reference equation.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
+        self.confirm_output_at(id, now, now)
+    }
+
+    /// Preserve actual physical acceptance separately from callback observation.
+    ///
+    /// Repair support may only use feedback causally available at acceptance.
+    /// Acceptance cannot precede this exact source/repair's actual availability.
+    /// If later feedback was already applied, no historical prefix is invented:
+    /// this owner becomes terminal, retires the physical output exactly once and
+    /// retains its real sent count. The caller must order actual completions
+    /// before subsequently arriving feedback. Neither timestamp rewinds a clock
+    /// or renews the original source/debt cap.
+    pub fn confirm_output_at(
+        &mut self,
+        id: OutputId,
+        accepted: Tick,
+        now: Tick,
+    ) -> Result<(), Error> {
+        let actual = self.pending_output().ok_or(Error::Busy)?.id();
+        if actual != id {
+            return Err(Error::Identity);
+        }
+        let freezes_repair = matches!(id, OutputId::Source(_)) && self.credit + 26 >= 125;
+        let causal = self.available_at.is_some_and(|at| at <= accepted)
+            && accepted <= now
+            && (!freezes_repair || self.feedback_at.is_none_or(|at| at <= accepted));
+        let result = if causal {
+            self.confirm_current(id, now)
+        } else {
+            Err(Error::TimeRegression)
+        };
+        if let Err(error) = result {
+            // Whole physical ownership is irreversible even if subsequent
+            // causal/time/expiry validation cannot continue this algorithm.
+            match id {
+                OutputId::Source(source) => {
+                    self.sent = source.0.checked_add(1).ok_or(Error::Exhausted)?
+                }
+                OutputId::Repair(repair) => {
+                    self.repairs = u32::try_from(repair.0).map_err(|_| Error::Exhausted)?
+                }
+            }
+            self.pending = None;
+            self.available_at = None;
+            self.output_end = None;
+            self.terminal.get_or_insert(error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn confirm_current(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
         let actual = self.pending_output().ok_or(Error::Busy)?.id();
         if actual != id {
             return Err(Error::Identity);
@@ -315,8 +385,11 @@ impl Sender {
                         id: repair,
                         confirmed,
                     });
+                    self.available_at = None;
+                    self.notice_availability(now);
                 } else {
                     self.pending = None;
+                    self.available_at = None;
                     self.output_end = None;
                 }
             }
@@ -330,6 +403,7 @@ impl Sender {
                     .ok_or(Error::Exhausted)
                     .or_else(|error| self.fail(error))?;
                 self.pending = None;
+                self.available_at = None;
                 self.output_end = None;
             }
         }
@@ -376,6 +450,7 @@ impl Sender {
             .confirm_prefix(feedback.prefix, now)
             .or_else(|error| self.fail(error))?;
         self.feedback = Some(feedback);
+        self.feedback_at = Some(now);
         if feedback.prefix == self.encoder.status().next_source {
             self.debt_end = None;
         }
