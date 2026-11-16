@@ -162,6 +162,24 @@ impl Receiver {
         cap: Tick,
     ) -> Result<Begin, Error> {
         let view = wire::inspect(self.config, bytes)?;
+        self.receive_view_at(view, received, now, cap)
+    }
+
+    /// Admit a typed selected body while retaining the same causal input and cap.
+    pub fn receive_view_at(
+        &mut self,
+        view: wire::View<'_>,
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<Begin, Error> {
+        match view {
+            wire::View::Source { original, .. } => {
+                wire::source_len(self.config, original.len())?;
+            }
+            wire::View::Repair(value) => value.validate(self.config)?,
+            wire::View::Feedback(_) => return Err(Error::Format),
+        }
         let incoming = match view {
             wire::View::Source { scope, .. } => scope,
             wire::View::Repair(value) => value.equation.scope,

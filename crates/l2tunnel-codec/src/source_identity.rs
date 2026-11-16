@@ -117,6 +117,38 @@ pub(crate) fn word64(input: &[u8], start: usize) -> u64 {
     u64::from_be_bytes(value)
 }
 
+pub(crate) fn varint_len(value: u64) -> usize {
+    ((64 - value.leading_zeros()).max(1) as usize).div_ceil(7)
+}
+
+pub(crate) fn write_varint(mut value: u64, output: &mut [u8]) -> usize {
+    let length = varint_len(value);
+    for byte in &mut output[..length] {
+        *byte = (value as u8 & 0x7f) | if value > 0x7f { 0x80 } else { 0 };
+        value >>= 7;
+    }
+    length
+}
+
+pub(crate) fn read_varint(input: &[u8]) -> Result<(u64, usize), Error> {
+    let mut value = 0_u64;
+    for index in 0..10 {
+        let byte = *input.get(index).ok_or(Error::Malformed)?;
+        if index == 9 && byte > 1 {
+            return Err(Error::Malformed);
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return if varint_len(value) == index + 1 {
+                Ok((value, index + 1))
+            } else {
+                Err(Error::Malformed)
+            };
+        }
+    }
+    Err(Error::Malformed)
+}
+
 #[cfg(test)]
 #[path = "source_identity_tests.rs"]
 mod tests;

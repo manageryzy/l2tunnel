@@ -152,6 +152,64 @@ fn deliveries(endpoint: &mut Endpoint, now: u64) -> Result<Vec<(u8, Vec<u8>)>, E
     }
     Ok(frames)
 }
+
+#[test]
+fn selected_compact_wire_elides_identity_envelope_and_restores_lost_fec_source() -> TestResult {
+    let (mut left, mut right) = peers(config(128))?;
+    left.enable_compact_wire(51)?;
+    right.enable_compact_wire(51)?;
+    let frames = native_frames()?;
+    for frame in &frames {
+        left.enqueue_admitted(ChannelId(0), frame, ms(0))?;
+    }
+    let packets = emissions(&mut left, 0)?;
+    assert_eq!(packets.len(), 5);
+    for packet in &packets[..3] {
+        let record = left.recovery.inspect_output_record(packet)?;
+        let (source, payload) = record.source.ok_or("systematic source")?;
+        assert_eq!(payload.len(), 129);
+        assert_eq!(
+            compact_wire::aligned(
+                true,
+                left.send_scope,
+                receiver::SourceId(source.0),
+                left.config.receiver,
+                payload
+            )?
+            .identity
+            .source
+            .0,
+            source.0
+        );
+        let mut witnesses = [UnitWitness {
+            identity: RecordIdentity {
+                channel: ChannelId(0),
+                record: receiver::RecordId(0),
+            },
+            index: 0,
+            count: 1,
+        }; 1];
+        assert_eq!(left.outgoing_units(packet, &mut witnesses)?, 1);
+    }
+    for index in [2, 1, 3] {
+        right.receive_authenticated(&packets[index], ms(1))?;
+    }
+    assert_eq!(
+        deliveries(&mut right, 1)?,
+        frames
+            .into_iter()
+            .map(|frame| (0, frame))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(right.statistics().repaired_unique_sources, 1);
+    let mut budget = allowance(&right);
+    let before = budget.wire_bytes;
+    let feedback = emit(&mut right, 2, true, &mut budget)?.ok_or("strong feedback")?;
+    assert_eq!(before - budget.wire_bytes, feedback.len() + 51);
+    left.receive_authenticated(&feedback, ms(2))?;
+    assert!(left.drained() && right.drained());
+    Ok(())
+}
 #[test]
 fn protected_independent_peers_restore_python_bytes_before_rto_in_both_roles() -> TestResult {
     for cover in [
@@ -588,5 +646,37 @@ fn sender_native_identity_and_all_original_fragment_witnesses_survive_retry() ->
         }
     }
     assert!(retried_native);
+    Ok(())
+}
+
+#[test]
+fn selected_compact_aligned_preview_preserves_gap_and_deduplicates_native_delivery() -> TestResult {
+    let mut config = config(128);
+    config.native_policy = NativePolicy::RawIp;
+    config.receiver.body.elide_payload_length = false;
+    config.receiver.body.predictive = false;
+    config.receiver.body.timestamp_pair_dictionary = false;
+    config.receiver.body.independent_short_frame_bytes = 32;
+    let (mut left, mut right) = peers(config)?;
+    left.enable_compact_wire(40)?;
+    right.enable_compact_wire(40)?;
+    left.enqueue_admitted_raw(ChannelId(0), &[11; 70], ms(0))?;
+    left.enqueue_admitted_raw(ChannelId(0), b"tiny", ms(0))?;
+    assert!(emissions(&mut left, 0)?.is_empty());
+    let packets = emissions(&mut left, 5)?;
+    right.receive_authenticated(&packets[1], ms(6))?;
+    assert_eq!(right.prepare(ChannelId(0), ms(6), 1)?, Prepared::Ready);
+    assert!(right.pending().ok_or("early native")?.early);
+    assert_eq!(right.pending().ok_or("early native")?.bytes, b"tiny");
+    right.commit_delivery(ms(7))?;
+    right.receive_authenticated(&packets[0], ms(8))?;
+    assert_eq!(deliveries(&mut right, 8)?, [(0, vec![11; 70])]);
+    right.receive_authenticated(&packets[1], ms(9))?;
+    assert_eq!(right.prepare(ChannelId(0), ms(9), 1)?, Prepared::Idle);
+    assert_eq!(
+        right.status().receiver.source_floor,
+        Some(receiver::SourceId(2))
+    );
+    assert_eq!(right.status().receiver.early_tombstones, 0);
     Ok(())
 }

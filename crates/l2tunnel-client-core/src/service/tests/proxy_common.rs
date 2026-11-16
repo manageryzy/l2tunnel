@@ -16,6 +16,14 @@ fn fixture_profile(
     retained_close: bool,
     measured: bool,
 ) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
+    fixture_wire(hosts, retained_close, measured, None)
+}
+fn fixture_wire(
+    hosts: &[Arc<Host>; 2],
+    retained_close: bool,
+    measured: bool,
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
     let TransactionPlans {
         plans,
         profile: old,
@@ -152,6 +160,10 @@ fn fixture_profile(
         selected
     } else {
         legacy
+    };
+    let profile = match wire {
+        Some(selection) => profile.with_compact_wire(selection)?,
+        None => profile,
     };
     let convert = |plan: Prepared| -> Result<Prepared> {
         let data = Arc::try_unwrap(plan.data).map_err(|_| "unstarted plan unexpectedly shared")?;
@@ -536,3 +548,6 @@ mod measured_common;
 
 #[path = "proxy_common_measured_policy.rs"]
 mod measured_policy;
+
+#[path = "proxy_common_compact.rs"]
+mod compact_wire;

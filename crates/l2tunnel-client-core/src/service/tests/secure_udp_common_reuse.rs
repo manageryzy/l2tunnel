@@ -26,13 +26,33 @@ fn next_packet(reverse: bool, payload: bool) -> Result<Vec<u8>> {
 #[tokio::test]
 async fn selected_reuse_service_keeps_original_cap_key_generation_and_peer_confirmed_new_bytes()
 -> Result {
+    exercise(None).await
+}
+#[tokio::test]
+async fn compact_wire_reuse_service_preserves_full_lifecycle_under_both_data_suites() -> Result {
+    for protection in [
+        l2tunnel_security::compact::Protection::Aes128Ccm4,
+        l2tunnel_security::compact::Protection::ChaCha20Crc32c,
+    ] {
+        exercise(Some(l2tunnel::secure_record::compact::Selection {
+            protection,
+            limits: l2tunnel_security::compact::Selection {
+                max_forward_packets: 8192,
+                max_failed_checks: 64,
+            },
+        }))
+        .await?;
+    }
+    Ok(())
+}
+async fn exercise(wire: Option<l2tunnel::secure_record::compact::Selection>) -> Result {
     timeout(Duration::from_secs(20), async {
         let hosts = support::hosts();
         let Selected {
             plans: [left, right],
             addresses,
             profile,
-        } = selected_reuse(&hosts, true)?;
+        } = selected_wire(&hosts, true, wire)?;
         assert!(profile.connection_reuse());
         let (client, client_run) = channel();
         let (server, server_run) = channel();
@@ -61,6 +81,14 @@ async fn selected_reuse_service_keeps_original_cap_key_generation_and_peer_confi
         for handle in &handles {
             let frame = common_frame(handle)?;
             let status = frame.status()?;
+            assert_eq!(
+                status.compact_wire.as_ref().map(|value| value.effective),
+                wire.map(|value| {
+                    crate::secure_udp::common_status::CompactWireSelection::from_selection(value)
+                        .map(Some)
+                })
+                .transpose()?
+            );
             let selected = status
                 .connection_reuse
                 .ok_or("selected idle controller absent")?;

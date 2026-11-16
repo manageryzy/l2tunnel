@@ -683,7 +683,7 @@ mod observe {
                 configuration_change: true,
                 coordinator: info.role == Role::Initiator,
                 reconnect: true,
-                cross_profile_switching: profile.compact_wire().is_none(),
+                cross_profile_switching: true,
                 retained_state_recovery: false,
                 fresh_rekey: false,
                 rolling_work: profile

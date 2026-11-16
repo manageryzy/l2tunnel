@@ -174,7 +174,14 @@ fn emit(
     assert_eq!(prepared.security_number, *number);
     assert_eq!(budget.packets, 0);
     assert_eq!(budget.wire_bytes, 10_000 - prepared.wire_bytes);
-    assert_eq!(prepared.wire_bytes, prepared.bytes + endpoint.overhead);
+    let overhead = if prepared.kind == record_engine::EmissionKind::Feedback {
+        endpoint
+            .compact_feedback_overhead
+            .unwrap_or(endpoint.overhead)
+    } else {
+        endpoint.overhead
+    };
+    assert_eq!(prepared.wire_bytes, prepared.bytes + overhead);
     let datagram = Datagram {
         kind: prepared.kind,
         bytes: output[..prepared.bytes].to_vec(),
@@ -202,6 +209,15 @@ fn receive(endpoint: &mut Endpoint, now: Tick, queue: &mut VecDeque<Datagram>) -
 #[test]
 fn actual_compact_rolling_recovers_both_directions_with_loss_and_original_zero_tails() -> TestResult
 {
+    rolling_loss_fixture(false)
+}
+
+#[test]
+fn selected_compact_wire_rolling_actual_loss_feedback_and_native_completion() -> TestResult {
+    rolling_loss_fixture(true)
+}
+
+fn rolling_loss_fixture(selected: bool) -> TestResult {
     for wire in [
         rolling::wire::SourceWire::Padded,
         rolling::wire::SourceWire::Exact,
@@ -210,6 +226,10 @@ fn actual_compact_rolling_recovers_both_directions_with_loss_and_original_zero_t
             let config = config(raw, wire);
             let mut client = endpoint(config, Role::Client)?;
             let mut server = endpoint(config, Role::Server)?;
+            if selected {
+                client.enable_compact_wire(53)?;
+                server.enable_compact_wire(85)?;
+            }
             let forward = packet(raw, 0x39, 700);
             let reverse = packet(raw, 0x73, 389);
             let forward_id = client
@@ -551,3 +571,117 @@ mod copies;
 
 #[path = "framing_tests.rs"]
 mod framing;
+
+#[test]
+fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identity() -> TestResult {
+    use crate::fec::research;
+    for profile in [
+        research::Profile::Recursive {
+            taps: 3,
+            width: 8,
+            reset: 256,
+            fresh_interval: 0,
+        },
+        research::Profile::Recursive {
+            taps: 4,
+            width: 8,
+            reset: 256,
+            fresh_interval: 8,
+        },
+        research::Profile::Accumulator {
+            lanes: 7,
+            window: 128,
+        },
+    ] {
+        let minimum_window = profile.minimum_window()?.max(256);
+        let convert = |direction: DirectionConfig| DirectionConfig {
+            native_policy: direction.native_policy,
+            receiver: direction.receiver,
+            packing: direction.packing,
+            codec_stage_micros: direction.codec_stage_micros,
+            scheduler: research::Config {
+                recovery: rolling::Config {
+                    window: minimum_window,
+                    ..direction.scheduler.recovery
+                },
+                profile,
+                feedback_ticks: 100,
+                memory_bytes: 16 << 20,
+            },
+        };
+        let base = config(true, rolling::wire::SourceWire::Exact);
+        let cfg = Config {
+            forward: convert(base.forward),
+            reverse: convert(base.reverse),
+            geometry: base.geometry,
+            native_stall_micros: base.native_stall_micros,
+        };
+        let mut a = Endpoint::new(cfg, context(Role::Client), 17, Tick(0))?;
+        let mut b = Endpoint::new(cfg, context(Role::Server), 17, Tick(0))?;
+        a.enable_compact_wire(53)?;
+        b.enable_compact_wire(85)?;
+        let original = packet(true, 0x49, 64);
+        let identity = a
+            .enqueue_admitted_identified(Tick(0), 0, &original)?
+            .ok_or("admission")?;
+        a.flush(Tick(0))?;
+        let mut output = [0; 1024];
+        let mut witnesses = [witness(); 4];
+        a.step(Tick(0), work())?;
+        let mut budget = OutboundBudget {
+            packets: 1,
+            wire_bytes: 4096,
+        };
+        let sent = a
+            .prepare_output(Tick(0), 1, true, &mut output, &mut budget, &mut witnesses)?
+            .ok_or("source")?;
+        assert_eq!(output[0], 1);
+        assert!(
+            output[..sent.bytes]
+                .windows(4)
+                .all(|bytes| bytes != b"L2RS" && bytes != b"L2PK")
+        );
+        assert_eq!(b.inspect_peer(&output[..sent.bytes])?, sent.kind);
+        assert_eq!(sent.wire_bytes, sent.bytes + 41);
+        a.confirm_output(Tick(1), sent)?;
+        b.accept_authenticated_at(Tick(2), Tick(2), sent.kind, &output[..sent.bytes])?;
+        let mut delivered = false;
+        let mut feedback = false;
+        for tick in 2..300 {
+            b.step(Tick(tick), work())?;
+            let mut native = [0; 1024];
+            if let NativePreparation::Ready(prepared) =
+                b.prepare_native(Tick(tick), 32, Tick(1000), &mut native)?
+            {
+                assert_eq!(prepared.identity(), identity);
+                assert_eq!(&native[..prepared.bytes()], original);
+                b.commit_native(Tick(tick), prepared.token())?;
+                delivered = true;
+            }
+            let mut allowance = OutboundBudget {
+                packets: 1,
+                wire_bytes: 4096,
+            };
+            if let Some(ack) = b.prepare_output(
+                Tick(tick),
+                1,
+                false,
+                &mut output,
+                &mut allowance,
+                &mut witnesses,
+            )? {
+                assert_eq!(ack.kind, record_engine::EmissionKind::Feedback);
+                assert_eq!(ack.wire_bytes, ack.bytes + 85);
+                assert_eq!(a.inspect_peer(&output[..ack.bytes])?, ack.kind);
+                b.confirm_output(Tick(tick), ack)?;
+                a.accept_authenticated(Tick(tick), ack.kind, &output[..ack.bytes])?;
+                feedback = true;
+            }
+            if delivered && feedback && a.drained() && b.drained() {
+                break;
+            }
+        }
+        assert!(delivered && feedback && a.drained() && b.drained());
+    }
+    Ok(())
+}

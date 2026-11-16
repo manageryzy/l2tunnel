@@ -338,6 +338,20 @@ impl Sender {
             output,
         )?)
     }
+    /// Write only selected record metadata and the original symbol before commit.
+    /// Authenticated outer context and recovery supply scope and source identity.
+    pub fn write_pending_compact(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let (pending, _, _) = self.build_symbol()?;
+        Ok(aligned_envelope::encode_compact(
+            SymbolIdentity {
+                scope: self.scope,
+                source: SourceId(0),
+                record: pending.record,
+            },
+            &self.symbol,
+            output,
+        )?)
+    }
     /// Borrow the exact next unit without advancing any pending ownership.
     /// Actual zero-valued body bytes are retained; generated padding is excluded.
     pub fn pending_unit(&mut self) -> Result<PendingUnit<'_>, Error> {

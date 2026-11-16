@@ -28,6 +28,8 @@ pub struct ProxyCommonFrame {
     pub requested_cover: l2tunnel_cover::Appearance,
     /// Absent until the actual Common runtime publishes its installed selection.
     pub effective_cover: Option<l2tunnel_cover::Appearance>,
+    /// Explicit request and actual installed final-wire observations, absent for legacy.
+    pub compact_wire: Option<crate::secure_udp::common_status::CompactWireStatus>,
     /// Original authenticated connected socket endpoints.
     pub local_addr: std::net::SocketAddr,
     /// Original fixed peer endpoint.
@@ -135,6 +137,7 @@ impl ProxyFrame {
             effective_carrier: frame.effective_carrier,
             requested_cover: cover(frame.requested_cover),
             effective_cover: frame.effective_cover.map(cover),
+            compact_wire: frame.compact_wire,
             local_addr: frame.local_addr,
             peer_addr: frame.peer_addr,
             installed: frame.installed,
@@ -245,6 +248,23 @@ impl Backend {
             frame.liveness = snapshot.liveness;
             frame.socket_accepted_packets = snapshot.counters.socket_accepted_packets;
             frame.socket_accepted_ip_bytes = snapshot.counters.socket_accepted_ip_bytes;
+            if let Some(wire) = &mut frame.compact_wire {
+                use crate::secure_udp::common_status::{CompactCheckCounts, CompactWireSelection};
+                // Effective facts come only from the Driver, including a visible
+                // discrepancy if an actual observation ever differs from the request.
+                wire.effective = snapshot
+                    .compact_wire
+                    .and_then(|value| CompactWireSelection::from_selection(value).ok());
+                wire.checks = snapshot
+                    .compact_check_status
+                    .map(|value| CompactCheckCounts {
+                        data: value.data,
+                        feedback: value.feedback,
+                        control: value.control,
+                        limit: value.limit,
+                    });
+                wire.feedback_packet_number = snapshot.compact_feedback_number.map(|value| value.0);
+            }
             if snapshot.running {
                 frame.effective_cover = Some(frame.requested_cover);
             }

@@ -1,7 +1,8 @@
 # Compact final wire format and implementation cleanup
 
 Status: **selected compact format implemented and finite original-UDP/shared-service
-integration-tested; full migration open**. The owner authorized implementation after
+integration-tested; original-UDP algorithm migration implemented, broader carrier
+and qualification gates open**. The owner authorized implementation after
 reviewing encapsulation costs. The first structural checkpoint preserves legacy
 bytes and its retained regression failures. The additive selected-format
 checkpoint below installs real compact protection/encoding and original-UDP
@@ -280,10 +281,11 @@ The forward allowance must be 1 through 2147483647 and is also bounded by the
 configured `packets_per_key`; the positive u32 failed-check limit applies to each
 receiving owner's lifetime. No successful packet or data switch renews it.
 
-Current installation accepts full-duplex original UDP with complete Swift-only
-catalogs and initial-only QUIC-like or media-like appearance. Unsupported
-catalogs, OpenVPN, raw TCP and proxy selections are refused without pruning or
-fallback; they remain migration obligations. The selected H0 reaches the actual
+The initial selected checkpoint accepted full-duplex original UDP with Swift-only
+catalogs. The runtime migration below connects every existing algorithm family,
+including supported fixed/measured TCP proxy and connection-reuse profiles,
+with initial-only QUIC-like or media-like appearance. OpenVPN and raw TCP
+selections remain refused without pruning or fallback. The selected H0 reaches the actual
 Noise/member establishment factory before the session is released. Offline
 inspection reports the requested selection with `effective: null`; API4 reports
 the effective selection, independent feedback number and failed-check counts
@@ -396,6 +398,104 @@ Earlier connection-refusal/setup-deadline failures remain in the receipts; a lat
 passing case does not establish their cause. Host load was observed, not proven
 to explain any failure. No privileged lab, packet capture, QoS measurement,
 Windows/Android native execution or new performance qualification was run.
+
+## Runtime algorithm migration
+
+Status: **implemented**, with protocol and user-space runtime validation recorded
+separately below. This completes the connection of the existing algorithm owners
+to selected compact bodies; it is not a claim that every CWC acceptance gate or
+all 47 Python configurations is qualified.
+
+The selected original-UDP Engine/Bank now installs the format before admission
+and retains it in every staged generation. Existing poll, receive, feedback,
+physical-completion and native-delivery owners use the selected representation.
+There is no alternate recovery loop or post-commit legacy-packet transcoder.
+The authenticated full catalog and v3 protection selection remain established
+before traffic; legacy construction retains its original bytes.
+
+| Existing owner | Selected body and retained behavior |
+| --- | --- |
+| Swift | Existing source/repair/feedback bodies under compact final protection. |
+| Aligned and Packed | Context-free legacy ARQ/FEC union; the FEC vector itself codes short source bodies. Aligned record IDs and Packed unit/record metadata retain their full domains. |
+| AlignedCompact and PackedCompact | Actual CompactARQ source/attempt serials and lossy feedback use the short union through the running endpoint, including original arrival-time RTT and physical-send custody. |
+| PerConnectionCompact | The same independent owners, with a 10-byte source/feedback route or 18-byte source-free native route. Full incarnation and native serial identities remain separate; selection is preflighted across the complete cohort before any owner changes. |
+| Rolling and Research | Typed pending source, equation and feedback views feed the final body directly. Full established scope/profile supplies derivable context; recursive, fallback and accumulator behavior retains its existing owner and work limits. |
+| Explicit record fragments | Existing bounded reassembly and whole-group custody are retained. Each physical feedback fragment uses the strong-feedback overhead; data and feedback groups reserve their actual distinct geometry. Complete immutable fragment shape and physical MTU are checked before liveness authority. |
+
+Shared-service profiles preserve fixed/measured TCP proxy and connection-reuse
+policy through selection. `Profile::with_compact_wire` rebases carrier charges
+and rebuilds the complete authenticated configuration before establishment;
+the CLI builds the complete selected plan directly. Proxy status includes the
+requested selection and derives its effective selection/check counters from the
+actual runtime. Offline inspection never claims an effective connection.
+
+The new bodies remove the repeated L2AR/Reliable and Aligned/Packed identity
+envelopes on these selected paths. The final data outer cost remains 9 bytes;
+feedback/control outer cost remains 21 bytes. These are not whole-packet costs:
+
+- Direct legacy ARQ adds a kind byte and a canonical full source ID (1..10 bytes).
+  CompactARQ also adds its independent full transmission serial.
+- Aligned adds its canonical full record ID (1..10 bytes). Packed retains count,
+  record-list representation, first-unit identity and every actual record ID,
+  plus unchanged packing/context/length metadata. It chooses compact or fixed
+  record-list representation by actual byte count, not maximum-arm padding.
+- Block FEC includes generation/symbol/count/width metadata and the explicit
+  coefficient row. Large coefficient vectors can exceed the ordinary 24-byte
+  target and are not hidden in payload accounting or silently removed.
+- Rolling/Research source IDs, repair support and feedback fields retain exact
+  bounds. Feedback, large-ID cases and explicit 40-byte fragment headers remain
+  separately measured branches; this migration does not assert a universal
+  24-byte ceiling or qualify the fixed1460/MTU1500 experiment.
+
+Selected resource plans validate data and strong feedback separately before
+allocation. Existing conservative backing remains charged once; a smaller wire
+body is not claimed as an allocator-memory reduction. The exact emitted length,
+including route and selected protection, is debited once. Held output retains
+its physical token, original deadline and full protection identity.
+
+The runtime validates the selected owner's complete union before it can affect
+authenticated liveness. A valid feedback body placed in a short-check Data record
+is refused; a strong Feedback record cannot carry a data arm. CRC data never
+acquires authenticated feedback/control authority. Cross-profile selection keeps
+negotiated epochs, full configuration digests, old/staged readers, drain/native
+barriers and existing authenticated management.
+
+Validation receipts are retained under
+[`work/compact-wire-migration-20261116`](../../work/compact-wire-migration-20261116).
+The original focused failures and their corrections are retained alongside later
+checks; exact final scope is recorded in the batch summary. Source checks and
+local UDP/Unix-device integration do not establish privileged TAP/TUN/raw TCP,
+Windows/Android execution, ISP classification or throughput.
+
+The required `tools/check.py` stages pass as a composed validation. The initial
+run stopped at Clippy's type-complexity check in a new test helper; a type alias
+corrected it. Its already-passed, unchanged Python/golden stages were reused,
+then formatting through the final simulator stage passed on stable source:
+2,600 Rust cases including doctests and the separate codec feature branch,
+421 reported Python tooling cases across both receipts, and 1,658 simulator
+cases. Strict Clippy/rustdoc, two-process UDP, and external Generic/Common CLI
+probes pass. The [initial attempt](../../work/compact-wire-migration-20261116/full-check/validation.json)
+and [continuation](../../work/compact-wire-migration-20261116/remaining-check/validation.json)
+retain exact commands and source hashes; this is not a pristine single-run claim.
+Only this validation note was added after that source freeze.
+
+Focused runtime evidence includes both data-protection selections, initial-only
+QUIC-like/media-like appearance, bidirectional native bytes, selected MTU refusal,
+strong-feedback/data-domain refusal, ordinary cross-profile epoch switches,
+RollingCopies fragmentation and all three Research profiles. Shared-service
+coverage includes the six ordinary families, fixed/measured proxy native TCP
+bytes and retained clean close, and full authenticated reuse with independent
+incarnation and source-free native-ACK identity. A separate asymmetric-geometry
+fragment regression checks data/feedback packet and group debits, immutable
+parser refusal and exact native delivery at 17/73-byte data versus 29/85-byte
+strong-feedback overhead. These are finite functional cases, not impairment or
+native-throughput qualification.
+
+Raw TCP bootstrap-to-single-protection, other outer-carrier migrations, complete
+SW-11 fault/platform matrices, all47 acceptance and the full geometry/performance
+gates remain separate open requirements. Their definitions below are unchanged.
+This batch supplies scoped evidence for CWC-03/04/06/07/11/12/13/14/15/16/17;
+their complete acceptance obligations remain represented by the parent tasks.
 
 ## Full implementation and acceptance ledger
 

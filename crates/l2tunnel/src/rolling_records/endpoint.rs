@@ -110,6 +110,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) source: Vec<u8>,
     pub(super) symbols: Vec<u8>,
     pub(super) overhead: usize,
+    pub(super) compact_feedback_overhead: Option<usize>,
     pub(super) framing: Option<codec::FragmentConfig>,
     pub(super) now: Tick,
     pub(super) failure: Option<Error>,
@@ -191,6 +192,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Exact local selected fragment geometry; None retains one unfragmented packet.
     pub const fn output_fragment_config(&self) -> Option<codec::FragmentConfig> {
         self.framing
+    }
+    /// Actual selected fragment geometry for this data or strong-feedback arm.
+    pub fn output_fragment_config_for(&self, kind: EmissionKind) -> Option<codec::FragmentConfig> {
+        self.framing.map(|mut framing| {
+            if kind == EmissionKind::Feedback {
+                framing.outer_overhead_bytes =
+                    self.compact_feedback_overhead.unwrap_or(self.overhead);
+            }
+            framing
+        })
     }
     /// Observe exact selected policies; local observation provides no peer authority.
     pub const fn source_copy_policies(&self) -> CopyPolicies {
@@ -339,6 +350,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             source,
             symbols,
             overhead,
+            compact_feedback_overhead: None,
             framing: framing.map(|value| value.local(context.role)),
             now,
             failure: None,
@@ -478,10 +490,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return Ok(());
         }
         let expected = rolling::SourceId(P::send_state(&self.sender).encoder.next_source);
-        let length = self
-            .packing
-            .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
-            .map_err(Error::Sender)?;
+        let length = if self.compact_feedback_overhead.is_some() {
+            self.packing.write_pending_compact(&mut self.source)
+        } else {
+            self.packing
+                .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
+        }
+        .map_err(Error::Sender)?;
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
         match P::admit(
             &mut self.sender,
@@ -527,6 +542,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             bytes,
             &mut self.symbols,
             now,
+            self.compact_feedback_overhead.is_some(),
         );
         match result {
             Ok(()) => {
@@ -595,7 +611,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 else {
                     continue;
                 };
-                let view = packed_view(config, self.receive_scope, source, bytes)?;
+                let view = packed_view(
+                    config,
+                    self.receive_scope,
+                    source,
+                    bytes,
+                    self.compact_feedback_overhead.is_some(),
+                )?;
                 self.preview = Some(Preview {
                     source,
                     count: view.len(),
@@ -612,7 +634,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
-                let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
+                let view = packed_view(
+                    config,
+                    self.receive_scope,
+                    preview.source,
+                    bytes,
+                    self.compact_feedback_overhead.is_some(),
+                )?;
                 let mut inputs = empty_inputs(self.receive_scope);
                 let mut count = 0;
                 let floor = self.records.status().source_floor;
@@ -665,7 +693,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
-                let view = packed_view(config, self.receive_scope, preview.source, bytes)?;
+                let view = packed_view(
+                    config,
+                    self.receive_scope,
+                    preview.source,
+                    bytes,
+                    self.compact_feedback_overhead.is_some(),
+                )?;
                 // The maintained parser owns the bounded unit grammar. Retain
                 // the current exact slice coordinates so byte-budget resumes
                 // never walk the preceding units again.
@@ -805,7 +839,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             (
                 OutputId::Feedback(feedback),
                 EmissionKind::Feedback,
-                P::FEEDBACK_BYTES,
+                if self.compact_feedback_overhead.is_some() {
+                    P::Compact::feedback_len(&self.incoming)
+                        .map_err(Error::Rolling)?
+                        .ok_or(Error::Identity)?
+                } else {
+                    P::FEEDBACK_BYTES
+                },
                 None,
             )
         } else if allow_data {
@@ -816,7 +856,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 scheduler::OutputId::Source(_) => EmissionKind::Source(SourceForm::SystematicFec),
                 scheduler::OutputId::Repair(_) => EmissionKind::Repair,
             };
-            (OutputId::Data(data.id), kind, data.bytes, data.source_copy)
+            let length = if self.compact_feedback_overhead.is_some() {
+                P::Compact::data_len(&self.sender)
+                    .map_err(Error::Rolling)?
+                    .ok_or(Error::Identity)?
+            } else {
+                data.bytes
+            };
+            (OutputId::Data(data.id), kind, length, data.source_copy)
         } else {
             return Ok(None);
         };
@@ -831,14 +878,17 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if witnesses.len() < required {
             return Err(Error::Witnesses { required });
         }
-        let (packets, wire_bytes) = if let Some(framing) = self.framing {
+        let overhead = if kind == EmissionKind::Feedback {
+            self.compact_feedback_overhead.unwrap_or(self.overhead)
+        } else {
+            self.overhead
+        };
+        let (packets, wire_bytes) = if let Some(mut framing) = self.framing {
+            framing.outer_overhead_bytes = overhead;
             let geometry = framing.geometry(length).map_err(Error::Fragment)?;
             (geometry.fragments(), geometry.wire_bytes())
         } else {
-            (
-                1,
-                length.checked_add(self.overhead).ok_or(Error::Arithmetic)?,
-            )
+            (1, length.checked_add(overhead).ok_or(Error::Arithmetic)?)
         };
         if budget.packets < packets || budget.wire_bytes < wire_bytes {
             return Ok(None);
@@ -850,13 +900,23 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .ok_or(Error::Arithmetic)?;
         let count = match id {
             OutputId::Feedback(_) => {
-                if P::encode_feedback(&self.incoming, output).map_err(Error::Rolling)? != length {
+                let encoded = if self.compact_feedback_overhead.is_some() {
+                    P::Compact::encode_feedback(&self.incoming, output)
+                } else {
+                    P::encode_feedback(&self.incoming, output)
+                };
+                if encoded.map_err(Error::Rolling)? != length {
                     return self.fail(Error::Identity);
                 }
                 0
             }
             OutputId::Data(_) => {
-                if P::encode_data(&self.sender, output).map_err(Error::Rolling)? != length {
+                let encoded = if self.compact_feedback_overhead.is_some() {
+                    P::Compact::encode_data(&self.sender, output)
+                } else {
+                    P::encode_data(&self.sender, output)
+                };
+                if encoded.map_err(Error::Rolling)? != length {
                     return self.fail(Error::Identity);
                 }
                 self.outgoing_units(&output[..length], witnesses)?
@@ -974,7 +1034,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         match kind {
             EmissionKind::Feedback => {
-                P::receive_feedback(
+                compact_wire::receive_feedback::<P>(
+                    self.compact_feedback_overhead.is_some(),
+                    self.send_config.scheduler,
+                    self.send_rolling_scope,
                     &mut self.sender,
                     bytes,
                     rolling_tick(received),
@@ -983,17 +1046,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 .map_err(Error::Rolling)?;
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
-                let (observed, scope) = match self
-                    .receive_config
-                    .scheduler
-                    .inspect(bytes)
-                    .map_err(Error::Rolling)?
-                {
-                    recovery::View::Source { scope, .. } => {
-                        (EmissionKind::Source(SourceForm::SystematicFec), scope)
-                    }
-                    recovery::View::Repair { scope } => (EmissionKind::Repair, scope),
-                };
+                let (observed, scope) =
+                    match self.inspect_data(bytes, false).map_err(Error::Rolling)? {
+                        recovery::View::Source { scope, .. } => {
+                            (EmissionKind::Source(SourceForm::SystematicFec), scope)
+                        }
+                        recovery::View::Repair { scope } => (EmissionKind::Repair, scope),
+                    };
                 let expected = rolling::Scope {
                     direction: self.send_rolling_scope.direction ^ 1,
                     ..self.send_rolling_scope
@@ -1033,7 +1092,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         )
                         .map_err(Error::Ingress)?;
                 } else {
-                    P::receive(
+                    compact_wire::receive::<P>(
+                        self.compact_feedback_overhead.is_some(),
+                        self.receive_config.scheduler,
+                        rolling::Scope {
+                            direction: self.send_rolling_scope.direction ^ 1,
+                            ..self.send_rolling_scope
+                        },
                         &mut self.incoming,
                         bytes,
                         rolling_tick(received),
@@ -1075,7 +1140,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 }
                 return Ok(());
             }
-            let result = P::receive_feedback(
+            let result = compact_wire::receive_feedback::<P>(
+                self.compact_feedback_overhead.is_some(),
+                self.send_config.scheduler,
+                self.send_rolling_scope,
                 &mut self.sender,
                 front.bytes(),
                 rolling_tick(input.received),
@@ -1094,7 +1162,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         ) {
             return self.fail(Error::Identity);
         }
-        let result = P::receive(
+        let result = compact_wire::receive::<P>(
+            self.compact_feedback_overhead.is_some(),
+            self.receive_config.scheduler,
+            rolling::Scope {
+                direction: self.send_rolling_scope.direction ^ 1,
+                ..self.send_rolling_scope
+            },
             &mut self.incoming,
             front.bytes(),
             rolling_tick(input.received),
@@ -1121,12 +1195,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         packet: &[u8],
         output: &mut [receiver::UnitWitness],
     ) -> Result<usize, Error> {
-        let (scope, id, original) = match self
-            .send_config
-            .scheduler
-            .inspect(packet)
-            .map_err(Error::Rolling)?
-        {
+        let (scope, id, original) = match self.inspect_data(packet, true).map_err(Error::Rolling)? {
             recovery::View::Source {
                 scope,
                 id,
@@ -1142,12 +1211,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if scope != self.send_rolling_scope {
             return Err(Error::Identity);
         }
-        let view = packed_envelope::decode(
-            self.send_config.packing.envelope(),
+        let view = packed_view(
+            self.send_config,
             self.send_scope,
+            id,
             original,
-        )
-        .map_err(Error::Envelope)?;
+            self.compact_feedback_overhead.is_some(),
+        )?;
         if view.identity().source.0 != u64::from(id.0) {
             return Err(Error::Identity);
         }
@@ -1295,8 +1365,9 @@ fn admit_packed<P: RecoveryPolicy>(
     bytes: &[u8],
     symbols: &mut [u8],
     now: Tick,
+    compact: bool,
 ) -> Result<(), Error> {
-    let view = packed_view(config, scope, id, bytes)?;
+    let view = packed_view(config, scope, id, bytes, compact)?;
     if Some(view.identity().first_unit) != *ordered_unit {
         return Err(Error::Identity);
     }
@@ -1376,9 +1447,19 @@ fn packed_view<P: RecoveryPolicy>(
     scope: receiver::Scope,
     id: rolling::SourceId,
     bytes: &[u8],
+    compact: bool,
 ) -> Result<packed_envelope::View<'_>, Error> {
-    let view = packed_envelope::decode(config.packing.envelope(), scope, bytes)
-        .map_err(Error::Envelope)?;
+    let view = if compact {
+        packed_envelope::decode_compact(
+            config.packing.envelope(),
+            scope,
+            receiver::SourceId(u64::from(id.0)),
+            bytes,
+        )
+    } else {
+        packed_envelope::decode(config.packing.envelope(), scope, bytes)
+    }
+    .map_err(Error::Envelope)?;
     if view.identity().source.0 != u64::from(id.0) {
         return Err(Error::Identity);
     }

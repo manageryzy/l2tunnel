@@ -1,6 +1,6 @@
 use super::*;
 
-fn owner(
+pub(super) fn owner(
     config: ReliableConfig,
     role: EndpointRole,
     reserved: bool,

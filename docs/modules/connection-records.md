@@ -1,5 +1,10 @@
 # Fixed-cohort independent Compact owners
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: **implemented collection, tag8 Engine/Bank, Common runtime and shared
 Prepared/service path with finite protocol/protected-I/O evidence**. No default
 or named profile selection changes. Full PBA-03, drained/fenced flow reuse and

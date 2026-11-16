@@ -366,6 +366,12 @@ pub(super) async fn common(
         effective_carrier: info.authenticated.carrier,
         requested_cover: profile.settings().cover.appearance,
         effective_cover: None,
+        compact_wire: profile
+            .compact_wire()
+            .map(|requested| {
+                crate::secure_udp::common_status::CompactWireStatus::observe(requested, None)
+            })
+            .transpose()?,
         local_addr: info.local_addr,
         peer_addr: info.peer_addr,
         installed: false,
@@ -455,8 +461,15 @@ fn authenticate_common<'a>(
     profile: &'a crate::secure_udp::common_transaction_profile::Profile,
 ) -> Pin<Box<dyn std::future::Future<Output = io::Result<CommonAuthenticated>> + Send + 'a>> {
     Box::pin(async move {
-        let session =
-            authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
+        let session = authenticate_selected_secure_udp(
+            shared,
+            plan,
+            accepted,
+            deadline,
+            profile.settings(),
+            profile.compact_wire().map(|_| profile),
+        )
+        .await?;
         let info = session.info();
         setup::stage(shared, accepted.operation, SetupStage::Configuration);
         let contract = profile.runtime_contract(info.role)?;

@@ -282,6 +282,7 @@ impl Collection {
             raw_send,
             raw_receive,
             unreliable_statistics: UnreliableStatistics::default(),
+            compact_wire: false,
         })
     }
 }

@@ -11,6 +11,7 @@ use l2tunnel_recovery::{
 mod backing;
 mod compact;
 mod recovery_owner;
+mod selected_wire;
 pub use compact::{
     CompactOutput, CompactOutputError, CompactOverheads, CompactReliableConfig,
     inspect_compact_structural,
@@ -348,6 +349,7 @@ pub struct Reliable {
     next_output: u64,
     pending_output: Option<PreparedOutput>,
     independent_feedback: Option<PreparedOutput>,
+    compact_wire: Option<CompactOverheads>,
 }
 
 impl ReliableConfig {
@@ -502,6 +504,7 @@ impl Reliable {
             next_output: 1,
             pending_output: None,
             independent_feedback: None,
+            compact_wire: None,
         })
     }
 
@@ -668,6 +671,7 @@ impl Reliable {
             next_output: 1,
             pending_output: None,
             independent_feedback: None,
+            compact_wire: None,
         })
     }
     /// Select physical-attempt timing before any local/peer traffic is used.
@@ -900,7 +904,9 @@ impl Reliable {
         &self,
         packet: &[u8],
     ) -> Result<Option<l2tunnel_recovery::SourceId>, Error> {
-        let view = if self.arq.is_compact() {
+        let view = if self.compact_wire.is_some() {
+            self.selected_inspect(packet, true)?
+        } else if self.arq.is_compact() {
             self.compact_inspect(packet, true)?
         } else {
             inspect_record_view(
@@ -919,6 +925,9 @@ impl Reliable {
     /// This checks local sending role/session/epoch and all encoding bounds; it
     /// neither authenticates bytes nor advances sender/receiver state.
     pub fn inspect_output(&self, packet: &[u8]) -> Result<RecordKind, Error> {
+        if self.compact_wire.is_some() {
+            return self.selected_inspect(packet, true).map(|view| view.kind);
+        }
         if self.arq.is_compact() {
             return self.compact_inspect(packet, true).map(|view| view.kind);
         }
@@ -936,6 +945,9 @@ impl Reliable {
     /// allowing callers to reject feedback on data lanes or data on control lanes.
     /// Lower-layer integrity/replay verification must precede this operation.
     pub fn inspect_peer(&self, packet: &[u8]) -> Result<RecordKind, Error> {
+        if self.compact_wire.is_some() {
+            return self.selected_inspect(packet, false).map(|view| view.kind);
+        }
         if self.arq.is_compact() {
             return self.compact_inspect(packet, false).map(|view| view.kind);
         }
@@ -1022,7 +1034,9 @@ impl Reliable {
         else {
             return Ok(None);
         };
-        let view = if self.arq.is_compact() {
+        let view = if self.compact_wire.is_some() {
+            self.selected_inspect(&output[..bytes], true)
+        } else if self.arq.is_compact() {
             self.compact_inspect(&output[..bytes], true)
         } else {
             inspect_record_view(
@@ -1052,7 +1066,7 @@ impl Reliable {
             prepared_at: now,
             bytes,
             wire_bytes: bytes
-                .checked_add(self.outer_overhead())
+                .checked_add(self.selected_overhead(view.kind))
                 .ok_or(Error::Exhausted)?,
             kind: view.kind,
         };
@@ -1104,17 +1118,40 @@ impl Reliable {
         if allow_data && let Some(length) = self.emit_front(output, budget)? {
             return Ok(Some(length));
         }
-        if allow_data && self.outgoing.is_empty() && self.allowed(self.maximum_packet, budget)? {
+        let source_allowed = if self.compact_wire.is_some() {
+            self.arq
+                .body_packet_bytes(now, false)?
+                .map(|bytes| self.allowed(1 + bytes, budget))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            self.allowed(self.maximum_packet, budget)?
+        };
+        if allow_data && self.outgoing.is_empty() && source_allowed {
             for _ in 0..self.legacy_send()?.fec.block.max_sources {
-                let Some(length) = self.arq.poll_source(now, &mut self.scratch)? else {
+                let emitted = if self.compact_wire.is_some() {
+                    self.arq.poll_source_body(now, &mut self.scratch)?
+                } else {
+                    self.arq.poll_source(now, &mut self.scratch)?
+                };
+                let Some(length) = emitted else {
                     break;
                 };
                 let own = opposite_context(self.context);
-                let source = match inspect_packet(
-                    &self.scratch[..length],
-                    own,
-                    self.legacy_send()?.arq.max_source_bytes,
-                )? {
+                let source_view = if self.compact_wire.is_some() {
+                    l2tunnel_recovery::inspect_body(
+                        false,
+                        &self.scratch[..length],
+                        self.legacy_send()?.arq.max_source_bytes,
+                    )?
+                } else {
+                    inspect_packet(
+                        &self.scratch[..length],
+                        own,
+                        self.legacy_send()?.arq.max_source_bytes,
+                    )?
+                };
+                let source = match source_view {
                     PacketView::Data { source, .. } => source.0,
                     _ => return self.fail(Error::Malformed),
                 };
@@ -1197,6 +1234,12 @@ impl Reliable {
         let Some(at) = self.feedback_deadline() else {
             return Ok(None);
         };
+        if self.compact_wire.is_some() {
+            return Ok(self
+                .arq
+                .body_packet_bytes(at.max(self.now), true)?
+                .map(|bytes| (at, bytes + 1)));
+        }
         let body = if self.arq.is_compact() {
             let Some(bytes) = self.arq.compact_packet_bytes(at.max(self.now), true)? else {
                 return Ok(None);
@@ -1329,9 +1372,14 @@ impl Reliable {
     }
 
     fn receive_fec(&mut self, inner: &[u8], now: Duration) -> Result<(), Error> {
-        let maximum_source_bytes = self.legacy_receive()?.arq.max_source_bytes;
         let view = fec::inspect(inner, self.receive_fec, self.legacy_receive()?.fec.block)
             .or_else(|error| self.fail(error.into()))?;
+        self.receive_fec_view(view, now)
+    }
+
+    fn receive_fec_view(&mut self, view: fec::SymbolView<'_>, now: Duration) -> Result<(), Error> {
+        let maximum_source_bytes = self.legacy_receive()?.arq.max_source_bytes;
+        let compact = self.compact_wire.is_some();
         let systematic = if view.kind == fec::SymbolKind::Systematic {
             let length = usize::from(u16::from_be_bytes(
                 view.payload
@@ -1357,7 +1405,7 @@ impl Reliable {
             .decoder
             .as_mut()
             .ok_or(Error::Malformed)?
-            .accept(inner, ticks);
+            .accept_view(view, ticks);
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
                 let checked = (|| -> Result<(), Error> {
@@ -1401,7 +1449,8 @@ impl Reliable {
                     .decoded_sources(view.generation)?;
                 let count = sources.len();
                 for source in sources {
-                    let identity = source_id_with(self.context, maximum_source_bytes, source)?;
+                    let identity =
+                        source_id_selected(self.context, maximum_source_bytes, source, compact)?;
                     if !self.restored.contains_key(&identity) {
                         let total = self
                             .restored_bytes
@@ -1481,6 +1530,28 @@ impl Reliable {
             &mut legacy_encoder
         };
         let size = ENVELOPE_BYTES + fec::HEADER_BYTES + count + encoder.coded_bytes();
+        if self.compact_wire.is_some() {
+            for index in 0..count {
+                self.outgoing.push(size, Emission::Systematic, |output| {
+                    Ok(
+                        encoder.systematic_with(fec::SourceId(index as u16), |view| {
+                            selected_wire::encode_symbol(view, output)
+                        })?,
+                    )
+                })?;
+            }
+            for repair in 0..repairs {
+                self.outgoing.push(size, Emission::Repair, |output| {
+                    Ok(encoder.cauchy_repair_with(repair as u16, |view| {
+                        selected_wire::encode_symbol(view, output)
+                    })?)
+                })?;
+            }
+            self.building.clear();
+            self.building_deadline = None;
+            self.next_generation = generation.0.checked_add(1).map(fec::GenerationId);
+            return Ok(());
+        }
         for index in 0..count {
             self.outgoing.push(size, Emission::Systematic, |output| {
                 let bytes = encoder
@@ -1508,6 +1579,23 @@ impl Reliable {
         output: &mut [u8],
         budget: &mut OutboundBudget,
     ) -> Result<Option<usize>, Error> {
+        if self.compact_wire.is_some() {
+            let Some(body) = self.arq.body_packet_bytes(self.now, true)? else {
+                return Ok(None);
+            };
+            let charge = (1 + body)
+                .checked_add(self.selected_overhead(RecordKind::Feedback))
+                .ok_or(Error::Exhausted)?;
+            if budget.packets == 0 || budget.wire_bytes < charge {
+                return Ok(None);
+            }
+            let Some(length) = self.arq.poll_feedback_body(self.now, &mut self.scratch)? else {
+                return Ok(None);
+            };
+            return self
+                .emit_scratch(2, length, Emission::Feedback, output, budget)
+                .map(Some);
+        }
         if !self.allowed(ENVELOPE_BYTES + ACK_PACKET_BYTES, budget)? {
             return Ok(None);
         }
@@ -1544,12 +1632,27 @@ impl Reliable {
         output: &mut [u8],
         budget: &mut OutboundBudget,
     ) -> Result<usize, Error> {
-        let bytes = ENVELOPE_BYTES.checked_add(length).ok_or(Error::Exhausted)?;
-        if !self.allowed(bytes, budget)? || output.len() < bytes {
+        let prefix = if self.compact_wire.is_some() {
+            1
+        } else {
+            ENVELOPE_BYTES
+        };
+        let bytes = prefix.checked_add(length).ok_or(Error::Exhausted)?;
+        let overhead = self.selected_overhead(if kind == 2 {
+            RecordKind::Feedback
+        } else {
+            RecordKind::Source
+        });
+        let charge = bytes.checked_add(overhead).ok_or(Error::Exhausted)?;
+        if budget.packets == 0 || budget.wire_bytes < charge || output.len() < bytes {
             return Err(Error::Exhausted);
         }
-        write_header(kind, output);
-        output[ENVELOPE_BYTES..bytes].copy_from_slice(&self.scratch[..length]);
+        if self.compact_wire.is_some() {
+            output[0] = kind;
+        } else {
+            write_header(kind, output);
+        }
+        output[prefix..bytes].copy_from_slice(&self.scratch[..length]);
         self.charge(bytes, emission, budget)?;
         Ok(bytes)
     }
@@ -1559,8 +1662,13 @@ impl Reliable {
         emission: Emission,
         budget: &mut OutboundBudget,
     ) -> Result<(), Error> {
+        let kind = if matches!(emission, Emission::Feedback) {
+            RecordKind::Feedback
+        } else {
+            RecordKind::Source
+        };
         let charge = bytes
-            .checked_add(self.outer_overhead())
+            .checked_add(self.selected_overhead(kind))
             .ok_or(Error::Exhausted)?;
         self.charge_exact(charge, emission, budget)
     }
@@ -1620,14 +1728,12 @@ impl Reliable {
     }
 
     fn source_id(&self, bytes: &[u8]) -> Result<u64, Error> {
-        match inspect_packet(
-            bytes,
+        source_id_selected(
             self.context,
             self.legacy_receive()?.arq.max_source_bytes,
-        )? {
-            PacketView::Data { source, .. } => Ok(source.0),
-            _ => Err(Error::Malformed),
-        }
+            bytes,
+            self.compact_wire.is_some(),
+        )
     }
 
     fn validate_duplicate(&mut self, identity: u64, bytes: &[u8]) -> Result<(), Error> {
@@ -1665,7 +1771,12 @@ impl Reliable {
                 break;
             };
             let previous = self.arq.statistics().received_unique;
-            match self.arq.receive(&record.bytes, self.now) {
+            let received = if self.compact_wire.is_some() {
+                self.arq.receive_body(&record.bytes, false, self.now)
+            } else {
+                self.arq.receive(&record.bytes, self.now)
+            };
+            match received {
                 Ok(()) => {
                     if record.recovered && self.arq.statistics().received_unique > previous {
                         self.statistics.repaired_unique_sources =
@@ -1759,8 +1870,18 @@ fn fec_context(context: RecoveryContext, peer: bool) -> fec::FecContext {
 fn write_header(kind: u8, output: &mut [u8]) {
     output[..ENVELOPE_BYTES].copy_from_slice(&[b'L', b'2', b'R', b'F', 1, kind, 0, 0]);
 }
-fn source_id_with(context: RecoveryContext, maximum: usize, bytes: &[u8]) -> Result<u64, Error> {
-    match inspect_packet(bytes, context, maximum)? {
+fn source_id_selected(
+    context: RecoveryContext,
+    maximum: usize,
+    bytes: &[u8],
+    compact: bool,
+) -> Result<u64, Error> {
+    let view = if compact {
+        l2tunnel_recovery::inspect_body(false, bytes, maximum)?
+    } else {
+        inspect_packet(bytes, context, maximum)?
+    };
+    match view {
         PacketView::Data { source, .. } => Ok(source.0),
         _ => Err(Error::Malformed),
     }

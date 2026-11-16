@@ -64,6 +64,9 @@ impl Reliable {
         packet: &'a [u8],
     ) -> Result<StructuralRecord<'a>, Error> {
         self.inspect_output(packet)?;
+        if self.compact_wire.is_some() {
+            return self.selected_inspect(packet, true);
+        }
         if self.arq.is_compact() {
             return self.compact_inspect(packet, true);
         }
@@ -91,6 +94,9 @@ impl Reliable {
         }
     }
     pub(super) fn outer_overhead(&self) -> usize {
+        if let Some(overheads) = self.compact_wire {
+            return overheads.data;
+        }
         match &self.policies {
             Policies::Legacy { send, .. } => send.outer_overhead_bytes,
             Policies::Compact { send, .. } => send.outer_overhead_bytes,
@@ -200,6 +206,7 @@ impl Reliable {
             next_output: 1,
             pending_output: None,
             independent_feedback: None,
+            compact_wire: None,
         })
     }
     /// Admit using original authenticated arrival and monotonic observation.
@@ -210,6 +217,9 @@ impl Reliable {
         received: Duration,
         observed: Duration,
     ) -> Result<(), Error> {
+        if self.compact_wire.is_some() {
+            return self.receive_selected(packet, received, observed);
+        }
         if !self.arq.is_compact() {
             if received > observed {
                 return Err(Error::NonMonotonicTime);
@@ -296,6 +306,9 @@ impl Reliable {
         output: &mut [u8],
         budget: &mut OutboundBudget,
     ) -> Result<Option<usize>, Error> {
+        if self.compact_wire.is_some() {
+            return self.emit_compact_wire(now, feedback, output, budget);
+        }
         let Some(inner) = self.arq.compact_packet_bytes(now, feedback)? else {
             return Ok(None);
         };

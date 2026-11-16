@@ -144,8 +144,20 @@ impl Receiver {
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
         self.time(now)?;
-        let result = match wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?
-        {
+        let view = wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?;
+        self.receive_view_until(view, received, now, original_deadline)
+    }
+
+    /// Admit a typed selected data body through the same decoder and original cap.
+    pub fn receive_view_until(
+        &mut self,
+        view: wire::View<'_>,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
+        self.time(now)?;
+        let result = match view {
             wire::View::Source {
                 scope,
                 id,

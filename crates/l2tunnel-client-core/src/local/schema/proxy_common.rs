@@ -32,6 +32,9 @@ pub struct ProxyCommonStatus {
     pub requested_cover: ProxyCommonCover,
     /// Absent until actual Common installation.
     pub effective_cover: Option<ProxyCommonCover>,
+    /// Explicit compact request and actual installed protection/check observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_wire: Option<crate::secure_udp::common_status::CompactWireStatus>,
     /// Original local endpoint of the retained authenticated socket.
     pub local_addr: SocketAddr,
     /// Original peer endpoint of the retained authenticated socket.

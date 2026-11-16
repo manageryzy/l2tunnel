@@ -1,5 +1,10 @@
 # Authenticated identity boundary for packed sources
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: canonical envelope and focused tests pass. The pure inner [packer](packed-source.md)
 preserves Python container bytes. This separate envelope supplies full identities;
 it is not authentication by itself, a packed receiver, or runtime integration.

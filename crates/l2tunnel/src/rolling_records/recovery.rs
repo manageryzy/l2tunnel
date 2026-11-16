@@ -59,6 +59,7 @@ pub enum View<'a> {
 #[doc(hidden)]
 #[allow(missing_docs)] // Internal sealed dispatch; public only for concrete typed aliases.
 pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
+    type Compact: CompactRecovery<Self>;
     type Sender;
     type Receiver;
     type SenderStatus;
@@ -161,6 +162,7 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
 }
 
 impl RecoveryPolicy for scheduler::Policy {
+    type Compact = compact_wire::Rolling;
     type Sender = scheduler::Sender;
     type Receiver = scheduler::Receiver;
     type SenderStatus = scheduler::SenderStatus;
@@ -435,6 +437,7 @@ impl RecoveryPolicy for scheduler::Policy {
 }
 
 impl RecoveryPolicy for research::Config {
+    type Compact = compact_wire::Research;
     type Sender = research::Sender;
     type Receiver = research::Receiver;
     type SenderStatus = research::SenderStatus;

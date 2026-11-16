@@ -89,6 +89,56 @@ fn deliveries(endpoint: &mut packed::Endpoint, now: u64) -> Result<Vec<(u8, Vec<
 }
 
 #[test]
+fn selected_compact_packed_wire_preserves_multiple_units_and_fec_repair() -> TestResult {
+    let (mut left, mut right) = peers(config(128))?;
+    left.enable_compact_wire(53)?;
+    right.enable_compact_wire(53)?;
+    let mut expected = Vec::new();
+    for index in 0..12u8 {
+        let frame = vec![index, 1, 0, 0];
+        left.enqueue_admitted(ChannelId(index % 2), &frame, ms(0))?;
+        expected.push((index % 2, frame));
+    }
+    let packets = emissions(&mut left, 0)?;
+    assert_eq!(packets.len(), 5);
+    for packet in &packets[..3] {
+        let mut witnesses = [UnitWitness {
+            identity: RecordIdentity {
+                channel: ChannelId(0),
+                record: receiver::RecordId(0),
+            },
+            index: 0,
+            count: 1,
+        }; 4];
+        assert_eq!(left.outgoing_units(packet, &mut witnesses)?, 4);
+    }
+    for index in [2, 1, 3] {
+        right.receive_authenticated(&packets[index], ms(1))?;
+    }
+    let actual = deliveries(&mut right, 1)?;
+    for channel in 0..2 {
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|item| item.0 == channel)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .filter(|item| item.0 == channel)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(right.statistics().repaired_unique_sources, 1);
+    let mut budget = budget(&right);
+    let before = budget.wire_bytes;
+    let feedback = emit(&mut right, 2, true, &mut budget)?.ok_or("strong feedback")?;
+    assert_eq!(before - budget.wire_bytes, feedback.len() + 53);
+    left.receive_authenticated(&feedback, ms(2))?;
+    assert!(left.drained() && right.drained());
+    Ok(())
+}
+
+#[test]
 fn packed_protected_sources_repair_before_rto_with_distinct_unit_ids_in_both_roles() -> TestResult {
     for cover in [
         datagram::CoverProfile::OpenVpnLike,

@@ -148,3 +148,55 @@ impl Owner {
         dispatch!(self, owner => owner.storage_usage())
     }
 }
+
+impl Owner {
+    pub fn poll_source_body(
+        &mut self,
+        now: Duration,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, RecoveryError> {
+        match self {
+            Self::Legacy(owner) => owner.poll_source_body(now, out),
+            Self::Compact(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
+    pub fn poll_feedback_body(
+        &mut self,
+        now: Duration,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, RecoveryError> {
+        match self {
+            Self::Legacy(owner) => owner.poll_feedback_body(now, out),
+            Self::Compact(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
+    pub fn body_packet_bytes(
+        &self,
+        now: Duration,
+        feedback: bool,
+    ) -> Result<Option<usize>, RecoveryError> {
+        match self {
+            Self::Legacy(owner) => owner.body_packet_bytes(now, feedback),
+            Self::Compact(owner) if feedback => owner.feedback_body_bytes(now),
+            Self::Compact(owner) => owner.source_body_bytes(now),
+        }
+    }
+    pub fn receive_body(
+        &mut self,
+        bytes: &[u8],
+        feedback: bool,
+        now: Duration,
+    ) -> Result<(), RecoveryError> {
+        match self {
+            Self::Legacy(owner) => {
+                let view = l2tunnel_recovery::inspect_body(
+                    feedback,
+                    bytes,
+                    owner.receive_max_packet_bytes() - DATA_HEADER_BYTES,
+                )?;
+                owner.receive_view(view, now)
+            }
+            Self::Compact(_) => Err(RecoveryError::InvalidConfig),
+        }
+    }
+}

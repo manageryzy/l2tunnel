@@ -733,14 +733,6 @@ impl CommonTransactionContract {
         {
             return Err(invalid("common value outside exact authenticated catalog"));
         }
-        if self.compact_wire.is_some()
-            && !matches!(value.descriptor().profile(), common::Profile::Swift { .. })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "compact wire currently requires an actual Swift record owner",
-            ));
-        }
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);
             let view = value.descriptor().direction(sender);
@@ -773,30 +765,41 @@ impl CommonTransactionContract {
             } else {
                 mg::Role::Client
             };
-            let maximum = maximum_body(view, value.descriptor().direction(peer))?;
-            let (physical_body, wire) = if let Some(policy) =
-                selected_fragment_policy(&value, self.resources.rolling_fragments)
-            {
-                fragments::physical_requirement(maximum, sender, policy)?
+            let opposite = value.descriptor().direction(peer);
+            let maximum = maximum_body(view, opposite)?;
+            let overhead = if sender == mg::Role::Client {
+                self.geometry.forward_overhead_bytes
             } else {
-                let overhead = if sender == mg::Role::Client {
-                    self.geometry.forward_overhead_bytes
+                self.geometry.reverse_overhead_bytes
+            };
+            let selected_fragments =
+                selected_fragment_policy(&value, self.resources.rolling_fragments);
+            let (physical_body, maximum_packet, wire) = if self.compact_wire.is_some() {
+                let (data, feedback) = maximum_compact_body(view, opposite)?;
+                let feedback_overhead = self.feedback_overhead_bytes()?;
+                if let Some(policy) = selected_fragments {
+                    compact_fragment_requirement(data, feedback, sender, policy, feedback_overhead)?
                 } else {
-                    self.geometry.reverse_overhead_bytes
-                };
+                    let maximum_packet = data.checked_add(overhead).ok_or_else(exhausted)?.max(
+                        feedback
+                            .checked_add(feedback_overhead)
+                            .ok_or_else(exhausted)?,
+                    );
+                    (data.max(feedback), maximum_packet, maximum_packet)
+                }
+            } else if let Some(policy) = selected_fragments {
+                let (physical, group) = fragments::physical_requirement(maximum, sender, policy)?;
                 (
-                    maximum,
-                    maximum
-                        .checked_add(if self.compact_wire.is_some() {
-                            self.feedback_overhead_bytes()?
-                        } else {
-                            overhead
-                        })
-                        .ok_or_else(exhausted)?,
+                    physical,
+                    physical.checked_add(overhead).ok_or_else(exhausted)?,
+                    group,
                 )
+            } else {
+                let wire = maximum.checked_add(overhead).ok_or_else(exhausted)?;
+                (maximum, wire, wire)
             };
             if physical_body > self.resources.security.max_body_bytes
-                || (self.compact_wire.is_some() && wire > value.descriptor().path_mtu())
+                || (self.compact_wire.is_some() && maximum_packet > value.descriptor().path_mtu())
                 || value.descriptor().path_mtu() < self.control_maximum()?
                 || wire
                     .checked_add(self.reserve()?)
@@ -805,20 +808,35 @@ impl CommonTransactionContract {
                 return Err(invalid("common data/control/burst geometry"));
             }
         }
-        engine::storage::Plan::for_engine_with_fragmentation(
-            value,
-            engine::Context {
-                session: 1,
-                epoch: self.resources.data_epoch.0,
-                role: mg_role(self.role),
-            },
-            self.geometry,
-            self.native_limits()?,
-            self.resources.ack_coalescing,
-            self.resources.rolling_ingress,
-            selected_fragment_policy(&value, self.resources.rolling_fragments),
-        )
-        .map_err(invalid)?;
+        let context = engine::Context {
+            session: 1,
+            epoch: self.resources.data_epoch.0,
+            role: mg_role(self.role),
+        };
+        if self.compact_wire.is_some() {
+            engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+                value,
+                context,
+                self.geometry,
+                self.native_limits()?,
+                self.resources.ack_coalescing,
+                self.resources.rolling_ingress,
+                selected_fragment_policy(&value, self.resources.rolling_fragments),
+                self.feedback_overhead_bytes()?,
+            )
+            .map_err(invalid)?;
+        } else {
+            engine::storage::Plan::for_engine_with_fragmentation(
+                value,
+                context,
+                self.geometry,
+                self.native_limits()?,
+                self.resources.ack_coalescing,
+                self.resources.rolling_ingress,
+                selected_fragment_policy(&value, self.resources.rolling_fragments),
+            )
+            .map_err(invalid)?;
+        }
         Ok(value)
     }
     pub(super) fn reserve(&self) -> io::Result<usize> {
@@ -952,4 +970,160 @@ pub(super) fn maximum_body(
             .map_err(invalid)?
             .max(l2tunnel_fec::rolling::scheduler::FEEDBACK_BYTES)),
     }
+}
+
+/// Distinct selected output bounds keep strong feedback out of the data budget.
+fn maximum_compact_body(
+    view: common::DirectionView<'_>,
+    opposite: common::DirectionView<'_>,
+) -> io::Result<(usize, usize)> {
+    match view.profile() {
+        common::DirectionProfile::Swift(config) => {
+            Ok((config.codec.datagram_bytes, config.codec.datagram_bytes))
+        }
+        common::DirectionProfile::Aligned(send) => {
+            let common::DirectionProfile::Aligned(receive) = opposite.profile() else {
+                return Err(invalid("aligned directional family mismatch"));
+            };
+            Ok((
+                send.recovery
+                    .compact_wire_maximum_data_bytes()
+                    .map_err(invalid)?,
+                receive
+                    .recovery
+                    .compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+        common::DirectionProfile::Packed(send) => {
+            let common::DirectionProfile::Packed(receive) = opposite.profile() else {
+                return Err(invalid("packed directional family mismatch"));
+            };
+            Ok((
+                send.base
+                    .recovery
+                    .compact_wire_maximum_data_bytes()
+                    .map_err(invalid)?,
+                receive
+                    .base
+                    .recovery
+                    .compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+        common::DirectionProfile::AlignedCompact(send) => {
+            let common::DirectionProfile::AlignedCompact(receive) = opposite.profile() else {
+                return Err(invalid("compact directional family mismatch"));
+            };
+            Ok((
+                send.recovery
+                    .compact_wire_maximum_data_bytes()
+                    .map_err(invalid)?,
+                receive
+                    .recovery
+                    .compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+        common::DirectionProfile::PackedCompact(send) => {
+            let common::DirectionProfile::PackedCompact(receive) = opposite.profile() else {
+                return Err(invalid("packed compact directional family mismatch"));
+            };
+            Ok((
+                send.base
+                    .recovery
+                    .compact_wire_maximum_data_bytes()
+                    .map_err(invalid)?,
+                receive
+                    .base
+                    .recovery
+                    .compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+        common::DirectionProfile::PerConnectionCompact(send) => {
+            let common::DirectionProfile::PerConnectionCompact(receive) = opposite.profile() else {
+                return Err(invalid("connection directional family mismatch"));
+            };
+            let data = send
+                .compact
+                .recovery
+                .compact_wire_maximum_data_bytes()
+                .map_err(invalid)?
+                .checked_add(l2tunnel::connection_records::route::COMPACT_HEADER_BYTES)
+                .ok_or_else(exhausted)?;
+            let feedback = receive
+                .compact
+                .recovery
+                .compact_wire_maximum_feedback_bytes()
+                .map_err(invalid)?
+                .checked_add(l2tunnel::connection_records::route::COMPACT_HEADER_BYTES)
+                .ok_or_else(exhausted)?;
+            let raw = send
+                .unreliable
+                .map_or(0, |policy| policy.max_bytes)
+                .checked_add(l2tunnel::connection_records::route::COMPACT_UNRELIABLE_BYTES)
+                .ok_or_else(exhausted)?;
+            Ok((data.max(raw), feedback))
+        }
+        common::DirectionProfile::Rolling { config, .. } => {
+            let common::DirectionProfile::Rolling { config: peer, .. } = opposite.profile() else {
+                return Err(invalid("rolling directional family mismatch"));
+            };
+            Ok((
+                config.compact_wire_maximum_data_bytes().map_err(invalid)?,
+                peer.compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+        common::DirectionProfile::Research { config, .. } => {
+            let common::DirectionProfile::Research { config: peer, .. } = opposite.profile() else {
+                return Err(invalid("research directional family mismatch"));
+            };
+            Ok((
+                config.compact_wire_maximum_data_bytes().map_err(invalid)?,
+                peer.compact_wire_maximum_feedback_bytes()
+                    .map_err(invalid)?,
+            ))
+        }
+    }
+}
+
+/// Maximum individual packet and complete admitted group are different bounds.
+fn compact_fragment_requirement(
+    data: usize,
+    feedback: usize,
+    sender: mg::Role,
+    policy: engine::FragmentPolicy,
+    feedback_overhead: usize,
+) -> io::Result<(usize, usize, usize)> {
+    let direction = if sender == mg::Role::Client {
+        policy.forward
+    } else {
+        policy.reverse
+    };
+    let geometry =
+        |bytes, framing: l2tunnel_codec::FragmentConfig| -> io::Result<(usize, usize, usize)> {
+            let group = framing.geometry(bytes).map_err(invalid)?;
+            let physical = group
+                .fragment_range(0)
+                .ok_or_else(|| invalid("empty fragment group"))?
+                .len();
+            Ok((
+                physical,
+                physical
+                    .checked_add(framing.outer_overhead_bytes)
+                    .ok_or_else(exhausted)?,
+                group.wire_bytes(),
+            ))
+        };
+    let data = geometry(data, direction.framing)?;
+    let mut framing = direction.framing;
+    framing.outer_overhead_bytes = feedback_overhead;
+    let feedback = geometry(feedback, framing)?;
+    Ok((
+        data.0.max(feedback.0),
+        data.1.max(feedback.1),
+        data.2.max(feedback.2),
+    ))
 }

@@ -4,6 +4,10 @@ use std::fmt;
 
 /// Exact route bytes charged in each directional Compact external overhead.
 pub const HEADER_BYTES: usize = 24;
+/// Selected source/feedback route: class, bounded owner and full incarnation.
+pub const COMPACT_HEADER_BYTES: usize = 10;
+/// Selected source-free native route also retains its full independent serial.
+pub const COMPACT_UNRELIABLE_BYTES: usize = 18;
 /// Complete UDP payload bound, before any additional selected security/cover bytes.
 pub const MAX_PACKET_BYTES: usize = 65_507;
 
@@ -51,6 +55,39 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Header {
+    /// Actual selected header size, without maximum-arm padding.
+    pub const fn compact_bytes(self) -> usize {
+        match self.class {
+            Class::UnreliableNative => COMPACT_UNRELIABLE_BYTES,
+            Class::Source | Class::Feedback => COMPACT_HEADER_BYTES,
+        }
+    }
+
+    /// Encode only the selected route arm. Full incarnation identity is retained.
+    pub fn encode_compact(self, output: &mut [u8]) -> Result<(), Error> {
+        if output.len() != self.compact_bytes() {
+            return Err(Error::Length);
+        }
+        if self.owner.index() >= 256 {
+            return Err(Error::Owner);
+        }
+        if self.incarnation == 0
+            || (self.class == Class::UnreliableNative) != (self.unreliable_serial > 0)
+        {
+            return Err(Error::Identity);
+        }
+        output[0] = match self.class {
+            Class::Source => 1,
+            Class::Feedback => 2,
+            Class::UnreliableNative => 3,
+        };
+        output[1] = u8::try_from(self.owner.index()).map_err(|_| Error::Owner)?;
+        output[2..10].copy_from_slice(&self.incarnation.to_be_bytes());
+        if self.class == Class::UnreliableNative {
+            output[10..18].copy_from_slice(&self.unreliable_serial.to_be_bytes());
+        }
+        Ok(())
+    }
     fn encoded(self) -> Result<[u8; HEADER_BYTES], Error> {
         if self.owner.index() >= 256 {
             return Err(Error::Owner);
@@ -83,6 +120,42 @@ impl Header {
         output.copy_from_slice(&bytes);
         Ok(())
     }
+}
+
+/// Decode the explicitly selected compact grammar, never trial-parse legacy.
+pub fn decode_compact(input: &[u8]) -> Result<(Header, &[u8]), Error> {
+    if input.len() <= COMPACT_HEADER_BYTES || input.len() > MAX_PACKET_BYTES {
+        return Err(Error::Length);
+    }
+    let class = match input[0] {
+        1 => Class::Source,
+        2 => Class::Feedback,
+        3 => Class::UnreliableNative,
+        _ => return Err(Error::Prefix),
+    };
+    let mut incarnation = [0; 8];
+    incarnation.copy_from_slice(&input[2..10]);
+    let mut header = Header {
+        owner: OwnerId(u16::from(input[1])),
+        incarnation: u64::from_be_bytes(incarnation),
+        class,
+        unreliable_serial: 0,
+    };
+    let count = header.compact_bytes();
+    if input.len() <= count {
+        return Err(Error::Length);
+    }
+    if class == Class::UnreliableNative {
+        let mut serial = [0; 8];
+        serial.copy_from_slice(&input[10..18]);
+        header.unreliable_serial = u64::from_be_bytes(serial);
+    }
+    if header.incarnation == 0
+        || (class == Class::UnreliableNative && header.unreliable_serial == 0)
+    {
+        return Err(Error::Identity);
+    }
+    Ok((header, &input[count..]))
 }
 
 /// Parse one complete routed packet; authentication/replay checks remain external.

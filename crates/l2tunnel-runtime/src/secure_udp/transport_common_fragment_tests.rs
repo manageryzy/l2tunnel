@@ -407,3 +407,134 @@ fn selected_fragment_groups_use_fresh_records_and_original_udp_before_native_and
             Ok(())
         })
 }
+
+fn compact_fragmented(
+    protection: security::compact::Protection,
+) -> Result<([CommonTransactionContract; 2], [C; 2])> {
+    let kind = cover::Appearance::QuicLike;
+    let (original, values) = fragmented(kind)?;
+    let old = values[3];
+    let descriptor = old.descriptor();
+    let c::Profile::RollingCopies {
+        mut config,
+        stream,
+        copies,
+    } = *descriptor.profile()
+    else {
+        return Err("actual fragmented RollingCopies profile".into());
+    };
+    let overhead = 28 + record::compact::DATA_OVERHEAD;
+    config.geometry = engine::Geometry {
+        forward_overhead_bytes: overhead,
+        reverse_overhead_bytes: overhead,
+    };
+    let coded = c::Descriptor::new(
+        descriptor.path_mtu(),
+        descriptor.duplex(),
+        *descriptor.direction(mg::Role::Client).common(),
+        *descriptor.direction(mg::Role::Server).common(),
+        c::Profile::RollingCopies {
+            config,
+            stream,
+            copies,
+        },
+    )?;
+    let catalog = Catalog::new(coded, &[coded, *values[0].descriptor()])?;
+    let mut resources = original[0].resources();
+    resources.control.wire_overhead = 28 + record::compact::AUTHENTICATED_OVERHEAD;
+    resources.security.max_body_bytes = 1500 - overhead;
+    for settings in &mut resources.streams.as_mut().ok_or("actual streams")?.streams {
+        settings.delivery.wire_overhead = resources.control.wire_overhead + streams::HEADER_BYTES;
+    }
+    let fragments = resources
+        .rolling_fragments
+        .as_mut()
+        .ok_or("actual fragment policy")?;
+    for direction in [&mut fragments.forward, &mut fragments.reverse] {
+        direction.framing.outer_overhead_bytes = overhead;
+        let chunk = u16::try_from(
+            direction
+                .framing
+                .geometry(direction.framing.max_message_bytes)?
+                .chunk_bytes(),
+        )?;
+        for limits in [
+            &mut direction.reassembly.systematic,
+            &mut direction.reassembly.repair,
+            &mut direction.reassembly.feedback,
+        ] {
+            limits.max_fragment_payload_bytes = chunk;
+        }
+    }
+    let selection = record::compact::Selection {
+        protection,
+        limits: security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    };
+    let make = |role| -> Result<CommonTransactionContract> {
+        Ok(CommonTransactionContract::new_compact_wire(
+            security::ConfigDigest([0xcf; 32]),
+            role,
+            [resources; 2],
+            appearance(kind, role == security::Role::Initiator)?,
+            false,
+            old.envelope(),
+            catalog.clone(),
+            original[0].settings(),
+            selection,
+        )?)
+    };
+    Ok((
+        [
+            make(security::Role::Initiator)?,
+            make(security::Role::Responder)?,
+        ],
+        [C::new(old.envelope(), coded)?, values[0]],
+    ))
+}
+
+#[test]
+fn selected_compact_wire_rolling_fragments_deliver_and_switch_with_strong_feedback() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            for protection in [
+                security::compact::Protection::Aes128Ccm4,
+                security::compact::Protection::ChaCha20Crc32c,
+            ] {
+                let (contracts, values) = compact_fragmented(protection)?;
+                let expected = contracts[0].expected_configuration();
+                let mut fixture = Fixture::from_contracts_setup(
+                    cover::Appearance::QuicLike,
+                    contracts,
+                    true,
+                    Some(expected),
+                )
+                .await?;
+                fixture.exchange_all_channels(51).await?;
+                for endpoint in &fixture.endpoints {
+                    let driver = &endpoint.driver;
+                    let actual = driver
+                        .common_state()?
+                        .engine(driver.common_state()?.epoch())?
+                        .fragment_statistics()
+                        .ok_or("actual fragment statistics")?;
+                    assert!(actual.groups_written > 0);
+                    assert!(
+                        driver
+                            .snapshot_common(fixture.now, true)?
+                            .compact_feedback_number
+                            .is_some()
+                    );
+                }
+                fixture.switch(values[1]).await?;
+                fixture.exchange_all_channels(61).await?;
+                fixture.switch(values[0]).await?;
+                fixture.exchange_all_channels(71).await?;
+            }
+            Ok(())
+        })
+}

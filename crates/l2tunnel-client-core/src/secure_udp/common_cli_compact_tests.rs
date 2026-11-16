@@ -119,3 +119,113 @@ fn compact_plan_is_strict_optional_and_legacy_inspection_stays_absent() -> io::R
     }
     Ok(())
 }
+
+#[test]
+fn compact_wire_proxy_cli_binds_complete_policy_and_retirement_before_authentication()
+-> io::Result<()> {
+    use l2tunnel::{pipeline, record_configuration as common};
+    use l2tunnel_core::{Duplex, traffic::TcpControl};
+    let old = descriptor(1_250_001)?;
+    let direction = old.direction(l2tunnel_management::Role::Client).common();
+    let mut pipeline = direction.pipeline();
+    pipeline.flows.channels = 1;
+    pipeline.flows.mapping = pipeline::Mapping::Crc32;
+    let direction = common::CommonDirection::new(
+        l2tunnel_core::traffic::TrafficPolicy {
+            tcp: TcpControl::SplitTcpProxy,
+            ..direction.traffic()
+        },
+        pipeline,
+        direction.bytes_per_second(),
+        direction.burst_bytes(),
+        direction.native_window(),
+    )
+    .map_err(io::Error::other)?;
+    let mut forward = native_fixtures::aligned(
+        l2tunnel_device::PacketLayer::Ip,
+        1500,
+        28 + l2tunnel::secure_record::compact::DATA_OVERHEAD,
+        false,
+    );
+    forward.receiver.channels = 1;
+    forward.receiver.body.independent_short_frame_bytes = 0;
+    forward.recovery.repair_symbols = 0;
+    let reverse = forward;
+    let descriptor = common::Descriptor::new(
+        old.path_mtu(),
+        Duplex::Full,
+        direction,
+        direction,
+        common::Profile::Aligned { forward, reverse },
+    )
+    .map_err(io::Error::other)?;
+    let mut document = document(1)?;
+    document["catalog"] = json!([hex(descriptor)?]);
+    let peers = establish::Peers {
+        initiator: hs::LocalSecret::new(Zeroizing::new([21; 32])).public_key(),
+        responder: hs::LocalSecret::new(Zeroizing::new([22; 32])).public_key(),
+    };
+    let connection = ConnectionConfig {
+        layer: l2tunnel_device::PacketLayer::Ip,
+        duplex: Duplex::Full,
+        max_packet: 1280,
+        compression: crate::Compression::None,
+        handshake_timeout: Duration::from_secs(3),
+    };
+    let frontend = crate::cli::secure_udp_frontend::Common {
+        appearance: l2tunnel_cover::Appearance::QuicLike,
+        role: Role::Initiator,
+        local: "127.0.0.1:41921".parse().map_err(io::Error::other)?,
+        peer: "127.0.0.1:41922".parse().map_err(io::Error::other)?,
+        maximum_mtu: 2000,
+        profile: hs::Profile::Ik,
+    };
+    let settings = frontend.raw(
+        1280,
+        connection.handshake_timeout,
+        peers,
+        l2tunnel_identity::MemberPublicKey([7; 32]),
+    )?;
+    let (overhead, maximum) = frontend.geometry()?;
+    let mut proxy_settings =
+        crate::proxy::Settings::new(crate::proxy::RoutePolicy::new(Vec::new())?);
+    proxy_settings.channels = 1;
+    let mut proxy = crate::proxy::runtime_config(connection, &proxy_settings)?;
+    proxy.relay.max_record_bytes = 512;
+    let mut digests = Vec::new();
+    for protection in ["aes-ccm-4", "chacha20-crc32c"] {
+        document["compact_wire"] = json!({"version":3,"data_protection":protection,
+            "max_forward_packets":8192,"max_failed_checks":64});
+        let plan = decode(&document)?;
+        assert!(
+            plan.build(connection, settings, peers, maximum, overhead)
+                .is_err(),
+            "proxy ownership must not become transparent native ownership"
+        );
+        for retained in [false, true] {
+            let profile = plan.build_proxy(
+                connection,
+                settings,
+                peers,
+                maximum,
+                overhead,
+                proxy.clone(),
+                retained,
+            )?;
+            assert_eq!(profile.proxy_retirement(), retained);
+            assert!(profile.compact_wire().is_some());
+            let binding = l2tunnel_runtime::proxy::session_config(&proxy)?.digest;
+            for role in [Role::Initiator, Role::Responder] {
+                let contract = profile.runtime_contract(role)?;
+                assert_eq!(contract.proxy_binding(), Some(binding));
+                assert_eq!(contract.proxy_retirement(), retained);
+                assert_eq!(contract.expected_configuration(), profile.configuration()?);
+            }
+            digests.push(profile.configuration()?);
+        }
+    }
+    for (i, digest) in digests.iter().enumerate() {
+        assert!(!digests[..i].contains(digest));
+    }
+    Ok(())
+}

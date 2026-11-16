@@ -1,5 +1,10 @@
 # Reserved mixed-profile record Bank
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: **implemented; seven focused pure Bank cases passed across the initial
 source-bound batch and its narrow repair; named pure checkpoint checks passed**. Selected Common runtime regressions
 also passed; complete State/service/native/resource qualification remains open.

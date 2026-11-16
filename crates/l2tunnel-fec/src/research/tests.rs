@@ -86,6 +86,13 @@ fn service(receiver: &mut Receiver, now: Tick, delivered: &mut Vec<Vec<u8>>) -> 
 
 #[test]
 fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
+    research_loss_fixture(false);
+}
+#[test]
+fn selected_compact_research_actual_loss_reorder_reset_fallback_and_ack_history() {
+    research_loss_fixture(true);
+}
+fn research_loss_fixture(selected: bool) {
     for profile in [
         Profile::Recursive {
             taps: 3,
@@ -105,6 +112,32 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
         },
     ] {
         let config = config(profile);
+        let receive_record = |receiver: &mut Receiver, bytes: &[u8], now: Tick| {
+            if selected {
+                receiver.receive_view_at(
+                    wire::compact::inspect(config, scope(), bytes)?,
+                    now,
+                    now,
+                    Tick(u64::MAX),
+                )
+            } else {
+                receiver.receive_wire(bytes, now)
+            }
+        };
+        let receive_feedback = |sender: &mut Sender, feedback: Feedback, now: Tick| {
+            if selected {
+                let mut bytes = [0; wire::compact::MAXIMUM_FEEDBACK_BYTES];
+                let length = wire::compact::encode_feedback(feedback, &mut bytes)?;
+                let wire::View::Feedback(parsed) =
+                    wire::compact::inspect(config, scope(), &bytes[..length])?
+                else {
+                    return Err(Error::Format);
+                };
+                sender.receive_feedback(parsed, now)
+            } else {
+                sender.receive_feedback(feedback, now)
+            }
+        };
         let sender_plan = storage::Plan::for_sender(config).unwrap();
         let receiver_plan = storage::Plan::for_receiver(config).unwrap();
         let mut sender = Sender::new_reserved(
@@ -138,7 +171,7 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
             let now = Tick(100 + u64::from(id) * 10);
             while feedback.front().is_some_and(|(due, _)| *due <= now) {
                 let (_, value) = feedback.pop_front().unwrap();
-                sender.receive_feedback(value, now).unwrap();
+                receive_feedback(&mut sender, value, now).unwrap();
             }
             sender.admit_source(&payload(id), now, now).unwrap();
             loop {
@@ -151,9 +184,21 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
                 }
                 let output = sender.pending_output().expect("finite encoder work");
                 let identity = output.id();
-                let mut bytes = vec![0; output.encoded_len()];
-                assert_eq!(output.charge(53).unwrap(), bytes.len() + 53);
-                assert_eq!(sender.encode_pending(&mut bytes).unwrap(), bytes.len());
+                let length = if selected {
+                    wire::compact::data_len(output).unwrap()
+                } else {
+                    output.encoded_len()
+                };
+                let mut bytes = vec![0; length];
+                if selected {
+                    assert_eq!(
+                        wire::compact::encode_data(output, &mut bytes).unwrap(),
+                        length
+                    );
+                } else {
+                    assert_eq!(output.charge(53).unwrap(), bytes.len() + 53);
+                    assert_eq!(sender.encode_pending(&mut bytes).unwrap(), bytes.len());
+                }
                 let lost = match identity {
                     OutputId::Source(s) => {
                         source_bytes += bytes.len();
@@ -170,13 +215,13 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
                     if identity == OutputId::Source(SourceId(10)) {
                         delayed = Some(bytes);
                     } else {
-                        receiver.receive_wire(&bytes, now).unwrap();
+                        receive_record(&mut receiver, &bytes, now).unwrap();
                         for f in service(&mut receiver, now, &mut delivered) {
                             feedback.push_back((Tick(now.0 + 70), f));
                         }
                         if id.is_multiple_of(97) {
                             assert!(matches!(
-                                receiver.receive_wire(&bytes, now).unwrap(),
+                                receive_record(&mut receiver, &bytes, now).unwrap(),
                                 Begin::Duplicate | Begin::Stale
                             ));
                             for f in service(&mut receiver, now, &mut delivered) {
@@ -184,7 +229,7 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
                             }
                         }
                         if let Some(old) = delayed.take() {
-                            receiver.receive_wire(&old, now).unwrap();
+                            receive_record(&mut receiver, &old, now).unwrap();
                             for f in service(&mut receiver, now, &mut delivered) {
                                 feedback.push_back((Tick(now.0 + 70), f));
                             }
@@ -204,21 +249,31 @@ fn research_real_payload_loss_reorder_reset_fallback_and_ack_history() {
             (0..1600).map(payload).collect::<Vec<_>>(),
             "profile {profile:?}"
         );
-        assert_eq!(repair_bytes, repairs as usize * (wire::HEADER_BYTES + 25));
-        assert_eq!(
-            source_bytes,
-            (0..1600)
-                .map(|id| wire::HEADER_BYTES + payload(id).len())
-                .sum::<usize>()
-        );
+        if selected {
+            assert!(repair_bytes < repairs as usize * (wire::HEADER_BYTES + 25));
+            assert_eq!(
+                source_bytes,
+                (0..1600)
+                    .map(|id| 1 + rolling::wire::compact::len(u64::from(id)) + payload(id).len())
+                    .sum::<usize>()
+            );
+        } else {
+            assert_eq!(repair_bytes, repairs as usize * (wire::HEADER_BYTES + 25));
+            assert_eq!(
+                source_bytes,
+                (0..1600)
+                    .map(|id| wire::HEADER_BYTES + payload(id).len())
+                    .sum::<usize>()
+            );
+        }
         let now = Tick(20000);
-        receiver.receive_wire(&last_packet, now).unwrap();
+        receive_record(&mut receiver, &last_packet, now).unwrap();
         let final_feedback = service(&mut receiver, now, &mut delivered);
         while let Some((_, value)) = feedback.pop_front() {
-            sender.receive_feedback(value, now).unwrap();
+            receive_feedback(&mut sender, value, now).unwrap();
         }
         for f in final_feedback {
-            sender.receive_feedback(f, now).unwrap();
+            receive_feedback(&mut sender, f, now).unwrap();
         }
         assert_eq!(sender.status().encoder.confirmed_prefix, 1600);
         assert_eq!(sender.storage_usage().unwrap(), sender_usage);

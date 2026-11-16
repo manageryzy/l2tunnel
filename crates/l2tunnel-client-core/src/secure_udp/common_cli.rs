@@ -231,10 +231,10 @@ impl Plan {
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
-        if self.compact_wire.is_some() && (raw.is_some() || proxy.is_some() || measured.is_some()) {
+        if self.compact_wire.is_some() && raw.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "compact v3 currently requires the native Common original UDP backend",
+                "compact v3 currently requires the original UDP backend",
             ));
         }
         // Config shares a legacy-shaped resource container. These explicit inert
@@ -308,18 +308,6 @@ impl Plan {
             config.ack_coalescing = ack;
             config.rolling_ingress = rolling;
         }
-        if let Some(selection) = self.compact_wire {
-            return secure_udp::common_transaction_profile::Profile::new_compact(
-                connection,
-                settings,
-                peers,
-                configs[0],
-                configs[1],
-                self.catalog.clone(),
-                self.parameters,
-                selection.build()?,
-            );
-        }
         if let Some(policy) = raw {
             return secure_udp::common_transaction_profile::Profile::new_raw(
                 connection,
@@ -332,8 +320,8 @@ impl Plan {
                 policy,
             );
         }
-        if let Some(proxy) = measured {
-            return secure_udp::common_transaction_profile::Profile::new_proxy_measured_retained(
+        if let Some(measured) = measured {
+            return secure_udp::common_transaction_profile::Profile::new_proxy_selected(
                 connection,
                 settings,
                 peers,
@@ -341,16 +329,16 @@ impl Plan {
                 configs[1],
                 self.catalog.clone(),
                 self.parameters,
-                proxy,
+                measured.fixed.clone(),
+                true,
+                Some(measured),
+                self.compact_wire
+                    .map(|selection| selection.build())
+                    .transpose()?,
             );
         }
         if let Some((proxy, retained)) = proxy {
-            let construct = if retained {
-                secure_udp::common_transaction_profile::Profile::new_proxy_retained
-            } else {
-                secure_udp::common_transaction_profile::Profile::new_proxy
-            };
-            return construct(
+            return secure_udp::common_transaction_profile::Profile::new_proxy_selected(
                 connection,
                 settings,
                 peers,
@@ -359,6 +347,23 @@ impl Plan {
                 self.catalog.clone(),
                 self.parameters,
                 proxy,
+                retained,
+                None,
+                self.compact_wire
+                    .map(|selection| selection.build())
+                    .transpose()?,
+            );
+        }
+        if let Some(selection) = self.compact_wire {
+            return secure_udp::common_transaction_profile::Profile::new_compact(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                selection.build()?,
             );
         }
         secure_udp::common_transaction_profile::Profile::new(

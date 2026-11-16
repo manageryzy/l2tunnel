@@ -48,7 +48,16 @@ fn receiver(
     })
 }
 fn packets(config: packed::Config) -> Result<[Vec<u8>; 2], Box<dyn std::error::Error>> {
+    packets_selected(config, false)
+}
+fn packets_selected(
+    config: packed::Config,
+    compact: bool,
+) -> Result<[Vec<u8>; 2], Box<dyn std::error::Error>> {
     let mut sender = packed::Endpoint::new(config, tests::context(EndpointRole::Initiator))?;
+    if compact {
+        sender.enable_compact_wire(40)?;
+    }
     let first = sender.enqueue_identified(ChannelId(0), &[11; 70], ms(0))?;
     sender.flush(ms(0))?;
     let second = sender.enqueue_identified(ChannelId(0), b"tiny", ms(0))?;
@@ -180,5 +189,46 @@ fn packed_early_pending_keeps_original_record_expiry_under_native_pressure() -> 
     );
     assert!(receive.pending().is_none());
     assert!(!receive.drained());
+    Ok(())
+}
+
+#[test]
+fn selected_compact_packed_preview_keeps_gap_deduplication_and_original_expiry() -> TestResult {
+    let config = config(32);
+    let [first, second] = packets_selected(config, true)?;
+    for expire in [false, true] {
+        let mut receive = receiver(config, true)?;
+        receive.enable_compact_wire(40)?;
+        receive.receive_authenticated(&second, ms(6))?;
+        assert_eq!(receive.prepare(ChannelId(0), ms(6), 1)?, Prepared::Ready);
+        assert_eq!(receive.pending().ok_or("early native")?.bytes, b"tiny");
+        assert!(receive.pending().ok_or("early metadata")?.early);
+        assert_eq!(receive.pending_deadline(), Some(ms(5006)));
+        if expire {
+            receive.receive_authenticated(&first, ms(7))?;
+            assert_eq!(receive.prepare(ChannelId(0), ms(5005), 1)?, Prepared::Ready);
+            assert_eq!(receive.pending_deadline(), Some(ms(5006)));
+            assert_eq!(
+                receive.commit_delivery(ms(5006)),
+                Err(Error::Receiver(receiver::Error::Expired))
+            );
+        } else {
+            receive.commit_delivery(ms(7))?;
+            receive.receive_authenticated(&first, ms(8))?;
+            assert_eq!(receive.prepare(ChannelId(0), ms(8), 1)?, Prepared::Ready);
+            assert_eq!(receive.pending().ok_or("older native")?.bytes, &[11; 70]);
+            receive.commit_delivery(ms(8))?;
+            receive.receive_authenticated(&second, ms(9))?;
+            // One unit of work retires the earlier-delivered short tombstone.
+            assert_eq!(receive.prepare(ChannelId(0), ms(9), 1)?, Prepared::Progress);
+            assert!(receive.pending().is_none());
+            assert_eq!(receive.prepare(ChannelId(0), ms(9), 1)?, Prepared::Idle);
+            assert_eq!(
+                receive.status().receiver.source_floor,
+                Some(receiver::SourceId(2))
+            );
+            assert_eq!(receive.status().receiver.early_tombstones, 0);
+        }
+    }
     Ok(())
 }

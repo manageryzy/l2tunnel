@@ -764,3 +764,56 @@ fn compact_history_pressure_keeps_feedback_live_then_releases_exact_next_source_
     ));
     Ok(())
 }
+
+#[test]
+fn selected_compact_wire_existing_poll_receive_and_custody_cross_direction() -> Result {
+    let (mut a, mut b) = pair()?;
+    a.enable_compact_wire_with_overheads(37, 49)?;
+    b.enable_compact_wire_with_overheads(37, 49)?;
+    let mut output = vec![0; a.max_packet_bytes().max(b.max_packet_bytes())];
+    a.submit(b"actual", ms(0))?;
+    let mut exact = OutboundBudget {
+        packets: 1,
+        wire_bytes: 46,
+    };
+    let bytes = a
+        .poll_data_independent(ms(0), &mut output, &mut exact)?
+        .ok_or("source")?;
+    assert_eq!(&output[..bytes], b"\x01\0\x01actual");
+    assert_eq!(exact, OutboundBudget::default());
+    let source = a.pending_data_output().ok_or("source custody")?;
+    let view = a.inspect_output_record(&output[..bytes])?;
+    assert_eq!(
+        view.source,
+        Some((l2tunnel_recovery::SourceId(0), b"actual".as_slice()))
+    );
+    b.receive_at(&output[..bytes], ms(10), ms(10))?;
+    b.submit(b"back", ms(10))?;
+    let reverse = b
+        .poll_data_independent(ms(10), &mut output, &mut budget())?
+        .ok_or("reverse")?;
+    let held = b.pending_data_output().ok_or("held data")?;
+    a.receive_at(&output[..reverse], ms(11), ms(11))?;
+    let before = budget();
+    let mut allowance = before;
+    let ack = b
+        .poll_feedback_independent(ms(15), &mut output, &mut allowance)?
+        .ok_or("feedback beside held data")?;
+    assert_eq!(output[0], 2);
+    assert_eq!(b.inspect_output(&output[..ack])?, RecordKind::Feedback);
+    let pending = b.pending_feedback_output().ok_or("feedback custody")?;
+    assert_eq!(pending.wire_bytes, ack + 49);
+    assert_eq!(before.wire_bytes - allowance.wire_bytes, pending.wire_bytes);
+    assert_eq!(b.pending_data_output(), Some(held));
+    assert_eq!(
+        a.receive_at(&output[..ack], ms(16), ms(16)),
+        Err(Error::Arq(RecoveryError::FeedbackAwaitingPhysical))
+    );
+    a.confirm_output_at(ms(18), ms(1), source)?;
+    a.receive_at(&output[..ack], ms(16), ms(18))?;
+    assert_eq!(a.arq_statistics().feedback_received, 1);
+    b.confirm_output_at(ms(18), ms(16), pending)?;
+    b.confirm_output_at(ms(18), ms(11), held)?;
+    assert_eq!(a.arq_statistics().wire_bytes_emitted, 8);
+    Ok(())
+}

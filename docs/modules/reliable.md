@@ -1,5 +1,10 @@
 # Reliable selective repeat with optional systematic block FEC
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: implemented and locally unit-tested. This crate composes the existing
 [selective-repeat engine](recovery.md) and [full-byte block FEC](fec.md). It is a
 bounded protocol primitive, not native integration or completion of the Python

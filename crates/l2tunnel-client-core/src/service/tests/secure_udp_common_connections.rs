@@ -15,6 +15,13 @@ fn selected(hosts: &[Arc<Host>; 2]) -> Result<Selected> {
 }
 #[inline(never)]
 fn selected_reuse(hosts: &[Arc<Host>; 2], reuse: bool) -> Result<Selected> {
+    selected_wire(hosts, reuse, None)
+}
+fn selected_wire(
+    hosts: &[Arc<Host>; 2],
+    reuse: bool,
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result<Selected> {
     let CommonPlans {
         plans,
         addresses,
@@ -106,7 +113,7 @@ fn selected_reuse(hosts: &[Arc<Host>; 2], reuse: bool) -> Result<Selected> {
     } else {
         common_transaction_profile::Profile::new
     };
-    let profile = Arc::new(construct(
+    let profile = construct(
         original.connection(),
         original.settings(),
         original.peers(),
@@ -114,7 +121,11 @@ fn selected_reuse(hosts: &[Arc<Host>; 2], reuse: bool) -> Result<Selected> {
         resources[1],
         catalog,
         original.parameters(),
-    )?);
+    )?;
+    let profile = Arc::new(match wire {
+        Some(selection) => profile.with_compact_wire(selection)?,
+        None => profile,
+    });
     let convert = |plan: Prepared| -> Result<Prepared> {
         let data = Arc::try_unwrap(plan.data)
             .map_err(|_| "unstarted Common credentials unexpectedly shared")?;
@@ -171,7 +182,7 @@ fn checksum(bytes: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-fn tcp(reverse: bool, payload: bool) -> Result<Vec<u8>> {
+pub(super) fn tcp(reverse: bool, payload: bool) -> Result<Vec<u8>> {
     let mut packet = vec![0; if payload { 100 } else { 40 }];
     packet[0] = 0x45;
     let length = u16::try_from(packet.len())?;

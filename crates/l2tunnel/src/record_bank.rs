@@ -72,6 +72,7 @@ pub struct Bank {
     allocations: usize,
     next_generation: Option<u64>,
     slots: [Option<Slot>; 2],
+    compact_feedback_overhead: Option<usize>,
 }
 
 impl Bank {
@@ -116,6 +117,7 @@ impl Bank {
             allocations: 0,
             next_generation: Some(1),
             slots: [None, None],
+            compact_feedback_overhead: plan.initial().compact_feedback_overhead(),
         };
         let mut guard = bank.prepare(*plan.initial())?;
         bank.initial = bank.publish(&mut guard)?;
@@ -132,6 +134,25 @@ impl Bank {
         self.prepare_with(plan, |plan, limits, _| {
             engine::Engine::new_reserved(plan, limits)
         })
+    }
+
+    /// Select compact bodies for the virgin initial owner and every subsequent
+    /// staged owner. The authenticated carrier must bind this selection before
+    /// any traffic; it cannot change the format of an existing generation.
+    pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {
+        if self
+            .compact_feedback_overhead
+            .is_some_and(|actual| actual != feedback_overhead)
+            || self.slots.iter().flatten().count() != 1
+        {
+            return Err(Error::Engine(engine::Error::Configuration));
+        }
+        let slot = self.slots.iter_mut().flatten().next().ok_or(Error::Slots)?;
+        slot.engine
+            .enable_compact_wire(feedback_overhead)
+            .map_err(Error::Engine)?;
+        self.compact_feedback_overhead = Some(feedback_overhead);
+        Ok(())
     }
 
     fn prepare_with(
@@ -170,7 +191,7 @@ impl Bank {
         // Keep one constructed Engine until it moves into the existing inline
         // slot. Intermediate Result tuples duplicate this large owner's stack
         // extent in debug builds without providing another ownership boundary.
-        let engine = match build(
+        let mut engine = match build(
             plan,
             engine::storage::Limits {
                 capacity_bytes: plan.capacity_bytes(),
@@ -184,6 +205,13 @@ impl Bank {
                 return Err(Error::Storage(error));
             }
         };
+        if let Some(overhead) = self.compact_feedback_overhead
+            && let Err(error) = engine.enable_compact_wire(overhead)
+        {
+            self.building_bytes = 0;
+            self.capacity_bytes = previous_charge;
+            return Err(Error::Engine(error));
+        }
         let (allocations, allocation_total) =
             match observed(&engine, &plan).and_then(|allocations| {
                 self.allocations

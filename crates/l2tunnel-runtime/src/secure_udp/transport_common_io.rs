@@ -22,47 +22,24 @@ impl Driver {
         {
             return Ok(false);
         }
-        let local = reader
-            .config
-            .descriptor()
-            .local(common_contract::mg_role(self.info.role));
-        if !matches!(
-            local.receive().profile(),
-            configuration::DirectionProfile::Swift(_)
-        ) {
-            return Ok(false);
-        }
         let body = &self.buffers.plain[..opened.bytes];
-        if !opened.feedback {
-            return Ok(matches!(
-                body.first().map(|lead| lead & swift::KIND_MASK),
-                Some(swift::KIND_SOURCE | swift::KIND_REPAIR)
-            ));
-        }
-        if !opened.authenticated || body.is_empty() {
-            return Ok(false);
-        }
-        // Validate every complete block before any reliable-retiring body can
-        // reach the actual owner. Sender-dependent sequence checks stay there.
-        let mut rest = body;
-        while !rest.is_empty() {
-            if rest.len() < swift::FEEDBACK_HEADER
-                || rest[0] & swift::KIND_MASK != swift::KIND_FEEDBACK
-                || u16::from(rest[0] >> 2) >= local.send().channels()
-            {
-                return Ok(false);
-            }
-            let requests = usize::from(rest[swift::FEEDBACK_HEADER - 1]);
-            if requests > swift::MAX_REQUESTS {
-                return Ok(false);
-            }
-            let length = swift::FEEDBACK_HEADER + 2 * requests;
-            let Some(tail) = rest.get(length..) else {
-                return Ok(false);
-            };
-            rest = tail;
-        }
-        Ok(true)
+        let engine = state.engine(core::Epoch(opened.scope.epoch.0))?;
+        let inspected = if engine.fragment_policy().is_some() {
+            engine.inspect_fragment_kind(body)
+        } else {
+            engine.inspect_peer(body)
+        };
+        let kind = match inspected {
+            Ok(kind) => kind,
+            Err(_) => return Ok(false),
+        };
+        // Selected data checks never grant feedback authority. The negotiated
+        // owner's parser validates the complete body before liveness changes.
+        Ok(if kind == engine::EmissionKind::Feedback {
+            opened.feedback && opened.authenticated
+        } else {
+            !opened.feedback
+        })
     }
 
     pub(super) fn restore_common_path(&mut self) {
@@ -1186,121 +1163,133 @@ impl Driver {
             .descriptor()
             .local(common_contract::mg_role(self.info.role));
         let body = &self.buffers.plain[..opened.bytes];
-        let kind = match local.receive().profile() {
-            configuration::DirectionProfile::Research { config, .. } => {
-                let configuration::DirectionProfile::Research { config: send, .. } =
-                    local.send().profile()
-                else {
-                    return Err(protocol("research directional family mismatch"));
-                };
-                // Reverse feedback describes our actual sender's negotiated policy;
-                // source/repair records describe the peer's independent policy.
-                if matches!(
-                    l2tunnel_fec::research::wire::inspect(send.scheduler, body),
-                    Ok(l2tunnel_fec::research::wire::View::Feedback(_))
-                ) {
-                    engine::EmissionKind::Feedback
-                } else {
-                    match l2tunnel_fec::research::wire::inspect(config.scheduler, body)
-                        .map_err(protocol)?
-                    {
-                        l2tunnel_fec::research::wire::View::Source { .. } => {
-                            engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
-                        }
-                        l2tunnel_fec::research::wire::View::Repair(_) => {
-                            engine::EmissionKind::Repair
-                        }
-                        l2tunnel_fec::research::wire::View::Feedback(_) => {
-                            return Err(protocol("research feedback policy differs from sender"));
+        let kind = if self.records.is_compact() {
+            state.engine(epoch)?.inspect_peer(body).map_err(protocol)?
+        } else {
+            match local.receive().profile() {
+                configuration::DirectionProfile::Research { config, .. } => {
+                    let configuration::DirectionProfile::Research { config: send, .. } =
+                        local.send().profile()
+                    else {
+                        return Err(protocol("research directional family mismatch"));
+                    };
+                    // Reverse feedback describes our actual sender's negotiated policy;
+                    // source/repair records describe the peer's independent policy.
+                    if matches!(
+                        l2tunnel_fec::research::wire::inspect(send.scheduler, body),
+                        Ok(l2tunnel_fec::research::wire::View::Feedback(_))
+                    ) {
+                        engine::EmissionKind::Feedback
+                    } else {
+                        match l2tunnel_fec::research::wire::inspect(config.scheduler, body)
+                            .map_err(protocol)?
+                        {
+                            l2tunnel_fec::research::wire::View::Source { .. } => {
+                                engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
+                            }
+                            l2tunnel_fec::research::wire::View::Repair(_) => {
+                                engine::EmissionKind::Repair
+                            }
+                            l2tunnel_fec::research::wire::View::Feedback(_) => {
+                                return Err(protocol(
+                                    "research feedback policy differs from sender",
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            configuration::DirectionProfile::Swift(_) => match body
-                .first()
-                .map(|lead| lead & swift::KIND_MASK)
-            {
-                Some(swift::KIND_SOURCE) => engine::EmissionKind::Source(engine::SourceForm::Swift),
-                Some(swift::KIND_REPAIR) => engine::EmissionKind::Repair,
-                Some(swift::KIND_FEEDBACK) => engine::EmissionKind::Feedback,
-                _ => return Err(protocol("unknown common Swift body")),
-            },
-            configuration::DirectionProfile::Aligned(config) => {
-                classify(body, config.recovery, self.info.role)?
-            }
-            configuration::DirectionProfile::Packed(config) => {
-                classify(body, config.base.recovery, self.info.role)?
-            }
-            configuration::DirectionProfile::AlignedCompact(receive) => {
-                let configuration::DirectionProfile::AlignedCompact(send) = local.send().profile()
-                else {
-                    return Err(protocol("compact directional family mismatch"));
-                };
-                classify_compact(body, send.recovery, receive.recovery, self.info.role)?
-            }
-            configuration::DirectionProfile::PackedCompact(receive) => {
-                let configuration::DirectionProfile::PackedCompact(send) = local.send().profile()
-                else {
-                    return Err(protocol("packed compact directional family mismatch"));
-                };
-                classify_compact(
-                    body,
-                    send.base.recovery,
-                    receive.base.recovery,
-                    self.info.role,
-                )?
-            }
-            configuration::DirectionProfile::PerConnectionCompact(receive) => {
-                let configuration::DirectionProfile::PerConnectionCompact(send) =
-                    local.send().profile()
-                else {
-                    return Err(protocol("connection directional family mismatch"));
-                };
-                {
-                    let (route, _) =
-                        l2tunnel::connection_records::route::decode(body).map_err(protocol)?;
-                    let actual = state
-                        .engine(epoch)?
-                        .connection_route_incarnation(route.owner.index())
-                        .map_err(protocol)?;
-                    if route.incarnation != actual {
-                        self.counters.rejected_packets =
-                            self.counters.rejected_packets.saturating_add(1);
-                        return Ok(());
+                configuration::DirectionProfile::Swift(_) => {
+                    match body.first().map(|lead| lead & swift::KIND_MASK) {
+                        Some(swift::KIND_SOURCE) => {
+                            engine::EmissionKind::Source(engine::SourceForm::Swift)
+                        }
+                        Some(swift::KIND_REPAIR) => engine::EmissionKind::Repair,
+                        Some(swift::KIND_FEEDBACK) => engine::EmissionKind::Feedback,
+                        _ => return Err(protocol("unknown common Swift body")),
                     }
-                    common_connections::classify_incarnation(
+                }
+                configuration::DirectionProfile::Aligned(config) => {
+                    classify(body, config.recovery, self.info.role)?
+                }
+                configuration::DirectionProfile::Packed(config) => {
+                    classify(body, config.base.recovery, self.info.role)?
+                }
+                configuration::DirectionProfile::AlignedCompact(receive) => {
+                    let configuration::DirectionProfile::AlignedCompact(send) =
+                        local.send().profile()
+                    else {
+                        return Err(protocol("compact directional family mismatch"));
+                    };
+                    classify_compact(body, send.recovery, receive.recovery, self.info.role)?
+                }
+                configuration::DirectionProfile::PackedCompact(receive) => {
+                    let configuration::DirectionProfile::PackedCompact(send) =
+                        local.send().profile()
+                    else {
+                        return Err(protocol("packed compact directional family mismatch"));
+                    };
+                    classify_compact(
                         body,
-                        *send,
-                        *receive,
+                        send.base.recovery,
+                        receive.base.recovery,
                         self.info.role,
-                        actual,
                     )?
                 }
-            }
-            configuration::DirectionProfile::Rolling { config, .. } => {
-                let recovery = config.scheduler.recovery;
-                let configuration::DirectionProfile::Rolling { config: send, .. } =
-                    local.send().profile()
-                else {
-                    return Err(protocol("rolling directional family mismatch"));
-                };
-                if l2tunnel_fec::rolling::scheduler::decode_feedback(send.scheduler.recovery, body)
-                    .is_ok()
-                {
-                    engine::EmissionKind::Feedback
-                } else {
-                    match l2tunnel_fec::rolling::wire::inspect_with(
-                        recovery,
-                        config.scheduler.source_wire,
+                configuration::DirectionProfile::PerConnectionCompact(receive) => {
+                    let configuration::DirectionProfile::PerConnectionCompact(send) =
+                        local.send().profile()
+                    else {
+                        return Err(protocol("connection directional family mismatch"));
+                    };
+                    {
+                        let (route, _) =
+                            l2tunnel::connection_records::route::decode(body).map_err(protocol)?;
+                        let actual = state
+                            .engine(epoch)?
+                            .connection_route_incarnation(route.owner.index())
+                            .map_err(protocol)?;
+                        if route.incarnation != actual {
+                            self.counters.rejected_packets =
+                                self.counters.rejected_packets.saturating_add(1);
+                            return Ok(());
+                        }
+                        common_connections::classify_incarnation(
+                            body,
+                            *send,
+                            *receive,
+                            self.info.role,
+                            actual,
+                        )?
+                    }
+                }
+                configuration::DirectionProfile::Rolling { config, .. } => {
+                    let recovery = config.scheduler.recovery;
+                    let configuration::DirectionProfile::Rolling { config: send, .. } =
+                        local.send().profile()
+                    else {
+                        return Err(protocol("rolling directional family mismatch"));
+                    };
+                    if l2tunnel_fec::rolling::scheduler::decode_feedback(
+                        send.scheduler.recovery,
                         body,
                     )
-                    .map_err(protocol)?
+                    .is_ok()
                     {
-                        l2tunnel_fec::rolling::wire::View::Source { .. } => {
-                            engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
-                        }
-                        l2tunnel_fec::rolling::wire::View::Repair(_) => {
-                            engine::EmissionKind::Repair
+                        engine::EmissionKind::Feedback
+                    } else {
+                        match l2tunnel_fec::rolling::wire::inspect_with(
+                            recovery,
+                            config.scheduler.source_wire,
+                            body,
+                        )
+                        .map_err(protocol)?
+                        {
+                            l2tunnel_fec::rolling::wire::View::Source { .. } => {
+                                engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
+                            }
+                            l2tunnel_fec::rolling::wire::View::Repair(_) => {
+                                engine::EmissionKind::Repair
+                            }
                         }
                     }
                 }

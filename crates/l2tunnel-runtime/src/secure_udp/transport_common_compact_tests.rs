@@ -10,7 +10,7 @@ use l2tunnel_recovery::{
 };
 use l2tunnel_reliable::CompactReliableConfig;
 
-fn direction(
+pub(super) fn direction(
     old: aligned::Config,
     reverse: bool,
     overhead: usize,

@@ -9,6 +9,8 @@ use l2tunnel_runtime::secure_udp::transport;
 use ring::digest;
 use std::io;
 
+#[path = "common_transaction_profile_compact.rs"]
+mod compact;
 #[path = "common_transaction_profile_raw.rs"]
 mod raw;
 
@@ -18,6 +20,7 @@ pub struct Profile {
     connection: ConnectionConfig,
     peers: establish::Peers,
     settings: Settings,
+    application: ConfigDigest,
     initiator: transport::Config,
     responder: transport::Config,
     catalog: Catalog,
@@ -98,6 +101,66 @@ impl Profile {
     #[allow(clippy::too_many_arguments)]
     pub fn new_proxy(
         connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+    ) -> io::Result<Self> {
+        Self::new_proxy_selected(
+            connection, settings, peers, initiator, responder, catalog, parameters, proxy, false,
+            None, None,
+        )
+    }
+    /// Explicit retained graceful retirement, bound before Noise/member H0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_retained(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+    ) -> io::Result<Self> {
+        Self::new_proxy_selected(
+            connection, settings, peers, initiator, responder, catalog, parameters, proxy, true,
+            None, None,
+        )
+    }
+    /// Explicit complete measured policy with retained Common retirement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_measured_retained(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::measured::Config,
+    ) -> io::Result<Self> {
+        Self::new_proxy_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            proxy.fixed.clone(),
+            true,
+            Some(proxy),
+            None,
+        )
+    }
+    /// Build a complete proxy selection with its requested final wire before H0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_proxy_selected(
+        connection: ConnectionConfig,
         mut settings: Settings,
         peers: establish::Peers,
         initiator: transport::Config,
@@ -105,6 +168,9 @@ impl Profile {
         catalog: Catalog,
         parameters: transport::TransactionSettings,
         proxy: l2tunnel_runtime::proxy::Config,
+        retained: bool,
+        measured: Option<l2tunnel_runtime::proxy::measured::Config>,
+        wire: Option<l2tunnel::secure_record::compact::Selection>,
     ) -> io::Result<Self> {
         let binding = l2tunnel_runtime::proxy::session_config(&proxy)?;
         if proxy.duplex != Duplex::Full
@@ -119,12 +185,34 @@ impl Profile {
                 "Common proxy requires explicit fixed full-duplex one-channel TUN and one immutable descriptor",
             ));
         }
+        if let Some(measured) = &measured {
+            if !retained
+                || l2tunnel_runtime::proxy::session_config(&measured.fixed)?.digest
+                    != binding.digest
+            {
+                return Err(invalid(
+                    "measured Common proxy requires matching fixed policy and retained close",
+                ));
+            }
+            let digest = l2tunnel_runtime::proxy::measured::session_config(measured)?.digest;
+            let mut application = digest::Context::new(&digest::SHA256);
+            application.update(b"l2tunnel/shared-client/common-proxy-measured/v1\0");
+            application.update(&settings.application.0);
+            application.update(&digest.0);
+            settings.application = ConfigDigest(super::finish(application));
+        }
+        if retained {
+            let mut application = digest::Context::new(&digest::SHA256);
+            application.update(b"l2tunnel/shared-client/common-proxy-retirement/v1\0");
+            application.update(&settings.application.0);
+            settings.application = ConfigDigest(super::finish(application));
+        }
         let mut application = digest::Context::new(&digest::SHA256);
         application.update(b"l2tunnel/shared-client/common-proxy/v1\0");
         application.update(&settings.application.0);
         application.update(&binding.digest.0);
         settings.application = ConfigDigest(super::finish(application));
-        Self::new_selected(
+        let mut result = Self::new_selected(
             connection,
             settings,
             peers,
@@ -134,65 +222,13 @@ impl Profile {
             parameters,
             None,
             Some(proxy),
-            None,
-        )
-    }
-    /// Explicit retained graceful retirement. The existing v1 constructor and
-    /// defaults remain unchanged; this domain is included before Noise/member H0.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_proxy_retained(
-        connection: ConnectionConfig,
-        mut settings: Settings,
-        peers: establish::Peers,
-        initiator: transport::Config,
-        responder: transport::Config,
-        catalog: Catalog,
-        parameters: transport::TransactionSettings,
-        proxy: l2tunnel_runtime::proxy::Config,
-    ) -> io::Result<Self> {
-        let mut application = digest::Context::new(&digest::SHA256);
-        application.update(b"l2tunnel/shared-client/common-proxy-retirement/v1\0");
-        application.update(&settings.application.0);
-        settings.application = ConfigDigest(super::finish(application));
-        let mut result = Self::new_proxy(
-            connection, settings, peers, initiator, responder, catalog, parameters, proxy,
+            wire,
         )?;
-        result.proxy_retirement = true;
-        Ok(result)
-    }
-    /// Explicit measured controller with retained Common retirement. The complete
-    /// existing measured policy is bound before the same admission/Noise/member H0.
-    /// Fixed constructors and their authenticated selections remain unchanged.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_proxy_measured_retained(
-        connection: ConnectionConfig,
-        mut settings: Settings,
-        peers: establish::Peers,
-        initiator: transport::Config,
-        responder: transport::Config,
-        catalog: Catalog,
-        parameters: transport::TransactionSettings,
-        proxy: l2tunnel_runtime::proxy::measured::Config,
-    ) -> io::Result<Self> {
-        let binding = l2tunnel_runtime::proxy::measured::session_config(&proxy)?;
-        let mut application = digest::Context::new(&digest::SHA256);
-        application.update(b"l2tunnel/shared-client/common-proxy-measured/v1\0");
-        application.update(&settings.application.0);
-        application.update(&binding.digest.0);
-        settings.application = ConfigDigest(super::finish(application));
-        let mut result = Self::new_proxy_retained(
-            connection,
-            settings,
-            peers,
-            initiator,
-            responder,
-            catalog,
-            parameters,
-            proxy.fixed.clone(),
-        )?;
-        result.proxy_measured = Some(Box::new(proxy));
-        result.runtime_contract(security::Role::Initiator)?;
-        result.runtime_contract(security::Role::Responder)?;
+        result.proxy_retirement = retained;
+        result.proxy_measured = measured.map(Box::new);
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            result.runtime_contract(role)?;
+        }
         Ok(result)
     }
     /// Exact selected measured policy, absent for fixed and transparent Common.
@@ -368,6 +404,7 @@ impl Profile {
             connection,
             peers,
             settings,
+            application: seed,
             initiator,
             responder,
             catalog,
@@ -626,18 +663,13 @@ impl Profile {
         let selection = self
             .compact_wire
             .ok_or_else(|| invalid("compact selection absent"))?;
-        if self.raw.is_some()
-            || self.carrier.is_some()
-            || self.proxy.is_some()
-            || self.proxy_measured.is_some()
-            || self.connection_reuse
-        {
+        if self.raw.is_some() || self.carrier.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "compact v3 currently requires the original UDP native Common backend",
+                "compact v3 currently requires the original UDP Common backend",
             ));
         }
-        transport::CommonTransactionContract::new_compact_wire(
+        let contract = transport::CommonTransactionContract::new_compact_wire(
             self.settings.configuration(self.peers)?,
             role,
             [self.initiator, self.responder],
@@ -647,7 +679,8 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
             selection,
-        )
+        )?;
+        self.complete_proxy_contract(contract)
     }
     // Both callers already constructed their actual original carrier contract.
     // This metadata cannot upgrade an observation into member/root authority.

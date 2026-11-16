@@ -1,5 +1,10 @@
 # Aligned symbol envelope and recovery composition
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: pure composition implemented and locally tested. A separate
 [runtime composition](aligned-runtime.md) now has real-carrier loopback tests;
 client selection and native OS-device qualification remain open. This slice connects actual Python aligned

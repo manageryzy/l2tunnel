@@ -1,0 +1,132 @@
+//! Explicit conversion of a complete original UDP plan before authentication.
+use super::*;
+
+impl Profile {
+    /// Select compact final framing before establishment, preserving the complete
+    /// proxy, measured, reuse and catalog policies. Only carrier byte charges are
+    /// rebased; E, D0 and H0 are rebuilt from the original application commitment.
+    /// Explicit storage and reassembly bounds are preserved and revalidated; a
+    /// plan that cannot fit the selected geometry returns an error without clamping.
+    /// No authenticated session or outer-carrier proof is converted by this API.
+    pub fn with_compact_wire(
+        self,
+        selection: l2tunnel::secure_record::compact::Selection,
+    ) -> io::Result<Self> {
+        selection.validate().map_err(io::Error::other)?;
+        if self.raw.is_some() || self.carrier.is_some() || self.compact_wire.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compact selection requires an unbound original UDP profile",
+            ));
+        }
+        let physical = if self.settings.gate.path.client.is_ipv6() {
+            48
+        } else {
+            28
+        };
+        let data = physical + l2tunnel::secure_record::compact::DATA_OVERHEAD;
+        let control = physical + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD;
+        let mut resources = [self.initiator, self.responder];
+        for resource in &mut resources {
+            resource.control.wire_overhead = control;
+            if let Some(fragments) = resource.rolling_fragments.as_mut() {
+                fragments.forward.framing.outer_overhead_bytes = data;
+                fragments.reverse.framing.outer_overhead_bytes = data;
+            }
+            if let Some(streams) = resource.streams.as_mut() {
+                for stream in &mut streams.streams {
+                    stream.delivery.wire_overhead =
+                        control + l2tunnel_management::control_streams::HEADER_BYTES;
+                }
+            }
+        }
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.catalog.descriptors().len())
+            .map_err(io::Error::other)?;
+        for descriptor in self.catalog.descriptors() {
+            descriptors.push(rebase(*descriptor, data)?);
+        }
+        let catalog = Catalog::new(rebase(self.catalog.initial(), data)?, &descriptors)
+            .map_err(io::Error::other)?;
+        let mut settings = self.settings;
+        settings.application = self.application;
+        let mut result = Self::new_selected(
+            self.connection,
+            settings,
+            self.peers,
+            resources[0],
+            resources[1],
+            catalog,
+            self.parameters,
+            None,
+            self.proxy,
+            Some(selection),
+        )?;
+        result.proxy_retirement = self.proxy_retirement;
+        result.proxy_measured = self.proxy_measured;
+        result.connection_reuse = self.connection_reuse;
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            result.runtime_contract(role)?;
+        }
+        Ok(result)
+    }
+}
+fn reliable(
+    config: l2tunnel::reliable::CompactReliableConfig,
+    overhead: usize,
+) -> io::Result<l2tunnel::reliable::CompactReliableConfig> {
+    l2tunnel::reliable::CompactReliableConfig::new(config.arq(), overhead).map_err(io::Error::other)
+}
+fn rebase(descriptor: common::Descriptor, overhead: usize) -> io::Result<common::Descriptor> {
+    let mut profile = *descriptor.profile();
+    match &mut profile {
+        common::Profile::Swift { .. } => {}
+        common::Profile::Aligned { forward, reverse } => {
+            for config in [forward, reverse] {
+                config.recovery.outer_overhead_bytes = overhead;
+            }
+        }
+        common::Profile::Packed { forward, reverse } => {
+            for config in [forward, reverse] {
+                config.base.recovery.outer_overhead_bytes = overhead;
+            }
+        }
+        common::Profile::AlignedCompact { forward, reverse } => {
+            for config in [forward, reverse] {
+                config.recovery = reliable(config.recovery, overhead)?;
+            }
+        }
+        common::Profile::PackedCompact { forward, reverse } => {
+            for config in [forward, reverse] {
+                config.base.recovery = reliable(config.base.recovery, overhead)?;
+            }
+        }
+        common::Profile::PerConnectionCompact { forward, reverse } => {
+            // The descriptor keeps its complete route capacity; selected endpoint
+            // admission replaces this legacy route charge with the actual arm.
+            let nested = overhead
+                .checked_add(l2tunnel::connection_records::route::HEADER_BYTES)
+                .ok_or_else(|| invalid("compact connection charge overflow"))?;
+            for config in [forward, reverse] {
+                config.compact.recovery = reliable(config.compact.recovery, nested)?;
+            }
+        }
+        common::Profile::Rolling { config, .. } | common::Profile::RollingCopies { config, .. } => {
+            config.geometry.forward_overhead_bytes = overhead;
+            config.geometry.reverse_overhead_bytes = overhead;
+        }
+        common::Profile::Research { config, .. } => {
+            config.geometry.forward_overhead_bytes = overhead;
+            config.geometry.reverse_overhead_bytes = overhead;
+        }
+    }
+    common::Descriptor::new(
+        descriptor.path_mtu(),
+        descriptor.duplex(),
+        *descriptor.direction(Role::Client).common(),
+        *descriptor.direction(Role::Server).common(),
+        profile,
+    )
+    .map_err(io::Error::other)
+}

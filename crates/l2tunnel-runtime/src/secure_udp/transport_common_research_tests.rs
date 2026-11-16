@@ -472,3 +472,100 @@ fn actual_research_udp_wouldblock_keeps_ciphertext_number_token_debit_and_origin
             Ok(())
         })
 }
+
+fn compact_research(
+    policy: research::Profile,
+    protection: security::compact::Protection,
+) -> Result<([CommonTransactionContract; 2], [C; 2])> {
+    let (original, values) = selected_research(policy)?;
+    let descriptor = values[1].descriptor();
+    let c::Profile::Research { mut config, stream } = *descriptor.profile() else {
+        return Err("actual Research fixture profile".into());
+    };
+    let overhead = 28 + record::compact::DATA_OVERHEAD;
+    config.geometry = engine::Geometry {
+        forward_overhead_bytes: overhead,
+        reverse_overhead_bytes: overhead,
+    };
+    let research = c::Descriptor::new(
+        descriptor.path_mtu(),
+        descriptor.duplex(),
+        *descriptor.direction(mg::Role::Client).common(),
+        *descriptor.direction(mg::Role::Server).common(),
+        c::Profile::Research { config, stream },
+    )?;
+    let catalog = Catalog::new(research, &[*values[0].descriptor(), research])?;
+    let mut resources = original[0].resources();
+    resources.control.wire_overhead = 28 + record::compact::AUTHENTICATED_OVERHEAD;
+    for stream in &mut resources.streams.as_mut().ok_or("actual streams")?.streams {
+        stream.delivery.wire_overhead = resources.control.wire_overhead + streams::HEADER_BYTES;
+    }
+    let selected = record::compact::Selection {
+        protection,
+        limits: security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    };
+    let make = |role| -> Result<CommonTransactionContract> {
+        Ok(CommonTransactionContract::new_compact_wire(
+            security::ConfigDigest([0xce; 32]),
+            role,
+            [resources; 2],
+            appearance(
+                cover::Appearance::QuicLike,
+                role == security::Role::Initiator,
+            )?,
+            false,
+            values[0].envelope(),
+            catalog.clone(),
+            original[0].settings(),
+            selected,
+        )?)
+    };
+    Ok((
+        [
+            make(security::Role::Initiator)?,
+            make(security::Role::Responder)?,
+        ],
+        [values[0], C::new(values[0].envelope(), research)?],
+    ))
+}
+
+#[test]
+fn selected_compact_wire_research_three_policies_deliver_and_switch_original_udp() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            for protection in [
+                security::compact::Protection::Aes128Ccm4,
+                security::compact::Protection::ChaCha20Crc32c,
+            ] {
+                for policy in policies() {
+                    let (contracts, values) = compact_research(policy, protection)?;
+                    let expected = contracts[0].expected_configuration();
+                    let mut fixture = Fixture::from_contracts_setup(
+                        cover::Appearance::QuicLike,
+                        contracts,
+                        true,
+                        Some(expected),
+                    )
+                    .await?;
+                    fixture.exchange_all_channels(51).await?;
+                    fixture.switch(values[0]).await?;
+                    fixture.exchange_all_channels(61).await?;
+                    fixture.switch(values[1]).await?;
+                    fixture.exchange_all_channels(71).await?;
+                    for endpoint in &fixture.endpoints {
+                        let status = endpoint.driver.snapshot_common(fixture.now, true)?;
+                        assert_eq!(status.current, values[1]);
+                        assert_eq!(status.configuration, expected);
+                        assert!(status.compact_feedback_number.is_some());
+                        assert!(status.liveness.last_pong_micros.is_some());
+                    }
+                }
+            }
+            Ok(())
+        })
+}

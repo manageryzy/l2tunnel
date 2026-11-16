@@ -37,6 +37,61 @@ fn fragments(id: u64, length: usize) -> Result<FragmentBatch, FragmentError> {
 }
 
 #[test]
+fn complete_fragment_preflight_reuses_geometry_parser_without_lifecycle_mutation() -> TestResult {
+    let mut receiver = Reassembler::new(context(), receiver_config())?;
+    let batch = fragments(1, 321)?;
+    for fragment in &batch.fragments {
+        receiver.validate_fragment(fragment)?;
+        for end in 0..fragment.len() {
+            assert!(receiver.validate_fragment(&fragment[..end]).is_err());
+        }
+        let mut trailing = fragment.clone();
+        trailing.push(0);
+        assert_eq!(
+            receiver.validate_fragment(&trailing),
+            Err(FragmentError::InvalidGeometry)
+        );
+        for offset in [2, 3, 4, 12, 28, 32, 34, 36, 38] {
+            let mut changed = fragment.clone();
+            changed[offset] ^= 0x80;
+            assert!(
+                receiver.validate_fragment(&changed).is_err(),
+                "field offset {offset}"
+            );
+        }
+    }
+    assert_eq!(receiver.pending_messages(), 0);
+    assert_eq!(receiver.reserved_bytes(), 0);
+    assert_eq!(receiver.reserved_fragments(), 0);
+    assert_eq!(receiver.deadline(), None);
+    let mut output = [0xa5; 321];
+    assert!(matches!(
+        receiver.accept(&batch.fragments[0], 3, &mut output)?,
+        ReassemblyStatus::Pending { .. }
+    ));
+    let original_deadline = receiver.deadline();
+    let reserved = (receiver.reserved_bytes(), receiver.reserved_fragments());
+    for fragment in &batch.fragments {
+        receiver.validate_fragment(fragment)?;
+    }
+    assert_eq!(receiver.deadline(), original_deadline);
+    assert_eq!(
+        (receiver.reserved_bytes(), receiver.reserved_fragments()),
+        reserved
+    );
+    receiver.accept(&batch.fragments[1], 3, &mut output)?;
+    assert_eq!(
+        receiver.accept(&batch.fragments[2], 3, &mut output)?,
+        ReassemblyStatus::Complete {
+            message: MessageId(1),
+            length: 321
+        }
+    );
+    assert_eq!(output, [7; 321]);
+    Ok(())
+}
+
+#[test]
 fn roundtrip_mtu_and_chunk_boundaries_in_reverse_order() -> TestResult {
     let mut sender = Fragmenter::new(context(), sender_config(), MessageId(0))?;
     let mut receiver = Reassembler::new(context(), receiver_config())?;

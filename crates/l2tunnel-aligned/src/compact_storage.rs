@@ -335,6 +335,8 @@ impl Endpoint {
             handoff: None,
             now: Duration::ZERO,
             failure: None,
+            compact_wire: false,
+            compact_data_overhead: 0,
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes: bytes,

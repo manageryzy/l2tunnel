@@ -346,6 +346,7 @@ impl Owner {
                     budget,
                     witnesses,
                     overhead,
+                    feedback_overhead,
                 },
             ),
             Self::Packed(endpoint) => poll_endpoint(
@@ -358,6 +359,7 @@ impl Owner {
                     budget,
                     witnesses,
                     overhead,
+                    feedback_overhead,
                 },
             ),
             Self::Rolling(endpoint) => {
@@ -719,7 +721,7 @@ impl Owner {
     }
 }
 
-fn emission_kind(kind: RecordKind) -> EmissionKind {
+pub(super) fn emission_kind(kind: RecordKind) -> EmissionKind {
     match kind {
         RecordKind::Source => EmissionKind::Source(SourceForm::DirectArq),
         RecordKind::Systematic => EmissionKind::Source(SourceForm::SystematicFec),
@@ -825,6 +827,7 @@ struct Poll<'a> {
     budget: &'a mut OutboundBudget,
     witnesses: &'a mut [receiver::UnitWitness],
     overhead: usize,
+    feedback_overhead: usize,
 }
 
 fn poll_endpoint(
@@ -839,6 +842,7 @@ fn poll_endpoint(
         budget,
         witnesses,
         overhead,
+        feedback_overhead,
     } = input;
     let maximum = endpoint.send_max();
     if out.len() < maximum {
@@ -864,7 +868,14 @@ fn poll_endpoint(
     };
     let packet = out.get(..bytes).ok_or(Error::Invariant)?;
     let kind = emission_kind(endpoint.inspect(packet).map_err(Error::Aligned)?);
-    let wire_bytes = bytes.checked_add(overhead).ok_or(Error::Arithmetic)?;
+    let selected_overhead = if kind == EmissionKind::Feedback {
+        feedback_overhead
+    } else {
+        overhead
+    };
+    let wire_bytes = bytes
+        .checked_add(selected_overhead)
+        .ok_or(Error::Arithmetic)?;
     if before.packets.checked_sub(budget.packets) != Some(1)
         || before.wire_bytes.checked_sub(budget.wire_bytes) != Some(wire_bytes)
     {

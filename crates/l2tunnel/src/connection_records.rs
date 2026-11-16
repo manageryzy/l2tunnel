@@ -154,6 +154,7 @@ pub struct PreparedOutput {
     owner: OwnerId,
     incarnation: u64,
     inner: aligned::PreparedOutput,
+    route_bytes: usize,
 }
 impl PreparedOutput {
     /// Exact owner that must consume the physical receipt.
@@ -162,7 +163,7 @@ impl PreparedOutput {
     }
     /// Exact initialized routed bytes in the caller's retained buffer.
     pub fn bytes(&self) -> usize {
-        self.inner.bytes + route::HEADER_BYTES
+        self.inner.bytes + self.route_bytes
     }
     /// Actual endpoint debit, including configured route overhead exactly once.
     pub const fn wire_bytes(&self) -> usize {
@@ -243,8 +244,75 @@ pub struct Collection {
     raw_send: Vec<u8>,
     raw_receive: Vec<u8>,
     unreliable_statistics: UnreliableStatistics,
+    compact_wire: bool,
 }
 impl Collection {
+    /// Select compact nested recovery bodies and route arms before any admission.
+    /// The caller binds this format into authenticated session establishment.
+    pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {
+        if self.compact_wire
+            || self.slots.iter().any(|slot| {
+                slot.admitted_native != 0
+                    || slot.raw_send.is_some()
+                    || slot.raw_receive.is_some()
+                    || slot.retirement.is_some()
+            })
+        {
+            return Err(Error::Invariant);
+        }
+        let data = self
+            .plan
+            .config()
+            .send_carrier_overhead_bytes
+            .checked_add(route::COMPACT_HEADER_BYTES)
+            .ok_or(Error::Arithmetic)?;
+        let feedback = feedback_overhead
+            .checked_add(route::COMPACT_HEADER_BYTES)
+            .ok_or(Error::Arithmetic)?;
+        for slot in &self.slots {
+            slot.endpoint
+                .validate_compact_wire_selection(data, feedback)
+                .map_err(Error::Endpoint)?;
+        }
+        for slot in &mut self.slots {
+            slot.endpoint
+                .enable_compact_wire_with_overheads(data, feedback)
+                .map_err(Error::Endpoint)?;
+        }
+        self.compact_wire = true;
+        Ok(())
+    }
+
+    fn route_bytes(&self, unreliable: bool) -> usize {
+        if self.compact_wire {
+            if unreliable {
+                route::COMPACT_UNRELIABLE_BYTES
+            } else {
+                route::COMPACT_HEADER_BYTES
+            }
+        } else {
+            route::HEADER_BYTES
+        }
+    }
+
+    fn encode_route(&self, header: route::Header, output: &mut [u8]) -> Result<(), Error> {
+        if self.compact_wire {
+            header.encode_compact(output)
+        } else {
+            header.encode(output)
+        }
+        .map_err(Error::Route)
+    }
+
+    /// Decode the exact selected route grammar; labels do not confer authority.
+    pub fn decode_route<'a>(&self, packet: &'a [u8]) -> Result<(route::Header, &'a [u8]), Error> {
+        if self.compact_wire {
+            route::decode_compact(packet)
+        } else {
+            route::decode(packet)
+        }
+        .map_err(Error::Route)
+    }
     /// Obtain a checked index without claiming flow or authentication authority.
     pub fn owner(&self, index: u16) -> Result<OwnerId, Error> {
         if usize::from(index) < self.slots.len() {
@@ -305,6 +373,7 @@ impl Collection {
             owner: id,
             incarnation,
             inner,
+            route_bytes: self.route_bytes(false),
         }
     }
 
@@ -353,11 +422,12 @@ impl Collection {
         budget: &mut OutboundBudget,
         feedback: bool,
     ) -> Result<Option<PreparedOutput>, Error> {
+        let route_bytes = self.route_bytes(false);
         let slot = self.slot(id)?;
         let required = slot
             .endpoint
             .send_max_packet_bytes()
-            .checked_add(route::HEADER_BYTES)
+            .checked_add(route_bytes)
             .ok_or(Error::Arithmetic)?;
         if output.len() < required {
             return Err(Error::Output { required });
@@ -374,12 +444,12 @@ impl Collection {
             unreliable_serial: 0,
         };
         let mut encoded = [0; route::HEADER_BYTES];
-        header.encode(&mut encoded).map_err(Error::Route)?;
+        self.encode_route(header, &mut encoded[..route_bytes])?;
         let endpoint = &mut self.slot_mut(id)?.endpoint;
         let selected = if feedback {
-            endpoint.poll_feedback_independent(now, &mut output[route::HEADER_BYTES..], budget)
+            endpoint.poll_feedback_independent(now, &mut output[route_bytes..], budget)
         } else {
-            endpoint.poll_data_independent(now, &mut output[route::HEADER_BYTES..], budget)
+            endpoint.poll_data_independent(now, &mut output[route_bytes..], budget)
         }
         .map_err(Error::Endpoint)?;
         let Some(bytes) = selected else {
@@ -396,19 +466,15 @@ impl Collection {
         } else {
             RecordKind::Source
         };
-        let end = route::HEADER_BYTES
-            .checked_add(bytes)
-            .ok_or(Error::Invariant)?;
-        let emitted = output
-            .get(route::HEADER_BYTES..end)
-            .ok_or(Error::Invariant)?;
+        let end = route_bytes.checked_add(bytes).ok_or(Error::Invariant)?;
+        let emitted = output.get(route_bytes..end).ok_or(Error::Invariant)?;
         if inner.bytes != bytes
             || inner.kind != expected
             || endpoint.inspect_output(emitted).map_err(Error::Endpoint)? != expected
         {
             return Err(Error::Invariant);
         }
-        output[..route::HEADER_BYTES].copy_from_slice(&encoded);
+        output[..route_bytes].copy_from_slice(&encoded[..route_bytes]);
         Ok(Some(self.wrap(id, header.incarnation, inner)))
     }
 
@@ -442,7 +508,7 @@ impl Collection {
         observed: Duration,
         packet: &[u8],
     ) -> Result<(), Error> {
-        let (header, body) = route::decode(packet).map_err(Error::Route)?;
+        let (header, body) = self.decode_route(packet)?;
         if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
         }
@@ -635,3 +701,7 @@ impl Collection {
 #[cfg(test)]
 #[path = "connection_records/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_records/compact_wire_tests.rs"]
+mod compact_wire_tests;

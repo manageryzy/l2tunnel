@@ -591,3 +591,59 @@ fn exact_source_rejects_truncation_trailing_bytes_and_length_limits() -> TestRes
     assert_eq!(output, [0xa5; 80]);
     Ok(())
 }
+
+#[test]
+fn selected_compact_union_full_identity_support_and_strict_feedback_shape() -> TestResult {
+    use crate::rolling::scheduler::{Feedback, FeedbackId, Output};
+    for source in [0, 127, 128, u32::MAX - 1] {
+        let value = Output::Source {
+            scope: scope(),
+            id: SourceId(source),
+            original: &[1, 0, 0],
+        };
+        let length = compact::data_len(value)?;
+        let mut output = [0xa5; 64];
+        assert_eq!(
+            compact::encode_data(value, &mut output[..length - 1]),
+            Err(Error::OutputTooSmall)
+        );
+        assert_eq!(output, [0xa5; 64]);
+        compact::encode_data(value, &mut output)?;
+        let compact::View::Data(View::Source { id, original, .. }) =
+            compact::inspect(config(), scope(), &output[..length])?
+        else {
+            return Err("source kind".into());
+        };
+        assert_eq!(id, SourceId(source));
+        assert_eq!(original, [1, 0, 0]);
+    }
+    for tail in [false, true] {
+        let repair = equation(16, 3, tail)?;
+        let mut output = [0; 64];
+        let length = compact::encode_data(Output::Repair(repair), &mut output)?;
+        let compact::View::Data(View::Repair(decoded)) =
+            compact::inspect(config(), scope(), &output[..length])?
+        else {
+            return Err("repair kind".into());
+        };
+        assert_eq!(decoded.support, repair.support);
+        assert_eq!(decoded.bytes, repair.bytes);
+        assert!(compact::inspect(config(), scope(), &output[..length - 1]).is_err());
+    }
+    let feedback = Feedback {
+        scope: scope(),
+        id: FeedbackId(u64::MAX - 1),
+        prefix: u32::MAX - 4,
+        observed_end: u32::MAX,
+        deficit: 2,
+    };
+    let mut output = [0; 64];
+    let length = compact::encode_feedback(feedback, &mut output)?;
+    assert!(
+        matches!(compact::inspect(config(), scope(), &output[..length])?, compact::View::Feedback(actual) if actual == feedback)
+    );
+    assert!(compact::inspect(config(), scope(), &output[..length + 1]).is_err());
+    assert!(compact::inspect(config(), scope(), &[1, 0x80, 0, 1]).is_err());
+    assert!(compact::inspect(config(), scope(), &hex(SOURCE0)?).is_err());
+    Ok(())
+}

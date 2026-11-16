@@ -39,6 +39,7 @@ mod native;
 pub use carrier::CarrierOutputToken;
 mod native_counts;
 pub use native_counts::NativeCounts;
+mod compact_wire;
 mod owner;
 mod proxy_records;
 #[cfg(test)]
@@ -337,6 +338,7 @@ pub struct Engine {
     native_max: usize,
     witnesses: usize,
     overhead: usize,
+    compact_feedback_overhead: Option<usize>,
     receive_channels: u16,
     next_channel: u16,
     limits: NativeLimits,
@@ -417,6 +419,7 @@ impl Engine {
             native_max,
             witnesses,
             overhead,
+            compact_feedback_overhead: None,
             receive_channels,
             next_channel: 0,
             limits,
@@ -569,12 +572,12 @@ impl Engine {
             output,
             shared_budget,
             unit_witnesses,
-            self.overhead,
+            self.compact_feedback_overhead.unwrap_or(self.overhead),
         )
     }
 
     /// Poll with an exact stronger feedback overhead on an explicitly selected
-    /// Swift outer format. Existing callers retain their uniform wire charge.
+    /// outer format. Existing callers retain their uniform wire charge.
     #[allow(clippy::too_many_arguments)]
     pub fn poll_with_feedback_overhead(
         &mut self,
@@ -586,7 +589,10 @@ impl Engine {
         unit_witnesses: &mut [receiver::UnitWitness],
         feedback_overhead: usize,
     ) -> Result<Option<Emission>, Error> {
-        if feedback_overhead != self.overhead && !matches!(&self.owner, Owner::Swift(_)) {
+        if feedback_overhead != self.overhead
+            && !matches!(&self.owner, Owner::Swift(_))
+            && self.compact_feedback_overhead != Some(feedback_overhead)
+        {
             return Err(Error::Geometry);
         }
         if self.fragments.is_some() {
@@ -957,6 +963,30 @@ fn parameters_with_fragmentation(
     native_limits: NativeLimits,
     fragments: Option<FragmentPolicy>,
 ) -> Result<Parameters, Error> {
+    parameters_selected(
+        configuration,
+        context,
+        geometry,
+        native_limits,
+        fragments,
+        None,
+    )
+}
+fn parameters_selected(
+    configuration: &configuration::Configuration,
+    context: Context,
+    geometry: Geometry,
+    native_limits: NativeLimits,
+    fragments: Option<FragmentPolicy>,
+    compact_feedback: Option<usize>,
+) -> Result<Parameters, Error> {
+    let local_overhead = match context.role {
+        Role::Client => geometry.forward_overhead_bytes,
+        Role::Server => geometry.reverse_overhead_bytes,
+    };
+    let feedback_delta = compact_feedback
+        .map(|feedback| feedback.checked_sub(local_overhead).ok_or(Error::Geometry))
+        .transpose()?;
     if let Some(policy) = fragments {
         policy.validate(configuration, geometry)?;
     }
@@ -980,6 +1010,9 @@ fn parameters_with_fragmentation(
         (Role::Client, geometry.forward_overhead_bytes),
         (Role::Server, geometry.reverse_overhead_bytes),
     ] {
+        let compact_feedback = feedback_delta
+            .map(|delta| overhead.checked_add(delta).ok_or(Error::Arithmetic))
+            .transpose()?;
         let view = descriptor.direction(role);
         match view.common().traffic().tcp {
             TcpControl::System => {}
@@ -1000,7 +1033,14 @@ fn parameters_with_fragmentation(
         }
         let opposite = descriptor.local(role).receive();
         let (maximum, _, charge) = dimensions(view.profile(), opposite.profile())?;
-        let wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
+        let wire = if let Some(feedback) = compact_feedback {
+            let (data, ack) = compact_wire::maximums(view.profile(), opposite.profile())?;
+            data.checked_add(overhead)
+                .ok_or(Error::Arithmetic)?
+                .max(ack.checked_add(feedback).ok_or(Error::Arithmetic)?)
+        } else {
+            maximum.checked_add(overhead).ok_or(Error::Arithmetic)?
+        };
         if charge.is_some_and(|actual| actual != overhead) {
             return Err(Error::Geometry);
         }
@@ -1016,13 +1056,35 @@ fn parameters_with_fragmentation(
             if group.wire_bytes() > view.common().burst_bytes() {
                 return Err(Error::Geometry);
             }
+            if let Some(overhead) = compact_feedback {
+                let (_, feedback) = compact_wire::maximums(view.profile(), opposite.profile())?;
+                let mut framing = selected.framing;
+                framing.outer_overhead_bytes = overhead;
+                let group = framing.geometry(feedback).map_err(Error::Fragment)?;
+                if group.wire_bytes() > view.common().burst_bytes()
+                    || usize::from(selected.reassembly.feedback.max_fragments_per_message)
+                        < group.fragments()
+                    || selected.reassembly.feedback.max_message_bytes < feedback
+                {
+                    return Err(Error::Geometry);
+                }
+            }
         } else if wire > descriptor.path_mtu() || wire > view.common().burst_bytes() {
             return Err(Error::Geometry);
         }
     }
     let local = descriptor.local(context.role);
-    let (send_max, witnesses, _) = dimensions(local.send().profile(), local.receive().profile())?;
-    let (receive_max, _, _) = dimensions(local.receive().profile(), local.send().profile())?;
+    let (mut send_max, witnesses, _) =
+        dimensions(local.send().profile(), local.receive().profile())?;
+    let (mut receive_max, _, _) = dimensions(local.receive().profile(), local.send().profile())?;
+    if compact_feedback.is_some() {
+        let (data, feedback) =
+            compact_wire::maximums(local.send().profile(), local.receive().profile())?;
+        send_max = data.max(feedback);
+        let (data, feedback) =
+            compact_wire::maximums(local.receive().profile(), local.send().profile())?;
+        receive_max = data.max(feedback);
+    }
     let native_max = local.receive().max_native();
     let receive_channels = local.receive().channels();
     let digest = configuration.digest().map_err(|_| Error::Configuration)?;

@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod backing;
+mod body;
+pub use body::{ARQ_BODY_DATA_MAX_HEADER_BYTES, ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES, inspect_body};
 mod compact;
 pub(crate) use backing::{ReceiveSlot, SendSlot};
 use backing::{Received, Sent};
@@ -945,8 +947,19 @@ impl Engine {
             self.profile,
             self.receive_config.max_source_bytes,
         )?;
-        match parsed {
-            PacketView::Data { source, payload } => self.receive_source(source, payload, now)?,
+        self.receive_view(parsed, now)
+    }
+
+    fn receive_view(&mut self, view: PacketView<'_>, now: Duration) -> Result<(), RecoveryError> {
+        self.check_time(now)?;
+        view.body_encoded_len()?;
+        match view {
+            PacketView::Data { source, payload } => {
+                if payload.len() > self.receive_config.max_source_bytes {
+                    return Err(RecoveryError::SourceTooLarge);
+                }
+                self.receive_source(source, payload, now)?;
+            }
             PacketView::Ack { prefix, bitmap } => self.receive_ack(prefix, bitmap)?,
         }
         self.last_now = now;
@@ -1094,6 +1107,17 @@ impl Engine {
         allow_feedback: bool,
         allow_sources: bool,
     ) -> Result<Option<usize>, RecoveryError> {
+        self.poll_selected_body(now, output, allow_feedback, allow_sources, false)
+    }
+
+    fn poll_selected_body(
+        &mut self,
+        now: Duration,
+        output: &mut [u8],
+        allow_feedback: bool,
+        allow_sources: bool,
+        body: bool,
+    ) -> Result<Option<usize>, RecoveryError> {
         if self.compact.is_some() {
             return self.compact_poll(now, output, allow_feedback, allow_sources);
         }
@@ -1108,7 +1132,6 @@ impl Engine {
             None
         };
         if ack_ready && (!self.prefer_data || data.is_none()) {
-            ensure_output(output, ACK_PACKET_BYTES)?;
             let mut bitmap = 0;
             for source in self.received.keys() {
                 if source.0 >= self.receive_prefix {
@@ -1118,9 +1141,19 @@ impl Engine {
                     }
                 }
             }
-            write_common(output, self.context, self.profile, 2);
-            output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
-            output[40..48].copy_from_slice(&bitmap.to_be_bytes());
+            let bytes = if body {
+                PacketView::Ack {
+                    prefix: self.receive_prefix,
+                    bitmap,
+                }
+                .encode_body_into(output)?
+            } else {
+                ensure_output(output, ACK_PACKET_BYTES)?;
+                write_common(output, self.context, self.profile, 2);
+                output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
+                output[40..48].copy_from_slice(&bitmap.to_be_bytes());
+                ACK_PACKET_BYTES
+            };
             self.ack_at = None;
             self.prefer_data = true;
             self.last_now = now;
@@ -1128,8 +1161,8 @@ impl Engine {
             self.statistics.wire_bytes_emitted = self
                 .statistics
                 .wire_bytes_emitted
-                .saturating_add(ACK_PACKET_BYTES as u64);
-            return Ok(Some(ACK_PACKET_BYTES));
+                .saturating_add(bytes as u64);
+            return Ok(Some(bytes));
         }
         let Some(source) = data else {
             self.last_now = now;
@@ -1145,7 +1178,15 @@ impl Engine {
             self.last_now = now;
             return Err(error);
         }
-        let required = DATA_HEADER_BYTES + flight.payload.len();
+        let view = PacketView::Data {
+            source,
+            payload: &flight.payload,
+        };
+        let required = if body {
+            view.body_encoded_len()?
+        } else {
+            DATA_HEADER_BYTES + flight.payload.len()
+        };
         ensure_output(output, required)?;
         let is_retry = flight.attempts > 0;
         let rto = if is_retry {
@@ -1169,10 +1210,14 @@ impl Engine {
         } else {
             None
         };
-        write_common(output, self.context, self.profile, 1);
-        output[32..40].copy_from_slice(&source.0.to_be_bytes());
-        output[40..44].copy_from_slice(&(flight.payload.len() as u32).to_be_bytes());
-        output[44..required].copy_from_slice(&flight.payload);
+        if body {
+            view.encode_body_into(output)?;
+        } else {
+            write_common(output, self.context, self.profile, 1);
+            output[32..40].copy_from_slice(&source.0.to_be_bytes());
+            output[40..44].copy_from_slice(&(flight.payload.len() as u32).to_be_bytes());
+            output[44..required].copy_from_slice(&flight.payload);
+        }
         if self.profile == Profile::CarrierOnly {
             self.send_bytes -= flight.payload.len();
             self.sent.remove(&source);

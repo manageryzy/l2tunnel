@@ -115,6 +115,7 @@ pub(super) struct Bank {
     ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     rolling_fragments: Option<records::FragmentPolicy>,
+    compact_feedback_overhead: Option<usize>,
     // One actual Bank in a fallibly reserved cell keeps its two inline Engine
     // extents out of the retained State. The selected Common entry constructs
     // this owner before polling its I/O continuation.
@@ -205,6 +206,35 @@ impl Bank {
         rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
         rolling_fragments: Option<records::FragmentPolicy>,
     ) -> io::Result<Self> {
+        Self::new_selected(
+            identity,
+            epoch,
+            initial,
+            geometry,
+            native,
+            limits,
+            external_bytes,
+            ingress,
+            rolling_ingress,
+            rolling_fragments,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Selected wire geometry is bound before reservation.
+    pub(super) fn new_selected(
+        identity: tx::Identity,
+        epoch: Epoch,
+        initial: C,
+        geometry: records::Geometry,
+        native: records::NativeLimits,
+        limits: storage::storage::Limits,
+        external_bytes: usize,
+        ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+        rolling_fragments: Option<records::FragmentPolicy>,
+        compact_feedback_overhead: Option<usize>,
+    ) -> io::Result<Self> {
         if epoch.0 == 0 || identity.session.0 == [0; 16] || identity.local == identity.remote {
             return Err(invalid("invalid actual common engine Bank identity"));
         }
@@ -218,6 +248,7 @@ impl Bank {
             ingress,
             rolling_ingress,
             rolling_fragments,
+            compact_feedback_overhead,
         )?;
         let plan =
             storage::storage::Plan::for_bank(plan, external_bytes).map_err(io::Error::other)?;
@@ -245,8 +276,15 @@ impl Bank {
             ingress,
             rolling_ingress,
             rolling_fragments,
+            compact_feedback_overhead,
             storage,
         })
+    }
+
+    pub(super) fn enable_compact_wire(&mut self, feedback_overhead: usize) -> io::Result<()> {
+        self.storage
+            .enable_compact_wire(feedback_overhead)
+            .map_err(io::Error::other)
     }
 
     #[allow(dead_code)] // Typed common Driver packet access is a required next consumer.
@@ -368,6 +406,7 @@ impl Backend<C> for Bank {
             self.ingress,
             self.rolling_ingress,
             self.rolling_fragments,
+            self.compact_feedback_overhead,
         )?;
         let storage = self.storage.prepare(plan).map_err(io::Error::other)?;
         let serial = self.next_serial;
@@ -535,6 +574,7 @@ fn plan_with_options(
         ingress,
         rolling_ingress,
         None,
+        None,
     )
 }
 #[allow(clippy::too_many_arguments)] // Actual existing plan inputs plus selected fragment owners.
@@ -547,7 +587,25 @@ fn plan_with_fragmentation(
     ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     rolling_fragments: Option<records::FragmentPolicy>,
+    compact_feedback_overhead: Option<usize>,
 ) -> io::Result<records::storage::Plan> {
+    if let Some(feedback_overhead) = compact_feedback_overhead {
+        return records::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+            config,
+            records::Context {
+                session: u128::from_be_bytes(identity.session.0),
+                epoch: epoch.0,
+                role: identity.role,
+            },
+            geometry,
+            native,
+            ingress,
+            rolling_ingress,
+            common_contract::selected_fragment_policy(&config, rolling_fragments),
+            feedback_overhead,
+        )
+        .map_err(io::Error::other);
+    }
     records::storage::Plan::for_engine_with_fragmentation(
         config,
         records::Context {

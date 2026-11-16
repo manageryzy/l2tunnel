@@ -46,6 +46,73 @@ fn source(identity: Identity, records: &[RecordId], payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn compact_source_keeps_full_identities_and_bounded_canonical_record_lists() {
+    for record in [0, 127, 128, 65536, u64::MAX] {
+        let identity = identity();
+        let payload = unit(0, record as u16, b"opaque\0\0");
+        let mut output = vec![0xa5; config().max_source_bytes().unwrap()];
+        let length = encode_compact(
+            config(),
+            identity,
+            &[RecordId(record)],
+            &payload,
+            &mut output,
+        )
+        .unwrap();
+        let view =
+            decode_compact(config(), identity.scope, identity.source, &output[..length]).unwrap();
+        assert_eq!(view.identity(), identity);
+        assert_eq!(view.payload(), payload);
+        let parsed = view.units().unwrap().next().unwrap();
+        assert_eq!(parsed.identity.record, RecordId(record));
+        assert_eq!(parsed.identity.source, identity.first_unit);
+        assert!(length < HEADER_BYTES + 8 + payload.len());
+        assert!(output[length..].iter().all(|byte| *byte == 0xa5));
+        for end in 0..length {
+            assert!(
+                decode_compact(config(), identity.scope, identity.source, &output[..end]).is_err()
+            );
+        }
+        let mut short = vec![0xa5; length - 1];
+        assert_eq!(
+            encode_compact(
+                config(),
+                identity,
+                &[RecordId(record)],
+                &payload,
+                &mut short
+            ),
+            Err(Error::OutputTooSmall { needed: length })
+        );
+        assert!(short.iter().all(|byte| *byte == 0xa5));
+    }
+    let identity = identity();
+    let payload = container(&[unit(0, 65535, b"one"), unit(1, 0, b"two")]);
+    let mut output = vec![0; config().max_source_bytes().unwrap()];
+    let length = encode_compact(
+        config(),
+        identity,
+        &[RecordId(u64::MAX), RecordId(65536)],
+        &payload,
+        &mut output,
+    )
+    .unwrap();
+    let view =
+        decode_compact(config(), identity.scope, identity.source, &output[..length]).unwrap();
+    assert_eq!(
+        view.units()
+            .unwrap()
+            .map(|unit| unit.identity.record.0)
+            .collect::<Vec<_>>(),
+        [u64::MAX, 65536]
+    );
+    // Unknown flags and nonminimal scalar encodings have no alternate interpretation.
+    output[1] = 2;
+    assert!(decode_compact(config(), identity.scope, identity.source, &output[..length]).is_err());
+    assert!(decode_compact(config(), identity.scope, identity.source, &[1, 1, 0x80, 0]).is_err());
+}
+
+#[test]
 fn exact_header_and_distinct_source_unit_record_spaces_round_trip() {
     for direction in [
         Direction::InitiatorToResponder,

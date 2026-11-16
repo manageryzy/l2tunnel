@@ -10,6 +10,7 @@ pub mod legacy_sliding;
 pub mod research;
 pub mod rolling;
 pub mod storage;
+mod symbol_output;
 mod wire;
 
 pub use decoder::{

@@ -25,8 +25,13 @@ impl Engine {
         original_cap: Tick,
         body: &[u8],
     ) -> Result<(), Error> {
-        let (header, native) = records::route::decode(body)
-            .map_err(|error| Error::Connections(records::Error::Route(error)))?;
+        let Owner::Connections(owner) = &self.owner else {
+            return Err(Error::Invariant);
+        };
+        let (header, native) = owner
+            .collection
+            .decode_route(body)
+            .map_err(Error::Connections)?;
         let receive = self
             .configuration
             .descriptor()

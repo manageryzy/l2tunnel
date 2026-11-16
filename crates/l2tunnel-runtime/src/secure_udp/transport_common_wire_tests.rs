@@ -334,3 +334,310 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
             Ok(())
         })
 }
+
+fn mixed_selected(
+    kind: cover::Appearance,
+    protection: security::compact::Protection,
+) -> Result<([CommonTransactionContract; 2], Vec<C>)> {
+    use l2tunnel::record_configuration as c;
+    let (base, _) = selected(kind, protection)?;
+    let overhead = base[0].geometry().forward_overhead_bytes;
+    let originals = udp_values(kind)?;
+    let mut descriptors = Vec::new();
+    for original in originals {
+        let descriptor = original.descriptor();
+        let profile = match *descriptor.profile() {
+            c::Profile::Swift { forward, reverse } => c::Profile::Swift { forward, reverse },
+            c::Profile::Aligned {
+                mut forward,
+                mut reverse,
+            } => {
+                forward.recovery.outer_overhead_bytes = overhead;
+                reverse.recovery.outer_overhead_bytes = overhead;
+                c::Profile::Aligned { forward, reverse }
+            }
+            c::Profile::Packed {
+                mut forward,
+                mut reverse,
+            } => {
+                forward.base.recovery.outer_overhead_bytes = overhead;
+                reverse.base.recovery.outer_overhead_bytes = overhead;
+                c::Profile::Packed { forward, reverse }
+            }
+            _ => return Err("unexpected mixed fixture profile".into()),
+        };
+        let make = |profile| {
+            c::Descriptor::new(
+                descriptor.path_mtu(),
+                descriptor.duplex(),
+                *descriptor.direction(mg::Role::Client).common(),
+                *descriptor.direction(mg::Role::Server).common(),
+                profile,
+            )
+        };
+        descriptors.push(make(profile)?);
+        match profile {
+            c::Profile::Aligned { forward, reverse } => {
+                descriptors.push(make(c::Profile::AlignedCompact {
+                    forward: super::compact::direction(forward, false, overhead)?,
+                    reverse: super::compact::direction(reverse, true, overhead)?,
+                })?)
+            }
+            c::Profile::Packed { forward, reverse } => {
+                descriptors.push(make(c::Profile::PackedCompact {
+                    forward: l2tunnel_aligned::packed::CompactConfig {
+                        base: super::compact::direction(forward.base, false, overhead)?,
+                        hold_micros: forward.hold_micros,
+                        max_units: forward.max_units,
+                        work_limit: forward.work_limit,
+                    },
+                    reverse: l2tunnel_aligned::packed::CompactConfig {
+                        base: super::compact::direction(reverse.base, true, overhead)?,
+                        hold_micros: reverse.hold_micros,
+                        max_units: reverse.max_units,
+                        work_limit: reverse.work_limit,
+                    },
+                })?)
+            }
+            _ => {}
+        }
+    }
+    let catalog = Catalog::new(descriptors[0], &descriptors)?;
+    let envelope = base[0].envelope();
+    let configurations = catalog.configurations(envelope)?;
+    let make = |role| -> Result<CommonTransactionContract> {
+        Ok(CommonTransactionContract::new_compact_wire(
+            security::ConfigDigest([0xc2; 32]),
+            role,
+            [base[0].resources(); 2],
+            appearance(kind, role == security::Role::Initiator)?,
+            false,
+            envelope,
+            catalog.clone(),
+            base[0].settings(),
+            base[0]
+                .compact_wire()
+                .ok_or_else(|| io::Error::other("selected compact wire"))?,
+        )?)
+    };
+    Ok((
+        [
+            make(security::Role::Initiator)?,
+            make(security::Role::Responder)?,
+        ],
+        configurations,
+    ))
+}
+
+async fn reject_migrated_feedback_confusion(fixture: &mut Fixture) -> Result {
+    use l2tunnel::record_configuration::Profile;
+    use l2tunnel::record_engine::EmissionKind;
+    let selected = fixture.endpoints[0].driver.common_state()?.current();
+    let mut feedback = vec![2; 128];
+    let bytes = match selected.descriptor().profile() {
+        Profile::Aligned { .. } | Profile::Packed { .. } => l2tunnel_recovery::PacketView::Ack {
+            prefix: 0,
+            bitmap: 0,
+        }
+        .encode_body_into(&mut feedback[1..])?,
+        Profile::AlignedCompact { .. } | Profile::PackedCompact { .. } => {
+            l2tunnel_recovery::CompactPacketView::Feedback(l2tunnel_recovery::CompactFeedback {
+                prefix: 0,
+                start: 0,
+                count: 0,
+                echo: 0,
+                receiver_delay_us: 0,
+                serial: 1,
+                bitmap: &[],
+            })
+            .encode_compact_into(&mut feedback[1..])?
+        }
+        _ => return Ok(()),
+    };
+    feedback.truncate(1 + bytes);
+    let target = &fixture.endpoints[0].driver;
+    assert_eq!(
+        target
+            .common_state()?
+            .engine(target.common_state()?.epoch())?
+            .inspect_peer(&feedback)?,
+        EmissionKind::Feedback
+    );
+    // Valid feedback in the short Data domain and malformed unions in either
+    // domain must be rejected before recovery state or authenticated liveness.
+    for (strong, plaintext) in [
+        (false, feedback.as_slice()),
+        (false, &[0xff, 0][..]),
+        (true, &[0xff, 0][..]),
+    ] {
+        let sender = &mut fixture.endpoints[1];
+        let mut wire = vec![0; 1500];
+        let sealed = if strong {
+            sender.driver.records.seal_feedback_in(
+                sender.driver.source_scope,
+                meta(0, cover::Phase::Established),
+                plaintext,
+                &mut sender.driver.buffers.seal,
+                &mut wire,
+            )?
+        } else {
+            sender.driver.records.seal_user_in(
+                sender.driver.source_scope,
+                meta(0, cover::Phase::Established),
+                plaintext,
+                &mut sender.driver.buffers.seal,
+                &mut wire,
+            )?
+        };
+        wire.truncate(sealed.bytes);
+        assert_eq!(sender.socket.try_send(&wire)?, wire.len());
+        let target = &mut fixture.endpoints[0];
+        let rejected = target.driver.counters.rejected_packets;
+        let verified = target.driver.live.last_verified_micros;
+        let drained = target
+            .driver
+            .common_state()?
+            .engine(target.driver.common_state()?.epoch())?
+            .drained()?;
+        assert_eq!(receive(target, fixture.now).await?, wire);
+        assert_eq!(target.driver.counters.rejected_packets, rejected + 1);
+        assert_eq!(target.driver.live.last_verified_micros, verified);
+        assert_eq!(
+            target
+                .driver
+                .common_state()?
+                .engine(target.driver.common_state()?.epoch())?
+                .drained()?,
+            drained
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn selected_compact_wire_mixed_algorithms_switch_and_deliver_original_udp() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            for protection in [
+                security::compact::Protection::Aes128Ccm4,
+                security::compact::Protection::ChaCha20Crc32c,
+            ] {
+                let appearance = cover::Appearance::QuicLike;
+                let (contracts, values) = mixed_selected(appearance, protection)?;
+                let expected = contracts[0].expected_configuration();
+                let mut fixture =
+                    Fixture::from_contracts_setup(appearance, contracts, true, Some(expected))
+                        .await?;
+                fixture.exchange_all_channels(31).await?;
+                for (index, target) in values
+                    .iter()
+                    .copied()
+                    .skip(1)
+                    .chain([values[0]])
+                    .enumerate()
+                {
+                    let epoch = fixture.switch(target).await?;
+                    reject_migrated_feedback_confusion(&mut fixture).await?;
+                    fixture.exchange_all_channels(40 + index as u8 * 5).await?;
+                    for endpoint in &fixture.endpoints {
+                        let runtime = endpoint
+                            .driver
+                            .common
+                            .as_ref()
+                            .ok_or("actual compact runtime")?;
+                        assert!(runtime.contract.compact_wire().is_some());
+                        assert!(runtime.compact_feedback_number.is_some());
+                        assert_eq!(*endpoint.driver.common_state()?.current(), target);
+                        assert_eq!(endpoint.driver.common_state()?.epoch(), epoch);
+                        assert_eq!(
+                            (endpoint.socket.local_addr()?, endpoint.socket.peer_addr()?),
+                            endpoint.original
+                        );
+                        assert!(endpoint.driver.records.is_compact());
+                    }
+                }
+            }
+            Ok(())
+        })
+}
+
+#[test]
+fn selected_compact_wire_mtu_uses_actual_union_and_preserves_storage_bounds() -> Result {
+    use l2tunnel::record_engine as engine;
+    let kind = cover::Appearance::QuicLike;
+    let (base, values) = mixed_selected(kind, security::compact::Protection::Aes128Ccm4)?;
+    let value = values
+        .iter()
+        .copied()
+        .find(|value| {
+            matches!(
+                value.descriptor().profile(),
+                l2tunnel::record_configuration::Profile::Packed { .. }
+            )
+        })
+        .ok_or("actual Packed catalog member")?;
+    let descriptor = value.descriptor();
+    let l2tunnel::record_configuration::Profile::Packed { forward, reverse } = descriptor.profile()
+    else {
+        return Err("actual Packed owner".into());
+    };
+    let overhead = base[0].geometry().forward_overhead_bytes;
+    let maximum = forward
+        .base
+        .recovery
+        .compact_wire_maximum_data_bytes()?
+        .max(reverse.base.recovery.compact_wire_maximum_data_bytes()?);
+    let mtu = maximum + overhead;
+    let descriptor = l2tunnel::record_configuration::Descriptor::new(
+        mtu,
+        descriptor.duplex(),
+        *descriptor.direction(mg::Role::Client).common(),
+        *descriptor.direction(mg::Role::Server).common(),
+        *descriptor.profile(),
+    )?;
+    let selected = C::new(value.envelope(), descriptor)?;
+    let context = engine::Context {
+        session: 1,
+        epoch: 1,
+        role: mg::Role::Client,
+    };
+    assert!(
+        engine::storage::Plan::for_engine(
+            selected,
+            context,
+            base[0].geometry(),
+            base[0].native_limits()?
+        )
+        .is_err()
+    );
+    let plan = engine::storage::Plan::for_engine_with_compact_wire(
+        selected,
+        context,
+        base[0].geometry(),
+        base[0].native_limits()?,
+        None,
+        None,
+        base[0].feedback_overhead_bytes()?,
+    )?;
+    let mut resources = base[0].resources();
+    resources.path_mtu = mtu;
+    for stream in &mut resources.streams.as_mut().ok_or("streams")?.streams {
+        stream.path_mtu = mtu;
+    }
+    let contract = CommonTransactionContract::new_compact_wire(
+        security::ConfigDigest([0xc3; 32]),
+        security::Role::Initiator,
+        [resources; 2],
+        base[0].cover(),
+        false,
+        selected.envelope(),
+        Catalog::new(descriptor, &[descriptor])?,
+        base[0].settings(),
+        base[0].compact_wire().ok_or("compact selection")?,
+    )?;
+    assert_eq!(contract.initial(), selected);
+    assert!(plan.heap_bytes() > 0);
+    Ok(())
+}

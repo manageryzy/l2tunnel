@@ -5,6 +5,9 @@
 //! authenticated session. This codec has no keys, replay state or transport.
 use super::{Config, Error, MAX_PAYLOAD, Repair, RepairId, Scope, SourceId, Support, add};
 
+/// Explicit context-free selected union; legacy formats remain unchanged.
+pub mod compact;
+
 /// Complete fixed version-one header, excluding the negotiated vector.
 pub const HEADER_BYTES: usize = 64;
 /// Maximum full record under the rolling payload limit; block limits are separate.

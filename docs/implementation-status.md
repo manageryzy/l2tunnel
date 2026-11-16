@@ -15,9 +15,12 @@ the selected H0, both directions, authenticated liveness and observed release.
 The complete affected client library passes 372 cases; required check stages and
 1,658 simulator cases have retained evidence, including initial failures and
 scoped follow-ups. This is not a pristine single full-suite run. The new format
-is opt-in and currently accepts Swift-only full-duplex UDP catalogs; Aligned,
-Packed, other algorithms, raw TCP single protection, full SW-11/all47 and the
-original MTU/repair/performance gates remain open without reduced definitions.
+was opt-in and Swift-only at that checkpoint. The subsequent
+[runtime algorithm migration](modules/compact-wire-cleanup.md#runtime-algorithm-migration)
+connects Aligned/Packed, CompactARQ, independent owners, Rolling and Research to
+the selected original-UDP format and negotiated epoch switching. Its own evidence
+is recorded separately; raw TCP single protection, other outer carriers, full
+SW-11/all47 and original MTU/repair/performance gates retain their definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

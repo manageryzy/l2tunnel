@@ -395,12 +395,29 @@ impl Sender {
     /// Encode complete retained source bytes using the actual recovery owner's ID.
     /// Neither successful encoding nor output pressure consumes local ownership.
     pub fn write_pending(&self, source: SourceId, output: &mut [u8]) -> Result<usize, Error> {
+        self.write_pending_selected(source, output, false)
+    }
+    /// Write compact packing metadata directly, retaining the same pending owner.
+    pub fn write_pending_compact(&self, output: &mut [u8]) -> Result<usize, Error> {
+        self.write_pending_selected(SourceId(0), output, true)
+    }
+    fn write_pending_selected(
+        &self,
+        source: SourceId,
+        output: &mut [u8],
+        compact: bool,
+    ) -> Result<usize, Error> {
         self.live()?;
         let packed = self.packing.pending().ok_or(Error::NoPending)?;
         if usize::from(packed.units) != self.records.len() || !(1..=4).contains(&packed.copies) {
             return Err(Error::Ownership);
         }
-        envelope::encode(
+        let encode = if compact {
+            envelope::encode_compact
+        } else {
+            envelope::encode
+        };
+        encode(
             self.config.envelope(),
             envelope::Identity {
                 scope: self.scope,

@@ -7,6 +7,9 @@ use crate::{
 };
 use std::fmt;
 
+mod compact;
+pub use compact::{decode_compact, encode_compact};
+
 /// Bytes added before the unchanged Python aligned symbol.
 pub const HEADER_BYTES: usize = Layout::Aligned.header_bytes();
 /// Envelope format version, independent of the Python inner format.

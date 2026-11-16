@@ -186,8 +186,10 @@ fn transfer(
             l2tunnel_reliable::RecordKind::Source
         }
     );
-    // The real selected packet is v2; no legacy direct/FEC packet was substituted.
-    assert_eq!(output[12], 2);
+    assert_eq!(
+        body!(&*from, inspect_output(&output[..length]))?,
+        token.kind
+    );
     let mut held = vec![0x5a; from.maximum()];
     let unchanged = budget;
     assert_eq!(from.poll(now, feedback, &mut held, &mut budget)?, None);
@@ -207,6 +209,16 @@ fn transfer(
 #[test]
 fn reserved_compact_aligned_and_packed_deliver_asymmetric_native_bytes_after_actual_source_loss()
 -> TestResult {
+    asymmetric_loss(false)
+}
+
+#[test]
+fn selected_compact_wire_preserves_asymmetric_loss_recovery_physical_custody_and_native_bytes()
+-> TestResult {
+    asymmetric_loss(true)
+}
+
+fn asymmetric_loss(compact_wire: bool) -> TestResult {
     let frames = tests::native_frames()?;
     assert!(frames.len() >= 2);
     for is_packed in [false, true] {
@@ -242,6 +254,10 @@ fn reserved_compact_aligned_and_packed_deliver_asymmetric_native_bytes_after_act
             is_packed,
             b_plan.capacity_bytes(),
         )?;
+        if compact_wire {
+            body!(&mut a, enable_compact_wire(41))?;
+            body!(&mut b, enable_compact_wire(97))?;
+        }
         let a_usage = a.usage().ok_or("actual A heap")?;
         let b_usage = b.usage().ok_or("actual B heap")?;
         assert_eq!(a_usage.capacity_bytes, a_plan.capacity_bytes());

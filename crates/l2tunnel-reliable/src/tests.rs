@@ -3,6 +3,8 @@ use super::*;
 mod feedback_custody;
 #[path = "physical_tests.rs"]
 mod physical;
+#[path = "selected_wire_tests.rs"]
+mod selected_wire;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -281,6 +281,26 @@ impl Decoder {
     ) -> Result<AcceptStatus, Error> {
         self.check_time(now_ticks)?;
         let view = inspect(authenticated_packet, self.context, self.config.block)?;
+        self.accept_validated_view(view, now_ticks)
+    }
+
+    /// Accept a typed symbol after the caller validates the selected outer context,
+    /// integrity and replay policy. All dimensions and state constraints remain checked.
+    pub fn accept_view(
+        &mut self,
+        view: crate::SymbolView<'_>,
+        now_ticks: u64,
+    ) -> Result<AcceptStatus, Error> {
+        self.check_time(now_ticks)?;
+        view.validate(self.config.block)?;
+        self.accept_validated_view(view, now_ticks)
+    }
+
+    fn accept_validated_view(
+        &mut self,
+        view: crate::SymbolView<'_>,
+        now_ticks: u64,
+    ) -> Result<AcceptStatus, Error> {
         self.check_generation(view.generation)?;
         let mut new_generation = None;
         let generation = if let Some(generation) = self.generations.get(&view.generation) {

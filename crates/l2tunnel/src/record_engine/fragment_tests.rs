@@ -544,3 +544,115 @@ fn actual_bank_fragment_receipt_refuses_foreign_generation_before_time_and_waits
     ));
     Ok(())
 }
+
+#[test]
+fn compact_fragment_asymmetric_strong_feedback_keeps_exact_group_and_native_custody() -> TestResult
+{
+    let c = fixture()?;
+    let build_selected = |role, feedback| -> TestResult<Engine> {
+        let plan = storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+            c,
+            context(role),
+            tests::geometry(),
+            NativeLimits {
+                stall_micros: 50000,
+            },
+            None,
+            None,
+            Some(policy()),
+            feedback,
+        )?;
+        Ok(Engine::new_reserved(
+            plan,
+            storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            },
+        )?)
+    };
+    let mut a = build_selected(Role::Client, 29)?;
+    let mut b = build_selected(Role::Server, 85)?;
+    let original = tests::packet(true, 4401, 1460, 0x73);
+    let identity = admit(&mut a, &original)?;
+    let mut delivered = false;
+    let mut feedback_seen = false;
+    let mut number = 0;
+    for step in 1..=32u64 {
+        let now = Tick(step * 1000);
+        for reverse in [false, true] {
+            let (sender, peer, data_overhead, feedback_overhead) = if reverse {
+                (&mut b, &mut a, 73, 85)
+            } else {
+                (&mut a, &mut b, 17, 29)
+            };
+            sender.step(now, work())?;
+            let mut budget = OutboundBudget {
+                packets: 8,
+                wire_bytes: 100_000,
+            };
+            let before = budget;
+            let Some(group) = sender.reserve_fragment_group_until(
+                now,
+                number,
+                true,
+                Tick(100000),
+                &mut budget,
+                &mut witnesses(),
+            )?
+            else {
+                continue;
+            };
+            assert_eq!(before.packets - budget.packets, group.packets);
+            assert_eq!(before.wire_bytes - budget.wire_bytes, group.wire_bytes);
+            let overhead = if group.kind == EmissionKind::Feedback {
+                feedback_seen = true;
+                feedback_overhead
+            } else {
+                data_overhead
+            };
+            let mut physical = 0;
+            for _ in 0..group.packets {
+                number += 1;
+                let mut output = [0; 1500];
+                let emitted = sender
+                    .poll_reserved_fragment(now, number, &mut output)?
+                    .ok_or("selected fragment")?;
+                assert_eq!(
+                    emitted.emission.bytes + overhead,
+                    emitted.emission.wire_bytes
+                );
+                physical += emitted.emission.wire_bytes;
+                let bytes = &output[..emitted.emission.bytes];
+                assert_eq!(peer.inspect_fragment_kind(bytes)?, group.kind);
+                let before_receive = peer.fragment_ingress_snapshot();
+                assert!(
+                    peer.inspect_fragment_kind(&bytes[..bytes.len() - 1])
+                        .is_err()
+                );
+                assert_eq!(peer.fragment_ingress_snapshot(), before_receive);
+                peer.accept_fragment_authenticated_until(now, now, Tick(100000), number, bytes)?;
+                let token = sender
+                    .pending_fragment_output()
+                    .ok_or("selected physical token")?;
+                sender.confirm_fragment_at(now, now, token)?;
+            }
+            assert_eq!(physical, group.wire_bytes);
+        }
+        for _ in 0..8 {
+            b.step(now, work())?;
+            let mut output = [0; 1500];
+            if let NativePreparation::Ready(packet) =
+                b.prepare_native(now, 32, Tick(100000), &mut output)?
+            {
+                assert_eq!(packet.identity(), identity);
+                assert_eq!(&output[..packet.bytes()], original);
+                b.commit_native(now, packet.token())?;
+                delivered = true;
+            }
+        }
+        if delivered && feedback_seen {
+            break;
+        }
+    }
+    assert!(delivered && feedback_seen);
+    Ok(())
+}

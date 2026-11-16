@@ -1,5 +1,10 @@
 # Reserved common record engine storage
 
+Selected compact v3 now uses this module through the existing runtime owners.
+See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+for the selected wire representation, exact-cost boundaries and validation scope.
+Legacy constructors and historical receipts below retain their original meaning.
+
 Status: **actual single Swift owner and complete reserved common Engine
 implemented and protocol-tested; full mixed Bank/runtime/resource/stage gates
 remain open**. The source-stable affected checkpoint passes142 distinct cases,

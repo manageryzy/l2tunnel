@@ -208,6 +208,7 @@ fn frame() -> io::Result<ProxyFrame> {
             effective_carrier: [6; 32],
             requested_cover: l2tunnel_cover::Appearance::QuicLike,
             effective_cover: None,
+            compact_wire: None,
             local_addr: "127.0.0.1:41921".parse().map_err(io::Error::other)?,
             peer_addr: "127.0.0.1:41922".parse().map_err(io::Error::other)?,
             installed: false,

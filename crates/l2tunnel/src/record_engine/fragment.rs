@@ -260,6 +260,8 @@ pub(super) struct Plan {
     reassembly: [codec::fragment_storage::Plan; 3],
     logical_bytes: usize,
     encoded_bytes: usize,
+    compact_feedback: Option<(usize, usize)>,
+    compact_receive_feedback: Option<usize>,
     heap_bytes: usize,
 }
 impl Plan {
@@ -267,8 +269,17 @@ impl Plan {
         policy: FragmentPolicy,
         context: Context,
         send_max: usize,
+        compact_feedback: Option<(usize, usize)>,
     ) -> Result<Self, FragmentStorageError> {
         let (send, receive) = policy.local(context.role);
+        let compact_receive_feedback = compact_feedback
+            .map(|(overhead, _)| {
+                overhead
+                    .checked_sub(send.framing.outer_overhead_bytes)
+                    .and_then(|delta| receive.framing.outer_overhead_bytes.checked_add(delta))
+                    .ok_or(FragmentStorageError::Layout)
+            })
+            .transpose()?;
         let limits = receive.reassembly.values();
         let reassembly = [
             codec::fragment_storage::Plan::for_reassembly(limits[0])
@@ -278,11 +289,21 @@ impl Plan {
             codec::fragment_storage::Plan::for_reassembly(limits[2])
                 .map_err(FragmentStorageError::Reassembly)?,
         ];
-        let encoded_bytes = send
+        let mut encoded_bytes = send
             .framing
             .geometry(send_max)
             .map_err(FragmentStorageError::Codec)?
             .encoded_bytes();
+        if let Some((overhead, feedback)) = compact_feedback {
+            let mut framing = send.framing;
+            framing.outer_overhead_bytes = overhead;
+            encoded_bytes = encoded_bytes.max(
+                framing
+                    .geometry(feedback)
+                    .map_err(FragmentStorageError::Codec)?
+                    .encoded_bytes(),
+            );
+        }
         let mut heap_bytes = slab_layout(send_max)?
             .checked_add(slab_layout(encoded_bytes)?)
             .ok_or(FragmentStorageError::Layout)?;
@@ -299,6 +320,8 @@ impl Plan {
             reassembly,
             logical_bytes: send_max,
             encoded_bytes,
+            compact_feedback,
+            compact_receive_feedback,
             heap_bytes,
         })
     }
@@ -382,15 +405,24 @@ pub(super) struct State {
     statistics: FragmentStatistics,
 }
 impl State {
+    pub(super) fn compact_feedback_overhead(&self) -> Option<usize> {
+        self.plan.compact_feedback.map(|value| value.0)
+    }
     pub(super) fn new(plan: Plan, context: Context) -> Result<Self, FragmentStorageError> {
         let epoch = crate::core::Epoch(context.epoch);
         let make_sender = |index| {
+            let mut framing = plan.send.framing;
+            if index == 2
+                && let Some((overhead, _)) = plan.compact_feedback
+            {
+                framing.outer_overhead_bytes = overhead;
+            }
             codec::Fragmenter::new(
                 codec::FragmentContext {
                     session: plan.send.labels[index],
                     epoch,
                 },
-                plan.send.framing,
+                framing,
                 plan.send.first_message,
             )
             .map_err(FragmentStorageError::Codec)
@@ -585,15 +617,30 @@ impl Engine {
             .framing
             .geometry(self.send_max)
             .map_err(Error::Fragment)?;
+        let feedback_maximum = state
+            .plan
+            .compact_feedback
+            .map(|(_, bytes)| state.senders[2].geometry(bytes).map_err(Error::Fragment))
+            .transpose()?;
+        let max_packets = feedback_maximum
+            .as_ref()
+            .map_or(maximum.fragments(), |feedback| {
+                feedback.fragments().max(maximum.fragments())
+            });
+        let max_wire = feedback_maximum
+            .as_ref()
+            .map_or(maximum.wire_bytes(), |feedback| {
+                feedback.wire_bytes().max(maximum.wire_bytes())
+            });
         state
             .statistics
             .packets_written
-            .checked_add(u64::try_from(maximum.fragments()).map_err(|_| Error::Arithmetic)?)
+            .checked_add(u64::try_from(max_packets).map_err(|_| Error::Arithmetic)?)
             .ok_or(Error::Arithmetic)?;
         state
             .statistics
             .wire_bytes_written
-            .checked_add(u64::try_from(maximum.wire_bytes()).map_err(|_| Error::Arithmetic)?)
+            .checked_add(u64::try_from(max_wire).map_err(|_| Error::Arithmetic)?)
             .ok_or(Error::Arithmetic)?;
         state
             .statistics
@@ -728,7 +775,16 @@ impl Engine {
         }
         let wire_bytes = source
             .len()
-            .checked_add(state.plan.send.framing.outer_overhead_bytes)
+            .checked_add(if group.metadata.kind == EmissionKind::Feedback {
+                state
+                    .plan
+                    .compact_feedback
+                    .map_or(state.plan.send.framing.outer_overhead_bytes, |value| {
+                        value.0
+                    })
+            } else {
+                state.plan.send.framing.outer_overhead_bytes
+            })
             .ok_or(Error::Arithmetic)?;
         let fragment = FragmentEmission {
             emission: Emission {
@@ -838,7 +894,8 @@ impl Engine {
     }
     /// Classify every authenticated LX fragment, including non-first fragments,
     /// using exact selected labels under this full Engine context and epoch.
-    /// This is not authentication and does not validate complete body geometry.
+    /// Validate complete immutable fragment geometry and its selected physical MTU.
+    /// This structural preflight grants no authentication, replay or admission authority.
     pub fn inspect_fragment_kind(&self, fragment: &[u8]) -> Result<EmissionKind, Error> {
         let state = self.fragments.as_ref().ok_or(Error::FragmentPolicy)?;
         let header = codec::inspect_fragment_context(fragment).map_err(Error::Fragment)?;
@@ -852,6 +909,26 @@ impl Engine {
             .iter()
             .position(|label| *label == header.session)
             .ok_or(Error::Fragment(codec::FragmentError::WrongContext))?;
+        state.lanes[index]
+            .receiver
+            .validate_fragment(fragment)
+            .map_err(Error::Fragment)?;
+        let overhead = if index == 2 {
+            state
+                .plan
+                .compact_receive_feedback
+                .unwrap_or(state.plan.receive.framing.outer_overhead_bytes)
+        } else {
+            state.plan.receive.framing.outer_overhead_bytes
+        };
+        if fragment
+            .len()
+            .checked_add(overhead)
+            .ok_or(Error::Arithmetic)?
+            > state.plan.receive.framing.path_mtu
+        {
+            return Err(Error::PacketSize);
+        }
         Ok(match index {
             0 => EmissionKind::Source(SourceForm::SystematicFec),
             1 => EmissionKind::Repair,
@@ -902,14 +979,6 @@ impl Engine {
         let index = lane_index(kind)?;
         self.advance(now)?;
         let state = self.fragments.as_mut().ok_or(Error::Invariant)?;
-        if fragment
-            .len()
-            .checked_add(state.plan.receive.framing.outer_overhead_bytes)
-            .ok_or(Error::Arithmetic)?
-            > state.plan.receive.framing.path_mtu
-        {
-            return Err(Error::PacketSize);
-        }
         let lane = &mut state.lanes[index];
         if lane.held.is_some() {
             return Err(Error::FragmentBusy);

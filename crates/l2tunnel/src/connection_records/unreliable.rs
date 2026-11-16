@@ -53,6 +53,7 @@ pub(super) struct RawReceive {
 pub struct UnreliableOutput {
     instance: u64,
     inner: RawSend,
+    route_bytes: usize,
 }
 impl UnreliableOutput {
     /// Original owner/incarnation/event, without peer-delivery authority.
@@ -61,7 +62,7 @@ impl UnreliableOutput {
     }
     /// Exact routed bytes retained in the caller's output buffer.
     pub fn bytes(&self) -> usize {
-        route::HEADER_BYTES + self.inner.bytes
+        self.route_bytes + self.inner.bytes
     }
     /// Exact route and actual external carrier charge, already debited once.
     pub const fn wire_bytes(&self) -> usize {
@@ -311,6 +312,7 @@ impl Collection {
             .map(|inner| UnreliableOutput {
                 instance: self.instance,
                 inner,
+                route_bytes: self.route_bytes(true),
             }))
     }
 
@@ -331,9 +333,10 @@ impl Collection {
         }
         let config = self.plan.config();
         let policy = config.send_unreliable.ok_or(Error::Invariant)?;
+        let route_bytes = self.route_bytes(true);
         let length = inner
             .bytes
-            .checked_add(route::HEADER_BYTES)
+            .checked_add(route_bytes)
             .ok_or(Error::Arithmetic)?;
         if output.len() < length {
             return Err(Error::Output { required: length });
@@ -346,18 +349,17 @@ impl Collection {
         }
         let emitted = next(self.unreliable_statistics.emitted)?;
         let mut header = [0; route::HEADER_BYTES];
-        route::Header {
+        let route = route::Header {
             owner: id,
             incarnation: inner.identity.incarnation,
             class: route::Class::UnreliableNative,
             unreliable_serial: inner.identity.serial,
-        }
-        .encode(&mut header)
-        .map_err(Error::Route)?;
+        };
+        self.encode_route(route, &mut header[..route_bytes])?;
         let range = payload_range(id, policy.max_bytes, inner.bytes)?;
         let source = self.raw_send.get(range).ok_or(Error::Invariant)?;
-        output[..route::HEADER_BYTES].copy_from_slice(&header);
-        output[route::HEADER_BYTES..length].copy_from_slice(source);
+        output[..route_bytes].copy_from_slice(&header[..route_bytes]);
+        output[route_bytes..length].copy_from_slice(source);
         inner.prepared_at = Some(now);
         inner.wire_bytes = wire;
         self.slot_mut(id)?.raw_send = Some(inner);
@@ -367,6 +369,7 @@ impl Collection {
         Ok(Some(UnreliableOutput {
             instance: self.instance,
             inner,
+            route_bytes: self.route_bytes(true),
         }))
     }
 
@@ -423,7 +426,7 @@ impl Collection {
         packet: &[u8],
         class: Classification,
     ) -> Result<(), Error> {
-        let (header, bytes) = route::decode(packet).map_err(Error::Route)?;
+        let (header, bytes) = self.decode_route(packet)?;
         if header.class != route::Class::UnreliableNative {
             return self.accept_authenticated_at(received, observed, packet);
         }

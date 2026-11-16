@@ -20,7 +20,10 @@ fn allocate_instance() -> Result<u64, Error> {
         .map_err(|_| Error::Arithmetic)
 }
 
+#[doc(hidden)]
+pub mod compact_wire;
 mod config;
+use compact_wire::CompactRecovery;
 mod copies;
 mod deferred_feedback;
 mod endpoint;

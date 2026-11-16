@@ -23,9 +23,17 @@ impl Endpoint<crate::fec::research::Config> {
             return Err(Error::Time);
         }
         self.advance(now)?;
-        let crate::fec::research::wire::View::Feedback(feedback) =
+        let parsed = if self.compact_feedback_overhead.is_some() {
+            crate::fec::research::wire::compact::inspect(
+                self.send_config.scheduler,
+                self.send_rolling_scope,
+                bytes,
+            )
+        } else {
             crate::fec::research::wire::inspect(self.send_config.scheduler, bytes)
-                .map_err(Error::Rolling)?
+        };
+        let crate::fec::research::wire::View::Feedback(feedback) =
+            parsed.map_err(Error::Rolling)?
         else {
             return Err(Error::Identity);
         };
@@ -91,14 +99,16 @@ impl Endpoint<crate::fec::research::Config> {
             if now >= input.deadline {
                 return self.fail(Error::Expired);
             }
-            let result = self
-                .sender
-                .receive_feedback_wire_at(
-                    front.bytes(),
-                    rolling::Tick(input.received.0),
-                    rolling::Tick(now.0),
-                )
-                .map_err(Error::Rolling);
+            let result = compact_wire::receive_feedback::<crate::fec::research::Config>(
+                self.compact_feedback_overhead.is_some(),
+                self.send_config.scheduler,
+                self.send_rolling_scope,
+                &mut self.sender,
+                front.bytes(),
+                rolling::Tick(input.received.0),
+                rolling::Tick(now.0),
+            )
+            .map_err(Error::Rolling);
             if let Err(error) = result {
                 return self.fail(error);
             }

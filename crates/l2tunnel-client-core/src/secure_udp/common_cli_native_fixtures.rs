@@ -50,7 +50,12 @@ fn direction(layer: PacketLayer, native: usize, rate: u64) -> io::Result<common:
     )
     .map_err(io::Error::other)
 }
-fn aligned(layer: PacketLayer, native: usize, overhead: usize, packed: bool) -> aligned::Config {
+pub(super) fn aligned(
+    layer: PacketLayer,
+    native: usize,
+    overhead: usize,
+    packed: bool,
+) -> aligned::Config {
     let symbol = if packed { 320 } else { 256 };
     let original = if packed {
         56 + 8 * 3 + symbol

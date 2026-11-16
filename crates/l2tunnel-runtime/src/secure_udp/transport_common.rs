@@ -369,7 +369,7 @@ fn reserve_common_state(
     external: usize,
 ) -> io::Result<owner::ReservedCommonState> {
     let config = contract.resources();
-    let bank = common_engines::Bank::new_with_fragmentation(
+    let mut bank = common_engines::Bank::new_selected(
         identity,
         core::Epoch(config.data_epoch.0),
         contract.initial(),
@@ -382,7 +382,14 @@ fn reserve_common_state(
         config.ack_coalescing,
         config.rolling_ingress,
         config.rolling_fragments,
+        contract
+            .compact_wire()
+            .map(|_| contract.feedback_overhead_bytes())
+            .transpose()?,
     )?;
+    if contract.compact_wire().is_some() {
+        bank.enable_compact_wire(contract.feedback_overhead_bytes()?)?;
+    }
     let state = transactions::CommonState::new(
         identity,
         core::Epoch(config.data_epoch.0),
@@ -644,22 +651,39 @@ impl Driver {
             // the one actual retained authenticated-feedback payload capacity.
             .and_then(|v| v.checked_add(config.security.max_body_bytes))
             .ok_or_else(exhausted)?;
-        let initial_plan = engine::storage::Plan::for_engine_with_fragmentation(
-            contract.initial(),
-            engine::Context {
-                session: u128::from_be_bytes(identity.session.0),
-                epoch: config.data_epoch.0,
-                role,
-            },
-            contract.geometry(),
-            contract.native_limits()?,
-            config.ack_coalescing,
-            config.rolling_ingress,
-            common_contract::selected_fragment_policy(
-                &contract.initial(),
-                config.rolling_fragments,
-            ),
-        )
+        let context = engine::Context {
+            session: u128::from_be_bytes(identity.session.0),
+            epoch: config.data_epoch.0,
+            role,
+        };
+        let initial_plan = if contract.compact_wire().is_some() {
+            engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+                contract.initial(),
+                context,
+                contract.geometry(),
+                contract.native_limits()?,
+                config.ack_coalescing,
+                config.rolling_ingress,
+                common_contract::selected_fragment_policy(
+                    &contract.initial(),
+                    config.rolling_fragments,
+                ),
+                contract.feedback_overhead_bytes()?,
+            )
+        } else {
+            engine::storage::Plan::for_engine_with_fragmentation(
+                contract.initial(),
+                context,
+                contract.geometry(),
+                contract.native_limits()?,
+                config.ack_coalescing,
+                config.rolling_ingress,
+                common_contract::selected_fragment_policy(
+                    &contract.initial(),
+                    config.rolling_fragments,
+                ),
+            )
+        }
         .map_err(invalid)?;
         let bank_plan = l2tunnel::record_bank::storage::Plan::for_bank(initial_plan, external)
             .map_err(invalid)?;

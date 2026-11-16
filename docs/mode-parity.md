@@ -14,12 +14,14 @@ The ordinary 24-byte/20-byte target remains unqualified across the full catalog;
 authenticated control/retiring ACKs and full raw/native scope remain required.
 
 The [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
-implements the explicit AES-CCM4 and ChaCha20/CRC32C data profiles, independent
-strong feedback/control, typed CompactARQ final encoding and a selected original
-UDP Swift runtime route. Data outer framing is 9 bytes; strong feedback/control
-is 21 bytes, before algorithm and packing metadata. Validation is scoped to the
-recorded paths; raw TCP, remaining algorithm migration, full SW-11/all47 and
-native/platform/performance gates stay open at their complete definitions.
+implements explicit AES-CCM4 and ChaCha20/CRC32C data profiles with independent
+strong feedback/control. The subsequent [runtime algorithm migration](modules/compact-wire-cleanup.md#runtime-algorithm-migration)
+connects existing Aligned/Packed, CompactARQ, independent-connection, Rolling and
+Research owners to the selected original-UDP format and existing epoch switching.
+Data outer framing is 9 bytes and strong feedback/control is 21 bytes, before
+actual algorithm, packing and fragment metadata. Validation remains scoped to
+recorded commands; raw TCP, other outer carriers, full SW-11/all47 and native,
+platform, geometry and performance gates retain their complete definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

@@ -240,12 +240,21 @@ impl SenderOwner {
         &mut self,
         source: receiver::SourceId,
         output: &mut [u8],
+        compact: bool,
     ) -> Result<usize, Error> {
         match self {
-            Self::Aligned(s) => s[0].write_pending(source, output).map_err(Error::Sender),
-            Self::Packed(s) => s[0]
-                .write_pending(source, output)
-                .map_err(Error::PackedSender),
+            Self::Aligned(s) => if compact {
+                s[0].write_pending_compact(output)
+            } else {
+                s[0].write_pending(source, output)
+            }
+            .map_err(Error::Sender),
+            Self::Packed(s) => if compact {
+                s[0].write_pending_compact(output)
+            } else {
+                s[0].write_pending(source, output)
+            }
+            .map_err(Error::PackedSender),
         }
     }
     pub(super) fn commit_source(&mut self) -> Result<(), Error> {
@@ -259,6 +268,28 @@ impl SenderOwner {
 /// Explicit packed capability; no automatic detection or ordinary-wire fallback.
 pub struct Endpoint(super::Endpoint);
 impl Endpoint {
+    /// Select compact source and recovery encoding before any traffic is admitted.
+    pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {
+        self.0.enable_compact_wire(feedback_overhead)
+    }
+    /// Select exact enclosing data/feedback charges with the compact source format.
+    pub fn enable_compact_wire_with_overheads(
+        &mut self,
+        data_overhead: usize,
+        feedback_overhead: usize,
+    ) -> Result<(), Error> {
+        self.0
+            .enable_compact_wire_with_overheads(data_overhead, feedback_overhead)
+    }
+    /// Pure complete preflight for atomic installation by an enclosing owner.
+    pub fn validate_compact_wire_selection(
+        &self,
+        data_overhead: usize,
+        feedback_overhead: usize,
+    ) -> Result<(), Error> {
+        self.0
+            .validate_compact_wire_selection(data_overhead, feedback_overhead)
+    }
     /// Fallibly reserve the complete actual equal-policy Packed endpoint.
     pub fn new_reserved(
         config: Config,

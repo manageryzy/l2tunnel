@@ -269,6 +269,7 @@ pub struct Plan {
     record: RecordPlan,
     ingress: Option<pipeline::ack_coalescing::Plan>,
     fragments: Option<fragment::Plan>,
+    compact_feedback: Option<usize>,
     heap_bytes: usize,
     capacity_bytes: usize,
 }
@@ -330,12 +331,84 @@ impl Plan {
         rolling_ingress: Option<rolling_records::IngressLimits>,
         fragments: Option<FragmentPolicy>,
     ) -> Result<Self, Error> {
-        let parameters = parameters_with_fragmentation(
+        Self::for_selected(
+            configuration,
+            context,
+            geometry,
+            native_limits,
+            ingress,
+            rolling_ingress,
+            fragments,
+            None,
+        )
+    }
+
+    /// Plan exact selected data/strong-feedback wire sizes before allocating the
+    /// same actual owners. Legacy backing remains an explicit conservative bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_engine_with_compact_wire(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<rolling_records::IngressLimits>,
+        feedback_overhead: usize,
+    ) -> Result<Self, Error> {
+        Self::for_selected(
+            configuration,
+            context,
+            geometry,
+            native_limits,
+            ingress,
+            rolling_ingress,
+            None,
+            Some(feedback_overhead),
+        )
+    }
+
+    /// Plan selected compact bodies with the existing explicit whole-group fragment policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_engine_with_compact_wire_and_fragmentation(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<rolling_records::IngressLimits>,
+        fragments: Option<FragmentPolicy>,
+        feedback_overhead: usize,
+    ) -> Result<Self, Error> {
+        Self::for_selected(
+            configuration,
+            context,
+            geometry,
+            native_limits,
+            ingress,
+            rolling_ingress,
+            fragments,
+            Some(feedback_overhead),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_selected(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<rolling_records::IngressLimits>,
+        fragments: Option<FragmentPolicy>,
+        compact_feedback: Option<usize>,
+    ) -> Result<Self, Error> {
+        let parameters = parameters_selected(
             &configuration,
             context,
             geometry,
             native_limits,
             fragments,
+            compact_feedback,
         )
         .map_err(Error::Engine)?;
         if super::proxy_records::selected(&configuration)
@@ -347,7 +420,16 @@ impl Plan {
         }
         let fragments = fragments
             .map(|policy| {
-                fragment::Plan::new(policy, context, parameters.send_max).map_err(Error::Fragment)
+                let selected = compact_feedback
+                    .map(|overhead| {
+                        let local = configuration.descriptor().local(context.role);
+                        compact_wire::maximums(local.send().profile(), local.receive().profile())
+                            .map(|(_, feedback)| (overhead, feedback))
+                    })
+                    .transpose()
+                    .map_err(Error::Engine)?;
+                fragment::Plan::new(policy, context, parameters.send_max, selected)
+                    .map_err(Error::Fragment)
             })
             .transpose()?;
         if let Some(policy) = ingress {
@@ -398,9 +480,14 @@ impl Plan {
             record,
             ingress,
             fragments,
+            compact_feedback,
             heap_bytes,
             capacity_bytes,
         })
+    }
+    /// Explicit selected final-feedback overhead; None retains legacy bodies.
+    pub const fn compact_feedback_overhead(&self) -> Option<usize> {
+        self.compact_feedback
     }
     /// Exact complete canonical configuration, without clamping or omitted fields.
     pub const fn configuration(&self) -> &configuration::Configuration {
@@ -538,6 +625,11 @@ impl Engine {
             Some(usage),
         );
         engine.fragments = fragments;
+        if let Some(overhead) = plan.compact_feedback {
+            engine
+                .enable_compact_wire(overhead)
+                .map_err(Error::Engine)?;
+        }
         Ok(engine)
     }
 

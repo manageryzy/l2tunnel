@@ -11,7 +11,7 @@ impl Collection {
     /// Check the actual routed grammar and authoritative selected inner parser.
     /// Raw eligibility still requires classification of its complete native body.
     pub fn inspect_authenticated(&self, packet: &[u8]) -> Result<route::Class, Error> {
-        let (header, body) = route::decode(packet).map_err(Error::Route)?;
+        let (header, body) = self.decode_route(packet)?;
         if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
         }
@@ -39,7 +39,7 @@ impl Collection {
         packet: &[u8],
         witnesses: &mut [UnitWitness],
     ) -> Result<usize, Error> {
-        let (header, body) = route::decode(packet).map_err(Error::Route)?;
+        let (header, body) = self.decode_route(packet)?;
         if header.incarnation != self.slot(header.owner)?.incarnation {
             return Err(Error::Incarnation);
         }
@@ -93,7 +93,7 @@ impl Collection {
             };
             let owner = self.owner(u16::try_from(index).map_err(|_| Error::Arithmetic)?)?;
             let bytes = bytes
-                .checked_add(route::HEADER_BYTES)
+                .checked_add(self.route_bytes(false))
                 .ok_or(Error::Arithmetic)?;
             if earliest.is_none_or(|(_, current, _)| at < current) {
                 earliest = Some((owner, at, bytes));

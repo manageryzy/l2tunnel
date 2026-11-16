@@ -5,8 +5,8 @@ impl CommonTransactionContract {
     /// Select the compact final record wire before the actual Noise handshake.
     /// The returned H0 must be supplied to establishment; a copied public Info
     /// cannot install it. Both complete endpoint inventories and the full catalog
-    /// are bound in initiator/responder order. This first route supports Swift
-    /// owners on the original UDP socket; other selections refuse explicitly.
+    /// are bound in initiator/responder order. Each supported record owner uses
+    /// the selected encoding on the original UDP socket, including staged owners.
     #[allow(clippy::too_many_arguments)]
     pub fn new_compact_wire(
         base_policy: security::ConfigDigest,

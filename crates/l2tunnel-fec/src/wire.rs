@@ -175,3 +175,38 @@ fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
         .try_into()
         .map_err(|_| Error::Malformed)
 }
+
+impl SymbolView<'_> {
+    /// Validate typed input independently of its enclosing authenticated wire context.
+    pub fn validate(self, config: BlockConfig) -> Result<(), Error> {
+        config.validate()?;
+        config.dimensions(self.source_count, self.coded_bytes)?;
+        if self.coefficients.len() != self.source_count || self.payload.len() != self.coded_bytes {
+            return Err(Error::Malformed);
+        }
+        if self
+            .coefficients
+            .iter()
+            .all(|&coefficient| coefficient == 0)
+        {
+            return Err(Error::InvalidCoefficients);
+        }
+        match self.kind {
+            SymbolKind::Systematic => {
+                if u64::from(self.symbol.0) >= self.source_count as u64
+                    || self.coefficients.iter().enumerate().any(|(index, &value)| {
+                        value != u8::from(index as u64 == u64::from(self.symbol.0))
+                    })
+                {
+                    return Err(Error::InvalidCoefficients);
+                }
+                crate::original_length(self.payload)?;
+            }
+            SymbolKind::Repair if u64::from(self.symbol.0) < self.source_count as u64 => {
+                return Err(Error::Malformed);
+            }
+            SymbolKind::Repair => {}
+        }
+        Ok(())
+    }
+}

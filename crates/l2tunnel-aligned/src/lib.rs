@@ -18,6 +18,7 @@ mod compact;
 mod compact_packed;
 /// Complete actual Compact R0 endpoint storage.
 pub mod compact_storage;
+mod compact_wire;
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
 /// Complete fallible backing for actual directional codec/recovery owners.
@@ -302,6 +303,8 @@ pub struct Endpoint {
     now: Duration,
     failure: Option<Error>,
     usage: Option<storage::Usage>,
+    compact_wire: bool,
+    compact_data_overhead: usize,
 }
 impl Endpoint {
     /// Reserve complete actual same-policy duplex backing without fallback.
@@ -500,6 +503,8 @@ impl Endpoint {
             handoff: None,
             now: Duration::ZERO,
             failure: None,
+            compact_wire: false,
+            compact_data_overhead: 0,
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes,
@@ -605,6 +610,8 @@ impl Endpoint {
             handoff: None,
             now: Duration::ZERO,
             failure: None,
+            compact_wire: false,
+            compact_data_overhead: 0,
             usage: None,
         })
     }
@@ -672,9 +679,11 @@ impl Endpoint {
             return Ok(0);
         };
         if let Some(options) = self.packing {
-            let packed = l2tunnel_codec::packed_envelope::decode(
+            let packed = compact_wire::packed(
+                self.compact_wire,
                 options.envelope(self.config),
                 self.send_scope,
+                receiver::SourceId(source.0),
                 bytes,
             )
             .map_err(Error::PackedEnvelope)?;
@@ -696,10 +705,11 @@ impl Endpoint {
             if output.is_empty() {
                 return Err(Error::Configuration);
             }
-            let aligned = envelope::decode(
+            let aligned = compact_wire::aligned(
+                self.compact_wire,
                 self.send_scope,
-                self.config.receiver.body.symbol_bytes,
-                self.config.receiver.channels,
+                receiver::SourceId(source.0),
+                self.config.receiver,
                 bytes,
             )
             .map_err(Error::Envelope)?;
@@ -1054,7 +1064,11 @@ impl Endpoint {
     }
     /// Exact configured external wire charge of this actual sending owner.
     pub fn outer_overhead_bytes(&self) -> usize {
-        self.config.outer_overhead_bytes
+        if self.compact_wire {
+            self.compact_data_overhead
+        } else {
+            self.config.outer_overhead_bytes
+        }
     }
     /// Exact maximum complete recovery output, excluding configured carrier overhead.
     pub fn max_packet_bytes(&self) -> usize {
@@ -1133,9 +1147,11 @@ impl Endpoint {
             }
             let result = self.recovery.next_source_id().map_err(Error::Recovery);
             let id = self.terminal_result(result)?;
-            let length = self
-                .sender
-                .write_pending(receiver::SourceId(id), &mut self.send_buffer)?;
+            let length = self.sender.write_pending(
+                receiver::SourceId(id),
+                &mut self.send_buffer,
+                self.compact_wire,
+            )?;
             match self.recovery.submit(&self.send_buffer[..length], self.now) {
                 Ok(actual) if actual == id => self.sender.commit_source()?,
                 Ok(_) => return self.fail(Error::Identity),
@@ -1153,9 +1169,11 @@ impl Endpoint {
         }
         let result = self.recovery.next_source_id().map_err(Error::Recovery);
         let id = self.terminal_result(result)?;
-        let result = self
-            .sender
-            .write_pending(receiver::SourceId(id), &mut self.send_buffer);
+        let result = self.sender.write_pending(
+            receiver::SourceId(id),
+            &mut self.send_buffer,
+            self.compact_wire,
+        );
         let length = self.terminal_result(result)?;
         match self.recovery.submit(&self.send_buffer[..length], self.now) {
             Ok(actual) if actual == id => {
@@ -1203,10 +1221,11 @@ impl Endpoint {
                     Err(error) => return self.fail(error),
                 }
             }
-            let view = match envelope::decode(
+            let view = match compact_wire::aligned(
+                self.compact_wire,
                 self.receive_scope,
-                self.receive_config.receiver.body.symbol_bytes,
-                self.receive_config.receiver.channels,
+                receiver::SourceId(id),
+                self.receive_config.receiver,
                 &self.receive_buffer[..length],
             ) {
                 Ok(view) => view,
@@ -1265,10 +1284,11 @@ impl Endpoint {
         let now = ticks(self.now)?;
         let result = (|| {
             for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
-                let view = envelope::decode(
+                let view = compact_wire::aligned(
+                    self.compact_wire,
                     self.receive_scope,
-                    self.receive_config.receiver.body.symbol_bytes,
-                    self.receive_config.receiver.channels,
+                    receiver::SourceId(id),
+                    self.receive_config.receiver,
                     payload,
                 )
                 .map_err(Error::Envelope)?;
@@ -1319,6 +1339,7 @@ impl Endpoint {
                 bytes: &[],
             });
         let (first, count) = packed_inputs(
+            self.compact_wire,
             options,
             self.receive_config,
             self.receive_scope,
@@ -1401,6 +1422,7 @@ impl Endpoint {
                         bytes: &[],
                     });
                 let (_, count) = packed_inputs(
+                    self.compact_wire,
                     options,
                     self.receive_config,
                     self.receive_scope,
@@ -1486,6 +1508,7 @@ impl Endpoint {
 // ordered admission and short preview. No payload queue or codec is duplicated.
 #[allow(clippy::too_many_arguments)] // Explicit existing owners and borrowed caller scratch.
 fn packed_inputs<'a>(
+    compact: bool,
     options: packed::Options,
     config: compact::BodyConfig,
     scope: receiver::Scope,
@@ -1494,8 +1517,14 @@ fn packed_inputs<'a>(
     scratch: &'a mut [u8],
     output: &mut [receiver::AuthenticatedSymbol<'a>; 255],
 ) -> Result<(receiver::SourceId, usize), Error> {
-    let view = l2tunnel_codec::packed_envelope::decode(options.envelope(config), scope, packet)
-        .map_err(Error::PackedEnvelope)?;
+    let view = compact_wire::packed(
+        compact,
+        options.envelope(config),
+        scope,
+        receiver::SourceId(source),
+        packet,
+    )
+    .map_err(Error::PackedEnvelope)?;
     if view.identity().source.0 != source {
         return Err(Error::Identity);
     }

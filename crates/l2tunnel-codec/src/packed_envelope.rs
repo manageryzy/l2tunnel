@@ -11,6 +11,9 @@ use crate::{
 };
 use std::fmt;
 
+mod compact;
+pub use compact::{decode_compact, encode_compact};
+
 /// Fixed source identity header, before per-unit u64 record IDs and inner bytes.
 pub const HEADER_BYTES: usize = Layout::Packed.header_bytes();
 /// Negotiated finite source geometry.
@@ -175,6 +178,7 @@ pub struct View<'a> {
     payload: &'a [u8],
     config: Config,
     count: u8,
+    variable_records: bool,
 }
 impl<'a> View<'a> {
     /// Copy the validated recovery and distinct absolute-unit identity.
@@ -201,6 +205,8 @@ impl<'a> View<'a> {
             payload: payload_units(self.payload, self.config, self.len())?,
             index: 0,
             remaining: self.len(),
+            variable_records: self.variable_records,
+            record_offset: 0,
         })
     }
 }
@@ -219,12 +225,21 @@ pub struct Units<'a> {
     payload: PayloadUnits<'a>,
     index: usize,
     remaining: usize,
+    variable_records: bool,
+    record_offset: usize,
 }
 impl<'a> Iterator for Units<'a> {
     type Item = Unit<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         let bytes = self.payload.next()?;
-        let record = RecordId(word64(self.records, self.index * 8));
+        let record = if self.variable_records {
+            let (value, length) =
+                source_identity::read_varint(&self.records[self.record_offset..]).ok()?;
+            self.record_offset += length;
+            RecordId(value)
+        } else {
+            RecordId(word64(self.records, self.index * 8))
+        };
         let source = SourceId(self.identity.first_unit.0 + self.index as u64);
         self.index += 1;
         self.remaining -= 1;
@@ -279,6 +294,7 @@ pub fn decode(config: Config, expected: Scope, input: &[u8]) -> Result<View<'_>,
         payload,
         config,
         count: count as u8,
+        variable_records: false,
     })
 }
 fn header_error(error: source_identity::Error) -> Error {

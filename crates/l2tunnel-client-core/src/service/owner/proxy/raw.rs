@@ -55,6 +55,7 @@ pub(in crate::service::owner) async fn common(
         effective_carrier: info.authenticated.carrier,
         requested_cover: requested.settings().cover.appearance,
         effective_cover: None,
+        compact_wire: None,
         local_addr: info.local_addr,
         peer_addr: info.peer_addr,
         installed: false,

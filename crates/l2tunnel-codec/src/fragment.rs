@@ -638,6 +638,12 @@ fn validate_reassembly(config: ReassemblyConfig) -> Result<(), FragmentError> {
 }
 
 impl Reassembler {
+    /// Validate complete immutable context, dimensions, offsets and payload length
+    /// with the same parser used by admission, without changing receiver state.
+    /// Success grants no authentication, freshness or reassembly reservation.
+    pub fn validate_fragment(&self, fragment: &[u8]) -> Result<(), FragmentError> {
+        self.parse(fragment).map(|_| ())
+    }
     /// Validate receiver limits without allocating peer-selected message storage.
     pub fn new(context: FragmentContext, config: ReassemblyConfig) -> Result<Self, FragmentError> {
         validate_reassembly(config)?;
