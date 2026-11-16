@@ -149,202 +149,208 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
 #[tokio::test]
 async fn actual_carrier_v4_service_binds_compact_catalog_and_switches_exact_native_bytes() -> Result
 {
-    timeout(Duration::from_secs(30), async {
-        let hosts = support::hosts();
-        let CarrierPlans {
-            plans: [left, right],
-            addresses,
-            requested,
-        } = compact_carrier_plans(&hosts)?;
-        let (client, run) = channel();
-        let (server, peer) = channel();
-        let client_task = tokio::spawn(run);
-        let server_task = tokio::spawn(peer);
-        let accepted = [
-            client
-                .connect(left, client.next_key().map_err(submit)?)
-                .map_err(submit)?,
-            server
-                .connect(right, server.next_key().map_err(submit)?)
-                .map_err(submit)?,
-        ];
-        let (a, b) = tokio::try_join!(
-            connected(&client, accepted[0]),
-            connected(&server, accepted[1])
-        )?;
-        let handles = [client, server];
-        let generations = [a, b];
-        let originals = [common_frame(&handles[0])?, common_frame(&handles[1])?];
-        let effective = originals[0].requested.clone();
-        assert!(matches!(
-            effective.initial().descriptor().profile(),
-            common::Profile::AlignedCompact { .. }
-        ));
-        let supported = effective.catalog().configurations(effective.envelope())?;
-        assert_eq!(supported.len(), 2);
-        let target = *supported
-            .iter()
-            .find(|value| {
-                matches!(
-                    value.descriptor().profile(),
-                    common::Profile::PackedCompact { .. }
-                )
-            })
-            .ok_or("bound effective PackedCompact absent")?;
-        let epoch = originals[0]
-            .runtime
-            .as_ref()
-            .ok_or("actual initial runtime absent")?
-            .epoch
-            .0;
-        let directory = ApiDirectory::new()?;
-        let paths = [
-            directory.0.join("compact-a.sock"),
-            directory.0.join("compact-b.sock"),
-        ];
-        let mut api_tasks = Vec::new();
-        for side in 0..2 {
-            let frame = &originals[side];
-            assert_eq!(frame.info.local_addr, addresses[side]);
-            assert_eq!(frame.info.peer_addr, addresses[1 - side]);
-            assert_eq!(frame.requested.configuration()?, effective.configuration()?);
-            assert_eq!(
-                frame.requested.requested_configuration()?,
-                requested.configuration()?
-            );
-            assert_eq!(frame.requested.requested_envelope(), requested.envelope());
-            assert_ne!(frame.requested.configuration()?, requested.configuration()?);
-            assert_ne!(frame.requested.envelope(), requested.envelope());
-            let proof = frame
-                .requested
-                .carrier_binding()
-                .ok_or("genuine completed outer proof absent")?;
-            assert_eq!(proof.endpoints(), (addresses[0], addresses[1]));
-            assert_eq!(
-                proof
-                    .expected_binding(
-                        frame.requested.establish_config(frame.info.role)?,
-                        frame.info.peers,
-                        frame.info.binding.session
-                    )?
-                    .outer,
-                frame.info.authenticated.outer
-            );
-            assert_common(frame, effective.initial(), epoch, frame, generations[side])?;
-            let api = local::Server::bind(&paths[side])?;
-            let handle = handles[side].clone();
-            api_tasks.push(tokio::spawn(async move {
-                api.serve(move |request| {
-                    let handle = handle.clone();
-                    async move { handle.lifecycle_request(request).await }
-                })
-                .await
-            }));
-        }
-        assert_eq!(originals[0].info.binding, originals[1].info.binding);
-        exchange_stage(&hosts, &handles, effective.initial(), epoch, 0).await?;
-        let key = handles[0].next_key().map_err(submit)?;
-        assert_eq!(
-            handles[0].apply_common(requested.initial(), key),
-            Err(SubmitError::InvalidConfiguration)
-        );
-        assert_eq!(handles[0].next_key().map_err(submit)?, key);
-        let change = request(local::Action::SwitchCommonConfiguration {
-            configuration: CanonicalConfiguration::from_configuration(target)?,
-            request_key: key.value(),
-        });
-        let changed = local::request(&paths[0], &change).await?;
-        assert!(changed.ok, "{changed:?}");
-        assert_current(observed(&changed)?, target, epoch + 1)?;
-        let completion = observed(&changed)?
-            .result
-            .as_ref()
-            .ok_or("actual completion absent")?;
-        assert_eq!(completion.configuration.configuration()?, target);
-        assert_eq!(completion.epoch, Some(epoch + 1));
-        assert_eq!(completion.request_key, key.value());
-        assert_eq!(completion.outcome, "ok");
-        await_common(&handles[1], target, epoch + 1, 0, None).await?;
-        exchange_stage(&hosts, &handles, target, epoch + 1, 1).await?;
-        for side in 0..2 {
-            let response = local::request(&paths[side], &request(local::Action::Status {})).await?;
-            assert!(response.ok);
-            let status = observed(&response)?;
-            assert_current(status, target, epoch + 1)?;
-            let carrier = status
-                .original_carrier
-                .as_ref()
-                .ok_or("actual carrier status absent")?;
-            assert_eq!(
-                carrier.requested_configuration,
-                requested.configuration()?.0
-            );
-            assert_eq!(
-                carrier.effective_configuration,
-                effective.configuration()?.0
-            );
-            assert_eq!(
-                carrier.requested_catalog,
-                *requested.catalog().root().as_bytes()
-            );
-            assert_eq!(
-                carrier.effective_catalog,
-                *effective.catalog().root().as_bytes()
-            );
-            assert_common(
-                &common_frame(&handles[side])?,
-                target,
-                epoch + 1,
-                &originals[side],
-                generations[side],
+    // Keep this same real lifecycle future out of the harness/timeout value.
+    // Its typed response locals otherwise remain inline across API awaits.
+    timeout(
+        Duration::from_secs(30),
+        Box::pin(async {
+            let hosts = support::hosts();
+            let CarrierPlans {
+                plans: [left, right],
+                addresses,
+                requested,
+            } = compact_carrier_plans(&hosts)?;
+            let (client, run) = channel();
+            let (server, peer) = channel();
+            let client_task = tokio::spawn(run);
+            let server_task = tokio::spawn(peer);
+            let accepted = [
+                client
+                    .connect(left, client.next_key().map_err(submit)?)
+                    .map_err(submit)?,
+                server
+                    .connect(right, server.next_key().map_err(submit)?)
+                    .map_err(submit)?,
+            ];
+            let (a, b) = tokio::try_join!(
+                connected(&client, accepted[0]),
+                connected(&server, accepted[1])
             )?;
-            assert_eq!(hosts[side].opened.load(Ordering::SeqCst), 1);
-            assert_no_native_replay(&hosts[side])?;
-        }
-        let stopped = [
-            handles[0]
-                .disconnect(handles[0].next_key().map_err(submit)?)
-                .map_err(submit)?,
-            handles[1]
-                .disconnect(handles[1].next_key().map_err(submit)?)
-                .map_err(submit)?,
-        ];
-        for side in 0..2 {
-            assert_eq!(
-                handles[side]
-                    .wait(stopped[side].operation)
+            let handles = [client, server];
+            let generations = [a, b];
+            let originals = [common_frame(&handles[0])?, common_frame(&handles[1])?];
+            let effective = originals[0].requested.clone();
+            assert!(matches!(
+                effective.initial().descriptor().profile(),
+                common::Profile::AlignedCompact { .. }
+            ));
+            let supported = effective.catalog().configurations(effective.envelope())?;
+            assert_eq!(supported.len(), 2);
+            let target = *supported
+                .iter()
+                .find(|value| {
+                    matches!(
+                        value.descriptor().profile(),
+                        common::Profile::PackedCompact { .. }
+                    )
+                })
+                .ok_or("bound effective PackedCompact absent")?;
+            let epoch = originals[0]
+                .runtime
+                .as_ref()
+                .ok_or("actual initial runtime absent")?
+                .epoch
+                .0;
+            let directory = ApiDirectory::new()?;
+            let paths = [
+                directory.0.join("compact-a.sock"),
+                directory.0.join("compact-b.sock"),
+            ];
+            let mut api_tasks = Vec::new();
+            for side in 0..2 {
+                let frame = &originals[side];
+                assert_eq!(frame.info.local_addr, addresses[side]);
+                assert_eq!(frame.info.peer_addr, addresses[1 - side]);
+                assert_eq!(frame.requested.configuration()?, effective.configuration()?);
+                assert_eq!(
+                    frame.requested.requested_configuration()?,
+                    requested.configuration()?
+                );
+                assert_eq!(frame.requested.requested_envelope(), requested.envelope());
+                assert_ne!(frame.requested.configuration()?, requested.configuration()?);
+                assert_ne!(frame.requested.envelope(), requested.envelope());
+                let proof = frame
+                    .requested
+                    .carrier_binding()
+                    .ok_or("genuine completed outer proof absent")?;
+                assert_eq!(proof.endpoints(), (addresses[0], addresses[1]));
+                assert_eq!(
+                    proof
+                        .expected_binding(
+                            frame.requested.establish_config(frame.info.role)?,
+                            frame.info.peers,
+                            frame.info.binding.session
+                        )?
+                        .outer,
+                    frame.info.authenticated.outer
+                );
+                assert_common(frame, effective.initial(), epoch, frame, generations[side])?;
+                let api = local::Server::bind(&paths[side])?;
+                let handle = handles[side].clone();
+                api_tasks.push(tokio::spawn(async move {
+                    api.serve(move |request| {
+                        let handle = handle.clone();
+                        async move { handle.lifecycle_request(request).await }
+                    })
                     .await
-                    .map_err(submit)?,
-                Completed::Aborted
-            );
-            assert_eq!(
-                handles[side]
-                    .wait_stopped(generations[side])
-                    .await
-                    .map_err(submit)?,
-                Terminal::Aborted
-            );
-            assert_eq!(hosts[side].live.load(Ordering::SeqCst), 0);
-        }
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if support::assert_ports_free(addresses).is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                }));
             }
-        })
-        .await?;
-        for task in api_tasks {
-            task.abort();
-            let _ = task.await;
-        }
-        client_task.abort();
-        server_task.abort();
-        let _ = client_task.await;
-        let _ = server_task.await;
-        assert!(paths.iter().all(|path| !path.exists()));
-        Ok::<(), Error>(())
-    })
+            assert_eq!(originals[0].info.binding, originals[1].info.binding);
+            exchange_stage(&hosts, &handles, effective.initial(), epoch, 0).await?;
+            let key = handles[0].next_key().map_err(submit)?;
+            assert_eq!(
+                handles[0].apply_common(requested.initial(), key),
+                Err(SubmitError::InvalidConfiguration)
+            );
+            assert_eq!(handles[0].next_key().map_err(submit)?, key);
+            let change = request(local::Action::SwitchCommonConfiguration {
+                configuration: CanonicalConfiguration::from_configuration(target)?,
+                request_key: key.value(),
+            });
+            let changed = local::request(&paths[0], &change).await?;
+            assert!(changed.ok, "{changed:?}");
+            assert_current(observed(&changed)?, target, epoch + 1)?;
+            let completion = observed(&changed)?
+                .result
+                .as_ref()
+                .ok_or("actual completion absent")?;
+            assert_eq!(completion.configuration.configuration()?, target);
+            assert_eq!(completion.epoch, Some(epoch + 1));
+            assert_eq!(completion.request_key, key.value());
+            assert_eq!(completion.outcome, "ok");
+            await_common(&handles[1], target, epoch + 1, 0, None).await?;
+            exchange_stage(&hosts, &handles, target, epoch + 1, 1).await?;
+            for side in 0..2 {
+                let response =
+                    local::request(&paths[side], &request(local::Action::Status {})).await?;
+                assert!(response.ok);
+                let status = observed(&response)?;
+                assert_current(status, target, epoch + 1)?;
+                let carrier = status
+                    .original_carrier
+                    .as_ref()
+                    .ok_or("actual carrier status absent")?;
+                assert_eq!(
+                    carrier.requested_configuration,
+                    requested.configuration()?.0
+                );
+                assert_eq!(
+                    carrier.effective_configuration,
+                    effective.configuration()?.0
+                );
+                assert_eq!(
+                    carrier.requested_catalog,
+                    *requested.catalog().root().as_bytes()
+                );
+                assert_eq!(
+                    carrier.effective_catalog,
+                    *effective.catalog().root().as_bytes()
+                );
+                assert_common(
+                    &common_frame(&handles[side])?,
+                    target,
+                    epoch + 1,
+                    &originals[side],
+                    generations[side],
+                )?;
+                assert_eq!(hosts[side].opened.load(Ordering::SeqCst), 1);
+                assert_no_native_replay(&hosts[side])?;
+            }
+            let stopped = [
+                handles[0]
+                    .disconnect(handles[0].next_key().map_err(submit)?)
+                    .map_err(submit)?,
+                handles[1]
+                    .disconnect(handles[1].next_key().map_err(submit)?)
+                    .map_err(submit)?,
+            ];
+            for side in 0..2 {
+                assert_eq!(
+                    handles[side]
+                        .wait(stopped[side].operation)
+                        .await
+                        .map_err(submit)?,
+                    Completed::Aborted
+                );
+                assert_eq!(
+                    handles[side]
+                        .wait_stopped(generations[side])
+                        .await
+                        .map_err(submit)?,
+                    Terminal::Aborted
+                );
+                assert_eq!(hosts[side].live.load(Ordering::SeqCst), 0);
+            }
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if support::assert_ports_free(addresses).is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await?;
+            for task in api_tasks {
+                task.abort();
+                let _ = task.await;
+            }
+            client_task.abort();
+            server_task.abort();
+            let _ = client_task.await;
+            let _ = server_task.await;
+            assert!(paths.iter().all(|path| !path.exists()));
+            Ok::<(), Error>(())
+        }),
+    )
     .await?
 }

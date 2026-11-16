@@ -158,6 +158,67 @@ async fn generic_cancel_from_authenticated_opener_drops_actual_device_before_com
     Ok(())
 }
 
+// Inspect only retained observations after the original finite wait failed.
+// Borrowing counters here retains no backend or cancellation sender.
+fn run_drop_failure(
+    appearance: l2tunnel_cover::Appearance,
+    stage: &str,
+    pair: &Pair,
+    error: Error,
+) -> Error {
+    let observations: Vec<_> = pair
+        .handles
+        .iter()
+        .enumerate()
+        .map(|(side, handle)| {
+            let state = handle.0.lock();
+            let entry = state
+                .entries
+                .iter()
+                .find(|entry| entry.accepted.operation == pair.accepted[side].operation);
+            let setup = entry.and_then(|entry| entry.setup.as_ref().map(|record| record.observation));
+            let completed = entry.and_then(|entry| entry.result.as_ref());
+            let runtime = match state.backend.as_ref() {
+                Some(ObservedBackend::SecureUdpTransaction(backend)) => {
+                    let counters = backend
+                        .counters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    counters.as_ref().map(|snapshot| {
+                        format!(
+                            "running={} elapsed={} epoch={} phase={:?} swift={:?} control={:?} counters={:?} liveness={:?} terminal={:?}",
+                            snapshot.running,
+                            snapshot.elapsed_micros,
+                            snapshot.epoch.0,
+                            snapshot.phase,
+                            snapshot.swift,
+                            snapshot.control,
+                            snapshot.counters,
+                            snapshot.liveness,
+                            snapshot.terminal,
+                        )
+                    })
+                }
+                _ => None,
+            };
+            format!(
+                "side={side} address={} phase={:?} generation={:?} terminal={:?} completed={completed:?} setup={setup:?} opened={} live={} runtime={runtime:?}",
+                pair.fixture.addresses[side],
+                state.snapshot.phase,
+                state.snapshot.generation,
+                state.snapshot.terminal,
+                pair.hosts[side].opened.load(Ordering::SeqCst),
+                pair.hosts[side].live.load(Ordering::SeqCst),
+            )
+        })
+        .collect();
+    io::Error::other(format!(
+        "generic Run drop boundary cover={appearance:?} stage={stage} cause={error:?}; {}",
+        observations.join("; ")
+    ))
+    .into()
+}
+
 #[tokio::test]
 async fn generic_run_drop_at_queued_admission_and_ready_boundaries_retains_truth() -> Result {
     for appearance in appearances() {
@@ -200,8 +261,12 @@ async fn generic_run_drop_at_queued_admission_and_ready_boundaries_retains_truth
         let hosts = hosts();
         let fixture = transaction_plans(appearance, &hosts)?;
         let mut pair = Pair::new(fixture, hosts)?;
-        pair.ready().await?;
-        pair.exchange(0, 81).await?;
+        pair.ready()
+            .await
+            .map_err(|error| run_drop_failure(appearance, "ready", &pair, error))?;
+        pair.exchange(0, 81)
+            .await
+            .map_err(|error| run_drop_failure(appearance, "native_exchange", &pair, error))?;
         let old_setup = observation(&pair.handles[0], pair.accepted[0].operation)?;
         let mut expected = status(&pair.handles[0])?;
         drop(pair.runs[0].take());
