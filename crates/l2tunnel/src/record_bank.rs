@@ -12,7 +12,9 @@ use std::{
 mod entry;
 /// Complete actual retained layout and typed construction/custody refusals.
 pub mod storage;
-pub use entry::{CarrierOutputToken, Entry, NativePreparation, NativeToken, PreparedNative};
+pub use entry::{
+    CarrierOutputToken, Entry, FragmentOutputToken, NativePreparation, NativeToken, PreparedNative,
+};
 pub use storage::Error;
 
 #[cfg(test)]
@@ -75,6 +77,19 @@ pub struct Bank {
 impl Bank {
     /// Pre-admit the entire initial layout and construct exactly one actual owner.
     pub fn new(plan: storage::Plan, limits: storage::Limits) -> Result<Self, Error> {
+        Self::new_with(plan, limits, core::convert::identity)
+    }
+
+    /// Construct the same precharged Bank and transfer it directly to caller storage.
+    ///
+    /// The callback runs once, after initial construction succeeds. Transferring
+    /// here avoids retaining large intermediate Bank return values in runtime
+    /// callers while nested Engine constructors use the same thread stack.
+    pub fn new_with<R>(
+        plan: storage::Plan,
+        limits: storage::Limits,
+        finish: impl FnOnce(Self) -> R,
+    ) -> Result<R, Error> {
         if plan.capacity_bytes() > limits.capacity_bytes {
             return Err(Error::Limit {
                 required: plan.capacity_bytes(),
@@ -104,7 +119,7 @@ impl Bank {
         };
         let mut guard = bank.prepare(*plan.initial())?;
         bank.initial = bank.publish(&mut guard)?;
-        Ok(bank)
+        Ok(finish(bank))
     }
 
     /// Historical original identity, not the runtime's current epoch selection.
@@ -152,37 +167,39 @@ impl Bank {
         self.building_bytes = plan.heap_bytes();
         self.capacity_bytes = total;
         self.peak_bytes = self.peak_bytes.max(total);
-        let built = build(
+        // Keep one constructed Engine until it moves into the existing inline
+        // slot. Intermediate Result tuples duplicate this large owner's stack
+        // extent in debug builds without providing another ownership boundary.
+        let engine = match build(
             plan,
             engine::storage::Limits {
                 capacity_bytes: plan.capacity_bytes(),
             },
             self.usage(),
-        );
-        let built = match built {
-            Ok(engine) => match observed(&engine, &plan).and_then(|allocations| {
+        ) {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.building_bytes = 0;
+                self.capacity_bytes = previous_charge;
+                return Err(Error::Storage(error));
+            }
+        };
+        let (allocations, allocation_total) =
+            match observed(&engine, &plan).and_then(|allocations| {
                 self.allocations
                     .checked_add(allocations)
                     .ok_or(Error::Layout)
                     .map(|total| (allocations, total))
             }) {
-                Ok((allocations, total)) => Ok((engine, allocations, total)),
+                Ok(counts) => counts,
                 Err(error) => {
+                    // Release the actual target while its full charge is retained.
                     drop(engine);
-                    Err(error)
+                    self.building_bytes = 0;
+                    self.capacity_bytes = previous_charge;
+                    return Err(error);
                 }
-            },
-            Err(error) => Err(Error::Storage(error)),
-        };
-        let (engine, allocations, allocation_total) = match built {
-            Ok(built) => built,
-            Err(error) => {
-                // Actual partial/full target cleanup has completed while the charge is held.
-                self.building_bytes = 0;
-                self.capacity_bytes = previous_charge;
-                return Err(error);
-            }
-        };
+            };
         self.slots[index] = Some(Slot {
             generation,
             published: false,
@@ -307,11 +324,15 @@ fn observed(actual: &engine::Engine, plan: &engine::storage::Plan) -> Result<usi
             .pipeline_bytes
             .checked_add(usage.record_bytes)
             .and_then(|bytes| bytes.checked_add(usage.ingress_bytes))
+            .and_then(|bytes| bytes.checked_add(usage.fragment_bytes))
             != Some(plan.heap_bytes())
         || usage.fixed_bytes.checked_add(plan.heap_bytes()) != Some(usage.capacity_bytes)
         || usage.capacity_bytes != plan.capacity_bytes()
         || usage.limit_bytes != plan.capacity_bytes()
         || actual.ingress_snapshot().map(|owner| owner.policy) != plan.ingress_policy()
+        || actual.rolling_ingress_status().map(|owner| owner.limits)
+            != plan.rolling_ingress_policy()
+        || actual.fragment_policy() != plan.fragment_policy()
         || actual.configuration() != plan.configuration()
         || actual.qualification() != engine::Qualification::Reserved
     {

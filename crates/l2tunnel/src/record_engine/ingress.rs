@@ -47,8 +47,17 @@ impl Engine {
                 )
                 .map_err(Error::Ingress)
         } else {
-            self.pipeline
-                .enqueue_borrowed(bytes, duration(now))
+            let admitted = if self.requires_original_ingress_cap() {
+                self.pipeline.enqueue_borrowed_capped(
+                    bytes,
+                    duration(received),
+                    duration(now),
+                    duration(original_cap),
+                )
+            } else {
+                self.pipeline.enqueue_borrowed(bytes, duration(now))
+            };
+            admitted
                 .map(IngressAdmission::Forwarded)
                 .map_err(Error::Pipeline)
         }
@@ -80,6 +89,9 @@ impl Engine {
         now: Tick,
         key: &pipeline::FlowKey,
     ) -> Result<pipeline::Binding, Error> {
+        if matches!(&self.owner, Owner::Connections(_)) {
+            return Err(Error::Unsupported(Capability::FlowReuse));
+        }
         self.advance(now)?;
         if self.pending.is_some() || !self.owner.drained()? {
             return Err(Error::Ingress(ack::Error::Busy));

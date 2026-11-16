@@ -32,6 +32,8 @@ pub struct Plan {
     config: Config,
     endpoint: aligned::compact_storage::Plan,
     slot_bytes: usize,
+    raw_send_bytes: usize,
+    raw_receive_bytes: usize,
     heap_bytes: usize,
     capacity_bytes: usize,
 }
@@ -54,6 +56,34 @@ impl Plan {
                 != Some(config.receive.recovery.outer_overhead_bytes())
         {
             return Err(Error::Configuration);
+        }
+        if config.send_unreliable.is_some() != config.receive_unreliable.is_some() {
+            return Err(Error::Configuration);
+        }
+        for (policy, native, carrier) in [
+            (
+                config.send_unreliable,
+                config.send.receiver.body.max_frame_bytes,
+                config.send_carrier_overhead_bytes,
+            ),
+            (
+                config.receive_unreliable,
+                config.receive.receiver.body.max_frame_bytes,
+                config.receive_carrier_overhead_bytes,
+            ),
+        ] {
+            if let Some(policy) = policy {
+                policy.validate(native)?;
+                let routed = policy
+                    .max_bytes
+                    .checked_add(route::HEADER_BYTES)
+                    .ok_or(Error::Arithmetic)?;
+                if routed > route::MAX_PACKET_BYTES
+                    || routed.checked_add(carrier).ok_or(Error::Arithmetic)? > 65_535
+                {
+                    return Err(Error::Configuration);
+                }
+            }
         }
         let endpoint = aligned::compact_storage::Plan::for_duplex(config.send, config.receive)
             .map_err(Error::Storage)?;
@@ -78,7 +108,19 @@ impl Plan {
             .capacity_bytes()
             .checked_mul(owners)
             .ok_or(Error::Arithmetic)?;
-        let heap_bytes = slot_bytes.checked_add(nested).ok_or(Error::Arithmetic)?;
+        let raw_send_bytes = config.send_unreliable.map_or(Ok(0), |p| {
+            p.max_bytes.checked_mul(owners).ok_or(Error::Arithmetic)
+        })?;
+        let raw_receive_bytes = config.receive_unreliable.map_or(Ok(0), |p| {
+            p.max_bytes.checked_mul(owners).ok_or(Error::Arithmetic)
+        })?;
+        Layout::array::<u8>(raw_send_bytes).map_err(|_| Error::Arithmetic)?;
+        Layout::array::<u8>(raw_receive_bytes).map_err(|_| Error::Arithmetic)?;
+        let heap_bytes = slot_bytes
+            .checked_add(nested)
+            .and_then(|n| n.checked_add(raw_send_bytes))
+            .and_then(|n| n.checked_add(raw_receive_bytes))
+            .ok_or(Error::Arithmetic)?;
         let capacity_bytes = size_of::<Collection>()
             .checked_add(heap_bytes)
             .ok_or(Error::Arithmetic)?;
@@ -86,6 +128,8 @@ impl Plan {
             config,
             endpoint,
             slot_bytes,
+            raw_send_bytes,
+            raw_receive_bytes,
             heap_bytes,
             capacity_bytes,
         })
@@ -105,11 +149,19 @@ impl Plan {
     }
     /// Exact maximum routed outgoing bytes, excluding further security/cover bytes.
     pub fn send_max_packet_bytes(&self) -> usize {
-        self.endpoint.reliable_plan().send_max_packet_bytes() + route::HEADER_BYTES
+        self.endpoint
+            .reliable_plan()
+            .send_max_packet_bytes()
+            .max(self.config.send_unreliable.map_or(0, |p| p.max_bytes))
+            + route::HEADER_BYTES
     }
     /// Exact maximum routed incoming bytes under the crossed actual geometry.
     pub fn receive_max_packet_bytes(&self) -> usize {
-        self.endpoint.reliable_plan().receive_max_packet_bytes() + route::HEADER_BYTES
+        self.endpoint
+            .reliable_plan()
+            .receive_max_packet_bytes()
+            .max(self.config.receive_unreliable.map_or(0, |p| p.max_bytes))
+            + route::HEADER_BYTES
     }
 }
 
@@ -164,9 +216,37 @@ impl Collection {
                 native: None,
                 next_native: 0,
                 native_failure: None,
+                claim: None,
+                raw_send: None,
+                raw_receive: None,
+                next_raw_send: 0,
+                next_raw_receive: 0,
+                last_raw: None,
+                raw_failure: None,
             });
         }
-        let heap_bytes = actual_slots.checked_add(nested).ok_or(Error::Arithmetic)?;
+        let mut raw_send = Vec::new();
+        let mut raw_receive = Vec::new();
+        for (buffer, required) in [
+            (&mut raw_send, plan.raw_send_bytes),
+            (&mut raw_receive, plan.raw_receive_bytes),
+        ] {
+            if required > 0 {
+                buffer
+                    .try_reserve_exact(required)
+                    .map_err(|_| Error::Allocation)?;
+                if buffer.capacity() != required {
+                    return Err(Error::Invariant);
+                }
+                buffer.resize(required, 0);
+                allocations = allocations.checked_add(1).ok_or(Error::Arithmetic)?;
+            }
+        }
+        let heap_bytes = actual_slots
+            .checked_add(nested)
+            .and_then(|n| n.checked_add(raw_send.capacity()))
+            .and_then(|n| n.checked_add(raw_receive.capacity()))
+            .ok_or(Error::Arithmetic)?;
         let capacity_bytes = size_of::<Collection>()
             .checked_add(heap_bytes)
             .ok_or(Error::Arithmetic)?;
@@ -192,6 +272,9 @@ impl Collection {
             instance,
             slots,
             usage,
+            raw_send,
+            raw_receive,
+            unreliable_statistics: UnreliableStatistics::default(),
         })
     }
 }

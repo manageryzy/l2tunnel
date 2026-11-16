@@ -33,6 +33,9 @@ pub struct Plan {
     receiver: codec::aligned_storage::ReceiverPlan,
     source_bytes: usize,
     symbol_bytes: usize,
+    ingress: Option<IngressLimits>,
+    framing: Option<OutputFraming>,
+    ingress_bytes: usize,
     capacity_bytes: usize,
 }
 impl Plan {
@@ -53,8 +56,35 @@ impl Plan {
         now: Tick,
         copies: CopyPolicies,
     ) -> Result<Self, Error> {
+        Self::for_endpoint_with_options(config, context, stream, now, copies, None)
+    }
+    /// Plan the same actual owners plus optional independently bounded input custody.
+    pub fn for_endpoint_with_options(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        copies: CopyPolicies,
+        ingress: Option<IngressLimits>,
+    ) -> Result<Self, Error> {
+        Self::for_endpoint_with_output_framing(config, context, stream, now, copies, ingress, None)
+    }
+    /// Plan exact optional physical fragmentation without adding a payload owner.
+    pub fn for_endpoint_with_output_framing(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        copies: CopyPolicies,
+        ingress: Option<IngressLimits>,
+        framing: Option<OutputFraming>,
+    ) -> Result<Self, Error> {
         copies.validate(config)?;
-        copies.binding_digest(config, stream)?;
+        if let Some(framing) = framing {
+            framing.binding_digest(config, copies, stream)?;
+        } else {
+            copies.binding_digest(config, stream)?;
+        }
         if context.session == 0 || context.epoch == 0 {
             return Err(Error::Configuration);
         }
@@ -95,6 +125,10 @@ impl Plan {
         for count in [source_bytes, symbol_bytes] {
             std::alloc::Layout::array::<u8>(count).map_err(|_| Error::Arithmetic)?;
         }
+        let ingress_bytes = ingress
+            .map(|limits| limits.required_capacity(receive.maximum_packet_bytes()?))
+            .transpose()?
+            .unwrap_or(0);
         let capacity_bytes = [
             sender.capacity_bytes(),
             incoming.capacity_bytes(),
@@ -102,6 +136,7 @@ impl Plan {
             receiver.capacity_bytes(),
             source_bytes,
             symbol_bytes,
+            ingress_bytes,
         ]
         .into_iter()
         .try_fold(0usize, |sum, value| {
@@ -119,6 +154,9 @@ impl Plan {
             receiver,
             source_bytes,
             symbol_bytes,
+            ingress,
+            framing,
+            ingress_bytes,
             capacity_bytes,
         })
     }
@@ -141,6 +179,14 @@ impl Plan {
     /// Exact constructor-time origin, supplied by the caller.
     pub const fn now(&self) -> Tick {
         self.now
+    }
+    /// Exact optional authenticated receive input custody.
+    pub const fn ingress_limits(&self) -> Option<IngressLimits> {
+        self.ingress
+    }
+    /// Exact complete global output framing, with no hidden reduction or default.
+    pub const fn output_framing(&self) -> Option<OutputFraming> {
+        self.framing
     }
     /// Complete heap-only capacity; an embedding owner counts Endpoint inline once.
     pub const fn capacity_bytes(&self) -> usize {
@@ -169,7 +215,11 @@ impl Endpoint {
             plan.stream,
             plan.now,
             Some(plan),
-            plan.copies,
+            endpoint::ConstructionOptions {
+                copies: plan.copies,
+                ingress: plan.ingress,
+                framing: plan.framing,
+            },
         )?;
         let packing = endpoint
             .packing
@@ -195,6 +245,11 @@ impl Endpoint {
             || incoming.allocations != plan.incoming.allocations()
             || endpoint.source.capacity() != plan.source_bytes
             || endpoint.symbols.capacity() != plan.symbol_bytes
+            || endpoint
+                .ingress
+                .as_ref()
+                .map_or(0, |owner| owner.usage().capacity_bytes)
+                != plan.ingress_bytes
         {
             return Err(Error::StorageInvariant);
         }
@@ -205,6 +260,10 @@ impl Endpoint {
             incoming.capacity_bytes,
             endpoint.source.capacity(),
             endpoint.symbols.capacity(),
+            endpoint
+                .ingress
+                .as_ref()
+                .map_or(0, |owner| owner.usage().capacity_bytes),
         ]
         .into_iter()
         .try_fold(0usize, |sum, value| {
@@ -217,6 +276,10 @@ impl Endpoint {
             incoming.allocations,
             usize::from(endpoint.source.capacity() != 0),
             usize::from(endpoint.symbols.capacity() != 0),
+            endpoint
+                .ingress
+                .as_ref()
+                .map_or(0, |owner| owner.usage().allocations),
         ]
         .into_iter()
         .try_fold(0usize, |sum, value| {

@@ -317,6 +317,8 @@ async fn actual_openvpn_common_service_uses_bound_catalog_for_all_four_families(
                 assert_ne!(frame.requested.configuration()?, requested.configuration()?);
                 assert_ne!(frame.requested.envelope(), requested.envelope());
                 let status = frame.status()?;
+                assert!(status.raw_carrier.is_none());
+                assert!(serde_json::to_value(&status)?.get("raw_carrier").is_none());
                 let carrier = status
                     .original_carrier
                     .as_ref()
@@ -527,3 +529,6 @@ async fn common_carrier_prepared_rejects_split_member_and_setup_expires_before_i
     support::assert_ports_free(addresses)?;
     Ok(())
 }
+
+#[path = "secure_udp_common_raw.rs"]
+mod raw;

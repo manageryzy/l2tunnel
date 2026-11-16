@@ -9,6 +9,9 @@ use l2tunnel_runtime::secure_udp::transport;
 use ring::digest;
 use std::io;
 
+#[path = "common_transaction_profile_raw.rs"]
+mod raw;
+
 /// Complete common plan; settings() uses the maintained admission/Noise/member factories.
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -23,6 +26,7 @@ pub struct Profile {
     initial: Configuration,
     data: ConfigDigest,
     carrier: Option<CarrierBinding>,
+    raw: Option<raw::RawSelection>,
     requested_catalog: Option<Catalog>,
 }
 
@@ -39,17 +43,49 @@ impl Profile {
     /// Swift fields in the explicit resource templates are inactive in this selection.
     pub fn new(
         connection: ConnectionConfig,
-        mut settings: Settings,
+        settings: Settings,
         peers: establish::Peers,
         initiator: transport::Config,
         responder: transport::Config,
         catalog: Catalog,
         parameters: transport::TransactionSettings,
     ) -> io::Result<Self> {
+        Self::new_selected(
+            connection, settings, peers, initiator, responder, catalog, parameters, None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_selected(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+    ) -> io::Result<Self> {
         let base = connection.session()?;
-        if connection.duplex != Duplex::Full
+        if initiator.rolling_fragments != responder.rolling_fragments {
+            return Err(invalid(
+                "both roles must select the same complete directional fragment policy",
+            ));
+        }
+        if initiator.rolling_fragments.is_some()
+            && !catalog.descriptors().iter().any(|descriptor| {
+                matches!(
+                    descriptor.profile(),
+                    common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. }
+                )
+            })
+        {
+            return Err(invalid(
+                "fragment selection requires a Rolling catalog member",
+            ));
+        }
+        if (raw_policy.is_none() && connection.duplex != Duplex::Full)
             || connection.compression != Compression::None
-            || catalog.initial().duplex() != Duplex::Full
+            || catalog.initial().duplex() != connection.duplex
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -75,7 +111,7 @@ impl Profile {
                 let original = initial.direction(role);
                 if direction.common().traffic().layer != layer
                     || direction.max_native() != original.max_native()
-                    || descriptor.duplex() != Duplex::Full
+                    || descriptor.duplex() != connection.duplex
                 {
                     return Err(invalid(
                         "common catalog changes immutable attachment/duplex",
@@ -133,8 +169,12 @@ impl Profile {
             initial,
             data,
             carrier: None,
+            raw: None,
             requested_catalog: None,
         };
+        if let Some(policy) = raw_policy {
+            return result.select_raw(policy);
+        }
         result.runtime_contract(security::Role::Initiator)?;
         result.runtime_contract(security::Role::Responder)?;
         Ok(result)
@@ -142,6 +182,24 @@ impl Profile {
     /// Exact requested directional ACK policies, unchanged by genuine outer binding.
     pub fn ack_coalescing(&self) -> [Option<l2tunnel::pipeline::ack_coalescing::Policy>; 2] {
         [self.initiator.ack_coalescing, self.responder.ack_coalescing]
+    }
+    /// Exact independent receive-wire policies, unchanged by genuine outer binding.
+    pub fn rolling_ingress(&self) -> [Option<l2tunnel::rolling_records::IngressLimits>; 2] {
+        [
+            self.initiator.rolling_ingress,
+            self.responder.rolling_ingress,
+        ]
+    }
+    /// Exact paired authenticated raw ACK ingress limits.
+    pub fn connection_ingress(&self) -> [Option<transport::ConnectionIngressLimits>; 2] {
+        [
+            self.initiator.connection_ingress,
+            self.responder.connection_ingress,
+        ]
+    }
+    /// Complete immutable requested fragment policy in global direction order.
+    pub fn rolling_fragments(&self) -> Option<l2tunnel::record_engine::FragmentPolicy> {
+        self.initiator.rolling_fragments
     }
     /// Exact shared native attachment contract.
     pub fn connection(&self) -> ConnectionConfig {
@@ -159,7 +217,7 @@ impl Profile {
     /// Derive an effective plan only from a genuine completed outer proof.
     /// The original settings/catalog/resources remain retained and unchanged.
     pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
-        if self.carrier.is_some() {
+        if self.carrier.is_some() || self.raw.is_some() {
             return Err(invalid("common profile already bound to an outer session"));
         }
         if outer.endpoints()
@@ -178,6 +236,12 @@ impl Profile {
         let role = outer_role(outer)?;
         let mut resources = [self.initiator, self.responder];
         for value in &mut resources {
+            if let Some(policy) = value.rolling_fragments.as_mut() {
+                policy.forward.framing.outer_overhead_bytes =
+                    extra_byte(policy.forward.framing.outer_overhead_bytes)?;
+                policy.reverse.framing.outer_overhead_bytes =
+                    extra_byte(policy.reverse.framing.outer_overhead_bytes)?;
+            }
             value.control.wire_overhead = extra_byte(value.control.wire_overhead)?;
             let streams = value
                 .streams
@@ -213,6 +277,9 @@ impl Profile {
     }
     /// Original offline setup identity H0, before a fresh outer session is known.
     pub fn requested_configuration(&self) -> io::Result<security::ConfigDigest> {
+        if let Some(raw) = self.raw {
+            return Ok(raw.requested);
+        }
         match self.carrier {
             Some(value) => Ok(value.requested_configuration),
             None => self.configuration(),
@@ -220,6 +287,9 @@ impl Profile {
     }
     /// Original offline common envelope E0, without a fabricated outer proof.
     pub fn requested_envelope(&self) -> EnvelopeDigest {
+        if let Some(raw) = self.raw {
+            return raw.envelope;
+        }
         self.carrier
             .map_or(self.envelope, |value| value.requested_envelope)
     }
@@ -231,6 +301,9 @@ impl Profile {
     /// Bound profiles carry the actual extra opcode and effective setup identity.
     pub fn establish_config(&self, role: security::Role) -> io::Result<establish::Config> {
         let mut config = self.settings.runtime(role, self.peers)?;
+        if self.raw.is_some() {
+            return self.establish_raw(config, role);
+        }
         if let Some(binding) = self.carrier {
             if role != outer_role(binding.outer)? {
                 return Err(invalid(
@@ -271,6 +344,9 @@ impl Profile {
     }
     /// Actual setup/Control digest consumed by the maintained authentication factories.
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
+        if let Some(raw) = self.raw {
+            return Ok(raw.configuration);
+        }
         match self.carrier {
             Some(value) => Ok(value.configuration),
             None => self.settings.configuration(self.peers),
@@ -281,6 +357,9 @@ impl Profile {
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if self.raw.is_some() {
+            return self.raw_contract(role);
+        }
         if let Some(binding) = self.carrier {
             if role != outer_role(binding.outer)? {
                 return Err(invalid(
@@ -356,6 +435,11 @@ fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Desc
         common::Profile::AlignedCompact { forward, reverse } => {
             for value in [forward, reverse] {
                 value.recovery = compact_extra_byte(value.recovery)?;
+            }
+        }
+        common::Profile::PerConnectionCompact { forward, reverse } => {
+            for value in [forward, reverse] {
+                value.compact.recovery = compact_extra_byte(value.compact.recovery)?;
             }
         }
         common::Profile::PackedCompact { forward, reverse } => {

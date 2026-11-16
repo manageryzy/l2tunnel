@@ -1,6 +1,7 @@
+use super::connections::Connections;
 use super::{
     Context, Emission, EmissionKind, Error, NativeStep, ProfileIdentity, SourceForm, Tick, aligned,
-    configuration, duration, receiver, swift,
+    configuration, duration, pipeline, receiver, swift,
 };
 use crate::rolling_records;
 use l2tunnel_recovery::{EndpointRole, RecoveryContext};
@@ -13,6 +14,7 @@ pub(super) enum Owner {
     Aligned(aligned::Endpoint),
     Packed(aligned::packed::Endpoint),
     Rolling(rolling_records::Endpoint),
+    Connections(Connections),
 }
 
 impl Owner {
@@ -37,6 +39,13 @@ impl Owner {
                     Err(Error::Invariant)
                 };
             }
+            configuration::Profile::PerConnectionCompact { .. } => {
+                return if matches!(self, Self::Connections(_)) {
+                    Ok(())
+                } else {
+                    Err(Error::Invariant)
+                };
+            }
             _ => {}
         }
         match self {
@@ -46,7 +55,7 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .enable_physical_send_confirmation()
                 .map_err(Error::Aligned),
-            Self::Swift(_) | Self::Rolling(_) => Ok(()),
+            Self::Swift(_) | Self::Rolling(_) | Self::Connections(_) => Ok(()),
         }
     }
     pub(super) fn storage_heap(&self) -> Option<(usize, usize)> {
@@ -61,6 +70,10 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .storage_usage()
                 .map(|u| (u.capacity_bytes, u.allocations)),
+            Self::Connections(owner) => {
+                let usage = owner.collection.storage_usage();
+                Some((usage.heap_bytes, usage.allocations))
+            }
             Self::Rolling(endpoint) => endpoint
                 .storage_usage()
                 .map(|u| (u.capacity_bytes, u.allocations)),
@@ -92,6 +105,20 @@ impl Owner {
             )
             .map(Self::Rolling)
             .map_err(Error::Rolling);
+        }
+        if let configuration::Profile::PerConnectionCompact { .. } =
+            configuration.descriptor().profile()
+        {
+            let local = configuration.descriptor().local(context.role);
+            let (
+                configuration::DirectionProfile::PerConnectionCompact(send),
+                configuration::DirectionProfile::PerConnectionCompact(receive),
+            ) = (local.send().profile(), local.receive().profile())
+            else {
+                return Err(Error::Configuration);
+            };
+            return Connections::new(Connections::plan(*send, *receive)?, context)
+                .map(Self::Connections);
         }
         let local = configuration.descriptor().local(context.role);
         let recovery = recovery_context(context);
@@ -159,6 +186,18 @@ impl Owner {
         }
     }
 
+    pub(super) fn offer_queued(
+        &mut self,
+        now: Tick,
+        metadata: pipeline::PacketMetadata,
+        bytes: &[u8],
+    ) -> Result<Option<ProfileIdentity>, Error> {
+        match self {
+            Self::Connections(owner) => owner.offer(now, metadata, bytes),
+            _ => self.offer(now, metadata.binding.channel, bytes),
+        }
+    }
+
     pub(super) fn offer(
         &mut self,
         now: Tick,
@@ -166,6 +205,7 @@ impl Owner {
         bytes: &[u8],
     ) -> Result<Option<ProfileIdentity>, Error> {
         match self {
+            Self::Connections(_) => Err(Error::IngressPolicy),
             Self::Swift(owned) => {
                 let channel =
                     records::ChannelId::new(usize::from(channel)).ok_or(Error::Configuration)?;
@@ -218,6 +258,7 @@ impl Owner {
         overhead: usize,
     ) -> Result<Option<Emission>, Error> {
         match self {
+            Self::Connections(owner) => owner.poll(now, number, allow_data, out, budget, witnesses),
             Self::Swift(owned) => {
                 let maximum = owned.engine().send_config().codec.datagram_bytes;
                 if out.len() < maximum {
@@ -319,6 +360,7 @@ impl Owner {
         body: &mut [u8],
     ) -> Result<(), Error> {
         match self {
+            Self::Connections(owner) => owner.accept_recovered(received, now, kind, body),
             Self::Swift(owned) => {
                 let observed = match *body.first().ok_or(Error::PacketSize)? & swift::KIND_MASK {
                     swift::KIND_SOURCE => EmissionKind::Source(SourceForm::Swift),
@@ -356,6 +398,31 @@ impl Owner {
         }
     }
 
+    pub(super) fn accept_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        number: u64,
+        kind: EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        if let Self::Rolling(endpoint) = self {
+            endpoint
+                .accept_authenticated_until(
+                    received,
+                    now,
+                    original_deadline,
+                    Some(number),
+                    kind,
+                    body,
+                )
+                .map_err(Error::Rolling)
+        } else {
+            self.accept_at(received, now, number, kind, body)
+        }
+    }
+
     pub(super) fn extract(
         &mut self,
         now: Tick,
@@ -365,6 +432,7 @@ impl Owner {
         out: &mut [u8],
     ) -> Result<NativeStep, Error> {
         match self {
+            Self::Connections(owner) => owner.extract(now, channel, work, out),
             Self::Swift(owned) => {
                 let maximum = owned.engine().receive_config().max_native;
                 if out.len() < maximum {
@@ -413,6 +481,7 @@ impl Owner {
 
     pub(super) fn commit(&mut self, now: Tick) -> Result<(), Error> {
         match self {
+            Self::Connections(owner) => owner.commit_native_at(now, now),
             Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint
                 .commit_delivery(duration(now))
@@ -429,6 +498,7 @@ impl Owner {
 
     pub(super) fn pending_deadline(&self) -> Option<std::time::Duration> {
         match self {
+            Self::Connections(owner) => owner.pending_deadline(),
             Self::Swift(_) => None,
             Self::Aligned(endpoint) => endpoint.pending_deadline(),
             Self::Packed(endpoint) => endpoint.pending_deadline(),
@@ -440,6 +510,7 @@ impl Owner {
 
     pub(super) fn tick(&mut self, now: Tick) -> Result<(), Error> {
         match self {
+            Self::Connections(owner) => owner.tick(now),
             Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
             Self::Packed(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
@@ -449,6 +520,16 @@ impl Owner {
 
     pub(super) fn feedback_opportunity(&self) -> Result<Option<(Tick, usize)>, Error> {
         let (at, bytes) = match self {
+            Self::Connections(owner) => {
+                let Some((_, at, bytes)) = owner
+                    .collection
+                    .feedback_opportunity()
+                    .map_err(Error::Connections)?
+                else {
+                    return Ok(None);
+                };
+                (Some(at), bytes)
+            }
             Self::Swift(owned) => {
                 return Ok(owned
                     .engine()
@@ -481,6 +562,7 @@ impl Owner {
 
     pub(super) fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
         let at = match self {
+            Self::Connections(owner) => owner.collection.expiry_deadline(),
             Self::Swift(_) => return Ok(None),
             Self::Aligned(endpoint) => endpoint.expiry_deadline(),
             Self::Packed(endpoint) => endpoint.expiry_deadline(),
@@ -496,6 +578,15 @@ impl Owner {
 
     pub(super) fn deadline(&self) -> Result<Option<Tick>, Error> {
         match self {
+            Self::Connections(owner) => owner
+                .collection
+                .deadline()
+                .map(|at| {
+                    u64::try_from(at.as_micros())
+                        .map(Tick)
+                        .map_err(|_| Error::Arithmetic)
+                })
+                .transpose(),
             Self::Swift(owned) => {
                 let engine = owned.engine();
                 Ok(engine
@@ -527,6 +618,7 @@ impl Owner {
 
     pub(super) fn drained(&self) -> Result<bool, Error> {
         match self {
+            Self::Connections(owner) => Ok(owner.drained()),
             Self::Swift(owned) => {
                 let engine = owned.engine();
                 Ok(engine.send_drained() && engine.receive_drained())

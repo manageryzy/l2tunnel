@@ -401,6 +401,9 @@ mod probe {
             },
             rolling_work: Some(rolling_work()),
             ack_coalescing: None,
+            connection_ingress: None,
+            rolling_fragments: None,
+            rolling_ingress: None,
             native: transport::NativeBudget {
                 pending_packets: 64,
                 pending_bytes: 102_400,

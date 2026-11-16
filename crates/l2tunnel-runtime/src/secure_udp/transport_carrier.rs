@@ -1,4 +1,5 @@
 //! Actual original-datagram custody for the existing sole runtime loop.
+use super::raw_carrier::{NoRaw, RawBacking};
 use super::*;
 use crate::secure_udp::original_datagram::{
     OriginalDatagram, PendingSend, SendClass, SendFailure, SendReceipt,
@@ -8,19 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
-/// One exact retained Common ciphertext; labels confer no authentication authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct UserIdentity {
-    pub(super) scope: Scope,
-    pub(super) number: security::PacketNumber,
-    pub(super) bytes: usize,
-    pub(super) deadline: Instant,
-}
-/// Physical completion is distinct from local bounded custody.
-pub(super) enum SendProgress {
-    Pending,
-    Whole { receipt: SendReceipt, late: bool },
-}
+pub(in crate::secure_udp) use super::raw_carrier::{PhysicalReceipt, SendProgress, UserIdentity};
 
 struct Pending {
     ticket: Option<PendingSend>,
@@ -76,9 +65,10 @@ impl Plan {
     }
 }
 /// Sole real socket owner. Carrier-only backing does not enlarge bare-UDP frames.
-pub(super) enum IoOwner {
+pub(super) enum IoOwner<R: RawBacking = NoRaw> {
     Udp(tokio::net::UdpSocket),
     Carrier(Vec<CarrierIo>),
+    Raw(Vec<R>),
 }
 impl From<tokio::net::UdpSocket> for IoOwner {
     fn from(socket: tokio::net::UdpSocket) -> Self {
@@ -114,9 +104,43 @@ impl IoOwner {
         }
         Ok(result)
     }
+}
+impl<R: RawBacking> IoOwner<R> {
+    pub(super) fn from_raw(raw: R) -> io::Result<Self> {
+        let mut values = Vec::new();
+        values.try_reserve_exact(1).map_err(io::Error::other)?;
+        if values.capacity() != 1 {
+            return Err(protocol("raw singleton capacity differs"));
+        }
+        values.push(raw);
+        Ok(Self::Raw(values))
+    }
+    pub(super) fn begin_turn(&mut self) {
+        if let Self::Raw(values) = self {
+            values[0].begin_turn();
+        }
+    }
+    pub(super) fn check_physical_failure(&self) -> io::Result<()> {
+        match self {
+            Self::Raw(values) => values[0].check_failure(),
+            _ => Ok(()),
+        }
+    }
+    pub(super) fn physical_wake(&self) -> io::Result<Option<Instant>> {
+        match self {
+            Self::Raw(values) => values[0].next_wake().map(Some),
+            _ => Ok(None),
+        }
+    }
     pub(super) fn adapter_capacity_bytes(&self) -> io::Result<usize> {
         match self {
             Self::Udp(_) => Ok(0),
+            Self::Raw(values) => values
+                .first()
+                .ok_or_else(|| protocol("missing raw singleton"))?
+                .capacity_bytes()?
+                .checked_add(std::mem::size_of::<Self>())
+                .ok_or_else(exhausted),
             Self::Carrier(values) => {
                 let value = values
                     .first()
@@ -135,18 +159,24 @@ impl IoOwner {
     pub(super) fn adapter_usage(&self) -> io::Result<Usage> {
         Ok(Usage {
             capacity_bytes: self.adapter_capacity_bytes()?,
-            allocations: if self.is_carrier() { 3 } else { 0 },
+            allocations: match self {
+                Self::Udp(_) => 0,
+                Self::Carrier(_) => 3,
+                Self::Raw(values) => values[0].allocations(),
+            },
         })
     }
+
     pub(super) fn addresses(&self) -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
         match self {
             Self::Udp(socket) => Ok((socket.local_addr()?, socket.peer_addr()?)),
             Self::Carrier(values) => Ok(values[0].datagram.addresses()),
+            Self::Raw(values) => Ok(values[0].addresses()),
         }
     }
     pub(super) fn extra_wire_bytes(&self) -> usize {
         match self {
-            Self::Udp(_) => 0,
+            Self::Udp(_) | Self::Raw(_) => 0,
             Self::Carrier(values) => values[0].datagram.geometry().extra_wire_bytes,
         }
     }
@@ -157,6 +187,11 @@ impl IoOwner {
             } else {
                 28
             }),
+            Self::Raw(values) => values[0]
+                .geometry()
+                .ip_tcp_bytes
+                .checked_add(values[0].geometry().record_overhead_bytes)
+                .ok_or_else(exhausted),
             Self::Carrier(values) => {
                 let geometry = values[0].datagram.geometry();
                 geometry
@@ -169,27 +204,53 @@ impl IoOwner {
     pub(super) fn maximum_datagram_bytes(&self) -> Option<usize> {
         match self {
             Self::Udp(_) => None,
+            Self::Raw(values) => Some(values[0].geometry().max_record_bytes),
             Self::Carrier(values) => Some(values[0].datagram.geometry().max_datagram_bytes),
         }
     }
+    pub(super) fn is_raw(&self) -> bool {
+        matches!(self, Self::Raw(_))
+    }
     pub(super) fn is_carrier(&self) -> bool {
-        matches!(self, Self::Carrier(_))
+        !matches!(self, Self::Udp(_))
     }
     pub(super) fn user_pending(&self) -> bool {
-        matches!(self, Self::Carrier(values) if values[0].user.as_ref().is_some_and(|u| u.pending.result.is_none()))
+        match self {
+            Self::Udp(_) => false,
+            Self::Carrier(values) => values[0]
+                .user
+                .as_ref()
+                .is_some_and(|u| u.pending.result.is_none()),
+            Self::Raw(values) => values[0].user_pending(),
+        }
     }
+
+    fn user_precedes_control(&self) -> bool {
+        match self {
+            Self::Raw(values) => values[0].user_precedes_control(),
+            _ => false,
+        }
+    }
+
     pub(super) fn control_pending(&self) -> bool {
-        matches!(self, Self::Carrier(values) if values[0].control.is_some())
+        match self {
+            Self::Udp(_) => false,
+            Self::Carrier(values) => values[0].control.is_some(),
+            Self::Raw(values) => values[0].control_pending(),
+        }
     }
+
     pub(super) fn receive_ready(&self) -> bool {
         match self {
             Self::Udp(_) => true,
+            Self::Raw(values) => values[0].receive_ready(),
             Self::Carrier(values) => values[0].input_length.is_some(),
         }
     }
     pub(super) fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Udp(_) => None,
+            Self::Raw(values) => values[0].deadline(),
             Self::Carrier(values) => {
                 let value = &values[0];
                 value
@@ -205,7 +266,7 @@ impl IoOwner {
     }
     pub(super) fn admission_wake(&self, now: Instant) -> Option<Instant> {
         match self {
-            Self::Udp(_) => None,
+            Self::Udp(_) | Self::Raw(_) => None,
             Self::Carrier(values) => {
                 let value = &values[0];
                 if value
@@ -232,6 +293,7 @@ impl IoOwner {
     ) -> io::Result<SendProgress> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, identity.deadline),
+            Self::Raw(values) => values[0].try_user(identity, bytes),
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 if bytes.len() != identity.bytes {
@@ -274,6 +336,7 @@ impl IoOwner {
     ) -> io::Result<SendProgress> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, deadline),
+            Self::Raw(values) => values[0].stage_control(bytes, cost, deadline),
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 if value.control.is_some() {
@@ -303,6 +366,9 @@ impl IoOwner {
         }
     }
     pub(super) fn take_control(&mut self) -> io::Result<Option<(SendProgress, usize)>> {
+        if let Self::Raw(values) = self {
+            return values[0].take_control();
+        }
         let Self::Carrier(values) = self else {
             return Ok(None);
         };
@@ -318,6 +384,9 @@ impl IoOwner {
         complete(result).map(|progress| Some((progress, cost)))
     }
     pub(super) fn take_user(&mut self) -> io::Result<Option<(UserIdentity, SendProgress)>> {
+        if let Self::Raw(values) = self {
+            return values[0].take_user();
+        }
         let Self::Carrier(values) = self else {
             return Ok(None);
         };
@@ -332,9 +401,21 @@ impl IoOwner {
         value.user = None;
         complete(result).map(|progress| Some((identity, progress)))
     }
+    pub(super) fn try_receive_at(
+        &mut self,
+        output: &mut [u8],
+    ) -> io::Result<(usize, Option<Instant>)> {
+        if let Self::Raw(values) = self {
+            return values[0]
+                .try_receive(output)
+                .map(|(bytes, at)| (bytes, Some(at)));
+        }
+        self.try_receive(output).map(|bytes| (bytes, None))
+    }
     pub(super) fn try_receive(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Udp(socket) => socket.try_recv(output),
+            Self::Raw(values) => values[0].try_receive(output).map(|(bytes, _)| bytes),
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 let length = value.input_length.ok_or(io::ErrorKind::WouldBlock)?;
@@ -352,12 +433,20 @@ impl IoOwner {
         match self {
             Self::Udp(socket) if receive => socket.readable().await,
             Self::Udp(_) => std::future::pending().await,
+            Self::Raw(values) => std::future::poll_fn(|cx| values[0].poll_ready(cx, receive)).await,
             Self::Carrier(values) => {
                 std::future::poll_fn(|cx| values[0].poll_ready(cx, receive)).await
             }
         }
     }
     pub(super) async fn observe_completions(&mut self) {
+        if let Self::Raw(values) = self {
+            std::future::poll_fn(|cx| {
+                let _ = values[0].poll_ready(cx, false);
+                Poll::Ready(())
+            })
+            .await;
+        }
         if let Self::Carrier(values) = self {
             std::future::poll_fn(|cx| {
                 values[0].poll_pending(cx);
@@ -443,13 +532,13 @@ fn poll(datagram: &OriginalDatagram, pending: &mut Pending, cx: &mut Context<'_>
 fn complete(result: Result<SendReceipt, SendFailure>) -> io::Result<SendProgress> {
     match result {
         Ok(receipt) => Ok(SendProgress::Whole {
-            receipt,
+            receipt: receipt.into(),
             late: false,
         }),
         Err(SendFailure::Expired {
             accepted: Some(receipt),
         }) => Ok(SendProgress::Whole {
-            receipt,
+            receipt: receipt.into(),
             late: true,
         }),
         Err(error @ SendFailure::Expired { accepted: None }) => {
@@ -481,9 +570,9 @@ fn udp_write(
         28
     };
     Ok(SendProgress::Whole {
-        receipt: SendReceipt {
-            datagram_bytes: written,
-            udp_bytes: written,
+        receipt: PhysicalReceipt {
+            record_bytes: written,
+            udp_bytes: Some(written),
             ip_bytes: written.checked_add(overhead).ok_or_else(exhausted)?,
             accepted_at,
             deadline,
@@ -502,9 +591,9 @@ fn buffer(bytes: usize) -> io::Result<Vec<u8>> {
 }
 
 impl Driver {
-    pub(super) fn complete_carrier_io(
+    pub(super) fn complete_carrier_io<R: RawBacking>(
         &mut self,
-        socket: &mut IoOwner,
+        socket: &mut IoOwner<R>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
         // Complete both independent physical facts before propagating either error.
@@ -518,7 +607,11 @@ impl Driver {
                     .counters
                     .socket_accepted_ip_bytes
                     .saturating_add(receipt.ip_bytes as u64);
-                if cost != receipt.ip_bytes {
+                if cost != receipt.ip_bytes
+                    || receipt.udp_bytes.is_some_and(|bytes| {
+                        bytes < receipt.record_bytes || bytes > receipt.ip_bytes
+                    })
+                {
                     return Err(protocol("carrier Control physical charge differs"));
                 }
                 let observed = sample();
@@ -540,6 +633,7 @@ impl Driver {
         });
         control?;
         user?;
+        socket.check_physical_failure()?;
         let observed = sample();
         clock(self.origin, observed)?;
         if socket.deadline().is_some_and(|cap| observed >= cap) {
@@ -550,9 +644,9 @@ impl Driver {
         }
         Ok(())
     }
-    pub(super) fn send_selected_io_sampled(
+    pub(super) fn send_selected_io_sampled<R: RawBacking>(
         &mut self,
-        socket: &mut IoOwner,
+        socket: &mut IoOwner<R>,
         now: u64,
         instant: Instant,
         mut sample: impl FnMut() -> Instant,
@@ -575,6 +669,14 @@ impl Driver {
             let now = clock(self.origin, instant)?.max(now);
             if !self.check_expiry(now)? {
                 break;
+            }
+            // Retry existing ciphertext before a new Control claims the same
+            // raw Full slot. Independent Half lanes keep their usual priority.
+            if socket.user_precedes_control() {
+                if !self.send_common_carrier(socket, now, &mut sample)? {
+                    break;
+                }
+                continue;
             }
             if !socket.control_pending() {
                 if let Some((bytes, cap)) = self.tail_with_cap(instant)? {
@@ -604,9 +706,9 @@ impl Driver {
         }
         Ok(())
     }
-    fn stage_carrier_control(
+    fn stage_carrier_control<R: RawBacking>(
         &mut self,
-        socket: &mut IoOwner,
+        socket: &mut IoOwner<R>,
         bytes: usize,
         cap: Instant,
         kind: performance::WireKind,
@@ -624,7 +726,11 @@ impl Driver {
             }
         }
     }
-    pub(super) fn wake_selected_io(&self, socket: &IoOwner, now: u64) -> io::Result<Instant> {
+    pub(super) fn wake_selected_io<R: RawBacking>(
+        &self,
+        socket: &IoOwner<R>,
+        now: u64,
+    ) -> io::Result<Instant> {
         let mut wake = if socket.is_carrier() && self.common.is_some() {
             self.wake_common_with_custody(now, socket.user_pending(), socket.control_pending())?
         } else {
@@ -632,6 +738,9 @@ impl Driver {
         };
         if let Some(cap) = socket.deadline() {
             wake = wake.min(cap);
+        }
+        if let Some(physical) = socket.physical_wake()? {
+            wake = wake.min(physical);
         }
         if let Some(at) = socket.admission_wake(Instant::now()) {
             wake = wake.min(at);

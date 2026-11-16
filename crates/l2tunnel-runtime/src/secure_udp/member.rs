@@ -26,6 +26,12 @@ pub mod refresh;
 #[path = "member_carrier.rs"]
 pub mod carrier;
 
+/// Original raw packet owner through the same member gate.
+#[path = "member_raw_carrier.rs"]
+pub mod raw_carrier;
+
+use super::raw_carrier_io::{NoRaw, RawBacking};
+
 const ROUTE: u8 = 3;
 const ACCEPT_BYTES: usize = 34;
 const PROOF_WIRE: usize = 1 + 26 + identity::MEMBER_PROOF_BYTES;
@@ -105,8 +111,8 @@ pub struct Parts {
     pub info: Info,
 }
 
-struct MemberState {
-    socket: establish::SocketBacking,
+struct MemberState<R: RawBacking = NoRaw> {
+    socket: establish::SocketBacking<R>,
     material: establish::InitialMaterial,
     cover: cover::Config,
     bootstrap: establish::BootstrapTail,
@@ -441,12 +447,12 @@ pub async fn accept_observed(
     .into_legacy()
 }
 
-async fn drive_observed(
-    established: establish::EstablishedState,
+async fn drive_observed<R: RawBacking>(
+    established: establish::EstablishedState<R>,
     local: Local<'_>,
     settings: Settings,
     observe: &mut diagnostics::Observer<'_>,
-) -> io::Result<MemberState> {
+) -> io::Result<MemberState<R>> {
     let mut report = Reporter::at(observe, Stage::Membership);
     report.bootstrap(
         established.tail.statistics(),
@@ -493,12 +499,12 @@ impl Quota {
     }
 }
 
-async fn drive(
-    established: establish::EstablishedState,
+async fn drive<R: RawBacking>(
+    established: establish::EstablishedState<R>,
     local: Local<'_>,
     settings: Settings,
     report: &mut Reporter<'_, '_>,
-) -> io::Result<MemberState> {
+) -> io::Result<MemberState<R>> {
     let role = if matches!(&local, Local::Client(_)) {
         security::Role::Initiator
     } else {
@@ -645,7 +651,7 @@ async fn drive(
             report.bootstrap(tail.statistics(), tail.control_statistics());
             handoff_observed(
                 joining_deadline,
-                send_backing(&socket, &output[..length], joining_deadline),
+                send_backing(&mut socket, &output[..length], joining_deadline),
                 report,
             )
             .await?;
@@ -673,7 +679,7 @@ async fn drive(
             report.bootstrap(tail.statistics(), tail.control_statistics());
             handoff_observed(
                 joining_deadline,
-                send_backing(&socket, &output[..length], joining_deadline),
+                send_backing(&mut socket, &output[..length], joining_deadline),
                 report,
             )
             .await?;
@@ -760,7 +766,7 @@ async fn drive(
                 advance(&mut next_outer)?;
                 report.member(1);
                 report.bootstrap(tail.statistics(), tail.control_statistics());
-                handoff_observed(joining_deadline, send_acceptance_backing(&socket, &output[..length], joining_deadline), report).await?;
+                handoff_observed(joining_deadline, send_acceptance_backing(&mut socket, &output[..length], joining_deadline), report).await?;
                 let now = Instant::now();
                 observed_before(report, now, deadline)?;
                 let material = crypto.finish(root, origin, now, report)?;
@@ -790,10 +796,22 @@ fn validate(
         &mut report,
     )
 }
+trait SocketAddresses {
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+}
+impl<R: RawBacking> SocketAddresses for establish::SocketBacking<R> {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        establish::SocketBacking::local_addr(self)
+    }
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        establish::SocketBacking::peer_addr(self)
+    }
+}
 enum SocketView<'a> {
     #[cfg(test)]
     Udp(&'a UdpSocket),
-    Backing(&'a establish::SocketBacking),
+    Backing(&'a dyn SocketAddresses),
 }
 impl SocketView<'_> {
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -836,8 +854,8 @@ impl<'a> From<&'a establish::Established> for EstablishedView<'a> {
         }
     }
 }
-impl<'a> From<&'a establish::EstablishedState> for EstablishedView<'a> {
-    fn from(value: &'a establish::EstablishedState) -> Self {
+impl<'a, R: RawBacking> From<&'a establish::EstablishedState<R>> for EstablishedView<'a> {
+    fn from(value: &'a establish::EstablishedState<R>) -> Self {
         Self {
             socket: SocketView::Backing(&value.socket),
             actual_binding: value.material.binding(),
@@ -1029,33 +1047,39 @@ async fn handoff_observed<T>(
     Ok(result)
 }
 
-async fn send_backing(
-    socket: &establish::SocketBacking,
+async fn send_backing<R: RawBacking>(
+    socket: &mut establish::SocketBacking<R>,
     packet: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
     match socket {
         establish::SocketBacking::Udp(socket) => send(socket, packet).await,
-        establish::SocketBacking::Carrier(_) => socket.send_control(packet, deadline).await,
+        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
+            socket.send_control(packet, deadline).await
+        }
     }
 }
-async fn receive_backing(
-    socket: &mut establish::SocketBacking,
+async fn receive_backing<R: RawBacking>(
+    socket: &mut establish::SocketBacking<R>,
     output: &mut [u8],
 ) -> io::Result<usize> {
     match socket {
         establish::SocketBacking::Udp(socket) => receive(socket, output).await,
-        establish::SocketBacking::Carrier(_) => socket.recv(output).await,
+        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
+            socket.recv(output).await
+        }
     }
 }
-async fn send_acceptance_backing(
-    socket: &establish::SocketBacking,
+async fn send_acceptance_backing<R: RawBacking>(
+    socket: &mut establish::SocketBacking<R>,
     packet: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
     match socket {
         establish::SocketBacking::Udp(socket) => send_acceptance(socket, packet).await,
-        establish::SocketBacking::Carrier(_) => socket.send_control(packet, deadline).await,
+        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
+            socket.send_control(packet, deadline).await
+        }
     }
 }
 async fn send(socket: &UdpSocket, packet: &[u8]) -> io::Result<()> {

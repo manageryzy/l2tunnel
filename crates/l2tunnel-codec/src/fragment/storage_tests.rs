@@ -665,3 +665,9 @@ fn exact_65535_fragment_wire_boundary_and_every_flat_error_preserve_id_and_outpu
     assert_eq!(inventory(&receiver)?, pointers);
     Ok(())
 }
+
+#[path = "timing_tests.rs"]
+mod original_time;
+
+#[path = "geometry_tests.rs"]
+mod geometry;

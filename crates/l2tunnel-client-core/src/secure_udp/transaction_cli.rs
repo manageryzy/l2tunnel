@@ -377,6 +377,9 @@ impl RuntimeDto {
             },
             rolling_work: None,
             ack_coalescing: None,
+            connection_ingress: None,
+            rolling_fragments: None,
+            rolling_ingress: None,
             report_interval: self.report_interval_micros.0.map(Duration::from_micros),
         };
         Ok([

@@ -27,6 +27,8 @@ pub struct PreparedOutput {
     pub bytes: usize,
     /// Exact complete charge including the selected overhead once.
     pub wire_bytes: usize,
+    /// Exact whole physical packet count reserved by the selected framing.
+    pub packets: usize,
     /// Original native units initialized in caller witness storage.
     pub witnesses: usize,
 }
@@ -77,6 +79,12 @@ struct Preview {
     current: Option<PreviewUnit>,
     selected: [u64; 4],
 }
+pub(super) struct ConstructionOptions {
+    pub(super) copies: CopyPolicies,
+    pub(super) ingress: Option<IngressLimits>,
+    pub(super) framing: Option<OutputFraming>,
+}
+
 /// One actual directional sender, receiver, compact record stage and record ledger.
 ///
 /// Functional construction preserves the existing conservative contracts.
@@ -96,11 +104,13 @@ pub struct Endpoint {
     pub(super) receive_scope: receiver::Scope,
     pub(super) sender: scheduler::Sender,
     pub(super) incoming: scheduler::Receiver,
+    pub(super) ingress: Option<ingress::Ingress>,
     pub(super) packing: packed_sender::Sender,
     pub(super) records: receiver::Receiver,
     pub(super) source: Vec<u8>,
     pub(super) symbols: Vec<u8>,
     pub(super) overhead: usize,
+    pub(super) framing: Option<codec::FragmentConfig>,
     pub(super) now: Tick,
     pub(super) failure: Option<Error>,
     pub(super) statistics: Statistics,
@@ -121,7 +131,18 @@ impl Endpoint {
     /// Construct real codec and rolling owners after complete scalar validation.
     /// Every tick in this composition is one injected microsecond.
     pub fn new(config: Config, context: Context, stream: u32, now: Tick) -> Result<Self, Error> {
-        Self::construct(config, context, stream, now, None, CopyPolicies::ONE)
+        Self::construct(
+            config,
+            context,
+            stream,
+            now,
+            None,
+            ConstructionOptions {
+                copies: CopyPolicies::ONE,
+                ingress: None,
+                framing: None,
+            },
+        )
     }
     /// Select complete caller-authenticated directional source-copy policies.
     pub fn new_with_copies(
@@ -131,7 +152,45 @@ impl Endpoint {
         now: Tick,
         copies: CopyPolicies,
     ) -> Result<Self, Error> {
-        Self::construct(config, context, stream, now, None, copies)
+        Self::construct(
+            config,
+            context,
+            stream,
+            now,
+            None,
+            ConstructionOptions {
+                copies,
+                ingress: None,
+                framing: None,
+            },
+        )
+    }
+    /// Construct the same actual owners with explicitly authenticated output framing.
+    /// The caller still encodes and physically confirms every actual fragment.
+    pub fn new_with_output_framing(
+        config: Config,
+        context: Context,
+        stream: u32,
+        now: Tick,
+        copies: CopyPolicies,
+        framing: OutputFraming,
+    ) -> Result<Self, Error> {
+        Self::construct(
+            config,
+            context,
+            stream,
+            now,
+            None,
+            ConstructionOptions {
+                copies,
+                ingress: None,
+                framing: Some(framing),
+            },
+        )
+    }
+    /// Exact local selected fragment geometry; None retains one unfragmented packet.
+    pub const fn output_fragment_config(&self) -> Option<codec::FragmentConfig> {
+        self.framing
     }
     /// Observe exact selected policies; local observation provides no peer authority.
     pub const fn source_copy_policies(&self) -> CopyPolicies {
@@ -143,10 +202,19 @@ impl Endpoint {
         stream: u32,
         now: Tick,
         reserved: Option<storage::Plan>,
-        copies: CopyPolicies,
+        options: ConstructionOptions,
     ) -> Result<Self, Error> {
+        let ConstructionOptions {
+            copies,
+            ingress: ingress_limits,
+            framing,
+        } = options;
         copies.validate(config)?;
-        let digest = copies.binding_digest(config, stream)?;
+        let digest = if let Some(framing) = framing {
+            framing.binding_digest(config, copies, stream)?
+        } else {
+            copies.binding_digest(config, stream)?
+        };
         if context.session == 0 || context.epoch == 0 {
             return Err(Error::Configuration);
         }
@@ -204,6 +272,10 @@ impl Endpoint {
             ] {
                 now.0.checked_add(interval).ok_or(Error::Arithmetic)?;
             }
+        }
+        // Every requested input layout/limit is checked before selected allocation.
+        if let Some(limits) = ingress_limits {
+            limits.required_capacity(receive_config.maximum_packet_bytes()?)?;
         }
         let source = bytes(source_bytes)?;
         let symbols = bytes(symbol_bytes)?;
@@ -268,6 +340,9 @@ impl Endpoint {
             )
             .map_err(Error::Rolling)?
         };
+        let ingress = ingress_limits
+            .map(|limits| ingress::Ingress::new(limits, receive_config.maximum_packet_bytes()?))
+            .transpose()?;
         Ok(Self {
             instance: allocate_instance()?,
             config,
@@ -282,11 +357,13 @@ impl Endpoint {
             receive_scope,
             sender,
             incoming,
+            ingress,
             packing,
             records,
             source,
             symbols,
             overhead,
+            framing: framing.map(|value| value.local(context.role)),
             now,
             failure: None,
             statistics: Statistics::default(),
@@ -314,6 +391,14 @@ impl Endpoint {
         }
         if now < self.now {
             return self.fail(Error::Time);
+        }
+        if self
+            .ingress
+            .as_ref()
+            .and_then(|owner| owner.deadline())
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return self.fail(Error::Expired);
         }
         if self.stage_deadline.is_some_and(|deadline| now >= deadline) {
             return self.fail(Error::Expired);
@@ -688,6 +773,7 @@ impl Endpoint {
     pub fn step(&mut self, now: Tick, work: rolling::WorkBudget) -> Result<Step, Error> {
         self.advance(now)?;
         self.pump_send(now)?;
+        self.service_ingress(now)?;
         let send = self
             .sender
             .step(rolling_tick(now), work)
@@ -776,8 +862,16 @@ impl Endpoint {
         if witnesses.len() < required {
             return Err(Error::Witnesses { required });
         }
-        let wire_bytes = length.checked_add(self.overhead).ok_or(Error::Arithmetic)?;
-        if budget.packets == 0 || budget.wire_bytes < wire_bytes {
+        let (packets, wire_bytes) = if let Some(framing) = self.framing {
+            let geometry = framing.geometry(length).map_err(Error::Fragment)?;
+            (geometry.fragments(), geometry.wire_bytes())
+        } else {
+            (
+                1,
+                length.checked_add(self.overhead).ok_or(Error::Arithmetic)?,
+            )
+        };
+        if budget.packets < packets || budget.wire_bytes < wire_bytes {
             return Ok(None);
         }
         let next = self.next_output.checked_add(1).ok_or(Error::Arithmetic)?;
@@ -815,11 +909,12 @@ impl Endpoint {
             security_number,
             bytes: length,
             wire_bytes,
+            packets,
             witnesses: count,
         };
         self.next_output = next;
         self.prepared_output = Some(pending);
-        budget.packets -= 1;
+        budget.packets -= packets;
         budget.wire_bytes -= wire_bytes;
         Ok(Some(pending))
     }
@@ -828,6 +923,8 @@ impl Endpoint {
         self.prepared_output
     }
     /// Record exactly one caller-observed complete carrier handoff, never enqueue.
+    /// Selected framing requires all `pending.packets` whole physical fragments;
+    /// an individual fragment or partial batch does not discharge this copy token.
     /// Physical observation is retained even if subsequent timing validation fails.
     pub fn confirm_output(&mut self, now: Tick, pending: PreparedOutput) -> Result<(), Error> {
         self.confirm_output_at(now, now, pending)
@@ -873,14 +970,43 @@ impl Endpoint {
         Ok(())
     }
     /// Accept complete plaintext only after caller carrier authentication/replay.
-    /// Busy owns no hidden input queue; the caller retains and retries exact bytes.
+    /// With no selected queue, Busy retains the original caller-owned input.
     pub fn accept_authenticated(
         &mut self,
         now: Tick,
         kind: EmissionKind,
         bytes: &[u8],
     ) -> Result<(), Error> {
+        self.accept_authenticated_at(now, now, kind, bytes)
+    }
+    /// Preserve original input age without inferring external operation authority.
+    pub fn accept_authenticated_at(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        kind: EmissionKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.accept_authenticated_until(received, now, Tick(u64::MAX), None, kind, bytes)
+    }
+    /// Retain already-opened input and its actual Records number/caller deadline.
+    /// A number is observation metadata only; this owner creates no replay window.
+    pub fn accept_authenticated_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        security_number: Option<u64>,
+        kind: EmissionKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if received > now {
+            return Err(Error::Time);
+        }
         self.advance(now)?;
+        if now >= original_deadline {
+            return self.fail(Error::Expired);
+        }
         match kind {
             EmissionKind::Feedback => {
                 self.sender
@@ -888,29 +1014,104 @@ impl Endpoint {
                     .map_err(Error::Rolling)?;
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
-                let observed = match rolling::wire::inspect_with(
+                let (observed, scope) = match rolling::wire::inspect_with(
                     self.receive_config.scheduler.recovery,
                     self.receive_config.scheduler.source_wire,
                     bytes,
                 )
                 .map_err(Error::Rolling)?
                 {
-                    rolling::wire::View::Source { .. } => {
-                        EmissionKind::Source(SourceForm::SystematicFec)
+                    rolling::wire::View::Source { scope, .. } => {
+                        (EmissionKind::Source(SourceForm::SystematicFec), scope)
                     }
-                    rolling::wire::View::Repair(_) => EmissionKind::Repair,
+                    rolling::wire::View::Repair(value) => (EmissionKind::Repair, value.scope),
                 };
-                if observed != kind {
+                let expected = rolling::Scope {
+                    direction: self.send_rolling_scope.direction ^ 1,
+                    ..self.send_rolling_scope
+                };
+                if observed != kind || scope != expected {
                     return Err(Error::Identity);
                 }
-                self.incoming
-                    .receive_wire(bytes, rolling_tick(now))
-                    .map_err(Error::Rolling)?;
-                self.request_preview_scan();
+                if let Some(owner) = &mut self.ingress {
+                    let policy = self.receive_config.scheduler.recovery;
+                    let deadline = Tick(
+                        received
+                            .0
+                            .checked_add(policy.job_ticks)
+                            .ok_or(Error::Arithmetic)?,
+                    )
+                    .min(original_deadline);
+                    received
+                        .0
+                        .checked_add(policy.debt_ticks)
+                        .ok_or(Error::Arithmetic)?;
+                    if now >= deadline {
+                        return self.fail(Error::Expired);
+                    }
+                    let lease = owner.queue.acquire().ok_or(Error::Busy)?;
+                    lease
+                        .copy(
+                            ingress::Input {
+                                kind,
+                                number: security_number,
+                                received,
+                                original_cap: original_deadline,
+                                deadline,
+                            },
+                            received.0,
+                            bytes,
+                        )
+                        .map_err(Error::Ingress)?;
+                } else {
+                    self.incoming
+                        .receive_wire_until(
+                            bytes,
+                            rolling_tick(received),
+                            rolling_tick(now),
+                            rolling_tick(original_deadline),
+                        )
+                        .map_err(Error::Rolling)?;
+                    self.request_preview_scan();
+                }
             }
             _ => return Err(Error::Identity),
         }
         Ok(())
+    }
+    fn service_ingress(&mut self, now: Tick) -> Result<(), Error> {
+        let Some(owner) = &mut self.ingress else {
+            return Ok(());
+        };
+        let Some(front) = owner.queue.front() else {
+            return Ok(());
+        };
+        let input = *front.metadata();
+        if !matches!(
+            input.kind,
+            EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair
+        ) {
+            return self.fail(Error::Identity);
+        }
+        let result = self.incoming.receive_wire_until(
+            front.bytes(),
+            rolling_tick(input.received),
+            rolling_tick(now),
+            rolling_tick(input.original_cap),
+        );
+        match result {
+            Ok(_) => {
+                owner.queue.complete_front().map_err(Error::Ingress)?;
+                self.request_preview_scan();
+                Ok(())
+            }
+            Err(rolling::Error::Busy) => Ok(()),
+            Err(error) => self.fail(Error::Rolling(error)),
+        }
+    }
+    /// Actual per-generation input custody, independent of decoded/native receipt.
+    pub fn ingress_status(&self) -> Option<IngressStatus> {
+        self.ingress.as_ref().map(|owner| owner.status())
     }
     /// Borrow actual source witnesses; repairs contain no original native unit.
     pub fn outgoing_units(
@@ -979,6 +1180,7 @@ impl Endpoint {
             .map(|t| Tick(t.0))
             .into_iter()
             .chain(self.stage_deadline)
+            .chain(self.ingress.as_ref().and_then(|owner| owner.deadline()))
             .chain(self.incoming.deadline().map(|t| Tick(t.0)))
             .chain(self.records.deadline().map(|t| Tick(t.0)))
             .chain(self.prepared_native.map(|native| native.deadline))
@@ -997,8 +1199,11 @@ impl Endpoint {
     pub fn work_pending(&self) -> bool {
         let send = self.sender.status();
         let receive = self.incoming.status();
-        (!send.output_ready
-            && (send.encoder.pending_repair || send.regular_due > 0 || send.tail_remaining > 0))
+        self.ingress
+            .as_ref()
+            .is_some_and(|owner| !owner.queue.is_empty())
+            || (!send.output_ready
+                && (send.encoder.pending_repair || send.regular_due > 0 || send.tail_remaining > 0))
             || receive.decoder.pending_job
             || receive.feedback_building
             || (self.receive_progress
@@ -1055,6 +1260,10 @@ impl Endpoint {
         let receive = self.incoming.status();
         let records = self.records.status();
         self.failure.is_none()
+            && self
+                .ingress
+                .as_ref()
+                .is_none_or(|owner| owner.queue.is_empty())
             && self.packing.is_idle()
             && self.prepared_output.is_none()
             && self.prepared_native.is_none()

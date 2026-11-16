@@ -372,15 +372,29 @@ impl Decoder {
         self.terminal = Some(error);
         Err(error)
     }
-    fn stage(&mut self, input: Input, now: Tick) -> Result<Begin, Error> {
-        let job_end = self.expires(now, self.config.job_ticks)?;
+    fn input_deadlines(
+        &mut self,
+        input: Input,
+        received: Tick,
+        observed: Tick,
+        cap: Tick,
+    ) -> Result<(Tick, Option<Tick>), Error> {
+        if received > observed {
+            return self.fail(Error::TimeRegression);
+        }
+        let job_end = self.expires(received, self.config.job_ticks)?.min(cap);
+        let debt_end = self.expires(received, self.config.debt_ticks)?.min(cap);
         let debt = match self.debt {
-            Some(value) => Some(value),
-            None if input.end() > self.live.prefix => {
-                Some(self.expires(now, self.config.debt_ticks)?)
-            }
+            Some(value) => Some(value.min(debt_end)),
+            None if input.end() > self.live.prefix => Some(debt_end),
             None => None,
         };
+        if observed >= job_end || debt.is_some_and(|end| observed >= end) {
+            return self.fail(Error::Expired);
+        }
+        Ok((job_end, debt))
+    }
+    fn stage(&mut self, input: Input, job_end: Tick, debt: Option<Tick>) -> Result<Begin, Error> {
         let ticket = self.decisions.begin()?;
         self.active = Some(ticket);
         self.shadow = self.live;
@@ -419,6 +433,29 @@ impl Decoder {
         original: &[u8],
         now: Tick,
     ) -> Result<Begin, Error> {
+        self.begin_source_at(scope, id, original, now, now)
+    }
+    /// Preserve original authenticated input age while observing current time.
+    pub fn begin_source_at(
+        &mut self,
+        scope: Scope,
+        id: SourceId,
+        original: &[u8],
+        received: Tick,
+        observed: Tick,
+    ) -> Result<Begin, Error> {
+        self.begin_source_until(scope, id, original, received, observed, Tick(u64::MAX))
+    }
+    /// Clamp original job/debt age to the caller's retained operation/session cap.
+    pub fn begin_source_until(
+        &mut self,
+        scope: Scope,
+        id: SourceId,
+        original: &[u8],
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
         if scope != self.scope {
             return Err(Error::Scope);
         }
@@ -429,6 +466,12 @@ impl Decoder {
             return Err(Error::Length);
         }
         self.time(now)?;
+        if received > now {
+            return self.fail(Error::TimeRegression);
+        }
+        if now >= original_deadline {
+            return self.fail(Error::Expired);
+        }
         if self.job.is_some() {
             return Err(Error::Busy);
         }
@@ -452,15 +495,34 @@ impl Decoder {
         if id.0 < self.live.prefix {
             return self.fail(Error::Identity);
         }
-        self.expires(now, self.config.job_ticks)?;
-        self.expires(now, self.config.debt_ticks)?;
+        let input = Input::Source(id.0);
+        let (job_end, debt) = self.input_deadlines(input, received, now, original_deadline)?;
         self.input.fill(0);
         self.input[..2].copy_from_slice(&(original.len() as u16).to_be_bytes());
         self.input[2..2 + original.len()].copy_from_slice(original);
-        self.stage(Input::Source(id.0), now)
+        self.stage(input, job_end, debt)
     }
     /// Stage a complete authenticated equation; useful end<=prefix+W is checked first.
     pub fn begin_repair(&mut self, repair: Repair<'_>, now: Tick) -> Result<Begin, Error> {
+        self.begin_repair_at(repair, now, now)
+    }
+    /// Preserve original repair arrival while observing current decoder time.
+    pub fn begin_repair_at(
+        &mut self,
+        repair: Repair<'_>,
+        received: Tick,
+        observed: Tick,
+    ) -> Result<Begin, Error> {
+        self.begin_repair_until(repair, received, observed, Tick(u64::MAX))
+    }
+    /// Stage the same equation under original age and caller cap, without renewal.
+    pub fn begin_repair_until(
+        &mut self,
+        repair: Repair<'_>,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
         if repair.scope != self.scope {
             return Err(Error::Scope);
         }
@@ -476,6 +538,12 @@ impl Decoder {
             return Err(Error::Identity);
         }
         self.time(now)?;
+        if received > now {
+            return self.fail(Error::TimeRegression);
+        }
+        if now >= original_deadline {
+            return self.fail(Error::Expired);
+        }
         if self.job.is_some() {
             return Err(Error::Busy);
         }
@@ -504,10 +572,10 @@ impl Decoder {
         if u64::from(repair.support.end) > u64::from(self.live.prefix) + self.config.window as u64 {
             return Err(Error::Identity);
         }
-        self.expires(now, self.config.job_ticks)?;
-        self.expires(now, self.config.debt_ticks)?;
+        let input = Input::Repair(descriptor);
+        let (job_end, debt) = self.input_deadlines(input, received, now, original_deadline)?;
         self.input.copy_from_slice(repair.bytes);
-        self.stage(Input::Repair(descriptor), now)
+        self.stage(input, job_end, debt)
     }
     fn row_start(&self, row: usize) -> usize {
         row * (self.config.window + self.width)

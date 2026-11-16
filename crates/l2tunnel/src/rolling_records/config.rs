@@ -225,3 +225,82 @@ impl Config {
         ))
     }
 }
+
+/// Explicit global directional fragmentation, selected and authenticated by the parent.
+/// None at construction preserves the original unfragmented body and binding bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputFraming {
+    /// Client-to-server canonical fragments and exact physical overhead.
+    pub forward: codec::FragmentConfig,
+    /// Server-to-client canonical fragments and exact physical overhead.
+    pub reverse: codec::FragmentConfig,
+}
+impl OutputFraming {
+    /// Check every actual data and opposite-driven feedback output before allocation.
+    pub fn validate(self, config: Config) -> Result<(), Error> {
+        config.validate()?;
+        for (direction, fragment, overhead) in [
+            (
+                config.forward,
+                self.forward,
+                config.geometry.forward_overhead_bytes,
+            ),
+            (
+                config.reverse,
+                self.reverse,
+                config.geometry.reverse_overhead_bytes,
+            ),
+        ] {
+            if fragment.outer_overhead_bytes != overhead {
+                return Err(Error::Configuration);
+            }
+            fragment
+                .geometry(direction.maximum_packet_bytes()?)
+                .map_err(Error::Fragment)?;
+            fragment
+                .geometry(scheduler::FEEDBACK_BYTES)
+                .map_err(Error::Fragment)?;
+        }
+        Ok(())
+    }
+    pub(super) fn local(self, role: Role) -> codec::FragmentConfig {
+        match role {
+            Role::Client => self.forward,
+            Role::Server => self.reverse,
+        }
+    }
+    /// Complete explicit framing commitment, not proof of peer authentication.
+    /// The parent binds this selection before installing a framed endpoint.
+    pub fn binding_digest(
+        self,
+        config: Config,
+        copies: CopyPolicies,
+        stream: u32,
+    ) -> Result<ConfigDigest, Error> {
+        self.validate(config)?;
+        let base = copies.binding_digest(config, stream)?;
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"l2tunnel/packed-records/local-global-rolling/output-framing/v1\0");
+        hash.update(&base.0);
+        for fragment in [self.forward, self.reverse] {
+            for value in [
+                fragment.path_mtu,
+                fragment.outer_overhead_bytes,
+                fragment.max_message_bytes,
+                usize::from(fragment.max_fragments),
+            ] {
+                hash.update(
+                    &u64::try_from(value)
+                        .map_err(|_| Error::Arithmetic)?
+                        .to_be_bytes(),
+                );
+            }
+        }
+        Ok(ConfigDigest(
+            hash.finish()
+                .as_ref()
+                .try_into()
+                .map_err(|_| Error::Arithmetic)?,
+        ))
+    }
+}

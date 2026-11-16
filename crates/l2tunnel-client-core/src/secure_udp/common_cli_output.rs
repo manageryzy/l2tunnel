@@ -26,12 +26,16 @@ pub(super) fn requested_tls(
 }
 
 pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>> {
-    let contract = profile.runtime_contract(role)?;
+    let resources = if profile.raw_policy().is_some() {
+        profile.validate_raw_request()?;
+        profile.requested_resources(role)
+    } else {
+        profile.runtime_contract(role)?.resources()
+    };
     let parameters = profile.parameters();
     let mut output = Vec::new();
     output.try_reserve_exact(17).map_err(io::Error::other)?;
-    let work = contract
-        .resources()
+    let work = resources
         .rolling_work
         .map(|v| json!({"field":v.field,"copies":v.copies,"metadata":v.metadata}));
     output.push(bounded(json!({"event":"secure_udp_common_plan","schema":1,"api_version":4,
@@ -53,6 +57,29 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
         output[0]["ack_coalescing"] = json!({"requested":requested,"effective":null,"observation":null,"pending_read":null,"policy_switching":false});
         output[0] = bounded(std::mem::take(&mut output[0]))?;
     }
+    if let Some(requested) =
+        crate::secure_udp::common_status::RollingIngressPolicies::from_policies(
+            profile.rolling_ingress(),
+        )?
+    {
+        output[0]["rolling_ingress"] = json!({"requested":requested,"effective":null,
+            "observation":null,"policy_switching":false});
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
+    if let Some(requested) =
+        crate::secure_udp::common_status::ConnectionIngressPolicies::from_policies(
+            profile.connection_ingress(),
+        )?
+    {
+        output[0]["connection_ingress"] = json!({"requested":requested,"effective":null,
+            "observation":null,"policy_switching":false});
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
+    if let Some(requested) = profile.rolling_fragments() {
+        output[0]["rolling_fragments"] = json!({"requested": crate::secure_udp::common_status::RollingFragments::from_policy(requested)?,
+            "effective":null,"policy_switching":false});
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
     for (index, page) in profile.catalog().descriptors().chunks(4).enumerate() {
         let configurations = page
             .iter()
@@ -68,6 +95,73 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
             "total":profile.catalog().descriptors().len(),"configurations":configurations}),
         )?);
     }
+    Ok(output)
+}
+
+/// Explicit requested raw policy only; no TLS proof, syscall or effective E1.
+pub(super) fn raw_inspection(
+    profile: &Profile,
+    role: Role,
+    raw: &crate::raw_packet::common::Settings,
+) -> io::Result<Vec<Value>> {
+    if profile.raw_binding().is_some() {
+        return Err(io::Error::other(
+            "offline raw inspection requires an unbound request",
+        ));
+    }
+    let mut output = inspection(profile, role)?;
+    let header = output
+        .first_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| io::Error::other("raw inspection header absent"))?;
+    let cover = header
+        .remove("carrier")
+        .ok_or_else(|| io::Error::other("raw inner cover absent"))?;
+    header.insert(
+        "event".into(),
+        json!("secure_udp_common_requested_carrier_plan"),
+    );
+    header.insert("carrier".into(), json!("raw-packet"));
+    header.insert("udp_cover".into(), cover);
+    header.remove("configuration");
+    header.remove("envelope");
+    let initial = header
+        .remove("initial")
+        .ok_or_else(|| io::Error::other("raw requested initial absent"))?;
+    header.insert("requested_initial".into(), initial);
+    header.insert(
+        "requested_configuration".into(),
+        json!(profile.requested_configuration()?.0),
+    );
+    header.insert(
+        "requested_envelope".into(),
+        json!(profile.requested_envelope().as_bytes()),
+    );
+    header.insert("configuration_scope".into(), json!("requested_raw_E0"));
+    for field in [
+        "effective_configuration",
+        "effective_envelope",
+        "effective_catalog",
+    ] {
+        header.insert(field.into(), Value::Null);
+    }
+    header.insert("authenticated_outer_binding_required".into(), json!(true));
+    header.insert("outer_tls_trust_validated".into(), json!(false));
+    let policy = raw.packet_policy();
+    let geometry = policy.record_geometry().map_err(io::Error::other)?;
+    let (local, peer) = raw.forward();
+    header.insert("outer_policy".into(), json!({"version":1,"backend":"raw-common-carrier-v1",
+        "duplex":if raw.duplex()==l2tunnel_core::Duplex::Half {"half"}else{"full"},
+        "first_local":local.to_string(),"first_peer":peer.to_string(),
+        "path_mtu":geometry.path_mtu,"protection":match policy.protection {l2tunnel_raw_io::handoff::pairing::packet::Protection::ChaCha20Poly1305=>"aead",l2tunnel_raw_io::handoff::pairing::packet::Protection::HmacSha256=>"integrity"},
+        "ip_tcp_bytes":geometry.ip_tcp_bytes,"record_overhead_bytes":geometry.record_overhead_bytes,
+        "max_record_bytes":geometry.max_record_bytes,
+        "policy_digest":policy.configuration_digest(l2tunnel_core::ConfigDigest(profile.requested_configuration()?.0)).map_err(io::Error::other)?,
+        "queue_packets":policy.queue_packets,"horizon_bytes":policy.horizon_bytes,"minimum_transfer_bytes":policy.minimum_transfer_bytes,
+        "bytes_per_second":policy.bytes_per_second,"packets_per_second":policy.packets_per_second,
+        "burst_bytes":policy.burst_bytes,"burst_packets":policy.burst_packets,"max_key_packets":policy.max_key_packets,"max_key_bytes":policy.max_key_bytes,
+        "kernel_firewall_ready":false,"native_qualified":false,"congestion_control":false,"clean_close":false}));
+    output[0] = bounded(std::mem::take(&mut output[0]))?;
     Ok(output)
 }
 

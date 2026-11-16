@@ -268,8 +268,8 @@ fn actual_pair(
             assert_eq!(sender.storage_usage(), sender_usage);
         }
     }
-    let mut data = Link::new(&configuration, role);
-    let mut feedback = Link::new(&configuration, peer(role));
+    let mut data = Link::new(&configuration, role)?;
+    let mut feedback = Link::new(&configuration, peer(role))?;
     let mut native = vec![0; native_max];
     let mut delivered = Vec::new();
     let mut done = false;

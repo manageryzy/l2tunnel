@@ -222,8 +222,8 @@ fn decoded_channel_learns_reverse_without_advancing_local_rr_and_retires_only_af
     let mut server = build(config, Role::Server)?;
     let client_usage = client.storage_usage();
     let server_usage = server.storage_usage();
-    let mut ab = Link::new(&config, Role::Client);
-    let mut ba = Link::new(&config, Role::Server);
+    let mut ab = Link::new(&config, Role::Client)?;
+    let mut ba = Link::new(&config, Role::Server)?;
     let mut clock = 1;
     let first = frame(10_001, 100, 7, false);
     let target = frame(10_002, 1100, 8, false);

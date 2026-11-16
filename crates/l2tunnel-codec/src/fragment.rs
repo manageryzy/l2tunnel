@@ -27,6 +27,28 @@ pub struct FragmentContext {
     pub epoch: Epoch,
 }
 
+/// Inspect the maintained fixed header only, without granting authentication,
+/// complete geometry validity, message freshness or reassembly admission.
+/// Full enclosing session/configuration/direction authority stays with the caller.
+pub fn inspect_fragment_context(fragment: &[u8]) -> Result<FragmentContext, FragmentError> {
+    fragment_header(fragment).map(|(_, context)| context)
+}
+fn fragment_header(fragment: &[u8]) -> Result<(&[u8], FragmentContext), FragmentError> {
+    let header = fragment
+        .get(..FRAGMENT_HEADER_BYTES)
+        .ok_or(FragmentError::Truncated)?;
+    if header.get(..2) != Some(b"LX") || header[2] != 1 || header[3] != 0 {
+        return Err(FragmentError::InvalidHeader);
+    }
+    Ok((
+        header,
+        FragmentContext {
+            session: SessionId(read_u64(header, 4)?),
+            epoch: Epoch(read_u64(header, 12)?),
+        },
+    ))
+}
+
 /// Local sender bounds and explicit complete outer-packet MTU accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FragmentConfig {
@@ -38,6 +60,58 @@ pub struct FragmentConfig {
     pub max_message_bytes: usize,
     /// Maximum fragment count per record; must be nonzero.
     pub max_fragments: u16,
+}
+
+impl FragmentConfig {
+    fn chunk_bytes(self) -> Result<usize, FragmentError> {
+        if !(1..=MAX_RECORD_BYTES).contains(&self.max_message_bytes) || self.max_fragments == 0 {
+            return Err(FragmentError::InvalidConfig);
+        }
+        let overhead = self
+            .outer_overhead_bytes
+            .checked_add(FRAGMENT_HEADER_BYTES)
+            .ok_or(FragmentError::Arithmetic)?;
+        self.path_mtu
+            .checked_sub(overhead)
+            .filter(|value| *value != 0)
+            .map(|value| value.min(usize::from(u16::MAX)))
+            .ok_or(FragmentError::MtuTooSmall)
+    }
+    /// Exact canonical encoding and full-wire charge without allocating or assigning an ID.
+    pub fn geometry(self, logical_bytes: usize) -> Result<FragmentGeometry, FragmentError> {
+        let chunk = self.chunk_bytes()?;
+        self.geometry_with_chunk(logical_bytes, chunk)?
+            .charged(self.outer_overhead_bytes)
+    }
+    fn geometry_with_chunk(
+        self,
+        length: usize,
+        chunk: usize,
+    ) -> Result<CanonicalGeometry, FragmentError> {
+        if length == 0 {
+            return Err(FragmentError::EmptyMessage);
+        }
+        if length > self.max_message_bytes {
+            return Err(FragmentError::MessageTooLarge);
+        }
+        let count =
+            u16::try_from(length.div_ceil(chunk)).map_err(|_| FragmentError::TooManyFragments)?;
+        if count > self.max_fragments {
+            return Err(FragmentError::TooManyFragments);
+        }
+        u32::try_from(length).map_err(|_| FragmentError::Arithmetic)?;
+        let chunk = u16::try_from(chunk).map_err(|_| FragmentError::Arithmetic)?;
+        let encoded = usize::from(count)
+            .checked_mul(FRAGMENT_HEADER_BYTES)
+            .and_then(|headers| headers.checked_add(length))
+            .ok_or(FragmentError::Arithmetic)?;
+        Ok(CanonicalGeometry {
+            length,
+            count,
+            chunk,
+            encoded,
+        })
+    }
 }
 
 /// Explicit receiver memory, work and lifetime bounds for one context.
@@ -88,7 +162,7 @@ pub enum FragmentError {
     WrongContext,
     /// Checked size, offset or accounting arithmetic failed.
     Arithmetic,
-    /// Supplied time moved backwards.
+    /// Observation moved backwards, or original arrival is after observation.
     TimeWentBackwards,
     /// The first-arrival deadline cannot be represented.
     DeadlineOverflow,
@@ -123,31 +197,16 @@ pub struct FragmentBatch {
     pub fragments: Vec<Vec<u8>>,
 }
 
-/// Checked canonical flat-batch geometry; not authentication or delivery authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FragmentLayout {
-    message: MessageId,
+struct CanonicalGeometry {
     length: usize,
     count: u16,
     chunk: u16,
     encoded: usize,
 }
-impl FragmentLayout {
-    /// Full nonwrapping identity assigned by the actual Fragmenter.
-    pub fn message(&self) -> MessageId {
-        self.message
-    }
-    /// Number of complete canonical fragments.
-    pub fn fragments(&self) -> usize {
-        usize::from(self.count)
-    }
-    /// Initialized flat-batch prefix length.
-    pub fn encoded_bytes(&self) -> usize {
-        self.encoded
-    }
-    /// Exact header-and-body range of one index, without allocating.
-    pub fn fragment_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
-        if index >= self.fragments() {
+impl CanonicalGeometry {
+    fn fragment_range(self, index: usize) -> Option<std::ops::Range<usize>> {
+        if index >= usize::from(self.count) {
             return None;
         }
         let chunk = usize::from(self.chunk);
@@ -160,6 +219,74 @@ impl FragmentLayout {
             .checked_add(FRAGMENT_HEADER_BYTES)?
             .checked_add(body)?;
         (end <= self.encoded).then_some(begin..end)
+    }
+    fn charged(self, outer: usize) -> Result<FragmentGeometry, FragmentError> {
+        let wire_bytes = usize::from(self.count)
+            .checked_mul(outer)
+            .and_then(|bytes| bytes.checked_add(self.encoded))
+            .ok_or(FragmentError::Arithmetic)?;
+        Ok(FragmentGeometry {
+            canonical: self,
+            wire_bytes,
+        })
+    }
+}
+
+/// Checked exact geometry, independent of message IDs, authentication or delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentGeometry {
+    canonical: CanonicalGeometry,
+    wire_bytes: usize,
+}
+impl FragmentGeometry {
+    /// Original complete logical body length.
+    pub const fn logical_bytes(self) -> usize {
+        self.canonical.length
+    }
+    /// Actual fixed payload capacity of each canonical fragment.
+    pub fn chunk_bytes(self) -> usize {
+        usize::from(self.canonical.chunk)
+    }
+    /// Complete packet count, including a possibly short final fragment.
+    pub fn fragments(self) -> usize {
+        usize::from(self.canonical.count)
+    }
+    /// Flat encoded bytes: original body and every fixed fragment header.
+    pub const fn encoded_bytes(self) -> usize {
+        self.canonical.encoded
+    }
+    /// Exact full-wire bytes, including the selected real outer overhead per packet.
+    pub const fn wire_bytes(self) -> usize {
+        self.wire_bytes
+    }
+    /// Exact header/body range of an encoded fragment in a flat caller buffer.
+    pub fn fragment_range(self, index: usize) -> Option<std::ops::Range<usize>> {
+        self.canonical.fragment_range(index)
+    }
+}
+
+/// Checked canonical flat-batch geometry; not authentication or delivery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentLayout {
+    message: MessageId,
+    geometry: CanonicalGeometry,
+}
+impl FragmentLayout {
+    /// Full nonwrapping identity assigned by the actual Fragmenter.
+    pub fn message(&self) -> MessageId {
+        self.message
+    }
+    /// Number of complete canonical fragments.
+    pub fn fragments(&self) -> usize {
+        usize::from(self.geometry.count)
+    }
+    /// Initialized flat-batch prefix length.
+    pub fn encoded_bytes(&self) -> usize {
+        self.geometry.encoded
+    }
+    /// Exact header-and-body range of one index, without allocating.
+    pub fn fragment_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        self.geometry.fragment_range(index)
     }
 }
 
@@ -212,20 +339,7 @@ impl Fragmenter {
         config: FragmentConfig,
         first_message: MessageId,
     ) -> Result<Self, FragmentError> {
-        if !(1..=MAX_RECORD_BYTES).contains(&config.max_message_bytes) || config.max_fragments == 0
-        {
-            return Err(FragmentError::InvalidConfig);
-        }
-        let overhead = config
-            .outer_overhead_bytes
-            .checked_add(FRAGMENT_HEADER_BYTES)
-            .ok_or(FragmentError::Arithmetic)?;
-        let chunk_bytes = config
-            .path_mtu
-            .checked_sub(overhead)
-            .filter(|value| *value != 0)
-            .ok_or(FragmentError::MtuTooSmall)?
-            .min(usize::from(u16::MAX));
+        let chunk_bytes = config.chunk_bytes()?;
         Ok(Self {
             context,
             config,
@@ -239,33 +353,27 @@ impl Fragmenter {
         self.chunk_bytes
     }
 
-    /// Fragment a bounded record; failed calls consume no message ID.
+    /// Observe the actual next unused ID without reserving it or creating another counter.
+    pub const fn next_message(&self) -> Option<MessageId> {
+        self.next_message
+    }
+
+    /// Exact canonical complete-wire charge, without consuming this owner's next ID.
+    pub fn geometry(&self, logical_bytes: usize) -> Result<FragmentGeometry, FragmentError> {
+        self.config
+            .geometry_with_chunk(logical_bytes, self.chunk_bytes)?
+            .charged(self.config.outer_overhead_bytes)
+    }
+
+    /// Canonical preparation shared with public geometry; failed calls consume no ID.
     fn prepare(&self, record: &[u8]) -> Result<FragmentLayout, FragmentError> {
-        if record.is_empty() {
-            return Err(FragmentError::EmptyMessage);
-        }
-        if record.len() > self.config.max_message_bytes {
-            return Err(FragmentError::MessageTooLarge);
-        }
-        let count = u16::try_from(record.len().div_ceil(self.chunk_bytes))
-            .map_err(|_| FragmentError::TooManyFragments)?;
-        if count > self.config.max_fragments {
-            return Err(FragmentError::TooManyFragments);
-        }
+        let geometry = self
+            .config
+            .geometry_with_chunk(record.len(), self.chunk_bytes)?;
         let message = self.next_message.ok_or(FragmentError::Exhausted)?;
-        u32::try_from(record.len()).map_err(|_| FragmentError::Arithmetic)?;
-        let chunk = u16::try_from(self.chunk_bytes).map_err(|_| FragmentError::Arithmetic)?;
-        let encoded = usize::from(count)
-            .checked_mul(FRAGMENT_HEADER_BYTES)
-            .and_then(|headers| headers.checked_add(record.len()))
-            .ok_or(FragmentError::Arithmetic)?;
-        Ok(FragmentLayout {
-            message,
-            length: record.len(),
-            count,
-            chunk,
-            encoded,
-        })
+        // Legacy encoding does not require a representable aggregate outer charge;
+        // the additive geometry API checks that sum before budget admission.
+        Ok(FragmentLayout { message, geometry })
     }
 
     /// Fragment a bounded record; failed calls consume no message ID.
@@ -295,7 +403,7 @@ impl Fragmenter {
     ) -> Result<FragmentBatchView<'out>, FragmentError> {
         let layout = self.prepare(record)?;
         let output = encoded
-            .get_mut(..layout.encoded)
+            .get_mut(..layout.geometry.encoded)
             .ok_or(FragmentError::OutputTooSmall)?;
         for (index, body) in record.chunks(self.chunk_bytes).enumerate() {
             let range = layout
@@ -326,7 +434,7 @@ fn encode_fragment(
 ) -> Result<(), FragmentError> {
     let index = u16::try_from(index).map_err(|_| FragmentError::Arithmetic)?;
     let length = u16::try_from(body.len()).map_err(|_| FragmentError::Arithmetic)?;
-    let total = u32::try_from(layout.length).map_err(|_| FragmentError::Arithmetic)?;
+    let total = u32::try_from(layout.geometry.length).map_err(|_| FragmentError::Arithmetic)?;
     let needed = FRAGMENT_HEADER_BYTES
         .checked_add(body.len())
         .ok_or(FragmentError::Arithmetic)?;
@@ -340,8 +448,8 @@ fn encode_fragment(
     output[20..28].copy_from_slice(&layout.message.0.to_be_bytes());
     output[28..32].copy_from_slice(&total.to_be_bytes());
     output[32..34].copy_from_slice(&index.to_be_bytes());
-    output[34..36].copy_from_slice(&layout.count.to_be_bytes());
-    output[36..38].copy_from_slice(&layout.chunk.to_be_bytes());
+    output[34..36].copy_from_slice(&layout.geometry.count.to_be_bytes());
+    output[36..38].copy_from_slice(&layout.geometry.chunk.to_be_bytes());
     output[38..40].copy_from_slice(&length.to_be_bytes());
     output[40..].copy_from_slice(body);
     Ok(())
@@ -373,12 +481,84 @@ pub enum ReassemblyStatus {
     },
 }
 
+/// Original accepted input age and effective lifetime/caller cap of completed bytes.
+/// This is local owner metadata, never authentication or physical-delivery proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReassemblyTiming {
+    first_received_ticks: u64,
+    deadline_ticks: u64,
+}
+impl ReassemblyTiming {
+    /// Earliest original arrival among successfully accepted distinct fragments.
+    pub const fn first_received_ticks(self) -> u64 {
+        self.first_received_ticks
+    }
+    /// Earliest accepted original lifetime/caller cap, never renewed by observation.
+    pub const fn deadline_ticks(self) -> u64 {
+        self.deadline_ticks
+    }
+}
+/// Explicit original-age admission outcome over the maintained reassembly owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimedReassemblyStatus {
+    /// A distinct fragment was retained; no output bytes were written.
+    Pending {
+        /// Full local context message identity.
+        message: MessageId,
+        /// Actual unique retained fragment count.
+        received: u16,
+        /// Canonical fragment count.
+        total: u16,
+    },
+    /// Identical fragment or an existing completion/expiry tombstone; no output.
+    Duplicate {
+        /// Full message identity inside the current replay window.
+        message: MessageId,
+    },
+    /// A unique original input was already beyond its effective cap and retired.
+    Expired {
+        /// Full message identity, now tombstoned without completed output.
+        message: MessageId,
+    },
+    /// Exact complete bytes were copied once into caller storage.
+    Complete {
+        /// Full completed message identity.
+        message: MessageId,
+        /// Exact initialized caller output prefix.
+        length: usize,
+        /// Metadata retained by the actual message owner, not this final observation.
+        timing: ReassemblyTiming,
+    },
+}
+impl TimedReassemblyStatus {
+    fn legacy(self) -> ReassemblyStatus {
+        match self {
+            Self::Pending {
+                message,
+                received,
+                total,
+            } => ReassemblyStatus::Pending {
+                message,
+                received,
+                total,
+            },
+            Self::Duplicate { message } | Self::Expired { message } => {
+                ReassemblyStatus::Duplicate { message }
+            }
+            Self::Complete {
+                message, length, ..
+            } => ReassemblyStatus::Complete { message, length },
+        }
+    }
+}
+
 struct Pending {
     chunk: u16,
     count: u16,
     received: u16,
     present: Vec<u8>,
     buffer: Vec<u8>,
+    first_received: u64,
     deadline: u64,
 }
 
@@ -506,8 +686,37 @@ impl Reassembler {
         now_ticks: u64,
         output: &mut [u8],
     ) -> Result<ReassemblyStatus, FragmentError> {
+        self.accept_inner(fragment, now_ticks, now_ticks, None, output)
+            .map(TimedReassemblyStatus::legacy)
+    }
+
+    /// Preserve caller-authenticated input arrival and its original operation/session cap.
+    /// Distinct valid input may tighten age only after geometry/output preflights.
+    /// Duplicate/conflicting/refused fragments never alter retained timing. A newly
+    /// expired unique input reports Expired; existing tombstones remain Duplicate.
+    pub fn accept_at_until(
+        &mut self,
+        fragment: &[u8],
+        received: u64,
+        observed: u64,
+        original_cap: u64,
+        output: &mut [u8],
+    ) -> Result<TimedReassemblyStatus, FragmentError> {
+        self.accept_inner(fragment, received, observed, Some(original_cap), output)
+    }
+    fn accept_inner(
+        &mut self,
+        fragment: &[u8],
+        received: u64,
+        observed: u64,
+        original_cap: Option<u64>,
+        output: &mut [u8],
+    ) -> Result<TimedReassemblyStatus, FragmentError> {
         let parsed = self.parse(fragment)?;
-        self.expire_count(now_ticks)?;
+        if received > observed {
+            return Err(FragmentError::TimeWentBackwards);
+        }
+        self.expire_count(observed)?;
         let high = self
             .highest
             .map_or(parsed.message, |current| current.max(parsed.message));
@@ -516,19 +725,24 @@ impl Reassembler {
             return Err(FragmentError::StaleMessage);
         }
         if self.retired.contains(&parsed.message) {
-            return Ok(ReassemblyStatus::Duplicate {
+            return Ok(TimedReassemblyStatus::Duplicate {
                 message: parsed.message,
             });
         }
         if self.pending.contains_key(&parsed.message) {
-            return self.accept_existing(parsed, output);
+            return self.accept_existing(
+                parsed,
+                original_cap.map(|cap| (received, observed, cap)),
+                output,
+            );
         }
         if self.pending.keys().any(|message| message.0 < floor) {
             return Err(FragmentError::ReplayWindowBlocked);
         }
-        let deadline = now_ticks
+        let deadline = received
             .checked_add(self.config.max_lifetime_ticks)
-            .ok_or(FragmentError::DeadlineOverflow)?;
+            .ok_or(FragmentError::DeadlineOverflow)?
+            .min(original_cap.unwrap_or(u64::MAX));
         if self.pending.len() >= self.config.max_messages {
             return Err(FragmentError::MessageBudget);
         }
@@ -548,17 +762,33 @@ impl Reassembler {
                 .ok_or(FragmentError::OutputTooSmall)?;
             self.advance_window(high);
             self.retired.insert(parsed.message)?;
+            if observed >= deadline {
+                return Ok(TimedReassemblyStatus::Expired {
+                    message: parsed.message,
+                });
+            }
             destination.copy_from_slice(parsed.body);
-            return Ok(ReassemblyStatus::Complete {
+            return Ok(TimedReassemblyStatus::Complete {
                 message: parsed.message,
                 length: parsed.length,
+                timing: ReassemblyTiming {
+                    first_received_ticks: received,
+                    deadline_ticks: deadline,
+                },
             });
         }
-        self.pending.insert(&parsed, deadline)?;
+        if observed >= deadline {
+            self.advance_window(high);
+            self.retired.insert(parsed.message)?;
+            return Ok(TimedReassemblyStatus::Expired {
+                message: parsed.message,
+            });
+        }
+        self.pending.insert(&parsed, received, deadline)?;
         self.advance_window(high);
         self.reserved_bytes = reserved_bytes;
         self.reserved_fragments = reserved_fragments;
-        Ok(ReassemblyStatus::Pending {
+        Ok(TimedReassemblyStatus::Pending {
             message: parsed.message,
             received: 1,
             total: parsed.count,
@@ -680,8 +910,9 @@ impl Reassembler {
     fn accept_existing(
         &mut self,
         parsed: ParsedFragment<'_>,
+        input_time: Option<(u64, u64, u64)>,
         output: &mut [u8],
-    ) -> Result<ReassemblyStatus, FragmentError> {
+    ) -> Result<TimedReassemblyStatus, FragmentError> {
         let pending = self
             .pending
             .get_mut(&parsed.message)
@@ -705,7 +936,7 @@ impl Reassembler {
             if pending.buffer.get(parsed.offset..end) != Some(parsed.body) {
                 return Err(FragmentError::Conflict);
             }
-            return Ok(ReassemblyStatus::Duplicate {
+            return Ok(TimedReassemblyStatus::Duplicate {
                 message: parsed.message,
             });
         }
@@ -717,10 +948,44 @@ impl Reassembler {
         if complete && output.len() < parsed.length {
             return Err(FragmentError::OutputTooSmall);
         }
+        // Legacy existing-message admission must not add a new now+lifetime:
+        // that sum may overflow while the original retained deadline is valid.
+        let timing = match input_time {
+            Some((arrival, observed, cap)) => {
+                // A later original arrival cannot shorten the retained lifetime.
+                // Avoid an irrelevant overflowing addition near the clock limit.
+                let candidate = if arrival >= pending.first_received {
+                    cap
+                } else {
+                    arrival
+                        .checked_add(self.config.max_lifetime_ticks)
+                        .ok_or(FragmentError::DeadlineOverflow)?
+                        .min(cap)
+                };
+                let deadline = pending.deadline.min(candidate);
+                if observed >= deadline {
+                    self.release_pending(parsed.message, None)?;
+                    self.retired.insert(parsed.message)?;
+                    return Ok(TimedReassemblyStatus::Expired {
+                        message: parsed.message,
+                    });
+                }
+                ReassemblyTiming {
+                    first_received_ticks: pending.first_received.min(arrival),
+                    deadline_ticks: deadline,
+                }
+            }
+            None => ReassemblyTiming {
+                first_received_ticks: pending.first_received,
+                deadline_ticks: pending.deadline,
+            },
+        };
         write_fragment(pending, &parsed)?;
         pending.received = received;
+        pending.first_received = timing.first_received_ticks;
+        pending.deadline = timing.deadline_ticks;
         if !complete {
-            return Ok(ReassemblyStatus::Pending {
+            return Ok(TimedReassemblyStatus::Pending {
                 message: parsed.message,
                 received,
                 total: parsed.count,
@@ -731,9 +996,10 @@ impl Reassembler {
             .ok_or(FragmentError::OutputTooSmall)?;
         self.release_pending(parsed.message, Some(destination))?;
         self.retired.insert(parsed.message)?;
-        Ok(ReassemblyStatus::Complete {
+        Ok(TimedReassemblyStatus::Complete {
             message: parsed.message,
             length: parsed.length,
+            timing,
         })
     }
 
@@ -774,15 +1040,8 @@ impl Reassembler {
     }
 
     fn parse<'a>(&self, fragment: &'a [u8]) -> Result<ParsedFragment<'a>, FragmentError> {
-        let header = fragment
-            .get(..FRAGMENT_HEADER_BYTES)
-            .ok_or(FragmentError::Truncated)?;
-        if header.get(..2) != Some(b"LX") || header[2] != 1 || header[3] != 0 {
-            return Err(FragmentError::InvalidHeader);
-        }
-        if read_u64(header, 4)? != self.context.session.0
-            || read_u64(header, 12)? != self.context.epoch.0
-        {
+        let (header, context) = fragment_header(fragment)?;
+        if context != self.context {
             return Err(FragmentError::WrongContext);
         }
         let message = MessageId(read_u64(header, 20)?);

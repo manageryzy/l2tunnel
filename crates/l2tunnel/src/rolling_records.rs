@@ -23,15 +23,17 @@ fn allocate_instance() -> Result<u64, Error> {
 mod config;
 mod copies;
 mod endpoint;
+mod ingress;
 mod native;
 /// Exact backing of the actual codec, rolling schedulers and scratch owners.
 pub mod storage;
 #[cfg(test)]
 mod tests;
 
-pub use config::{Config, DirectionConfig};
+pub use config::{Config, DirectionConfig, OutputFraming};
 pub use copies::{COPY_POLICY_BYTES, CopyPolicies};
 pub use endpoint::{Endpoint, OutputId, PreparedOutput, Statistics, Step};
+pub use ingress::{IngressLimits, IngressStatus};
 pub use l2tunnel_aligned::NativePolicy;
 pub use l2tunnel_reliable::OutboundBudget;
 pub use native::{NativePreparation, NativeToken, PreparedNative};
@@ -66,6 +68,8 @@ pub enum Error {
     Identity,
     /// Received record kind violates the negotiated native interpretation.
     Policy,
+    /// The maintained canonical fragment geometry refused the selected output.
+    Fragment(codec::FragmentError),
     /// The maintained rolling owner returned this failure.
     Rolling(rolling::Error),
     /// The maintained timed packed sender returned this failure.
@@ -78,6 +82,8 @@ pub enum Error {
     Storage(codec::aligned_storage::Error),
     /// Exact actual rolling scheduler backing refused construction or observation.
     RollingStorage(rolling::storage::Error),
+    /// Actual bounded authenticated input custody refused admission or construction.
+    Ingress(crate::native_storage::Error),
     /// Complete retained heap exceeds its original explicit allowance.
     Capacity {
         /// Complete actual requested heap capacity.

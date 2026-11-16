@@ -1382,6 +1382,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--max-path-mtu",
             "--swift-transaction-plan",
             "--common-transaction-plan",
+            "--raw-policy",
             "--noise-profile",
             "--noise-private-key-file",
             "--noise-peer-key-file",

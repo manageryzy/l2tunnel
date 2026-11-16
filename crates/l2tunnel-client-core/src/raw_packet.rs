@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::time::{Instant, Sleep};
 
+pub mod common;
 mod status;
 pub use status::{
     Capabilities, Carrier, Cover, NativeFlight, Observer, RecoveryWindow, Selection, Snapshot,
@@ -219,11 +220,28 @@ fn inputs<I: PacketIo>(
     settings: &Settings,
     role: Role,
     end: Instant,
+    open: impl FnMut(RawConfig, Role) -> io::Result<I>,
+) -> io::Result<RawInputs<I>> {
+    inputs_for(
+        settings.0.forward,
+        settings.0.reverse,
+        settings.0.packet,
+        role,
+        end,
+        open,
+    )
+}
+fn inputs_for<I: PacketIo>(
+    forward: Endpoints,
+    reverse: Option<Endpoints>,
+    packet: Packet,
+    role: Role,
+    end: Instant,
     mut open: impl FnMut(RawConfig, Role) -> io::Result<I>,
 ) -> io::Result<RawInputs<I>> {
     let mut lane = |endpoints| {
         check(end)?;
-        let mut config = raw_config(endpoints, settings.0.packet.mtu);
+        let mut config = raw_config(endpoints, packet.mtu);
         let mut seed = [0; 8];
         SystemRandom::new()
             .fill(&mut seed)
@@ -234,8 +252,8 @@ fn inputs<I: PacketIo>(
         let io = result?;
         Ok::<_, io::Error>(RawInput { config, io })
     };
-    let forward = lane(settings.0.forward)?;
-    Ok(match settings.0.reverse {
+    let forward = lane(forward)?;
+    Ok(match reverse {
         Some(reverse) => RawInputs::Half {
             forward,
             reverse: lane(reverse)?,

@@ -14,6 +14,8 @@ pub mod establish;
 pub mod member;
 /// Single original UDP/OpenVPN owner with explicit physical-send completion tickets.
 pub mod original_datagram;
+// Portable same-owner raw I/O; native forwarding remains Unix-gated below.
+mod raw_carrier_io;
 /// Unix native forwarding and fixed authenticated control on the original socket.
 #[cfg(unix)]
 pub mod transport;

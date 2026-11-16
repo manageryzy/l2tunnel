@@ -362,3 +362,6 @@ fn preview_reports_native_progress_only_after_actual_short_admission() -> TestRe
     assert_eq!(receiver.statistics().committed, 1);
     Ok(())
 }
+
+#[path = "ingress_tests.rs"]
+mod ingress;

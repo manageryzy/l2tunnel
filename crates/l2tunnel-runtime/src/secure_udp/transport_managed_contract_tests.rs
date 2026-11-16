@@ -91,6 +91,9 @@ fn inputs(kind: cover::Appearance) -> Result<Inputs> {
         },
         rolling_work: None,
         ack_coalescing: None,
+        connection_ingress: None,
+        rolling_fragments: None,
+        rolling_ingress: None,
         native: NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,

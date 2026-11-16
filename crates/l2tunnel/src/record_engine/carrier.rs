@@ -1,8 +1,9 @@
 //! Explicit post-carrier custody for actual Rolling and Reliable output.
 use super::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum Prepared {
+    Connections(connections::OutputWitness),
     Rolling(rolling_records::PreparedOutput),
     Aligned(l2tunnel_reliable::PreparedOutput),
     Packed(l2tunnel_reliable::PreparedOutput),
@@ -34,6 +35,12 @@ impl CarrierOutputToken {
 impl Engine {
     /// Observe actual pending custody; repeated observations do not hand off output.
     pub fn pending_carrier_output(&self) -> Option<CarrierOutputToken> {
+        if self.fragments.is_some() {
+            return None;
+        }
+        self.pending_whole_carrier_output()
+    }
+    pub(super) fn pending_whole_carrier_output(&self) -> Option<CarrierOutputToken> {
         let (emission, prepared) = match &self.owner {
             Owner::Rolling(endpoint) => {
                 let p = endpoint.pending_output()?;
@@ -55,6 +62,10 @@ impl Engine {
             Owner::Packed(_) => {
                 let (emission, p) = self.reliable_pending?;
                 (emission, Prepared::Packed(p))
+            }
+            Owner::Connections(owner) => {
+                let (emission, witness) = owner.pending_output().ok()??;
+                (emission, Prepared::Connections(witness))
             }
             Owner::Swift(_) => return None,
         };
@@ -81,13 +92,27 @@ impl Engine {
         accepted: Tick,
         token: CarrierOutputToken,
     ) -> Result<(), Error> {
-        if self.pending_carrier_output().as_ref() != Some(&token) {
+        if self.fragments.is_some() {
+            return Err(Error::FragmentPolicy);
+        }
+        self.confirm_whole_carrier_output_at(now, accepted, token)
+    }
+    pub(super) fn confirm_whole_carrier_output_at(
+        &mut self,
+        now: Tick,
+        accepted: Tick,
+        token: CarrierOutputToken,
+    ) -> Result<(), Error> {
+        if self.pending_whole_carrier_output().as_ref() != Some(&token) {
             return Err(Error::Token);
         }
         let timing = self.advance(now);
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
         let result = match (&mut self.owner, token.prepared) {
+            (Owner::Connections(owner), Prepared::Connections(witness)) => {
+                owner.confirm_output_at(now, accepted, witness)
+            }
             (Owner::Rolling(endpoint), Prepared::Rolling(p)) => endpoint
                 .confirm_output_at(now, accepted, p)
                 .map_err(Error::Rolling),

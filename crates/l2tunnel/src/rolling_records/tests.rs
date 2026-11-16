@@ -548,3 +548,6 @@ fn actual_reserved_pipeline_handoff_retains_busy_head_and_original_native_expiry
 
 #[path = "copy_tests.rs"]
 mod copies;
+
+#[path = "framing_tests.rs"]
+mod framing;

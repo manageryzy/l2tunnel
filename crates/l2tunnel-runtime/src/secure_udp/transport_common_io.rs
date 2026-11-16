@@ -55,6 +55,7 @@ impl Driver {
         if self.common.is_none() || !self.check_expiry(now)? {
             return Ok(());
         }
+        self.retry_common_fragment_inputs(now)?;
         for epoch in self.common_epochs().into_iter().flatten() {
             let step = self
                 .common_state_mut()?
@@ -90,6 +91,8 @@ impl Driver {
                 }
             }
         }
+        self.retry_common_fragment_inputs(now)?;
+        self.retry_common_feedback(now)?;
         Ok(())
     }
     pub(super) fn has_transactions(&self) -> bool {
@@ -237,13 +240,30 @@ impl Driver {
             self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
             return Ok(true);
         }
+        let connection_cap = if self.connection_scope(self.source_scope)? {
+            Some(add(before, self.config.native.stall_timeout)?.min(self.common_original_cap()?))
+        } else {
+            None
+        };
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("common ingress owner"));
         };
-        state
-            .entry(epoch)?
-            .enqueue_borrowed(engine::Tick(now), &output[..length])
-            .map_err(protocol)?;
+        if let Some(original_cap) = connection_cap {
+            state
+                .entry(epoch)?
+                .ingest_borrowed_at(
+                    engine::Tick(before),
+                    engine::Tick(now),
+                    &output[..length],
+                    engine::Tick(original_cap),
+                )
+                .map_err(protocol)?;
+        } else {
+            state
+                .entry(epoch)?
+                .enqueue_borrowed(engine::Tick(now), &output[..length])
+                .map_err(protocol)?;
+        }
         self.counters.native_read = self.counters.native_read.saturating_add(1);
         Ok(true)
     }
@@ -524,40 +544,54 @@ impl Driver {
                     break;
                 }
             }
-            let mut budget = OutboundBudget {
-                packets: 1,
-                wire_bytes: available,
-            };
-            let runtime = self
-                .common
-                .as_mut()
-                .ok_or_else(|| protocol("common witness owner"))?;
             self.buffers
                 .frame
                 .resize(self.config.security.max_body_bytes, 0);
-            let Some(emission) = state
-                .entry(epoch)?
-                .poll(
-                    engine::Tick(now),
-                    number.0,
-                    allow_data,
-                    &mut self.buffers.frame,
-                    &mut budget,
-                    &mut runtime.witnesses,
-                )
-                .map_err(protocol)?
-            else {
-                continue;
+            let selected_fragment = state.engine(epoch)?.fragment_policy().is_some();
+            let (emission, carrier, fragment, fragment_deadline) = if selected_fragment {
+                let Some((emission, fragment, deadline)) =
+                    self.prepare_common_fragment(epoch, now, number.0, allow_data, available)?
+                else {
+                    continue;
+                };
+                (emission, None, Some(fragment), Some(deadline))
+            } else {
+                let mut budget = OutboundBudget {
+                    packets: 1,
+                    wire_bytes: available,
+                };
+                let runtime = self
+                    .common
+                    .as_mut()
+                    .ok_or_else(|| protocol("common witness owner"))?;
+                let owner::DataOwner::Common(state) = &mut self.owner else {
+                    return Err(protocol("common poll owner"));
+                };
+                let mut entry = state.entry(epoch)?;
+                let Some(emission) = entry
+                    .poll(
+                        engine::Tick(now),
+                        number.0,
+                        allow_data,
+                        &mut self.buffers.frame,
+                        &mut budget,
+                        &mut runtime.witnesses,
+                    )
+                    .map_err(protocol)?
+                else {
+                    continue;
+                };
+                let carrier = entry.pending_carrier_output();
+                if carrier
+                    .as_ref()
+                    .is_some_and(|token| token.emission() != emission)
+                {
+                    return Err(protocol(
+                        "common carrier witness differs from actual emission",
+                    ));
+                }
+                (emission, carrier, None, None)
             };
-            let carrier = state.entry(epoch)?.pending_carrier_output();
-            if carrier
-                .as_ref()
-                .is_some_and(|token| token.emission() != emission)
-            {
-                return Err(protocol(
-                    "common carrier witness differs from actual emission",
-                ));
-            }
             let sealed = if self.records.key_epoch().is_ok() {
                 self.records
                     .seal_user_in_at(
@@ -593,17 +627,23 @@ impl Driver {
                 .transpose()?
                 .unwrap_or(self.lease)
                 .min(self.lease);
+            // Soft recovery/feedback wakes do not expire retained physical custody.
             if carrier.is_some()
                 && let Some(original) = self
                     .common_state()?
                     .engine(epoch)?
-                    .deadline()
+                    .expiry_deadline()
                     .map_err(protocol)?
             {
                 deadline = deadline.min(original.0);
             }
+            if let Some(cap) = fragment_deadline {
+                deadline = deadline.min(cap);
+            }
             let cost = sealed.bytes.checked_add(self.ip).ok_or_else(exhausted)?;
-            self.bucket.charge(cost)?;
+            if fragment.is_none() {
+                self.bucket.charge(cost)?;
+            }
             self.performance.sent(
                 if emission.kind == engine::EmissionKind::Feedback {
                     performance::WireKind::Feedback
@@ -630,6 +670,7 @@ impl Driver {
                 cost,
                 deadline,
                 carrier,
+                fragment,
             });
             return Ok(true);
         }
@@ -640,46 +681,57 @@ impl Driver {
             .saturating_add(1);
         Ok(false)
     }
-    pub(super) fn send_common_carrier(
+    pub(super) fn send_common_carrier<R: super::raw_carrier::RawBacking>(
         &mut self,
-        socket: &mut carrier::IoOwner,
+        socket: &mut carrier::IoOwner<R>,
         now: u64,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<bool> {
-        if !self.prepare_common_wire(now)? {
-            return Ok(false);
-        }
-        let runtime = self
-            .common
-            .as_ref()
-            .ok_or_else(|| protocol("common carrier output owner"))?;
-        let pending = runtime
-            .sealed
-            .as_ref()
-            .ok_or_else(|| protocol("common carrier output custody"))?;
-        let identity = carrier::UserIdentity {
-            scope: pending.scope,
-            number: pending.sealed.number,
-            bytes: pending.sealed.bytes,
-            deadline: self
-                .origin
-                .checked_add(duration(pending.deadline))
-                .ok_or_else(exhausted)?,
-        };
-        match socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])? {
-            carrier::SendProgress::Pending => Ok(false),
-            carrier::SendProgress::Whole { receipt, late } => {
-                self.complete_common_carrier(identity, receipt, late, &mut sample)
+        let result = (|| -> io::Result<bool> {
+            if !self.prepare_common_wire(now)? {
+                return Ok(false);
             }
+            let runtime = self
+                .common
+                .as_ref()
+                .ok_or_else(|| protocol("common carrier output owner"))?;
+            let pending = runtime
+                .sealed
+                .as_ref()
+                .ok_or_else(|| protocol("common carrier output custody"))?;
+            let identity = carrier::UserIdentity {
+                scope: pending.scope,
+                number: pending.sealed.number,
+                bytes: pending.sealed.bytes,
+                deadline: self
+                    .origin
+                    .checked_add(duration(pending.deadline))
+                    .ok_or_else(exhausted)?,
+            };
+            match socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])? {
+                carrier::SendProgress::Pending => Ok(false),
+                carrier::SendProgress::Whole { receipt, late } => {
+                    self.complete_common_carrier(identity, receipt, late, &mut sample)
+                }
+            }
+        })();
+        // A terminal User/preparation error must not hide the other lane's
+        // irreversible Control receipt (or a saved User receipt). No new I/O is
+        // polled here: both existing physical facts are consumed exactly once.
+        let completed = self.complete_carrier_io(socket, &mut sample);
+        match result {
+            Err(error) => Err(error),
+            Ok(sent) => completed.map(|()| sent),
         }
     }
     pub(super) fn complete_common_carrier(
         &mut self,
         identity: carrier::UserIdentity,
-        receipt: crate::secure_udp::original_datagram::SendReceipt,
+        receipt: impl Into<carrier::PhysicalReceipt>,
         late: bool,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<bool> {
+        let receipt = receipt.into();
         // Physical facts are irreversible, including completion observed after a cap.
         self.counters.socket_accepted_packets =
             self.counters.socket_accepted_packets.saturating_add(1);
@@ -697,7 +749,10 @@ impl Driver {
         if pending.scope != identity.scope
             || pending.sealed.number != identity.number
             || pending.sealed.bytes != identity.bytes
-            || receipt.datagram_bytes != identity.bytes
+            || receipt.record_bytes != identity.bytes
+            || receipt
+                .udp_bytes
+                .is_some_and(|bytes| bytes < receipt.record_bytes || bytes > receipt.ip_bytes)
             || pending.cost != receipt.ip_bytes
             || !self.scope_registered(pending.scope)
         {
@@ -713,14 +768,13 @@ impl Driver {
         let accepted = clock(self.origin, receipt.accepted_at);
         let at = completed.as_ref().copied().unwrap_or(u64::MAX);
         let physical_at = accepted.as_ref().copied().unwrap_or(u64::MAX);
-        let confirmation = if let Some(token) = pending.carrier {
-            self.common_state_mut()?
-                .entry(core::Epoch(pending.scope.epoch.0))?
-                .confirm_carrier_output_at(engine::Tick(at), engine::Tick(physical_at), token)
-                .map_err(protocol)
-        } else {
-            Ok(())
-        };
+        let confirmation = self.confirm_common_output(
+            pending.scope,
+            at,
+            physical_at,
+            pending.carrier,
+            pending.fragment,
+        );
         completed?;
         accepted?;
         confirmation?;
@@ -806,14 +860,13 @@ impl Driver {
                     .ok_or_else(|| protocol("whole write lost Common custody"))?;
                 let sampled = sample();
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
-                let confirmation = if let Some(token) = pending.carrier {
-                    self.common_state_mut()?
-                        .entry(core::Epoch(pending.scope.epoch.0))?
-                        .confirm_carrier_output(engine::Tick(completed), token)
-                        .map_err(protocol)
-                } else {
-                    Ok(())
-                };
+                let confirmation = self.confirm_common_output(
+                    pending.scope,
+                    completed,
+                    completed,
+                    pending.carrier,
+                    pending.fragment,
+                );
                 // Whole physical ownership is permanent even if the post-write
                 // sample or original cap makes the connection terminal.
                 sampled?;
@@ -852,16 +905,22 @@ impl Driver {
             Err(error) => Err(error),
         }
     }
-    pub(super) fn receive_common_user(
+    pub(super) fn receive_common_user_at(
         &mut self,
         opened: record::Opened,
+        received: u64,
         now: u64,
     ) -> io::Result<()> {
         self.retry_common_feedback(now)?;
+        self.retry_common_connection_input(now)?;
+        if self.receive_common_fragment_at(opened, received, now)? {
+            return Ok(());
+        }
         if self
             .common
             .as_ref()
             .is_some_and(|runtime| runtime.pending_feedback.is_some())
+            && !self.connection_scope(opened.scope)?
         {
             // Only one exact input is retained. Continue Control/Liveness reads;
             // additional lossy User packets cannot overwrite the retained ACK.
@@ -920,6 +979,14 @@ impl Driver {
                     self.info.role,
                 )?
             }
+            configuration::DirectionProfile::PerConnectionCompact(receive) => {
+                let configuration::DirectionProfile::PerConnectionCompact(send) =
+                    local.send().profile()
+                else {
+                    return Err(protocol("connection directional family mismatch"));
+                };
+                common_connections::classify(body, *send, *receive, self.info.role)?
+            }
             configuration::DirectionProfile::Rolling { config, .. } => {
                 let recovery = config.scheduler.recovery;
                 let configuration::DirectionProfile::Rolling { config: send, .. } =
@@ -949,6 +1016,16 @@ impl Driver {
                 }
             }
         };
+        if kind == engine::EmissionKind::Feedback
+            && self
+                .common
+                .as_ref()
+                .is_some_and(|runtime| runtime.pending_feedback.is_some())
+        {
+            self.counters.native_backpressure_drops =
+                self.counters.native_backpressure_drops.saturating_add(1);
+            return Ok(());
+        }
         if reader.disposition == transaction::ReadDisposition::Staged
             && kind != engine::EmissionKind::Feedback
         {
@@ -956,27 +1033,81 @@ impl Driver {
                 "staged common generation cannot admit native-producing data",
             ));
         }
+        let queued_rolling_input = self.config.rolling_ingress.is_some()
+            && matches!(
+                local.receive().profile(),
+                configuration::DirectionProfile::Rolling { .. }
+            )
+            && kind != engine::EmissionKind::Feedback;
         let width = usize::from(local.receive().channels());
         self.common
             .as_mut()
             .ok_or_else(|| protocol("common scan contract"))?
             .native_work[(epoch.0 % 2) as usize] = width;
+        let raw_connection = kind == engine::EmissionKind::UnreliableNative;
+        let mut original_deadline = if raw_connection {
+            self.raw_connection_deadline(opened.scope, received)?
+        } else {
+            self.lease
+        };
+        if raw_connection && now >= original_deadline {
+            return self.retain_common_connection_input(opened, received, now, original_deadline);
+        }
+        if queued_rolling_input
+            && let Some(cap) = self
+                .common_state()?
+                .operation_deadline()
+                .into_iter()
+                .chain(
+                    self.common
+                        .as_ref()
+                        .and_then(|runtime| runtime.outcome)
+                        .map(common_actions::outcome_deadline),
+                )
+                .min()
+        {
+            original_deadline =
+                original_deadline.min(u64::try_from(cap.as_micros()).map_err(invalid)?);
+        }
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("common receive owner"));
         };
-        match state.entry(epoch)?.accept_authenticated_at(
-            engine::Tick(now),
-            engine::Tick(now),
-            opened.number.0,
-            kind,
-            &mut self.buffers.plain[..opened.bytes],
-        ) {
+        let mut entry = state.entry(epoch)?;
+        let accepted = if queued_rolling_input || raw_connection {
+            entry.accept_authenticated_until(
+                engine::Tick(received),
+                engine::Tick(now),
+                engine::Tick(original_deadline),
+                opened.number.0,
+                kind,
+                &mut self.buffers.plain[..opened.bytes],
+            )
+        } else {
+            // Feedback and every unchanged family retain the existing service
+            // boundary; source-queue custody cannot monopolize reverse feedback.
+            entry.accept_authenticated_at(
+                engine::Tick(received),
+                engine::Tick(now),
+                opened.number.0,
+                kind,
+                &mut self.buffers.plain[..opened.bytes],
+            )
+        };
+        match accepted {
             Ok(()) => Ok(()),
-            Err(record_bank::Error::Engine(engine::Error::Aligned(
-                l2tunnel_aligned::Error::RecoveryPressure(l2tunnel_reliable::Error::Arq(
-                    recovery::RecoveryError::FeedbackAwaitingPhysical,
-                )),
-            ))) => self.retain_common_feedback(opened, kind, now),
+            Err(error) if common_connections::feedback_awaiting_physical(&error) => {
+                self.retain_common_feedback_at(opened, kind, received, now)
+            }
+            Err(record_bank::Error::Engine(engine::Error::Connections(
+                l2tunnel::connection_records::Error::UnreliableBusy,
+            ))) => self.retain_common_connection_input(opened, received, now, original_deadline),
+            Err(record_bank::Error::Engine(engine::Error::Connections(error)))
+                if error.is_backpressure() =>
+            {
+                self.counters.native_backpressure_drops =
+                    self.counters.native_backpressure_drops.saturating_add(1);
+                Ok(())
+            }
             Err(record_bank::Error::Engine(engine::Error::Aligned(error)))
                 if error.is_backpressure() =>
             {
@@ -1004,6 +1135,16 @@ impl Driver {
         held_control: bool,
     ) -> io::Result<Instant> {
         let mut wake = self.lease;
+        if let Some(input) = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.connection_input.as_ref())
+            && let Some(deadline) = input.snapshot().deadline_micros
+        {
+            wake = wake
+                .min(deadline)
+                .min(add(now, self.config.work.receive_interval)?);
+        }
         if let Some(pending) = self
             .common
             .as_ref()
@@ -1114,13 +1255,22 @@ impl Driver {
                 .contract
                 .geometry()
                 .forward_overhead_bytes;
+            if engine.pending_fragment_group().is_some() {
+                // Its complete shared allowance was paid at reservation. Only
+                // another physical fragment and its original cap remain.
+                wake = wake.min(now);
+                if let Some(at) = engine.expiry_deadline().map_err(protocol)? {
+                    wake = wake.min(at.0);
+                }
+                continue;
+            }
             // Drain excludes user-data custody, not later duplicate-triggered
             // feedback. Every retained reader keeps its actual small ACK wake.
             if let Some((at, bytes)) = engine.feedback_opportunity().map_err(protocol)? {
-                let required = bytes
-                    .checked_add(overhead)
-                    .and_then(|v| v.checked_add(self.reserve))
-                    .ok_or_else(exhausted)?;
+                let cost = self
+                    .common_fragment_wire_cost(epoch, bytes)?
+                    .map_or_else(|| bytes.checked_add(overhead).ok_or_else(exhausted), Ok)?;
+                let required = cost.checked_add(self.reserve).ok_or_else(exhausted)?;
                 wake = wake.min(at.0.max(self.bucket.ready_at(required)?));
             }
             // Physical promotion follows the complete old-generation barrier.
@@ -1129,10 +1279,11 @@ impl Driver {
             if epoch.0 != self.source_scope.epoch.0 || engine.drained().map_err(protocol)? {
                 continue;
             }
-            let required = common_contract::maximum_body(local.send(), local.receive())?
-                .checked_add(overhead)
-                .and_then(|v| v.checked_add(self.reserve))
-                .ok_or_else(exhausted)?;
+            let logical = common_contract::maximum_body(local.send(), local.receive())?;
+            let cost = self
+                .common_fragment_wire_cost(epoch, logical)?
+                .map_or_else(|| logical.checked_add(overhead).ok_or_else(exhausted), Ok)?;
+            let required = cost.checked_add(self.reserve).ok_or_else(exhausted)?;
             let ready = self.bucket.ready_at(required)?;
             if engine.queue_usage().packets > 0 {
                 wake = wake.min(ready);
@@ -1202,7 +1353,7 @@ fn classify(
 
 // Classification observes actual v2 source/feedback structure after the sole
 // Records opener authenticated it. It creates no new admission or replay proof.
-fn classify_compact(
+pub(super) fn classify_compact(
     body: &[u8],
     send: l2tunnel_reliable::CompactReliableConfig,
     receive: l2tunnel_reliable::CompactReliableConfig,
@@ -1231,11 +1382,12 @@ fn classify_compact(
 }
 
 impl Driver {
-    fn retain_common_feedback(
+    fn retain_common_feedback_at(
         &mut self,
         opened: record::Opened,
         kind: engine::EmissionKind,
         received: u64,
+        observed: u64,
     ) -> io::Result<()> {
         if kind != engine::EmissionKind::Feedback {
             return Err(protocol("physical feedback pressure on non-feedback body"));
@@ -1266,7 +1418,7 @@ impl Driver {
         {
             deadline = deadline.min(u64::try_from(cap.as_micros()).map_err(invalid)?);
         }
-        if received >= deadline {
+        if received > observed || observed >= deadline {
             self.terminal = Some(StopReason::PolicyTimeout);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1293,6 +1445,7 @@ impl Driver {
             bytes: opened.bytes,
             received,
             deadline,
+            encoding: common_fragments::FeedbackEncoding::Record,
         });
         runtime.observation_dirty = true;
         Ok(())
@@ -1330,27 +1483,43 @@ impl Driver {
             .common
             .as_mut()
             .ok_or_else(|| protocol("retained feedback runtime missing"))?;
-        let result = state.entry(epoch)?.accept_authenticated_at(
-            engine::Tick(pending.received),
-            engine::Tick(now),
-            pending.number,
-            engine::EmissionKind::Feedback,
-            runtime
-                .feedback_input
-                .get_mut(..pending.bytes)
-                .ok_or_else(|| protocol("retained feedback length changed"))?,
-        );
+        let bytes = runtime
+            .feedback_input
+            .get_mut(..pending.bytes)
+            .ok_or_else(|| protocol("retained feedback length changed"))?;
+        let result = match pending.encoding {
+            common_fragments::FeedbackEncoding::Record => {
+                state.entry(epoch)?.accept_authenticated_at(
+                    engine::Tick(pending.received),
+                    engine::Tick(now),
+                    pending.number,
+                    engine::EmissionKind::Feedback,
+                    bytes,
+                )
+            }
+            common_fragments::FeedbackEncoding::Fragment => state
+                .entry(epoch)?
+                .accept_fragment_authenticated_until(
+                    engine::Tick(pending.received),
+                    engine::Tick(now),
+                    engine::Tick(pending.deadline),
+                    pending.number,
+                    bytes,
+                )
+                .map(|_| ()),
+        };
         match result {
             Ok(()) => {
                 runtime.pending_feedback = None;
                 runtime.observation_dirty = true;
                 Ok(true)
             }
-            Err(record_bank::Error::Engine(engine::Error::Aligned(
-                l2tunnel_aligned::Error::RecoveryPressure(l2tunnel_reliable::Error::Arq(
-                    recovery::RecoveryError::FeedbackAwaitingPhysical,
-                )),
-            ))) => Ok(false),
+            Err(record_bank::Error::Engine(engine::Error::FragmentBusy))
+                if pending.encoding == common_fragments::FeedbackEncoding::Fragment =>
+            {
+                Ok(false)
+            }
+            Err(error) if common_connections::feedback_awaiting_physical(&error) => Ok(false),
             Err(error) => Err(protocol(error)),
         }
     }

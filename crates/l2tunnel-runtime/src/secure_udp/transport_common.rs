@@ -10,6 +10,9 @@ mod managed;
 #[path = "transport_common_provision.rs"]
 mod provision;
 pub use managed::run_common_on_carrier;
+#[path = "transport_common_raw.rs"]
+mod raw;
+pub use raw::run_common_on_raw;
 
 /// Observed recovery of the same connected UDP flow, not peer-state reconciliation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,12 +70,30 @@ pub struct CommonSnapshot {
     pub receive_channels: u16,
     /// Actual independent directional work cap, at most four schedulers per turn.
     pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    /// Exact configured local wire-input policy, inactive on non-Rolling generations.
+    pub rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+    /// Actual current-generation input queue observation, absent when inactive.
+    pub rolling_input: Option<l2tunnel::rolling_records::IngressStatus>,
+    /// Actual current Engine fragment selection; absent for other record families.
+    pub rolling_fragments: Option<engine::FragmentPolicy>,
+    /// Actual independently retained reassembly and completed-body custody.
+    pub fragment_ingress: Option<engine::FragmentIngressSnapshot>,
+    /// Actual logical reservation and physical completion counters.
+    pub fragment_statistics: Option<engine::FragmentStatistics>,
     /// Actual sending and receiving rolling scheduler steps since construction.
     pub rolling_scheduler_steps: u64,
     /// Actual cumulative GF, copy and metadata work, respectively.
     pub rolling_work_used: [u64; 3],
+    /// New authenticated data fragments refused by actual full completion custody.
+    pub fragment_data_drops: u64,
+    /// New authenticated feedback fragments refused by the dedicated retained slot.
+    pub fragment_feedback_drops: u64,
     /// Actual current Engine-owned optional ACK ingress, not a requested-as-effective projection.
     pub ack_ingress: Option<engine::IngressSnapshot>,
+    /// Actual installed independent cohort and source-free local observations.
+    pub connections: Option<engine::ConnectionSnapshot>,
+    /// Actual separate deferred raw input owner, not a reliable delivery ledger.
+    pub connection_input: Option<ConnectionIngressSnapshot>,
     /// Actual held native read awaiting typed ingress admission.
     pub pending_ingress_bytes: Option<usize>,
     /// First actual read time, not a TCP creation timestamp.
@@ -144,11 +165,13 @@ pub(super) struct PendingWire {
     pub(super) cost: usize,
     pub(super) deadline: u64,
     pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
+    pub(super) fragment: Option<l2tunnel::record_bank::FragmentOutputToken>,
 }
 // Created only after the sole Records opener commits this exact User record.
 // Public copied metadata cannot install or reconstruct this retained authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PendingFeedback {
+    pub(super) encoding: common_fragments::FeedbackEncoding,
     pub(super) scope: Scope,
     pub(super) number: u64,
     pub(super) bytes: usize,
@@ -175,6 +198,7 @@ pub(super) struct Runtime {
     pub(super) pending_feedback: Option<PendingFeedback>,
     pub(super) pending_ingress: Option<PendingIngress>,
     pub(super) feedback_input: Vec<u8>,
+    pub(super) connection_input: Option<common_connections::Input>,
     pub(super) outcome: Option<transactions::Outcome>,
     pub(super) completion: Option<(TransactionReply, Result<core::Epoch, SwitchError>)>,
     pub(super) observation_dirty: bool,
@@ -183,6 +207,8 @@ pub(super) struct Runtime {
     pub(super) delivered: Option<super::common_actions::Boundary>,
     pub(super) rolling_scheduler_steps: u64,
     pub(super) rolling_work_used: [u64; 3],
+    pub(super) fragment_data_drops: u64,
+    pub(super) fragment_feedback_drops: u64,
     pub(super) path: SameFlowRecovery,
 }
 
@@ -214,8 +240,8 @@ where
     )
 }
 
-async fn run_prepared_common<D>(
-    prepared: io::Result<PreparedRuntime<D>>,
+async fn run_prepared_common<D, R: super::raw_carrier::RawBacking>(
+    prepared: io::Result<PreparedRuntime<D, R>>,
     requests: Option<CommonControlRequests>,
     shutdown: impl Future<Output = ()> + Send,
     mut observe: impl FnMut(&CommonSnapshot) + Send,
@@ -250,9 +276,9 @@ where
     }
 }
 
-struct PreparedRuntime<D> {
+struct PreparedRuntime<D, R: super::raw_carrier::RawBacking = super::raw_carrier::NoRaw> {
     device: D,
-    socket: carrier::IoOwner,
+    socket: carrier::IoOwner<R>,
     driver: owner::StateCell<Driver>,
     setup_deadline: Instant,
 }
@@ -309,7 +335,7 @@ fn reserve_common_state(
     external: usize,
 ) -> io::Result<owner::ReservedCommonState> {
     let config = contract.resources();
-    let bank = common_engines::Bank::new_with_ingress(
+    let bank = common_engines::Bank::new_with_fragmentation(
         identity,
         core::Epoch(config.data_epoch.0),
         contract.initial(),
@@ -320,6 +346,8 @@ fn reserve_common_state(
         },
         external,
         config.ack_coalescing,
+        config.rolling_ingress,
+        config.rolling_fragments,
     )?;
     let state = transactions::CommonState::new(
         identity,
@@ -357,7 +385,10 @@ impl Driver {
         origin: Instant,
         finish: impl FnOnce(tokio::net::UdpSocket, Self) -> io::Result<T>,
     ) -> io::Result<T> {
-        if contract.refresh_selection().is_some() || contract.extra_wire_bytes() != 0 {
+        if contract.refresh_selection().is_some()
+            || contract.extra_wire_bytes() != 0
+            || contract.raw_outer().is_some()
+        {
             return Err(invalid("legacy Common requires unselected legacy contract"));
         }
         contract.validate_outer(None)?;
@@ -408,9 +439,7 @@ impl Driver {
         }
         contract.resolve(contract.initial())?;
         let config = contract.resources();
-        let ip = (if contract.ipv6() { 48usize } else { 28usize })
-            .checked_add(contract.extra_wire_bytes())
-            .ok_or_else(exhausted)?;
+        let ip = contract.physical_overhead_bytes()?;
         let control_scope = contract.fixed_control_scope().unwrap_or(Scope {
             epoch: config.control_epoch,
             configuration: expected,
@@ -516,6 +545,10 @@ impl Driver {
             config.native.pending_bytes,
             max_native,
         )?;
+        let connection_plan = config
+            .connection_ingress
+            .map(|limits| limits.plan(config.security.max_body_bytes))
+            .transpose()?;
         // Fixed witness scratch covers the unchanged Packed maximum, regardless
         // of which catalog entry is initially active. It is not a native fence.
         let witness_count = 255usize;
@@ -533,6 +566,13 @@ impl Driver {
             .and_then(|v| v.checked_add(buffer_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(input_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(native_plan.capacity_bytes()))
+            .and_then(|v| {
+                v.checked_add(
+                    connection_plan
+                        .as_ref()
+                        .map_or(0, |plan| plan.capacity_bytes()),
+                )
+            })
             .and_then(|v| v.checked_add(message_bytes))
             .and_then(|v| v.checked_add(input.io_capacity))
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
@@ -542,7 +582,7 @@ impl Driver {
             // the one actual retained authenticated-feedback payload capacity.
             .and_then(|v| v.checked_add(config.security.max_body_bytes))
             .ok_or_else(exhausted)?;
-        let initial_plan = engine::storage::Plan::for_engine_with_ingress(
+        let initial_plan = engine::storage::Plan::for_engine_with_fragmentation(
             contract.initial(),
             engine::Context {
                 session: u128::from_be_bytes(identity.session.0),
@@ -552,6 +592,11 @@ impl Driver {
             contract.geometry(),
             contract.native_limits()?,
             config.ack_coalescing,
+            config.rolling_ingress,
+            common_contract::selected_fragment_policy(
+                &contract.initial(),
+                config.rolling_fragments,
+            ),
         )
         .map_err(invalid)?;
         let bank_plan = l2tunnel::record_bank::storage::Plan::for_bank(initial_plan, external)
@@ -569,6 +614,11 @@ impl Driver {
         let inputs = buffers::Inputs::with_plan(input_plan)?;
         let input_capacity = inputs.capacity_bytes();
         let native = native_storage::Queue::with_plan(native_plan)?;
+        let connection_input = config
+            .connection_ingress
+            .zip(connection_plan)
+            .map(|(limits, plan)| common_connections::Input::new(limits, plan))
+            .transpose()?;
         let mut witnesses = Vec::new();
         witnesses
             .try_reserve_exact(witness_count)
@@ -648,6 +698,7 @@ impl Driver {
                     pending_feedback: None,
                     pending_ingress: None,
                     feedback_input,
+                    connection_input,
                     outcome: None,
                     completion: None,
                     observation_dirty: false,
@@ -656,6 +707,8 @@ impl Driver {
                     delivered: None,
                     rolling_scheduler_steps: 0,
                     rolling_work_used: [0; 3],
+                    fragment_data_drops: 0,
+                    fragment_feedback_drops: 0,
                     path: SameFlowRecovery::default(),
                 }),
                 send: config.send,
@@ -747,9 +800,21 @@ impl Driver {
             send_channels: local.send().channels(),
             receive_channels: local.receive().channels(),
             rolling_work: self.config.rolling_work,
+            rolling_ingress: self.config.rolling_ingress,
+            rolling_input: state.engine(state.epoch())?.rolling_ingress_status(),
+            rolling_fragments: state.engine(state.epoch())?.fragment_policy(),
+            fragment_ingress: state.engine(state.epoch())?.fragment_ingress_snapshot(),
+            fragment_statistics: state.engine(state.epoch())?.fragment_statistics(),
             rolling_scheduler_steps: runtime.rolling_scheduler_steps,
             rolling_work_used: runtime.rolling_work_used,
+            fragment_data_drops: runtime.fragment_data_drops,
+            fragment_feedback_drops: runtime.fragment_feedback_drops,
             ack_ingress: state.engine(state.epoch())?.ingress_snapshot(),
+            connections: state.engine(state.epoch())?.connection_snapshot(),
+            connection_input: runtime
+                .connection_input
+                .as_ref()
+                .map(common_connections::Input::snapshot),
             pending_ingress_bytes: runtime.pending_ingress.map(|pending| pending.bytes),
             pending_ingress_since_micros: runtime.pending_ingress.map(|pending| pending.received),
             pending_ingress_deadline_micros: runtime

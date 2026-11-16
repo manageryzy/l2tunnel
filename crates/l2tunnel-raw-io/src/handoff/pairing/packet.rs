@@ -79,6 +79,11 @@ impl PacketPolicy {
         }
         Ok(())
     }
+    /// Exact original authenticated packet policy commitment for a requested base.
+    /// Computing it grants no TLS, raw owner or transition authority.
+    pub fn configuration_digest(self, base: ConfigDigest) -> Result<[u8; 32], Error> {
+        self.digest(base)
+    }
     fn digest(self, base: ConfigDigest) -> Result<[u8; 32], Error> {
         self.validate()?;
         let mut b = Vec::with_capacity(256);
@@ -148,6 +153,33 @@ impl PacketPolicy {
         self.validate()?;
         Ok(self.body_limit())
     }
+    /// Exact record geometry from the maintained protection and phase format.
+    /// Current packet emission uses fixed twenty-byte IPv4 and TCP headers.
+    pub fn record_geometry(self) -> Result<RecordGeometry, Error> {
+        self.validate()?;
+        let datagram = self.datagram([0; 16], 0, Direction::ClientToServer);
+        let ip_tcp_bytes = datagram.outer_overhead_bytes;
+        let record_overhead_bytes = datagram
+            .wire_overhead()
+            .checked_add(wire::HEADER)
+            .ok_or(Error::Capacity)?;
+        let max_record_bytes = usize::from(self.mtu)
+            .checked_sub(ip_tcp_bytes)
+            .and_then(|n| n.checked_sub(record_overhead_bytes))
+            .filter(|n| *n > 0)
+            .ok_or(Error::Capacity)?;
+        let geometry = RecordGeometry {
+            path_mtu: usize::from(self.mtu),
+            ip_tcp_bytes,
+            record_overhead_bytes,
+            max_record_bytes,
+        };
+        if max_record_bytes != self.body_limit() {
+            return Err(Error::Proof);
+        }
+        geometry.ip_bytes(max_record_bytes)?;
+        Ok(geometry)
+    }
     fn body_limit(self) -> usize {
         usize::from(self.mtu) - self.overhead() - wire::HEADER
     }
@@ -169,6 +201,32 @@ impl PacketPolicy {
         }
     }
 }
+/// Exact maintained raw record geometry; no UDP headers or fictitious surcharge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordGeometry {
+    /// Complete original IPv4/TCP packet ceiling.
+    pub path_mtu: usize,
+    /// Actual fixed IPv4/TCP headers; options are not emitted by this format.
+    pub ip_tcp_bytes: usize,
+    /// Maintained datagram protection plus authenticated phase header.
+    pub record_overhead_bytes: usize,
+    /// Maximum complete caller record before either authenticated wrapper.
+    pub max_record_bytes: usize,
+}
+impl RecordGeometry {
+    /// Validate one complete caller record and return its exact IP wire cost.
+    pub fn ip_bytes(self, record_bytes: usize) -> Result<usize, Error> {
+        if record_bytes == 0 || record_bytes > self.max_record_bytes {
+            return Err(Error::Capacity);
+        }
+        record_bytes
+            .checked_add(self.record_overhead_bytes)
+            .and_then(|n| n.checked_add(self.ip_tcp_bytes))
+            .filter(|n| *n <= self.path_mtu)
+            .ok_or(Error::Capacity)
+    }
+}
+
 /// Original pair and fixed packet policy; no post-authentication fallback occurs.
 #[derive(Clone, Copy, Debug)]
 pub struct PacketPhaseConfig {

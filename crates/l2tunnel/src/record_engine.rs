@@ -21,9 +21,18 @@ mod errors_tests;
 pub mod storage;
 
 mod affinity;
+mod connection_ingress;
+mod connections;
+pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
 pub use ingress::{IngressAdmission, IngressSnapshot};
 mod carrier;
+mod fragment;
+pub use fragment::{
+    FragmentAdmission, FragmentDirection, FragmentEmission, FragmentGroup, FragmentIngressSnapshot,
+    FragmentOutputToken, FragmentPolicy, FragmentReceipt, FragmentStatistics, FragmentStorageError,
+    ReassemblyPolicies,
+};
 mod native;
 pub use carrier::CarrierOutputToken;
 mod native_counts;
@@ -79,6 +88,10 @@ pub enum ProfileIdentity {
     Packed(receiver::RecordIdentity),
     /// Compact rolling body identity, separate from recovery source/repair IDs.
     Rolling(receiver::RecordIdentity),
+    /// Actual independently recovered connection body, retaining owner/incarnation.
+    Connection(crate::connection_records::Identity),
+    /// Source-free native ACK event, outside reliable native-prefix accounting.
+    UnreliableNative(crate::connection_records::UnreliableIdentity),
 }
 
 /// Actual source-producing branch, without authentication authority.
@@ -95,6 +108,8 @@ pub enum SourceForm {
 /// Actual outer record kind, checked against the maintained profile parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmissionKind {
+    /// Complete native ACK bypassing recovery, still authenticated and fully budgeted.
+    UnreliableNative,
     /// Original source copy from the named actual branch.
     Source(SourceForm),
     /// Recovery equation.
@@ -121,6 +136,8 @@ pub struct Emission {
 /// Explicit capability refusal; representation does not install these owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Capability {
+    /// Actual authenticated drained/fenced fixed-owner reuse is not installed.
+    FlowReuse,
     /// Actual Active/tunnel-credit owner is required.
     TunnelCredits,
     /// Actual TCP leg ownership is required.
@@ -164,6 +181,12 @@ pub enum Error {
     Expired,
     /// Local completion token is absent, stale or belongs to another handoff.
     Token,
+    /// Explicit fragment API/selected policy is required; no compatibility bypass.
+    FragmentPolicy,
+    /// This kind already retains a completed body; caller keeps its new plaintext.
+    FragmentBusy,
+    /// Maintained fragment geometry, parser or original-time refusal.
+    Fragment(crate::codec::FragmentError),
     /// Actual queue or composed owner invariants disagree.
     Invariant,
     /// Actual common queue failure.
@@ -182,6 +205,8 @@ pub enum Error {
     AlignedStorage(aligned::storage::Error),
     /// Actual compact-record/rolling composition or backing failure.
     Rolling(rolling_records::Error),
+    /// Actual independent-owner collection/custody failure.
+    Connections(crate::connection_records::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -312,6 +337,7 @@ pub struct Engine {
     limits: NativeLimits,
     pending: Option<PreparedNative>,
     reliable_pending: Option<(Emission, l2tunnel_reliable::PreparedOutput)>,
+    fragments: Option<fragment::State>,
     statistics: Statistics,
     last: Option<Tick>,
     failure: Option<Error>,
@@ -391,6 +417,7 @@ impl Engine {
             limits,
             pending: None,
             reliable_pending: None,
+            fragments: None,
             statistics: Statistics::default(),
             last: None,
             failure: None,
@@ -405,7 +432,7 @@ impl Engine {
         now: Tick,
         payload: Vec<u8>,
     ) -> Result<pipeline::PacketMetadata, EnqueueError> {
-        if self.ingress.is_some() {
+        if self.ingress.is_some() || self.requires_original_ingress_cap() {
             return Err(EnqueueError {
                 kind: Error::IngressPolicy,
                 payload,
@@ -446,7 +473,7 @@ impl Engine {
             .send()
             .channels();
         match self.pipeline.offer_front(|metadata, bytes| {
-            native_counts::offer(owner, counts, now, metadata.binding.channel, width, bytes)
+            native_counts::offer(owner, counts, now, metadata, width, bytes)
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
@@ -467,7 +494,7 @@ impl Engine {
         now: Tick,
         bytes: &[u8],
     ) -> Result<pipeline::PacketMetadata, Error> {
-        if self.ingress.is_some() {
+        if self.ingress.is_some() || self.requires_original_ingress_cap() {
             return Err(Error::IngressPolicy);
         }
         self.advance(now)?;
@@ -496,7 +523,7 @@ impl Engine {
             .send()
             .channels();
         match self.pipeline.offer_front_borrowed(|metadata, bytes| {
-            native_counts::offer(owner, counts, now, metadata.binding.channel, width, bytes)
+            native_counts::offer(owner, counts, now, metadata, width, bytes)
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
@@ -521,7 +548,15 @@ impl Engine {
         shared_budget: &mut OutboundBudget,
         unit_witnesses: &mut [receiver::UnitWitness],
     ) -> Result<Option<Emission>, Error> {
+        if self.fragments.is_some() {
+            return Err(Error::FragmentPolicy);
+        }
         self.advance(now)?;
+        if matches!(&self.owner, Owner::Connections(owner) if owner.has_output())
+            && self.pending_carrier_output().is_none()
+        {
+            return self.fail(Error::Invariant);
+        }
         if let Some(pending) = self.pending_carrier_output() {
             if let Err(error) = self.owner.tick(now) {
                 return self.fail(error);
@@ -602,21 +637,84 @@ impl Engine {
         kind: EmissionKind,
         body: &mut [u8],
     ) -> Result<(), Error> {
+        self.accept_input(received, now, None, security_number, kind, body)
+    }
+    /// Retain the original caller operation/session cap for delayed authenticated input.
+    pub fn accept_authenticated_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        security_number: u64,
+        kind: EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        self.accept_input(
+            received,
+            now,
+            Some(original_deadline),
+            security_number,
+            kind,
+            body,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Existing exact input plus optional retained caller cap.
+    fn accept_input(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_deadline: Option<Tick>,
+        security_number: u64,
+        kind: EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        if self.fragments.is_some() {
+            return Err(Error::FragmentPolicy);
+        }
         if received > now {
             return Err(Error::Time);
         }
         self.advance(now)?;
+        if original_deadline.is_some_and(|deadline| now >= deadline) {
+            return self.fail(Error::Expired);
+        }
         if body.is_empty() || body.len() > self.receive_max {
             return self.fail(Error::PacketSize);
         }
-        match self
-            .owner
-            .accept_at(received, now, security_number, kind, body)
+        let result = if matches!(&self.owner, Owner::Connections(_))
+            && kind == EmissionKind::UnreliableNative
         {
+            match original_deadline {
+                Some(cap) => self.accept_connection_raw(received, now, cap, body),
+                None => Err(Error::IngressPolicy),
+            }
+        } else {
+            match original_deadline {
+                Some(cap) => {
+                    self.owner
+                        .accept_until(received, now, cap, security_number, kind, body)
+                }
+                None => self
+                    .owner
+                    .accept_at(received, now, security_number, kind, body),
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(Error::Aligned(error)) if error.is_backpressure() => Err(Error::Aligned(error)),
             Err(Error::Rolling(error)) if error.is_backpressure() => Err(Error::Rolling(error)),
+            Err(Error::Connections(error)) if error.is_backpressure() => {
+                Err(Error::Connections(error))
+            }
             Err(error) => self.fail(error),
+        }
+    }
+
+    /// Actual generation-owned Rolling input custody, absent for other families.
+    pub fn rolling_ingress_status(&self) -> Option<rolling_records::IngressStatus> {
+        match &self.owner {
+            Owner::Rolling(endpoint) => endpoint.ingress_status(),
+            _ => None,
         }
     }
 
@@ -671,6 +769,7 @@ impl Engine {
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
             .chain(self.ingress_expiry())
+            .chain(self.fragments.as_ref().and_then(fragment::State::deadline))
             .min())
     }
 
@@ -684,6 +783,7 @@ impl Engine {
             .into_iter()
             .chain(self.pending.map(|p| p.deadline))
             .chain(self.ingress_expiry())
+            .chain(self.fragments.as_ref().and_then(fragment::State::deadline))
             .min())
     }
 
@@ -701,7 +801,8 @@ impl Engine {
         Ok(self.pipeline.usage().packets == 0
             && self.ingress_empty()
             && self.pending.is_none()
-            && self.owner.drained()?)
+            && self.owner.drained()?
+            && self.fragments.as_ref().is_none_or(fragment::State::drained))
     }
 
     /// Exact complete requested policy, without clamping rates or directions.
@@ -746,6 +847,11 @@ impl Engine {
         {
             return self.fail(Error::Ingress(pipeline::ack_coalescing::Error::Expired));
         }
+        if let Some(state) = &mut self.fragments
+            && let Err(error) = state.tick(now)
+        {
+            return self.fail(error);
+        }
         self.last = Some(now);
         Ok(())
     }
@@ -772,6 +878,18 @@ fn parameters(
     geometry: Geometry,
     native_limits: NativeLimits,
 ) -> Result<Parameters, Error> {
+    parameters_with_fragmentation(configuration, context, geometry, native_limits, None)
+}
+fn parameters_with_fragmentation(
+    configuration: &configuration::Configuration,
+    context: Context,
+    geometry: Geometry,
+    native_limits: NativeLimits,
+    fragments: Option<FragmentPolicy>,
+) -> Result<Parameters, Error> {
+    if let Some(policy) = fragments {
+        policy.validate(configuration, geometry)?;
+    }
     configuration.validate().map_err(|_| Error::Configuration)?;
     if context.session == 0 || context.epoch == 0 || native_limits.stall_micros == 0 {
         return Err(Error::Configuration);
@@ -804,10 +922,22 @@ fn parameters(
         let opposite = descriptor.local(role).receive();
         let (maximum, _, charge) = dimensions(view.profile(), opposite.profile())?;
         let wire = maximum.checked_add(overhead).ok_or(Error::Arithmetic)?;
-        if charge.is_some_and(|actual| actual != overhead)
-            || wire > descriptor.path_mtu()
-            || wire > view.common().burst_bytes()
-        {
+        if charge.is_some_and(|actual| actual != overhead) {
+            return Err(Error::Geometry);
+        }
+        if let Some(policy) = fragments {
+            let selected = match role {
+                Role::Client => policy.forward,
+                Role::Server => policy.reverse,
+            };
+            let group = selected
+                .framing
+                .geometry(maximum)
+                .map_err(Error::Fragment)?;
+            if group.wire_bytes() > view.common().burst_bytes() {
+                return Err(Error::Geometry);
+            }
+        } else if wire > descriptor.path_mtu() || wire > view.common().burst_bytes() {
             return Err(Error::Geometry);
         }
     }
@@ -883,6 +1013,17 @@ fn dimensions(
                 Some(config.base.recovery.outer_overhead_bytes()),
             )
         }
+        configuration::DirectionProfile::PerConnectionCompact(config) => {
+            let configuration::DirectionProfile::PerConnectionCompact(peer) = opposite else {
+                return Err(Error::Configuration);
+            };
+            let plan = connections::Connections::plan(*config, *peer)?;
+            (
+                plan.send_max_packet_bytes(),
+                1,
+                Some(plan.config().send_carrier_overhead_bytes),
+            )
+        }
         configuration::DirectionProfile::Rolling {
             config,
             overhead_bytes,
@@ -900,3 +1041,6 @@ fn dimensions(
 
 #[cfg(test)]
 mod bounded_feedback_tests;
+
+#[cfg(test)]
+mod fragment_tests;

@@ -116,7 +116,7 @@ fn early_short_roundtrip(raw: bool, role: Role) -> TestResult {
     let receiver_usage = receiver.storage_usage();
     let mut clock = 0_u64;
     let mut number = (1_u64 << 50) + 17;
-    let mut feedback = Link::new(&config, peer);
+    let mut feedback = Link::new(&config, peer)?;
     let mut output = vec![0; sender.send_max];
     let mut native = vec![0; receiver.native_max];
     let mut witnesses = vec![

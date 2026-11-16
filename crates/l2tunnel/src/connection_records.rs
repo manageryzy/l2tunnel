@@ -1,7 +1,7 @@
 //! Actual independent Compact owners, before Common Engine/profile installation.
 //!
 //! Callers retain the sole Pipeline, authentication, carrier and immutable output
-//! buffers. This fixed cohort has no flow rebinding/eviction or ACK-bypass consumer.
+//! buffers. This fixed cohort has no flow rebinding/eviction or runtime installation.
 use crate::aligned;
 use l2tunnel_recovery::RecoveryContext;
 use l2tunnel_reliable::{OutboundBudget, RecordKind};
@@ -11,10 +11,18 @@ use std::{
     time::Duration,
 };
 
+mod configuration;
+mod observers;
 /// Exact versioned route grammar, without authentication authority.
 pub mod route;
 /// Actual fixed, vector and nested heap inventory.
 pub mod storage;
+mod unreliable;
+pub use configuration::{DIRECTION_BYTES, Direction};
+pub use unreliable::{
+    PendingUnreliableNative, UnreliableConfig, UnreliableIdentity, UnreliableNativeToken,
+    UnreliableOutput, UnreliableStatistics,
+};
 
 // Local custody discriminator only; never serialized, used as a nonce or trusted.
 static NEXT_COLLECTION: AtomicU64 = AtomicU64::new(1);
@@ -34,6 +42,10 @@ pub struct Config {
     pub send_carrier_overhead_bytes: usize,
     /// Exact opposite-direction external bytes before adding the route.
     pub receive_carrier_overhead_bytes: usize,
+    /// Explicit finite raw ACK custody, or recovered-only behavior.
+    pub send_unreliable: Option<UnreliableConfig>,
+    /// Independently bounded original-arrival native custody for peer raw ACKs.
+    pub receive_unreliable: Option<UnreliableConfig>,
 }
 
 /// Checked index, unrelated to a cryptographic lane or inner source identity.
@@ -72,6 +84,16 @@ pub enum Error {
     Class,
     /// Unreliable-native custody is not installed; no body was admitted.
     UnsupportedUnreliable,
+    /// Actual normalized flow conflicts with this immutable fixed owner claim.
+    Binding,
+    /// Complete native bytes are not an eligible canonical pure TCP ACK.
+    UnreliableEligibility,
+    /// Retain exact authenticated input and original cap until raw receive custody frees.
+    UnreliableBusy,
+    /// The original selected raw send/arrival cap expired.
+    UnreliableExpired,
+    /// Injected observation/acceptance is nonmonotonic or inconsistent.
+    Time,
     /// Caller output is too short; no downstream poll ran.
     Output {
         /// Complete routed output bytes required in caller storage.
@@ -98,6 +120,13 @@ pub enum Error {
     Allocation,
     /// Actual retained capacities or emitted custody disagree with the plan.
     Invariant,
+}
+impl Error {
+    /// Caller must retain authenticated plaintext, original arrival and cap on pressure.
+    pub fn is_backpressure(self) -> bool {
+        matches!(self, Self::UnreliableBusy)
+            || matches!(self, Self::Endpoint(error) if error.is_backpressure())
+    }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -177,6 +206,13 @@ struct Slot {
     native: Option<(Identity, u64)>,
     next_native: u64,
     native_failure: Option<aligned::Error>,
+    claim: Option<crate::packet::FlowKey>,
+    raw_send: Option<unreliable::RawSend>,
+    raw_receive: Option<unreliable::RawReceive>,
+    next_raw_send: u64,
+    next_raw_receive: u64,
+    last_raw: Option<Duration>,
+    raw_failure: Option<Error>,
 }
 
 /// One actual fixed cohort; downstream scheduling remains the caller's owner.
@@ -185,6 +221,9 @@ pub struct Collection {
     instance: u64,
     slots: Vec<Slot>,
     usage: storage::Usage,
+    raw_send: Vec<u8>,
+    raw_receive: Vec<u8>,
+    unreliable_statistics: UnreliableStatistics,
 }
 impl Collection {
     /// Obtain a checked index without claiming flow or authentication authority.
@@ -205,6 +244,15 @@ impl Collection {
 
     /// Stage only bytes already selected by the caller's sole common Pipeline.
     pub fn enqueue(&mut self, id: OwnerId, now: Duration, bytes: &[u8]) -> Result<Identity, Error> {
+        if self.slot(id)?.claim.is_some() {
+            return Err(Error::Binding);
+        }
+        if let Some(error) = self.slot(id)?.native_failure {
+            return Err(Error::Endpoint(error));
+        }
+        if let Some(error) = self.slot(id)?.raw_failure {
+            return Err(error);
+        }
         let incarnation = self.plan.config().incarnation;
         let record = self
             .slot_mut(id)?
@@ -387,6 +435,9 @@ impl Collection {
         let instance = self.instance;
         let incarnation = self.plan.config().incarnation;
         let slot = self.slot_mut(id)?;
+        if let Some(error) = slot.raw_failure {
+            return Err(error);
+        }
         if let Some(error) = slot.native_failure {
             return Err(Error::Endpoint(error));
         }
@@ -433,6 +484,9 @@ impl Collection {
     /// Borrow the exact retained body and actual original deadline without mutation.
     pub fn pending_native(&self, id: OwnerId) -> Result<Option<PendingNative<'_>>, Error> {
         let slot = self.slot(id)?;
+        if let Some(error) = slot.raw_failure {
+            return Err(error);
+        }
         if let Some(error) = slot.native_failure {
             return Err(Error::Endpoint(error));
         }
@@ -471,6 +525,9 @@ impl Collection {
 
     /// Service one selected owner's original endpoint deadlines without new timers.
     pub fn tick(&mut self, id: OwnerId, now: Duration) -> Result<(), Error> {
+        if self.plan.config().send_unreliable.is_some() {
+            self.tick_unreliable(id, now)?;
+        }
         self.slot_mut(id)?
             .endpoint
             .tick(now)
@@ -480,21 +537,40 @@ impl Collection {
     pub fn deadline(&self) -> Option<Duration> {
         self.slots
             .iter()
-            .filter_map(|s| s.endpoint.deadline_independent())
+            .filter_map(|s| {
+                s.endpoint
+                    .deadline_independent()
+                    .into_iter()
+                    .chain(s.raw_send.map(|r| r.deadline))
+                    .chain(s.raw_receive.map(|r| r.deadline))
+                    .min()
+            })
             .min()
     }
     /// Actual retained hard expiry only, never a retransmission or probe wake.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         self.slots
             .iter()
-            .filter_map(|s| s.endpoint.expiry_deadline())
+            .filter_map(|s| {
+                s.endpoint
+                    .expiry_deadline()
+                    .into_iter()
+                    .chain(s.raw_send.map(|r| r.deadline))
+                    .chain(s.raw_receive.map(|r| r.deadline))
+                    .min()
+            })
             .min()
     }
     /// Local owner/custody drain; not an authenticated peer fence or delivery claim.
     pub fn drained(&self) -> bool {
-        self.slots
-            .iter()
-            .all(|s| s.native_failure.is_none() && s.native.is_none() && s.endpoint.drained())
+        self.slots.iter().all(|s| {
+            s.native_failure.is_none()
+                && s.raw_failure.is_none()
+                && s.raw_send.is_none()
+                && s.raw_receive.is_none()
+                && s.native.is_none()
+                && s.endpoint.drained()
+        })
     }
     /// Actual fixed/vector/nested capacities observed at construction.
     pub const fn storage_usage(&self) -> storage::Usage {

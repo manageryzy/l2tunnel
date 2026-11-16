@@ -14,6 +14,9 @@ pub(super) struct Plan {
     rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
     outer_carrier: Option<OuterCarrierDto>,
     ack_coalescing: Option<crate::secure_udp::common_status::AckPolicies>,
+    rolling_ingress: Option<crate::secure_udp::common_status::RollingIngressPolicies>,
+    connection_ingress: Option<crate::secure_udp::common_status::ConnectionIngressPolicies>,
+    rolling_fragments: Option<crate::secure_udp::common_status::RollingFragments>,
 }
 impl Plan {
     pub(super) fn read(path: &Path) -> io::Result<Self> {
@@ -41,6 +44,9 @@ impl Plan {
             rolling_work: dto.rolling_work.0.map(|value| value.build()).transpose()?,
             outer_carrier: dto.outer_carrier,
             ack_coalescing: dto.ack_coalescing,
+            rolling_ingress: dto.rolling_ingress,
+            connection_ingress: dto.connection_ingress,
+            rolling_fragments: dto.rolling_fragments,
         })
     }
     pub(super) fn initial(&self) -> Descriptor {
@@ -125,6 +131,37 @@ impl Plan {
         maximum_body: usize,
         overhead: usize,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.build_selected(connection, settings, peers, maximum_body, overhead, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_raw(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        overhead: usize,
+        policy: l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.build_selected(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            overhead,
+            Some(policy),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_selected(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        overhead: usize,
+        raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
         let inert = l2tunnel_swift::policy::Direction {
@@ -161,9 +198,40 @@ impl Plan {
             .map(|policy| policy.build())
             .transpose()?
             .unwrap_or([None, None]);
-        for (config, ack) in configs.iter_mut().zip(ack) {
+        let rolling = self
+            .rolling_ingress
+            .map(|policy| policy.build())
+            .transpose()?
+            .unwrap_or([None, None]);
+        let fragments = self
+            .rolling_fragments
+            .map(|policy| policy.build())
+            .transpose()?;
+        let connections = self
+            .connection_ingress
+            .map(|policy| policy.build())
+            .transpose()?
+            .unwrap_or([None, None]);
+        for (((config, ack), rolling), connections) in
+            configs.iter_mut().zip(ack).zip(rolling).zip(connections)
+        {
+            config.connection_ingress = connections;
+            config.rolling_fragments = fragments;
             config.rolling_work = self.rolling_work;
             config.ack_coalescing = ack;
+            config.rolling_ingress = rolling;
+        }
+        if let Some(policy) = raw {
+            return secure_udp::common_transaction_profile::Profile::new_raw(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                policy,
+            );
         }
         secure_udp::common_transaction_profile::Profile::new(
             connection,
@@ -190,6 +258,27 @@ struct PlanDto {
     outer_carrier: Option<OuterCarrierDto>,
     #[serde(default, deserialize_with = "selected_ack")]
     ack_coalescing: Option<crate::secure_udp::common_status::AckPolicies>,
+    #[serde(default, deserialize_with = "selected_rolling_ingress")]
+    rolling_ingress: Option<crate::secure_udp::common_status::RollingIngressPolicies>,
+    #[serde(default, deserialize_with = "selected_connection_ingress")]
+    connection_ingress: Option<crate::secure_udp::common_status::ConnectionIngressPolicies>,
+    #[serde(default, deserialize_with = "selected_fragments")]
+    rolling_fragments: Option<crate::secure_udp::common_status::RollingFragments>,
+}
+fn selected_fragments<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::RollingFragments>, D::Error> {
+    crate::secure_udp::common_status::RollingFragments::deserialize(deserializer).map(Some)
+}
+fn selected_connection_ingress<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::ConnectionIngressPolicies>, D::Error> {
+    crate::secure_udp::common_status::ConnectionIngressPolicies::deserialize(deserializer).map(Some)
+}
+fn selected_rolling_ingress<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::secure_udp::common_status::RollingIngressPolicies>, D::Error> {
+    crate::secure_udp::common_status::RollingIngressPolicies::deserialize(deserializer).map(Some)
 }
 fn selected_ack<'de, D: Deserializer<'de>>(
     deserializer: D,

@@ -7,7 +7,29 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
-The current Batch11 implementation adds explicit bounded benchmark ACK ingress
+The current Batch12 implementation installs the selected independent Compact
+collection in the actual Engine/Bank/Common runtime and shared service, including
+bounded source-free ACK custody with original arrival/deadline and observable
+fixed-cohort limitations. It adds explicit authenticated Rolling input custody and
+selected fragment Engine/Bank/runtime composition, with whole-group charging,
+fresh per-fragment protection and physical completion. The original raw TCP
+Full/Half owners now feed the same Common service and strict CLI, with genuine
+TLS/member and initial Noise/member admission, fresh lower reconnect and unchanged
+setup caps. These are implemented slices with finite protocol/protected-I/O
+receipts, not complete named Python profiles or kernel/platform qualification.
+
+The [Batch12 scoped receipt](../work/parallel-features-20261115/parallel-batch12-scoped-validation.json)
+retains actual source identities, failed attempts, focused continuations and the
+required batch check separately. See [independent owners](modules/connection-records.md),
+[Rolling ingress](modules/common-rolling-ingress.md),
+[record fragmentation](modules/common-record-fragmentation.md) and
+[raw Common carrier](modules/raw-common-carrier.md). Full flow reuse, the named
+1460/1500/global8192/local128/every16/copies/ACK composition, native/platform/
+resource/performance, all47 and complete SW-11 remain open. External Windows,
+recursive-FEC and TCP-proxy/Common commits are delivered but are not part of this
+checkpoint; their integration and validation are separate work.
+
+The preceding Batch11 implementation adds explicit bounded benchmark ACK ingress
 through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and
 paired resource binding; decoded-channel reverse learning in the same Pipeline;
 and a pure fixed-cohort collection of independently reserved Compact owners.
@@ -636,7 +658,7 @@ integration or performance acceptance.
 - [ ] [CONN-08] Implement explicit raw/TCP/UDP selection and visible, configured fallback; permission absence cannot silently change selected semantics.
 - [ ] [CONN-09] Implement and qualify the requested HTTPS-like real TCP/TLS handshake followed by ACK-independent custom TCP-shaped packets on the original ports and sequence space, with configurable SNI and independent own-server trust. Preserve the separate real HTTPS framing/ALPN compatibility work and its MOD-HTTPS-* gates; it is not a substitute for the raw path. Separately implement and qualify the requested L2TP cover.
 - [ ] [CONN-10] Complete UDP-* gates for OpenVPN-like, QUIC-header appearance and the new minimal media appearance, including standalone same-socket authentication; TCP-bootstrapped UDP alone is incomplete. Preserve the original OpenVPN wire-handshake gate and genuine QUIC compatibility evidence as distinct contracts.
-- [ ] [CONN-11] Qualify raw TCP packet ownership, sequence/ACK/options/RST/PMTU/NAT behavior in isolated target-path tests.
+- [ ] [CONN-11] Qualify raw TCP packet ownership, sequence/ACK/options/RST/PMTU/NAT behavior in isolated target-path tests. The original-carrier Common composition has separate [RCC-01..04](modules/raw-common-carrier.md) implementation and acceptance gates.
 - [ ] [CONN-12] Publish effective carrier/cover/security/duplex capabilities and reasons for unsupported combinations.
 - [ ] [CONN-13] Complete SEC-01..SEC-12 for the shared point-to-point secure session, common AEAD/protection and fixed management service; require selected-carrier continuity, bounded automatic recovery and exact failure/restart/key-generation semantics before enabling a new client path.
 

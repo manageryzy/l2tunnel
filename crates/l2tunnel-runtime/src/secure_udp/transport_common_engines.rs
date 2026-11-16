@@ -1,6 +1,7 @@
 //! Exact leased intents over actual reserved common Bank generations.
 //! No method supplies authentication, a physical fence or a second transaction FSM.
 
+use super::common_contract;
 use super::transaction_family::{Backend, Reservation as ReservationContract};
 use l2tunnel::{
     record_bank as storage, record_configuration::Configuration as C, record_engine as records,
@@ -112,6 +113,8 @@ pub(super) struct Bank {
     geometry: records::Geometry,
     native: records::NativeLimits,
     ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+    rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+    rolling_fragments: Option<records::FragmentPolicy>,
     // One actual Bank in a fallibly reserved cell keeps its two inline Engine
     // extents out of the retained State. The selected Common entry constructs
     // this owner before polling its I/O continuation.
@@ -152,11 +155,70 @@ impl Bank {
         external_bytes: usize,
         ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     ) -> io::Result<Self> {
+        Self::new_with_options(
+            identity,
+            epoch,
+            initial,
+            geometry,
+            native,
+            limits,
+            external_bytes,
+            ingress,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Actual Bank inputs plus independent selected custody.
+    pub(super) fn new_with_options(
+        identity: tx::Identity,
+        epoch: Epoch,
+        initial: C,
+        geometry: records::Geometry,
+        native: records::NativeLimits,
+        limits: storage::storage::Limits,
+        external_bytes: usize,
+        ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+    ) -> io::Result<Self> {
+        Self::new_with_fragmentation(
+            identity,
+            epoch,
+            initial,
+            geometry,
+            native,
+            limits,
+            external_bytes,
+            ingress,
+            rolling_ingress,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit complete immutable fragment policy.
+    pub(super) fn new_with_fragmentation(
+        identity: tx::Identity,
+        epoch: Epoch,
+        initial: C,
+        geometry: records::Geometry,
+        native: records::NativeLimits,
+        limits: storage::storage::Limits,
+        external_bytes: usize,
+        ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+        rolling_fragments: Option<records::FragmentPolicy>,
+    ) -> io::Result<Self> {
         if epoch.0 == 0 || identity.session.0 == [0; 16] || identity.local == identity.remote {
             return Err(invalid("invalid actual common engine Bank identity"));
         }
         tx::configuration_digest(&initial).map_err(io::Error::other)?;
-        let plan = plan_with_ingress(initial, identity, epoch, geometry, native, ingress)?;
+        let plan = plan_with_fragmentation(
+            initial,
+            identity,
+            epoch,
+            geometry,
+            native,
+            ingress,
+            rolling_ingress,
+            rolling_fragments,
+        )?;
         let plan =
             storage::storage::Plan::for_bank(plan, external_bytes).map_err(io::Error::other)?;
         let owner = NEXT_OWNER
@@ -164,9 +226,9 @@ impl Bank {
                 value.checked_add(1)
             })
             .map_err(|_| invalid("common engine Bank owner identity exhausted"))?;
-        let storage = storage::Bank::new(plan, limits).map_err(io::Error::other)?;
+        let storage = storage::Bank::new_with(plan, limits, super::owner::StateCell::new)
+            .map_err(io::Error::other)??;
         let engine = storage.initial();
-        let storage = super::owner::StateCell::new(storage)?;
         Ok(Self {
             owner,
             identity,
@@ -181,6 +243,8 @@ impl Bank {
             geometry,
             native,
             ingress,
+            rolling_ingress,
+            rolling_fragments,
             storage,
         })
     }
@@ -295,13 +359,15 @@ impl Backend<C> for Bank {
             .next_serial
             .checked_add(1)
             .ok_or_else(|| invalid("common reservation serial exhausted"))?;
-        let plan = plan_with_ingress(
+        let plan = plan_with_fragmentation(
             exact.config,
             self.identity,
             exact.ticket.epoch,
             self.geometry,
             self.native,
             self.ingress,
+            self.rolling_ingress,
+            self.rolling_fragments,
         )?;
         let storage = self.storage.prepare(plan).map_err(io::Error::other)?;
         let serial = self.next_serial;
@@ -438,6 +504,7 @@ fn plan(
 ) -> io::Result<records::storage::Plan> {
     plan_with_ingress(config, identity, epoch, geometry, native, None)
 }
+#[cfg(test)]
 fn plan_with_ingress(
     config: C,
     identity: tx::Identity,
@@ -446,7 +513,42 @@ fn plan_with_ingress(
     native: records::NativeLimits,
     ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
 ) -> io::Result<records::storage::Plan> {
-    records::storage::Plan::for_engine_with_ingress(
+    plan_with_options(config, identity, epoch, geometry, native, ingress, None)
+}
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // Exact existing plan inputs plus selected input custody.
+fn plan_with_options(
+    config: C,
+    identity: tx::Identity,
+    epoch: Epoch,
+    geometry: records::Geometry,
+    native: records::NativeLimits,
+    ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+    rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+) -> io::Result<records::storage::Plan> {
+    plan_with_fragmentation(
+        config,
+        identity,
+        epoch,
+        geometry,
+        native,
+        ingress,
+        rolling_ingress,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Actual existing plan inputs plus selected fragment owners.
+fn plan_with_fragmentation(
+    config: C,
+    identity: tx::Identity,
+    epoch: Epoch,
+    geometry: records::Geometry,
+    native: records::NativeLimits,
+    ingress: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+    rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+    rolling_fragments: Option<records::FragmentPolicy>,
+) -> io::Result<records::storage::Plan> {
+    records::storage::Plan::for_engine_with_fragmentation(
         config,
         records::Context {
             session: u128::from_be_bytes(identity.session.0),
@@ -456,6 +558,8 @@ fn plan_with_ingress(
         geometry,
         native,
         ingress,
+        rolling_ingress,
+        common_contract::selected_fragment_policy(&config, rolling_fragments),
     )
     .map_err(io::Error::other)
 }

@@ -221,6 +221,7 @@ impl Driver {
             return Ok(());
         }
         self.retry_common_feedback(now)?;
+        self.retry_common_connection_input(now)?;
         let mut runtime = self
             .common
             .take()
@@ -402,7 +403,13 @@ impl Driver {
                         return Err(protocol("common Stage original scopes"));
                     }
                     runtime.contract.resolve(*config)?;
-                    if runtime.pending_feedback.is_some() || runtime.pending_ingress.is_some() {
+                    if runtime.pending_feedback.is_some()
+                        || runtime.pending_ingress.is_some()
+                        || runtime
+                            .connection_input
+                            .as_ref()
+                            .is_some_and(|input| !input.is_empty())
+                    {
                         return Ok(false);
                     }
                     // Queued originals predate the stopped-ingress barrier. They
@@ -459,6 +466,10 @@ impl Driver {
                         || runtime.sealed.is_some()
                         || runtime.pending_feedback.is_some()
                         || runtime.pending_ingress.is_some()
+                        || runtime
+                            .connection_input
+                            .as_ref()
+                            .is_some_and(|input| !input.is_empty())
                     {
                         return Ok(false);
                     }
@@ -612,6 +623,10 @@ impl Driver {
             || runtime.sealed.is_some()
             || runtime.pending_feedback.is_some()
             || runtime.pending_ingress.is_some()
+            || runtime
+                .connection_input
+                .as_ref()
+                .is_some_and(|input| !input.is_empty())
         {
             return Ok(false);
         }

@@ -124,6 +124,25 @@ impl Receiver {
     /// No input queue is hidden: an actual pending decode job returns Busy unchanged.
     /// An immutable feedback snapshot does not prevent new decode admission.
     pub fn receive_wire(&mut self, bytes: &[u8], now: Tick) -> Result<Begin, Error> {
+        self.receive_wire_at(bytes, now, now)
+    }
+    /// Stage already authenticated bytes without renewing their original age.
+    pub fn receive_wire_at(
+        &mut self,
+        bytes: &[u8],
+        received: Tick,
+        observed: Tick,
+    ) -> Result<Begin, Error> {
+        self.receive_wire_until(bytes, received, observed, Tick(u64::MAX))
+    }
+    /// Preserve original arrival and the existing caller operation/session cap.
+    pub fn receive_wire_until(
+        &mut self,
+        bytes: &[u8],
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
         self.time(now)?;
         let result = match wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?
         {
@@ -131,8 +150,18 @@ impl Receiver {
                 scope,
                 id,
                 original,
-            } => self.decoder.begin_source(scope, id, original, now)?,
-            wire::View::Repair(value) => self.decoder.begin_repair(value, now)?,
+            } => self.decoder.begin_source_until(
+                scope,
+                id,
+                original,
+                received,
+                now,
+                original_deadline,
+            )?,
+            wire::View::Repair(value) => {
+                self.decoder
+                    .begin_repair_until(value, received, now, original_deadline)?
+            }
         };
         if result != Begin::Staged {
             self.notice(now)?;

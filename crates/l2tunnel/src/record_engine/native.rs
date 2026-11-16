@@ -133,16 +133,24 @@ impl Engine {
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
         let pending = self.pending.ok_or(Error::Token)?;
-        let (channel, committed) = self
-            .native_counts
-            .next_commit(pending.token.identity, self.receive_channels)?;
+        let reliable_commit =
+            if matches!(pending.token.identity, ProfileIdentity::UnreliableNative(_)) {
+                None
+            } else {
+                Some(
+                    self.native_counts
+                        .next_commit(pending.token.identity, self.receive_channels)?,
+                )
+            };
         let timing = self.advance(now);
         // The caller has already observed a complete physical write. Record
         // that receipt once even if subsequent authoritative cleanup is fatal.
         self.statistics.committed = next;
-        self.native_counts.commit(channel, committed);
+        if let Some((channel, committed)) = reliable_commit {
+            self.native_counts.commit(channel, committed);
+        }
         self.pending = None;
-        if matches!(&self.owner, Owner::Rolling(_)) {
+        if matches!(&self.owner, Owner::Rolling(_) | Owner::Connections(_)) {
             let result = self.owner.commit(now);
             timing?;
             return match result {

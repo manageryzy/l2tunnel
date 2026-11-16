@@ -31,6 +31,7 @@ pub(super) fn preflight(command: &str, options: &BTreeMap<String, String>) -> io
         .unwrap_or("frame");
     let supported = match carrier {
         "tcp" if !inspection => records == "frame",
+        "raw-packet" if records == "common" => options.contains_key("--common-transaction-plan"),
         "raw-packet" if !inspection => records == "frame",
         "openvpn-like" => records == "common" && options.contains_key("--common-transaction-plan"),
         _ => false,

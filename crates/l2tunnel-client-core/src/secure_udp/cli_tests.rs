@@ -229,3 +229,6 @@ fn explicit_common_carrier_rejects_missing_cover_and_standalone_or_role_flags_be
     }
     Ok(())
 }
+
+#[path = "raw_cli_tests.rs"]
+mod raw_common;

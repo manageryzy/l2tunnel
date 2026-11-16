@@ -66,6 +66,9 @@ impl Counts {
     }
 
     pub(super) fn prepare(&mut self, identity: ProfileIdentity, width: u16) -> Result<(), Error> {
+        if matches!(identity, ProfileIdentity::UnreliableNative(_)) {
+            return Ok(());
+        }
         let channel = identity_channel(identity);
         Self::slice(&self.prepared, width)?
             .get(channel)
@@ -102,6 +105,8 @@ impl Counts {
 pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index(),
+        ProfileIdentity::Connection(identity) => usize::from(identity.owner.index()),
+        ProfileIdentity::UnreliableNative(identity) => usize::from(identity.owner.index()),
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
         | ProfileIdentity::Rolling(identity) => usize::from(identity.channel.0),
@@ -112,13 +117,21 @@ pub(super) fn offer(
     owner: &mut Owner,
     counts: &mut Counts,
     now: Tick,
-    channel: u16,
+    metadata: pipeline::PacketMetadata,
     width: u16,
     bytes: &[u8],
 ) -> Result<Option<ProfileIdentity>, Error> {
-    let next = counts.next_admission(channel, width)?;
-    let admitted = owner.offer(now, channel, bytes)?;
-    if admitted.is_some() {
+    let channel = metadata.binding.channel;
+    let raw = matches!(&*owner, Owner::Connections(owner) if owner.collection.unreliable_eligible(metadata.classification, bytes));
+    let next = if raw {
+        None
+    } else {
+        Some(counts.next_admission(channel, width)?)
+    };
+    let admitted = owner.offer_queued(now, metadata, bytes)?;
+    if admitted.is_some()
+        && let Some(next) = next
+    {
         counts.admitted[usize::from(channel)] = next;
     }
     Ok(admitted)

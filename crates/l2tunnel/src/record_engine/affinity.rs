@@ -23,9 +23,26 @@ impl Engine {
             .map_err(|error| Error::Pipeline(pipeline::PipelineError::Parse(error)))?;
         let channel = u16::try_from(native_counts::identity_channel(identity))
             .map_err(|_| Error::Invariant)?;
+        let connection = match identity {
+            ProfileIdentity::Connection(identity) => Some(identity.owner),
+            ProfileIdentity::UnreliableNative(identity) => Some(identity.owner),
+            _ => None,
+        };
+        if let (Owner::Connections(owner), Some(id)) = (&self.owner, connection) {
+            owner
+                .collection
+                .check_owner_claim(id, classification.key)
+                .map_err(Error::Connections)?;
+        }
         self.pipeline
             .learn_classified(classification, channel, duration(now))
             .map_err(Error::Pipeline)?;
+        if let (Owner::Connections(owner), Some(id)) = (&mut self.owner, connection) {
+            owner
+                .collection
+                .bind_received_owner(id, classification.key)
+                .map_err(Error::Connections)?;
+        }
         Ok(())
     }
 

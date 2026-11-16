@@ -1,32 +1,77 @@
 # Fixed-cohort independent Compact owners
 
-Status: implemented pure component with four executed protocol cases. No default
-or named profile selection changes. This is a prerequisite for full PBA-03;
-Common Engine/Bank/runtime/service installation remains required and open.
+Status: **implemented collection, tag8 Engine/Bank, Common runtime and shared
+Prepared/service path with finite protocol/protected-I/O evidence**. No default
+or named profile selection changes. Full PBA-03, drained/fenced flow reuse and
+the complete raw-ACK pressure/retirement gate remain open.
 
 The named `quic-overhead-1/2/3` reference constructs sixteen independent CompactTCP
 objects, each with directional recovery and codec contexts, and shares physical
 Links/events. The existing Rust Compact tags6/7 retain one shared duplex body
 owner. A channel count alone does not change that topology.
 
+## Selected-owner integration and finite evidence
+
+The collection supplies explicit bounded source-free ACK send/receive/native
+custody and immutable flow claims.
+An optional per-direction policy provisions actual fixed slabs; the old omitted
+policy continues to refuse raw admission. A complete277-byte directional codec
+is used by the explicit CompleteV2 tag8 Engine/runtime selection.
+Actual common Pipeline metadata now retains original received/admitted time and
+an optional original cap; old APIs select equal times and no new cap. Engine
+admission preserves this metadata and the earliest held ACK age.
+These new bodies pass source-stable Build39 and six actual collection cases plus
+five Pipeline handoff cases in [Cases25](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-25/validation.json).
+The new raw ACK cases cover immutable flow claims, complete directional policy,
+original caps, exact wire debit, Busy retention and physical retirement without
+recovery debt. Those component passes alone do not prove the later installed
+Engine/runtime/service composition. PCO-05/06 and full PBA-03 remain open.
+
+The newly integrated explicit tag8 consumer selects that same collection behind
+one actual Pipeline, preserves its original received/cap metadata, and dispatches
+real physical/native custody tokens. Recovered and source-free native identities
+remain distinct; source-free ACKs create no reliable native-prefix debt. Its
+fixed-cohort capability explicitly reports `flow_reuse=false`, and passive
+retirement cannot discard live claims. The actual Engine roundtrip passes in
+[Cases29](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-29/validation.json),
+including strict canonical tag8 decoding, independent-owner loss progress, raw
+ACK physical/native custody and distinct reliable fences. The genuine shared
+Prepared/service case passes in
+[Cases30](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-30/validation.json):
+real catalog-bound Noise/member setup, sixteen reserved owners, exact forward TCP
+and learned reverse raw ACK bytes, actual status/Pong/original tuples and owned
+disconnect/release. It does not exercise sixteen active service flows or switches.
+
+The separate sixteen-flow protected UDP pressure case passes in
+[Cases31](../../work/parallel-features-20261115/parallel-tcp-cases-attempt-31/validation.json)
+after the fixture services at most the actual receive width at the same timestamp.
+It retains the actual owner1 native token and its original cap without performing
+a native write. It preserves queue-full/replay/expiry and separate reliable
+retirement assertions. The source fix for sealed runtime output uses the existing
+hard expiry deadline, rather than a different owner's soft retry/feedback wake.
+PCO-05/06 remain open for their full reuse/drain compositions; finite pressure and
+service passes do not establish the entire named profile. Earlier failed
+aggregates remain preserved with their original status.
+
 ## First deliverable and ownership
 
 New pure facade module `connection_records` owns a bounded fixed cohort of actual
 reserved `aligned::Endpoint` Compact owners. It supplies no classifier, Pipeline,
-cryptography, socket, clock, task or congestion controller. Future Engine wiring
-must select it through one actual shared Pipeline and the existing single
-authenticated User/carrier path. Existing constructors, tags and defaults remain
-unchanged. Tag8 remains a proposed explicit CompleteV2 integration, not a claimed
-installed profile.
+cryptography, socket, clock, task or congestion controller. The Engine selects it
+through one actual shared Pipeline and the existing single authenticated
+User/carrier path. Existing constructors, old tags and defaults remain unchanged.
+The finite tag8 runtime/service evidence above does not qualify the complete
+named Python profile.
 
 `Config { owners, incarnation, send, receive, send_carrier_overhead_bytes,
-receive_carrier_overhead_bytes }` requires owners1..=256, a positive
+receive_carrier_overhead_bytes, send_unreliable, receive_unreliable }` requires owners1..=256, a positive
 incarnation, actual single-channel directional Compact configs and copy count1.
 The same directional config is instantiated independently for every owner; source,
 feedback, retry, RTT, codec and native state are not shared between them. A fixed
-cohort has no eviction, rebinding or reuse method. Full authenticated flow claims,
-reverse affinity, conflict handling and drained/fenced reuse remain required
-follow-on work; the caller cannot obtain those guarantees from an owner index.
+cohort has no eviction, rebinding or reuse method. Engine integration binds actual
+flow claims and learned reverse affinity to authenticated decoded native channels
+and refuses conflicts before publication. Complete authenticated drained/fenced
+reuse remains required; an owner index alone grants no such authority.
 
 ## Exact route v1
 
@@ -36,9 +81,9 @@ Classes are recovered source1, recovered feedback2 and unreliable native3.
 Recovered records require serial0; unreliable native requires a positive serial.
 The complete route and payload must be authenticated/replay-checked by the caller
 before admission. A structural parser grants no authentication or management
-authority. Unreliable native is a distinct typed grammar branch but is explicitly
-refused by this first collection until actual bounded ACK custody is installed.
-It cannot silently enter recovery or be counted as reliable peer confirmation.
+authority. Unreliable native is a distinct typed grammar branch with actual
+bounded ACK custody only when explicitly selected; None refuses admission. It
+cannot silently enter recovery or be counted as reliable peer confirmation.
 
 Each Compact direction's explicit external overhead must equal its separately
 declared carrier overhead plus24 checked route bytes; the collection validates

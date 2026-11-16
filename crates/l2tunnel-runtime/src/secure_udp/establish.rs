@@ -4,6 +4,7 @@
 //! The returned bootstrap tail must share the sole session socket reader.
 
 use super::diagnostics::{self, Reporter, Stage};
+use super::raw_carrier_io::{NoRaw, RawBacking};
 use l2tunnel_cover as cover;
 use l2tunnel_handshake as hs;
 use l2tunnel_security as security;
@@ -27,36 +28,59 @@ pub mod refresh;
 #[path = "establish_carrier.rs"]
 pub mod carrier;
 
+/// Explicit original raw TCP owner and initial-only inner authentication.
+#[path = "establish_raw_carrier.rs"]
+pub mod raw_carrier;
+
 // Only the carrier branch needs retained send tickets. The UDP branch keeps its
 // original borrowed I/O and test hooks, without a per-packet allocation.
 #[allow(clippy::large_enum_variant)]
-pub(in crate::secure_udp) enum SocketBacking {
+pub(in crate::secure_udp) enum SocketBacking<R: RawBacking = NoRaw> {
     Udp(UdpSocket),
     Carrier(super::original_datagram::OriginalDatagram),
+    Raw(R),
 }
-impl SocketBacking {
+impl<R: RawBacking> SocketBacking<R> {
     pub(in crate::secure_udp) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Self::Udp(socket) => socket.local_addr(),
             Self::Carrier(socket) => Ok(socket.addresses().0),
+            Self::Raw(socket) => Ok(socket.addresses().0),
         }
     }
     pub(in crate::secure_udp) fn peer_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Self::Udp(socket) => socket.peer_addr(),
             Self::Carrier(socket) => Ok(socket.addresses().1),
+            Self::Raw(socket) => Ok(socket.addresses().1),
         }
     }
-    fn extra_wire_bytes(&self) -> usize {
+    fn physical_overhead(&self) -> io::Result<usize> {
         match self {
-            Self::Udp(_) => 0,
-            Self::Carrier(socket) => socket.geometry().extra_wire_bytes,
+            Self::Udp(socket) => Ok(if socket.local_addr()?.is_ipv4() {
+                28
+            } else {
+                48
+            }),
+            Self::Carrier(socket) => {
+                let geometry = socket.geometry();
+                geometry
+                    .ip_udp_bytes
+                    .checked_add(geometry.extra_wire_bytes)
+                    .ok_or_else(|| io::Error::other("carrier physical overhead overflow"))
+            }
+            Self::Raw(socket) => socket
+                .geometry()
+                .ip_tcp_bytes
+                .checked_add(socket.geometry().record_overhead_bytes)
+                .ok_or_else(|| io::Error::other("raw physical overhead overflow")),
         }
     }
     pub(in crate::secure_udp) fn receive_capacity(&self, maximum: usize) -> io::Result<usize> {
         let maximum = match self {
             Self::Udp(_) => maximum,
             Self::Carrier(socket) => maximum.max(socket.geometry().max_datagram_bytes),
+            Self::Raw(socket) => maximum.max(socket.geometry().max_record_bytes),
         };
         maximum
             .checked_add(1)
@@ -65,7 +89,7 @@ impl SocketBacking {
     pub(in crate::secure_udp) fn into_udp(self) -> io::Result<UdpSocket> {
         match self {
             Self::Udp(socket) => Ok(socket),
-            Self::Carrier(_) => Err(io::Error::new(
+            Self::Carrier(_) | Self::Raw(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "carrier custody is not a UDP handoff",
             )),
@@ -76,9 +100,18 @@ impl SocketBacking {
     ) -> io::Result<super::original_datagram::OriginalDatagram> {
         match self {
             Self::Carrier(socket) => Ok(socket),
-            Self::Udp(_) => Err(io::Error::new(
+            Self::Udp(_) | Self::Raw(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "UDP custody is not a carrier handoff",
+                "noncarrier custody is not an original-datagram handoff",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) fn into_raw(self) -> io::Result<R> {
+        match self {
+            Self::Raw(socket) => Ok(socket),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "actual raw custody required",
             )),
         }
     }
@@ -88,13 +121,38 @@ impl SocketBacking {
             Self::Carrier(socket) => {
                 std::future::poll_fn(|cx| socket.poll_receive(cx, output)).await
             }
+            Self::Raw(socket) => {
+                std::future::poll_fn(|cx| {
+                    socket.begin_turn();
+                    match socket.poll_ready(cx, true) {
+                        std::task::Poll::Ready(Ok(())) => match socket.try_receive(output) {
+                            Ok((bytes, _)) => std::task::Poll::Ready(Ok(bytes)),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                std::task::Poll::Pending
+                            }
+                            Err(error) => std::task::Poll::Ready(Err(error)),
+                        },
+                        std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+            }
         }
     }
     pub(in crate::secure_udp) async fn send_control(
-        &self,
+        &mut self,
         bytes: &[u8],
         deadline: Instant,
     ) -> io::Result<()> {
+        if let Self::Raw(socket) = self {
+            return timeout_at(
+                deadline,
+                std::future::poll_fn(|cx| socket.poll_setup_send(cx, bytes, deadline)),
+            )
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+        }
         let Self::Carrier(socket) = self else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -359,6 +417,23 @@ impl ServerAdmission {
             origin,
         })
     }
+    fn with_physical_overhead(
+        config: Config,
+        peers: Peers,
+        admission: gate::Secret,
+        cookie: gate::Secret,
+        origin: Instant,
+        physical: usize,
+    ) -> Result<Self, Error> {
+        let setup = setup_with_physical_overhead(config, peers, physical)?;
+        let gate = gate::ServerGate::new(setup.gate, admission, cookie, Duration::ZERO)?;
+        Ok(Self {
+            setup,
+            peers,
+            gate,
+            origin,
+        })
+    }
     /// Current bounded gate counters and pending/quarantine count.
     pub fn statistics(&self) -> gate::GateStatistics {
         self.gate.statistics()
@@ -419,8 +494,8 @@ impl InitialMaterial {
     }
 }
 
-pub(in crate::secure_udp) struct EstablishedState {
-    pub(in crate::secure_udp) socket: SocketBacking,
+pub(in crate::secure_udp) struct EstablishedState<R: RawBacking = NoRaw> {
+    pub(in crate::secure_udp) socket: SocketBacking<R>,
     pub(in crate::secure_udp) material: InitialMaterial,
     pub(in crate::secure_udp) binding: security::SessionBinding,
     pub(in crate::secure_udp) authenticated: hs::Binding,
@@ -863,7 +938,7 @@ pub async fn connect_observed(
     let mut report = Reporter::new(observe);
     // One setup allocation keeps instrumentation from multiplying caller stack storage.
     let result = Box::pin(connect_inner(
-        SocketBacking::Udp(socket),
+        SocketBacking::<NoRaw>::Udp(socket),
         config,
         identity,
         admission,
@@ -880,8 +955,8 @@ pub async fn connect_observed(
 }
 
 #[allow(clippy::too_many_arguments)] // Same bounded setup inputs plus a borrowed observation sink.
-async fn connect_inner(
-    mut socket: SocketBacking,
+async fn connect_inner<R: RawBacking>(
+    mut socket: SocketBacking<R>,
     config: Config,
     identity: Identity,
     admission: gate::Secret,
@@ -889,12 +964,12 @@ async fn connect_inner(
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
     selection: Option<hs::refresh::Selection>,
-) -> Result<EstablishedState, Error> {
+) -> Result<EstablishedState<R>, Error> {
     let peers = Peers {
         initiator: identity.local.public_key(),
         responder: identity.peer,
     };
-    let setup = setup_with_extra(config, peers, socket.extra_wire_bytes())?;
+    let setup = setup_with_physical_overhead(config, peers, socket.physical_overhead()?)?;
     socket_path(&socket, setup.gate.path, hs::Role::Initiator)?;
     let origin = Instant::now();
     before(origin, deadline)?;
@@ -913,7 +988,7 @@ async fn connect_inner(
         if let Some(frame) = client.poll(elapsed(origin, now)?)? {
             let length = gate_packet(setup, &frame, next_outer, &mut output)?;
             report.bootstrap(statistics, None);
-            let accepted = send_backing(&socket, &output[..length], deadline).await?;
+            let accepted = send_backing(&mut socket, &output[..length], deadline).await?;
             sent(&mut statistics, length, accepted);
             advance(&mut next_outer)?;
             emitted(&mut statistics, length);
@@ -978,7 +1053,7 @@ pub async fn accept_observed(
     let mut report = Reporter::new(observe);
     report.server(admission.statistics());
     let result = Box::pin(accept_inner(
-        SocketBacking::Udp(socket),
+        SocketBacking::<NoRaw>::Udp(socket),
         identity,
         admission,
         deadline,
@@ -994,15 +1069,15 @@ pub async fn accept_observed(
     result.and_then(EstablishedState::into_legacy)
 }
 
-async fn accept_inner(
-    mut socket: SocketBacking,
+async fn accept_inner<R: RawBacking>(
+    mut socket: SocketBacking<R>,
     identity: Identity,
     admission: &mut ServerAdmission,
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
     selection: Option<hs::refresh::Selection>,
-) -> Result<EstablishedState, Error> {
+) -> Result<EstablishedState<R>, Error> {
     let peers = Peers {
         initiator: identity.peer,
         responder: identity.local.public_key(),
@@ -1021,7 +1096,8 @@ async fn accept_inner(
     report.bootstrap(statistics, None);
     let mut next_outer = 0;
     let mut quota = Quota::new(setup.config, now)?;
-    if setup_with_extra(setup.config, admission.peers, socket.extra_wire_bytes())?.gate
+    if setup_with_physical_overhead(setup.config, admission.peers, socket.physical_overhead()?)?
+        .gate
         != setup.gate
     {
         return Err(Error::Configuration("actual carrier bootstrap geometry"));
@@ -1054,7 +1130,7 @@ async fn accept_inner(
                     gate::GateEvent::Retry(retry) => {
                         let length = gate_packet(setup, &retry, next_outer, &mut output)?;
                         report.bootstrap(statistics, None);
-            let accepted = send_backing(&socket, &output[..length], deadline).await?;
+            let accepted = send_backing(&mut socket, &output[..length], deadline).await?;
                         sent(&mut statistics, length, accepted);
                         advance(&mut next_outer)?;
                         emitted(&mut statistics, length);
@@ -1090,8 +1166,8 @@ async fn accept_inner(
     result
 }
 
-struct Exchange {
-    socket: SocketBacking,
+struct Exchange<R: RawBacking> {
+    socket: SocketBacking<R>,
     setup: Setup,
     identity: Identity,
     peers: Peers,
@@ -1102,14 +1178,14 @@ struct Exchange {
     next_outer: u32,
     client: Option<gate::ClientGate>,
 }
-impl Exchange {
+impl<R: RawBacking> Exchange<R> {
     async fn run(
         mut self,
         entropy: &mut (impl hs::Entropy + Send),
         mut server: Option<&mut ServerAdmission>,
         report: &mut Reporter<'_, '_>,
         selection: Option<hs::refresh::Selection>,
-    ) -> Result<EstablishedState, Error> {
+    ) -> Result<EstablishedState<R>, Error> {
         report.stage(Stage::Noise);
         let role = if self.client.is_some() {
             hs::Role::Initiator
@@ -1222,7 +1298,7 @@ impl Exchange {
                     core.statistics,
                     core.control.as_ref().map(gate::ControlEngine::statistics),
                 );
-                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&mut self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
                 emitted(&mut core.statistics, length);
@@ -1234,7 +1310,7 @@ impl Exchange {
                     core.statistics,
                     core.control.as_ref().map(gate::ControlEngine::statistics),
                 );
-                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&mut self.socket, &output[..length], core.end).await?;
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
             }
@@ -1327,7 +1403,7 @@ impl Exchange {
                                     gate::GateEvent::Retry(frame) => {
                                         let length = gate_packet(self.setup, &frame, self.next_outer, &mut output)?;
                                         report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
-                let accepted = send_backing(&self.socket, &output[..length], core.end).await?;
+                let accepted = send_backing(&mut self.socket, &output[..length], core.end).await?;
                                         sent(&mut core.statistics, length, accepted);
                                         advance(&mut self.next_outer)?;
                                         emitted(&mut core.statistics, length);
@@ -1367,17 +1443,37 @@ fn setup_with_extra(config: Config, peers: Peers, extra: usize) -> Result<Setup,
     if extra > 1 {
         return Err(Error::Configuration("unsupported carrier overhead"));
     }
+    let ip = if config.gate.path.client.is_ipv4() {
+        28usize
+    } else {
+        48usize
+    };
+    setup_with_physical_overhead(
+        config,
+        peers,
+        ip.checked_add(extra)
+            .ok_or(Error::Configuration("carrier overhead"))?,
+    )
+}
+fn setup_with_physical_overhead(
+    config: Config,
+    peers: Peers,
+    physical: usize,
+) -> Result<Setup, Error> {
     if !(1..=4096).contains(&config.receive_packets_per_interval)
         || !(FRAME_BYTES..=4096).contains(&config.gate.arq.max_source_bytes)
         || peers.initiator == peers.responder
     {
         return Err(Error::Configuration("bounded bootstrap selection"));
     }
-    let ip = if config.gate.path.client.is_ipv4() {
+    let minimum = if config.gate.path.client.is_ipv4() {
         28
     } else {
         48
     };
+    if physical < minimum || physical >= config.gate.path_mtu {
+        return Err(Error::Configuration("actual physical geometry"));
+    }
     let cover_bytes = match config.cover.appearance() {
         cover::Appearance::QuicLike => 30,
         cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
@@ -1392,7 +1488,7 @@ fn setup_with_extra(config: Config, peers: Peers, extra: usize) -> Result<Setup,
     let max_wire = protected
         .checked_add(actual_overhead)
         .ok_or(Error::Configuration("covered lengths"))?;
-    if config.gate.outer_overhead != ip + extra + 1 + cover_bytes
+    if config.gate.outer_overhead != physical + 1 + cover_bytes
         || actual_overhead != cover_bytes
         || config
             .cover
@@ -1400,7 +1496,7 @@ fn setup_with_extra(config: Config, peers: Peers, extra: usize) -> Result<Setup,
             != cover_bytes
         || max_wire > config.cover.limits().max_packet_bytes
         || max_wire
-            .checked_add(ip + extra)
+            .checked_add(physical)
             .is_none_or(|bytes| bytes > config.gate.path_mtu)
     {
         return Err(Error::Configuration("exact bootstrap cover/MTU accounting"));
@@ -1469,7 +1565,11 @@ fn outer_binding(setup: Setup, session: [u8; 16]) -> Result<[u8; 32], Error> {
     result.copy_from_slice(context.finish().as_ref());
     Ok(result)
 }
-fn socket_path(socket: &SocketBacking, path: gate::Path, role: hs::Role) -> Result<(), Error> {
+fn socket_path<R: RawBacking>(
+    socket: &SocketBacking<R>,
+    path: gate::Path,
+    role: hs::Role,
+) -> Result<(), Error> {
     let (local, remote) = match role {
         hs::Role::Initiator => (path.client, path.server),
         hs::Role::Responder => (path.server, path.client),
@@ -1591,14 +1691,14 @@ fn gate_body(setup: Setup, packet: &[u8]) -> Option<&[u8]> {
         && decoded.protected[0] == GATE_TAG)
         .then_some(&decoded.protected[1..])
 }
-async fn send_backing(
-    socket: &SocketBacking,
+async fn send_backing<R: RawBacking>(
+    socket: &mut SocketBacking<R>,
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<bool, Error> {
     match socket {
         SocketBacking::Udp(socket) => send(socket, bytes, deadline).await,
-        SocketBacking::Carrier(_) => {
+        SocketBacking::Carrier(_) | SocketBacking::Raw(_) => {
             socket.send_control(bytes, deadline).await?;
             Ok(true)
         }

@@ -396,6 +396,11 @@ impl Ingress {
         if received > now || original_cap <= now {
             return Err(Error::Time);
         }
+        let timing = super::PacketTiming {
+            received,
+            admitted: now,
+            original_deadline: Some(original_cap),
+        };
         let classification = pipeline
             .classify(bytes)
             .map_err(|error| Error::Pipeline(PipelineError::Parse(error)))?;
@@ -408,7 +413,7 @@ impl Ingress {
                 pipeline,
                 bytes,
                 classification.key,
-                now,
+                timing,
                 Forward::Bypass(false),
             )?;
             for slot in &mut self.slots {
@@ -435,7 +440,7 @@ impl Ingress {
                     pipeline,
                     bytes,
                     ack.key.flow,
-                    now,
+                    timing,
                     Forward::First(ack.signature.is_some()),
                 )?;
                 let Admission::Forwarded(metadata) = admitted else {
@@ -477,7 +482,7 @@ impl Ingress {
                 pipeline,
                 bytes,
                 ack.key.flow,
-                now,
+                timing,
                 if duplicate {
                     Forward::Duplicate(ack.signature.is_some())
                 } else {
@@ -708,9 +713,10 @@ impl Ingress {
         pipeline: &mut Pipeline,
         bytes: &[u8],
         key: FlowKey,
-        now: Duration,
+        timing: super::PacketTiming,
         disposition: Forward,
     ) -> Result<Admission, Error> {
+        let now = timing.admitted;
         let (eligible, first, duplicate) = match disposition {
             Forward::First(eligible) => (eligible, true, false),
             Forward::Duplicate(eligible) => (eligible, false, true),
@@ -731,7 +737,12 @@ impl Ingress {
             next.bypassed = increment(next.bypassed)?;
         }
         let metadata = pipeline
-            .enqueue_borrowed(bytes, now)
+            .enqueue_borrowed_capped(
+                bytes,
+                timing.received,
+                now,
+                timing.original_deadline.ok_or(Error::Invariant)?,
+            )
             .map_err(Error::Pipeline)?;
         self.statistics = next;
         self.now = now;
@@ -792,7 +803,7 @@ impl Ingress {
             .get(start..start + pending.bytes)
             .ok_or(Error::Invariant)?;
         pipeline
-            .enqueue_borrowed(bytes, now)
+            .enqueue_borrowed_capped(bytes, pending.first_created, now, pending.expires)
             .map_err(Error::Pipeline)?;
         self.slots[index].as_mut().ok_or(Error::Invariant)?.pending = None;
         self.usage.held = held;

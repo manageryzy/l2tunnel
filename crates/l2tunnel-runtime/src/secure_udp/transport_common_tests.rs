@@ -30,7 +30,8 @@ fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
             c::Profile::Rolling { .. }
             | c::Profile::RollingCopies { .. }
             | c::Profile::AlignedCompact { .. }
-            | c::Profile::PackedCompact { .. } => {
+            | c::Profile::PackedCompact { .. }
+            | c::Profile::PerConnectionCompact { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "legacy three-family fixture does not select this profile",
@@ -70,8 +71,18 @@ fn contracts_with_catalog_and_work(
     work: usize,
     rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
 ) -> Result<[CommonTransactionContract; 2]> {
+    contracts_with_catalog_and_options(kind, catalog, work, rolling_work, None)
+}
+fn contracts_with_catalog_and_options(
+    kind: cover::Appearance,
+    catalog: Catalog,
+    work: usize,
+    rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+) -> Result<[CommonTransactionContract; 2]> {
     let mut base = config(kind);
     base.rolling_work = rolling_work;
+    base.rolling_ingress = rolling_ingress;
     base.work.native_write_batch = work;
     base.report_interval = None;
     base.lifetime.lease = Duration::from_secs(60);
@@ -178,7 +189,9 @@ impl Fixture {
         retire_at_deadline: bool,
     ) -> Result<Self> {
         let [client, server] = contracts;
-        let (a, b) = parts_pair(kind).await?;
+        // Authenticate the requested role-local cover from the first actual
+        // setup flight; changing copied Parts afterward would not be authority.
+        let (a, b) = parts_pair_with_covers(kind, Some([client.cover(), server.cover()])).await?;
         let setup_end = a.deadline.max(b.deadline);
         let origin = Instant::now();
         let make = |parts: member::Parts, contract| -> Result<Endpoint> {
@@ -617,6 +630,7 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                     cost: retained.cost,
                     deadline: retained.deadline,
                     carrier: None,
+                    fragment: None,
                 };
                 let bytes = runtime.wire[..pending.sealed.bytes].to_vec();
                 let next = endpoint.driver.records.next_number(Class::User);
@@ -982,3 +996,6 @@ mod compact_feedback_input;
 
 #[path = "transport_common_ingress_tests.rs"]
 mod ack_ingress;
+
+#[path = "transport_common_connection_tests.rs"]
+mod connections;

@@ -355,3 +355,6 @@ fn metadata_accounting_and_busy_transit_fail_before_actual_downstream_admission(
     }
     Ok(())
 }
+
+#[path = "timing_tests.rs"]
+mod timing;

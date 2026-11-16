@@ -224,6 +224,8 @@ fn next(clock: &mut u64) -> Tick {
 pub(super) fn identity_channel(identity: ProfileIdentity) -> u16 {
     match identity {
         ProfileIdentity::Swift(identity) => identity.channel.index() as u16,
+        ProfileIdentity::Connection(identity) => identity.owner.index(),
+        ProfileIdentity::UnreliableNative(identity) => identity.owner.index(),
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
         | ProfileIdentity::Rolling(identity) => u16::from(identity.channel.0),
@@ -270,9 +272,15 @@ pub(super) struct Link {
     swift: bool,
 }
 impl Link {
-    pub(super) fn new(configuration: &configuration::Configuration, role: Role) -> Self {
+    pub(super) fn new(
+        configuration: &configuration::Configuration,
+        role: Role,
+    ) -> TestResult<Self> {
         let direction = configuration.descriptor().direction(role);
         let (maximum, witnesses, swift) = match direction.profile() {
+            configuration::DirectionProfile::PerConnectionCompact(_) => {
+                return Err("legacy Link fixture excludes per-connection profile".into());
+            }
             configuration::DirectionProfile::Swift(config) => {
                 (config.codec.datagram_bytes, 0, true)
             }
@@ -298,7 +306,7 @@ impl Link {
                 false,
             ),
         };
-        Self {
+        Ok(Self {
             number: if role == Role::Client {
                 (1_u64 << 48) + 0x12345
             } else {
@@ -323,7 +331,7 @@ impl Link {
             sources: 0,
             feedback: 0,
             swift,
-        }
+        })
     }
 
     pub(super) fn transfer(
@@ -366,6 +374,9 @@ impl Link {
                 assert_eq!(emission.kind, EmissionKind::Feedback);
             }
             match emission.kind {
+                EmissionKind::UnreliableNative => {
+                    return Err("legacy Link fixture excludes source-free raw output".into());
+                }
                 EmissionKind::Source(form) => {
                     self.sources += 1;
                     assert_eq!(form == SourceForm::Swift, self.swift);
@@ -529,8 +540,8 @@ fn roundtrip(
             assert_eq!(sender.failure(), None);
         }
     }
-    let mut data = Link::new(&configuration, role);
-    let mut feedback = Link::new(&configuration, peer);
+    let mut data = Link::new(&configuration, role)?;
+    let mut feedback = Link::new(&configuration, peer)?;
     let mut native = vec![0; native_max];
     let mut delivered = Vec::new();
     let mut done = false;
@@ -633,6 +644,9 @@ fn roundtrip(
     assert_eq!(receiver.statistics().emitted, feedback.emissions);
     for (identity, _) in accepted {
         match identity {
+            ProfileIdentity::Connection(_) | ProfileIdentity::UnreliableNative(_) => {
+                return Err("legacy roundtrip fixture excludes per-connection identity".into());
+            }
             ProfileIdentity::Swift(_) => assert!(data.units.is_empty()),
             ProfileIdentity::Aligned(identity)
             | ProfileIdentity::Packed(identity)
@@ -762,7 +776,7 @@ fn actual_held_native_original_cap_expires_without_a_completion_or_renewal() -> 
             Engine::new_functional(configuration, context(Role::Server), geometry(), limits)?;
         sender.enqueue(Tick(0), packet(true, 1001, 100, 7))?;
         sender.admit_one(Tick(0))?.ok_or("admission")?;
-        let mut link = Link::new(&configuration, Role::Client);
+        let mut link = Link::new(&configuration, Role::Client)?;
         let mut output = vec![0; 1024];
         let mut clock = 0;
         let mut held = None;
@@ -825,7 +839,8 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
             | configuration::Profile::AlignedCompact { .. }
             | configuration::Profile::PackedCompact { .. }
             | configuration::Profile::Rolling { .. }
-            | configuration::Profile::RollingCopies { .. } => {
+            | configuration::Profile::RollingCopies { .. }
+            | configuration::Profile::PerConnectionCompact { .. } => {
                 return Err("aligned-family fixture".into());
             }
         }
@@ -851,7 +866,8 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 configuration::DirectionProfile::Swift(_)
                 | configuration::DirectionProfile::AlignedCompact(_)
                 | configuration::DirectionProfile::PackedCompact(_)
-                | configuration::DirectionProfile::Rolling { .. } => {
+                | configuration::DirectionProfile::Rolling { .. }
+                | configuration::DirectionProfile::PerConnectionCompact(_) => {
                     return Err("aligned-family direction".into());
                 }
             };
@@ -871,7 +887,7 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 },
             )?;
             assert_eq!(engine.configuration(), &configuration);
-            let mut link = Link::new(&configuration, role);
+            let mut link = Link::new(&configuration, role)?;
             let before = OutboundBudget {
                 packets: 1,
                 wire_bytes: actual + recovery.outer_overhead_bytes,
@@ -960,7 +976,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
         let native = packet(true, 1001, 100, 7);
         sender.enqueue(Tick(0), native.clone())?;
         sender.admit_one(Tick(0))?.ok_or("actual admission")?;
-        let mut forward = Link::new(&configuration, Role::Client);
+        let mut forward = Link::new(&configuration, Role::Client)?;
         let mut arrival = None;
         for step in 0..8 {
             let now = Tick(step * 10_000);
@@ -1001,7 +1017,8 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
             configuration::DirectionProfile::Swift(_)
             | configuration::DirectionProfile::AlignedCompact(_)
             | configuration::DirectionProfile::PackedCompact(_)
-            | configuration::DirectionProfile::Rolling { .. } => {
+            | configuration::DirectionProfile::Rolling { .. }
+            | configuration::DirectionProfile::PerConnectionCompact(_) => {
                 return Err("aligned-family lifetime".into());
             }
         };
@@ -1011,7 +1028,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
         receiver
             .admit_one(Tick(arrival.0 + 2))?
             .ok_or("reverse source admission")?;
-        let mut reverse = Link::new(&configuration, Role::Server);
+        let mut reverse = Link::new(&configuration, Role::Server)?;
         let mut retry_armed = false;
         let mut outgoing_empty = false;
         let mut last_poll = arrival;

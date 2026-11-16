@@ -4,7 +4,29 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
-The current Batch11 implementation adds explicit bounded benchmark ACK ingress
+The current Batch12 implementation installs the selected independent Compact
+collection in the actual Engine/Bank/Common runtime and shared service, including
+bounded source-free ACK custody with original arrival/deadline and observable
+fixed-cohort limitations. It adds explicit authenticated Rolling input custody and
+selected fragment Engine/Bank/runtime composition, with whole-group charging,
+fresh per-fragment protection and physical completion. The original raw TCP
+Full/Half owners now feed the same Common service and strict CLI, with genuine
+TLS/member and initial Noise/member admission, fresh lower reconnect and unchanged
+setup caps. These are implemented slices with finite protocol/protected-I/O
+receipts, not complete named Python profiles or kernel/platform qualification.
+
+The [Batch12 scoped receipt](../work/parallel-features-20261115/parallel-batch12-scoped-validation.json)
+retains actual source identities, failed attempts, focused continuations and the
+required batch check separately. See [independent owners](modules/connection-records.md),
+[Rolling ingress](modules/common-rolling-ingress.md),
+[record fragmentation](modules/common-record-fragmentation.md) and
+[raw Common carrier](modules/raw-common-carrier.md). Full flow reuse, the named
+1460/1500/global8192/local128/every16/copies/ACK composition, native/platform/
+resource/performance, all47 and complete SW-11 remain open. External Windows,
+recursive-FEC and TCP-proxy/Common commits are delivered but are not part of this
+checkpoint; their integration and validation are separate work.
+
+The preceding Batch11 implementation adds explicit bounded benchmark ACK ingress
 through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and
 paired resource binding; decoded-channel reverse learning in the same Pipeline;
 and a pure fixed-cohort collection of independently reserved Compact owners.

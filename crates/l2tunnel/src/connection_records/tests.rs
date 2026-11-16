@@ -67,6 +67,8 @@ fn config(owners: u16) -> TestResult<Config> {
         receive: policy,
         send_carrier_overhead_bytes: 28,
         receive_carrier_overhead_bytes: 28,
+        send_unreliable: None,
+        receive_unreliable: None,
     })
 }
 fn context(role: EndpointRole) -> RecoveryContext {
@@ -450,3 +452,6 @@ fn physical_native_completion_error_cannot_reissue_the_already_written_body() ->
     assert!(!b.drained());
     Ok(())
 }
+
+#[path = "unreliable_tests.rs"]
+mod unreliable;

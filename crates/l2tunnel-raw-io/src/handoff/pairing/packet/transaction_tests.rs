@@ -584,3 +584,329 @@ async fn actual_fresh_liveness_pong_refreshes_both_original_lanes() -> R {
     .await?;
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn half_one_way_records_return_same_lane_window_after_actual_physical_send() -> R {
+    let af = Arc::new(Fault::default());
+    let bf = Arc::new(Fault::default());
+    let (mut a, mut b) = run(true, af, bf.clone(), false).await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        // Finish existing transition output before holding the real reverse
+        // packet adapter; no transition owner or original cap is replaced.
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if [&a, &b].into_iter().all(|carrier| {
+                carrier
+                    .lanes
+                    .iter()
+                    .flatten()
+                    .all(|lane| lane.pending.is_none())
+            }) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        let start = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?
+            .fence
+            .as_ref()
+            .ok_or("fence")?
+            .sent;
+        let horizon = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?
+            .fence
+            .as_ref()
+            .ok_or("fence")?
+            .peer_horizon;
+        let threshold = b.lanes[0].as_ref().ok_or("lane")?.retirement_threshold()?;
+        let mut body = [0x5a; 384];
+        bf.block_all.store(true, Ordering::SeqCst);
+        let mut next = 0u16;
+        // Real one-way arrivals cross the actual horizon-derived batching
+        // threshold. Below it no standalone Window may consume a nonce.
+        loop {
+            assert!(next < 96);
+            body[..2].copy_from_slice(&next.to_be_bytes());
+            let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, &body)?;
+            let mut sent = None;
+            let mut received = false;
+            poll_fn(|cx| {
+                for carrier in [&mut a, &mut b] {
+                    if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                if sent.is_none() {
+                    sent = a.take_sent_record(PairLane::First)?;
+                }
+                if let Some(record) = b.record() {
+                    assert_eq!(record.bytes, body);
+                    assert!(!received);
+                    b.consume_record()?;
+                    received = true;
+                }
+                if sent.is_some() && received {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+            assert_eq!(sent.ok_or("source receipt")?.token, token);
+            next += 1;
+            let lane = b.lanes[0].as_ref().ok_or("lane")?;
+            if lane
+                .retirement_required
+                .saturating_sub(lane.retirement_reported)
+                >= threshold
+            {
+                break;
+            }
+            assert!(
+                !lane
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.kind == wire::Kind::Window),
+                "below-threshold arrival must stay coalesced"
+            );
+        }
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if b.lanes[0].as_ref().is_some_and(|lane| {
+                lane.pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.kind == wire::Kind::Window)
+            }) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        let lane = b.lanes[0].as_ref().ok_or("lane")?;
+        let required = lane.retirement_required;
+        let reported = lane.retirement_reported;
+        assert!(required.saturating_sub(reported) >= threshold);
+        let frozen = lane.pending.as_ref().ok_or("held window")?.bytes.clone();
+        let usage = lane.sealer.usage();
+        for _ in 0..4 {
+            poll_fn(|cx| {
+                if let Poll::Ready(Err(error)) = b.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Ok(()))
+            })
+            .await?;
+            let lane = b.lanes[0].as_ref().ok_or("lane")?;
+            assert_eq!(lane.pending.as_ref().ok_or("held window")?.bytes, frozen);
+            assert_eq!(lane.retirement_reported, reported);
+            assert_eq!(lane.sealer.usage(), usage);
+        }
+        bf.block_all.store(false, Ordering::SeqCst);
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            let peer_retired = lock(&a.lanes[0].as_ref().ok_or(Error::Proof)?.io.state)?
+                .fence
+                .as_ref()
+                .ok_or(Error::Proof)?
+                .peer_retired;
+            if peer_retired >= required {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        assert!(b.lanes[0].as_ref().ok_or("lane")?.retirement_reported >= required);
+        // More real one-way records than the original finite lane horizon.
+        // There is no upper reverse payload or fabricated retirement credit.
+        for number in next..96 {
+            body[..2].copy_from_slice(&number.to_be_bytes());
+            let mut token = None;
+            let mut written = false;
+            let mut received = false;
+            poll_fn(|cx| {
+                if token.is_none() {
+                    match a.stage_record_tracked(PairLane::First, RecordKind::Data, &body) {
+                        Ok(value) => token = Some(value),
+                        Err(Error::Busy) => {}
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
+                for carrier in [&mut a, &mut b] {
+                    if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                if let Some(sent) = a.take_sent_record(PairLane::First)? {
+                    assert_eq!(Some(sent.token), token);
+                    assert!(!written);
+                    written = true;
+                }
+                if let Some(record) = b.record() {
+                    assert_eq!(record.kind, RecordKind::Data);
+                    assert_eq!(record.lane, PairLane::First);
+                    assert_eq!(record.bytes, body);
+                    assert!(!received);
+                    b.consume_record()?;
+                    received = true;
+                }
+                assert!(a.record().is_none(), "Window is not an upper record");
+                if written && received {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+        }
+        let end = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?
+            .fence
+            .as_ref()
+            .ok_or("fence")?
+            .sent;
+        assert!(end - start > horizon);
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if b.lanes[0].as_ref().is_some_and(|lane| {
+                lane.retirement_required
+                    .saturating_sub(lane.retirement_reported)
+                    < threshold
+                    && lane.pending.is_none()
+            }) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        let quiet = [
+            a.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
+            b.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
+        ];
+        for _ in 0..4 {
+            poll_fn(|cx| {
+                for carrier in [&mut a, &mut b] {
+                    if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            })
+            .await?;
+        }
+        assert_eq!(
+            quiet,
+            [
+                a.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
+                b.lanes[0].as_ref().ok_or("lane")?.sealer.usage()
+            ]
+        );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_upper_feedback_piggybacks_retirement_before_idle_window_claims_slot() -> R {
+    let (mut a, mut b) = run(
+        false,
+        Arc::new(Fault::default()),
+        Arc::new(Fault::default()),
+        false,
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if [&a, &b].into_iter().all(|carrier| {
+                carrier
+                    .lanes
+                    .iter()
+                    .flatten()
+                    .all(|lane| lane.pending.is_none())
+            }) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        a.stage_record(PairLane::First, RecordKind::Data, b"actual upper source")?;
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if b.record().is_some() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        assert_eq!(b.record().ok_or("source")?.bytes, b"actual upper source");
+        b.consume_record()?;
+        let lane = b.lanes[0].as_ref().ok_or("lane")?;
+        let required = lane.retirement_required;
+        assert!(required > lane.retirement_reported);
+        assert!(
+            lane.pending.is_none(),
+            "new receive must leave the real upper output opportunity"
+        );
+        let token = b.stage_record_tracked(
+            PairLane::First,
+            RecordKind::Feedback,
+            b"actual upper feedback",
+        )?;
+        let mut sent = None;
+        poll_fn(|cx| {
+            for carrier in [&mut a, &mut b] {
+                if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if sent.is_none() {
+                sent = b.take_sent_record(PairLane::First)?;
+            }
+            if sent.is_some() && a.record().is_some() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        assert_eq!(sent.ok_or("feedback receipt")?.token, token);
+        assert_eq!(
+            a.record().ok_or("feedback")?.bytes,
+            b"actual upper feedback"
+        );
+        a.consume_record()?;
+        assert!(b.lanes[0].as_ref().ok_or("lane")?.retirement_reported >= required);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}

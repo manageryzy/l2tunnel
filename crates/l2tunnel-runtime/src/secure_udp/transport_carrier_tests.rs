@@ -139,8 +139,8 @@ async fn actual_outer_io_keeps_separate_tickets_and_only_reports_whole_original_
                 return Err("queue admission became completion".into());
             };
             assert_eq!(
-                (receipt.datagram_bytes, receipt.udp_bytes, receipt.ip_bytes),
-                (4, 5, 33)
+                (receipt.record_bytes, receipt.udp_bytes, receipt.ip_bytes),
+                (4, Some(5), 33)
             );
             assert!(!late);
             assert!(receipt.accepted_at < cap);
@@ -152,12 +152,12 @@ async fn actual_outer_io_keeps_separate_tickets_and_only_reports_whole_original_
             };
             assert_eq!(
                 (
-                    receipt.datagram_bytes,
+                    receipt.record_bytes,
                     receipt.udp_bytes,
                     receipt.ip_bytes,
                     cost
                 ),
-                (7, 8, 36, 36)
+                (7, Some(8), 36, 36)
             );
             assert!(!late);
             control = true;
@@ -209,7 +209,7 @@ async fn physical_late_projection_retains_actual_whole_udp_fact_without_success_
     else {
         return Err("lost physical fact".into());
     };
-    assert_eq!(observed, receipt);
+    assert_eq!(observed, receipt.into());
     assert!(late);
     assert_eq!(
         complete(Err(SendFailure::Expired { accepted: None }))

@@ -154,6 +154,9 @@ fn config(kind: cover::Appearance) -> Config {
         },
         rolling_work: None,
         ack_coalescing: None,
+        connection_ingress: None,
+        rolling_fragments: None,
+        rolling_ingress: None,
         native: NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,
@@ -260,6 +263,7 @@ async fn authenticated(
     path: gate::Path,
     kind: cover::Appearance,
     client: bool,
+    selected_cover: Option<cover::Config>,
 ) -> Result<member::Parts> {
     let local = hs::LocalSecret::new(Zeroizing::new(if client { [11; 32] } else { [22; 32] }));
     let initiator = hs::LocalSecret::new(Zeroizing::new([11; 32])).public_key();
@@ -290,7 +294,10 @@ async fn authenticated(
     gate.gate_attempts = 32;
     let setup = establish::Config {
         gate,
-        cover: appearance(kind, client)?,
+        cover: match selected_cover {
+            Some(selected) => selected,
+            None => appearance(kind, client)?,
+        },
         profile: hs::Profile::Ik,
         binding: establish::Binding {
             configuration: [3; 32],
@@ -430,7 +437,7 @@ impl Pair {
                     .build()
                     .map_err(|error| error.to_string())?;
                 runtime.block_on(async move {
-                    let parts = authenticated(socket, path, kind, client_side)
+                    let parts = authenticated(socket, path, kind, client_side, None)
                         .await
                         .map_err(|error| error.to_string())?;
                     let mut first = true;
@@ -943,7 +950,17 @@ fn submicrosecond_runtime_deadlines_never_become_zero_quota_or_lease() -> Result
     Ok(())
 }
 
-async fn parts_pair(kind: cover::Appearance) -> Result<(member::Parts, member::Parts)> {
+fn parts_pair(
+    kind: cover::Appearance,
+) -> impl std::future::Future<Output = Result<(member::Parts, member::Parts)>> {
+    // Return the same actual setup future, without another large poll frame.
+    parts_pair_with_covers(kind, None)
+}
+
+async fn parts_pair_with_covers(
+    kind: cover::Appearance,
+    selected: Option<[cover::Config; 2]>,
+) -> Result<(member::Parts, member::Parts)> {
     let a = StdUdp::bind("127.0.0.1:0")?;
     let b = StdUdp::bind("127.0.0.1:0")?;
     let path = gate::Path {
@@ -954,9 +971,12 @@ async fn parts_pair(kind: cover::Appearance) -> Result<(member::Parts, member::P
     b.connect(path.client)?;
     a.set_nonblocking(true)?;
     b.set_nonblocking(true)?;
+    let [client_cover, server_cover] = selected.map_or([None, None], |[client, server]| {
+        [Some(client), Some(server)]
+    });
     tokio::try_join!(
-        authenticated(a, path, kind, true),
-        authenticated(b, path, kind, false)
+        authenticated(a, path, kind, true, client_cover),
+        authenticated(b, path, kind, false, server_cover)
     )
 }
 fn source(driver: &mut Driver, now: u64, number: u8) -> Result<Vec<u8>> {

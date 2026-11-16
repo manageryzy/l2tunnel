@@ -15,7 +15,7 @@ impl Outer {
         self.validate(config, hs::Role::Initiator)?;
         let mut report = Reporter::new(observe);
         let result = Box::pin(connect_inner(
-            SocketBacking::Carrier(self.socket),
+            SocketBacking::<NoRaw>::Carrier(self.socket),
             config,
             identity,
             admission,
@@ -51,7 +51,7 @@ impl Outer {
         let mut report = Reporter::new(observe);
         report.server(admission.inner.statistics());
         let result = Box::pin(accept_inner(
-            SocketBacking::Carrier(self.socket),
+            SocketBacking::<NoRaw>::Carrier(self.socket),
             identity,
             &mut admission.inner,
             self.proof.deadline,

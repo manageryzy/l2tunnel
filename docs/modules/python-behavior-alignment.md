@@ -112,7 +112,11 @@ symbol into one MTU1500 datagram. Preserve the coding width and network MTU:
 complete alignment needs a versioned source/repair fragmentation and bounded
 reassembly composition, with original identities/deadlines and each physical
 fragment charged/authenticated. A changed-MTU experiment must have a distinct
-configuration label. Full8192 also requires bounded authenticated ingress separate
+configuration label. The maintained [fragment original-time core](fragment-original-time.md)
+now has finite protocol evidence; [whole-group charging](rolling-fragment-output.md)
+and [selected Engine/Bank/runtime fragmentation](common-record-fragmentation.md)
+have finite implementation evidence. Their complete service/native/resource
+qualification remains open. Full8192 also requires bounded authenticated ingress separate
 from recovery support so multi-turn GF work does not discard every later arrival
 as local Busy. Neither requirement is satisfied by the small-symbol component
 witness; exact source findings remain in the
@@ -141,7 +145,7 @@ parallel; it is not Python parity evidence.
 - [ ] [PBA-01] Bind each selected runtime comparison to the complete named Python configuration, source hashes, topology, ACK path, time/loss units, payload/window and measurement definition. Reject unsupported combinations before I/O; report requested/effective values through the shared client/service API.
 - [ ] [PBA-02] Implement actual CompactARQ serial/history, RTT and receiver-delay sampling, rotating lossy feedback/repeats, adaptive timeout and guarded fast retry, including its first-flight/bounded-gap variants. Differential event traces cover loss, reorder, duplicates, silent tails, bounds and stale callbacks; actual selected runtime feedback uses the same carrier.
 - [ ] [PBA-03] Install separately selected per-connection and shared-directional recovery topologies with bounded ownership and authenticated namespaces. Validate learned reverse affinity, conflicts, shared admission, isolation and explicit lossy-ACK retirement without false delivery or stranded drain.
-- [ ] [PBA-04] Deliver the complete named Packed global8192/local128/every16 profile with real short copies, packing and ACK coalescing through actual authenticated client/runtime paths. Qualify meaningful symbol width, old holes beyond128, full/half local2 pressure, feedback loss, ring reuse, exact physical bytes and live management; component tests are prerequisites only.
+- [ ] [PBA-04] Deliver the complete named Packed global8192/local128/every16 profile with real short copies, packing and ACK coalescing through actual authenticated client/runtime paths. Qualify meaningful symbol width, old holes beyond128, full/half local2 pressure, feedback loss, ring reuse, exact physical bytes and live management; component tests are prerequisites only. The [exact fragment output charge](rolling-fragment-output.md) is a finite prerequisite; it does not qualify selected Engine/runtime fragmentation or this full profile.
 - [ ] [PBA-05] Integrate L3 TCP compression and safe ACK handling first, with exact IPv4/IPv6/TCP bytes/options/checksums and fallback. Preserve and optimize L2; keep transparent TUN and explicit proxy ownership claims distinct.
 - [ ] [PBA-06] Run focused changed-behavior differential and runtime checks in bounded parallel groups, then the required full check at batch acceptance. Run matched native clean/delay/loss comparisons with per-direction payload, repair/retry/copy/feedback/authentication bytes, timing, CPU and queue counters. Preserve the full80 Mbit/s target, all47 modes, SW-11, RLNC/parity/rolling/packed/proxy and platform/resource gates.
 

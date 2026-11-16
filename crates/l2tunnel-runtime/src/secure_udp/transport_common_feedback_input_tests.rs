@@ -67,7 +67,7 @@ async fn actual_early_compact_feedback_keeps_original_input_until_delayed_whole_
     let original_usage = a.driver.common_state()?.usage();
     let original_charges = (a.driver.counters.wire_packets, a.driver.counters.wire_bytes);
     let next_user = a.driver.records.next_number(Class::User);
-    let mut socket_owner = carrier::IoOwner::Udp(a.socket);
+    let mut socket_owner: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
     let receipt = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let carrier::IoOwner::Udp(socket) = &socket_owner else {

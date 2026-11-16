@@ -266,3 +266,32 @@ async fn tracked_record_requires_actual_send_and_preserves_original_receipt_time
     b.abort();
     Ok(())
 }
+
+#[test]
+fn maintained_raw_record_geometry_keeps_both_protections_exact() -> R {
+    for (protection, overhead) in [
+        (Protection::ChaCha20Poly1305, 152usize),
+        (Protection::HmacSha256, 168usize),
+    ] {
+        let mut policy = PacketPolicy::new(1500);
+        policy.protection = protection;
+        let geometry = policy.record_geometry()?;
+        assert_eq!(geometry.ip_tcp_bytes, 40);
+        assert_eq!(
+            geometry.record_overhead_bytes + geometry.ip_tcp_bytes,
+            overhead
+        );
+        assert_eq!(geometry.max_record_bytes, policy.max_record_bytes()?);
+        assert_eq!(geometry.ip_bytes(geometry.max_record_bytes)?, 1500);
+        assert!(matches!(
+            geometry.ip_bytes(geometry.max_record_bytes + 1),
+            Err(Error::Capacity)
+        ));
+        assert!(matches!(geometry.ip_bytes(0), Err(Error::Capacity)));
+        assert_eq!(
+            policy.configuration_digest(ConfigDigest([9; 32]))?,
+            policy.digest(ConfigDigest([9; 32]))?
+        );
+    }
+    Ok(())
+}

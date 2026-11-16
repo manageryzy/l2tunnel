@@ -106,6 +106,13 @@ pub(super) enum Endpoint {
     },
     #[cfg(unix)]
     CommonCarrierServer(Box<CommonCarrierServer>),
+    #[cfg(unix)]
+    CommonRawClient {
+        outer: Client,
+        inner: crate::secure_udp::credentials::Client,
+    },
+    #[cfg(unix)]
+    CommonRawServer(Box<CommonRawServer>),
 }
 #[cfg(unix)]
 pub(super) struct SecureServer {
@@ -120,6 +127,14 @@ pub(super) struct CommonCarrierServer {
     // replaces it; this is not retained-session recovery across fresh TLS.
     pub admission: tokio::sync::Mutex<
         Option<l2tunnel_runtime::secure_udp::establish::carrier::InitialServerAdmission>,
+    >,
+}
+#[cfg(unix)]
+pub(super) struct CommonRawServer {
+    pub outer: Server,
+    pub inner: crate::secure_udp::credentials::Server,
+    pub admission: tokio::sync::Mutex<
+        Option<l2tunnel_runtime::secure_udp::establish::raw_carrier::RawInitialServerAdmission>,
     >,
 }
 /// Selected setup backend. Each variant names one existing authenticated factory;
@@ -145,6 +160,12 @@ pub(super) enum Transport {
     SecureUdpCommonCarrier {
         profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
         outer: l2tunnel_openvpn::wire_carrier::common::Config,
+    },
+    #[cfg(unix)]
+    SecureUdpCommonRaw {
+        profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+        raw: Arc<crate::raw_packet::common::Settings>,
+        opener: crate::raw_packet::common::PacketOpener,
     },
 }
 /// Longest time a swift acceptor keeps its listener open for a peer. Each
@@ -360,6 +381,53 @@ impl Prepared {
             },
         )
     }
+    /// Explicit original raw Full/Half Common client; all original I/O is deferred.
+    #[cfg(unix)]
+    pub fn secure_udp_common_raw_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        raw: crate::raw_packet::common::Settings,
+        outer: Client,
+        inner: crate::secure_udp::credentials::Client,
+        opener: crate::raw_packet::common::PacketOpener,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::client_endpoint(&outer)?;
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonRawClient { outer, inner },
+            attachment,
+            Transport::SecureUdpCommonRaw {
+                profile: Arc::new(profile),
+                raw: Arc::new(raw),
+                opener,
+            },
+        )
+    }
+    /// Same original paired raw factory and actual fixed-member acceptance path.
+    #[cfg(unix)]
+    pub fn secure_udp_common_raw_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        raw: crate::raw_packet::common::Settings,
+        outer: Server,
+        inner: crate::secure_udp::credentials::Server,
+        opener: crate::raw_packet::common::PacketOpener,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonRawServer(Box::new(CommonRawServer {
+                outer,
+                inner,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::SecureUdpCommonRaw {
+                profile: Arc::new(profile),
+                raw: Arc::new(raw),
+                opener,
+            },
+        )
+    }
     #[cfg(unix)]
     pub(super) fn secure_udp(&self) -> bool {
         matches!(
@@ -368,6 +436,7 @@ impl Prepared {
                 | Transport::SecureUdpTransaction(_)
                 | Transport::SecureUdpCommon(_)
                 | Transport::SecureUdpCommonCarrier { .. }
+                | Transport::SecureUdpCommonRaw { .. }
         )
     }
     #[cfg(unix)]
@@ -378,7 +447,9 @@ impl Prepared {
     pub(super) fn secure_udp_common(&self) -> bool {
         matches!(
             &self.data.transport,
-            Transport::SecureUdpCommon(_) | Transport::SecureUdpCommonCarrier { .. }
+            Transport::SecureUdpCommon(_)
+                | Transport::SecureUdpCommonCarrier { .. }
+                | Transport::SecureUdpCommonRaw { .. }
         )
     }
     /// Pure validation; credentials are already parsed and no provider is invoked.
@@ -663,6 +734,67 @@ impl Prepared {
                 None
             }
             #[cfg(unix)]
+            Transport::SecureUdpCommonRaw { profile, raw, .. } => {
+                let session = profile.settings();
+                let (noise, role) = match &endpoint {
+                    Endpoint::CommonRawClient { outer, inner } => {
+                        if outer.remote != session.gate.path.server
+                            || outer.member.public_key().0 != session.member.0
+                            || inner.member_key() != session.member
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "raw outer/inner member or fixed endpoint differs",
+                            ));
+                        }
+                        (inner.noise(), l2tunnel_security::Role::Initiator)
+                    }
+                    Endpoint::CommonRawServer(server) => {
+                        if !server
+                            .outer
+                            .members
+                            .contains(l2tunnel_auth::MemberPublicKey(session.member.0))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "raw allowlist excludes configured member",
+                            ));
+                        }
+                        if server.outer.listen != session.gate.path.server {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "raw server fixed tuple differs",
+                            ));
+                        }
+                        (server.inner.noise(), l2tunnel_security::Role::Responder)
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "raw Common requires actual independent TLS/Noise credentials",
+                        ));
+                    }
+                };
+                if profile.raw_policy().is_none()
+                    || profile.raw_binding().is_some()
+                    || profile.carrier_binding().is_some()
+                    || noise.profile() != session.profile
+                    || !attachment.readable_kind()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "raw Common requires an unbound raw profile and readable attachment",
+                    ));
+                }
+                if noise.peers(role) != profile.peers() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "raw Common actual Noise pins differ",
+                    ));
+                }
+                raw.validate(profile, role)?;
+                None
+            }
             Transport::SecureUdpCommonCarrier { profile, outer } => {
                 let session = profile.settings();
                 let (noise, role) = match &endpoint {

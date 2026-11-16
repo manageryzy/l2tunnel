@@ -56,18 +56,24 @@ pub use performance::Performance;
 pub use transaction_contract::TransactionContract;
 #[path = "transport_carrier.rs"]
 mod carrier;
+use super::raw_carrier_io as raw_carrier;
 #[path = "transport_common.rs"]
 mod common;
 #[path = "transport_common_actions.rs"]
 mod common_actions;
+#[path = "transport_common_connections.rs"]
+mod common_connections;
 #[path = "transport_common_contract.rs"]
 mod common_contract;
+#[path = "transport_common_fragments.rs"]
+mod common_fragments;
 #[path = "transport_common_ingress.rs"]
 mod common_ingress;
 #[path = "transport_common_io.rs"]
 mod common_io;
 #[path = "transport_common_native.rs"]
 mod common_native;
+pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
 #[path = "transport_construction.rs"]
 mod construction;
 #[path = "transport_generic.rs"]
@@ -76,7 +82,7 @@ mod generic;
 mod generic_actions;
 pub use common::{
     CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, SameFlowRecovery,
-    common_channel, run_common, run_common_on_carrier,
+    common_channel, run_common, run_common_on_carrier, run_common_on_raw,
 };
 pub use common_contract::{CommonTransactionContract, FreshKeyPolicy};
 pub use generic::{
@@ -298,9 +304,9 @@ where
 // The one existing loop borrows its actual Driver. Common constructs its cell
 // before polling, so construction frames do not nest inside readiness polling.
 #[allow(clippy::too_many_arguments)] // The original loop's owners and deadline remain explicit.
-async fn run_driver_clock<D>(
+async fn run_driver_clock<D, R: raw_carrier::RawBacking>(
     device: D,
-    mut socket: carrier::IoOwner,
+    mut socket: carrier::IoOwner<R>,
     driver: &mut Driver,
     setup_deadline: Instant,
     mut requests: Requests,
@@ -329,6 +335,7 @@ where
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
+            socket.begin_turn();
             if socket.is_carrier() {
                 socket.observe_completions().await;
                 driver.complete_carrier_io(&mut socket,&mut sample)?;
@@ -396,20 +403,22 @@ where
                 event=next_io(&mut socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
                 IoEvent::Udp=>{
                     native_first=true;
-                    driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);
+                    if !socket.is_raw() {driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);}
                     let maximum=if socket.receive_ready() {driver.config.work.receive_packets.min(driver.ingress.left)}else{0};
                     let mut batch=0u64;
                     for _ in 0..maximum {
                         if !driver.check_expiry(clock(origin,sample())?)? {break;}
                         driver.ingress.left-=1;
-                        match socket.try_receive(&mut inputs.datagram) {
-                            Ok(length)=>{
+                        match socket.try_receive_at(&mut inputs.datagram) {
+                            Ok((length,received))=>{
                                 batch+=1;
-                                driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
-                                if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
+                                if !socket.is_raw() {
+                                    driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
+                                    if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
+                                }
                                 let at=sample();let time=clock(origin,at)?;
                                 if !driver.check_expiry(time)? {break;}
-                                if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive_selected(&inputs.datagram[..length],time,at,resolve.as_ref())?;}
+                                if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive_selected_at(&inputs.datagram[..length],received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time),time,at,resolve.as_ref())?;}
                             },
                             Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
                             Err(error) if establish::path_loss(&error)=>{driver.counters.socket_receive_errors=driver.counters.socket_receive_errors.saturating_add(1);break;},
@@ -507,8 +516,8 @@ enum IoEvent<'a, D: AsRawFd> {
 
 // The caller polls shutdown and control first. Alternate ready I/O priorities so
 // elapsed receive work cannot renew UDP's quota ahead of every native read.
-async fn next_io<'a, D: AsRawFd>(
-    socket: &mut carrier::IoOwner,
+async fn next_io<'a, D: AsRawFd, R: raw_carrier::RawBacking>(
+    socket: &mut carrier::IoOwner<R>,
     device: &'a mut AsyncFd<D>,
     interest: Interest,
     native: bool,
@@ -675,9 +684,18 @@ pub struct Config {
     /// Two retained generations can service at most four directional schedulers.
     /// None preserves legacy policy and cannot select a rolling record catalog.
     pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    /// Optional per-generation authenticated Rolling wire-input custody.
+    /// None preserves direct decoder admission and every legacy resource digest.
+    pub rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     /// Explicit local Benchmark ACK ingress, immutable in the authenticated Common envelope.
     /// None preserves transparent behavior and all legacy resource digest bytes.
     pub ack_coalescing: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
+    /// Explicit deferred authenticated per-connection raw ACK input storage.
+    /// None preserves old resource digests and cannot select a raw tag8 catalog.
+    pub connection_ingress: Option<ConnectionIngressLimits>,
+    /// Complete global selected Rolling fragmentation policy, authenticated at establishment.
+    /// None retains legacy packet geometry and resource digest bytes.
+    pub rolling_fragments: Option<l2tunnel::record_engine::FragmentPolicy>,
     /// Independent retained native output bounds.
     pub native: NativeBudget,
     /// Explicit active lease and authenticated round-trip timers.
@@ -689,6 +707,21 @@ impl Config {
     /// Validate finite scalar/algorithm bounds without network, keys or clocks.
     pub fn validate(&self) -> io::Result<()> {
         self.validate_rolling_work()?;
+        if self.rolling_fragments.is_some() {
+            return Err(invalid(
+                "Rolling fragmentation requires explicit Common selection",
+            ));
+        }
+        if self.connection_ingress.is_some() {
+            return Err(invalid(
+                "connection input custody requires explicit Common selection",
+            ));
+        }
+        if self.rolling_ingress.is_some() {
+            return Err(invalid(
+                "Rolling input custody requires explicit Common selection",
+            ));
+        }
         if self.ack_coalescing.is_some() {
             return Err(invalid(
                 "ACK coalescing requires an explicit Common Benchmark selection",
@@ -2556,6 +2589,7 @@ impl Driver {
     ) -> io::Result<()> {
         self.receive_selected(packet, now, instant, Some(resolve))
     }
+    #[cfg(test)]
     fn receive_selected(
         &mut self,
         packet: &[u8],
@@ -2563,6 +2597,19 @@ impl Driver {
         instant: Instant,
         resolve: Option<&Resolver>,
     ) -> io::Result<()> {
+        self.receive_selected_at(packet, now, now, instant, resolve)
+    }
+    fn receive_selected_at(
+        &mut self,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+    ) -> io::Result<()> {
+        if received > now {
+            return Err(invalid("authenticated input arrived after observation"));
+        }
         if self.has_transactions() {
             self.progress(now)?;
         }
@@ -2654,7 +2701,7 @@ impl Driver {
             }
             Class::User => {
                 if self.common.is_some() {
-                    return self.receive_common_user(opened, now);
+                    return self.receive_common_user_at(opened, received, now);
                 }
                 let lead = self
                     .buffers

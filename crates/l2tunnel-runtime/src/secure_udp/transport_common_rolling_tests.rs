@@ -398,3 +398,9 @@ mod source_copies;
 
 #[path = "transport_common_rolling_silent_tail_tests.rs"]
 mod silent_tail;
+
+#[path = "transport_common_raw_tests.rs"]
+mod raw_common;
+
+#[path = "transport_common_fragment_tests.rs"]
+mod fragments;

@@ -5,6 +5,8 @@ use l2tunnel::{record_configuration as common, record_engine as engine};
 #[path = "transport_managed_contract.rs"]
 mod managed;
 pub use managed::FreshKeyPolicy;
+#[path = "transport_raw_contract.rs"]
+mod raw;
 
 /// Complete common policy/catalog handoff to the sole original-socket Driver.
 #[derive(Clone, Debug)]
@@ -23,6 +25,24 @@ pub struct CommonTransactionContract {
     managed: Option<managed::Managed>,
     extra_wire_bytes: usize,
     outer: Option<establish::carrier::AuthenticatedOuter>,
+    raw: Option<establish::raw_carrier::AuthenticatedRaw>,
+}
+
+#[path = "transport_common_fragment_policy.rs"]
+mod fragments;
+
+pub(super) fn selected_fragment_policy(
+    value: &common::Configuration,
+    policy: Option<engine::FragmentPolicy>,
+) -> Option<engine::FragmentPolicy> {
+    if matches!(
+        value.descriptor().profile(),
+        common::Profile::Rolling { .. } | common::Profile::RollingCopies { .. }
+    ) {
+        policy
+    } else {
+        None
+    }
 }
 
 impl Config {
@@ -42,6 +62,24 @@ impl Config {
     /// Common C supplies native geometry, rates, burst, queues and record policy.
     pub fn validate_common_resources(&self, max_native: usize) -> io::Result<()> {
         self.validate_rolling_work()?;
+        if let Some(policy) = self.rolling_fragments {
+            fragments::validate(policy)?;
+        }
+        if let Some(limits) = self.connection_ingress {
+            limits.plan(self.security.max_body_bytes)?;
+        }
+        if self
+            .rolling_ingress
+            .is_some_and(|limits| limits.slots == 0 || limits.capacity_bytes == 0)
+        {
+            return Err(invalid(
+                "Rolling input custody requires positive explicit bounds",
+            ));
+        }
+        if let Some(limits) = self.rolling_ingress {
+            u64::try_from(limits.slots).map_err(invalid)?;
+            u64::try_from(limits.capacity_bytes).map_err(invalid)?;
+        }
         if let Some(policy) = self.ack_coalescing {
             use l2tunnel_pipeline::ack_coalescing::Selection;
             if policy.selection != Selection::Benchmark {
@@ -232,6 +270,21 @@ impl Config {
                 hash.update(&value.to_be_bytes());
             }
         }
+        if let Some(limits) = self.rolling_ingress {
+            hash.update(b"l2tunnel/common-resources/rolling-ingress/v1\0");
+            for value in [limits.slots, limits.capacity_bytes] {
+                hash.update(&u64::try_from(value).map_err(invalid)?.to_be_bytes());
+            }
+        }
+        if let Some(limits) = self.connection_ingress {
+            hash.update(b"l2tunnel/common-resources/connection-ingress/v1\0");
+            for value in [limits.slots, limits.capacity_bytes] {
+                hash.update(&u64::try_from(value).map_err(invalid)?.to_be_bytes());
+            }
+        }
+        if let Some(policy) = self.rolling_fragments {
+            fragments::update_hash(policy, &mut hash)?;
+        }
         let mut bytes = [0; 32];
         bytes.copy_from_slice(hash.finish().as_ref());
         Ok(core::ConfigDigest(bytes))
@@ -270,11 +323,53 @@ impl CommonTransactionContract {
         extra_wire_bytes: usize,
         outer: Option<establish::carrier::AuthenticatedOuter>,
     ) -> io::Result<Self> {
+        let physical = (if ipv6 { 48usize } else { 28usize })
+            .checked_add(extra_wire_bytes)
+            .ok_or_else(exhausted)?;
+        Self::construct_physical(
+            expected,
+            role,
+            resources,
+            cover,
+            ipv6,
+            envelope,
+            catalog,
+            settings,
+            managed,
+            extra_wire_bytes,
+            outer,
+            physical,
+            None,
+            core::Duplex::Full,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn construct_physical(
+        expected: security::ConfigDigest,
+        role: security::Role,
+        resources: Config,
+        cover: cover::Config,
+        ipv6: bool,
+        envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        managed: Option<managed::Managed>,
+        extra_wire_bytes: usize,
+        outer: Option<establish::carrier::AuthenticatedOuter>,
+        physical: usize,
+        raw: Option<establish::raw_carrier::AuthenticatedRaw>,
+        duplex: core::Duplex,
+    ) -> io::Result<Self> {
         let initial = common::Configuration::new(envelope, catalog.initial()).map_err(invalid)?;
-        if initial.descriptor().duplex() != core::Duplex::Full {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "common selected runtime requires full duplex",
+        if initial.descriptor().duplex() != duplex {
+            if duplex == core::Duplex::Full {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "common selected runtime requires full duplex",
+                ));
+            }
+            return Err(invalid(
+                "common requested duplex differs from selected carrier",
             ));
         }
         let max_native = [mg::Role::Client, mg::Role::Server]
@@ -319,8 +414,7 @@ impl CommonTransactionContract {
         let overhead = record::ROUTE_BYTES
             + security::Protection::ChaCha20Poly1305.overhead_bytes()
             + header
-            + if ipv6 { 48 } else { 28 }
-            + extra_wire_bytes
+            + physical
             + if managed.is_some() {
                 security::refresh::PREFIX_BYTES - security::COMMON_PREFIX_BYTES
             } else {
@@ -349,6 +443,7 @@ impl CommonTransactionContract {
             managed,
             extra_wire_bytes,
             outer,
+            raw,
         };
         for value in result.catalog.configurations(envelope).map_err(invalid)? {
             result.resolve(value)?;
@@ -363,6 +458,24 @@ impl CommonTransactionContract {
     /// Extra outer carrier bytes, excluding the IP/UDP and record headers.
     pub fn extra_wire_bytes(&self) -> usize {
         self.extra_wire_bytes
+    }
+    /// Exact selected physical headers, independent of UDP/OpenVPN/raw naming.
+    pub fn physical_overhead_bytes(&self) -> io::Result<usize> {
+        if let Some(raw) = self.raw {
+            let geometry = raw.geometry();
+            geometry
+                .ip_tcp_bytes
+                .checked_add(geometry.record_overhead_bytes)
+                .ok_or_else(exhausted)
+        } else {
+            (if self.ipv6 { 48usize } else { 28usize })
+                .checked_add(self.extra_wire_bytes)
+                .ok_or_else(exhausted)
+        }
+    }
+    /// Genuine selected raw proof; copying it cannot create a handoff owner.
+    pub fn raw_outer(&self) -> Option<establish::raw_carrier::AuthenticatedRaw> {
+        self.raw
     }
     /// Actual explicit initial refresh selection, never an authentication proof.
     pub fn refresh_selection(&self) -> Option<security::refresh::Selection> {
@@ -444,6 +557,14 @@ impl CommonTransactionContract {
         for sender in [mg::Role::Client, mg::Role::Server] {
             let old = self.initial.descriptor().direction(sender);
             let view = value.descriptor().direction(sender);
+            if matches!(view.profile(), common::DirectionProfile::PerConnectionCompact(direction) if direction.unreliable.is_some())
+                && self.resources.connection_ingress.is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "raw per-connection catalog requires explicit authenticated input custody",
+                ));
+            }
             if matches!(view.profile(), common::DirectionProfile::Rolling { .. })
                 && self.resources.rolling_work.is_none()
             {
@@ -463,10 +584,22 @@ impl CommonTransactionContract {
                 mg::Role::Client
             };
             let maximum = maximum_body(view, value.descriptor().direction(peer))?;
-            let wire = maximum
-                .checked_add(self.geometry.forward_overhead_bytes)
-                .ok_or_else(exhausted)?;
-            if maximum > self.resources.security.max_body_bytes
+            let (physical_body, wire) = if let Some(policy) =
+                selected_fragment_policy(&value, self.resources.rolling_fragments)
+            {
+                fragments::physical_requirement(maximum, sender, policy)?
+            } else {
+                let overhead = if sender == mg::Role::Client {
+                    self.geometry.forward_overhead_bytes
+                } else {
+                    self.geometry.reverse_overhead_bytes
+                };
+                (
+                    maximum,
+                    maximum.checked_add(overhead).ok_or_else(exhausted)?,
+                )
+            };
+            if physical_body > self.resources.security.max_body_bytes
                 || value.descriptor().path_mtu() < self.control_maximum()?
                 || wire
                     .checked_add(self.reserve()?)
@@ -475,7 +608,7 @@ impl CommonTransactionContract {
                 return Err(invalid("common data/control/burst geometry"));
             }
         }
-        engine::storage::Plan::for_engine_with_ingress(
+        engine::storage::Plan::for_engine_with_fragmentation(
             value,
             engine::Context {
                 session: 1,
@@ -485,6 +618,8 @@ impl CommonTransactionContract {
             self.geometry,
             self.native_limits()?,
             self.resources.ack_coalescing,
+            self.resources.rolling_ingress,
+            selected_fragment_policy(&value, self.resources.rolling_fragments),
         )
         .map_err(invalid)?;
         Ok(value)
@@ -604,6 +739,12 @@ pub(super) fn maximum_body(
             )
             .map(|plan| plan.send_max_packet_bytes())
             .map_err(invalid)
+        }
+        common::DirectionProfile::PerConnectionCompact(send) => {
+            let common::DirectionProfile::PerConnectionCompact(receive) = opposite.profile() else {
+                return Err(invalid("connection directional family mismatch"));
+            };
+            common_connections::maximum_body(*send, *receive)
         }
         common::DirectionProfile::Rolling { config, .. } => Ok(config
             .maximum_packet_bytes()

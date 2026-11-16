@@ -75,7 +75,6 @@ impl<T> Queue<T> {
         self.inner.acquire().map(|inner| Lease { inner })
     }
 
-    #[cfg(test)]
     pub(super) fn iter(&self) -> impl Iterator<Item = &Packet<T>> {
         self.inner.iter()
     }

@@ -137,6 +137,19 @@ pub struct PacketMetadata {
     pub classification: Classification,
     /// Local monotonic flow ID and negotiated MUX channel.
     pub binding: Binding,
+    /// Original packet time/cap in this same actual metadata pool.
+    pub timing: PacketTiming,
+}
+
+/// Original actual queue timing; it never becomes peer/authentication authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketTiming {
+    /// First actual ingress/arrival time, retained through earlier custody.
+    pub received: Duration,
+    /// Actual admission into this Pipeline.
+    pub admitted: Duration,
+    /// Original external absolute cap, when explicitly supplied.
+    pub original_deadline: Option<Duration>,
 }
 
 /// One unchanged original packet handed to the caller.
@@ -258,6 +271,8 @@ pub enum PipelineError {
     Busy,
     /// An explicitly allocating compatibility ingress or owned handoff failed.
     Allocation,
+    /// Caller arrival/admission order or an explicit original cap is invalid.
+    Timing,
     /// Defensive internal component-accounting inconsistency.
     Invariant,
 }
@@ -415,12 +430,88 @@ impl Pipeline {
             .map_err(|(kind, _)| kind)
     }
 
+    /// Admit original owned bytes while preserving actual ingress and original cap.
+    pub fn enqueue_capped(
+        &mut self,
+        payload: Vec<u8>,
+        received: Duration,
+        now: Duration,
+        original_deadline: Duration,
+    ) -> Result<PacketMetadata, EnqueueError> {
+        self.enqueue_input_timed(
+            Input::Owned(payload),
+            1,
+            PacketTiming {
+                received,
+                admitted: now,
+                original_deadline: Some(original_deadline),
+            },
+        )
+        .map_err(|(kind, input)| EnqueueError {
+            kind,
+            payload: input.into_owned(),
+        })
+    }
+
+    /// Copy once into actual reserved queue backing with original caller timing.
+    pub fn enqueue_borrowed_capped(
+        &mut self,
+        bytes: &[u8],
+        received: Duration,
+        now: Duration,
+        original_deadline: Duration,
+    ) -> Result<PacketMetadata, PipelineError> {
+        self.enqueue_borrowed_weighted_capped(bytes, 1, received, now, original_deadline)
+    }
+
+    /// Retain trusted weight and timing in the same actual metadata transaction.
+    pub fn enqueue_borrowed_weighted_capped(
+        &mut self,
+        bytes: &[u8],
+        weight: u32,
+        received: Duration,
+        now: Duration,
+        original_deadline: Duration,
+    ) -> Result<PacketMetadata, PipelineError> {
+        self.enqueue_input_timed(
+            Input::Borrowed(bytes),
+            weight,
+            PacketTiming {
+                received,
+                admitted: now,
+                original_deadline: Some(original_deadline),
+            },
+        )
+        .map_err(|(kind, _)| kind)
+    }
+
     fn enqueue_input<'a>(
         &mut self,
         input: Input<'a>,
         weight: u32,
         now: Duration,
     ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
+        self.enqueue_input_timed(
+            input,
+            weight,
+            PacketTiming {
+                received: now,
+                admitted: now,
+                original_deadline: None,
+            },
+        )
+    }
+
+    fn enqueue_input_timed<'a>(
+        &mut self,
+        input: Input<'a>,
+        weight: u32,
+        timing: PacketTiming,
+    ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
+        let now = timing.admitted;
+        if timing.received > now || timing.original_deadline.is_some_and(|cap| now >= cap) {
+            return Err((PipelineError::Timing, input));
+        }
         let classification = match self.classify(input.bytes()) {
             Ok(value) => value,
             Err(error) => return Err((PipelineError::Parse(error), input)),
@@ -506,6 +597,7 @@ impl Pipeline {
         let metadata = PacketMetadata {
             classification,
             binding,
+            timing,
         };
         if new {
             self.states

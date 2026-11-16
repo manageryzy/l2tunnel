@@ -22,6 +22,8 @@ pub struct Usage {
     pub record_bytes: usize,
     /// Actual optional ACK-ingress heap, excluding its already inline header.
     pub ingress_bytes: usize,
+    /// Actual selected fragment slabs and maintained reassembly heaps.
+    pub fragment_bytes: usize,
     /// Exact fixed plus nested heap layouts.
     pub capacity_bytes: usize,
     /// Explicit successful nonzero constructor reservations.
@@ -43,6 +45,8 @@ pub enum Error {
     Rolling(rolling_records::Error),
     /// Actual bounded optional ACK-ingress plan or construction refused.
     Ingress(pipeline::ack_coalescing::Error),
+    /// Actual selected fragment planning or fallible backing refused.
+    Fragment(FragmentStorageError),
     /// A complete layout or allocation count cannot be represented.
     Layout,
     /// Complete actual owner exceeds its explicit allowance.
@@ -71,15 +75,24 @@ enum RecordPlan {
     AlignedCompact(aligned::compact_storage::Plan),
     PackedCompact(aligned::compact_storage::Plan),
     Rolling(rolling_records::storage::Plan),
+    Connections(crate::connection_records::storage::Plan),
 }
 impl RecordPlan {
-    fn for_engine(config: &configuration::Configuration, context: Context) -> Result<Self, Error> {
+    fn for_engine(
+        config: &configuration::Configuration,
+        context: Context,
+        ingress: Option<rolling_records::IngressLimits>,
+        framing: Option<rolling_records::OutputFraming>,
+    ) -> Result<Self, Error> {
         if let configuration::Profile::Rolling { config, stream } = config.descriptor().profile() {
-            return rolling_records::storage::Plan::for_endpoint(
+            return rolling_records::storage::Plan::for_endpoint_with_output_framing(
                 *config,
                 context,
                 *stream,
                 Tick(0),
+                rolling_records::CopyPolicies::ONE,
+                ingress,
+                framing,
             )
             .map(Self::Rolling)
             .map_err(Error::Rolling);
@@ -90,17 +103,28 @@ impl RecordPlan {
             copies,
         } = config.descriptor().profile()
         {
-            return rolling_records::storage::Plan::for_endpoint_with_copies(
+            return rolling_records::storage::Plan::for_endpoint_with_output_framing(
                 *config,
                 context,
                 *stream,
                 Tick(0),
                 *copies,
+                ingress,
+                framing,
             )
             .map(Self::Rolling)
             .map_err(Error::Rolling);
         }
         let local = config.descriptor().local(context.role);
+        if let (
+            configuration::DirectionProfile::PerConnectionCompact(send),
+            configuration::DirectionProfile::PerConnectionCompact(receive),
+        ) = (local.send().profile(), local.receive().profile())
+        {
+            return connections::Connections::plan(*send, *receive)
+                .map(Self::Connections)
+                .map_err(Error::Engine);
+        }
         match (local.send().profile(), local.receive().profile()) {
             (
                 configuration::DirectionProfile::Swift(send),
@@ -141,11 +165,15 @@ impl RecordPlan {
             Self::Aligned(plan) | Self::Packed(plan) => plan.capacity_bytes(),
             Self::AlignedCompact(plan) | Self::PackedCompact(plan) => plan.capacity_bytes(),
             Self::Rolling(plan) => plan.capacity_bytes(),
+            Self::Connections(plan) => plan.heap_bytes(),
         }
     }
     fn construct(self, context: Context) -> Result<Owner, Error> {
         let recovery = owner::recovery_context(context);
         match self {
+            Self::Connections(plan) => connections::Connections::new(plan, context)
+                .map(Owner::Connections)
+                .map_err(Error::Engine),
             Self::Swift(plan) => {
                 let capacity_bytes = size_of::<swift::storage::Owned>()
                     .checked_add(plan.capacity_bytes())
@@ -217,6 +245,7 @@ pub struct Plan {
     pipeline: pipeline::storage::Plan,
     record: RecordPlan,
     ingress: Option<pipeline::ack_coalescing::Plan>,
+    fragments: Option<fragment::Plan>,
     heap_bytes: usize,
     capacity_bytes: usize,
 }
@@ -239,8 +268,58 @@ impl Plan {
         native_limits: NativeLimits,
         ingress: Option<pipeline::ack_coalescing::Policy>,
     ) -> Result<Self, Error> {
-        let parameters =
-            parameters(&configuration, context, geometry, native_limits).map_err(Error::Engine)?;
+        Self::for_engine_with_options(
+            configuration,
+            context,
+            geometry,
+            native_limits,
+            ingress,
+            None,
+        )
+    }
+    /// Bind independent native-ACK and authenticated Rolling wire-input custody.
+    /// Inactive families allocate no Rolling input queue.
+    pub fn for_engine_with_options(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<rolling_records::IngressLimits>,
+    ) -> Result<Self, Error> {
+        Self::for_engine_with_fragmentation(
+            configuration,
+            context,
+            geometry,
+            native_limits,
+            ingress,
+            rolling_ingress,
+            None,
+        )
+    }
+    /// Explicit selected Rolling fragmentation; None retains the original MTU refusal.
+    pub fn for_engine_with_fragmentation(
+        configuration: configuration::Configuration,
+        context: Context,
+        geometry: Geometry,
+        native_limits: NativeLimits,
+        ingress: Option<pipeline::ack_coalescing::Policy>,
+        rolling_ingress: Option<rolling_records::IngressLimits>,
+        fragments: Option<FragmentPolicy>,
+    ) -> Result<Self, Error> {
+        let parameters = parameters_with_fragmentation(
+            &configuration,
+            context,
+            geometry,
+            native_limits,
+            fragments,
+        )
+        .map_err(Error::Engine)?;
+        let fragments = fragments
+            .map(|policy| {
+                fragment::Plan::new(policy, context, parameters.send_max).map_err(Error::Fragment)
+            })
+            .transpose()?;
         if let Some(policy) = ingress {
             for value in [policy.interval, policy.max_hold] {
                 let micros = u64::try_from(value.as_micros())
@@ -258,7 +337,12 @@ impl Plan {
         let local = configuration.descriptor().local(context.role);
         let pipeline = pipeline::storage::Plan::for_pipeline(local.send().common().pipeline())
             .map_err(Error::Pipeline)?;
-        let record = RecordPlan::for_engine(&configuration, context)?;
+        let record = RecordPlan::for_engine(
+            &configuration,
+            context,
+            rolling_ingress,
+            fragments.map(|plan| plan.policy().output_framing()),
+        )?;
         let ingress = ingress
             .map(|policy| {
                 pipeline::ack_coalescing::Plan::for_pipeline(pipeline.config(), policy)
@@ -269,6 +353,7 @@ impl Plan {
             .capacity_bytes()
             .checked_add(record.heap_bytes())
             .and_then(|bytes| bytes.checked_add(ingress.map_or(0, |plan| plan.capacity_bytes())))
+            .and_then(|bytes| bytes.checked_add(fragments.map_or(0, fragment::Plan::heap_bytes)))
             .ok_or(Error::Layout)?;
         let capacity_bytes = size_of::<Engine>()
             .checked_add(heap_bytes)
@@ -282,6 +367,7 @@ impl Plan {
             pipeline,
             record,
             ingress,
+            fragments,
             heap_bytes,
             capacity_bytes,
         })
@@ -305,6 +391,17 @@ impl Plan {
     /// Exact optional local ingress selection, immutable for this Engine generation.
     pub fn ingress_policy(&self) -> Option<pipeline::ack_coalescing::Policy> {
         self.ingress.map(|plan| plan.policy())
+    }
+    /// Exact active Rolling input policy; other actual families own no such queue.
+    pub fn rolling_ingress_policy(&self) -> Option<rolling_records::IngressLimits> {
+        match self.record {
+            RecordPlan::Rolling(plan) => plan.ingress_limits(),
+            _ => None,
+        }
+    }
+    /// Exact active selected fragmentation; no unselected heaps are installed.
+    pub fn fragment_policy(&self) -> Option<FragmentPolicy> {
+        self.fragments.map(fragment::Plan::policy)
     }
     /// Complete actual nested heap, excluding the outer inline Engine.
     pub const fn heap_bytes(&self) -> usize {
@@ -347,6 +444,10 @@ impl Engine {
                 .map_err(Error::Ingress)
             })
             .transpose()?;
+        let fragments = plan
+            .fragments
+            .map(|value| fragment::State::new(value, plan.context).map_err(Error::Fragment))
+            .transpose()?;
         let mut owner = plan.record.construct(plan.context)?;
         owner
             .enable_carrier_confirmation(&plan.configuration)
@@ -364,9 +465,19 @@ impl Engine {
         if ingress_bytes != plan.ingress.map_or(0, |plan| plan.capacity_bytes()) {
             return Err(Error::Invariant);
         }
+        let (fragment_bytes, fragment_allocations) = fragments
+            .as_ref()
+            .map(fragment::State::usage)
+            .transpose()
+            .map_err(Error::Fragment)?
+            .unwrap_or((0, 0));
+        if fragment_bytes != plan.fragments.map_or(0, fragment::Plan::heap_bytes) {
+            return Err(Error::Invariant);
+        }
         let allocations = p
             .allocations
             .checked_add(record_allocations)
+            .and_then(|n| n.checked_add(fragment_allocations))
             .and_then(|count| {
                 count.checked_add(
                     ingress
@@ -381,10 +492,11 @@ impl Engine {
             pipeline_bytes: p.capacity_bytes,
             record_bytes,
             ingress_bytes,
+            fragment_bytes,
             capacity_bytes: plan.capacity_bytes,
             allocations,
         };
-        Ok(Self::assemble(
+        let mut engine = Self::assemble(
             plan.configuration,
             plan.context,
             plan.native_limits,
@@ -393,7 +505,9 @@ impl Engine {
             owner,
             ingress,
             Some(usage),
-        ))
+        );
+        engine.fragments = fragments;
+        Ok(engine)
     }
 
     /// Actual complete retained backing, or None for explicit functional construction.

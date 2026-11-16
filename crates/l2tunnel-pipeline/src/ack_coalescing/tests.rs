@@ -362,3 +362,6 @@ fn downstream_refusal_keeps_duplicate_input_and_original_expiry_without_false_dr
     assert_eq!(&ingress.slab[start..start + b.len()], b);
     Ok(())
 }
+
+#[path = "timing_tests.rs"]
+mod original_timing;

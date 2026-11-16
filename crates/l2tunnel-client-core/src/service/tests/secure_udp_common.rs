@@ -497,3 +497,6 @@ mod local_api;
 
 #[path = "secure_udp_common_carrier.rs"]
 mod original_carrier;
+
+#[path = "secure_udp_common_connections.rs"]
+mod independent_connections;

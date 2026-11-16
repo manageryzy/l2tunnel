@@ -8,6 +8,30 @@ use std::{fmt, io};
 mod ack;
 pub use ack::{AckObservation, AckPolicies, AckPolicy, AckRead, AckSelection, AckStatus};
 
+#[path = "common_rolling_ingress.rs"]
+mod rolling_ingress;
+pub use rolling_ingress::{
+    RollingIngressLimits, RollingIngressObservation, RollingIngressPolicies, RollingIngressStatus,
+};
+
+#[path = "common_raw_status.rs"]
+mod raw;
+pub use raw::{RawCarrier, RawLane, RawPacketPolicy};
+
+#[path = "common_connection_status.rs"]
+mod connections;
+pub use connections::{
+    ConnectionIngressLimits, ConnectionIngressObservation, ConnectionIngressPolicies,
+    ConnectionIngressStatus, ConnectionRecovery,
+};
+
+#[path = "common_fragment_status.rs"]
+mod fragments;
+pub use fragments::{
+    FragmentCounters, FragmentDirection, FragmentFraming, FragmentIngress, FragmentReassembly,
+    FragmentStatus, ReassemblyLimits, RollingFragments,
+};
+
 /// Exact length of the lowercase hexadecimal complete configuration value.
 pub const CANONICAL_CHARACTERS: usize = CONFIGURATION_BYTES * 2;
 
@@ -194,6 +218,9 @@ pub struct Status {
     /// Present only after the original outer carrier actually authenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_carrier: Option<OriginalCarrier>,
+    /// Present only after the actual original raw TCP carrier authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_carrier: Option<RawCarrier>,
     /// Data algorithm, separate from carrier selection.
     pub algorithm: String,
     /// Actual required integrity/confidentiality profile.
@@ -293,6 +320,18 @@ pub struct Status {
     /// Explicit immutable Benchmark policy and actual Engine ingress observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_coalescing: Option<AckStatus>,
+    /// Establishment-bound input selection and actual current Rolling Queue state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_ingress: Option<RollingIngressStatus>,
+    /// Paired raw ACK ingress policy and actual queue observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_ingress: Option<ConnectionIngressStatus>,
+    /// Actual independent recovery cohort, absent for other active profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<ConnectionRecovery>,
+    /// Complete fragment request and actual current Engine selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_fragments: Option<FragmentStatus>,
     /// Actual directional scheduler step count, never inferred from packet count.
     pub rolling_scheduler_steps: Option<u64>,
     /// Actual cumulative GF/copy/metadata work consumed.
@@ -329,11 +368,15 @@ mod observe {
             let configuration = profile.configuration()?;
             let settings = profile.settings();
             let effective = profile.establish_config(info.role)?;
-            let expected = match profile.carrier_binding() {
-                Some(outer) => {
+            let expected = match (profile.carrier_binding(), profile.raw_binding()) {
+                (Some(outer), None) => {
                     outer.expected_binding(effective, profile.peers(), info.binding.session)
                 }
-                None => effective.expected_binding(profile.peers(), info.binding.session),
+                (None, Some(outer)) => {
+                    outer.expected_binding(effective, profile.peers(), info.binding.session)
+                }
+                (None, None) => effective.expected_binding(profile.peers(), info.binding.session),
+                (Some(_), Some(_)) => return Err(invalid("conflicting original carrier bindings")),
             }
             .map_err(invalid)?;
             let path = settings.gate.path;
@@ -358,6 +401,54 @@ mod observe {
                 ));
             }
             let requested_ack = AckPolicies::from_policies(profile.ack_coalescing())?;
+            let requested_rolling =
+                RollingIngressPolicies::from_policies(profile.rolling_ingress())?;
+            let effective_resources = profile.runtime_contract(info.role)?.resources();
+            let expected_rolling = effective_resources.rolling_ingress;
+            if let Some(value) = snapshot {
+                let expected_fragments = if matches!(
+                    value.current.descriptor().profile(),
+                    l2tunnel::record_configuration::Profile::Rolling { .. }
+                        | l2tunnel::record_configuration::Profile::RollingCopies { .. }
+                ) {
+                    effective_resources.rolling_fragments
+                } else {
+                    None
+                };
+                if value.rolling_fragments != expected_fragments {
+                    return Err(invalid(
+                        "actual fragment selection differs from authenticated effective policy",
+                    ));
+                }
+            }
+            if snapshot.is_some_and(|value| {
+                value.rolling_ingress != expected_rolling
+                    || value
+                        .rolling_input
+                        .is_some_and(|input| Some(input.limits) != expected_rolling)
+                    || matches!(
+                        value.current.descriptor().profile(),
+                        l2tunnel::record_configuration::Profile::Rolling { .. }
+                            | l2tunnel::record_configuration::Profile::RollingCopies { .. }
+                    ) && value.rolling_input.map(|input| input.limits) != expected_rolling
+            }) {
+                return Err(invalid(
+                    "actual Rolling ingress differs from authenticated policy",
+                ));
+            }
+            let requested_connections =
+                ConnectionIngressPolicies::from_policies(profile.connection_ingress())?;
+            let expected_connections = profile
+                .runtime_contract(info.role)?
+                .resources()
+                .connection_ingress;
+            if snapshot.is_some_and(|value| {
+                value.connection_input.map(|input| input.limits) != expected_connections
+            }) {
+                return Err(invalid(
+                    "actual raw ACK ingress differs from authenticated policy",
+                ));
+            }
             let expected_ack = profile
                 .runtime_contract(info.role)?
                 .resources()
@@ -422,16 +513,20 @@ mod observe {
                     })
                 })
                 .transpose()?;
+            let raw_carrier = RawCarrier::observe(profile, configuration, udp_cover)?;
             Ok(Self {
                 generation,
                 next_request_key: None,
-                carrier: if original_carrier.is_some() {
+                carrier: if raw_carrier.is_some() {
+                    "raw-packet"
+                } else if original_carrier.is_some() {
                     "openvpn-like"
                 } else {
                     udp_cover
                 }
                 .into(),
                 original_carrier,
+                raw_carrier,
                 algorithm: "common-records".into(),
                 protection: "chacha20-poly1305".into(),
                 backend: "common_records_v2".into(),
@@ -567,6 +662,24 @@ mod observe {
                     .transpose()?,
                 ack_coalescing: requested_ack
                     .map(|requested| AckStatus::observe(requested, snapshot))
+                    .transpose()?,
+                rolling_ingress: requested_rolling
+                    .map(|requested| RollingIngressStatus::observe(requested, snapshot))
+                    .transpose()?,
+                connection_ingress: requested_connections
+                    .map(|requested| {
+                        ConnectionIngressStatus::observe(
+                            requested,
+                            snapshot.and_then(|v| v.connection_input),
+                        )
+                    })
+                    .transpose()?,
+                connections: snapshot
+                    .and_then(|v| v.connections)
+                    .map(ConnectionRecovery::observe),
+                rolling_fragments: profile
+                    .rolling_fragments()
+                    .map(|requested| FragmentStatus::observe(requested, snapshot))
                     .transpose()?,
                 rolling_scheduler_steps: snapshot.map(|value| value.rolling_scheduler_steps),
                 rolling_work_used: snapshot.map(|value| value.rolling_work_used),

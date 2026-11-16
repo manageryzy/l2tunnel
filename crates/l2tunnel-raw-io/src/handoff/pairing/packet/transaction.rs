@@ -28,14 +28,38 @@ struct Detached<I: PacketIo> {
     last_ping: Instant,
     ping: Option<[u8; 8]>,
     pong: Option<[u8; 8]>,
+    // Only genuine upper records require a report; Window never acknowledges itself.
+    retirement_required: u64,
+    retirement_reported: u64,
     early: Option<Cell>,
 }
 struct Pending {
     bytes: Vec<u8>,
     end: u64,
     kind: wire::Kind,
+    retired: u64,
 }
 impl<I: PacketIo> Detached<I> {
+    fn retirement_threshold(&self) -> Result<u64, Error> {
+        let state = lock(&self.io.state)?;
+        let maximum = u64::from(state.policy.mtu)
+            .checked_sub(40)
+            .ok_or(Error::Proof)?;
+        let reserve = wire::Kind::Data
+            .reserved_cells()
+            .checked_mul(maximum)
+            .ok_or(Error::Exhausted)?;
+        let horizon = state.fence.as_ref().ok_or(Error::Proof)?.local_horizon;
+        // Existing validation guarantees H >= 9M. With peer DATA credit
+        // U = H - 8M, D < max(1, (U-M)/2) implies D+M <= U: another
+        // maximum record fits before report eligibility. At H=9M every
+        // genuine upper record reports. No timer or extra credit is created.
+        horizon
+            .checked_sub(reserve)
+            .and_then(|usable| usable.checked_sub(maximum))
+            .map(|margin| (margin / 2).max(1))
+            .ok_or(Error::Proof)
+    }
     fn stage(&mut self, kind: wire::Kind, body: &[u8], tx: [u8; 16]) -> Result<(), Error> {
         if self.pending.is_some() || self.io.pending() {
             return Err(Error::Busy);
@@ -78,6 +102,7 @@ impl<I: PacketIo> Detached<I> {
                 .ok_or(Error::Exhausted)?,
             body: u16::try_from(body.len()).map_err(|_| Error::Capacity)?,
         };
+        let retired = h.retired;
         let plain = h.encode(body)?;
         let protected = self.sealer.seal_vec(&plain)?;
         if protected.bytes.len() != payload_len {
@@ -102,7 +127,12 @@ impl<I: PacketIo> Detached<I> {
         )
         .map_err(|_| Error::Proof)?;
         state.fence.as_mut().ok_or(Error::Proof)?.allocated = end;
-        self.pending = Some(Pending { bytes, end, kind });
+        self.pending = Some(Pending {
+            bytes,
+            end,
+            kind,
+            retired,
+        });
         Ok(())
     }
     fn expire_controls(&mut self) -> Result<(), Error> {
@@ -134,6 +164,9 @@ impl<I: PacketIo> Detached<I> {
             match self.io.send(&p.bytes) {
                 Ok(()) => {
                     let p = self.pending.take().ok_or(Error::Proof)?;
+                    // A staged header cannot grant physical report credit. Retain
+                    // the exact snapshot until this same packet is accepted.
+                    self.retirement_reported = self.retirement_reported.max(p.retired);
                     if let Some(token) = self.tracked.take() {
                         if self.completed.is_some() {
                             return Err(Error::Proof);
@@ -719,6 +752,8 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             last_ping: Instant::now(),
             ping: None,
             pong: None,
+            retirement_required: 0,
+            retirement_reported: 0,
             early: None,
         })
     }
@@ -1033,6 +1068,15 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                     self.lanes[i].as_mut().ok_or(Error::Proof)?.early = Some(cell);
                     return Ok(());
                 }
+                // These actual accepted records spend the peer's lane-local
+                // horizon even when all upper reverse traffic uses the other
+                // Half lane. Return only authenticated carrier retirement.
+                let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+                lane.retirement_required = lock(&lane.io.state)?
+                    .fence
+                    .as_ref()
+                    .ok_or(Error::Proof)?
+                    .retired;
                 self.records.push_back(ReceivedRecord {
                     received_at: cell.received_at,
                     lane: if i == 0 {
@@ -1069,7 +1113,25 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         for offset in 0..count {
             let i = (self.cursor + offset) % count;
             self.check()?;
-            progress |= self.lanes[i].as_mut().ok_or(Error::Proof)?.progress()?;
+            let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
+            if self.ready
+                && lane.pending.is_none()
+                && lane
+                    .retirement_required
+                    .saturating_sub(lane.retirement_reported)
+                    >= lane.retirement_threshold()?
+            {
+                // Attempt the coalesced report in this existing physical turn.
+                // Do not reserve the free slot after receive: the upper owner
+                // must first get its normal chance to piggyback new retirement.
+                // A blocked report still retains its exact packet and nonce.
+                match lane.stage(wire::Kind::Window, &[], self.transaction) {
+                    Ok(()) => progress = true,
+                    Err(Error::Busy) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            progress |= lane.progress()?;
             self.check()?;
             for _ in 0..(usize::from(self.policy.queue_packets) + 4) {
                 let cell = lock(&self.lanes[i].as_ref().ok_or(Error::Proof)?.io.state)?
@@ -1250,6 +1312,84 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             Ok(()) => Ok(()),
             Err(e) => Err(self.fail(e)),
         }
+    }
+    /// Exact immutable physical geometry checked against every occupied original.
+    pub fn geometry(&self) -> Result<RecordGeometry, Error> {
+        self.check()?;
+        if !self.ready {
+            return Err(Error::Proof);
+        }
+        let geometry = self.policy.record_geometry()?;
+        for lane in self.lanes.iter().flatten() {
+            let state = lock(&lane.io.state)?;
+            if state.config.mtu != geometry.path_mtu || state.policy != self.policy {
+                return Err(Error::Proof);
+            }
+        }
+        if self.lanes.iter().flatten().count() != self.count() {
+            return Err(Error::Proof);
+        }
+        Ok(geometry)
+    }
+    /// Actual immutable authenticated packet policy, without any transfer authority.
+    pub fn policy(&self) -> PacketPolicy {
+        self.policy
+    }
+    /// Actual complete policy commitment accepted by the original raw transition.
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+    /// Exact occupied original tuples in First/Second order, with no dummy lane.
+    pub fn lane_endpoints(
+        &self,
+    ) -> Result<[Option<(std::net::SocketAddr, std::net::SocketAddr)>; 2], Error> {
+        self.geometry()?;
+        let mut result = [None, None];
+        for (target, lane) in result.iter_mut().zip(&self.lanes) {
+            if let Some(lane) = lane {
+                let state = lock(&lane.io.state)?;
+                *target = Some((state.config.local.into(), state.config.peer.into()));
+            }
+        }
+        Ok(result)
+    }
+    /// Number of actual occupied original owners; never a synthetic duplex width.
+    pub fn lane_count(&self) -> usize {
+        self.count()
+    }
+    /// Original setup cap; observing it never grants another setup interval.
+    pub fn setup_deadline(&self) -> Instant {
+        self.deadline
+    }
+    /// Existing physical-service, transition and liveness wakes; no new timer owner.
+    pub fn next_wake(&self) -> Result<Instant, Error> {
+        self.check()?;
+        let mut wake = self.tick.deadline();
+        if !self.ready {
+            wake = wake.min(self.timer.deadline());
+        }
+        for lane in self.lanes.iter().flatten() {
+            if self.ready {
+                wake = wake.min(
+                    lane.last_alive
+                        .checked_add(Duration::from_secs(15))
+                        .ok_or(Error::Exhausted)?,
+                );
+                if lane.ping.is_none() {
+                    wake = wake.min(
+                        lane.last_ping
+                            .checked_add(Duration::from_secs(5))
+                            .ok_or(Error::Exhausted)?,
+                    );
+                }
+            } else if let Some(last) = lane.last_transition {
+                wake = wake.min(
+                    last.checked_add(Duration::from_millis(250))
+                        .ok_or(Error::Exhausted)?,
+                );
+            }
+        }
+        Ok(wake)
     }
     /// Maximum complete upper recovery record under the authenticated packet policy.
     pub fn max_record_bytes(&self) -> usize {

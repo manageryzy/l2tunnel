@@ -86,6 +86,7 @@ pub(super) fn reserved(
                 received: 0,
                 present: std::mem::take(&mut construction.present),
                 buffer: std::mem::take(&mut construction.buffer),
+                first_received: 0,
                 deadline: 0,
             },
         });
@@ -143,6 +144,7 @@ impl PendingStore {
     pub(super) fn insert(
         &mut self,
         parsed: &ParsedFragment<'_>,
+        first_received: u64,
         deadline: u64,
     ) -> Result<(), FragmentError> {
         match self {
@@ -153,6 +155,7 @@ impl PendingStore {
                     received: 1,
                     present: vec![0; usize::from(parsed.count)],
                     buffer: vec![0; parsed.length],
+                    first_received,
                     deadline,
                 };
                 write_fragment(&mut pending, parsed)?;
@@ -175,6 +178,7 @@ impl PendingStore {
                 slot.pending.chunk = parsed.chunk;
                 slot.pending.count = parsed.count;
                 slot.pending.received = 1;
+                slot.pending.first_received = first_received;
                 slot.pending.deadline = deadline;
                 write_fragment(&mut slot.pending, parsed)?;
                 slot.message = Some(parsed.message);

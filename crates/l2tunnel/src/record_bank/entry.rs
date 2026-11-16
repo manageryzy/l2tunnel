@@ -1,4 +1,7 @@
+#[path = "fragment.rs"]
+mod fragment;
 use super::{Error, GenerationId, engine};
+pub use fragment::FragmentOutputToken;
 use l2tunnel_codec::aligned_receiver::UnitWitness;
 use l2tunnel_pipeline::{Admission, PacketMetadata};
 use l2tunnel_reliable::OutboundBudget;
@@ -197,6 +200,27 @@ impl<'a> Entry<'a> {
     ) -> Result<(), Error> {
         self.engine
             .accept_authenticated_at(received, now, security_number, kind, body)
+            .map_err(Error::Engine)
+    }
+    /// Preserve the authenticated input's original operation/session deadline.
+    pub fn accept_authenticated_until(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        original_deadline: engine::Tick,
+        security_number: u64,
+        kind: engine::EmissionKind,
+        body: &mut [u8],
+    ) -> Result<(), Error> {
+        self.engine
+            .accept_authenticated_until(
+                received,
+                now,
+                original_deadline,
+                security_number,
+                kind,
+                body,
+            )
             .map_err(Error::Engine)
     }
     /// Service actual injected deadlines without reading a real clock.
