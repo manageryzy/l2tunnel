@@ -19,8 +19,13 @@ was opt-in and Swift-only at that checkpoint. The subsequent
 [runtime algorithm migration](modules/compact-wire-cleanup.md#runtime-algorithm-migration)
 connects Aligned/Packed, CompactARQ, independent owners, Rolling and Research to
 the selected original-UDP format and negotiated epoch switching. Its own evidence
-is recorded separately; raw TCP single protection, other outer carriers, full
-SW-11/all47 and original MTU/repair/performance gates retain their definitions.
+is recorded separately. The later [outer-carrier migration](modules/compact-wire-cleanup.md#selected-outer-carrier-migration)
+installs selected final Records on the original OpenVPN UDP socket and single
+final protection on the original raw TCP owner. Finite shared-service cases pass
+for both data suites, including four-family switches and Full raw TCP-proxy
+retirement. The [new batch receipt](../work/compact-carrier-migration-20261116/batch-summary.json)
+records required-check results separately. Full SW-11/all47, native/platform,
+original MTU/repair/performance and ISP classification gates retain their definitions.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

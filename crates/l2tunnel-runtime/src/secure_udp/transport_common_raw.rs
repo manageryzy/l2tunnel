@@ -57,8 +57,8 @@ where
     })
 }
 impl Driver {
-    pub(super) fn new_common_on_raw<I: PacketIo + Send + 'static>(
-        parts: member::raw_carrier::RawInitialParts<I>,
+    pub(in super::super) fn new_common_on_raw<I: PacketIo + Send + 'static>(
+        mut parts: member::raw_carrier::RawInitialParts<I>,
         contract: CommonTransactionContract,
     ) -> io::Result<(carrier::IoOwner<RawAdapter<I>>, owner::StateCell<Self>)> {
         contract.validate_raw(parts.outer())?;
@@ -68,6 +68,16 @@ impl Driver {
                 "actual raw owner geometry differs from genuine handoff",
             ));
         }
+        let final_geometry = if contract.compact_wire().is_some() {
+            Some(
+                parts
+                    .io
+                    .enable_final_records(contract.expected_configuration().0, parts.cover)?,
+            )
+        } else {
+            None
+        };
+        let geometry = final_geometry.unwrap_or(geometry);
         let origin = parts.clock_origin();
         let io_capacity = parts
             .io
@@ -87,7 +97,10 @@ impl Driver {
         };
         // Check the complete known Bank subtotal before allocating the raw singleton
         // or moving this same initialized Driver into its existing fallible cell.
-        Self::new_common_input(input, contract, origin, parts.io, |raw, driver| {
+        Self::new_common_input(input, contract, origin, parts.io, |raw, mut driver| {
+            if let Some(runtime) = &mut driver.common {
+                runtime.raw_final_geometry = final_geometry;
+            }
             if driver
                 .records
                 .capacity(driver.config.security.max_body_bytes)

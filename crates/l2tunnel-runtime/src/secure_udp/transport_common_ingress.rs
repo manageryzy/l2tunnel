@@ -15,7 +15,7 @@ impl Driver {
         let draining = !self.common_state()?.can_admit_data()
             || self
                 .common
-                .as_ref()
+                .as_deref()
                 .and_then(|r| r.reuse_controller())
                 .is_some_and(super::common_reuse::Controller::active);
         let work = self.config.work.native_read_batch;
@@ -93,7 +93,7 @@ impl Driver {
         let deadline = add(before, self.config.native.stall_timeout)?.min(self.lease);
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("Common ingress owner missing"))?;
         if runtime.pending_ingress.is_some() {
             return Err(protocol("Common native read overwrote pending input"));
@@ -117,7 +117,7 @@ impl Driver {
     fn retry_common_ingress(&mut self, now: u64, input: &[u8]) -> io::Result<bool> {
         let Some(pending) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.pending_ingress)
         else {
             return Ok(false);
@@ -148,7 +148,7 @@ impl Driver {
                 | engine::IngressAdmission::Superseded,
             ) => {
                 self.common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("Common ingress owner missing"))?
                     .pending_ingress = None;
                 self.counters.native_read = self.counters.native_read.saturating_add(1);

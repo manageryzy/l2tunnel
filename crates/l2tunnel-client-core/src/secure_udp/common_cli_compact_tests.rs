@@ -113,7 +113,48 @@ fn compact_plan_is_strict_optional_and_legacy_inspection_stays_absent() -> io::R
                 assert_eq!(lines[0]["catalog_members"], 2);
             }
             value["outer_carrier"] = outer_policy(&value);
-            assert!(decode(&value).is_err());
+            let carrier_plan = decode(&value)?;
+            carrier_plan.validate_carrier(true)?;
+            assert!(carrier_plan.validate_carrier(false).is_err());
+            let mut carrier_settings = settings;
+            let (carrier_overhead, carrier_body) =
+                common.carrier_geometry(&mut carrier_settings, carrier_plan.outer_capacity()?)?;
+            let carrier_profile = carrier_plan.build(
+                connection,
+                carrier_settings,
+                peers,
+                carrier_body,
+                carrier_overhead,
+            )?;
+            let outer = carrier_plan.outer_config(&carrier_profile)?;
+            assert_eq!(
+                outer.base.digest.0,
+                carrier_profile.requested_configuration()?.0
+            );
+            assert_eq!(
+                outer.outer_overhead_bytes, 29,
+                "bootstrap still uses DataV1"
+            );
+            assert_eq!(
+                carrier_profile
+                    .requested_resources(Role::Initiator)
+                    .control
+                    .wire_overhead,
+                49
+            );
+            let lines = crate::cli::secure_udp_frontend::common_cli_output::carrier_inspection(
+                &carrier_profile,
+                Role::Initiator,
+                outer,
+            )?;
+            assert_eq!(lines[0]["carrier"], "openvpn-like");
+            assert_eq!(
+                lines[0]["compact_wire"]["requested"]["data_protection"],
+                protection
+            );
+            assert!(lines[0]["compact_wire"]["effective"].is_null());
+            assert!(lines[0]["effective_configuration"].is_null());
+            assert_eq!(lines[0]["authenticated"], false);
         }
         assert_ne!(h0[0], h0[1]);
     }

@@ -50,7 +50,7 @@ impl Driver {
         configuration: C,
         reply: generic::TransactionReply,
     ) -> io::Result<()> {
-        let Some(runtime) = self.common.as_mut() else {
+        let Some(runtime) = self.common.as_deref_mut() else {
             let _ = reply.send(Err(SwitchError::Invalid));
             return Err(protocol("generic request on legacy runtime"));
         };
@@ -118,7 +118,7 @@ impl Driver {
     ) -> io::Result<()> {
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("generic admission on legacy runtime"))?;
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("generic admission lacks State"));
@@ -351,7 +351,7 @@ impl Driver {
     ) -> io::Result<bool> {
         if self
             .common
-            .as_ref()
+            .as_deref()
             .is_none_or(|runtime| runtime.completion.is_none())
         {
             return Ok(false);
@@ -366,7 +366,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("completion lost generic owner"))?;
         let (reply, result) = runtime
             .completion
@@ -485,6 +485,8 @@ impl Driver {
                     if !engine.drained().map_err(protocol)?
                         || !self.native.is_empty()
                         || runtime.sealed.is_some()
+                        || runtime.unsealed.is_some()
+                        || runtime.raw_control.is_some()
                         || runtime.pending_feedback.is_some()
                         || runtime.pending_ingress.is_some()
                         || runtime
@@ -642,6 +644,8 @@ impl Driver {
     fn common_barrier_ready(&self, runtime: &common::Runtime, old: Scope) -> io::Result<bool> {
         if !self.native.is_empty()
             || runtime.sealed.is_some()
+            || runtime.unsealed.is_some()
+            || runtime.raw_control.is_some()
             || runtime.pending_feedback.is_some()
             || runtime.pending_ingress.is_some()
             || runtime

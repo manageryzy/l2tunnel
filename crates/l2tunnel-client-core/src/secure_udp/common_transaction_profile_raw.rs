@@ -46,6 +46,35 @@ impl Profile {
             None,
         )
     }
+    /// Select single final protection before the original raw TLS/member bootstrap.
+    /// The raw phase remains protected until the actual accepted inner session
+    /// transfers its material to the same original packet owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_raw_compact(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        packet: PacketPolicy,
+        selection: l2tunnel::secure_record::compact::Selection,
+    ) -> io::Result<Self> {
+        selection.validate().map_err(io::Error::other)?;
+        Self::new_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            Some(packet),
+            None,
+            Some(selection),
+        )
+    }
     /// Explicit fixed/full proxy on the maintained original raw TCP carrier.
     /// Complete raw geometry is requested upfront; no descriptor/body is clamped.
     #[allow(clippy::too_many_arguments)]
@@ -131,23 +160,45 @@ impl Profile {
             self.settings.cover.config(security::Role::Responder)?,
         ];
         let resources = [self.initiator, self.responder];
-        transport::CommonTransactionContract::validate_raw_requested(
-            base,
-            self.envelope,
-            &self.catalog,
-            resources,
-            covers,
-            self.parameters,
-            policy,
-        )?;
-        let requested = transport::CommonTransactionContract::raw_requested_configuration(
-            base,
-            self.envelope,
-            &self.catalog,
-            resources,
-            covers,
-            self.parameters,
-        )?;
+        let requested = if let Some(selection) = self.compact_wire {
+            transport::CommonTransactionContract::validate_raw_requested_compact(
+                base,
+                self.envelope,
+                &self.catalog,
+                resources,
+                covers,
+                self.parameters,
+                policy,
+                selection,
+            )?;
+            transport::CommonTransactionContract::raw_requested_configuration_compact(
+                base,
+                self.envelope,
+                &self.catalog,
+                resources,
+                covers,
+                self.parameters,
+                selection,
+            )?
+        } else {
+            transport::CommonTransactionContract::validate_raw_requested(
+                base,
+                self.envelope,
+                &self.catalog,
+                resources,
+                covers,
+                self.parameters,
+                policy,
+            )?;
+            transport::CommonTransactionContract::raw_requested_configuration(
+                base,
+                self.envelope,
+                &self.catalog,
+                resources,
+                covers,
+                self.parameters,
+            )?
+        };
         self.raw = Some(RawSelection {
             policy,
             base,
@@ -171,6 +222,21 @@ impl Profile {
         let raw = self
             .raw
             .ok_or_else(|| invalid("Common profile has no selected raw policy"))?;
+        if let Some(selection) = self.compact_wire {
+            return transport::CommonTransactionContract::validate_raw_requested_compact(
+                raw.base,
+                raw.envelope,
+                self.requested_catalog(),
+                [self.initiator, self.responder],
+                [
+                    self.settings.cover.config(security::Role::Initiator)?,
+                    self.settings.cover.config(security::Role::Responder)?,
+                ],
+                self.parameters,
+                raw.policy,
+                selection,
+            );
+        }
         transport::CommonTransactionContract::validate_raw_requested(
             raw.base,
             raw.envelope,
@@ -237,6 +303,23 @@ impl Profile {
         outer: AuthenticatedRaw,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if let Some(selection) = self.compact_wire {
+            let contract = transport::CommonTransactionContract::new_on_raw_paired_compact(
+                raw.base,
+                role,
+                [self.initiator, self.responder],
+                [
+                    self.settings.cover.config(security::Role::Initiator)?,
+                    self.settings.cover.config(security::Role::Responder)?,
+                ],
+                raw.envelope,
+                self.catalog.clone(),
+                self.parameters,
+                outer,
+                selection,
+            )?;
+            return self.complete_proxy_contract(contract);
+        }
         let contract = transport::CommonTransactionContract::new_on_raw_paired(
             raw.base,
             role,

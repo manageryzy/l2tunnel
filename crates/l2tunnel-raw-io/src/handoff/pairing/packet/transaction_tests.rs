@@ -205,7 +205,13 @@ async fn cancelled_borrow_keeps_exact_original_protected_packet_through_wouldblo
     }
     assert!(af.pending.lock().map_err(|_| "test lock")?.is_some());
     assert!(b.record().is_none());
-    let before = a.lanes[0].as_ref().ok_or("lane")?.sealer.usage();
+    let before = a.lanes[0]
+        .as_ref()
+        .ok_or("lane")?
+        .sealer
+        .as_ref()
+        .ok_or("bootstrap protector")?
+        .usage();
     af.blocked.store(false, Ordering::SeqCst);
     poll_fn(|cx| {
         if let Poll::Ready(Err(e)) = a.poll_progress(cx) {
@@ -221,7 +227,16 @@ async fn cancelled_borrow_keeps_exact_original_protected_packet_through_wouldblo
         }
     })
     .await?;
-    assert_eq!(before, a.lanes[0].as_ref().ok_or("lane")?.sealer.usage());
+    assert_eq!(
+        before,
+        a.lanes[0]
+            .as_ref()
+            .ok_or("lane")?
+            .sealer
+            .as_ref()
+            .ok_or("bootstrap protector")?
+            .usage()
+    );
     assert_eq!(b.record().ok_or("record")?.bytes, b"held bytes");
     Ok(())
 }
@@ -705,7 +720,7 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
         let reported = lane.retirement_reported;
         assert!(required.saturating_sub(reported) >= threshold);
         let frozen = lane.pending.as_ref().ok_or("held window")?.bytes.clone();
-        let usage = lane.sealer.usage();
+        let usage = lane.sealer.as_ref().ok_or("bootstrap protector")?.usage();
         for _ in 0..4 {
             poll_fn(|cx| {
                 if let Poll::Ready(Err(error)) = b.poll_progress(cx) {
@@ -717,7 +732,10 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
             let lane = b.lanes[0].as_ref().ok_or("lane")?;
             assert_eq!(lane.pending.as_ref().ok_or("held window")?.bytes, frozen);
             assert_eq!(lane.retirement_reported, reported);
-            assert_eq!(lane.sealer.usage(), usage);
+            assert_eq!(
+                lane.sealer.as_ref().ok_or("bootstrap protector")?.usage(),
+                usage
+            );
         }
         bf.block_all.store(false, Ordering::SeqCst);
         poll_fn(|cx| {
@@ -806,8 +824,20 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
         })
         .await?;
         let quiet = [
-            a.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
-            b.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
+            a.lanes[0]
+                .as_ref()
+                .ok_or("lane")?
+                .sealer
+                .as_ref()
+                .ok_or("bootstrap protector")?
+                .usage(),
+            b.lanes[0]
+                .as_ref()
+                .ok_or("lane")?
+                .sealer
+                .as_ref()
+                .ok_or("bootstrap protector")?
+                .usage(),
         ];
         for _ in 0..4 {
             poll_fn(|cx| {
@@ -823,8 +853,20 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
         assert_eq!(
             quiet,
             [
-                a.lanes[0].as_ref().ok_or("lane")?.sealer.usage(),
-                b.lanes[0].as_ref().ok_or("lane")?.sealer.usage()
+                a.lanes[0]
+                    .as_ref()
+                    .ok_or("lane")?
+                    .sealer
+                    .as_ref()
+                    .ok_or("bootstrap protector")?
+                    .usage(),
+                b.lanes[0]
+                    .as_ref()
+                    .ok_or("lane")?
+                    .sealer
+                    .as_ref()
+                    .ok_or("bootstrap protector")?
+                    .usage()
             ]
         );
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -919,3 +961,6 @@ async fn full_upper_feedback_piggybacks_retirement_before_idle_window_claims_slo
     .await??;
     Ok(())
 }
+
+#[path = "compact_tests.rs"]
+mod compact_tests;

@@ -213,7 +213,7 @@ impl Driver {
         let mut cap = self.lease;
         let runtime = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("Common input owner missing"))?;
         if let Some(at) = self
             .common_state()?
@@ -276,7 +276,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("raw ACK runtime missing"))?;
         let input = runtime
             .connection_input
@@ -315,7 +315,7 @@ impl Driver {
     pub(super) fn retry_common_connection_input(&mut self, now: u64) -> io::Result<()> {
         let count = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.connection_input.as_ref())
             .map_or(0, |input| input.queue.len())
             .min(usize::try_from(self.config.work.receive_packets).map_err(invalid)?);
@@ -325,7 +325,7 @@ impl Driver {
         for _ in 0..count {
             let Some((pending, bytes)) = self
                 .common
-                .as_ref()
+                .as_deref()
                 .and_then(|runtime| runtime.connection_input.as_ref())
                 .and_then(|input| input.queue.front())
                 .map(|packet| (*packet.metadata(), packet.bytes().len()))
@@ -355,7 +355,7 @@ impl Driver {
             if now >= pending.deadline {
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("raw ACK runtime missing"))?;
                 let input = runtime
                     .connection_input
@@ -376,7 +376,7 @@ impl Driver {
             self.buffers.frame.resize(bytes, 0);
             let runtime = self
                 .common
-                .as_mut()
+                .as_deref_mut()
                 .ok_or_else(|| protocol("raw ACK runtime missing"))?;
             let input = runtime
                 .connection_input

@@ -4,13 +4,16 @@ use super::*;
 use gate::{Budget, Cell, Fence};
 use l2tunnel_raw_tcp::{handoff::QuiescentTcp, packet};
 use tokio::time::{sleep, sleep_until};
+#[path = "compact_owner.rs"]
+mod compact_owner;
 
 struct Detached<I: PacketIo> {
     io: GateIo<I>,
     _tcp: QuiescentTcp,
     _frozen: FrozenTls,
     proof: wire::LaneProof,
-    sealer: PacketSealer,
+    sealer: Option<PacketSealer>,
+    final_prepared: Option<(compact::FinalMetadata, Option<compact::FinalControl>)>,
     pending: Option<Pending>,
     tracked: Option<RecordToken>,
     completed: Option<SentRecord>,
@@ -34,6 +37,7 @@ struct Detached<I: PacketIo> {
     early: Option<Cell>,
 }
 struct Pending {
+    bootstrap: bool,
     bytes: Vec<u8>,
     end: u64,
     kind: wire::Kind,
@@ -61,12 +65,25 @@ impl<I: PacketIo> Detached<I> {
             .ok_or(Error::Proof)
     }
     fn stage(&mut self, kind: wire::Kind, body: &[u8], tx: [u8; 16]) -> Result<(), Error> {
-        if self.pending.is_some() || self.io.pending() {
+        if self.pending.is_some() || self.io.pending() || self.final_prepared.is_some() {
             return Err(Error::Busy);
         }
         let mut state = lock(&self.io.state)?;
         let policy = state.policy;
         let config = state.config;
+        if state.final_context.is_some()
+            && (Instant::now() >= state.deadline
+                || match kind {
+                    wire::Kind::Data | wire::Kind::Feedback => state
+                        .bootstrap_filter
+                        .as_ref()
+                        .is_none_or(|allow| !allow(body)),
+                    wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck => false,
+                    _ => true,
+                })
+        {
+            return Err(Error::Proof);
+        }
         if body.len() > policy.body_limit() {
             return Err(Error::Capacity);
         }
@@ -104,7 +121,7 @@ impl<I: PacketIo> Detached<I> {
         };
         let retired = h.retired;
         let plain = h.encode(body)?;
-        let protected = self.sealer.seal_vec(&plain)?;
+        let protected = self.sealer.as_mut().ok_or(Error::Proof)?.seal_vec(&plain)?;
         if protected.bytes.len() != payload_len {
             return Err(Error::Proof);
         }
@@ -128,6 +145,7 @@ impl<I: PacketIo> Detached<I> {
         .map_err(|_| Error::Proof)?;
         state.fence.as_mut().ok_or(Error::Proof)?.allocated = end;
         self.pending = Some(Pending {
+            bootstrap: true,
             bytes,
             end,
             kind,
@@ -136,6 +154,24 @@ impl<I: PacketIo> Detached<I> {
         Ok(())
     }
     fn expire_controls(&mut self) -> Result<(), Error> {
+        let retire_bootstrap = {
+            let state = lock(&self.io.state)?;
+            state.final_context.is_some() && Instant::now() >= state.deadline
+        };
+        if retire_bootstrap {
+            self.sealer = None;
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.bootstrap)
+            {
+                if self.tracked.is_some() {
+                    return Err(Error::Expired);
+                }
+                self.pending = None;
+                self.io.cancel_pending();
+            }
+        }
         if Instant::now() >= lock(&self.io.state)?.deadline {
             if self.pending.as_ref().is_some_and(|p| {
                 matches!(
@@ -284,6 +320,7 @@ pub struct PacketCarrier<I: PacketIo + Send + 'static> {
     ready: bool,
     fault: Option<Error>,
     cursor: usize,
+    final_context: Option<[u8; 32]>,
 }
 fn recover<I: PacketIo>(inputs: RawInputs<GateIo<I>>) -> RawInputs<I> {
     let raw = |input: RawInput<GateIo<I>>| RawInput {
@@ -734,7 +771,8 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             _tcp: tcp,
             _frozen: frozen,
             proof,
-            sealer,
+            sealer: Some(sealer),
+            final_prepared: None,
             pending: None,
             tracked: None,
             completed: None,
@@ -785,6 +823,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             ready: false,
             fault: None,
             cursor: 0,
+            final_context: None,
         });
         self.paired = None;
         Ok(())
@@ -1115,6 +1154,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             self.check()?;
             let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
             if self.ready
+                && self.final_context.is_none()
                 && lane.pending.is_none()
                 && lane
                     .retirement_required
@@ -1134,9 +1174,14 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             progress |= lane.progress()?;
             self.check()?;
             for _ in 0..(usize::from(self.policy.queue_packets) + 4) {
-                let cell = lock(&self.lanes[i].as_ref().ok_or(Error::Proof)?.io.state)?
-                    .incoming
-                    .pop_front();
+                let cell = {
+                    let mut state = lock(&self.lanes[i].as_ref().ok_or(Error::Proof)?.io.state)?;
+                    let index = state
+                        .incoming
+                        .iter()
+                        .position(|cell| cell.final_metadata.is_none());
+                    index.and_then(|index| state.incoming.remove(index))
+                };
                 let Some(cell) = cell else {
                     break;
                 };
@@ -1176,7 +1221,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         let now = Instant::now();
         for i in 0..count {
             let lane = self.lanes[i].as_mut().ok_or(Error::Proof)?;
-            if self.ready && lane.pending.is_none() {
+            if self.ready && self.final_context.is_none() && lane.pending.is_none() {
                 if let Some(pong) = lane.pong {
                     match lane.stage(wire::Kind::Pong, &pong, self.transaction) {
                         Ok(()) => {
@@ -1401,6 +1446,17 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     }
     /// Copy one admitted upper recovery record into the finite carrier slot.
     pub fn stage_record(
+        &mut self,
+        lane: PairLane,
+        kind: RecordKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if self.final_context.is_some() {
+            return Err(Error::Configuration);
+        }
+        self.stage_bootstrap_inner(lane, kind, bytes)
+    }
+    fn stage_bootstrap_inner(
         &mut self,
         lane: PairLane,
         kind: RecordKind,

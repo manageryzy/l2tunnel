@@ -1,7 +1,7 @@
 //! The sole connected socket owner. Retained emissions survive WouldBlock without
 //! another recovery attempt, packet number, encryption operation or wire charge.
 use super::common::send::{Custody, Ledger, SendFailure, SendReceipt};
-use super::{Activation, Data, Error, Submission, control, wire};
+use super::{Activation, Data, Error, Submission, common, control, wire};
 use crate::budget::Budget;
 use l2tunnel_recovery::RecoveryError;
 use tokio::{
@@ -18,11 +18,12 @@ pub(super) struct Inputs {
     pub bridge: DuplexStream,
     pub submissions: mpsc::Receiver<Submission>,
     pub priority: Option<mpsc::Receiver<Submission>>,
-    pub outputs: mpsc::Sender<Vec<u8>>,
+    pub outputs: mpsc::Sender<common::Received>,
     pub activate: mpsc::Receiver<Activation>,
     pub started: Instant,
     pub budget: Budget,
     pub physical: Option<Ledger>,
+    pub final_records: Option<std::sync::Arc<std::sync::OnceLock<Instant>>>,
     #[cfg(test)]
     pub user_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -94,6 +95,15 @@ fn poll_control(
         .map_err(Error::Control)
 }
 
+/// This selected namespace is disjoint from every supported OpenVPN opcode.
+/// It conveys routing only; the final Records owner still validates all authority.
+pub(super) fn final_prefix(packet: &[u8]) -> bool {
+    packet
+        .first()
+        .is_some_and(|byte| *byte <= 1 || *byte >= 128)
+}
+
+#[cfg(test)]
 pub(super) fn poll_data(
     data: &mut Data,
     payload: &[u8],
@@ -103,9 +113,33 @@ pub(super) fn poll_data(
     crypto: &mut [u8],
     output: &mut [u8],
 ) -> Result<Option<usize>, Error> {
+    poll_selected_data(
+        data, payload, control, budget, settings, crypto, output, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_selected_data(
+    data: &mut Data,
+    payload: &[u8],
+    control: bool,
+    budget: &Budget,
+    settings: Settings,
+    crypto: &mut [u8],
+    output: &mut [u8],
+    final_record: bool,
+) -> Result<Option<usize>, Error> {
     budget
         .transaction(|quota| {
-            if !quota.permits(control, settings.path_mtu) {
+            let required = if final_record {
+                match payload.len().checked_add(settings.ip_overhead) {
+                    Some(value) => value,
+                    None => return Ok(Err(Error::Configuration)),
+                }
+            } else {
+                settings.path_mtu
+            };
+            if !quota.permits(control, required) {
                 return Ok(Ok(None));
             }
             let emission = (|| {
@@ -120,7 +154,18 @@ pub(super) fn poll_data(
                     }
                     Data::Opaque => payload,
                 };
-                wire::encode_data(0, None, body, output).map_err(Error::Wire)
+                if final_record {
+                    if !matches!(data, Data::Opaque)
+                        || !final_prefix(body)
+                        || body.len() > output.len()
+                    {
+                        return Err(Error::Configuration);
+                    }
+                    output[..body.len()].copy_from_slice(body);
+                    Ok(body.len())
+                } else {
+                    wire::encode_data(0, None, body, output).map_err(Error::Wire)
+                }
             })();
             if let Ok(length) = emission {
                 quota.charge(control, length + settings.ip_overhead, None)?;
@@ -253,6 +298,28 @@ fn expire_held(held: &mut Option<Submission>, physical: Option<&Ledger>) -> Resu
     Ok(true)
 }
 
+fn deliver_opaque(
+    outputs: &mpsc::Sender<common::Received>,
+    payload: &[u8],
+    maximum: usize,
+) -> Result<(), Error> {
+    if payload.is_empty() || payload.len() > maximum || outputs.capacity() == 0 {
+        return Ok(());
+    }
+    let mut packet = Vec::new();
+    packet
+        .try_reserve_exact(payload.len())
+        .map_err(|_| Error::Allocation)?;
+    packet.extend_from_slice(payload);
+    match outputs.try_send(common::Received {
+        bytes: packet,
+        framing: common::ReceiveFraming::Final,
+    }) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+    }
+}
+
 pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
     let Inputs {
         socket,
@@ -266,6 +333,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
         started,
         budget,
         physical,
+        final_records,
         #[cfg(test)]
         user_gate,
     } = inputs;
@@ -297,13 +365,28 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
             if elapsed >= transport.expires() {
                 return Err(Error::Control(control::Error::Expired));
             }
+            let setup_open = final_records
+                .as_ref()
+                .and_then(|selected| selected.get())
+                .is_none_or(|cap| Instant::now() < *cap);
+            let final_selected = final_records
+                .as_ref()
+                .is_some_and(|selected| selected.get().is_some());
             let mut progress = false;
             progress |= expire_held(&mut held, physical.as_ref())?;
             progress |= expire_held(&mut held_priority, physical.as_ref())?;
             match socket.try_recv(&mut receive) {
                 Ok(length) => {
                     progress = true;
-                    if length <= maximum {
+                    if length <= maximum && final_selected && final_prefix(&receive[..length]) {
+                        if matches!(data, Some(Data::Opaque)) && settings.receiving {
+                            deliver_opaque(
+                                &outputs,
+                                &receive[..length],
+                                settings.max_payload_bytes,
+                            )?;
+                        }
+                    } else if length <= maximum && setup_open {
                         match wire::decode(&receive[..length]) {
                             Ok(wire::Packet::Control(_)) => {
                                 match transport.receive(&receive[..length], elapsed) {
@@ -329,7 +412,10 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                                         .try_reserve_exact(payload.len())
                                         .map_err(|_| Error::Allocation)?;
                                     packet.extend_from_slice(payload);
-                                    match outputs.try_send(packet) {
+                                    match outputs.try_send(common::Received {
+                                        bytes: packet,
+                                        framing: common::ReceiveFraming::DataV1,
+                                    }) {
                                         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             return Err(Error::Closed);
@@ -344,7 +430,13 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
             }
-            if transport.ready() && tls_source_length != 0 {
+            if !setup_open {
+                // The initial-only selection never renews or periodically services TLS.
+                control_length = None;
+                tls_source_length = 0;
+                tls_delivery_start = tls_delivery_end;
+            }
+            if setup_open && transport.ready() && tls_source_length != 0 {
                 match transport.write_tls(&tls_source[..tls_source_length], elapsed) {
                     Ok(length) => {
                         tls_source.copy_within(length..tls_source_length, 0);
@@ -357,12 +449,12 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                     Err(error) => return Err(error.into()),
                 }
             }
-            if tls_delivery_start == tls_delivery_end {
+            if setup_open && tls_delivery_start == tls_delivery_end {
                 tls_delivery_end = transport.read_tls(&mut tls_delivery, elapsed)?;
                 tls_delivery_start = 0;
                 progress |= tls_delivery_end != 0;
             }
-            if control_length.is_none() {
+            if setup_open && control_length.is_none() {
                 control_length = poll_control(
                     &mut transport,
                     &budget,
@@ -374,7 +466,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
             }
             if pending_data.is_none()
                 && let (Some(owner), Some(submission)) = (data.as_mut(), held.as_ref())
-                && let Some(length) = poll_data(
+                && let Some(length) = poll_selected_data(
                     owner,
                     &submission.bytes,
                     submission.control,
@@ -382,6 +474,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                     settings,
                     &mut crypto_output,
                     &mut data_output,
+                    submission.final_record,
                 )?
             {
                 let submission = held.take().ok_or(Error::Closed)?;
@@ -394,7 +487,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
             }
             if pending_priority.is_none()
                 && let (Some(owner), Some(submission)) = (data.as_mut(), held_priority.as_ref())
-                && let Some(length) = poll_data(
+                && let Some(length) = poll_selected_data(
                     owner,
                     &submission.bytes,
                     true,
@@ -402,6 +495,7 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
                     settings,
                     &mut crypto_output,
                     &mut priority_output,
+                    submission.final_record,
                 )?
             {
                 let submission = held_priority.take().ok_or(Error::Closed)?;
@@ -497,15 +591,19 @@ pub(super) async fn run(inputs: Inputs) -> Result<(), Error> {
         .into_iter()
         .flatten()
         .min();
+        let setup_open = final_records
+            .as_ref()
+            .and_then(|selected| selected.get())
+            .is_none_or(|cap| Instant::now() < *cap);
         tokio::select! {
             _ = timer.tick() => {},
             _ = async { match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {},
             ready = socket.readable() => { ready?; },
             ready = socket.writable(), if control_length.is_some() || pending_priority.is_some() || pending_data.is_some() => { ready?; },
-            read = tls_read.read(&mut tls_source), if tls_source_length == 0 => {
+            read = tls_read.read(&mut tls_source), if setup_open && tls_source_length == 0 => {
                 let length = read?; if length == 0 { return Err(Error::Closed); } tls_source_length = length;
             },
-            write = tls_write.write(&tls_delivery[tls_delivery_start..tls_delivery_end]), if tls_delivery_start != tls_delivery_end => {
+            write = tls_write.write(&tls_delivery[tls_delivery_start..tls_delivery_end]), if setup_open && tls_delivery_start != tls_delivery_end => {
                 let length = write?; if length == 0 { return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()); } tls_delivery_start += length;
             },
             submission = submissions.recv(), if held.is_none() && pending_data.is_none() && data.is_some() => {

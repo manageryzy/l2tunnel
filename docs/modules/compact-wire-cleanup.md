@@ -1,8 +1,8 @@
 # Compact final wire format and implementation cleanup
 
-Status: **selected compact format implemented and finite original-UDP/shared-service
-integration-tested; original-UDP algorithm migration implemented, broader carrier
-and qualification gates open**. The owner authorized implementation after
+Status: **selected compact format and algorithm migration implemented; finite
+original-UDP, OpenVPN and injected raw shared-service paths integration-tested;
+full qualification gates open**. The owner authorized implementation after
 reviewing encapsulation costs. The first structural checkpoint preserves legacy
 bytes and its retained regression failures. The additive selected-format
 checkpoint below installs real compact protection/encoding and original-UDP
@@ -491,11 +491,102 @@ parser refusal and exact native delivery at 17/73-byte data versus 29/85-byte
 strong-feedback overhead. These are finite functional cases, not impairment or
 native-throughput qualification.
 
-Raw TCP bootstrap-to-single-protection, other outer-carrier migrations, complete
-SW-11 fault/platform matrices, all47 acceptance and the full geometry/performance
-gates remain separate open requirements. Their definitions below are unchanged.
+At the preceding original-UDP checkpoint, raw TCP single protection and other
+outer-carrier migration remained pending; the following section records their
+later implementation. Complete SW-11 fault/platform matrices, all47 acceptance
+and the full geometry/performance gates remain separate open requirements. Their definitions below are unchanged.
 This batch supplies scoped evidence for CWC-03/04/06/07/11/12/13/14/15/16/17;
 their complete acceptance obligations remain represented by the parent tasks.
+
+## Selected outer-carrier migration
+
+Status: **implemented with finite local runtime/shared-service evidence**. Explicit
+compact selection now reaches the original OpenVPN-like and raw TCP carrier owners.
+The [batch receipt](../../work/compact-carrier-migration-20261116/batch-summary.json)
+records the final executed scope and required-check outcome; the separate
+[client receipt](../../work/compact-carrier-migration-20261116/client-results.json)
+retains every focused attempt, corrected fixture/API failure and executed command.
+These results extend the preceding original-UDP checkpoint; historical legacy
+receipts and all complete acceptance definitions remain unchanged.
+
+OpenVPN keeps its real reset/TLS/member handshake and the existing inner
+cookie/Noise/member admission on the same connected UDP socket. Bootstrap records
+retain DataV1. After genuine inner member handoff, the selected actor sends final
+Records directly, without continued DataV1 or an inner QUIC/media wrapper.
+The actor carries an explicit receive-framing tag through OriginalDatagram and
+CarrierIo. The Driver therefore distinguishes actual DataV1 bootstrap tails from
+final packets without guessing from a decoded payload byte: a media bootstrap
+body and a final union can legitimately share that byte. The disjoint outer
+namespace and authenticated carrier layout do not make final packets valid
+OpenVPN payload traffic or establish protocol interoperability.
+
+Raw TCP keeps the actual original TLS/member proof, packet policy, ports, lanes,
+sequence space and original setup deadline through inner Noise/member acceptance.
+The same retained packet owner then activates single final Records protection;
+it does not reseal a protected Common record in the old phase/datagram envelopes.
+The canonical 49-byte raw metadata AAD binds actual TCP sequence/ACK/window/flags,
+length, transaction/lane/direction context. It is authentication input, **not
+49 additional wire bytes**. Strong CarrierControl uses route 1 and the shared
+monotonic control packet-number domain with management; retirement, Window and
+Ping/Pong authority cannot come from the selected short-check Data branch.
+Legacy construction retains its original phase/protection bytes and policy.
+An attempted first final activation at the expired original setup cap fails
+terminally as `Expired`, preserving the first cause and releasing the original
+owners. It neither renews the cap nor reports expiry as a configuration error.
+
+| Selected final path | Physical carrier cost | Data outer cost including carrier | Strong feedback/control outer cost including carrier |
+| --- | ---: | ---: | ---: |
+| OpenVPN original IPv4 UDP socket | 28 bytes | 37 bytes | 49 bytes |
+| Raw original IPv4/TCP flow | 40 bytes | 49 bytes | 61 bytes |
+
+These costs exclude the actual algorithm union, packing, feedback, control-body
+and explicit fragment metadata. They are not a universal ordinary-packet ceiling
+or a new throughput observation. Bootstrap costs remain separate. A raw algorithm
+body waiting for actual carrier metadata occupies the existing wire slab; its
+reserved number, witness and original deadline survive until sealing and physical
+completion. Pending plaintext, held ciphertext and raw control all block the
+relevant epoch, reuse and proxy-retirement barriers. Research feedback retains
+causal dependencies across this pre-seal stage without claiming a physical receipt.
+
+Common runtime state occupies one fallibly allocated singleton on actual Common
+paths, rather than increasing every legacy/Generic Driver's inline extent.
+Planning validates its layout and charges its actual payload exactly once; the
+cell header is already part of Driver. Allocation follows the retained-budget
+check. Legacy/Generic paths with no Common state allocate no such cell. This
+does not change the existing partial scope of external resource accounting or
+claim that resource preallocation is complete.
+
+The shared Profile/CLI binds the complete selected suite, paired resources,
+bootstrap covers, catalog and transaction settings before authentication, then
+checks the genuine outer proof. Unbound whole-profile conversion preserves the
+existing fixed/measured/reuse policy metadata and explicit resource limits.
+Supported combinations remain explicit: selection does not install previously
+unsupported OpenVPN proxy/reuse or raw measured/Half-proxy capabilities. Raw status
+keeps proof-derived bootstrap geometry labeled separately and exposes final
+framing only from successful actual runtime activation. Offline inspection shows
+requested final framing and no effective session.
+
+Focused client cases pass across preserved scoped attempts: both suites and both
+inner appearances on actual OpenVPN service, both suites on paired Half raw
+service, and both suites on Full raw fixed proxy. The first two service fixtures
+exercise Swift, Aligned, Packed and Rolling switches, bidirectional native bytes,
+liveness and release; the proxy fixture exercises actual TCP bytes and retained
+retirement. Strict requested-only CLI cases cover OpenVPN and Full/Half raw.
+The default-stack raw fixture correction relocates only its newly nested test
+future; it does not increase thread stacks or change production ownership.
+The aggregate client run also retained one unreproduced raw readiness
+`InvalidInput` failure; its exact same-binary recheck passed. The underlying error
+was not retained in that original log, so the cause is unknown. Test diagnostics
+now retain that error and both endpoints' setup observations. The independently
+identified expiry classification correction above is not proof of that failure's
+cause. The batch receipt distinguishes composed checks from a pristine suite pass.
+
+These are local UDP/Unix-device and caller-owned PacketIo checks. They do not
+qualify kernel ACK/RST/firewall handling, privileges, options/PMTU/NAT, native
+Linux deployment, Windows/Android execution, full SW-11/all47 behavior, standard
+dissector captures, endpoint interoperability, resistance to identification or
+ISP/QoS/performance assumptions. CWC-08/09/13 progress is recorded here; their
+unchecked complete gates below retain all remaining obligations.
 
 ## Full implementation and acceptance ledger
 
@@ -506,12 +597,12 @@ their complete acceptance obligations remain represented by the parent tasks.
 - [ ] [CWC-05] Resolve and authenticate the explicit data-check/protection selection, including the AES-CCM4 and ChaCha20/CRC32C candidates' different guarantees, maintained provider/dependency support, nonce/replay/forgery/key-use limits and failure behavior; retain old formats and make no unselected default or custom-primitive claim.
 - [ ] [CWC-06] Preserve authenticated replay-protected management and reliable-retiring ACKs, same-carrier lossy feedback, repeat/loss policies, original deadlines and independent bounded service through user pressure; qualify forged/replayed/stale feedback without weakening control to the data-check contract.
 - [ ] [CWC-07] Bind full session/role/direction/lane/epoch/configuration/operation/incarnation context while keeping short selectors and distinct packet/source/serial/record/native counters correct under reordering, wrap ambiguity, mode changes, retries and key exhaustion; no alias, nonce reuse or implicit lifetime reset.
-- [ ] [CWC-08] Install explicitly selected initial-only carrier appearance and one final data encoding on the same original connection/socket/five-tuple; remove continued inner mimic wrappers only in that selected new version and separately qualify handshake parseability, continuing protocol consistency, interoperability limitations and measured ISP/QoS assumptions.
-- [ ] [CWC-09] Implement the actual raw authenticated bootstrap-to-single-final-protection handoff without a pre-Noise key cycle, retaining phase transactions, original deadlines, byte sequence/window retirement, independent control progress, whole-write facts, held ciphertext and retained reliable close semantics on the existing owner/loop.
+- [ ] [CWC-08] Install explicitly selected initial-only carrier appearance and one final data encoding on the same original connection/socket/five-tuple; remove continued inner mimic wrappers only in that selected new version and separately qualify handshake parseability, continuing protocol consistency, interoperability limitations and measured ISP/QoS assumptions. **Progress:** selected carrier implementation and scoped evidence are recorded in [the outer-carrier checkpoint](#selected-outer-carrier-migration); the complete acceptance definition remains open.
+- [ ] [CWC-09] Implement the actual raw authenticated bootstrap-to-single-final-protection handoff without a pre-Noise key cycle, retaining phase transactions, original deadlines, byte sequence/window retirement, independent control progress, whole-write facts, held ciphertext and retained reliable close semantics on the existing owner/loop. **Progress:** selected carrier implementation and scoped evidence are recorded in [the outer-carrier checkpoint](#selected-outer-carrier-migration); the complete acceptance definition remains open.
 - [ ] [CWC-10] Qualify raw kernel ACK/RST/firewall handling, privileges, same ports/sequence space, options/PMTU/NAT, failure/recovery and supported Linux/Windows/Android boundaries in owned environments; pure parsing, compilation and injected PacketIo cannot close native/platform gates.
 - [ ] [CWC-11] Recompute and validate native MTU, packet/group bursts, actual repair/fragment/copy costs and original-age reassembly before allocation/admission; preserve fixed1460/MTU1500/global8192/local128/every16/short-copy/ACK requirements and exact physical confirmation without double debit or early whole-record release.
 - [ ] [CWC-12] Integrate actual selected owners through Engine/Bank/Pipeline and resource plans with bounded reusable buffers, complete inline/nested usage counted once, meaningful pressure/rollback/drop checks and no dummy reservation, duplicate queue, unused algorithm owner or allocator-completeness fiction.
-- [ ] [CWC-13] Negotiate explicit version/capability/configuration through the shared CLI/GUI/service API, preserve old byte-exact formats and commands, expose complete requested/effective wire/protection/carrier/algorithm state and bounded catalog/status, and refuse unsupported selection without fallback or synthetic readiness.
+- [ ] [CWC-13] Negotiate explicit version/capability/configuration through the shared CLI/GUI/service API, preserve old byte-exact formats and commands, expose complete requested/effective wire/protection/carrier/algorithm state and bounded catalog/status, and refuse unsupported selection without fallback or synthetic readiness. **Progress:** selected carrier implementation and scoped evidence are recorded in [the outer-carrier checkpoint](#selected-outer-carrier-migration); the complete acceptance definition remains open.
 - [ ] [CWC-14] Preserve full SW-11 epoch switching, authenticated management, staged/draining readers, complete barriers/native fences, idempotent retries and retained source/feedback/ciphertext custody across all required profiles; test loss, reordered old traffic and original-cap failures without removing regular switching.
 - [ ] [CWC-15] Preserve every 47-mode P-* definition and all RLNC/parity/rolling/packed/proxy, codec, independent/shared recovery, source-copy and named Python requirements; qualify meaningful exact-byte/behavior differentials rather than redefining an unsupported mode or counting enum coverage as implementation.
 - [ ] [CWC-16] Install and exercise the new format through actual authenticated runtime and shared service carriers, real bidirectional native/application bytes, control liveness, physical receipts, switch/drain, cancellation/failure/reconnect and observed release; distinguish protocol, user-space integration, privileged native and platform evidence.

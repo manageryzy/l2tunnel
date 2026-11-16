@@ -16,6 +16,8 @@ type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 mod compact;
 #[path = "secure_record/compact_arq.rs"]
 mod compact_arq;
+#[path = "secure_record/compact_carrier.rs"]
+mod compact_carrier;
 
 fn scope(epoch: u64, digest: u8) -> Scope {
     Scope {

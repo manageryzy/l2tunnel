@@ -108,6 +108,68 @@ impl CommonTransactionContract {
         make(role, local)
     }
 
+    /// Bind the complete selected compact catalog to a genuine OpenVPN outer proof.
+    /// Only initial bootstrap/member packets retain DataV1; final records use the
+    /// authenticated carrier layout directly on the original UDP socket.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_on_carrier_paired_compact(
+        base_policy: security::ConfigDigest,
+        role: security::Role,
+        resources: [Config; 2],
+        cover: cover::Config,
+        ipv6: bool,
+        base_envelope: common::EnvelopeDigest,
+        catalog: common::Catalog,
+        settings: TransactionSettings,
+        outer: establish::carrier::AuthenticatedOuter,
+        selection: record::compact::Selection,
+    ) -> io::Result<Self> {
+        let local = resources[match role {
+            security::Role::Initiator => 0,
+            security::Role::Responder => 1,
+        }];
+        managed::validate_carrier(outer, role, local, ipv6, catalog.initial())?;
+        for local in resources {
+            if local.path_mtu != outer.requested().path_mtu
+                || local
+                    .security
+                    .max_body_bytes
+                    .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+                    .is_none_or(|maximum| maximum > outer.requested().max_record_bytes)
+                || cover.limits().max_packet_bytes > outer.requested().max_record_bytes
+            {
+                return Err(invalid(
+                    "selected compact or setup exceeds actual OpenVPN owner capacity",
+                ));
+            }
+        }
+        let mut hash = digest::Context::new(&digest::SHA256);
+        hash.update(b"l2tunnel/common-compact-openvpn-carrier-layout/v1\0");
+        hash.update(base_envelope.as_bytes());
+        hash.update(&base_policy.0);
+        hash.update(&outer.binding());
+        hash.update(&outer.info().config.digest.0);
+        let mut envelope = [0; 32];
+        envelope.copy_from_slice(hash.finish().as_ref());
+        let mut result = Self::new_compact_wire(
+            base_policy,
+            role,
+            resources,
+            cover,
+            ipv6,
+            common::EnvelopeDigest::new(envelope),
+            catalog,
+            settings,
+            selection,
+        )?;
+        result.outer = Some(outer);
+        Ok(result)
+    }
+
+    pub(crate) fn on_outer_carrier(&self) -> bool {
+        self.outer.is_some()
+    }
+
     /// Exact explicit final-wire selection; absence retains legacy framing.
     pub fn compact_wire(&self) -> Option<record::compact::Selection> {
         self.compact_wire

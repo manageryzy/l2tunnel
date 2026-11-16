@@ -478,7 +478,7 @@ fn finish(hash: digest::Context) -> [u8; 32] {
 #[path = "transport_managed_contract_tests.rs"]
 mod tests;
 
-fn validate_carrier(
+pub(super) fn validate_carrier(
     outer: AuthenticatedOuter,
     role: security::Role,
     resources: Config,

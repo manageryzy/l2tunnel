@@ -57,7 +57,7 @@ impl Driver {
         let interval = self.config.work.receive_interval;
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common retry owner missing"))?;
         if runtime.path.unavailable {
             if runtime.path.retry_at_micros.is_some_and(|at| now < at) {
@@ -74,7 +74,7 @@ impl Driver {
         let next = add(now, self.config.work.receive_interval)?;
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common retry owner missing"))?;
         runtime.observation_dirty |= !runtime.path.unavailable;
         runtime.path.unavailable = true;
@@ -112,7 +112,7 @@ impl Driver {
                 );
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("rolling service owner"))?;
                 runtime.rolling_scheduler_steps = runtime.rolling_scheduler_steps.saturating_add(2);
                 for (total, (sent, received)) in runtime.rolling_work_used.iter_mut().zip([
@@ -138,7 +138,7 @@ impl Driver {
     }
     pub(super) fn observation_dirty(&self) -> bool {
         self.generic.as_ref().is_some_and(|r| r.observation_dirty)
-            || self.common.as_ref().is_some_and(|r| r.observation_dirty)
+            || self.common.as_deref().is_some_and(|r| r.observation_dirty)
     }
     pub(super) fn clear_observation_dirty(&mut self) {
         if let Some(r) = &mut self.generic {
@@ -153,7 +153,7 @@ impl Driver {
             let state = self.common_state()?;
             let runtime = self
                 .common
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| protocol("common scan contract"))?;
             Ok(self.common_epochs().into_iter().flatten().any(|epoch| {
                 runtime.native_work[(epoch.0 % 2) as usize] > 0
@@ -195,7 +195,7 @@ impl Driver {
     pub(super) fn can_admit_common_native(&self) -> io::Result<bool> {
         if self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|r| r.reuse_controller())
             .is_some_and(super::common_reuse::Controller::active)
         {
@@ -211,14 +211,14 @@ impl Driver {
             .common()
             .pipeline();
         if self.config.ack_coalescing.is_some() {
-            return Ok(!self.common.as_ref().is_some_and(|runtime| {
+            return Ok(!self.common.as_deref().is_some_and(|runtime| {
                 runtime.path.unavailable || runtime.pending_ingress.is_some()
             }) && state.can_admit_data());
         }
         let usage = engine.queue_usage();
         Ok(!self
             .common
-            .as_ref()
+            .as_deref()
             .is_some_and(|runtime| runtime.path.unavailable)
             && state.can_admit_data()
             && usage.packets < policy.queue.packets
@@ -297,7 +297,7 @@ impl Driver {
         };
         let proxy_timing = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.proxy_bridge.as_ref())
             .map(|bridge| bridge.timing())
             .transpose()?;
@@ -367,7 +367,7 @@ impl Driver {
             let index = (epoch.0 % 2) as usize;
             let remaining = self
                 .common
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| protocol("common scan contract"))?
                 .native_work[index];
             if remaining == 0 {
@@ -391,13 +391,13 @@ impl Driver {
                 )
                 .map_err(protocol)?;
             self.common
-                .as_mut()
+                .as_deref_mut()
                 .ok_or_else(|| protocol("common scan contract"))?
                 .native_work[index] = remaining - 1;
             match result {
                 record_bank::NativePreparation::Ready(packet) => {
                     self.common
-                        .as_mut()
+                        .as_deref_mut()
                         .ok_or_else(|| protocol("common scan contract"))?
                         .native_work[index] = 0;
                     lease.publish(
@@ -437,7 +437,7 @@ impl Driver {
                             .channels(),
                     );
                     self.common
-                        .as_mut()
+                        .as_deref_mut()
                         .ok_or_else(|| protocol("common scan contract"))?
                         .native_work[index] = width;
                 }
@@ -519,7 +519,7 @@ impl Driver {
                     .channels(),
             );
             self.common
-                .as_mut()
+                .as_deref_mut()
                 .ok_or_else(|| protocol("common scan contract"))?
                 .native_work[(epoch.0 % 2) as usize] = width;
         } else if matches!(&result, Ok(false)) {
@@ -568,17 +568,31 @@ impl Driver {
         self.flush_common_wire_sampled(now, &mut send, &mut sample)
     }
     fn prepare_common_wire(&mut self, now: u64) -> io::Result<bool> {
+        self.prepare_common_wire_for::<super::raw_carrier::NoRaw>(now, None)
+    }
+    fn prepare_common_wire_for<R: super::raw_carrier::RawBacking>(
+        &mut self,
+        now: u64,
+        raw: Option<&mut R>,
+    ) -> io::Result<bool> {
         if self
             .common
-            .as_ref()
+            .as_deref()
             .is_some_and(|runtime| runtime.sealed.is_some())
         {
             return Ok(true);
         }
+        if self
+            .common
+            .as_deref()
+            .is_some_and(|runtime| runtime.unsealed.is_some())
+        {
+            return self.finish_common_wire(now, raw);
+        }
         let epochs = self.common_epochs();
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common scheduler contract"))?;
         let first = usize::from(runtime.cursor);
         runtime.cursor = !runtime.cursor;
@@ -615,7 +629,7 @@ impl Driver {
                 };
                 if let Some(bridge) = self
                     .common
-                    .as_ref()
+                    .as_deref()
                     .and_then(|runtime| runtime.proxy_bridge.as_ref())
                 {
                     let engine::ProfileIdentity::Aligned(identity) = admitted.permit else {
@@ -644,7 +658,7 @@ impl Driver {
                 };
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("common witness owner"))?;
                 let owner::DataOwner::Common(state) = &mut self.owner else {
                     return Err(protocol("common poll owner"));
@@ -677,49 +691,6 @@ impl Driver {
             };
             let compact_feedback =
                 self.records.is_compact() && emission.kind == engine::EmissionKind::Feedback;
-            let sealed = if compact_feedback {
-                self.records.seal_feedback_in(
-                    scope,
-                    meta(self.outer, cover::Phase::Established),
-                    &self.buffers.frame[..emission.bytes],
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-            } else if self.records.key_epoch().is_ok() {
-                self.records
-                    .seal_user_in_at(
-                        l2tunnel::handshake::Time(now),
-                        scope,
-                        meta(self.outer, cover::Phase::Established),
-                        &self.buffers.frame[..emission.bytes],
-                        &mut self.buffers.seal,
-                        &mut self.buffers.wire,
-                    )
-                    .map(|sealed| sealed.record)
-            } else {
-                self.records.seal_user_in(
-                    scope,
-                    meta(self.outer, cover::Phase::Established),
-                    &self.buffers.frame[..emission.bytes],
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-            }
-            .map_err(record_error)?;
-            if (!compact_feedback && sealed.number != number)
-                || sealed.bytes.checked_add(self.ip) != Some(emission.wire_bytes)
-            {
-                return Err(protocol("common exact security number/wire charge differs"));
-            }
-            if compact_feedback {
-                self.common
-                    .as_mut()
-                    .ok_or_else(|| protocol("compact feedback owner"))?
-                    .compact_feedback_number = Some(sealed.number);
-            } else {
-                self.counters.user_number = Some(sealed.number);
-                self.counters.user_generation = Some(sealed.generation);
-            }
             let mut deadline = self
                 .common_state()?
                 .operation_deadline()
@@ -740,7 +711,7 @@ impl Driver {
             if let Some(cap) = fragment_deadline {
                 deadline = deadline.min(cap);
             }
-            let cost = sealed.bytes.checked_add(self.ip).ok_or_else(exhausted)?;
+            let cost = emission.wire_bytes;
             if fragment.is_none() {
                 self.bucket.charge(cost)?;
             }
@@ -752,18 +723,17 @@ impl Driver {
                 },
                 cost,
             );
-            self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
             self.counters.wire_packets = self.counters.wire_packets.saturating_add(1);
             self.counters.wire_bytes = self.counters.wire_bytes.saturating_add(cost as u64);
             let runtime = self
                 .common
-                .as_mut()
+                .as_deref_mut()
                 .ok_or_else(|| protocol("common sealed owner"))?;
             runtime
                 .wire
-                .get_mut(..sealed.bytes)
-                .ok_or_else(|| protocol("common sealed capacity"))?
-                .copy_from_slice(&self.buffers.wire[..sealed.bytes]);
+                .get_mut(..emission.bytes)
+                .ok_or_else(|| protocol("common pending body capacity"))?
+                .copy_from_slice(&self.buffers.frame[..emission.bytes]);
             let proxy_record = runtime.proxy_bridge.as_ref().and_then(|bridge| {
                 let identity = bridge.pending_identity()?;
                 runtime
@@ -798,17 +768,22 @@ impl Driver {
                     .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
                 bridge.bind_final_source(unit.identity, source)?;
             }
-            runtime.sealed = Some(common::PendingWire {
+            runtime.unsealed = Some(common::PendingPlain {
                 proxy_record,
                 scope,
-                sealed,
+                number: if compact_feedback {
+                    self.records.next_feedback_number().map_err(record_error)?
+                } else {
+                    number
+                },
+                bytes: emission.bytes,
                 feedback: compact_feedback,
                 cost,
                 deadline,
                 carrier,
                 fragment,
             });
-            return Ok(true);
+            return self.finish_common_wire(now, raw);
         }
         self.performance.counters.user_not_ready_polls = self
             .performance
@@ -817,6 +792,125 @@ impl Driver {
             .saturating_add(1);
         Ok(false)
     }
+    fn finish_common_wire<R: super::raw_carrier::RawBacking>(
+        &mut self,
+        now: u64,
+        mut raw: Option<&mut R>,
+    ) -> io::Result<bool> {
+        let runtime = self
+            .common
+            .as_deref_mut()
+            .ok_or_else(|| protocol("common pending owner"))?;
+        let pending = runtime
+            .unsealed
+            .as_ref()
+            .ok_or_else(|| protocol("common pending body"))?;
+        if now >= pending.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original Common body cap",
+            ));
+        }
+        let kind = if pending.feedback {
+            record::compact::Kind::Feedback
+        } else {
+            record::compact::Kind::Data
+        };
+        let capacity = self
+            .records
+            .capacity_for(kind, pending.bytes)
+            .map_err(record_error)?;
+        if capacity.packet_bytes.checked_add(self.ip) != Some(pending.cost) {
+            return Err(protocol("common exact final geometry differs"));
+        }
+        let metadata = if let Some(raw) = raw.as_deref_mut() {
+            let kind = if pending.feedback {
+                l2tunnel_raw_io::handoff::pairing::packet::compact::FinalKind::Feedback
+            } else {
+                l2tunnel_raw_io::handoff::pairing::packet::compact::FinalKind::Data
+            };
+            let Some(metadata) = raw.prepare_final(kind, capacity.packet_bytes)? else {
+                return Ok(false);
+            };
+            Some(metadata)
+        } else {
+            None
+        };
+        let body = &runtime.wire[..pending.bytes];
+        let result = if let Some(metadata) = metadata {
+            self.records.seal_compact_with_carrier(
+                kind,
+                pending.scope,
+                meta(self.outer, cover::Phase::Established),
+                body,
+                &metadata.aad(),
+                &mut self.buffers.seal,
+                &mut self.buffers.wire,
+            )
+        } else if pending.feedback {
+            self.records.seal_feedback_in(
+                pending.scope,
+                meta(self.outer, cover::Phase::Established),
+                body,
+                &mut self.buffers.seal,
+                &mut self.buffers.wire,
+            )
+        } else if self.records.key_epoch().is_ok() {
+            self.records
+                .seal_user_in_at(
+                    l2tunnel::handshake::Time(now),
+                    pending.scope,
+                    meta(self.outer, cover::Phase::Established),
+                    body,
+                    &mut self.buffers.seal,
+                    &mut self.buffers.wire,
+                )
+                .map(|sealed| sealed.record)
+        } else {
+            self.records.seal_user_in(
+                pending.scope,
+                meta(self.outer, cover::Phase::Established),
+                body,
+                &mut self.buffers.seal,
+                &mut self.buffers.wire,
+            )
+        };
+        let sealed = match result {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                if let Some(raw) = raw {
+                    raw.cancel_final()?;
+                }
+                return Err(record_error(error));
+            }
+        };
+        if sealed.number != pending.number || sealed.bytes != capacity.packet_bytes {
+            return Err(protocol("common exact security number/wire charge differs"));
+        }
+        if pending.feedback {
+            runtime.compact_feedback_number = Some(sealed.number);
+        } else {
+            self.counters.user_number = Some(sealed.number);
+            self.counters.user_generation = Some(sealed.generation);
+        }
+        self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
+        runtime.wire[..sealed.bytes].copy_from_slice(&self.buffers.wire[..sealed.bytes]);
+        let pending = runtime
+            .unsealed
+            .take()
+            .ok_or_else(|| protocol("common pending body lost"))?;
+        runtime.sealed = Some(common::PendingWire {
+            scope: pending.scope,
+            sealed,
+            feedback: pending.feedback,
+            cost: pending.cost,
+            deadline: pending.deadline,
+            carrier: pending.carrier,
+            fragment: pending.fragment,
+            proxy_record: pending.proxy_record,
+        });
+        Ok(true)
+    }
     pub(super) fn send_common_carrier<R: super::raw_carrier::RawBacking>(
         &mut self,
         socket: &mut carrier::IoOwner<R>,
@@ -824,12 +918,12 @@ impl Driver {
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<bool> {
         let result = (|| -> io::Result<bool> {
-            if !self.prepare_common_wire(now)? {
+            if !self.prepare_common_wire_for(now, socket.final_raw_mut())? {
                 return Ok(false);
             }
             let runtime = self
                 .common
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| protocol("common carrier output owner"))?;
             let pending = runtime
                 .sealed
@@ -883,7 +977,7 @@ impl Driver {
             .saturating_add(receipt.ip_bytes as u64);
         let pending = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("whole carrier write lost runtime"))?
             .sealed
             .take()
@@ -953,7 +1047,7 @@ impl Driver {
             if let Some(unit) = pending.proxy_record {
                 let bridge = self
                     .common
-                    .as_ref()
+                    .as_deref()
                     .and_then(|runtime| runtime.proxy_bridge.as_ref())
                     .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?;
                 if let Some(kind) = rejected {
@@ -989,7 +1083,7 @@ impl Driver {
         }
         let Some(pending) = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("common sealed owner"))?
             .sealed
             .as_ref()
@@ -1023,7 +1117,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common sealed owner"))?;
         match send(&runtime.wire[..sealed.bytes]) {
             Ok(bytes) if bytes == sealed.bytes => {
@@ -1066,7 +1160,7 @@ impl Driver {
                     if let Some(unit) = pending.proxy_record {
                         let bridge = self
                             .common
-                            .as_ref()
+                            .as_deref()
                             .and_then(|runtime| runtime.proxy_bridge.as_ref())
                             .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?;
                         if let Some(kind) = rejected {
@@ -1135,7 +1229,7 @@ impl Driver {
         if self.receive_common_fragment_at(opened, received, now, original)? {
             return Ok(());
         }
-        if self.common.as_ref().is_some_and(|runtime| {
+        if self.common.as_deref().is_some_and(|runtime| {
             runtime
                 .pending_feedback
                 .is_some_and(|p| p.physical_dependency.is_none())
@@ -1312,7 +1406,7 @@ impl Driver {
         if kind == engine::EmissionKind::Feedback
             && self
                 .common
-                .as_ref()
+                .as_deref()
                 .is_some_and(|runtime| runtime.pending_feedback.is_some())
         {
             self.counters.native_backpressure_drops =
@@ -1325,7 +1419,7 @@ impl Driver {
             ));
         }
         self.common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common scan contract"))?
             .native_work[(epoch.0 % 2) as usize] = width;
         let raw_connection = kind == engine::EmissionKind::UnreliableNative;
@@ -1344,7 +1438,7 @@ impl Driver {
                 .into_iter()
                 .chain(
                     self.common
-                        .as_ref()
+                        .as_deref()
                         .and_then(|runtime| runtime.outcome)
                         .map(common_actions::outcome_deadline),
                 )
@@ -1421,7 +1515,7 @@ impl Driver {
         let mut wake = self.lease;
         if let Some(state) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|r| r.reuse_controller())
             .filter(|r| r.active())
         {
@@ -1431,7 +1525,7 @@ impl Driver {
         }
         if let Some(cap) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.proxy_bridge.as_ref())
             .map(|bridge| bridge.retirement_deadline())
             .transpose()?
@@ -1441,7 +1535,7 @@ impl Driver {
         }
         if let Some(input) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.connection_input.as_ref())
             && let Some(deadline) = input.snapshot().deadline_micros
         {
@@ -1451,7 +1545,7 @@ impl Driver {
         }
         if let Some(pending) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.pending_ingress)
         {
             wake = wake
@@ -1470,7 +1564,7 @@ impl Driver {
         }
         if let Some(pending) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.pending_feedback)
         {
             wake = wake.min(pending.deadline);
@@ -1478,24 +1572,40 @@ impl Driver {
         if !held_user
             && let Some(pending) = self
                 .common
-                .as_ref()
+                .as_deref()
                 .and_then(|runtime| runtime.sealed.as_ref())
         {
             let retry = self
                 .common
-                .as_ref()
+                .as_deref()
                 .filter(|runtime| runtime.path.unavailable)
                 .and_then(|runtime| runtime.path.retry_at_micros)
                 .unwrap_or(now);
             wake = wake.min(retry).min(pending.deadline);
         }
+        if let Some(pending) = self.common.as_deref().and_then(|r| r.unsealed.as_ref()) {
+            wake = wake
+                .min(pending.deadline)
+                .min(add(now, self.config.work.receive_interval)?);
+        }
+        if let Some(pending) = self.common.as_deref().and_then(|r| r.raw_control.as_ref()) {
+            wake = wake.min(clock(self.origin, pending.deadline)?).min(
+                self.bucket
+                    .ready_at(pending.wire_bytes)?
+                    .max(add(now, self.config.work.receive_interval)?),
+            );
+        }
+        let held_control = held_control
+            || self
+                .common
+                .as_deref()
+                .is_some_and(|r| r.raw_control.is_some());
         // A retained retry already owns the only User wire slot. Do not wake
         // on another data/feedback poll while that exact slot waits its cadence.
         let held_user = held_user
-            || self
-                .common
-                .as_ref()
-                .is_some_and(|runtime| runtime.path.unavailable && runtime.sealed.is_some());
+            || self.common.as_deref().is_some_and(|runtime| {
+                runtime.unsealed.is_some() || (runtime.path.unavailable && runtime.sealed.is_some())
+            });
         if self.control_work || self.control.ready_nontransaction()? {
             wake = wake.min(now);
         }
@@ -1554,7 +1664,7 @@ impl Driver {
                 .local(common_contract::mg_role(self.info.role));
             let overhead = self
                 .common
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| protocol("common wake contract"))?
                 .contract
                 .geometry()
@@ -1573,7 +1683,7 @@ impl Driver {
             if let Some((at, bytes)) = engine.feedback_opportunity().map_err(protocol)? {
                 let feedback_overhead = self
                     .common
-                    .as_ref()
+                    .as_deref()
                     .ok_or_else(|| protocol("common feedback wake contract"))?
                     .contract
                     .feedback_overhead_bytes()?;
@@ -1705,21 +1815,24 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("common feedback owner"))?;
-        let output = runtime
-            .sealed
-            .as_ref()
-            .ok_or_else(|| protocol("feedback lost physical dependency"))?;
-        if output.scope != opened.scope
-            || output.carrier.as_ref().is_none_or(|token| {
+        let (scope, carrier, deadline) = if let Some(output) = runtime.sealed.as_ref() {
+            (output.scope, output.carrier.as_ref(), output.deadline)
+        } else if let Some(output) = runtime.unsealed.as_ref() {
+            (output.scope, output.carrier.as_ref(), output.deadline)
+        } else {
+            return Err(protocol("feedback lost physical dependency"));
+        };
+        if scope != opened.scope
+            || carrier.is_none_or(|token| {
                 token.emission().kind != engine::EmissionKind::Source(engine::SourceForm::DirectArq)
             })
             || runtime.pending_feedback.is_some()
         {
             return Err(protocol("feedback physical dependency differs"));
         }
-        let mut deadline = output.deadline.min(self.lease);
+        let mut deadline = deadline.min(self.lease);
         if let Some(cap) = self
             .common_state()?
             .operation_deadline()
@@ -1738,7 +1851,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("common feedback owner"))?;
         runtime
             .feedback_input
@@ -1767,16 +1880,26 @@ impl Driver {
     pub(super) fn retry_common_feedback(&mut self, now: u64) -> io::Result<bool> {
         let Some(pending) = self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.pending_feedback)
         else {
             return Ok(true);
         };
         if let Some(dependency) = pending.physical_dependency
-            && let Some(output) = self.common.as_ref().and_then(|r| r.sealed.as_ref())
+            && let Some(output) = self.common.as_deref().and_then(|r| r.sealed.as_ref())
         {
             if output.scope != pending.scope || output.sealed.number.0 != dependency {
                 return Err(protocol("Research feedback physical dependency changed"));
+            }
+            return Ok(false);
+        }
+        if let Some(dependency) = pending.physical_dependency
+            && let Some(output) = self.common.as_deref().and_then(|r| r.unsealed.as_ref())
+        {
+            if output.scope != pending.scope || output.number.0 != dependency {
+                return Err(protocol(
+                    "Research feedback pending-body dependency changed",
+                ));
             }
             return Ok(false);
         }
@@ -1806,7 +1929,7 @@ impl Driver {
         };
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("retained feedback runtime missing"))?;
         let bytes = runtime
             .feedback_input

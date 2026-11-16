@@ -22,9 +22,13 @@ strong feedback/control. The subsequent [runtime algorithm migration](modules/co
 connects existing Aligned/Packed, CompactARQ, independent-connection, Rolling and
 Research owners to the selected original-UDP format and existing epoch switching.
 Data outer framing is 9 bytes and strong feedback/control is 21 bytes, before
-actual algorithm, packing and fragment metadata. Validation remains scoped to
-recorded commands; raw TCP, other outer carriers, full SW-11/all47 and native,
-platform, geometry and performance gates retain their complete definitions.
+actual algorithm, packing and fragment metadata. The later
+[selected outer-carrier migration](modules/compact-wire-cleanup.md#selected-outer-carrier-migration)
+installs final Records directly on the original OpenVPN UDP owner and once on the
+original raw TCP owner, with finite shared-service evidence. Raw bootstrap proof
+geometry remains separate from actual final 49/61-byte IPv4/TCP data/control
+geometry. Full SW-11/all47, native/platform, geometry, protocol-identification and
+performance gates retain their complete definitions and scoped evidence.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

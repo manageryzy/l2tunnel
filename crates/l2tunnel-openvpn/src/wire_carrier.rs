@@ -237,6 +237,7 @@ pub struct ServerCredentials<'a> {
 }
 struct Submission {
     bytes: Vec<u8>,
+    final_record: bool,
     control: bool,
     completion: oneshot::Sender<Result<(), Error>>,
     custody: Option<common::send::Custody>,
@@ -265,7 +266,7 @@ struct Activation {
 pub struct Carrier {
     connection: AuthenticatedIo<DuplexStream>,
     input: mpsc::Sender<Submission>,
-    output: mpsc::Receiver<Vec<u8>>,
+    output: mpsc::Receiver<common::Received>,
     actor: JoinHandle<Result<(), Error>>,
     maximum: usize,
     sending: bool,
@@ -312,6 +313,7 @@ impl Carrier {
         owned.extend_from_slice(bytes);
         self.input
             .send(Submission {
+                final_record: false,
                 bytes: owned,
                 control: false,
                 completion,
@@ -323,7 +325,11 @@ impl Carrier {
     }
     /// Receive exact authenticated/replay-checked bytes in arrival order; loss stays visible.
     pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
-        self.output.recv().await.ok_or(Error::Closed)
+        self.output
+            .recv()
+            .await
+            .ok_or(Error::Closed)
+            .map(|packet| packet.bytes)
     }
 }
 impl Drop for Carrier {
@@ -337,7 +343,7 @@ struct Started {
     activation: mpsc::Sender<Activation>,
     input: Option<mpsc::Sender<Submission>>,
     priority: Option<mpsc::Sender<Submission>>,
-    output: Option<mpsc::Receiver<Vec<u8>>>,
+    output: Option<mpsc::Receiver<common::Received>>,
     actor: Option<JoinHandle<Result<(), Error>>>,
     local: SocketAddr,
     peer: SocketAddr,
@@ -422,6 +428,7 @@ fn start(
         started,
         budget: budget.clone(),
         physical: None,
+        final_records: None,
         #[cfg(test)]
         user_gate: None,
     }));

@@ -39,6 +39,8 @@ pub struct SameFlowRecovery {
 pub struct CommonSnapshot {
     /// Explicit selected final record format; None preserves legacy framing.
     pub compact_wire: Option<record::compact::Selection>,
+    /// Actual single-protection geometry installed on the original raw owner.
+    pub raw_final_geometry: Option<l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry>,
     /// Last actual strong feedback PN, independent from the Data repair seed.
     pub compact_feedback_number: Option<security::PacketNumber>,
     /// Actual sticky per-domain check failures under the original selected cap.
@@ -191,6 +193,24 @@ pub(super) struct PendingWire {
     pub(super) fragment: Option<l2tunnel::record_bank::FragmentOutputToken>,
     pub(super) proxy_record: Option<l2tunnel_codec::aligned_receiver::UnitWitness>,
 }
+/// One emitted algorithm body waiting for actual carrier metadata, in the same wire slab.
+pub(super) struct PendingPlain {
+    pub(super) scope: Scope,
+    pub(super) number: security::PacketNumber,
+    pub(super) bytes: usize,
+    pub(super) feedback: bool,
+    pub(super) cost: usize,
+    pub(super) deadline: u64,
+    pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
+    pub(super) fragment: Option<l2tunnel::record_bank::FragmentOutputToken>,
+    pub(super) proxy_record: Option<l2tunnel_codec::aligned_receiver::UnitWitness>,
+}
+/// One management emission awaiting the same raw lane reservation.
+pub(super) struct PendingRawControl {
+    pub(super) bytes: usize,
+    pub(super) wire_bytes: usize,
+    pub(super) deadline: Instant,
+}
 // Created only after the sole Records opener commits this exact User record.
 // Public copied metadata cannot install or reconstruct this retained authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +243,11 @@ pub(super) struct Runtime {
     pub(super) cursor: bool,
     pub(super) native_work: [usize; 2],
     pub(super) sealed: Option<PendingWire>,
+    pub(super) unsealed: Option<PendingPlain>,
+    pub(super) raw_control: Option<PendingRawControl>,
+    pub(super) raw_control_turn: bool,
+    pub(super) raw_final_geometry:
+        Option<l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry>,
     pub(super) wire: Vec<u8>,
     pub(super) pending_feedback: Option<PendingFeedback>,
     pub(super) compact_feedback_number: Option<security::PacketNumber>,
@@ -406,8 +431,8 @@ fn reserve_common_state(
 
 // Keep final Driver scratch off the stack while the Bank constructs its actual
 // reserved Engines. This continuation starts only after reservation returns and
-// moves the same Driver into the caller's existing charged owner; it allocates
-// no temporary or durable owner and preserves the original construction order.
+// assembles the charged Common cell and Driver without retaining another Driver
+// owner, preserving the original construction order.
 #[inline(never)]
 fn assemble_common_driver<T>(assemble: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     assemble()
@@ -516,7 +541,7 @@ impl Driver {
                     return Err(invalid("legacy material cannot install managed Records"));
                 }
                 if let Some(selection) = contract.compact_wire() {
-                    record::Records::new_compact(
+                    record::Records::new_compact_with_layout(
                         root,
                         security::LaneId(LANE),
                         config.security,
@@ -524,6 +549,11 @@ impl Driver {
                         control_scope,
                         data_scope,
                         selection,
+                        if contract.on_outer_carrier() || contract.raw_outer().is_some() {
+                            record::compact::Layout::Carrier
+                        } else {
+                            record::compact::Layout::Original
+                        },
                     )
                 } else {
                     record::Records::new(
@@ -626,8 +656,12 @@ impl Driver {
         } else {
             0
         };
+        // Common-only state has its own real cell; inactive legacy Drivers carry
+        // only the header. Validate and charge the payload before provisioning.
+        std::alloc::Layout::array::<Runtime>(1).map_err(io::Error::other)?;
         let external = std::mem::size_of::<Driver>()
             .checked_add(std::mem::size_of::<owner::StateCell<Driver>>())
+            .and_then(|v| v.checked_add(std::mem::size_of::<Runtime>()))
             .and_then(|v| v.checked_add(std::mem::size_of::<transactions::CommonState>()))
             .and_then(|v| v.checked_add(std::mem::size_of::<buffers::Inputs>()))
             .and_then(|v| v.checked_add(buffer_plan.capacity_bytes()))
@@ -647,7 +681,7 @@ impl Driver {
             .and_then(|v| v.checked_add(wrapper_plan.capacity_bytes()))
             .and_then(|v| v.checked_add(witness_bytes))
             .and_then(|v| v.checked_add(input.cover.limits().max_packet_bytes))
-            // The inline Vec/metadata headers are already in Driver; this is
+            // The Vec/metadata headers are already in the charged Runtime; this is
             // the one actual retained authenticated-feedback payload capacity.
             .and_then(|v| v.checked_add(config.security.max_body_bytes))
             .ok_or_else(exhausted)?;
@@ -764,6 +798,37 @@ impl Driver {
                 .report_interval
                 .map(|interval| add(0, interval))
                 .transpose()?;
+            let common = owner::StateCell::new(Runtime {
+                proxy_bridge: None,
+                reuse_owner,
+                contract,
+                action: None,
+                request: None,
+                cursor: false,
+                native_work: [0; 2],
+                sealed: None,
+                unsealed: None,
+                raw_control: None,
+                raw_control_turn: false,
+                raw_final_geometry: None,
+                wire,
+                pending_feedback: None,
+                compact_feedback_number: None,
+                pending_ingress: None,
+                feedback_input,
+                connection_input,
+                outcome: None,
+                completion: None,
+                observation_dirty: false,
+                witnesses,
+                sent: None,
+                delivered: None,
+                rolling_scheduler_steps: 0,
+                rolling_work_used: [0; 3],
+                fragment_data_drops: 0,
+                fragment_feedback_drops: 0,
+                path: SameFlowRecovery::default(),
+            })?;
             // Complete ownership here. The carrier moves this same Driver into its
             // existing cell without retaining additional inline Driver return slots
             // in callers while the reserved Bank is being constructed.
@@ -780,33 +845,7 @@ impl Driver {
                     records,
                     owner: owner::DataOwner::Common(owner),
                     generic: None,
-                    common: Some(Runtime {
-                        proxy_bridge: None,
-                        reuse_owner,
-                        contract,
-                        action: None,
-                        request: None,
-                        cursor: false,
-                        native_work: [0; 2],
-                        sealed: None,
-                        wire,
-                        pending_feedback: None,
-                        compact_feedback_number: None,
-                        pending_ingress: None,
-                        feedback_input,
-                        connection_input,
-                        outcome: None,
-                        completion: None,
-                        observation_dirty: false,
-                        witnesses,
-                        sent: None,
-                        delivered: None,
-                        rolling_scheduler_steps: 0,
-                        rolling_work_used: [0; 3],
-                        fragment_data_drops: 0,
-                        fragment_feedback_drops: 0,
-                        path: SameFlowRecovery::default(),
-                    }),
+                    common: Some(common),
                     send: config.send,
                     receive: config.receive,
                     source_scope: data_scope,
@@ -868,7 +907,7 @@ impl Driver {
         let state = self.common_state()?;
         let runtime = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("common runtime missing"))?;
         let current = *state.current();
         let local = current
@@ -883,6 +922,7 @@ impl Driver {
             compact_wire: runtime.contract.compact_wire(),
             compact_check_status: self.records.compact_check_status(),
             compact_feedback_number: runtime.compact_feedback_number,
+            raw_final_geometry: runtime.raw_final_geometry,
             running,
             elapsed_micros: now,
             info: self.info,

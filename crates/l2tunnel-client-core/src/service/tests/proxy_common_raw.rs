@@ -21,7 +21,10 @@ fn full_settings(
     )?)?)
 }
 
-fn plans(hosts: &[Arc<Host>; 2]) -> Result<(CarrierPlans, Vec<Arc<Probe>>)> {
+fn plans_wire(
+    hosts: &[Arc<Host>; 2],
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result<(CarrierPlans, Vec<Arc<Probe>>)> {
     let CarrierPlans {
         plans: [left, right],
         addresses,
@@ -126,6 +129,10 @@ fn plans(hosts: &[Arc<Host>; 2]) -> Result<(CarrierPlans, Vec<Arc<Probe>>)> {
         proxy,
         policy,
     )?;
+    let requested = match wire {
+        Some(selection) => requested.with_compact_wire(selection)?,
+        None => requested,
+    };
     assert!(requested.raw_binding().is_none() && requested.carrier_binding().is_none());
     let (_, [left_open, right_open], probes) = raw_originals(addresses, policy, 1)?;
     let local = [
@@ -182,9 +189,30 @@ fn plans(hosts: &[Arc<Host>; 2]) -> Result<(CarrierPlans, Vec<Arc<Probe>>)> {
 #[tokio::test]
 async fn actual_raw_full_common_proxy_preserves_physical_custody_tcp_bytes_liveness_retirement_and_release()
 -> Result {
+    exercise_proxy_wire(None).await
+}
+
+#[tokio::test]
+async fn actual_compact_wire_raw_full_proxy_preserves_tcp_retirement_and_both_suites() -> Result {
+    use l2tunnel::secure_record::compact::Selection;
+    use l2tunnel_security::compact::Protection;
+    for protection in [Protection::Aes128Ccm4, Protection::ChaCha20Crc32c] {
+        exercise_proxy_wire(Some(Selection {
+            protection,
+            limits: l2tunnel_security::compact::Selection {
+                max_forward_packets: 8192,
+                max_failed_checks: 64,
+            },
+        }))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn exercise_proxy_wire(wire: Option<l2tunnel::secure_record::compact::Selection>) -> Result {
     timeout(Duration::from_secs(35),async {
         let hosts=support::hosts();
-        let (CarrierPlans{plans:[a,b],addresses,requested},probes)=plans(&hosts)?;
+        let (CarrierPlans{plans:[a,b],addresses,requested},probes)=plans_wire(&hosts,wire)?;
         let (client,run)=channel();let (server,peer)=channel();
         let tasks=[tokio::spawn(run),tokio::spawn(peer)];
         let handles=[client,server];
@@ -202,6 +230,14 @@ async fn actual_raw_full_common_proxy_preserves_physical_custody_tcp_bytes_liven
             assert_eq!(common.local_addr,addresses[side]);assert_eq!(common.peer_addr,addresses[1-side]);
             assert_eq!(common.requested_carrier,common.effective_carrier);
             assert!(!frame.released && !frame.releasing);
+            match (wire, common.compact_wire.as_ref()) {
+                (Some(selection), Some(actual)) => {
+                    assert_eq!(actual.requested, crate::secure_udp::common_status::CompactWireSelection::from_selection(selection)?);
+                    assert_eq!(actual.effective.as_ref(), Some(&actual.requested));
+                }
+                (None, None) => {}
+                _ => return Err("raw proxy compact requested/effective status absent".into()),
+            }
         }
         assert_eq!(probes[0].opened.load(Ordering::SeqCst),1);
         assert_eq!(probes[1].opened.load(Ordering::SeqCst),1);

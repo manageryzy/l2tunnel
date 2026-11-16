@@ -466,12 +466,6 @@ impl Profile {
     /// Derive an effective plan only from a genuine completed outer proof.
     /// The original settings/catalog/resources remain retained and unchanged.
     pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
-        if self.compact_wire.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "compact v3 currently supports the original UDP carrier only",
-            ));
-        }
         if self.proxy.is_some() || self.connection_reuse {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -497,6 +491,9 @@ impl Profile {
         let role = outer_role(outer)?;
         let mut resources = [self.initiator, self.responder];
         for value in &mut resources {
+            if self.compact_wire.is_some() {
+                continue;
+            }
             if let Some(policy) = value.rolling_fragments.as_mut() {
                 policy.forward.framing.outer_overhead_bytes =
                     extra_byte(policy.forward.framing.outer_overhead_bytes)?;
@@ -521,7 +518,11 @@ impl Profile {
             configuration: requested_configuration,
         };
         let mut result = self.clone();
-        result.catalog = carrier_catalog(&self.catalog)?;
+        result.catalog = if self.compact_wire.is_some() {
+            self.catalog.clone()
+        } else {
+            carrier_catalog(&self.catalog)?
+        };
         result.requested_catalog = Some(self.catalog.clone());
         let contract = result.carrier_contract(binding, role)?;
         binding.configuration = contract.expected_configuration();
@@ -559,10 +560,11 @@ impl Profile {
         self.requested_catalog.as_ref().unwrap_or(&self.catalog)
     }
     /// Exact role-specific factory input; copied observations create no authority.
-    /// Bound profiles carry the actual extra opcode and effective setup identity.
+    /// Bound OpenVPN profiles retain the bootstrap opcode and effective setup
+    /// identity; selected final Records geometry belongs to the runtime contract.
     pub fn establish_config(&self, role: security::Role) -> io::Result<establish::Config> {
         let mut config = self.settings.runtime(role, self.peers)?;
-        if self.compact_wire.is_some() {
+        if self.compact_wire.is_some() && self.raw.is_none() && self.carrier.is_none() {
             config.binding.configuration = self.compact_contract(role)?.expected_configuration().0;
         }
         if self.raw.is_some() {
@@ -608,27 +610,24 @@ impl Profile {
     }
     /// Actual setup/Control digest consumed by the maintained authentication factories.
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
+        if let Some(raw) = self.raw {
+            return Ok(raw.configuration);
+        }
+        if let Some(binding) = self.carrier {
+            return Ok(binding.configuration);
+        }
         if self.compact_wire.is_some() {
             return Ok(self
                 .compact_contract(security::Role::Initiator)?
                 .expected_configuration());
         }
-        if let Some(raw) = self.raw {
-            return Ok(raw.configuration);
-        }
-        match self.carrier {
-            Some(value) => Ok(value.configuration),
-            None => self.settings.configuration(self.peers),
-        }
+        self.settings.configuration(self.peers)
     }
     /// Transfer the exact selected role resources/catalog and setup identity.
     pub fn runtime_contract(
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        if self.compact_wire.is_some() {
-            return self.compact_contract(role);
-        }
         if self.raw.is_some() {
             return self.raw_contract(role);
         }
@@ -639,6 +638,9 @@ impl Profile {
                 ));
             }
             return self.carrier_contract(binding, role);
+        }
+        if self.compact_wire.is_some() {
+            return self.compact_contract(role);
         }
         let contract = transport::CommonTransactionContract::new(
             self.configuration()?,
@@ -727,6 +729,20 @@ impl Profile {
         binding: CarrierBinding,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if let Some(selection) = self.compact_wire {
+            return transport::CommonTransactionContract::new_on_carrier_paired_compact(
+                binding.requested_configuration,
+                role,
+                binding.resources,
+                self.settings.cover.config(role)?,
+                self.settings.gate.path.client.is_ipv6(),
+                binding.requested_envelope,
+                self.catalog.clone(),
+                self.parameters,
+                binding.outer,
+                selection,
+            );
+        }
         transport::CommonTransactionContract::new_on_carrier_paired(
             binding.requested_configuration,
             role,

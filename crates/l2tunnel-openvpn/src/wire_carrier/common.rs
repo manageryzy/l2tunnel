@@ -176,6 +176,23 @@ pub enum Class {
     Control,
 }
 
+/// Exact outer framing observed by the original socket actor, not authentication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiveFraming {
+    /// An explicit OpenVPN DataV1 packet, with its opcode removed.
+    DataV1,
+    /// A selected final record received without an OpenVPN data wrapper.
+    Final,
+}
+
+/// Untrusted record bytes with the actor's unambiguous outer framing fact.
+pub struct Received {
+    /// Exact caller record; authentication remains with the common owner.
+    pub bytes: Vec<u8>,
+    /// Framing selected before stripping any outer bytes.
+    pub framing: ReceiveFraming,
+}
+
 /// Retained outer TLS control and unmodified caller-owned common record bytes.
 ///
 /// Incoming records deliberately undergo no authentication/replay acceptance here.
@@ -185,7 +202,7 @@ pub struct Carrier {
     connection: AuthenticatedIo<DuplexStream>,
     input: mpsc::Sender<Submission>,
     priority: mpsc::Sender<Submission>,
-    output: mpsc::Receiver<Vec<u8>>,
+    output: mpsc::Receiver<Received>,
     actor: JoinHandle<Result<(), Error>>,
     config: Config,
     budget: crate::budget::Budget,
@@ -194,6 +211,23 @@ pub struct Carrier {
     shared: send::Shared,
 }
 impl Carrier {
+    /// Select the disjoint final-record namespace on this actual authenticated owner.
+    /// The caller must bind the same selection before Noise/member establishment.
+    /// Retained TLS and DataV1 setup tails keep their original absolute cap only.
+    pub fn select_final_records(&mut self, setup_deadline: Instant) -> Result<(), Error> {
+        before_deadline(setup_deadline)?;
+        if setup_deadline > self.shared.expires {
+            return Err(Error::Configuration);
+        }
+        self.shared
+            .final_records
+            .set(setup_deadline)
+            .map_err(|_| Error::Configuration)
+    }
+    /// True only after this owner explicitly selected final, unwrapped records.
+    pub fn final_records(&self) -> bool {
+        self.shared.final_records.get().is_some()
+    }
     /// Actual outer TLS/member proof, explicitly distinct from common Noise membership.
     pub fn outer_info(&self) -> &SessionInfo {
         self.connection.info()
@@ -227,7 +261,7 @@ impl Carrier {
     /// Completes after one whole socket write, with no cipher operation or user ARQ.
     /// Local class selection reserves pacing only; cancellation may still send bytes.
     pub async fn send(&self, class: Class, record: &[u8]) -> Result<(), Error> {
-        self.validate_send(record, self.shared.expires)?;
+        self.validate_send(record, self.shared.expires, self.final_records())?;
         let permit = timeout_at(
             self.shared.expires,
             self.shared.slots(class).acquire_owned(),
@@ -235,7 +269,13 @@ impl Carrier {
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|_| Error::Closed)?;
-        let (submission, pending) = self.submission(class, record, self.shared.expires, permit)?;
+        let (submission, pending) = self.submission(
+            class,
+            record,
+            self.shared.expires,
+            permit,
+            self.final_records(),
+        )?;
         let input = if class == Class::Control {
             &self.priority
         } else {
@@ -261,8 +301,31 @@ impl Carrier {
         record: &[u8],
         deadline: Instant,
     ) -> Result<PendingSend, Error> {
+        self.try_send_selected_until(class, record, deadline, self.final_records())
+    }
+    /// Retain one original DataV1 setup tail under the immutable setup cap.
+    pub fn try_send_bootstrap_until(
+        &self,
+        class: Class,
+        record: &[u8],
+        deadline: Instant,
+    ) -> Result<PendingSend, Error> {
+        let deadline = self
+            .shared
+            .final_records
+            .get()
+            .map_or(deadline, |cap| deadline.min(*cap));
+        self.try_send_selected_until(class, record, deadline, false)
+    }
+    fn try_send_selected_until(
+        &self,
+        class: Class,
+        record: &[u8],
+        deadline: Instant,
+        final_record: bool,
+    ) -> Result<PendingSend, Error> {
         let deadline = deadline.min(self.shared.expires);
-        self.validate_send(record, deadline)?;
+        self.validate_send(record, deadline, final_record)?;
         let permit = self
             .shared
             .slots(class)
@@ -273,7 +336,8 @@ impl Carrier {
                 }
                 tokio::sync::TryAcquireError::Closed => Error::Closed,
             })?;
-        let (submission, pending) = self.submission(class, record, deadline, permit)?;
+        let (submission, pending) =
+            self.submission(class, record, deadline, permit, final_record)?;
         let input = if class == Class::Control {
             &self.priority
         } else {
@@ -285,13 +349,21 @@ impl Carrier {
         })?;
         Ok(pending)
     }
-    fn validate_send(&self, record: &[u8], deadline: Instant) -> Result<(), Error> {
+    fn validate_send(
+        &self,
+        record: &[u8],
+        deadline: Instant,
+        final_record: bool,
+    ) -> Result<(), Error> {
         if record.is_empty() || record.len() > self.config.max_record_bytes {
+            return Err(Error::Configuration);
+        }
+        if final_record && (!self.final_records() || !super::actor::final_prefix(record)) {
             return Err(Error::Configuration);
         }
         record
             .len()
-            .checked_add(self.config.outer_overhead_bytes)
+            .checked_add(self.config.outer_overhead_bytes - usize::from(final_record))
             .filter(|bytes| *bytes <= self.config.path_mtu)
             .ok_or(Error::Configuration)?;
         before_deadline(deadline)?;
@@ -303,8 +375,9 @@ impl Carrier {
         record: &[u8],
         deadline: Instant,
         permit: tokio::sync::OwnedSemaphorePermit,
+        final_record: bool,
     ) -> Result<(Submission, PendingSend), Error> {
-        self.validate_send(record, deadline)?;
+        self.validate_send(record, deadline, final_record)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(record.len())
@@ -316,6 +389,7 @@ impl Carrier {
         Ok((
             Submission {
                 bytes,
+                final_record,
                 control: class == Class::Control,
                 completion,
                 custody: Some(send::Custody {
@@ -337,6 +411,10 @@ impl Carrier {
     /// Receive exact untrusted opaque bytes in arrival order; common security must open them.
     /// The caller authenticates and replay-checks them; this substrate does not filter duplicates.
     pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
+        self.recv_framed().await.map(|packet| packet.bytes)
+    }
+    /// Receive bytes and their original framing without inspecting the inner payload.
+    pub async fn recv_framed(&mut self) -> Result<Received, Error> {
         self.output.recv().await.ok_or(Error::Closed)
     }
     /// Poll the unique raw receive owner without adding another reader or queue.
@@ -344,6 +422,14 @@ impl Carrier {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Vec<u8>, Error>> {
+        self.poll_recv_framed(cx)
+            .map(|result| result.map(|packet| packet.bytes))
+    }
+    /// Poll the same bounded queue while preserving its explicit outer framing.
+    pub fn poll_recv_framed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Received, Error>> {
         self.output
             .poll_recv(cx)
             .map(|packet| packet.ok_or(Error::Closed))
@@ -410,6 +496,7 @@ fn start(
         started,
         budget: budget.clone(),
         physical: Some(shared.physical.clone()),
+        final_records: Some(shared.final_records.clone()),
         #[cfg(test)]
         user_gate: Some(shared.user_gate.clone()),
     }));

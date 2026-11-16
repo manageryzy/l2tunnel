@@ -42,7 +42,7 @@ impl Driver {
         };
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("fragment scheduler witnesses missing"))?;
         let mut entry = state.entry(epoch)?;
         let Some(group) = entry
@@ -207,7 +207,7 @@ impl Driver {
             Ok(status) => {
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("fragment input observation owner"))?;
                 runtime.observation_dirty = true;
                 if status == engine::FragmentAdmission::Accepted {
@@ -226,7 +226,7 @@ impl Driver {
                     // and Rolling queue custody remain exact; the carrier is lossy.
                     let runtime = self
                         .common
-                        .as_mut()
+                        .as_deref_mut()
                         .ok_or_else(|| protocol("fragment pressure owner"))?;
                     runtime.fragment_data_drops = runtime.fragment_data_drops.saturating_add(1);
                     runtime.observation_dirty = true;
@@ -268,7 +268,7 @@ impl Driver {
         if self.research_physical_output(opened.scope)?
             && self
                 .common
-                .as_ref()
+                .as_deref()
                 .is_some_and(|r| r.pending_feedback.is_some())
         {
             return Err(protocol(
@@ -277,7 +277,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("fragment feedback retained owner missing"))?;
         if runtime.pending_feedback.is_some() {
             runtime.fragment_feedback_drops = runtime.fragment_feedback_drops.saturating_add(1);
@@ -338,7 +338,7 @@ impl Driver {
                 );
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("fragment completion observation owner"))?;
                 runtime.native_work[(epoch.0 % 2) as usize] = width;
                 runtime.observation_dirty = true;

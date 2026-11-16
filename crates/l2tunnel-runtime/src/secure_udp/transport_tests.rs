@@ -1955,9 +1955,9 @@ async fn event_expiry_preserves_lease_challenge_native_and_policy_priority() -> 
 
 struct ReadyWakeFixture {
     socket: tokio::net::UdpSocket,
-    driver: Driver,
+    driver: owner::StateCell<Driver>,
     _remote_socket: tokio::net::UdpSocket,
-    remote: Driver,
+    remote: owner::StateCell<Driver>,
     now: u64,
 }
 impl ReadyWakeFixture {
@@ -1971,12 +1971,16 @@ impl ReadyWakeFixture {
         config.lifetime.lease = Duration::from_secs(60);
         config.lifetime.ping_interval = Duration::from_secs(10);
         config.report_interval = None;
-        let (a, b) = parts_pair(kind).await?;
+        // Keep actual peer setup and the two retained Drivers out of each
+        // caller's nested test future; authentication and ownership are unchanged.
+        let (a, b) = Box::pin(parts_pair(kind)).await?;
         let setup_end = a.deadline.max(b.deadline);
         let origin = Instant::now();
-        let (socket, mut driver) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
-        let (remote_socket, mut remote) =
+        let (socket, driver) = Driver::new(a, security::ConfigDigest([3; 32]), config, origin)?;
+        let mut driver = owner::StateCell::new(driver)?;
+        let (remote_socket, remote) =
             Driver::new(b, security::ConfigDigest([3; 32]), config, origin)?;
+        let mut remote = owner::StateCell::new(remote)?;
         // Retire actual bootstrap/joining custody at its original deadline,
         // without allowing an unrelated tail wake to mask ready Swift work.
         driver.bucket.tokens = 0;
@@ -1996,7 +2000,7 @@ impl ReadyWakeFixture {
     }
 
     fn ready_at(&mut self) -> Result<(u64, Instant)> {
-        let driver = &mut self.driver;
+        let driver = &mut *self.driver;
         assert!(driver.owner.legacy()?.engine.data_ready(self.now));
         // With flush=0, free source retention and no queued native bytes, only
         // an idle probe remains in data_deadline despite the already-ready work.
@@ -2061,14 +2065,15 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
     for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
         let mut fixture = ReadyWakeFixture::new(kind, false).await?;
         let first = fixture.now - 5_000;
+        let remote = &mut *fixture.remote;
         for number in 0..4 {
             let wire = source(&mut fixture.driver, first + u64::from(number), number)?;
             if number != 0 {
-                fixture.remote.receive(
+                remote.receive(
                     &wire,
                     first + 100 + u64::from(number),
-                    fixture.remote.origin + duration(first + 100 + u64::from(number)),
-                    &resolve(fixture.remote.config),
+                    remote.origin + duration(first + 100 + u64::from(number)),
+                    &resolve(remote.config),
                 )?;
             }
         }
@@ -2076,20 +2081,9 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
             fixture.driver.owner.legacy()?.engine.stats().sender.sources,
             4
         );
-        assert_eq!(
-            fixture
-                .remote
-                .owner
-                .legacy()?
-                .engine
-                .stats()
-                .receiver
-                .sources,
-            3
-        );
-        let number = fixture.remote.records.next_number(Class::User);
-        let body = fixture
-            .remote
+        assert_eq!(remote.owner.legacy()?.engine.stats().receiver.sources, 3);
+        let number = remote.records.next_number(Class::User);
+        let body = remote
             .owner
             .legacy_mut()?
             .engine
@@ -2098,19 +2092,20 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
         assert_eq!(body[0] & swift::KIND_MASK, swift::KIND_FEEDBACK);
         assert_eq!(body[swift::FEEDBACK_HEADER - 1], 1);
         assert_eq!(&body[swift::FEEDBACK_HEADER..], &[0, 0]);
-        let mut wire = vec![0; fixture.remote.cover.limits().max_packet_bytes];
-        let sealed = fixture.remote.records.seal_user_in(
-            fixture.remote.feedback_scope,
-            meta(fixture.remote.outer, cover::Phase::Established),
+        let mut wire = vec![0; remote.cover.limits().max_packet_bytes];
+        let sealed = remote.records.seal_user_in(
+            remote.feedback_scope,
+            meta(remote.outer, cover::Phase::Established),
             body,
-            &mut fixture.remote.buffers.seal,
+            &mut remote.buffers.seal,
             &mut wire,
         )?;
-        fixture.driver.receive(
+        let driver = &mut *fixture.driver;
+        driver.receive(
             &wire[..sealed.bytes],
             fixture.now,
-            fixture.driver.origin + duration(fixture.now),
-            &resolve(fixture.driver.config),
+            driver.origin + duration(fixture.now),
+            &resolve(driver.config),
         )?;
         assert_eq!(
             fixture
@@ -2129,12 +2124,9 @@ async fn queued_retransmission_wakes_when_wire_credit_returns_before_the_idle_pr
             fixture.driver.origin + duration(ready),
             "queued authenticated retransmission slept until a later idle probe"
         );
-        fixture.driver.progress(ready)?;
-        fixture.driver.send(
-            &fixture.socket,
-            ready,
-            fixture.driver.origin + duration(ready),
-        )?;
+        let driver = &mut *fixture.driver;
+        driver.progress(ready)?;
+        driver.send(&fixture.socket, ready, driver.origin + duration(ready))?;
         assert_eq!(
             fixture
                 .driver
@@ -2171,12 +2163,9 @@ async fn earned_repair_wakes_when_wire_credit_returns_before_the_idle_probe() ->
             fixture.driver.origin + duration(ready),
             "earned repair slept until a later idle probe"
         );
-        fixture.driver.progress(ready)?;
-        fixture.driver.send(
-            &fixture.socket,
-            ready,
-            fixture.driver.origin + duration(ready),
-        )?;
+        let driver = &mut *fixture.driver;
+        driver.progress(ready)?;
+        driver.send(&fixture.socket, ready, driver.origin + duration(ready))?;
         assert_eq!(
             fixture.driver.owner.legacy()?.engine.stats().sender.repairs,
             1

@@ -181,6 +181,7 @@ pub(in super::super) struct Custody {
     pub(in super::super) _permit: OwnedSemaphorePermit,
 }
 pub(in super::super) struct Shared {
+    pub(in super::super) final_records: Arc<std::sync::OnceLock<Instant>>,
     pub(super) user: Arc<Semaphore>,
     pub(super) control: Arc<Semaphore>,
     pub(in super::super) physical: Ledger,
@@ -191,6 +192,7 @@ pub(in super::super) struct Shared {
 impl Shared {
     pub(super) fn new(slots: usize, expires: Instant) -> Self {
         Self {
+            final_records: Arc::new(std::sync::OnceLock::new()),
             user: Arc::new(Semaphore::new(slots)),
             control: Arc::new(Semaphore::new(slots)),
             physical: Ledger::new(),

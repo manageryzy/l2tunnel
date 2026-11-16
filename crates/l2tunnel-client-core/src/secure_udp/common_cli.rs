@@ -40,12 +40,6 @@ impl Plan {
             .ok_or_else(|| invalid("initial index outside catalog"))?;
         if let Some(value) = dto.compact_wire {
             value.build()?;
-            if dto.outer_carrier.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "compact v3 currently requires the original UDP carrier",
-                ));
-            }
         }
         Ok(Self {
             catalog: Catalog::new(initial, &dto.catalog.0).map_err(io::Error::other)?,
@@ -231,12 +225,6 @@ impl Plan {
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
-        if self.compact_wire.is_some() && raw.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "compact v3 currently requires the original UDP backend",
-            ));
-        }
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
         let inert = l2tunnel_swift::policy::Direction {
@@ -262,7 +250,12 @@ impl Plan {
             },
         };
         let overhead = if self.compact_wire.is_some() {
-            let physical: usize = if settings.gate.path.client.is_ipv6() {
+            let physical: usize = if let Some(policy) = raw {
+                policy
+                    .record_geometry()
+                    .map_err(io::Error::other)?
+                    .ip_tcp_bytes
+            } else if settings.gate.path.client.is_ipv6() {
                 48
             } else {
                 28
@@ -309,6 +302,19 @@ impl Plan {
             config.rolling_ingress = rolling;
         }
         if let Some(policy) = raw {
+            if let Some(selection) = self.compact_wire {
+                return secure_udp::common_transaction_profile::Profile::new_raw_compact(
+                    connection,
+                    settings,
+                    peers,
+                    configs[0],
+                    configs[1],
+                    self.catalog.clone(),
+                    self.parameters,
+                    policy,
+                    selection.build()?,
+                );
+            }
             return secure_udp::common_transaction_profile::Profile::new_raw(
                 connection,
                 settings,

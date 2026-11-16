@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct RawPacketPolicy {
     /// Complete IPv4 packet ceiling.
     pub mtu: u16,
-    /// Actual outer integrity/confidentiality suite.
+    /// Actual bootstrap integrity/confidentiality suite; compact final Records
+    /// protection is reported separately after the original-owner transition.
     pub protection: String,
     /// Per-lane bounded packet slots.
     pub queue_packets: u16,
@@ -41,6 +42,26 @@ pub struct RawLane {
     pub session: [u8; 16],
     /// Actual TLS/member configuration commitment.
     pub configuration: [u8; 32],
+}
+
+/// Geometry observed only after the actual original owner activates compact Records.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawFinalFraming {
+    /// Complete configured IPv4 packet ceiling.
+    pub path_mtu: u64,
+    /// Actual IPv4 and TCP header cost.
+    pub ip_tcp_bytes: u64,
+    /// Final carrier wrapper cost, excluding the Records union.
+    pub record_overhead_bytes: u64,
+    /// Complete compact Records packet capacity inside the actual TCP payload.
+    pub max_record_bytes: u64,
+    /// Actual full data overhead including the selected Records check.
+    pub data_overhead_bytes: u64,
+    /// Actual full control/feedback overhead including strong authentication.
+    pub control_feedback_overhead_bytes: u64,
+    /// Exactly one final Records protection layer.
+    pub protection_layers: u8,
 }
 
 /// Requested configuration and facts from the actual TLS/member handoff.
@@ -80,10 +101,17 @@ pub struct RawCarrier {
     pub profile_digest: [u8; 32],
     /// Exact per-packet IPv4 and TCP header cost.
     pub ip_tcp_bytes: u64,
-    /// Exact outer protected record and phase framing cost.
+    /// Exact bootstrap protected record and phase framing cost. Legacy sessions
+    /// retain this same framing throughout their lifetime.
     pub record_overhead_bytes: u64,
-    /// Exact upper protected record capacity within the original MTU.
+    /// Exact bootstrap protected record capacity within the original MTU.
     pub max_record_bytes: u64,
+    /// Present for compact selection: the preceding proof geometry is bootstrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_scope: Option<String>,
+    /// Actual final framing, absent until successful runtime activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_framing: Option<RawFinalFraming>,
     /// Actual occupied originals; an unused second lane remains absent.
     pub lanes: [Option<RawLane>; 2],
 }
@@ -118,6 +146,7 @@ impl RawCarrier {
         profile: &crate::secure_udp::common_transaction_profile::Profile,
         configuration: l2tunnel_security::ConfigDigest,
         inner_cover: &str,
+        snapshot: Option<&l2tunnel_runtime::secure_udp::transport::CommonSnapshot>,
     ) -> std::io::Result<Option<Self>> {
         use super::invalid;
         let Some(outer) = profile.raw_binding() else {
@@ -148,6 +177,36 @@ impl RawCarrier {
         }
         let number = |n| u64::try_from(n).map_err(invalid);
         let geometry = outer.geometry();
+        let final_framing = snapshot
+            .and_then(|value| value.raw_final_geometry)
+            .map(|actual| {
+                if profile.compact_wire().is_none()
+                    || actual.ip_tcp_bytes != 40
+                    || actual.record_overhead_bytes != 0
+                    || actual.path_mtu != geometry.path_mtu
+                    || actual.max_record_bytes.checked_add(actual.ip_tcp_bytes)
+                        != Some(actual.path_mtu)
+                {
+                    return Err(invalid(
+                        "actual raw final geometry differs from compact carrier",
+                    ));
+                }
+                Ok(RawFinalFraming {
+                    path_mtu: number(actual.path_mtu)?,
+                    ip_tcp_bytes: number(actual.ip_tcp_bytes)?,
+                    record_overhead_bytes: number(actual.record_overhead_bytes)?,
+                    max_record_bytes: number(actual.max_record_bytes)?,
+                    data_overhead_bytes: number(
+                        actual.ip_tcp_bytes + l2tunnel::secure_record::compact::DATA_OVERHEAD,
+                    )?,
+                    control_feedback_overhead_bytes: number(
+                        actual.ip_tcp_bytes
+                            + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD,
+                    )?,
+                    protection_layers: 1,
+                })
+            })
+            .transpose()?;
         Ok(Some(Self {
             requested: "raw-packet".into(),
             effective: "raw-packet".into(),
@@ -171,6 +230,8 @@ impl RawCarrier {
             ip_tcp_bytes: number(geometry.ip_tcp_bytes)?,
             record_overhead_bytes: number(geometry.record_overhead_bytes)?,
             max_record_bytes: number(geometry.max_record_bytes)?,
+            geometry_scope: profile.compact_wire().map(|_| "bootstrap".into()),
+            final_framing,
             lanes,
         }))
     }

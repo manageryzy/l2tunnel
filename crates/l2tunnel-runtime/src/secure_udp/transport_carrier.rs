@@ -22,6 +22,7 @@ struct User {
 }
 struct Control {
     bytes: usize,
+    bootstrap: bool,
     cost: usize,
     pending: Pending,
 }
@@ -30,6 +31,7 @@ pub(super) struct CarrierIo {
     control_bytes: Vec<u8>,
     input: Vec<u8>,
     input_length: Option<usize>,
+    input_framing: Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
     user: Option<User>,
     control: Option<Control>,
 }
@@ -77,7 +79,9 @@ impl From<tokio::net::UdpSocket> for IoOwner {
 }
 impl IoOwner {
     pub(super) fn from_original(datagram: OriginalDatagram) -> io::Result<Self> {
-        if datagram.outer_info().is_none() || datagram.geometry().extra_wire_bytes != 1 {
+        if datagram.outer_info().is_none()
+            || datagram.geometry().extra_wire_bytes != usize::from(!datagram.final_records())
+        {
             return Err(invalid(
                 "selected carrier requires the actual opaque outer owner",
             ));
@@ -95,6 +99,7 @@ impl IoOwner {
             control_bytes,
             input,
             input_length: None,
+            input_framing: None,
             user: None,
             control: None,
         });
@@ -369,10 +374,10 @@ impl<R: RawBacking> IoOwner<R> {
                 }),
         }
     }
-    pub(super) fn authenticated_input_before(&self, accepted: Instant) -> io::Result<bool> {
+    pub(super) fn input_for_ordering_before(&self, accepted: Instant) -> io::Result<bool> {
         match self {
             Self::Raw(values) => Ok(values[0]
-                .earliest_authenticated_input_at()?
+                .earliest_input_for_ordering_at()?
                 .is_some_and(|at| at <= accepted)),
             // OpenVPN payloads have not passed Records yet. Their inner
             // authenticated observation is assigned at the sole opener, not
@@ -380,21 +385,44 @@ impl<R: RawBacking> IoOwner<R> {
             Self::Udp(_) | Self::Carrier(_) => Ok(false),
         }
     }
+    pub(super) fn final_raw_mut(&mut self) -> Option<&mut R> {
+        match self {
+            Self::Raw(values) if values[0].geometry().record_overhead_bytes == 0 => {
+                Some(&mut values[0])
+            }
+            _ => None,
+        }
+    }
+    #[cfg(test)]
     pub(super) fn stage_control(
         &mut self,
         bytes: &[u8],
         cost: usize,
         deadline: Instant,
     ) -> io::Result<SendProgress> {
+        self.stage_control_with_bootstrap(bytes, cost, deadline, false)
+    }
+    fn stage_control_with_bootstrap(
+        &mut self,
+        bytes: &[u8],
+        cost: usize,
+        deadline: Instant,
+        bootstrap: bool,
+    ) -> io::Result<SendProgress> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, deadline),
-            Self::Raw(values) => values[0].stage_control(bytes, cost, deadline),
+            Self::Raw(values) => values[0].stage_control(bytes, cost, deadline, bootstrap),
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 if value.control.is_some() {
                     return Err(protocol("carrier Control slot already retained"));
                 }
-                if value.datagram.geometry().full_ip_bytes(bytes.len())? != cost {
+                let actual = if bootstrap {
+                    value.datagram.bootstrap_ip_bytes(bytes.len())?
+                } else {
+                    value.datagram.geometry().full_ip_bytes(bytes.len())?
+                };
+                if actual != cost {
                     return Err(protocol("carrier Control full-IP charge differs"));
                 }
                 let target = value
@@ -407,9 +435,16 @@ impl<R: RawBacking> IoOwner<R> {
                     result: None,
                     deadline,
                 };
-                begin(&value.datagram, &mut pending, SendClass::Control, bytes)?;
+                begin_selected(
+                    &value.datagram,
+                    &mut pending,
+                    SendClass::Control,
+                    bytes,
+                    bootstrap,
+                )?;
                 value.control = Some(Control {
                     bytes: bytes.len(),
+                    bootstrap,
                     cost,
                     pending,
                 });
@@ -453,16 +488,41 @@ impl<R: RawBacking> IoOwner<R> {
         value.user = None;
         complete(result).map(|progress| Some((identity, progress)))
     }
+    pub(super) fn final_input_metadata(&self) -> Option<raw_compact::FinalMetadata> {
+        match self {
+            Self::Raw(values) => values[0].final_input_metadata(),
+            _ => None,
+        }
+    }
+    pub(super) fn commit_final_input(
+        &mut self,
+        metadata: raw_compact::FinalMetadata,
+        verdict: Option<raw_compact::FinalAcceptance<()>>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Raw(values) => values[0].commit_final_input(metadata, verdict),
+            _ => Err(protocol("final raw candidate has no actual carrier owner")),
+        }
+    }
     pub(super) fn try_receive_at(
         &mut self,
         output: &mut [u8],
-    ) -> io::Result<(usize, Option<Instant>)> {
+    ) -> io::Result<(
+        usize,
+        Option<Instant>,
+        Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
+    )> {
         if let Self::Raw(values) = self {
             return values[0]
                 .try_receive(output)
-                .map(|(bytes, at)| (bytes, Some(at)));
+                .map(|(bytes, at)| (bytes, Some(at), None));
         }
-        self.try_receive(output).map(|bytes| (bytes, None))
+        let bytes = self.try_receive(output)?;
+        let framing = match self {
+            Self::Carrier(values) => values[0].input_framing.take(),
+            _ => None,
+        };
+        Ok((bytes, None, framing))
     }
     pub(super) fn try_receive(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -515,11 +575,12 @@ impl CarrierIo {
             ready |= poll(&self.datagram, &mut user.pending, cx);
         }
         if let Some(control) = &mut self.control {
-            if let Err(error) = begin(
+            if let Err(error) = begin_selected(
                 &self.datagram,
                 &mut control.pending,
                 SendClass::Control,
                 &self.control_bytes[..control.bytes],
+                control.bootstrap,
             ) {
                 control.pending.result = Some(Err(SendFailure::Io(error)));
             }
@@ -536,10 +597,11 @@ impl CarrierIo {
             if self.input_length.is_some() {
                 ready = true;
             } else {
-                match self.datagram.poll_receive(cx, &mut self.input) {
+                match self.datagram.poll_receive_framed(cx, &mut self.input) {
                     Poll::Pending => {}
-                    Poll::Ready(Ok(length)) => {
+                    Poll::Ready(Ok((length, framing))) => {
                         self.input_length = Some(length);
+                        self.input_framing = framing;
                         ready = true;
                     }
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -559,8 +621,22 @@ fn begin(
     class: SendClass,
     bytes: &[u8],
 ) -> io::Result<()> {
+    begin_selected(datagram, pending, class, bytes, false)
+}
+fn begin_selected(
+    datagram: &OriginalDatagram,
+    pending: &mut Pending,
+    class: SendClass,
+    bytes: &[u8],
+    bootstrap: bool,
+) -> io::Result<()> {
     if pending.ticket.is_none() && pending.result.is_none() {
-        match datagram.begin_send(class, bytes, pending.deadline) {
+        let result = if bootstrap {
+            datagram.begin_bootstrap_send(class, bytes, pending.deadline)
+        } else {
+            datagram.begin_send(class, bytes, pending.deadline)
+        };
+        match result {
             Ok(ticket) => pending.ticket = Some(ticket),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
@@ -664,13 +740,14 @@ impl Driver {
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
         // Both physical facts survive errors. Only the Research User receipt
-        // may wait for already authenticated older bounded raw input.
+        // may wait for older bounded raw candidates to reach Records verification.
+        // Deferral grants no authentication, retirement, or liveness authority.
         let control = socket.take_control();
         let ordering = (|| -> io::Result<bool> {
             let Some(accepted) = socket.user_accepted_at() else {
                 return Ok(false);
             };
-            let pending = self.common.as_ref().and_then(|r| r.sealed.as_ref());
+            let pending = self.common.as_deref().and_then(|r| r.sealed.as_ref());
             let Some(pending) = pending else {
                 return Ok(false);
             };
@@ -681,7 +758,7 @@ impl Driver {
             {
                 return Ok(false);
             }
-            socket.authenticated_input_before(accepted)
+            socket.input_for_ordering_before(accepted)
         })();
         let user = if ordering.as_ref().is_ok_and(|held| *held) {
             Ok(None)
@@ -781,7 +858,20 @@ impl Driver {
                 if self.outer == u32::MAX {
                     return Err(exhausted());
                 }
-                if let Some(bytes) = self.prepare_control(now)? {
+                if socket.final_raw_mut().is_some() {
+                    // A retained body gets the next available data extent before
+                    // another fresh control occupies Full's sole lane. If the
+                    // data horizon is closed, reserved strong controls still run.
+                    if self.common.as_deref().is_some_and(|r| r.unsealed.is_some())
+                        && (self.send_common_carrier(socket, now, &mut sample)?
+                            || self.common.as_deref().is_some_and(|r| r.unsealed.is_none()))
+                    {
+                        continue;
+                    }
+                    if self.send_raw_services(socket, now)? {
+                        continue;
+                    }
+                } else if let Some(bytes) = self.prepare_control(now)? {
                     let cap = self
                         .origin
                         .checked_add(self.control.expiry())
@@ -796,20 +886,31 @@ impl Driver {
         }
         Ok(())
     }
-    fn stage_carrier_control<R: RawBacking>(
+    pub(super) fn stage_carrier_control<R: RawBacking>(
         &mut self,
         socket: &mut IoOwner<R>,
         bytes: usize,
         cap: Instant,
         kind: performance::WireKind,
     ) -> io::Result<()> {
-        let cost = bytes.checked_add(self.ip).ok_or_else(exhausted)?;
+        let bootstrap = matches!(kind, performance::WireKind::Bootstrap);
+        let physical = if bootstrap {
+            self.bootstrap_ip_bytes()
+        } else {
+            self.ip
+        };
+        let cost = bytes.checked_add(physical).ok_or_else(exhausted)?;
         self.bucket.charge(cost)?;
         self.performance.sent(kind, cost);
         self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
         self.counters.wire_packets = self.counters.wire_packets.saturating_add(1);
         self.counters.wire_bytes = self.counters.wire_bytes.saturating_add(cost as u64);
-        match socket.stage_control(&self.buffers.wire[..bytes], cost, cap)? {
+        match socket.stage_control_with_bootstrap(
+            &self.buffers.wire[..bytes],
+            cost,
+            cap,
+            bootstrap,
+        )? {
             SendProgress::Pending => Ok(()),
             SendProgress::Whole { .. } => {
                 Err(protocol("carrier Control unexpectedly bypassed ticket"))

@@ -212,7 +212,7 @@ impl Driver {
         let validate = (|| {
             let runtime = self
                 .common
-                .as_ref()
+                .as_deref()
                 .ok_or(ConnectionReuseError::Unsupported)?;
             if !runtime.contract.connection_reuse() || self.info.role != security::Role::Initiator {
                 return Err(ConnectionReuseError::Unsupported);
@@ -302,7 +302,7 @@ impl Driver {
                 let digest = core::ConfigDigest(self.source_scope.configuration.0);
                 let runtime = self
                     .common
-                    .as_mut()
+                    .as_deref_mut()
                     .ok_or_else(|| protocol("reuse runtime absent"))?;
                 let installed = runtime
                     .reuse_owner
@@ -336,7 +336,7 @@ impl Driver {
     ) -> io::Result<Wire> {
         let runtime = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("reuse on another backend"))?;
         if !runtime.contract.connection_reuse() {
             return Err(invalid("slot reuse not authenticated by selected profile"));
@@ -386,6 +386,7 @@ impl Driver {
             .take()
             .ok_or_else(|| protocol("reuse runtime absent"))?;
         let result = (|| {
+            let runtime = &mut *runtime;
             let installed = runtime
                 .reuse_owner
                 .as_mut()
@@ -495,6 +496,8 @@ impl Driver {
             // This is a concrete external-custody guard, not an injected boolean.
             // All original retained input remains serviceable until this is true.
             let external = runtime.sealed.is_none()
+                && runtime.unsealed.is_none()
+                && runtime.raw_control.is_none()
                 && runtime.pending_feedback.is_none()
                 && runtime.pending_ingress.is_none()
                 && runtime

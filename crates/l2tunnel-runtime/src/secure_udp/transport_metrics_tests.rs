@@ -33,7 +33,7 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
             assert!(drained);
         }
         fixture.socket.writable().await?;
-        let driver = &mut fixture.driver;
+        let driver = &mut *fixture.driver;
         let now = fixture.now;
         driver.bucket.last = now;
         driver.bucket.tokens = 0;
@@ -96,20 +96,21 @@ async fn eligible_credit_wait_and_actual_wire_classes_reconcile_without_idle_inf
         .await??;
         assert_eq!(sent.performance.user_ip_bytes, (length + driver.ip) as u64);
         let remote_now = resumed + 1;
-        fixture.remote.receive(
+        let remote = &mut *fixture.remote;
+        remote.receive(
             &wire[..length],
             remote_now,
-            fixture.remote.origin + duration(remote_now),
-            &resolve(fixture.remote.config),
+            remote.origin + duration(remote_now),
+            &resolve(remote.config),
         )?;
-        fixture.remote.progress(remote_now)?;
+        remote.progress(remote_now)?;
         fixture._remote_socket.writable().await?;
-        fixture.remote.send(
+        remote.send(
             &fixture._remote_socket,
             remote_now,
-            fixture.remote.origin + duration(remote_now),
+            remote.origin + duration(remote_now),
         )?;
-        let received = fixture.remote.snapshot(remote_now, true)?;
+        let received = remote.snapshot(remote_now, true)?;
         assert_eq!(received.performance.feedback_packets, 1);
         assert_eq!(received.performance.user_packets, 0);
         reconcile(&received);

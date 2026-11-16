@@ -233,3 +233,73 @@ async fn actual_whole_write_crossing_original_cap_retains_late_fact_and_single_d
     assert_eq!(&wire[..bytes], &output[..length]);
     Ok(())
 }
+
+#[tokio::test]
+async fn selected_compact_openvpn_actor_preserves_final_bytes_custody_and_bounded_setup_tails()
+-> TestResult {
+    let (mut a, mut b) = pair().await?;
+    let addresses = a.addresses();
+    let setup_cap = Instant::now() + Duration::from_millis(250);
+    a.select_final_records(setup_cap)?;
+    b.select_final_records(setup_cap)?;
+    assert!(a.select_final_records(setup_cap).is_err());
+    for opcode in [3u8, 4, 5, 6, 7, 8, 9] {
+        for key in 0..8 {
+            assert!(!actor::final_prefix(&[opcode << 3 | key]));
+        }
+    }
+    for prefix in [0u8, 1, 128, 191, 192, 255] {
+        assert!(actor::final_prefix(&[prefix]));
+    }
+    let collision = b"\x80identical-inner-prefix-for-both-paths";
+    let tail = a.try_send_bootstrap_until(Class::Control, collision, setup_cap)?;
+    let receipt = tail.await?;
+    assert_eq!(receipt.udp_bytes, receipt.record_bytes + 1);
+    assert_eq!(receipt.ip_bytes, receipt.record_bytes + 29);
+    let initial = timeout(Duration::from_secs(1), b.recv_framed()).await??;
+    assert_eq!(initial.bytes, collision);
+    assert_eq!(initial.framing, ReceiveFraming::DataV1);
+    a.try_send_until(Class::Control, collision, setup_cap)?
+        .await?;
+    let established = timeout(Duration::from_secs(1), b.recv_framed()).await??;
+    assert_eq!(established.bytes, collision);
+    assert_eq!(established.framing, ReceiveFraming::Final);
+    a.shared.user_gate.store(true, Ordering::Relaxed);
+    let bytes = b"\x80final-data-without-an-opcode";
+    let final_cap = Instant::now() + Duration::from_secs(1);
+    let held = a.try_send_until(Class::User, bytes, final_cap)?;
+    timeout(Duration::from_secs(1), async {
+        while a.physical_status()?.user_would_block == 0 {
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, Error>(())
+    })
+    .await??;
+    let control = b.try_send_until(Class::Control, b"\0final-strong-control", final_cap)?;
+    let receipt = control.await?;
+    assert_eq!(receipt.udp_bytes, receipt.record_bytes);
+    assert_eq!(receipt.ip_bytes, receipt.record_bytes + 28);
+    assert_eq!(
+        timeout(Duration::from_secs(1), a.recv()).await??,
+        b"\0final-strong-control"
+    );
+    a.shared.user_gate.store(false, Ordering::Relaxed);
+    let receipt = held.await?;
+    assert_eq!(receipt.udp_bytes, bytes.len());
+    assert_eq!(receipt.ip_bytes, bytes.len() + 28);
+    assert_eq!(timeout(Duration::from_secs(1), b.recv()).await??, bytes);
+    tokio::time::sleep_until(setup_cap).await;
+    assert!(matches!(
+        a.try_send_bootstrap_until(Class::Control, b"expired-tail", final_cap),
+        Err(Error::Timeout)
+    ));
+    let before = a.physical_status()?.tls_control_datagrams;
+    let bytes = b"\xfffinal-feedback-after-setup-cap";
+    let receipt = a.try_send_until(Class::Control, bytes, final_cap)?.await?;
+    assert_eq!(receipt.ip_bytes, bytes.len() + 28);
+    assert_eq!(timeout(Duration::from_secs(1), b.recv()).await??, bytes);
+    assert_eq!(a.physical_status()?.tls_control_datagrams, before);
+    assert_eq!(a.addresses(), addresses);
+    assert_eq!(b.addresses(), (addresses.1, addresses.0));
+    Ok(())
+}

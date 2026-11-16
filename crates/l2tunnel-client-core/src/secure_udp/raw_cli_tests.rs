@@ -346,3 +346,75 @@ fn raw_cli_rejects_shape_mark_tuple_and_legacy_policy_before_any_runtime_open() 
     assert!(selection("connect", &old, configuration)?.is_none());
     Ok(())
 }
+
+#[test]
+fn compact_wire_raw_cli_binds_both_suites_full_half_without_effective_authority() -> io::Result<()>
+{
+    for duplex in [Duplex::Full, Duplex::Half] {
+        let base = plan(duplex)?;
+        let legacy_file = File::new(&base)?;
+        let mut previous_suite = None;
+        for protection in ["aes-ccm-4", "chacha20-crc32c"] {
+            let mut value = base.clone();
+            value["compact_wire"] = json!({"version":3,"data_protection":protection,
+                "max_forward_packets":8192,"max_failed_checks":64});
+            let plan_file = File::new(&value)?;
+            let mut previous_role = None;
+            for role in ["connect", "serve"] {
+                let policy_file = File::new(&policy(duplex, role, Protection::ChaCha20Poly1305))?;
+                let options = options(role, "quic-like", duplex, &plan_file, &policy_file);
+                let selected = selection(role, &options, configuration(&options)?)?
+                    .ok_or_else(|| input("compact raw selection absent"))?;
+                let built = profile(&selected, &options)?;
+                let mut legacy_options = options.clone();
+                legacy_options.insert("--common-transaction-plan".into(), legacy_file.text());
+                let legacy_selected =
+                    selection(role, &legacy_options, configuration(&legacy_options)?)?
+                        .ok_or_else(|| input("legacy raw selection absent"))?;
+                let legacy = profile(&legacy_selected, &legacy_options)?;
+                assert_ne!(built.configuration()?, legacy.configuration()?);
+                assert!(built.raw_binding().is_none() && built.carrier_binding().is_none());
+                built.validate_raw_request()?;
+                for side in [security::Role::Initiator, security::Role::Responder] {
+                    assert!(built.runtime_contract(side).is_err());
+                    assert_eq!(built.requested_resources(side).control.wire_overhead, 61);
+                }
+                let digest = built.requested_configuration()?;
+                if let Some(previous) = previous_role {
+                    assert_eq!(digest, previous);
+                }
+                previous_role = Some(digest);
+                let values = common_cli_output::raw_inspection(
+                    &built,
+                    selected.common().role,
+                    &selected
+                        .2
+                        .as_ref()
+                        .ok_or_else(|| input("raw policy absent"))?
+                        .settings,
+                )?;
+                let header = &values[0];
+                assert_eq!(
+                    header["compact_wire"]["requested"]["data_protection"],
+                    protection
+                );
+                assert!(header["compact_wire"]["effective"].is_null());
+                assert!(header["effective_final_framing"].is_null());
+                assert_eq!(header["outer_policy_scope"], "bootstrap");
+                assert_eq!(header["outer_policy"]["record_overhead_bytes"], 112);
+                assert_eq!(header["requested_final_framing"]["data_overhead_bytes"], 49);
+                assert_eq!(
+                    header["requested_final_framing"]["control_feedback_overhead_bytes"],
+                    61
+                );
+                assert_eq!(header["requested_final_framing"]["protection_layers"], 1);
+                assert_eq!(header["authenticated"], false);
+            }
+            if let Some(previous) = previous_suite {
+                assert_ne!(previous_role, previous);
+            }
+            previous_suite = Some(previous_role);
+        }
+    }
+    Ok(())
+}

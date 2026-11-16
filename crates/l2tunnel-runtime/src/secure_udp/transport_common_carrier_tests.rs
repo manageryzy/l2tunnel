@@ -7,7 +7,13 @@ fn selected(
     outer: &establish::carrier::AuthenticatedOuter,
     client: bool,
 ) -> Result<(establish::Config, CommonTransactionContract)> {
-    let kind = cover::Appearance::QuicLike;
+    selected_kind(outer, client, cover::Appearance::QuicLike)
+}
+fn selected_kind(
+    outer: &establish::carrier::AuthenticatedOuter,
+    client: bool,
+    kind: cover::Appearance,
+) -> Result<(establish::Config, CommonTransactionContract)> {
     let mut resources = config(kind);
     resources.control.wire_overhead += 1;
     let selected = mg::messages::Settings {
@@ -75,6 +81,13 @@ fn selected(
     let mut setup = factory_fixture::effective(outer, client)?;
     setup.gate.path_mtu = resources.path_mtu;
     setup.cover = cover;
+    setup.gate.outer_overhead = 28
+        + 1
+        + 1
+        + match kind {
+            cover::Appearance::QuicLike => 30,
+            cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+        };
     setup.binding.configuration = contract.expected_configuration().0;
     Ok((setup, contract))
 }
@@ -95,12 +108,163 @@ fn device() -> Result<(Device, tokio::net::UnixDatagram)> {
 
 #[tokio::test]
 async fn actual_initial_only_openvpn_common_loop_delivers_both_directions_and_liveness() -> Result {
+    run_initial_case(None).await
+}
+
+#[tokio::test]
+async fn selected_compact_openvpn_common_loop_delivers_both_suites_on_original_socket() -> Result {
+    for protection in [
+        security::compact::Protection::Aes128Ccm4,
+        security::compact::Protection::ChaCha20Crc32c,
+    ] {
+        run_initial_case(Some(record::compact::Selection {
+            protection,
+            limits: security::compact::Selection {
+                max_forward_packets: 8192,
+                max_failed_checks: 64,
+            },
+        }))
+        .await?;
+    }
+    Ok(())
+}
+
+fn selected_wire(
+    proof: &establish::carrier::AuthenticatedOuter,
+    client: bool,
+    selection: Option<record::compact::Selection>,
+) -> Result<(establish::Config, CommonTransactionContract)> {
+    selected_wire_kind(proof, client, selection, cover::Appearance::QuicLike)
+}
+fn selected_wire_kind(
+    proof: &establish::carrier::AuthenticatedOuter,
+    client: bool,
+    selection: Option<record::compact::Selection>,
+    kind: cover::Appearance,
+) -> Result<(establish::Config, CommonTransactionContract)> {
+    let (mut setup, old) = selected_kind(proof, client, kind)?;
+    let Some(selection) = selection else {
+        return Ok((setup, old));
+    };
+    let mut resources = old.resources();
+    resources.control.wire_overhead = 28 + record::compact::AUTHENTICATED_OVERHEAD;
+    for stream in &mut resources.streams.as_mut().ok_or("actual streams")?.streams {
+        stream.delivery.wire_overhead = resources.control.wire_overhead + streams::HEADER_BYTES;
+    }
+    let contract = CommonTransactionContract::new_on_carrier_paired_compact(
+        security::ConfigDigest([3; 32]),
+        old.role(),
+        [resources; 2],
+        old.cover(),
+        false,
+        EnvelopeDigest::new([0x39; 32]),
+        old.catalog().clone(),
+        old.settings(),
+        *proof,
+        selection,
+    )?;
+    setup.binding.configuration = contract.expected_configuration().0;
+    Ok((setup, contract))
+}
+
+#[tokio::test]
+async fn selected_compact_openvpn_member_proof_refuses_a_different_data_suite() -> Result {
+    let mut outer = factory_fixture::outer_config();
+    outer.base.layer = PacketLayer::Ethernet;
+    outer.path_mtu = 1500;
+    outer.max_record_bytes = 1471;
+    let selection = record::compact::Selection {
+        protection: security::compact::Protection::Aes128Ccm4,
+        limits: security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    };
+    let [(a, original), _peer] = factory_fixture::initial::initial_parts(outer, |proof, client| {
+        selected_wire(proof, client, Some(selection))
+    })
+    .await?;
+    let mut changed = selection;
+    changed.protection = security::compact::Protection::ChaCha20Crc32c;
+    let (_, contract) = selected_wire(&a.outer(), true, Some(changed))?;
+    assert_ne!(
+        contract.expected_configuration(),
+        original.expected_configuration()
+    );
+    assert!(!a.datagram.final_records());
+    let (native, _host) = device()?;
+    let error = run_common_on_carrier(native, a, contract, None, async {}, |_| {})
+        .await
+        .err()
+        .ok_or("different suite installed")?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_compact_openvpn_explicit_final_route_never_enters_media_joining_tail() -> Result {
+    use l2tunnel_openvpn::wire_carrier::common::ReceiveFraming;
+    let mut outer = factory_fixture::outer_config();
+    outer.base.layer = PacketLayer::Ethernet;
+    outer.path_mtu = 1500;
+    outer.max_record_bytes = 1471;
+    let selection = record::compact::Selection {
+        protection: security::compact::Protection::ChaCha20Crc32c,
+        limits: security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    };
+    let [(a, contract), (_b, peer)] =
+        factory_fixture::initial::initial_parts(outer, |proof, client| {
+            selected_wire_kind(proof, client, Some(selection), cover::Appearance::MediaLike)
+        })
+        .await?;
+    let (_socket, mut driver) = Driver::new_common_on_carrier(a, contract)?;
+    let mut collision = [0; 128];
+    let bytes = peer
+        .cover()
+        .encode(meta(0, cover::Phase::Established), &[3], &mut collision)?;
+    assert_eq!(collision[0], 0x80);
+    assert_eq!(driver.cover.decode(&collision[..bytes])?.protected, &[3]);
+    let at = Instant::now();
+    let now = clock(driver.origin, at)?;
+    let rejected = driver.counters.rejected_packets;
+    let verified = driver.live.last_verified_micros;
+    driver.receive_selected_on_carrier(
+        &collision[..bytes],
+        now,
+        now,
+        at,
+        at,
+        None,
+        ReceiveFraming::DataV1,
+    )?;
+    assert_eq!(driver.counters.rejected_packets, rejected);
+    driver.receive_selected_on_carrier(
+        &collision[..bytes],
+        now,
+        now,
+        at,
+        at,
+        None,
+        ReceiveFraming::Final,
+    )?;
+    assert_eq!(driver.counters.rejected_packets, rejected + 1);
+    assert_eq!(driver.live.last_verified_micros, verified);
+    Ok(())
+}
+
+async fn run_initial_case(selection: Option<record::compact::Selection>) -> Result {
     let mut outer = factory_fixture::outer_config();
     outer.base.layer = PacketLayer::Ethernet;
     outer.path_mtu = 1500;
     outer.max_record_bytes = 1471;
     let [(a, a_contract), (b, b_contract)] =
-        factory_fixture::initial::initial_parts(outer, selected).await?;
+        factory_fixture::initial::initial_parts(outer, |proof, client| {
+            selected_wire(proof, client, selection)
+        })
+        .await?;
     let endpoints = a.outer().endpoints();
     let cap = a.deadline.min(b.deadline);
     assert_eq!(a.datagram.addresses(), endpoints);
@@ -174,6 +338,7 @@ async fn actual_initial_only_openvpn_common_loop_delivers_both_directions_and_li
     exercise?;
     for (side, stopped) in [a?, b?].into_iter().enumerate() {
         assert_eq!(stopped.reason, StopReason::Cancelled);
+        assert_eq!(stopped.snapshot.compact_wire, selection);
         let expected = if side == 0 {
             endpoints
         } else {

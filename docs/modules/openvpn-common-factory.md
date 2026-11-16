@@ -55,6 +55,33 @@ bootstrap full-IP accounting, the same actual endpoint pair and MTU, and the
 actual raw maximum. Inner and outer policy ledgers overlap; summing them does not
 measure network bytes. User data has no new outer ARQ or exporter resealing.
 
+## Explicit compact initial-only framing
+
+The selected compact Common path retains the same real outer factory and inner
+initial Noise/member handoff. Its complete suite/catalog/resources and genuine
+outer proof bind the effective contract before runtime installation. Bootstrap
+DataV1 and its exact extra byte remain unchanged. After accepted inner membership,
+the existing actor explicitly switches final output to the authenticated carrier
+Records layout on the original UDP socket, without a continuing DataV1 opcode or
+inner QUIC/media wrapper. IPv4 final data/control outer costs are 37/49 bytes,
+including IP/UDP28 and excluding actual algorithm/feedback/control-body metadata.
+
+An explicit actor receive-framing tag survives OriginalDatagram/CarrierIo to the
+sole Driver. It separates DataV1 bootstrap tails from final Records, including
+identical decoded first bytes; payload sniffing cannot grant bootstrap authority.
+Bounded bootstrap tails retain their original cap. Final compact traffic remains
+our protocol, not a claim of ordinary OpenVPN endpoint interoperability or ongoing
+standard-protocol consistency. Dissector capture and ISP classification remain
+separate measured gates.
+
+Both data suites and both inner appearances pass actual shared-service admission,
+bidirectional native bytes, four-family switching, liveness and same-owner release
+in the [scoped client receipt](../../work/compact-carrier-migration-20261116/client-results.json).
+Protocol/actor and required-check results are recorded in the
+[batch receipt](../../work/compact-carrier-migration-20261116/batch-summary.json).
+Earlier legacy factory/native receipts remain historical; these new cases do not
+qualify privileged native startup, Windows/Android, full fault matrices or QoS.
+
 ## Stable implementation and acceptance leaves
 
 Checked leaves cover only their stated finite factory/handoff deliverable.

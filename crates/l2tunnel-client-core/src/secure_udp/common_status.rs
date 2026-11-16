@@ -22,7 +22,7 @@ pub use rolling_ingress::{
 
 #[path = "common_raw_status.rs"]
 mod raw;
-pub use raw::{RawCarrier, RawLane, RawPacketPolicy};
+pub use raw::{RawCarrier, RawFinalFraming, RawLane, RawPacketPolicy};
 
 #[path = "common_connection_status.rs"]
 mod connections;
@@ -541,7 +541,7 @@ mod observe {
                     })
                 })
                 .transpose()?;
-            let raw_carrier = RawCarrier::observe(profile, configuration, udp_cover)?;
+            let raw_carrier = RawCarrier::observe(profile, configuration, udp_cover, snapshot)?;
             Ok(Self {
                 generation,
                 next_request_key: None,

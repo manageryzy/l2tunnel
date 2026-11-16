@@ -55,16 +55,27 @@ where
 }
 
 impl Driver {
-    pub(super) fn new_common_on_carrier(
-        parts: member::carrier::InitialParts,
+    pub(in super::super) fn new_common_on_carrier(
+        mut parts: member::carrier::InitialParts,
         contract: CommonTransactionContract,
     ) -> io::Result<(carrier::IoOwner, owner::StateCell<Self>)> {
-        if contract.refresh_selection().is_some() || contract.extra_wire_bytes() != 1 {
+        let selected = contract.compact_wire().is_some();
+        if contract.refresh_selection().is_some()
+            || contract.extra_wire_bytes() != usize::from(!selected)
+        {
             return Err(invalid(
                 "initial-only carrier requires its exact untimed contract",
             ));
         }
         contract.validate_outer(Some(parts.outer()))?;
+        if selected {
+            if parts.info.authenticated.configuration != contract.expected_configuration().0 {
+                return Err(invalid(
+                    "compact carrier selection differs from actual member proof",
+                ));
+            }
+            parts.datagram.select_final_records(parts.deadline)?;
+        }
         let origin = parts.clock_origin();
         let geometry = parts.datagram.geometry();
         if parts.datagram.outer_info() != Some(&parts.outer().info())
@@ -111,7 +122,7 @@ impl Driver {
                     || usage.allocations != 3
                     || socket.addresses()? != (driver.info.local_addr, driver.info.peer_addr)
                     || socket.ip_wire_bytes()? != driver.ip
-                    || socket.extra_wire_bytes() != 1
+                    || socket.extra_wire_bytes() != geometry.extra_wire_bytes
                     || socket.maximum_datagram_bytes() != Some(geometry.max_datagram_bytes)
                 {
                     return Err(protocol("carrier adapter usage differs from admitted plan"));

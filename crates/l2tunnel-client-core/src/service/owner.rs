@@ -102,6 +102,8 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     shared.changed();
 }
 fn failed(error: io::Error) -> Completed {
+    #[cfg(test)]
+    eprintln!("shared service setup failed: {error:?}");
     Completed::Failed(Failure { kind: error.kind() })
 }
 fn expired() -> io::Error {

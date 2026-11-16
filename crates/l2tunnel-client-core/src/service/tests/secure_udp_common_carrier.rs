@@ -63,7 +63,28 @@ fn carrier_plans(
     hosts: &[Arc<Host>; 2],
     wrong_outer_member: bool,
 ) -> Result<CarrierPlans> {
+    carrier_plans_wire(appearance, hosts, wrong_outer_member, None)
+}
+#[inline(never)]
+fn carrier_plans_wire(
+    appearance: l2tunnel_cover::Appearance,
+    hosts: &[Arc<Host>; 2],
+    wrong_outer_member: bool,
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result<CarrierPlans> {
     let CommonPlans { profile: old, .. } = common_plans(appearance, hosts)?;
+    carrier_plans_from_profile(old, hosts, wrong_outer_member, wire)
+}
+
+// Finish each fixture stage before entering the next large conversion frame.
+// Raw and other derived callers retain the same complete requested contracts.
+#[inline(never)]
+fn carrier_plans_from_profile(
+    old: common_transaction_profile::Profile,
+    hosts: &[Arc<Host>; 2],
+    wrong_outer_member: bool,
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result<CarrierPlans> {
     let mut settings = old.settings();
     let addresses = [settings.gate.path.client, settings.gate.path.server];
     let encoded = Zeroizing::new(MemberKey::generate_pkcs8()?);
@@ -150,6 +171,10 @@ fn carrier_plans(
         )?,
         old.parameters(),
     )?;
+    let requested = match wire {
+        Some(selection) => requested.with_compact_wire(selection)?,
+        None => requested,
+    };
     let certificate = rcgen::generate_simple_self_signed(vec!["service-carrier.test".into()])?;
     let chain = vec![certificate.cert.der().to_vec()];
     let outer_member = if wrong_outer_member {
@@ -240,6 +265,29 @@ fn carrier_plans(
 
 #[tokio::test]
 async fn actual_openvpn_common_service_uses_bound_catalog_for_all_four_families() -> Result {
+    exercise_carrier_wire(None).await
+}
+#[tokio::test]
+async fn actual_compact_wire_openvpn_service_preserves_four_family_switches_and_both_suites()
+-> Result {
+    for protection in [
+        l2tunnel_security::compact::Protection::Aes128Ccm4,
+        l2tunnel_security::compact::Protection::ChaCha20Crc32c,
+    ] {
+        exercise_carrier_wire(Some(l2tunnel::secure_record::compact::Selection {
+            protection,
+            limits: l2tunnel_security::compact::Selection {
+                max_forward_packets: 8192,
+                max_failed_checks: 64,
+            },
+        }))
+        .await?;
+    }
+    Ok(())
+}
+async fn exercise_carrier_wire(
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+) -> Result {
     timeout(Duration::from_secs(30), async {
         for appearance in support::appearances() {
             let hosts = support::hosts();
@@ -247,7 +295,7 @@ async fn actual_openvpn_common_service_uses_bound_catalog_for_all_four_families(
                 plans: [a, b],
                 addresses,
                 requested,
-            } = carrier_plans(appearance, &hosts, false)?;
+            } = carrier_plans_wire(appearance, &hosts, false, wire)?;
             let (client, run) = channel();
             let (server, peer) = channel();
             let task = tokio::spawn(run);
@@ -317,6 +365,28 @@ async fn actual_openvpn_common_service_uses_bound_catalog_for_all_four_families(
                 assert_ne!(frame.requested.configuration()?, requested.configuration()?);
                 assert_ne!(frame.requested.envelope(), requested.envelope());
                 let status = frame.status()?;
+                assert_eq!(
+                    status.compact_wire.as_ref().map(|value| value.effective),
+                    wire.map(|value| {
+                        crate::secure_udp::common_status::CompactWireSelection::from_selection(
+                            value,
+                        )
+                        .map(Some)
+                    })
+                    .transpose()?
+                );
+                if wire.is_some() {
+                    assert_eq!(effective.catalog().root(), requested.catalog().root());
+                    assert_eq!(
+                        frame
+                            .requested
+                            .runtime_contract(frame.info.role)?
+                            .resources()
+                            .control
+                            .wire_overhead,
+                        28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
+                    );
+                }
                 assert!(status.raw_carrier.is_none());
                 assert!(serde_json::to_value(&status)?.get("raw_carrier").is_none());
                 let carrier = status

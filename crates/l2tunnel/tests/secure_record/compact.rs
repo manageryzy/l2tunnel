@@ -45,6 +45,7 @@ fn compact_seal(records: &mut Records, kind: Kind, scope: Scope, body: &[u8]) ->
             records.seal_feedback_in(scope, outer(0), body, &mut scratch, &mut wire)?
         }
         Kind::Control => records.seal(Class::Control, outer(0), body, &mut scratch, &mut wire)?,
+        Kind::CarrierControl => return Err(Error::ScopeState.into()),
     };
     assert_eq!(wire.len(), sealed.bytes);
     Ok(wire)

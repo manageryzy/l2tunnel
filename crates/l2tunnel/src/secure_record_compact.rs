@@ -80,6 +80,42 @@ impl Selection {
     }
 }
 
+/// Transcript-selected namespace for the established final records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Layout {
+    /// Original UDP v3, preserving its existing byte format.
+    Original,
+    /// Initial carrier tails and final records occupy disjoint namespaces.
+    Carrier,
+}
+impl Layout {
+    /// Parse a final route without attempting a legacy protocol fallback.
+    pub fn kind(self, byte: u8) -> Result<Kind, Error> {
+        match (self, byte) {
+            (Self::Original, 0..=63) | (Self::Carrier, 128..=191) => Ok(Kind::Data),
+            (Self::Original, 64..=127) | (Self::Carrier, 192..=255) => Ok(Kind::Feedback),
+            (Self::Original, 128) | (Self::Carrier, 0) => Ok(Kind::Control),
+            (Self::Carrier, 1) => Ok(Kind::CarrierControl),
+            _ => Err(Error::Malformed),
+        }
+    }
+    fn route(self, kind: Kind, slot: u8) -> Result<u8, Error> {
+        if slot > 63 {
+            return Err(Error::Scope);
+        }
+        match (self, kind) {
+            (Self::Original, Kind::Data) => Ok(slot),
+            (Self::Original, Kind::Feedback) => Ok(0x40 | slot),
+            (Self::Original, Kind::Control) => Ok(0x80),
+            (Self::Carrier, Kind::Data) => Ok(0x80 | slot),
+            (Self::Carrier, Kind::Feedback) => Ok(0xc0 | slot),
+            (Self::Carrier, Kind::Control) => Ok(0),
+            (Self::Carrier, Kind::CarrierControl) => Ok(1),
+            _ => Err(Error::ScopeState),
+        }
+    }
+}
+
 /// Final packet authority, separate from the selected algorithm's header union.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -89,39 +125,27 @@ pub enum Kind {
     Feedback,
     /// Fixed-scope management under the independent strong domain.
     Control,
+    /// Carrier window and liveness controls sharing the management counter.
+    CarrierControl,
 }
 impl Kind {
-    fn bits(self) -> u8 {
-        match self {
-            Self::Data => 0,
-            Self::Feedback => 0x40,
-            Self::Control => 0x80,
-        }
-    }
-    fn parse(byte: u8) -> Result<Self, Error> {
-        match byte >> 6 {
-            0 => Ok(Self::Data),
-            1 => Ok(Self::Feedback),
-            2 if byte & 0x3f == 0 => Ok(Self::Control),
-            _ => Err(Error::Malformed),
-        }
-    }
     fn class(self) -> Class {
         match self {
             Self::Data | Self::Feedback => Class::User,
-            Self::Control => Class::Control,
+            Self::Control | Self::CarrierControl => Class::Control,
         }
     }
     fn tag_bytes(self) -> usize {
         match self {
             Self::Data => 4,
-            Self::Feedback | Self::Control => 16,
+            Self::Feedback | Self::Control | Self::CarrierControl => 16,
         }
     }
 }
 
 pub(super) struct Owners {
     pub(super) selection: Selection,
+    layout: Layout,
     pub(super) data_sender: sec::Sender,
     data_receiver: sec::Receiver,
     pub(super) control_sender: sec::Sender,
@@ -164,7 +188,7 @@ impl Records {
     /// No fallback, additional handshake, clock or packet loop is created here.
     #[allow(clippy::too_many_arguments)]
     pub fn new_compact(
-        mut root: security::SessionRoot,
+        root: security::SessionRoot,
         lane: security::LaneId,
         limits: security::Limits,
         cover: cover::Config,
@@ -172,12 +196,37 @@ impl Records {
         data: Scope,
         selection: Selection,
     ) -> Result<Self, Error> {
+        Self::new_compact_with_layout(
+            root,
+            lane,
+            limits,
+            cover,
+            control,
+            data,
+            selection,
+            Layout::Original,
+        )
+    }
+
+    /// Install the namespace explicitly bound by the authenticated carrier contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_compact_with_layout(
+        mut root: security::SessionRoot,
+        lane: security::LaneId,
+        limits: security::Limits,
+        cover: cover::Config,
+        control: Scope,
+        data: Scope,
+        selection: Selection,
+        layout: Layout,
+    ) -> Result<Self, Error> {
         selection.validate()?;
         capacity(cover, limits, 16, limits.max_body_bytes)?;
         let mut owners = Vec::new();
         owners.try_reserve_exact(1).map_err(|_| Error::Allocation)?;
         owners.push(Owners {
             selection,
+            layout,
             data_sender: root.compact_sender(
                 security::Purpose::Data,
                 lane,
@@ -242,6 +291,13 @@ impl Records {
     pub fn compact_selection(&self) -> Option<Selection> {
         match &self.owners {
             super::Owners::Compact(owners) => Some(owners[0].selection),
+            _ => None,
+        }
+    }
+    /// Actual installed final namespace.
+    pub fn compact_layout(&self) -> Option<Layout> {
+        match &self.owners {
+            super::Owners::Compact(owners) => Some(owners[0].layout),
             _ => None,
         }
     }
@@ -333,6 +389,7 @@ impl Records {
             outer,
             &workspace[..length],
             workspace.len(),
+            &[],
             output,
         )?)
     }
@@ -347,7 +404,33 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
-        self.seal_compact_from(kind, scope, outer, plaintext, workspace.len(), output)
+        self.seal_compact_from(kind, scope, outer, plaintext, workspace.len(), &[], output)
+    }
+
+    /// Protect the selected final record and canonical carrier metadata once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_compact_with_carrier(
+        &mut self,
+        kind: Kind,
+        scope: Scope,
+        outer: cover::PacketMeta,
+        plaintext: &[u8],
+        carrier_aad: &[u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<Sealed, Error> {
+        if self.compact_layout() != Some(Layout::Carrier) {
+            return Err(Error::ScopeState);
+        }
+        self.seal_compact_from(
+            kind,
+            scope,
+            outer,
+            plaintext,
+            workspace.len(),
+            carrier_aad,
+            output,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -358,6 +441,7 @@ impl Records {
         outer: cover::PacketMeta,
         plaintext: &[u8],
         workspace_bytes: usize,
+        carrier_aad: &[u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
         if outer.phase != cover::Phase::Established {
@@ -374,26 +458,34 @@ impl Records {
             return Err(Error::ScopeState);
         };
         let owner = &mut owners[0];
-        let slot = if kind == Kind::Control {
+        let slot = if kind.class() == Class::Control {
             0
         } else if scope == self.data {
             owner.data_slot
         } else {
             owner.additional_slot.ok_or(Error::ScopeState)?
         };
-        let route = [kind.bits() | slot];
+        let route = owner.layout.route(kind, slot)?;
+        let mut aad = [0; security::MAX_METADATA_BYTES];
+        let aad_len = carrier_aad
+            .len()
+            .checked_add(1)
+            .filter(|len| *len <= aad.len())
+            .ok_or(Error::TooLarge)?;
+        aad[0] = route;
+        aad[1..aad_len].copy_from_slice(carrier_aad);
         let metadata = security::Metadata {
             epoch: scope.epoch,
             configuration: scope.configuration,
-            extra: &route,
+            extra: &aad[..aad_len],
         };
         let sender = match kind {
             Kind::Data => &mut owner.data_sender,
             Kind::Feedback => &mut owner.feedback_sender,
-            Kind::Control => &mut owner.control_sender,
+            Kind::Control | Kind::CarrierControl => &mut owner.control_sender,
         };
         let sealed = sender.seal(metadata, plaintext, &mut output[1..cap.packet_bytes])?;
-        output[0] = route[0];
+        output[0] = route;
         Ok(Sealed {
             number: sealed.number,
             generation: sealed.generation,
@@ -407,8 +499,40 @@ impl Records {
         workspace: &mut [u8],
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
+        self.open_compact_from(packet, &[], workspace, plaintext)
+    }
+
+    /// Verify canonical carrier metadata before committing the record replay state.
+    pub fn open_compact_with_carrier(
+        &mut self,
+        packet: &[u8],
+        carrier_aad: &[u8],
+        workspace: &mut [u8],
+        plaintext: &mut [u8],
+    ) -> Result<Opened, Error> {
+        if self.compact_layout() != Some(Layout::Carrier) {
+            return Err(Error::ScopeState);
+        }
+        self.open_compact_from(packet, carrier_aad, workspace, plaintext)
+    }
+
+    fn open_compact_from(
+        &mut self,
+        packet: &[u8],
+        carrier_aad: &[u8],
+        workspace: &mut [u8],
+        plaintext: &mut [u8],
+    ) -> Result<Opened, Error> {
         let byte = *packet.first().ok_or(Error::Malformed)?;
-        let kind = Kind::parse(byte)?;
+        let kind = self.compact_layout().ok_or(Error::ScopeState)?.kind(byte)?;
+        let mut aad = [0; security::MAX_METADATA_BYTES];
+        let aad_len = carrier_aad
+            .len()
+            .checked_add(1)
+            .filter(|len| *len <= aad.len())
+            .ok_or(Error::TooLarge)?;
+        aad[0] = byte;
+        aad[1..aad_len].copy_from_slice(carrier_aad);
         let body_bytes = packet
             .len()
             .checked_sub(PREFIX_BYTES + kind.tag_bytes())
@@ -422,7 +546,7 @@ impl Records {
         };
         let owner = &mut owners[0];
         let slot = byte & 0x3f;
-        let scope = if kind == Kind::Control {
+        let scope = if kind.class() == Class::Control {
             self.control
         } else if slot == owner.data_slot {
             self.data
@@ -434,13 +558,13 @@ impl Records {
         let receiver = match kind {
             Kind::Data => &mut owner.data_receiver,
             Kind::Feedback => &mut owner.feedback_receiver,
-            Kind::Control => &mut owner.control_receiver,
+            Kind::Control | Kind::CarrierControl => &mut owner.control_receiver,
         };
         let opened = receiver.open(
             security::Metadata {
                 epoch: scope.epoch,
                 configuration: scope.configuration,
-                extra: &packet[..1],
+                extra: &aad[..aad_len],
             },
             &packet[1..],
             workspace,

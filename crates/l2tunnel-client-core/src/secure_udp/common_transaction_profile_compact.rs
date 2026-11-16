@@ -1,4 +1,4 @@
-//! Explicit conversion of a complete original UDP plan before authentication.
+//! Explicit conversion of a complete unbound carrier plan before authentication.
 use super::*;
 
 impl Profile {
@@ -13,13 +13,22 @@ impl Profile {
         selection: l2tunnel::secure_record::compact::Selection,
     ) -> io::Result<Self> {
         selection.validate().map_err(io::Error::other)?;
-        if self.raw.is_some() || self.carrier.is_some() || self.compact_wire.is_some() {
+        if self.raw.is_some_and(|raw| raw.outer.is_some())
+            || self.carrier.is_some()
+            || self.compact_wire.is_some()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "compact selection requires an unbound original UDP profile",
+                "compact selection requires an unbound carrier profile",
             ));
         }
-        let physical = if self.settings.gate.path.client.is_ipv6() {
+        let raw_policy = self.raw.map(|raw| raw.policy);
+        let physical = if let Some(policy) = raw_policy {
+            policy
+                .record_geometry()
+                .map_err(io::Error::other)?
+                .ip_tcp_bytes
+        } else if self.settings.gate.path.client.is_ipv6() {
             48
         } else {
             28
@@ -59,15 +68,19 @@ impl Profile {
             resources[1],
             catalog,
             self.parameters,
-            None,
+            raw_policy,
             self.proxy,
             Some(selection),
         )?;
         result.proxy_retirement = self.proxy_retirement;
         result.proxy_measured = self.proxy_measured;
         result.connection_reuse = self.connection_reuse;
-        for role in [security::Role::Initiator, security::Role::Responder] {
-            result.runtime_contract(role)?;
+        if result.raw_policy().is_some() {
+            result.validate_raw_request()?;
+        } else {
+            for role in [security::Role::Initiator, security::Role::Responder] {
+                result.runtime_contract(role)?;
+            }
         }
         Ok(result)
     }

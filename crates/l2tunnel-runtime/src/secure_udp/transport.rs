@@ -11,6 +11,7 @@ use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_management::{
     self as mg, control_streams as streams, delivery, session_control as control, transaction,
 };
+use l2tunnel_raw_io::handoff::pairing::packet::compact as raw_compact;
 use l2tunnel_recovery as recovery;
 use l2tunnel_security as security;
 use l2tunnel_swift::{self as swift, policy, records};
@@ -58,6 +59,8 @@ pub use transaction_contract::TransactionContract;
 mod carrier;
 #[path = "transport_common_research_order.rs"]
 mod common_research_order;
+#[path = "transport_raw_send.rs"]
+mod raw_send;
 use super::raw_carrier_io as raw_carrier;
 #[path = "transport_common.rs"]
 mod common;
@@ -495,15 +498,32 @@ where
                         if !driver.check_expiry(clock(origin,sample())?)? {break;}
                         driver.ingress.left-=1;
                         match socket.try_receive_at(&mut inputs.datagram) {
-                            Ok((length,received))=>{
+                            Ok((length,received,framing))=>{
                                 batch+=1;
                                 if !socket.is_raw() {
                                     driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
                                     if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
                                 }
+                                let metadata=socket.final_input_metadata();
                                 let at=sample();let time=clock(origin,at)?;
-                                if !driver.check_expiry(time)? {break;}
-                                if length>driver.cover.limits().max_packet_bytes {driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);}else{driver.receive_selected_with_arrival(&inputs.datagram[..length],received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time),time,received.unwrap_or(at),at,resolve.as_ref())?;}
+                                if !driver.check_expiry(time)? {
+                                    if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
+                                    break;
+                                }
+                                if length>driver.cover.limits().max_packet_bytes {
+                                    driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);
+                                    driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);
+                                    if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
+                                }else{
+                                    let received_time=received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time);
+                                    if let Some(metadata)=metadata {
+                                        driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref(),metadata)?;
+                                    }else if let Some(framing)=framing {
+                                        driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref(),framing)?;
+                                    }else{
+                                        driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref())?;
+                                    }
+                                }
                             },
                             Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
                             Err(error) if establish::path_loss(&error)=>{driver.counters.socket_receive_errors=driver.counters.socket_receive_errors.saturating_add(1);break;},
@@ -1588,7 +1608,7 @@ struct Driver {
     records: record::Records,
     owner: owner::DataOwner,
     generic: Option<generic::Runtime>,
-    common: Option<common::Runtime>,
+    common: Option<owner::StateCell<common::Runtime>>,
     send: policy::Direction,
     receive: policy::Direction,
     source_scope: Scope,
@@ -2126,7 +2146,7 @@ impl Driver {
         }
         if self
             .common
-            .as_ref()
+            .as_deref()
             .and_then(|runtime| runtime.pending_ingress)
             .is_some_and(|pending| now >= pending.deadline)
         {
@@ -2169,19 +2189,31 @@ impl Driver {
                 .into_iter()
                 .chain(
                     self.common
-                        .as_ref()
+                        .as_deref()
                         .and_then(|r| r.outcome)
                         .map(common_actions::outcome_deadline),
                 )
                 .chain(
                     self.common
-                        .as_ref()
+                        .as_deref()
                         .and_then(|r| r.sealed.as_ref())
                         .map(|pending| duration(pending.deadline)),
                 )
                 .chain(
                     self.common
-                        .as_ref()
+                        .as_deref()
+                        .and_then(|r| r.unsealed.as_ref())
+                        .map(|p| duration(p.deadline)),
+                )
+                .chain(
+                    self.common
+                        .as_deref()
+                        .and_then(|r| r.raw_control.as_ref())
+                        .map(|p| p.deadline.saturating_duration_since(self.origin)),
+                )
+                .chain(
+                    self.common
+                        .as_deref()
                         .and_then(|r| r.pending_feedback)
                         .map(|pending| duration(pending.deadline)),
                 )
@@ -2721,6 +2753,96 @@ impl Driver {
         instant: Instant,
         resolve: Option<&Resolver>,
     ) -> io::Result<()> {
+        self.receive_selected_inner_carrier(
+            packet,
+            received,
+            now,
+            original,
+            instant,
+            resolve,
+            None,
+            None,
+            |_| Ok(()),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn receive_selected_on_carrier(
+        &mut self,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        original: Instant,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+        framing: l2tunnel_openvpn::wire_carrier::common::ReceiveFraming,
+    ) -> io::Result<()> {
+        if received > now || original > instant || clock(self.origin, original)? != received {
+            return Err(invalid("carrier input arrived after observation"));
+        }
+        self.receive_selected_inner_carrier(
+            packet,
+            received,
+            now,
+            original,
+            instant,
+            resolve,
+            None,
+            Some(framing),
+            |_| Ok(()),
+        )
+    }
+    /// Keep untrusted raw input in its original owner until the sole Records verifier decides.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_selected_raw<R: raw_carrier::RawBacking>(
+        &mut self,
+        socket: &mut carrier::IoOwner<R>,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        original: Instant,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+        metadata: raw_compact::FinalMetadata,
+    ) -> io::Result<()> {
+        let mut committed = false;
+        let result = match clock(self.origin, original) {
+            Err(error) => Err(error),
+            Ok(arrived) if received > now || original > instant || arrived != received => {
+                Err(invalid("raw input arrived after observation"))
+            }
+            Ok(_) => self.receive_selected_inner_carrier(
+                packet,
+                received,
+                now,
+                original,
+                instant,
+                resolve,
+                Some(metadata),
+                None,
+                |verdict| {
+                    committed = true;
+                    socket.commit_final_input(metadata, Some(verdict))
+                },
+            ),
+        };
+        if !committed {
+            socket.commit_final_input(metadata, None)?;
+        }
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn receive_selected_inner_carrier(
+        &mut self,
+        packet: &[u8],
+        received: u64,
+        now: u64,
+        original: Instant,
+        instant: Instant,
+        resolve: Option<&Resolver>,
+        carrier: Option<raw_compact::FinalMetadata>,
+        framing: Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
+        mut commit: impl FnMut(raw_compact::FinalAcceptance<()>) -> io::Result<()>,
+    ) -> io::Result<()> {
         if received > now {
             return Err(invalid("authenticated input arrived after observation"));
         }
@@ -2728,7 +2850,26 @@ impl Driver {
             self.progress(now)?;
         }
         self.counters.received_packets = self.counters.received_packets.saturating_add(1);
-        if self.records.is_compact() {
+        let carrier_control = self.records.compact_layout()
+            == Some(record::compact::Layout::Carrier)
+            && packet.first() == Some(&1);
+        if let Some(metadata) = carrier {
+            if self.records.compact_layout() != Some(record::compact::Layout::Carrier)
+                || metadata.payload_bytes() != packet.len()
+                || raw_compact::FinalKind::inspect(packet) != Some(metadata.kind())
+            {
+                self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+                return Ok(());
+            }
+        } else if carrier_control {
+            // Only an actual raw candidate owns the carrier Window/Ping/Pong branch.
+            self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+            return Ok(());
+        }
+        if self.records.is_compact()
+            && carrier.is_none()
+            && framing != Some(l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::Final)
+        {
             // The authenticated selection uses appearance only for setup tails;
             // ordinary established compact records have no cover envelope.
             if let Ok(decoded) = self.cover.decode(packet)
@@ -2737,7 +2878,13 @@ impl Driver {
             {
                 return Ok(());
             }
-        } else {
+            if framing == Some(l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::DataV1) {
+                // Explicit bootstrap framing never falls through to a final record,
+                // even when its inner media header overlaps a final route selector.
+                self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+                return Ok(());
+            }
+        } else if !self.records.is_compact() {
             let decoded = match self.cover.decode(packet) {
                 Ok(decoded) => decoded,
                 Err(_) => {
@@ -2752,7 +2899,14 @@ impl Driver {
                 return Ok(());
             }
         }
-        let opened = if self.records.key_epoch().is_ok() {
+        let opened = if let Some(metadata) = carrier {
+            self.records.open_compact_with_carrier(
+                packet,
+                &metadata.aad(),
+                &mut self.buffers.open,
+                &mut self.buffers.plain,
+            )
+        } else if self.records.key_epoch().is_ok() {
             self.records
                 .open_at(
                     l2tunnel::handshake::Time(now),
@@ -2805,7 +2959,36 @@ impl Driver {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(());
         }
-        if opened.authenticated {
+        let strong_carrier = carrier
+            .is_some_and(|metadata| metadata.kind() != raw_compact::FinalKind::Data)
+            && opened.authenticated;
+        if carrier_control {
+            if !strong_carrier
+                || opened.class != Class::Control
+                || opened.scope != self.records.control_scope()
+            {
+                self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+                return Ok(());
+            }
+            let control =
+                match raw_compact::FinalControl::decode(&self.buffers.plain[..opened.bytes]) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.counters.rejected_packets =
+                            self.counters.rejected_packets.saturating_add(1);
+                        return Ok(());
+                    }
+                };
+            commit(raw_compact::FinalAcceptance::control((), control))?;
+            self.live.last_verified_micros = Some(now);
+            self.restore_common_path();
+            return Ok(());
+        }
+        if carrier.is_some() {
+            // Even CCM4 data grants no raw retirement/liveness authority.
+            commit(raw_compact::FinalAcceptance::record((), strong_carrier))?;
+        }
+        if opened.authenticated && (carrier.is_none() || strong_carrier) {
             self.live.last_verified_micros = Some(now);
             // A CRC-selected data check never restores an authenticated path or
             // satisfies liveness; strong Control/Feedback retain those rights.
@@ -3175,6 +3358,20 @@ impl Driver {
             Err(error) => Err(error),
         }
     }
+    fn bootstrap_ip_bytes(&self) -> usize {
+        let Some(runtime) = self
+            .common
+            .as_deref()
+            .filter(|r| r.contract.compact_wire().is_some())
+        else {
+            return self.ip;
+        };
+        if let Some(raw) = runtime.contract.raw_outer() {
+            raw.geometry().ip_tcp_bytes + raw.geometry().record_overhead_bytes
+        } else {
+            self.ip + usize::from(runtime.contract.on_outer_carrier())
+        }
+    }
     fn tail(&mut self, instant: Instant) -> io::Result<Option<usize>> {
         self.tail_with_cap(instant)
             .map(|value| value.map(|(bytes, _)| bytes))
@@ -3184,7 +3381,7 @@ impl Driver {
             return Err(exhausted());
         }
         let bootstrap_max = self.bootstrap.max_packet_bytes();
-        let enough = self.bucket.allowance() >= bootstrap_max + self.ip;
+        let enough = self.bucket.allowance() >= bootstrap_max + self.bootstrap_ip_bytes();
         let result = self.bootstrap.poll(
             instant,
             meta(self.outer, cover::Phase::Handshake),
@@ -3200,7 +3397,8 @@ impl Driver {
             Err(establish::Error::OutputTooSmall) if !enough => {}
             Err(error) => return Err(protocol(error)),
         }
-        let enough = self.bucket.allowance() >= self.joining.max_packet_bytes() + self.ip;
+        let enough =
+            self.bucket.allowance() >= self.joining.max_packet_bytes() + self.bootstrap_ip_bytes();
         let result = self.joining.poll(
             instant,
             meta(self.outer, cover::Phase::Established),
@@ -3626,11 +3824,11 @@ impl Driver {
         for (at, bytes) in [
             (
                 self.bootstrap.deadline(),
-                self.bootstrap.max_packet_bytes() + self.ip,
+                self.bootstrap.max_packet_bytes() + self.bootstrap_ip_bytes(),
             ),
             (
                 self.joining.deadline(),
-                self.joining.max_packet_bytes() + self.ip,
+                self.joining.max_packet_bytes() + self.bootstrap_ip_bytes(),
             ),
         ] {
             if let Some(at) = at {

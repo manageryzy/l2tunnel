@@ -170,6 +170,16 @@ pub(super) fn raw_inspection(
         "bytes_per_second":policy.bytes_per_second,"packets_per_second":policy.packets_per_second,
         "burst_bytes":policy.burst_bytes,"burst_packets":policy.burst_packets,"max_key_packets":policy.max_key_packets,"max_key_bytes":policy.max_key_bytes,
         "kernel_firewall_ready":false,"native_qualified":false,"congestion_control":false,"clean_close":false}));
+    if profile.compact_wire().is_some() {
+        header.insert("outer_policy_scope".into(), json!("bootstrap"));
+        header.insert("requested_final_framing".into(), json!({
+            "ip_tcp_bytes":geometry.ip_tcp_bytes,
+            "data_overhead_bytes":geometry.ip_tcp_bytes + l2tunnel::secure_record::compact::DATA_OVERHEAD,
+            "control_feedback_overhead_bytes":geometry.ip_tcp_bytes + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD,
+            "protection_layers":1,"phase_envelope":false,"raw_datagram_envelope":false
+        }));
+        header.insert("effective_final_framing".into(), Value::Null);
+    }
     output[0] = bounded(std::mem::take(&mut output[0]))?;
     Ok(output)
 }

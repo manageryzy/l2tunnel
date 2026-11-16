@@ -196,6 +196,32 @@ impl OriginalDatagram {
             peer,
         })
     }
+    /// Select final unwrapped records after authenticating the full compact contract.
+    /// The existing actor retains bounded initial TLS/member tails under this cap.
+    pub(crate) fn select_final_records(&mut self, setup_deadline: Instant) -> io::Result<()> {
+        let Backend::OpenVpn(carrier) = &mut self.backend else {
+            return Err(invalid(
+                "final carrier selection requires actual OpenVPN ownership",
+            ));
+        };
+        carrier
+            .select_final_records(setup_deadline)
+            .map_err(carrier_error)?;
+        self.geometry.extra_wire_bytes = 0;
+        Ok(())
+    }
+    /// Whether this actual actor has selected the disjoint final record namespace.
+    pub fn final_records(&self) -> bool {
+        matches!(&self.backend, Backend::OpenVpn(carrier) if carrier.final_records())
+    }
+    /// Exact retained initial packet cost; final record geometry does not hide its opcode.
+    pub(crate) fn bootstrap_ip_bytes(&self, bytes: usize) -> io::Result<usize> {
+        self.geometry
+            .full_ip_bytes(bytes)?
+            .checked_add(usize::from(self.final_records()))
+            .filter(|value| *value <= self.geometry.path_mtu)
+            .ok_or_else(|| invalid("original bootstrap geometry"))
+    }
     /// Exact original endpoint pair; no proxy socket or caller-asserted endpoint.
     pub fn addresses(&self) -> (SocketAddr, SocketAddr) {
         (self.local, self.peer)
@@ -238,7 +264,8 @@ impl OriginalDatagram {
     ) -> Option<&mut l2tunnel_auth::AuthenticatedIo<tokio::io::DuplexStream>> {
         match &mut self.backend {
             Backend::Udp(_) => None,
-            Backend::OpenVpn(carrier) => Some(carrier.control()),
+            Backend::OpenVpn(carrier) if !carrier.final_records() => Some(carrier.control()),
+            Backend::OpenVpn(_) => None,
         }
     }
     /// Retain one datagram without reporting a physical write. WouldBlock admits nothing.
@@ -248,14 +275,38 @@ impl OriginalDatagram {
         bytes: &[u8],
         deadline: Instant,
     ) -> io::Result<PendingSend> {
-        self.geometry.full_ip_bytes(bytes.len())?;
+        self.begin_selected_send(class, bytes, deadline, false)
+    }
+    pub(crate) fn begin_bootstrap_send(
+        &self,
+        class: SendClass,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> io::Result<PendingSend> {
+        self.begin_selected_send(class, bytes, deadline, true)
+    }
+    fn begin_selected_send(
+        &self,
+        class: SendClass,
+        bytes: &[u8],
+        deadline: Instant,
+        bootstrap: bool,
+    ) -> io::Result<PendingSend> {
+        if bootstrap {
+            self.bootstrap_ip_bytes(bytes.len())?;
+        } else {
+            self.geometry.full_ip_bytes(bytes.len())?;
+        }
         let deadline = self.expires().map_or(deadline, |outer| outer.min(deadline));
         check(deadline)?;
         let pending = match &self.backend {
             Backend::OpenVpn(carrier) => Pending::OpenVpn(
-                carrier
-                    .try_send_until(class, bytes, deadline)
-                    .map_err(carrier_error)?,
+                (if bootstrap {
+                    carrier.try_send_bootstrap_until(class, bytes, deadline)
+                } else {
+                    carrier.try_send_until(class, bytes, deadline)
+                })
+                .map_err(carrier_error)?,
             ),
             Backend::Udp(udp) => {
                 let slots = if class == SendClass::User {
@@ -379,6 +430,15 @@ impl OriginalDatagram {
         cx: &mut Context<'_>,
         output: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        self.poll_receive_framed(cx, output)
+            .map(|result| result.map(|(bytes, _)| bytes))
+    }
+    /// Preserve the actor's outer framing before any DataV1 wrapper was removed.
+    pub(crate) fn poll_receive_framed(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<(usize, Option<openvpn::ReceiveFraming>)>> {
         if output.len() <= self.geometry.max_datagram_bytes {
             return Poll::Ready(Err(invalid(
                 "original receive requires maximum plus one byte",
@@ -395,18 +455,18 @@ impl OriginalDatagram {
                         Poll::Ready(if length > self.geometry.max_datagram_bytes {
                             Err(invalid("oversize original UDP input"))
                         } else {
-                            Ok(length)
+                            Ok((length, None))
                         })
                     }
                 }
             }
-            Backend::OpenVpn(carrier) => carrier.poll_recv(cx).map(|result| {
+            Backend::OpenVpn(carrier) => carrier.poll_recv_framed(cx).map(|result| {
                 result.map_err(carrier_error).and_then(|packet| {
-                    if packet.len() > self.geometry.max_datagram_bytes {
+                    if packet.bytes.len() > self.geometry.max_datagram_bytes {
                         return Err(invalid("oversize original carrier input"));
                     }
-                    output[..packet.len()].copy_from_slice(&packet);
-                    Ok(packet.len())
+                    output[..packet.bytes.len()].copy_from_slice(&packet.bytes);
+                    Ok((packet.bytes.len(), Some(packet.framing)))
                 })
             }),
         }

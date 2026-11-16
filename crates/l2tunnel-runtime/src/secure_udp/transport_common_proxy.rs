@@ -28,7 +28,7 @@ pub(crate) fn run_common_proxy_records(
             })?;
         driver
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| invalid("Common proxy owner absent"))?
             .proxy_bridge = Some(bridge);
         if Instant::now() >= setup_deadline {
@@ -71,7 +71,7 @@ where
         let (socket, mut driver) = Driver::new_common_on_raw(parts, contract)?;
         driver
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| invalid("raw Common proxy owner absent"))?
             .proxy_bridge = Some(bridge);
         if Instant::now() >= setup_deadline {
@@ -104,6 +104,8 @@ impl Driver {
             .transpose()?
             .unwrap_or(false);
         let drained = runtime.sealed.is_none()
+            && runtime.unsealed.is_none()
+            && runtime.raw_control.is_none()
             && runtime.pending_feedback.is_none()
             && runtime.pending_ingress.is_none()
             && self.native.is_empty()

@@ -13,7 +13,7 @@ impl Driver {
         let Some(runtime) = &self.common else {
             return Ok(false);
         };
-        if runtime.contract.extra_wire_bytes() == 0 && runtime.contract.raw_outer().is_none() {
+        if !runtime.contract.on_outer_carrier() && runtime.contract.raw_outer().is_none() {
             return Ok(false);
         }
         let state = self.common_state()?;
@@ -29,8 +29,8 @@ impl Driver {
         )
     }
     pub(super) fn research_carrier_selected(&self) -> bool {
-        self.common.as_ref().is_some_and(|runtime| {
-            (runtime.contract.extra_wire_bytes() != 0 || runtime.contract.raw_outer().is_some())
+        self.common.as_deref().is_some_and(|runtime| {
+            (runtime.contract.on_outer_carrier() || runtime.contract.raw_outer().is_some())
                 && runtime
                     .contract
                     .catalog()
@@ -51,27 +51,45 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| protocol("Research runtime missing"))?;
-        let Some(output) = &runtime.sealed else {
+        let (scope, dependency, deadline, kind) = if let Some(output) = &runtime.sealed {
+            (
+                output.scope,
+                output.sealed.number.0,
+                output.deadline,
+                output
+                    .carrier
+                    .as_ref()
+                    .map(|v| v.emission().kind)
+                    .or_else(|| output.fragment.as_ref().map(|v| v.emission().emission.kind)),
+            )
+        } else if let Some(output) = &runtime.unsealed {
+            // The number identifies retained output only. No physical receipt
+            // or authentication fact is inferred before actual carrier sealing.
+            (
+                output.scope,
+                output.number.0,
+                output.deadline,
+                output
+                    .carrier
+                    .as_ref()
+                    .map(|v| v.emission().kind)
+                    .or_else(|| output.fragment.as_ref().map(|v| v.emission().emission.kind)),
+            )
+        } else {
             return Ok(false);
         };
-        if output.scope != opened.scope {
+        if scope != opened.scope {
             return Ok(false);
         }
-        let kind = output
-            .carrier
-            .as_ref()
-            .map(|v| v.emission().kind)
-            .or_else(|| output.fragment.as_ref().map(|v| v.emission().emission.kind));
         if !matches!(
             kind,
             Some(engine::EmissionKind::Source(_) | engine::EmissionKind::Repair)
         ) {
             return Ok(false);
         }
-        let dependency = output.sealed.number.0;
-        let deadline = output.deadline.min(self.common_original_cap()?);
+        let deadline = deadline.min(self.common_original_cap()?);
         let order = self.causal_time(original)?;
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("Research feedback Bank missing"));
@@ -95,7 +113,7 @@ impl Driver {
         }
         if self
             .common
-            .as_ref()
+            .as_deref()
             .is_some_and(|runtime| runtime.pending_feedback.is_some())
         {
             return Err(protocol("bounded Research feedback custody is full"));
@@ -108,7 +126,7 @@ impl Driver {
         }
         let runtime = self
             .common
-            .as_mut()
+            .as_deref_mut()
             .ok_or_else(|| protocol("Research runtime missing"))?;
         runtime
             .feedback_input
@@ -141,7 +159,7 @@ impl Driver {
         accepted: u64,
         observed: u64,
     ) -> io::Result<()> {
-        let Some(pending) = self.common.as_ref().and_then(|r| r.pending_feedback) else {
+        let Some(pending) = self.common.as_deref().and_then(|r| r.pending_feedback) else {
             return Ok(());
         };
         let Some(dependency) = pending.physical_dependency else {

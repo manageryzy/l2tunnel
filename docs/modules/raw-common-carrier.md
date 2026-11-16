@@ -35,8 +35,10 @@ or alter the requested policy.
 The raw adapter retains one actual PacketCarrier, a User witness, a separate
 bounded Control buffer and one bounded copied input with its original arrival.
 Maintained raw RecordGeometry supplies exact IPv4/TCP and protection costs. Every
-Common record retains authentication/replay and the raw phase's existing outer
-protection; TCP-shaped packet traffic is not ordinary ACK-driven TCP/TLS data.
+legacy Common record retains authentication/replay and the raw phase's existing
+outer protection; the explicitly selected compact handoff below replaces that
+nested final protection. TCP-shaped packet traffic is not ordinary ACK-driven
+TCP/TLS data.
 Raw physical observations do not increment UDP-byte counters.
 
 Only the maintained sent-record token and acceptance timestamp confirm physical
@@ -47,6 +49,47 @@ input. A held ciphertext keeps its original bytes, identity, charge and deadline
 The adapter counts its actual inline owner and two buffer capacities; nested
 raw/TLS/backend heap qualification remains open and the full-preallocation flag
 stays false.
+
+## Selected compact final handoff
+
+The additive `Profile::new_raw_compact` and unbound `with_compact_wire` conversion
+bind the selected data suite and complete paired Common contract before original
+TLS/member establishment. `new_on_raw_paired_compact` then validates the genuine
+proof, preserves the complete bootstrap policy/capacity and preflights every
+catalog entry at final physical cost 40. Pure preflight derives this geometry from
+the validated selected contract; absence of a genuine proof never substitutes
+UDP accounting or creates opposite-role authority.
+
+After actual inner Noise/member acceptance, the retained owner installs final
+Records directly in the TCP payload. The legacy phase48/datagram64 envelope is
+absent on this selected path. Canonical raw metadata is 49 bytes of AAD, not a
+second on-wire header. Data costs 49 bytes and strong feedback/control costs 61
+bytes including IPv4/TCP40, before algorithm/control-body/fragment fields.
+Strong route 1 CarrierControl and management share the original monotonic control
+packet-number domain. Short-check data never authorizes raw window retirement.
+Whole-send tokens, original deadlines, pending ciphertext, independent control,
+sequence/horizon state and Full/Half lane ownership retain their existing owners.
+Pre-seal output waits for actual raw metadata in the existing wire slab and
+participates in drain/reuse/proxy barriers without inventing send completion.
+
+The shared raw service now carries explicit compact selection and actual
+activation observations. `raw_carrier` retains the original bootstrap proof
+geometry, marks that scope when compact is selected, and reports `final_framing`
+only from the installed runtime owner. Offline CLI exposes requested 49/61 framing
+with no effective session. Existing unsupported measured and Half proxy
+combinations remain explicit refusals.
+
+Both-suite paired Half service checks exercise genuine outer/inner admission,
+bidirectional native bytes, Swift/Aligned/Packed/Rolling switching, liveness,
+unchanged originals and release. Both-suite Full fixed-proxy checks exercise
+actual native TCP, retained retirement and original release. The
+[client receipt](../../work/compact-carrier-migration-20261116/client-results.json)
+preserves failed fixture/typing attempts and their narrow corrections; the
+[batch receipt](../../work/compact-carrier-migration-20261116/batch-summary.json)
+records the remaining protocol/runtime and required-check scope. These checks use
+caller-owned PacketIo/Unix devices and retain default thread stacks. They do not
+qualify privileged kernel/raw/native CLI, Windows/Android, ISP classification or
+throughput. RCC and CWC complete acceptance definitions remain unchanged.
 
 ## Shared service installation
 

@@ -1,6 +1,8 @@
 //! One original physical reader, from birth through the terminal packet phase.
 use super::*;
 use l2tunnel_raw_tcp::packet;
+#[path = "compact_gate.rs"]
+mod compact;
 
 pub(super) struct Budget {
     policy: PacketPolicy,
@@ -59,6 +61,7 @@ pub(super) struct Cell {
     pub received_at: Instant,
     pub header: wire::Header,
     pub body: Vec<u8>,
+    pub final_metadata: Option<super::compact::FinalMetadata>,
 }
 pub(super) struct Fence {
     pub local: u32,
@@ -146,6 +149,8 @@ pub(super) struct GateState {
     pub installed: bool,
     pub transaction: [u8; 16],
     pub opener: Option<PacketOpener>,
+    pub final_context: Option<[u8; 32]>,
+    pub bootstrap_filter: Option<super::compact::BootstrapFilter>,
     pub fence: Option<Fence>,
     early: Option<Early>,
     pub hello_allowed: bool,
@@ -178,7 +183,10 @@ impl GateState {
     pub(super) fn earliest_authenticated_upper_at(&self) -> Option<Instant> {
         self.incoming
             .iter()
-            .filter(|cell| matches!(cell.header.kind, wire::Kind::Data | wire::Kind::Feedback))
+            .filter(|cell| {
+                cell.final_metadata.is_none()
+                    && matches!(cell.header.kind, wire::Kind::Data | wire::Kind::Feedback)
+            })
             .map(|cell| cell.received_at)
             .chain(
                 self.early
@@ -200,6 +208,8 @@ impl GateState {
             installed: false,
             transaction: [0; 16],
             opener: None,
+            final_context: None,
+            bootstrap_filter: None,
             fence: None,
             early: None,
             hello_allowed: false,
@@ -248,7 +258,16 @@ impl GateState {
         let mut output = vec![0; usize::from(self.policy.mtu)];
         let tx = self.transaction;
         let policy = self.policy;
-        let queued_data = self.records_outstanding;
+        let queued_data = self.records_outstanding
+            + self
+                .incoming
+                .iter()
+                .filter(|cell| {
+                    cell.final_metadata.is_some_and(|meta| {
+                        meta.kind() != super::compact::FinalKind::CarrierControl
+                    })
+                })
+                .count();
         let queued_control = self
             .incoming
             .iter()
@@ -263,6 +282,9 @@ impl GateState {
         let commit_body = self.commit_body;
         let ack_body = self.ack_body;
         let client = self.client;
+        let final_selected = self.final_context.is_some();
+        let bootstrap_filter = self.bootstrap_filter.clone();
+        let bootstrap_live = Instant::now() < self.deadline;
         let count = if self.half { 2 } else { 1 };
         let lane = self.lane;
         let mut protocol_fault = false;
@@ -303,6 +325,22 @@ impl GateState {
                 range_proposal =
                     Some(ranges.propose(h.offset, end, f.retired.max(end), f.local_horizon)?);
                 let body = &plain[wire::HEADER..];
+                if final_selected
+                    && (!bootstrap_live
+                        || match h.kind {
+                            wire::Kind::Data | wire::Kind::Feedback => {
+                                bootstrap_filter.as_ref().is_none_or(|allow| !allow(body))
+                            }
+                            wire::Kind::Hello
+                            | wire::Kind::Commit
+                            | wire::Kind::CommitAck
+                            | wire::Kind::Window
+                            | wire::Kind::Ping
+                            | wire::Kind::Pong => false,
+                        })
+                {
+                    return Err(Error::Proof);
+                }
                 match h.kind {
                     wire::Kind::Hello => {
                         let hello = wire::Hello::parse(body)?;
@@ -392,6 +430,7 @@ impl GateState {
                     received_at: Instant::now(),
                     header: h,
                     body: output[wire::HEADER..opened.payload_len].to_vec(),
+                    final_metadata: None,
                 });
             }
             Err(l2tunnel_datagram::CheckedOpenError::Datagram(_)) => {
@@ -477,6 +516,7 @@ impl GateState {
                 let header = wire::Header::parse(&output[..opened.payload_len])?;
                 let candidate = Early {
                     cell: Cell {
+                        final_metadata: None,
                         received_at: Instant::now(),
                         header,
                         body: output[wire::HEADER..opened.payload_len].to_vec(),
@@ -595,6 +635,10 @@ impl<I: PacketIo> GateIo<I> {
         if s.opener.is_some() {
             s.installed = true;
         }
+        if s.final_context.is_some() && Instant::now() >= s.deadline {
+            s.opener = None;
+            s.bootstrap_filter = None;
+        }
         Ok(())
     }
     pub fn cancel_pending(&mut self) {
@@ -646,6 +690,10 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
         // fabricate ECN acceptance state in the maintained owner.
         if p.flags & 0xc0 != 0 {
             s.reject().map_err(io::Error::other)?;
+            return Ok(None);
+        }
+        if s.final_context.is_some() && super::compact::FinalKind::inspect(p.payload).is_some() {
+            s.ingest_final(&out[..n]).map_err(io::Error::other)?;
             return Ok(None);
         }
         let candidate = s.opener.is_some()

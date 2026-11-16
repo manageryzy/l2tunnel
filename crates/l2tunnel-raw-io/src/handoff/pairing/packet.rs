@@ -9,6 +9,8 @@ use l2tunnel_datagram::{
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// Explicit final Records framing over the same original raw owners.
+pub mod compact;
 mod gate;
 mod transaction;
 use gate::{GateIo, GateState, SharedBudget};

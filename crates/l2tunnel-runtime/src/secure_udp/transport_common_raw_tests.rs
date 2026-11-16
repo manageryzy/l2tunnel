@@ -26,6 +26,8 @@ struct Probe {
     syns: AtomicUsize,
     dropped: AtomicUsize,
     blocked: AtomicBool,
+    final_management: AtomicUsize,
+    final_carrier: AtomicUsize,
 }
 struct PacketLink {
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -53,6 +55,15 @@ impl PacketIo for PacketLink {
             .try_send(bytes.to_vec())
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         self.probe.sent.fetch_add(1, Ordering::Relaxed);
+        match bytes.get(40) {
+            Some(0) => {
+                self.probe.final_management.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(1) => {
+                self.probe.final_carrier.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         if bytes.get(33).is_some_and(|flags| flags & 2 != 0) {
             self.probe.syns.fetch_add(1, Ordering::Relaxed);
         }
@@ -131,6 +142,7 @@ fn originals(
 }
 fn requested(
     duplex: core::Duplex,
+    selection: Option<record::compact::Selection>,
 ) -> Result<(
     [Config; 2],
     [cover::Config; 2],
@@ -139,12 +151,21 @@ fn requested(
 )> {
     let kind = cover::Appearance::QuicLike;
     let physical = PacketPolicy::new(1500).record_geometry()?.ip_bytes(1)? - 1;
+    let selected_data = 40 + record::compact::DATA_OVERHEAD;
     let mut resources = config(kind);
     resources.security.max_body_bytes = 1200;
     resources.control.wire_overhead = physical
         + record::ROUTE_BYTES
         + security::Protection::ChaCha20Poly1305.overhead_bytes()
         + 13;
+    if selection.is_some() {
+        resources.control.wire_overhead = 40 + record::compact::AUTHENTICATED_OVERHEAD;
+    }
+    let data_overhead = if selection.is_some() {
+        selected_data
+    } else {
+        resources.control.wire_overhead
+    };
     // Keep the base rollover interval within its inherited per-key byte cap.
     resources.lifetime.lease = Duration::from_secs(30);
     resources.native.stall_timeout = Duration::from_secs(5);
@@ -195,24 +216,24 @@ fn requested(
                 mut forward,
                 mut reverse,
             } => {
-                forward.recovery.outer_overhead_bytes = resources.control.wire_overhead;
-                reverse.recovery.outer_overhead_bytes = resources.control.wire_overhead;
+                forward.recovery.outer_overhead_bytes = data_overhead;
+                reverse.recovery.outer_overhead_bytes = data_overhead;
                 c::Profile::Aligned { forward, reverse }
             }
             c::Profile::Packed {
                 mut forward,
                 mut reverse,
             } => {
-                forward.base.recovery.outer_overhead_bytes = resources.control.wire_overhead;
-                reverse.base.recovery.outer_overhead_bytes = resources.control.wire_overhead;
+                forward.base.recovery.outer_overhead_bytes = data_overhead;
+                reverse.base.recovery.outer_overhead_bytes = data_overhead;
                 c::Profile::Packed { forward, reverse }
             }
             c::Profile::Rolling { mut config, stream } => {
                 config.native_stall_micros =
                     u64::try_from(resources.native.stall_timeout.as_micros())?;
                 config.geometry = engine::Geometry {
-                    forward_overhead_bytes: resources.control.wire_overhead,
-                    reverse_overhead_bytes: resources.control.wire_overhead,
+                    forward_overhead_bytes: data_overhead,
+                    reverse_overhead_bytes: data_overhead,
                 };
                 c::Profile::Rolling { config, stream }
             }
@@ -253,7 +274,8 @@ fn setup(
         1,
     )?;
     gate.path_mtu = outer.geometry().path_mtu;
-    gate.outer_overhead = contract.physical_overhead_bytes()? + 1 + 30;
+    gate.outer_overhead =
+        outer.geometry().ip_tcp_bytes + outer.geometry().record_overhead_bytes + 1 + 30;
     gate.arq.max_source_bytes = 100;
     gate.arq.send_bytes = 3200;
     gate.arq.receive_bytes = 3200;
@@ -334,21 +356,37 @@ struct OriginalPair {
     endpoints: (std::net::SocketAddr, std::net::SocketAddr),
 }
 
+// Construct the setup future outside its caller's poll frame. Every legacy and
+// selected fixture retains the same real owners through this shared boundary.
+#[inline(never)]
+fn establish_original_pair(
+    half: bool,
+    selection: Option<record::compact::Selection>,
+) -> Pin<Box<dyn Future<Output = Result<OriginalPair>>>> {
+    Box::pin(establish_original_pair_inner(half, selection))
+}
+
 // Complete both real setup state machines before constructing either Driver.
-// Keeping their poll temporaries in a separate future reflects the actual
-// setup-to-runtime handoff and leaves the test's default thread stack unchanged.
-async fn establish_original_pair(half: bool) -> Result<OriginalPair> {
+async fn establish_original_pair_inner(
+    half: bool,
+    selection: Option<record::compact::Selection>,
+) -> Result<OriginalPair> {
     let duplex = if half {
         core::Duplex::Half
     } else {
         core::Duplex::Full
     };
-    let (resources, covers, catalog, settings) = requested(duplex)?;
+    let (resources, covers, catalog, settings) = requested(duplex, selection)?;
     let base = security::ConfigDigest([3; 32]);
     let envelope = c::EnvelopeDigest::new([0x39; 32]);
-    let requested = CommonTransactionContract::raw_requested_configuration(
-        base, envelope, &catalog, resources, covers, settings,
-    )?;
+    let requested = match selection {
+        Some(selection) => CommonTransactionContract::raw_requested_configuration_compact(
+            base, envelope, &catalog, resources, covers, settings, selection,
+        )?,
+        None => CommonTransactionContract::raw_requested_configuration(
+            base, envelope, &catalog, resources, covers, settings,
+        )?,
+    };
     let certificate = rcgen::generate_simple_self_signed(vec!["raw-common.test".to_owned()])?;
     let roots = vec![certificate.cert.der().to_vec()];
     let tls_client = ClientTls::from_der_roots(&roots)?;
@@ -414,26 +452,31 @@ async fn establish_original_pair(half: bool) -> Result<OriginalPair> {
         assert_ne!(original_endpoints[0], original_endpoints[1]);
     }
     let endpoints = a.authenticated().lane_endpoints()[0].ok_or("original tuple")?;
-    let a_contract = CommonTransactionContract::new_on_raw_paired(
-        base,
-        security::Role::Initiator,
-        resources,
-        covers,
-        envelope,
-        catalog.clone(),
-        settings,
-        a.authenticated(),
-    )?;
-    let b_contract = CommonTransactionContract::new_on_raw_paired(
-        base,
-        security::Role::Responder,
-        resources,
-        covers,
-        envelope,
-        catalog.clone(),
-        settings,
-        b.authenticated(),
-    )?;
+    let bind = |role, resources, outer| match selection {
+        Some(selection) => CommonTransactionContract::new_on_raw_paired_compact(
+            base,
+            role,
+            resources,
+            covers,
+            envelope,
+            catalog.clone(),
+            settings,
+            outer,
+            selection,
+        ),
+        None => CommonTransactionContract::new_on_raw_paired(
+            base,
+            role,
+            resources,
+            covers,
+            envelope,
+            catalog.clone(),
+            settings,
+            outer,
+        ),
+    };
+    let a_contract = bind(security::Role::Initiator, resources, a.authenticated())?;
+    let b_contract = bind(security::Role::Responder, resources, b.authenticated())?;
     assert_eq!(
         a_contract.expected_configuration(),
         b_contract.expected_configuration()
@@ -442,19 +485,7 @@ async fn establish_original_pair(half: bool) -> Result<OriginalPair> {
     assert!(a_contract.refresh_selection().is_none());
     let mut wrong = resources;
     wrong[1].work.send_batch += 1;
-    assert!(
-        CommonTransactionContract::new_on_raw_paired(
-            base,
-            security::Role::Initiator,
-            wrong,
-            covers,
-            envelope,
-            catalog.clone(),
-            settings,
-            a.authenticated()
-        )
-        .is_err()
-    );
+    assert!(bind(security::Role::Initiator, wrong, a.authenticated()).is_err());
     let a_config = setup(a.authenticated(), &a_contract)?;
     let b_config = setup(b.authenticated(), &b_contract)?;
     let local = hs::LocalSecret::new(Zeroizing::new([11; 32]));
@@ -523,7 +554,17 @@ async fn establish_original_pair(half: bool) -> Result<OriginalPair> {
     })
 }
 
-async fn exercise_original_raw(half: bool) -> Result {
+// Setup and runtime exercise never share one large poll frame. This wrapper
+// owns only the handoff between their original futures, without larger stacks.
+#[inline(never)]
+fn exercise_original_raw(half: bool) -> Pin<Box<dyn Future<Output = Result>>> {
+    Box::pin(async move {
+        let pair = establish_original_pair(half, None).await?;
+        Box::pin(exercise_established_raw(half, pair)).await
+    })
+}
+
+async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
     let OriginalPair {
         client: a,
         server: b,
@@ -532,7 +573,7 @@ async fn exercise_original_raw(half: bool) -> Result {
         catalog,
         probes,
         endpoints,
-    } = Box::pin(establish_original_pair(half)).await?;
+    } = pair;
     let cap = a.deadline().min(b.deadline());
     let session = a.info().binding;
     let original_syns: Vec<_> = probes
@@ -706,3 +747,6 @@ async fn exercise_original_raw(half: bool) -> Result {
     }
     Ok(())
 }
+
+#[path = "transport_common_raw_selected_tests.rs"]
+mod selected;

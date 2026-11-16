@@ -10,6 +10,7 @@ use l2tunnel_raw_io::{
     },
 };
 use l2tunnel_security as security;
+use raw::compact::{FinalAcceptance, FinalControl, FinalKind, FinalMetadata, FinalOutputToken};
 use std::io;
 use std::{
     alloc::Layout,
@@ -62,6 +63,16 @@ pub(in crate::secure_udp) enum NoRaw {}
 /// Narrow I/O ownership seam; this is not a protocol or authentication state machine.
 pub(in crate::secure_udp) trait RawBacking: Send {
     fn geometry(&self) -> raw::RecordGeometry;
+    fn final_input_metadata(&self) -> Option<FinalMetadata>;
+    fn commit_final_input(
+        &mut self,
+        metadata: FinalMetadata,
+        verdict: Option<FinalAcceptance<()>>,
+    ) -> io::Result<()>;
+    fn prepare_final(&mut self, kind: FinalKind, bytes: usize)
+    -> io::Result<Option<FinalMetadata>>;
+    fn prepare_final_control(&mut self) -> io::Result<Option<(FinalMetadata, FinalControl)>>;
+    fn cancel_final(&mut self) -> io::Result<()>;
     fn addresses(&self) -> (SocketAddr, SocketAddr);
     fn capacity_bytes(&self) -> io::Result<usize>;
     fn allocations(&self) -> usize;
@@ -79,11 +90,12 @@ pub(in crate::secure_udp) trait RawBacking: Send {
         bytes: &[u8],
         cost: usize,
         deadline: Instant,
+        bootstrap: bool,
     ) -> io::Result<SendProgress>;
     fn take_control(&mut self) -> io::Result<Option<(SendProgress, usize)>>;
     fn take_user(&mut self) -> io::Result<Option<(UserIdentity, SendProgress)>>;
     fn user_accepted_at(&self) -> Option<Instant>;
-    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>>;
+    fn earliest_input_for_ordering_at(&self) -> io::Result<Option<Instant>>;
     fn try_user_held(&mut self, identity: UserIdentity, bytes: &[u8]) -> io::Result<SendProgress>;
     fn try_receive(&mut self, output: &mut [u8]) -> io::Result<(usize, Instant)>;
     fn poll_ready(&mut self, cx: &mut Context<'_>, receive: bool) -> Poll<io::Result<()>>;
@@ -95,6 +107,25 @@ pub(in crate::secure_udp) trait RawBacking: Send {
     ) -> Poll<io::Result<()>>;
 }
 impl RawBacking for NoRaw {
+    fn final_input_metadata(&self) -> Option<FinalMetadata> {
+        match *self {}
+    }
+    fn commit_final_input(
+        &mut self,
+        _: FinalMetadata,
+        _: Option<FinalAcceptance<()>>,
+    ) -> io::Result<()> {
+        match *self {}
+    }
+    fn prepare_final(&mut self, _: FinalKind, _: usize) -> io::Result<Option<FinalMetadata>> {
+        match *self {}
+    }
+    fn prepare_final_control(&mut self) -> io::Result<Option<(FinalMetadata, FinalControl)>> {
+        match *self {}
+    }
+    fn cancel_final(&mut self) -> io::Result<()> {
+        match *self {}
+    }
     fn geometry(&self) -> raw::RecordGeometry {
         match *self {}
     }
@@ -134,7 +165,13 @@ impl RawBacking for NoRaw {
     fn try_user(&mut self, _: UserIdentity, _: &[u8]) -> io::Result<SendProgress> {
         match *self {}
     }
-    fn stage_control(&mut self, _: &[u8], _: usize, _: Instant) -> io::Result<SendProgress> {
+    fn stage_control(
+        &mut self,
+        _: &[u8],
+        _: usize,
+        _: Instant,
+        _: bool,
+    ) -> io::Result<SendProgress> {
         match *self {}
     }
     fn take_control(&mut self) -> io::Result<Option<(SendProgress, usize)>> {
@@ -146,7 +183,7 @@ impl RawBacking for NoRaw {
     fn user_accepted_at(&self) -> Option<Instant> {
         match *self {}
     }
-    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>> {
+    fn earliest_input_for_ordering_at(&self) -> io::Result<Option<Instant>> {
         match *self {}
     }
     fn try_user_held(&mut self, _: UserIdentity, _: &[u8]) -> io::Result<SendProgress> {
@@ -169,6 +206,7 @@ impl RawBacking for NoRaw {
 }
 
 struct Pending {
+    bootstrap: bool,
     lane: PairLane,
     token: Option<raw::RecordToken>,
     bytes: usize,
@@ -183,6 +221,7 @@ struct User {
 struct Input {
     bytes: usize,
     received: Instant,
+    final_metadata: Option<(PairLane, FinalMetadata)>,
 }
 
 /// Actual bounded backing, including the real inline PacketCarrier header.
@@ -196,7 +235,11 @@ impl Plan {
     pub(in crate::secure_udp) fn for_packet<I: PacketIo + Send + 'static>(
         carrier: &PacketCarrier<I>,
     ) -> io::Result<Self> {
-        let maximum = carrier.geometry().map_err(raw_error)?.max_record_bytes;
+        let geometry = carrier.geometry().map_err(raw_error)?;
+        let maximum = geometry
+            .path_mtu
+            .checked_sub(geometry.ip_tcp_bytes)
+            .ok_or_else(exhausted)?;
         let capacity = Layout::array::<RawAdapter<I>>(1)
             .map_err(invalid)?
             .size()
@@ -213,6 +256,9 @@ impl Plan {
 pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     carrier: PacketCarrier<I>,
     geometry: raw::RecordGeometry,
+    bootstrap_geometry: raw::RecordGeometry,
+    prepared: Option<(PairLane, FinalOutputToken)>,
+    control_cursor: usize,
     addresses: (SocketAddr, SocketAddr),
     lanes: usize,
     client: bool,
@@ -259,12 +305,27 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             {
                 return Ok(SendProgress::Pending);
             }
-            Self::stage(
-                &mut self.carrier,
-                &mut user.pending,
-                raw::RecordKind::Data,
-                bytes,
-            )?;
+            if self.carrier.final_records_enabled() && user.pending.token.is_none() {
+                let (lane, token) = self
+                    .prepared
+                    .take()
+                    .ok_or_else(|| protocol("raw final User reservation missing"))?;
+                if lane != user.pending.lane {
+                    return Err(protocol("raw final User lane changed"));
+                }
+                user.pending.token = Some(
+                    self.carrier
+                        .commit_final_record(token, bytes)
+                        .map_err(raw_error)?,
+                );
+            } else {
+                Self::stage(
+                    &mut self.carrier,
+                    &mut user.pending,
+                    raw::RecordKind::Data,
+                    bytes,
+                )?;
+            }
             self.fail()?;
             return Ok(SendProgress::Pending);
         }
@@ -292,6 +353,9 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         let result = Self {
             carrier,
             geometry,
+            bootstrap_geometry: geometry,
+            prepared: None,
+            control_cursor: 0,
             addresses,
             lanes,
             client,
@@ -307,6 +371,31 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             return Err(protocol("raw adapter capacity differs"));
         }
         Ok(result)
+    }
+    pub(in crate::secure_udp) fn enable_final_records(
+        &mut self,
+        binding: [u8; 32],
+        cover: l2tunnel::cover::Config,
+    ) -> io::Result<raw::RecordGeometry> {
+        if self.user.is_some() || self.control.is_some() || self.input.is_some() {
+            return Err(protocol("raw upper custody remains at final handoff"));
+        }
+        self.carrier
+            .enable_final_records(binding, move |packet| {
+                cover
+                    .decode(packet)
+                    .is_ok_and(|decoded| match decoded.phase {
+                        l2tunnel::cover::Phase::Handshake => {
+                            decoded.protected.first() == Some(&super::establish::CONTROL_TAG)
+                        }
+                        l2tunnel::cover::Phase::Established => {
+                            decoded.protected.first() == Some(&super::member::ROUTE)
+                        }
+                    })
+            })
+            .map_err(raw_error)?;
+        self.geometry = self.carrier.final_geometry().map_err(raw_error)?;
+        Ok(self.geometry)
     }
     fn data_lane(&self) -> PairLane {
         if self.lanes == 1 || self.client {
@@ -335,6 +424,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             return Err(io::ErrorKind::TimedOut.into());
         }
         Ok(Pending {
+            bootstrap: false,
             lane,
             token: None,
             bytes,
@@ -358,7 +448,15 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         if Instant::now() >= pending.deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        match carrier.stage_record_tracked(pending.lane, kind, bytes) {
+        let staged = if carrier.final_records_enabled() {
+            if !pending.bootstrap {
+                return Err(protocol("final ciphertext lacks prepared metadata"));
+            }
+            carrier.stage_bootstrap_record_tracked(pending.lane, kind, bytes)
+        } else {
+            carrier.stage_record_tracked(pending.lane, kind, bytes)
+        };
+        match staged {
             Ok(token) => pending.token = Some(token),
             Err(raw::Error::Busy) => {}
             Err(error) => return Err(raw_error(error)),
@@ -462,9 +560,34 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             let input = Input {
                 bytes: record.bytes.len(),
                 received: record.received_at,
+                final_metadata: None,
             };
             self.carrier.consume_record().map_err(raw_error)?;
             self.input = Some(input);
+        }
+        if self.input.is_none()
+            && receive
+            && self.failure.is_none()
+            && self.carrier.final_records_enabled()
+        {
+            for lane in [PairLane::First, PairLane::Second]
+                .into_iter()
+                .take(self.lanes)
+            {
+                if let Some(candidate) = self.carrier.final_input(lane).map_err(raw_error)? {
+                    let bytes = candidate.bytes();
+                    self.input_bytes
+                        .get_mut(..bytes.len())
+                        .ok_or_else(|| protocol("raw final incoming capacity"))?
+                        .copy_from_slice(bytes);
+                    self.input = Some(Input {
+                        bytes: bytes.len(),
+                        received: candidate.received_at(),
+                        final_metadata: Some((lane, candidate.metadata())),
+                    });
+                    break;
+                }
+            }
         }
         ready |= self
             .user
@@ -488,6 +611,98 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
     }
 }
 impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
+    fn final_input_metadata(&self) -> Option<FinalMetadata> {
+        self.input
+            .as_ref()
+            .and_then(|input| input.final_metadata.map(|(_, metadata)| metadata))
+    }
+    fn commit_final_input(
+        &mut self,
+        metadata: FinalMetadata,
+        verdict: Option<FinalAcceptance<()>>,
+    ) -> io::Result<()> {
+        let input = self
+            .input
+            .as_ref()
+            .ok_or_else(|| protocol("raw final candidate missing"))?;
+        let (lane, expected) = input
+            .final_metadata
+            .ok_or_else(|| protocol("raw final metadata missing"))?;
+        if metadata != expected {
+            return Err(protocol("raw final candidate changed"));
+        }
+        let result = self
+            .carrier
+            .commit_final_input(lane, metadata, verdict)
+            .map_err(raw_error);
+        self.input = None;
+        result
+    }
+    fn prepare_final(
+        &mut self,
+        kind: FinalKind,
+        bytes: usize,
+    ) -> io::Result<Option<FinalMetadata>> {
+        self.fail()?;
+        if self.prepared.is_some() {
+            return Err(protocol("raw reservation already occupied"));
+        }
+        let lane = if kind == FinalKind::Control {
+            self.control_lane()
+        } else {
+            self.data_lane()
+        };
+        if self.control.as_ref().is_some_and(|p| p.lane == lane)
+            || self.user.as_ref().is_some_and(|u| u.pending.lane == lane)
+        {
+            return Ok(None);
+        }
+        match self.carrier.prepare_final_record(lane, kind, bytes) {
+            Ok(token) => {
+                let metadata = token.metadata();
+                self.prepared = Some((lane, token));
+                Ok(Some(metadata))
+            }
+            Err(raw::Error::Busy) => Ok(None),
+            Err(error) => Err(raw_error(error)),
+        }
+    }
+    fn prepare_final_control(&mut self) -> io::Result<Option<(FinalMetadata, FinalControl)>> {
+        self.fail()?;
+        if self.prepared.is_some() || self.control.is_some() {
+            return Ok(None);
+        }
+        for offset in 0..self.lanes {
+            let index = (self.control_cursor + offset) % self.lanes;
+            let lane = [PairLane::First, PairLane::Second][index];
+            if self.user.as_ref().is_some_and(|u| u.pending.lane == lane) {
+                continue;
+            }
+            if let Some(control) = self.carrier.poll_final_control(lane).map_err(raw_error)? {
+                let bytes = control
+                    .encoded_bytes()
+                    .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+                    .ok_or_else(exhausted)?;
+                match self.carrier.prepare_final_control(lane, control, bytes) {
+                    Ok(token) => {
+                        let metadata = token.metadata();
+                        self.prepared = Some((lane, token));
+                        self.control_cursor = (index + 1) % self.lanes;
+                        return Ok(Some((metadata, control)));
+                    }
+                    Err(raw::Error::Busy) => {}
+                    Err(error) => return Err(raw_error(error)),
+                }
+            }
+        }
+        Ok(None)
+    }
+    fn cancel_final(&mut self) -> io::Result<()> {
+        if let Some((_, token)) = self.prepared.take() {
+            self.carrier.cancel_final_record(token).map_err(raw_error)?;
+        }
+        Ok(())
+    }
     fn geometry(&self) -> raw::RecordGeometry {
         self.geometry
     }
@@ -548,7 +763,7 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .and_then(|u| u.pending.receipt)
             .map(|r| r.accepted_at)
     }
-    fn earliest_authenticated_input_at(&self) -> io::Result<Option<Instant>> {
+    fn earliest_input_for_ordering_at(&self) -> io::Result<Option<Instant>> {
         Ok(self
             .input
             .as_ref()
@@ -559,6 +774,11 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                     .earliest_authenticated_record_at()
                     .map_err(raw_error)?,
             )
+            .chain(
+                self.carrier
+                    .earliest_final_candidate_at()
+                    .map_err(raw_error)?,
+            )
             .min())
     }
     fn stage_control(
@@ -566,11 +786,23 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
         bytes: &[u8],
         cost: usize,
         deadline: Instant,
+        bootstrap: bool,
     ) -> io::Result<SendProgress> {
         if self.control.is_some() {
             return Err(protocol("raw Control custody already occupied"));
         }
-        let mut pending = self.pending(self.control_lane(), bytes.len(), deadline)?;
+        let lane = self
+            .prepared
+            .as_ref()
+            .map_or_else(|| self.control_lane(), |(lane, _)| *lane);
+        let mut pending = self.pending(lane, bytes.len(), deadline)?;
+        pending.bootstrap = bootstrap;
+        if bootstrap {
+            pending.cost = self
+                .bootstrap_geometry
+                .ip_bytes(bytes.len())
+                .map_err(raw_error)?;
+        }
         if pending.cost != cost {
             return Err(protocol("raw Control full-IP debit differs"));
         }
@@ -578,12 +810,27 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .get_mut(..bytes.len())
             .ok_or_else(|| invalid("raw Control output capacity"))?
             .copy_from_slice(bytes);
-        Self::stage(
-            &mut self.carrier,
-            &mut pending,
-            raw::RecordKind::Feedback,
-            bytes,
-        )?;
+        if self.carrier.final_records_enabled() && !bootstrap {
+            let (lane, token) = self
+                .prepared
+                .take()
+                .ok_or_else(|| protocol("raw final Control reservation missing"))?;
+            if lane != pending.lane {
+                return Err(protocol("raw final Control lane changed"));
+            }
+            pending.token = Some(
+                self.carrier
+                    .commit_final_record(token, bytes)
+                    .map_err(raw_error)?,
+            );
+        } else {
+            Self::stage(
+                &mut self.carrier,
+                &mut pending,
+                raw::RecordKind::Feedback,
+                bytes,
+            )?;
+        }
         self.control = Some(pending);
         Ok(SendProgress::Pending)
     }
@@ -626,11 +873,11 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .get_mut(..input.bytes)
             .ok_or_else(|| invalid("raw incoming caller capacity"))?;
         target.copy_from_slice(&self.input_bytes[..input.bytes]);
-        let input = self
-            .input
-            .take()
-            .ok_or_else(|| protocol("raw incoming custody missing"))?;
-        Ok((input.bytes, input.received))
+        let result = (input.bytes, input.received);
+        if input.final_metadata.is_none() {
+            self.input = None;
+        }
+        Ok(result)
     }
     fn poll_ready(&mut self, cx: &mut Context<'_>, receive: bool) -> Poll<io::Result<()>> {
         match self.progress(cx, receive) {
@@ -650,7 +897,7 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                 Ok(n) => n,
                 Err(e) => return Poll::Ready(Err(e)),
             };
-            if let Err(e) = self.stage_control(bytes, cost, deadline) {
+            if let Err(e) = self.stage_control(bytes, cost, deadline, true) {
                 return Poll::Ready(Err(e));
             }
         } else if !self

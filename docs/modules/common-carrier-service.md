@@ -24,6 +24,20 @@ aborted with a stack overflow. The
 passed in 60.963 s. The initial failed build and failed service case remain
 preserved; neither is relabeled by these finite passes.
 
+The later [compact carrier migration](compact-wire-cleanup.md#selected-outer-carrier-migration)
+adds explicitly selected initial-only framing through the same Profile, strict
+plan CLI and shared service. It preserves full catalog/resource commitments and
+actual outer proof binding; final OpenVPN packets omit the bootstrap DataV1 and
+inner appearance wrappers. Requested/effective compact state comes from the
+retained request and actual runtime snapshot. Offline inspection never reports
+an effective session. The new both-suite/both-appearance four-family service
+checks are recorded separately in the
+[client receipt](../../work/compact-carrier-migration-20261116/client-results.json)
+and [batch receipt](../../work/compact-carrier-migration-20261116/batch-summary.json).
+They use local UDP/Unix devices; the earlier legacy production CLI/TAP/TUN receipts
+do not become compact-wire native evidence. Existing unsupported OpenVPN proxy
+and connection-reuse combinations retain explicit refusal.
+
 This leaf composes the existing Common Profile, original OpenVPN-like carrier,
 Noise/member factories and shared service. It does not select periodic fresh-DH,
 change defaults, or qualify native/platform/performance and complete carrier gates.

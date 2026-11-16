@@ -32,7 +32,7 @@ pub mod raw_carrier;
 
 use super::raw_carrier_io::{NoRaw, RawBacking};
 
-const ROUTE: u8 = 3;
+pub(super) const ROUTE: u8 = 3;
 const ACCEPT_BYTES: usize = 34;
 const PROOF_WIRE: usize = 1 + 26 + identity::MEMBER_PROOF_BYTES;
 const ACCEPT_WIRE: usize = 1 + 26 + ACCEPT_BYTES;

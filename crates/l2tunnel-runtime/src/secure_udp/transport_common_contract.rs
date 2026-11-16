@@ -428,9 +428,9 @@ impl CommonTransactionContract {
         }
         let (overhead, control_overhead) = if let Some(selection) = compact_wire {
             selection.validate().map_err(invalid)?;
-            if managed.is_some() || outer.is_some() || raw.is_some() || extra_wire_bytes != 0 {
+            if managed.is_some() || extra_wire_bytes != 0 {
                 return Err(invalid(
-                    "compact wire requires the explicitly selected original UDP path",
+                    "compact wire requires explicit initial-only final packet geometry",
                 ));
             }
             if resources
@@ -640,6 +640,15 @@ impl CommonTransactionContract {
     }
     /// Exact selected physical headers, independent of UDP/OpenVPN/raw naming.
     pub fn physical_overhead_bytes(&self) -> io::Result<usize> {
+        if self.compact_wire.is_some() {
+            // The validated selected geometry exists during pure peer preflight,
+            // before any genuine raw proof can be retained by this contract.
+            return self
+                .geometry
+                .forward_overhead_bytes
+                .checked_sub(record::compact::DATA_OVERHEAD)
+                .ok_or_else(exhausted);
+        }
         if let Some(raw) = self.raw {
             let geometry = raw.geometry();
             geometry

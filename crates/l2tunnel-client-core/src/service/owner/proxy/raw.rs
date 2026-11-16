@@ -55,7 +55,12 @@ pub(in crate::service::owner) async fn common(
         effective_carrier: info.authenticated.carrier,
         requested_cover: requested.settings().cover.appearance,
         effective_cover: None,
-        compact_wire: None,
+        compact_wire: requested
+            .compact_wire()
+            .map(|selection| {
+                crate::secure_udp::common_status::CompactWireStatus::observe(selection, None)
+            })
+            .transpose()?,
         local_addr: info.local_addr,
         peer_addr: info.peer_addr,
         installed: false,
