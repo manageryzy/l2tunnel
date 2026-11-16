@@ -1,5 +1,6 @@
 //! Startup-only native raw selection; retained TCP/UDP paths remain unchanged.
 use super::*;
+#[cfg(unix)]
 use crate::raw_packet as client;
 pub(super) const OPTIONS: &[&str] = &["--raw-policy", "--raw-mark"];
 pub(super) const HELP: &str = "Experimental raw packet runtime: --carrier raw-packet --raw-policy JSON_FILE --raw-mark NONZERO_U32. Explicit IPv4 tuples, system traffic and frame records only; existing TLS/member credentials remain required. The first configured peer/local tuple must match --remote/--listen. No fallback, hot reload, real congestion controller or clean drain. Optional --control-socket provides actual bounded status. Requires separately configured owned-lab raw permissions/mark/RST fencing; native qualification remains separate.";

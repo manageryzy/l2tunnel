@@ -32,6 +32,7 @@ fn prepare_carrier_runtime<D>(
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
+    contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {
         return Err(invalid(
             "carrier Common native layer differs from actual device",

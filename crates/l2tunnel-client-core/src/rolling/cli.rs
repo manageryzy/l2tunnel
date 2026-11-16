@@ -1,5 +1,6 @@
 //! Explicit startup-only rolling selection; all transport owners come from the shared API.
 use super::*;
+#[cfg(unix)]
 use crate::rolling as client;
 pub(super) const OPTIONS: &[&str] = &["--rolling-policy"];
 pub(super) const HELP: &str = "Rolling frames: --record-profile rolling --rolling-policy JSON_FILE with explicit --carrier udp|quic, TAP/TUN and system traffic. Complete strict version1 policy is authenticated before forwarding. No --fec, active/proxy/packed/aligned/raw/VXLAN composition, hot reload or clean drain. Optional --control-socket supports status only. Small-window integration is not native, W8192 or full Python-family qualification.";

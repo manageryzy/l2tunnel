@@ -325,6 +325,19 @@ impl<F: Family> TransactionState<F> {
     pub(super) fn dispatch(
         &mut self,
         owner: &mut control_owner::Owner,
+        sample: impl FnMut() -> io::Result<Duration>,
+    ) -> io::Result<Progress> {
+        self.dispatch_preparations(owner, true, sample)
+    }
+
+    /// Reuse the exact leased preview and original cap for immutable profiles.
+    /// A forbidden fresh PREPARE is terminal Unsupported before allocation or
+    /// Peer admission. The existing FSM has no follower policy-REJECT command;
+    /// this must not fabricate one or silently replace its active generation.
+    pub(super) fn dispatch_preparations(
+        &mut self,
+        owner: &mut control_owner::Owner,
+        allow_preparation: bool,
         mut sample: impl FnMut() -> io::Result<Duration>,
     ) -> io::Result<Progress> {
         let now = sample()?;
@@ -342,6 +355,12 @@ impl<F: Family> TransactionState<F> {
                 Progress::Idle
             });
         };
+        if !allow_preparation && view.preparation().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "immutable Common proxy cannot prepare another generation",
+            ));
+        }
         let pending = PendingAdmission {
             incoming: view.incoming(),
             deadline: view.deadline(),

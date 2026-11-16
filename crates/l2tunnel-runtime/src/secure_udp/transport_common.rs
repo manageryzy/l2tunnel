@@ -9,7 +9,10 @@ use l2tunnel::{record_bank::storage, record_engine as engine};
 mod managed;
 #[path = "transport_common_provision.rs"]
 mod provision;
+#[path = "transport_common_proxy.rs"]
+mod proxy_records;
 pub use managed::run_common_on_carrier;
+pub(crate) use proxy_records::run_common_proxy_records;
 #[path = "transport_common_raw.rs"]
 mod raw;
 pub use raw::run_common_on_raw;
@@ -166,6 +169,7 @@ pub(super) struct PendingWire {
     pub(super) deadline: u64,
     pub(super) carrier: Option<l2tunnel::record_bank::CarrierOutputToken>,
     pub(super) fragment: Option<l2tunnel::record_bank::FragmentOutputToken>,
+    pub(super) proxy_record: Option<l2tunnel_codec::aligned_receiver::RecordIdentity>,
 }
 // Created only after the sole Records opener commits this exact User record.
 // Public copied metadata cannot install or reconstruct this retained authority.
@@ -188,6 +192,7 @@ pub(super) struct PendingIngress {
     pub(super) deadline: u64,
 }
 pub(super) struct Runtime {
+    pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
     pub(super) contract: CommonTransactionContract,
     pub(super) action: Option<ActionWork>,
     pub(super) request: Option<PendingRequest>,
@@ -294,6 +299,7 @@ fn prepare_common_runtime<D>(
 where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
 {
+    contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {
         return Err(invalid(
             "authenticated native layer differs from actual device",
@@ -688,6 +694,7 @@ impl Driver {
                 owner: owner::DataOwner::Common(owner),
                 generic: None,
                 common: Some(Runtime {
+                    proxy_bridge: None,
                     contract,
                     action: None,
                     request: None,

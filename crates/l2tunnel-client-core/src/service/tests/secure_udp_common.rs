@@ -3,6 +3,8 @@
 //! native-platform/performance qualification. Full SW-11/fault/resource gates stay open.
 
 use super::*;
+#[path = "proxy_common.rs"]
+mod proxy_common;
 use crate::secure_udp::common_transaction_profile;
 use l2tunnel::{
     aligned, codec::aligned_body, pipeline as l2tunnel_pipeline, record_configuration as common,

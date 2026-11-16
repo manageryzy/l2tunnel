@@ -155,6 +155,18 @@ impl<'a> Entry<'a> {
             .enqueue_borrowed(now, bytes)
             .map_err(Error::Engine)
     }
+    /// Admit an already-arbitrated opaque proxy record with its original cap.
+    pub fn enqueue_proxy_borrowed(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        bytes: &[u8],
+        original_deadline: engine::Tick,
+    ) -> Result<PacketMetadata, Error> {
+        self.engine
+            .enqueue_proxy_borrowed(received, now, bytes, original_deadline)
+            .map_err(Error::Engine)
+    }
     /// Admit one actual selected original without allocating an owned output.
     pub fn admit_borrowed(
         &mut self,

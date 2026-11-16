@@ -11,6 +11,40 @@ pub enum ProxyProfile {
     /// Measured relay targets over the same maintained native TCP legs.
     MeasuredRelay,
 }
+/// Bounded copied facts for the explicit fixed Common composition. No Common
+/// control sender, credential, packet buffer or lifecycle authority escapes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProxyCommonFrame {
+    /// Full requested authenticated Common plan, including the proxy policy.
+    pub requested_configuration: l2tunnel_security::ConfigDigest,
+    /// Configuration read from actual completed Noise/member authentication.
+    pub effective_configuration: l2tunnel_security::ConfigDigest,
+    /// Exact requested carrier binding and actual authenticated binding.
+    pub requested_carrier: [u8; 32],
+    /// Actual authenticated carrier binding, without a fallback selection.
+    pub effective_carrier: [u8; 32],
+    /// Explicit selected UDP appearance.
+    pub requested_cover: l2tunnel_cover::Appearance,
+    /// Absent until the actual Common runtime publishes its installed selection.
+    pub effective_cover: Option<l2tunnel_cover::Appearance>,
+    /// Original authenticated connected socket endpoints.
+    pub local_addr: std::net::SocketAddr,
+    /// Original fixed peer endpoint.
+    pub peer_addr: std::net::SocketAddr,
+    /// True only after actual Common Driver readiness publication.
+    pub installed: bool,
+    /// Last observed Common running state, distinct from proxy drain state.
+    pub running: bool,
+    /// Actual current Common generation.
+    pub epoch: Option<l2tunnel_core::Epoch>,
+    /// Actual authenticated Common liveness observations.
+    pub liveness: l2tunnel_runtime::secure_udp::transport::Liveness,
+    /// False for the initial immutable single-descriptor composition.
+    pub hot_switch: bool,
+    /// False until Common ARQ and feedback custody can prove final peer drain.
+    pub graceful_close: bool,
+}
 /// Copied facts from the actual fixed/measured owner; no control sender escapes.
 #[derive(Clone, Debug)]
 pub struct ProxyFrame {
@@ -41,8 +75,11 @@ pub struct ProxyFrame {
     pub service_terminal: Option<Terminal>,
     /// False: the maintained stack, not measured relay targets, chooses rwnd.
     pub exact_tcp_rwnd_control: bool,
-    /// False: this backend does not install a Common proxy record adapter.
+    /// True only after the actual Common adapter publishes installation.
     pub common_record_composition: bool,
+    /// Exact bounded Common facts; absent for retained TLS proxy selections.
+    #[cfg(unix)]
+    pub common: Option<ProxyCommonFrame>,
 }
 
 enum Control {
@@ -62,6 +99,8 @@ pub(super) struct Backend {
     released: AtomicBool,
     drain_accepted: AtomicBool,
     terminal: Mutex<Option<local::ProxyTerminal>>,
+    #[cfg(unix)]
+    common: Mutex<Option<ProxyCommonFrame>>,
 }
 impl Backend {
     pub(super) fn fixed(
@@ -92,6 +131,36 @@ impl Backend {
             config,
         )
     }
+    #[cfg(unix)]
+    pub(super) fn common(
+        handle: crate::proxy::Handle,
+        digest: l2tunnel_core::ConfigDigest,
+        config: &runtime::Config,
+        frame: ProxyCommonFrame,
+    ) -> Self {
+        let mut backend = Self::fixed(handle, digest, digest, config);
+        backend.common = Mutex::new(Some(frame));
+        backend
+    }
+    #[cfg(unix)]
+    pub(super) fn observe_common(
+        &self,
+        snapshot: &l2tunnel_runtime::secure_udp::transport::CommonSnapshot,
+    ) {
+        if let Some(frame) = &mut *self
+            .common
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            frame.installed |= snapshot.running;
+            frame.running = snapshot.running;
+            frame.epoch = Some(snapshot.epoch);
+            frame.liveness = snapshot.liveness;
+            if snapshot.running {
+                frame.effective_cover = Some(frame.requested_cover);
+            }
+        }
+    }
     fn new(
         control: Control,
         profile: ProxyProfile,
@@ -112,6 +181,8 @@ impl Backend {
             released: AtomicBool::new(false),
             drain_accepted: AtomicBool::new(false),
             terminal: Mutex::new(None),
+            #[cfg(unix)]
+            common: Mutex::new(None),
         }
     }
     pub(super) fn observe(&self) -> ProxyFrame {
@@ -131,6 +202,15 @@ impl Backend {
         };
         #[cfg(not(unix))]
         let _ = (measured, self.duplex);
+        #[cfg(unix)]
+        let common = *self
+            .common
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(unix)]
+        let common_record_composition = common.is_some_and(|frame| frame.installed);
+        #[cfg(not(unix))]
+        let common_record_composition = false;
         ProxyFrame {
             requested_profile: self.profile,
             effective_profile: self.profile,
@@ -153,10 +233,21 @@ impl Backend {
                 .clone(),
             service_terminal: None,
             exact_tcp_rwnd_control: false,
-            common_record_composition: false,
+            common_record_composition,
+            #[cfg(unix)]
+            common,
         }
     }
     pub(super) fn ready(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .common
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|frame| !frame.running)
+        {
+            return false;
+        }
         !self.released.load(Ordering::Acquire)
             && self
                 .observe()
@@ -241,6 +332,14 @@ impl Backend {
         Ok("accepted")
     }
     pub(super) fn finished(&self, result: &io::Result<runtime::CloseReport>) {
+        #[cfg(unix)]
+        if let Some(frame) = &mut *self
+            .common
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            frame.running = false;
+        }
         let terminal = match result {
             Ok(report) => local::ProxyTerminal::Closed {
                 report: local::ProxyCloseReport {

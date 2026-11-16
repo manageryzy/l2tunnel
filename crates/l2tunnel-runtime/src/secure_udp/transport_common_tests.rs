@@ -631,6 +631,7 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                     deadline: retained.deadline,
                     carrier: None,
                     fragment: None,
+                    proxy_record: None,
                 };
                 let bytes = runtime.wire[..pending.sealed.bytes].to_vec();
                 let next = endpoint.driver.records.next_number(Class::User);
@@ -999,3 +1000,6 @@ mod ack_ingress;
 
 #[path = "transport_common_connection_tests.rs"]
 mod connections;
+
+#[path = "transport_common_proxy_guard_tests.rs"]
+mod proxy_guards;

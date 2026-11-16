@@ -1,11 +1,12 @@
 //! Bounded systematic block FEC over actual payload bytes in GF(256).
 //!
 //! Authenticate enclosing records before decoding. This crate supplies no
-//! authentication, socket, clock, feedback scheduler or complete transport mode.
+//! authentication, socket, real clock or complete transport mode.
 use std::fmt;
 
 mod decoder;
 pub mod field;
+pub mod research;
 pub mod rolling;
 pub mod storage;
 mod wire;

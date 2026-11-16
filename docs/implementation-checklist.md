@@ -7,7 +7,25 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
-The current Batch12 implementation installs the selected independent Compact
+The current Batch13 integration brings three reviewed feature deltas into this
+checkout: the existing fixed/full single-channel TCP proxy actor through actual
+Common records and the shared service; the Windows foreground TCP/TLS TUN entry
+point with a safe-dependency Wintun device; and pure recursive parity, fallback
+and rolling-accumulator owners using the maintained GF/storage engines. See
+[Common proxy](modules/common-tcp-proxy.md), [Windows Wintun](modules/windows-wintun.md)
+and [research components](modules/research-recursive.md). External source-bound
+receipts remain historical; current root validation is recorded separately in the
+[Batch13 receipt](../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
+The integrated checkpoint passes all 66 selected new/affected cases and the
+remaining required check stages. The first full attempt retains two existing
+runtime failures; each passed one same-binary recheck without a code change.
+Their causes remain unqualified, so this is not a pristine full-suite pass.
+Affected Windows GNU lint/link checks pass; native execution remains unverified. Windows native device
+execution, complete proxy/Common selection and graceful retirement, and research
+Engine/Bank/runtime installation remain open at their full existing definitions.
+No new default carrier, periodic key exchange or reduced parity gate is implied.
+
+The preceding Batch12 implementation installs the selected independent Compact
 collection in the actual Engine/Bank/Common runtime and shared service, including
 bounded source-free ACK custody with original arrival/deadline and observable
 fixed-cohort limitations. It adds explicit authenticated Rolling input custody and
@@ -26,8 +44,8 @@ required batch check separately. See [independent owners](modules/connection-rec
 [raw Common carrier](modules/raw-common-carrier.md). Full flow reuse, the named
 1460/1500/global8192/local128/every16/copies/ACK composition, native/platform/
 resource/performance, all47 and complete SW-11 remain open. External Windows,
-recursive-FEC and TCP-proxy/Common commits are delivered but are not part of this
-checkpoint; their integration and validation are separate work.
+recursive-FEC and TCP-proxy/Common commits were excluded from that preceding
+checkpoint; they are integrated in Batch13 above.
 
 The preceding Batch11 implementation adds explicit bounded benchmark ACK ingress
 through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and

@@ -12,6 +12,7 @@ mod raw;
 #[derive(Clone, Debug)]
 pub struct CommonTransactionContract {
     expected: security::ConfigDigest,
+    proxy_binding: Option<core::ConfigDigest>,
     role: security::Role,
     resources: Config,
     cover: cover::Config,
@@ -430,6 +431,7 @@ impl CommonTransactionContract {
         let data = transaction::configuration_digest(&initial).map_err(invalid)?;
         let result = Self {
             expected,
+            proxy_binding: None,
             role,
             resources,
             cover,
@@ -450,6 +452,58 @@ impl CommonTransactionContract {
         }
         result.validate_message_capacity()?;
         Ok(result)
+    }
+    /// Bind trusted construction metadata to an explicitly selected fixed proxy.
+    /// The caller must include this complete policy digest in authenticated H0.
+    /// This marker neither creates authentication nor permits native-IP ingress.
+    pub fn with_proxy_binding(mut self, binding: core::ConfigDigest) -> io::Result<Self> {
+        use l2tunnel_core::traffic::TcpControl;
+        if self.catalog.descriptors().len() != 1
+            || self.outer.is_some()
+            || self.raw.is_some()
+            || self.managed.is_some()
+            || [mg::Role::Client, mg::Role::Server]
+                .into_iter()
+                .any(|role| {
+                    self.initial
+                        .descriptor()
+                        .direction(role)
+                        .common()
+                        .traffic()
+                        .tcp
+                        != TcpControl::SplitTcpProxy
+                })
+        {
+            return Err(invalid(
+                "fixed Common proxy requires one explicit initial UDP profile",
+            ));
+        }
+        self.proxy_binding = Some(binding);
+        Ok(self)
+    }
+    /// Complete fixed proxy policy included by the constructing authenticated plan.
+    pub fn proxy_binding(&self) -> Option<core::ConfigDigest> {
+        self.proxy_binding
+    }
+    /// Native entrypoints cannot install an opaque proxy owner, including a
+    /// later catalog target. Only the explicit proxy adapter supplies its bytes.
+    pub(super) fn require_native_adapter(&self) -> io::Result<()> {
+        if self.proxy_binding.is_some()
+            || self.catalog.descriptors().iter().any(|descriptor| {
+                [mg::Role::Client, mg::Role::Server]
+                    .into_iter()
+                    .any(|role| {
+                        descriptor.direction(role).common().traffic().tcp
+                            == core::traffic::TcpControl::SplitTcpProxy
+                    })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Common proxy requires the explicit record adapter",
+            ));
+        }
+        Ok(())
     }
     /// Actual expected maintained setup/Control digest H0.
     pub fn expected_configuration(&self) -> security::ConfigDigest {

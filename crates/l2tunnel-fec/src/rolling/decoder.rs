@@ -16,6 +16,8 @@ struct Header {
 struct Descriptor {
     id: RepairId,
     support: Support,
+    profile: Option<crate::research::Profile>,
+    confirmed: u32,
 }
 #[derive(Clone, Copy)]
 enum Input {
@@ -35,10 +37,15 @@ impl Input {
             Self::Repair(d) => d.support.start,
         }
     }
-    fn coefficient(self, id: u32) -> u8 {
+    fn coefficient(self, id: u32) -> Result<u8, Error> {
         match self {
-            Self::Source(_) => 1,
-            Self::Repair(d) => field::compact_coefficient(d.support.seed, id),
+            Self::Source(_) => Ok(1),
+            Self::Repair(d) => match d.profile {
+                Some(profile) => {
+                    profile.coefficient(u32::try_from(d.id.0).map_err(|_| Error::Exhausted)?, id)
+                }
+                None => Ok(field::compact_coefficient(d.support.seed, id)),
+            },
         }
     }
 }
@@ -227,7 +234,7 @@ enum Action {
     Capacity,
 }
 impl Decoder {
-    pub(super) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
+    pub(crate) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
         let width = storage::width(config)?;
         let row_bytes = mul(config.max_rows, add(config.window, width)?)?;
         let cells = add(mul(3, config.window)?, mul(2, config.max_rows)?)?;
@@ -256,7 +263,7 @@ impl Decoder {
             )?)
     }
 
-    pub(super) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+    pub(crate) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
         storage::Usage::vector(&self.data[0])?
             .join(storage::Usage::vector(&self.data[1])?)?
             .join(storage::Usage::vector(&self.known)?)?
@@ -537,6 +544,54 @@ impl Decoder {
         {
             return Err(Error::Identity);
         }
+        self.stage_repair(repair, None, 0, received, now, original_deadline)
+    }
+    // Structural and canonical profile validation belongs to the research owner.
+    // This entry point still enforces the real decoder's complete finite horizon,
+    // retained history, exact duplicate identity and original deadline rules.
+    pub(crate) fn begin_equation_until(
+        &mut self,
+        repair: Repair<'_>,
+        profile: crate::research::Profile,
+        confirmed: u32,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
+        profile.validate()?;
+        if repair.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        if repair.bytes.len() != self.width {
+            return Err(Error::Length);
+        }
+        if repair.id.0 == 0
+            || u32::try_from(repair.id.0).is_err()
+            || repair.support.end == 0
+            || repair.support.start > repair.support.end
+            || confirmed > repair.support.end
+            || repair.support.end - repair.support.start > self.config.window as u32
+        {
+            return Err(Error::Identity);
+        }
+        self.stage_repair(
+            repair,
+            Some(profile),
+            confirmed,
+            received,
+            now,
+            original_deadline,
+        )
+    }
+    fn stage_repair(
+        &mut self,
+        repair: Repair<'_>,
+        profile: Option<crate::research::Profile>,
+        confirmed: u32,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+    ) -> Result<Begin, Error> {
         self.time(now)?;
         if received > now {
             return self.fail(Error::TimeRegression);
@@ -553,6 +608,8 @@ impl Decoder {
         let descriptor = Descriptor {
             id: repair.id,
             support: repair.support,
+            profile,
+            confirmed,
         };
         let slot = (repair.id.0 % self.config.repair_history as u64) as usize;
         if let Some(old) = self.history_meta[slot]
@@ -566,7 +623,9 @@ impl Decoder {
                 self.fail(Error::Conflict)
             };
         }
-        if repair.support.end <= self.live.prefix {
+        if repair.support.end <= self.live.prefix
+            || repair.support.start < self.live.prefix.saturating_sub(self.config.window as u32)
+        {
             return Ok(Begin::Stale);
         }
         if u64::from(repair.support.end) > u64::from(self.live.prefix) + self.config.window as u64 {
@@ -722,7 +781,9 @@ impl Decoder {
                 if id == job.input.end() {
                     job.phase = Phase::Reduce(self.live.prefix);
                 } else {
-                    let factor = job.input.coefficient(id);
+                    // A research metadata visit includes at most sixteen
+                    // single-block SHA-256 evaluations, bounded by Profile.
+                    let factor = job.input.coefficient(id)?;
                     if factor == 0 {
                         job.phase = Phase::Support(id + 1);
                     } else if self.known(id)?.is_some() {
@@ -1359,7 +1420,7 @@ impl Decoder {
     // Every retained ID below the contiguous prefix is known. Subtract that
     // history from the committed count instead of scanning future columns.
     // The actual eviction watermark can lag prefix advancement during handoff.
-    pub(super) fn feedback_state(&self) -> Result<(u32, u32, u32), Error> {
+    pub(crate) fn feedback_state(&self) -> Result<(u32, u32, u32), Error> {
         let live = self.live;
         let history = live
             .prefix
@@ -1408,3 +1469,6 @@ mod decoded_source_tests;
 
 #[cfg(test)]
 mod feedback_tests;
+
+#[cfg(test)]
+mod equation_tests;

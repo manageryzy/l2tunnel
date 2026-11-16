@@ -28,6 +28,7 @@ pub struct Profile {
     carrier: Option<CarrierBinding>,
     raw: Option<raw::RawSelection>,
     requested_catalog: Option<Catalog>,
+    proxy: Option<l2tunnel_runtime::proxy::Config>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,8 +52,55 @@ impl Profile {
         parameters: transport::TransactionSettings,
     ) -> io::Result<Self> {
         Self::new_selected(
-            connection, settings, peers, initiator, responder, catalog, parameters, None,
+            connection, settings, peers, initiator, responder, catalog, parameters, None, None,
         )
+    }
+    /// Explicit fixed TCP proxy on the initial Common record profile. The complete
+    /// maintained proxy policy is bound before admission/Noise/member hashing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+    ) -> io::Result<Self> {
+        let binding = l2tunnel_runtime::proxy::session_config(&proxy)?;
+        if proxy.duplex != Duplex::Full
+            || proxy.mux.channels != 1
+            || proxy.runtime.layer != PacketLayer::Ip
+            || connection.layer != PacketLayer::Ip
+            || proxy.runtime.max_packet != connection.max_packet
+            || catalog.descriptors().len() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Common proxy requires explicit fixed full-duplex one-channel TUN and one immutable descriptor",
+            ));
+        }
+        let mut application = digest::Context::new(&digest::SHA256);
+        application.update(b"l2tunnel/shared-client/common-proxy/v1\0");
+        application.update(&settings.application.0);
+        application.update(&binding.digest.0);
+        settings.application = ConfigDigest(super::finish(application));
+        Self::new_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            None,
+            Some(proxy),
+        )
+    }
+    /// The exact selected fixed policy, absent for all transparent Common plans.
+    pub fn proxy_config(&self) -> Option<&l2tunnel_runtime::proxy::Config> {
+        self.proxy.as_ref()
     }
     #[allow(clippy::too_many_arguments)]
     fn new_selected(
@@ -64,6 +112,7 @@ impl Profile {
         catalog: Catalog,
         parameters: transport::TransactionSettings,
         raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        proxy: Option<l2tunnel_runtime::proxy::Config>,
     ) -> io::Result<Self> {
         let base = connection.session()?;
         if initiator.rolling_fragments != responder.rolling_fragments {
@@ -92,6 +141,19 @@ impl Profile {
                 "common runtime requires full duplex and no outer compression",
             ));
         }
+        for descriptor in catalog.descriptors() {
+            for role in [Role::Client, Role::Server] {
+                let selected = descriptor.direction(role).common().traffic().tcp;
+                if (selected == l2tunnel_core::traffic::TcpControl::SplitTcpProxy)
+                    != proxy.is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Common TCP ownership requires the matching explicit proxy plan",
+                    ));
+                }
+            }
+        }
         let initial = catalog.initial();
         let native = [Role::Client, Role::Server]
             .into_iter()
@@ -102,7 +164,7 @@ impl Profile {
             PacketLayer::Ethernet => NetworkLayer::Tap,
             PacketLayer::Ip => NetworkLayer::Tun,
         };
-        if connection.max_packet != native {
+        if proxy.is_none() && connection.max_packet != native {
             return Err(invalid("common native maximum differs from attachment"));
         }
         for descriptor in catalog.descriptors() {
@@ -171,6 +233,7 @@ impl Profile {
             carrier: None,
             raw: None,
             requested_catalog: None,
+            proxy,
         };
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
@@ -217,6 +280,12 @@ impl Profile {
     /// Derive an effective plan only from a genuine completed outer proof.
     /// The original settings/catalog/resources remain retained and unchanged.
     pub fn bind_outer(&self, outer: establish::carrier::AuthenticatedOuter) -> io::Result<Self> {
+        if self.proxy.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixed Common proxy supports only its original protected UDP owner",
+            ));
+        }
         if self.carrier.is_some() || self.raw.is_some() {
             return Err(invalid("common profile already bound to an outer session"));
         }
@@ -368,7 +437,7 @@ impl Profile {
             }
             return self.carrier_contract(binding, role);
         }
-        transport::CommonTransactionContract::new(
+        let contract = transport::CommonTransactionContract::new(
             self.configuration()?,
             role,
             if role == security::Role::Initiator {
@@ -381,7 +450,16 @@ impl Profile {
             self.envelope,
             self.catalog.clone(),
             self.parameters,
-        )
+        )?;
+        match &self.proxy {
+            Some(proxy) => {
+                let contract = contract
+                    .with_proxy_binding(l2tunnel_runtime::proxy::session_config(proxy)?.digest)?;
+                l2tunnel_runtime::proxy::common::validate(proxy, &contract)?;
+                Ok(contract)
+            }
+            None => Ok(contract),
+        }
     }
     fn carrier_contract(
         &self,

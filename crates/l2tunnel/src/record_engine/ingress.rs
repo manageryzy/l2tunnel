@@ -35,6 +35,9 @@ impl Engine {
         bytes: &[u8],
         original_cap: Tick,
     ) -> Result<IngressAdmission, Error> {
+        if self.proxy_records() {
+            return Err(Error::Unsupported(Capability::TcpProxy));
+        }
         self.advance(now)?;
         if let Some(ingress) = &mut self.ingress {
             ingress

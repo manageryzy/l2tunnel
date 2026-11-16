@@ -315,6 +315,13 @@ impl Plan {
             fragments,
         )
         .map_err(Error::Engine)?;
+        if super::proxy_records::selected(&configuration)
+            && (ingress.is_some() || rolling_ingress.is_some() || fragments.is_some())
+        {
+            return Err(Error::Engine(super::Error::Unsupported(
+                Capability::TcpProxy,
+            )));
+        }
         let fragments = fragments
             .map(|policy| {
                 fragment::Plan::new(policy, context, parameters.send_max).map_err(Error::Fragment)

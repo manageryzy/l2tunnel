@@ -27,6 +27,8 @@ pub use prepared::{Attachment, Client, Options, Prepared, Server};
 mod common_local;
 mod owner;
 mod proxy_backend;
+#[cfg(unix)]
+pub use proxy_backend::ProxyCommonFrame;
 pub use proxy_backend::{ProxyFrame, ProxyProfile};
 #[cfg(unix)]
 mod setup;
@@ -1218,6 +1220,11 @@ impl Handle {
                 Some(ObservedBackend::SecureUdp(_)) => local::SECURE_UDP_VERSION,
                 Some(_) => local::VERSION,
                 None => match &state.plan {
+                    Some(plan)
+                        if matches!(&plan.data.transport, prepared::Transport::ProxyCommon(_)) =>
+                    {
+                        local::VERSION
+                    }
                     Some(plan) if plan.secure_udp_common() => local::COMMON_VERSION,
                     Some(plan) if plan.secure_udp_transaction() => local::TRANSACTION_VERSION,
                     Some(plan) if plan.secure_udp() => local::SECURE_UDP_VERSION,

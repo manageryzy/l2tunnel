@@ -59,6 +59,7 @@ mod carrier;
 use super::raw_carrier_io as raw_carrier;
 #[path = "transport_common.rs"]
 mod common;
+pub(crate) use common::run_common_proxy_records;
 #[path = "transport_common_actions.rs"]
 mod common_actions;
 #[path = "transport_common_connections.rs"]

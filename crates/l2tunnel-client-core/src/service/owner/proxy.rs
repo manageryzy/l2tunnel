@@ -178,6 +178,8 @@ pub(super) async fn ready(
         return Err(io::Error::other("non-proxy readiness owner"));
     };
     let deadline = accepted.deadline.ok_or_else(expired)?;
+    #[cfg(unix)]
+    setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
     loop {
         check(deadline)?;
         if cancelled(shared, accepted.operation) {
@@ -322,4 +324,94 @@ pub(super) fn retain_or_stop(shared: &Shared, active: &mut Option<Active>, kind:
     } else {
         stopped(shared, active, Terminal::Failed(Failure { kind }));
     }
+}
+
+/// Reuse the original Common authentication factory and the same proxy lifecycle.
+/// The returned future is retained by Active before readiness starts child work.
+#[cfg(unix)]
+pub(super) async fn common(
+    shared: &Arc<Shared>,
+    plan: &Prepared,
+    accepted: Accepted,
+    deadline: Instant,
+    profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
+) -> io::Result<Active> {
+    let config = profile.proxy_config().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing explicit Common proxy policy",
+        )
+    })?;
+    let digest = runtime::session_config(&config)?.digest;
+    let session =
+        authenticate_secure_udp(shared, plan, accepted, deadline, profile.settings()).await?;
+    let info = session.info();
+    setup::stage(shared, accepted.operation, SetupStage::Configuration);
+    let contract = profile.runtime_contract(info.role)?;
+    let requested = profile.configuration()?;
+    let carrier = profile.establish_config(info.role)?.binding.carrier;
+    if info.peers != profile.peers()
+        || info.authenticated.configuration != requested.0
+        || info.authenticated.configuration != contract.expected_configuration().0
+        || info.authenticated.carrier != carrier
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "actual Common authentication differs from explicit proxy plan",
+        ));
+    }
+    check(deadline)?;
+    let parts = session.into_parts();
+    setup::stage(shared, accepted.operation, SetupStage::Attachment);
+    let device = plan.open()?;
+    check(deadline)?;
+    let (handle, control) = crate::proxy::control_channel();
+    let backend = Arc::new(Backend::common(
+        handle,
+        digest,
+        &config,
+        ProxyCommonFrame {
+            requested_configuration: requested,
+            effective_configuration: l2tunnel_security::ConfigDigest(
+                info.authenticated.configuration,
+            ),
+            requested_carrier: carrier,
+            effective_carrier: info.authenticated.carrier,
+            requested_cover: profile.settings().cover.appearance,
+            effective_cover: None,
+            local_addr: info.local_addr,
+            peer_addr: info.peer_addr,
+            installed: false,
+            running: false,
+            epoch: None,
+            liveness: Default::default(),
+            hot_switch: false,
+            graceful_close: false,
+        },
+    ));
+    let observed = backend.clone();
+    let sink = backend.clone();
+    let changed = shared.clone();
+    let runtime = Box::pin(async move {
+        let result = runtime::common::run(
+            device,
+            parts,
+            contract,
+            config,
+            control,
+            None,
+            move |snapshot| {
+                sink.observe_common(snapshot);
+                changed.changed();
+            },
+        )
+        .await;
+        observed.finished(&result);
+        result.map(|_| ())
+    });
+    Ok(Active {
+        runtime,
+        backend: ObservedBackend::Proxy(backend),
+        generation: accepted.operation,
+    })
 }

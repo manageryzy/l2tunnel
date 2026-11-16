@@ -155,6 +155,11 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             proxy::measured(&shared, &plan, accepted, deadline, settings)
         ),
+        #[cfg(unix)]
+        Transport::ProxyCommon(profile) => selected!(
+            deadline,
+            proxy::common(&shared, &plan, accepted, deadline, profile)
+        ),
         Transport::UdpFrame { settings, delivery } => selected!(
             deadline,
             establish_udp(&shared, &plan, accepted, deadline, settings, delivery)

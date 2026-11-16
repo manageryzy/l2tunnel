@@ -38,6 +38,7 @@ pub use carrier::CarrierOutputToken;
 mod native_counts;
 pub use native_counts::NativeCounts;
 mod owner;
+mod proxy_records;
 #[cfg(test)]
 pub(crate) mod rolling_tests;
 #[cfg(test)]
@@ -432,6 +433,12 @@ impl Engine {
         now: Tick,
         payload: Vec<u8>,
     ) -> Result<pipeline::PacketMetadata, EnqueueError> {
+        if self.proxy_records() {
+            return Err(EnqueueError {
+                kind: Error::Unsupported(Capability::TcpProxy),
+                payload,
+            });
+        }
         if self.ingress.is_some() || self.requires_original_ingress_cap() {
             return Err(EnqueueError {
                 kind: Error::IngressPolicy,
@@ -494,6 +501,9 @@ impl Engine {
         now: Tick,
         bytes: &[u8],
     ) -> Result<pipeline::PacketMetadata, Error> {
+        if self.proxy_records() {
+            return Err(Error::Unsupported(Capability::TcpProxy));
+        }
         if self.ingress.is_some() || self.requires_original_ingress_cap() {
             return Err(Error::IngressPolicy);
         }
@@ -911,7 +921,11 @@ fn parameters_with_fragmentation(
             TcpControl::TunnelCredits => {
                 return Err(Error::Unsupported(Capability::TunnelCredits));
             }
-            TcpControl::SplitTcpProxy => return Err(Error::Unsupported(Capability::TcpProxy)),
+            TcpControl::SplitTcpProxy => {
+                if fragments.is_some() || !proxy_records::supported(configuration) {
+                    return Err(Error::Unsupported(Capability::TcpProxy));
+                }
+            }
         }
         if !matches!(
             view.common().native_window(),

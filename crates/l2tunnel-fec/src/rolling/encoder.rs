@@ -4,6 +4,7 @@ use crate::field;
 struct Job {
     id: RepairId,
     support: Support,
+    profile: Option<crate::research::Profile>,
     deadline: Tick,
     cleared: usize,
     source: u32,
@@ -42,14 +43,14 @@ pub struct Encoder {
     terminal: Option<Error>,
 }
 impl Encoder {
-    pub(super) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
+    pub(crate) fn requested_storage(config: Config) -> Result<storage::Usage, storage::Error> {
         let width = storage::width(config)?;
         storage::requested::<u8>(mul(config.window, width)?)?
             .join(storage::requested::<Option<u32>>(config.window)?)?
             .join(storage::requested::<u8>(width)?)
     }
 
-    pub(super) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
+    pub(crate) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
         storage::Usage::vector(&self.vectors)?
             .join(storage::Usage::vector(&self.ids)?)?
             .join(storage::Usage::vector(&self.output)?)
@@ -194,10 +195,45 @@ impl Encoder {
         }
         let id = RepairId(self.next_repair);
         let support = self.config.support(self.next, id, tail)?;
+        self.start_repair(id, support, None, now)
+    }
+    // Only the research owner may admit a canonical alternative equation. Its
+    // negotiated profile is immutable for the entire job; public rolling APIs
+    // continue deriving compact local/global support themselves.
+    pub(crate) fn begin_equation(
+        &mut self,
+        support: Support,
+        profile: crate::research::Profile,
+        now: Tick,
+    ) -> Result<RepairId, Error> {
+        profile.validate()?;
+        if support.end == 0
+            || support.end != self.next
+            || support.start > support.end
+            || support.end - support.start > self.config.window as u32
+        {
+            return Err(Error::Identity);
+        }
+        u32::try_from(self.next_repair).map_err(|_| Error::Exhausted)?;
+        self.time(now)?;
+        if self.job.is_some() {
+            return Err(Error::Busy);
+        }
+        let id = RepairId(self.next_repair);
+        self.start_repair(id, support, Some(profile), now)
+    }
+    fn start_repair(
+        &mut self,
+        id: RepairId,
+        support: Support,
+        profile: Option<crate::research::Profile>,
+        now: Tick,
+    ) -> Result<RepairId, Error> {
         let deadline = self.expires(now, self.config.job_ticks)?;
         self.job = Some(Job {
             id,
             support,
+            profile,
             deadline,
             cleared: 0,
             source: support.start,
@@ -236,7 +272,16 @@ impl Encoder {
             let factor = match job.factor {
                 Some(value) => value,
                 None => {
-                    let value = field::compact_coefficient(job.support.seed, job.source);
+                    // Research evaluation is bounded by its validated tap limit:
+                    // one metadata visit performs at most sixteen single-block
+                    // maintained SHA-256 evaluations, with no heap allocation.
+                    let value = match job.profile {
+                        Some(profile) => profile.coefficient(
+                            u32::try_from(job.id.0).map_err(|_| Error::Exhausted)?,
+                            job.source,
+                        )?,
+                        None => field::compact_coefficient(job.support.seed, job.source),
+                    };
                     job.factor = Some(value);
                     value
                 }
@@ -326,3 +371,6 @@ impl Encoder {
         }
     }
 }
+
+#[cfg(test)]
+mod equation_tests;

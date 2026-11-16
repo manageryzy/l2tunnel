@@ -188,6 +188,7 @@ pub struct Aggregate {
     pub failed: bool,
 }
 impl LocalSnapshot {
+    #[cfg(any(unix, test))]
     pub(crate) fn observed(lanes: Duplex, snapshot: Option<&Snapshot>) -> Self {
         Self {
             capabilities: Capabilities {

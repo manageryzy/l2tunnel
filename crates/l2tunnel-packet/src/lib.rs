@@ -134,6 +134,8 @@ pub enum OpaqueReason {
 /// Structural packet classification, independent of scheduling privilege.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketKind {
+    /// Explicit local ordered proxy record; never produced by native parsing.
+    ProxyRecord,
     /// Complete unfragmented TCP header.
     Tcp,
     /// Complete unfragmented UDP header.
@@ -285,6 +287,7 @@ struct Domain {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum Tuple {
+    ProxyRecords,
     Transport(u8, Endpoint, Endpoint),
     Ip(u8, Address, Address),
     Fragment(u8, u32, Address, Address),
@@ -334,9 +337,19 @@ impl KeyBytes {
 }
 
 impl FlowKey {
+    /// One ordered proxy-record namespace, distinct from every native packet key.
+    /// The caller must already arbitrate the original TCP flows before this lane.
+    pub fn proxy_records() -> Self {
+        Self {
+            domain: Domain::default(),
+            tuple: Tuple::ProxyRecords,
+        }
+    }
+
     /// Encode `L2FK`, version 1, VLAN count/pairs and the canonical tuple.
     ///
-    /// Tuple tags are 1=transport, 2=IP, 3=fragment, 4=ARP, 5=Ethernet.
+    /// Tuple tags are 1=transport, 2=IP, 3=fragment, 4=ARP, 5=Ethernet,
+    /// 6=explicit ordered proxy records.
     /// Integers are big-endian; IP addresses carry a one-byte family marker.
     pub fn canonical_bytes(&self) -> KeyBytes {
         let mut output = KeyBytes {
@@ -350,6 +363,7 @@ impl FlowKey {
             output.push(&vid.to_be_bytes());
         }
         match self.tuple {
+            Tuple::ProxyRecords => output.push(&[6]),
             Tuple::Transport(protocol, low, high) => {
                 output.push(&[1, protocol]);
                 output.address(low.address);

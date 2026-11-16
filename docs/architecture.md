@@ -4,7 +4,25 @@ Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
 
-The current Batch12 implementation installs the selected independent Compact
+The current Batch13 integration brings three reviewed feature deltas into this
+checkout: the existing fixed/full single-channel TCP proxy actor through actual
+Common records and the shared service; the Windows foreground TCP/TLS TUN entry
+point with a safe-dependency Wintun device; and pure recursive parity, fallback
+and rolling-accumulator owners using the maintained GF/storage engines. See
+[Common proxy](modules/common-tcp-proxy.md), [Windows Wintun](modules/windows-wintun.md)
+and [research components](modules/research-recursive.md). External source-bound
+receipts remain historical; current root validation is recorded separately in the
+[Batch13 receipt](../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
+The integrated checkpoint passes all 66 selected new/affected cases and the
+remaining required check stages. The first full attempt retains two existing
+runtime failures; each passed one same-binary recheck without a code change.
+Their causes remain unqualified, so this is not a pristine full-suite pass.
+Affected Windows GNU lint/link checks pass; native execution remains unverified. Windows native device
+execution, complete proxy/Common selection and graceful retirement, and research
+Engine/Bank/runtime installation remain open at their full existing definitions.
+No new default carrier, periodic key exchange or reduced parity gate is implied.
+
+The preceding Batch12 implementation installs the selected independent Compact
 collection in the actual Engine/Bank/Common runtime and shared service, including
 bounded source-free ACK custody with original arrival/deadline and observable
 fixed-cohort limitations. It adds explicit authenticated Rolling input custody and
@@ -23,8 +41,8 @@ required batch check separately. See [independent owners](modules/connection-rec
 [raw Common carrier](modules/raw-common-carrier.md). Full flow reuse, the named
 1460/1500/global8192/local128/every16/copies/ACK composition, native/platform/
 resource/performance, all47 and complete SW-11 remain open. External Windows,
-recursive-FEC and TCP-proxy/Common commits are delivered but are not part of this
-checkpoint; their integration and validation are separate work.
+recursive-FEC and TCP-proxy/Common commits were excluded from that preceding
+checkpoint; they are integrated in Batch13 above.
 
 The preceding Batch11 implementation adds explicit bounded benchmark ACK ingress
 through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and
@@ -205,7 +223,7 @@ following are evidence boundaries, not a declaration that the target is running:
 | Genuine QUIC | Maintained QUIC connection with DATAGRAM data and scoped historical Linux native receipts. | Keep distinct from the owner's QUIC-header-only appearance profile and its shared-session integration. |
 | OpenVPN-like UDP | Preserved custom-gate native slices; additive outer-wire/control codec and actual same-socket TLS/member carrier. The selected shared-session Common Driver/service and finite APIv4 case exchange all four actual record families without exporter resealing, including explicit ARQ-only Aligned/Packed. | Production TAP/TUN CLI now has four finite clean cases; complete factory/service fault and resource matrices, standard-dissector capture and full native/platform/ISP qualification remain open. The historical custom 144-byte gate is a separate path. |
 | HTTPS | Focused real TLS/HTTP2 streaming code; separate raw TLS-to-packet owner and four historical clean Linux integrity cases. | HTTP2 does not satisfy the requested TCP/TLS-to-ACK-independent packet path; broader raw feasibility remains open. |
-| Platforms | Linux has named, finite native compositions. Windows is a status/help scaffold; Android has no JNI/VpnService. | New common-session support, Windows and Android execution are unqualified. |
+| Platforms | Linux has named, finite native compositions. Windows has an explicit foreground TCP/TLS TUN implementation with portable and cross-build evidence; Android has no JNI/VpnService. | New common-session support, Windows and Android execution are unqualified. |
 
 The [fourth record-family checkpoint](modules/rolling-common-records.md) is an
 actual pure Engine/Bank composition with explicit rolling work and move-only
@@ -774,8 +792,9 @@ liveness and private control deadlines do not satisfy the new recovery contract.
 The Android crate is currently an rlib/cdylib staging target with no JNI ABI.
 Native platform integration and native-device tests remain M5 gates. Cross-building
 portable contracts alone does not validate a platform client.
-The Windows entry point is currently a help/status scaffold and rejects runtime
-execution. Linux has implemented TAP/TUN adapters and finite named native tests;
+The Windows entry point now implements explicit foreground TCP/TLS TUN startup
+through the shared service and owned Wintun adapter; native Windows execution,
+service installation, L2 and other carriers remain unqualified. Linux has implemented TAP/TUN adapters and finite named native tests;
 the common WireGuard-like session and minimal media appearance have no platform
 execution evidence yet. Keep those statuses separate from the wrapper contracts.
 

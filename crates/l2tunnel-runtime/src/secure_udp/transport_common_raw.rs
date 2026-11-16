@@ -37,6 +37,7 @@ where
     D: PacketDevice<Error = io::Error> + AsRawFd + Send,
     I: PacketIo + Send + 'static,
 {
+    contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {
         return Err(invalid("raw Common actual native layer differs"));
     }

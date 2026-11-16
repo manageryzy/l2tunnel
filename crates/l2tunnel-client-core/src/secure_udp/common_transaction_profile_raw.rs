@@ -42,6 +42,7 @@ impl Profile {
             catalog,
             parameters,
             Some(packet),
+            None,
         )
     }
     pub(super) fn select_raw(mut self, policy: PacketPolicy) -> io::Result<Self> {

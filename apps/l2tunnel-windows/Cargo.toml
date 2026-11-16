@@ -10,3 +10,13 @@ workspace = true
 
 [dependencies]
 l2tunnel = { path = "../../crates/l2tunnel" }
+l2tunnel-auth = { path = "../../crates/l2tunnel-auth" }
+l2tunnel-client-core = { path = "../../crates/l2tunnel-client-core" }
+l2tunnel-core = { path = "../../crates/l2tunnel-core" }
+l2tunnel-device = { path = "../../crates/l2tunnel-device" }
+l2tunnel-platform-windows = { path = "../../crates/l2tunnel-platform-windows" }
+tokio = { version = "=1.53.1", features = ["rt", "macros", "signal", "time", "sync"] }
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

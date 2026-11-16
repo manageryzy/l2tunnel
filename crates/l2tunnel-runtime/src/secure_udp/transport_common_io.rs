@@ -245,10 +245,31 @@ impl Driver {
         } else {
             None
         };
+        let proxy_timing = self
+            .common
+            .as_ref()
+            .and_then(|runtime| runtime.proxy_bridge.as_ref())
+            .map(|bridge| bridge.timing())
+            .transpose()?;
+        let proxy_timing = proxy_timing
+            .map(|(received, deadline)| {
+                Ok::<_, io::Error>((clock(self.origin, received)?, clock(self.origin, deadline)?))
+            })
+            .transpose()?;
         let owner::DataOwner::Common(state) = &mut self.owner else {
             return Err(protocol("common ingress owner"));
         };
-        if let Some(original_cap) = connection_cap {
+        if let Some((received, deadline)) = proxy_timing {
+            state
+                .entry(epoch)?
+                .enqueue_proxy_borrowed(
+                    engine::Tick(received),
+                    engine::Tick(now),
+                    &output[..length],
+                    engine::Tick(deadline),
+                )
+                .map_err(protocol)?;
+        } else if let Some(original_cap) = connection_cap {
             state
                 .entry(epoch)?
                 .ingest_borrowed_at(
@@ -535,13 +556,24 @@ impl Driver {
             // Existing queued originals are serviced after new native ingress has
             // stopped, before Stage can capture its immutable admitted fence.
             for _ in 0..self.config.work.native_read_batch {
-                if state
+                let Some(admitted) = state
                     .entry(epoch)?
                     .admit_borrowed(engine::Tick(now))
                     .map_err(protocol)?
-                    .is_none()
-                {
+                else {
                     break;
+                };
+                if let Some(bridge) = self
+                    .common
+                    .as_ref()
+                    .and_then(|runtime| runtime.proxy_bridge.as_ref())
+                {
+                    let engine::ProfileIdentity::Aligned(identity) = admitted.permit else {
+                        return Err(protocol(
+                            "Common proxy admission has another record identity",
+                        ));
+                    };
+                    bridge.admitted(identity)?;
                 }
             }
             self.buffers
@@ -664,7 +696,27 @@ impl Driver {
                 .get_mut(..sealed.bytes)
                 .ok_or_else(|| protocol("common sealed capacity"))?
                 .copy_from_slice(&self.buffers.wire[..sealed.bytes]);
+            let proxy_record = runtime.proxy_bridge.as_ref().and_then(|bridge| {
+                bridge.pending_identity().filter(|identity| {
+                    runtime
+                        .witnesses
+                        .iter()
+                        .take(emission.witnesses)
+                        .any(|unit| {
+                            unit.identity == *identity && unit.index == 0 && unit.count == 1
+                        })
+                })
+            });
+            if proxy_record.is_some() {
+                let (_, cap) = runtime
+                    .proxy_bridge
+                    .as_ref()
+                    .ok_or_else(|| protocol("Common proxy record lost original cap"))?
+                    .timing()?;
+                deadline = deadline.min(clock(self.origin, cap)?);
+            }
             runtime.sealed = Some(common::PendingWire {
+                proxy_record,
                 scope,
                 sealed,
                 cost,
@@ -791,6 +843,13 @@ impl Driver {
         if !self.check_expiry(at)? {
             return Ok(false);
         }
+        if let Some(identity) = pending.proxy_record {
+            self.common
+                .as_ref()
+                .and_then(|runtime| runtime.proxy_bridge.as_ref())
+                .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?
+                .complete(identity, receipt.accepted_at, observed)?;
+        }
         self.retry_common_feedback(at)?;
         Ok(true)
     }
@@ -879,6 +938,17 @@ impl Driver {
                 }
                 if !self.check_expiry(completed)? {
                     return Ok(false);
+                }
+                if let Some(identity) = pending.proxy_record {
+                    let accepted = self
+                        .origin
+                        .checked_add(duration(completed))
+                        .ok_or_else(exhausted)?;
+                    self.common
+                        .as_ref()
+                        .and_then(|runtime| runtime.proxy_bridge.as_ref())
+                        .ok_or_else(|| protocol("Common proxy physical receipt lost bridge"))?
+                        .complete(identity, accepted, accepted)?;
                 }
                 self.retry_common_feedback(completed)?;
                 Ok(true)

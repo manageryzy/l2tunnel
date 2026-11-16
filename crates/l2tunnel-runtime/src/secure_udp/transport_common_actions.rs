@@ -54,6 +54,11 @@ impl Driver {
             let _ = reply.send(Err(SwitchError::Invalid));
             return Err(protocol("generic request on legacy runtime"));
         };
+        if runtime.contract.proxy_binding().is_some() {
+            // The initial proxy composition has no generation-handoff contract.
+            let _ = reply.send(Err(SwitchError::Invalid));
+            return Ok(());
+        }
         if self.info.role != security::Role::Initiator {
             let _ = reply.send(Err(SwitchError::NotCoordinator));
             return Ok(());
@@ -211,7 +216,11 @@ impl Driver {
                 }
             }
         }
-        state.dispatch(&mut self.control, &mut sample)?;
+        state.dispatch_preparations(
+            &mut self.control,
+            runtime.contract.proxy_binding().is_none(),
+            &mut sample,
+        )?;
         Ok(())
     }
 

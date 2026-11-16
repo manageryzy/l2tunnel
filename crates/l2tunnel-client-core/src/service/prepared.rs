@@ -144,6 +144,8 @@ pub(super) enum Transport {
     Managed(Options),
     Proxy(Arc<crate::proxy::Settings>),
     ProxyMeasured(Arc<crate::proxy_measured::Settings>),
+    #[cfg(unix)]
+    ProxyCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
     UdpFrame {
         settings: crate::udp::Settings,
         delivery: managed::DeliveryConfig,
@@ -242,6 +244,37 @@ impl Prepared {
             Endpoint::Server(credentials),
             attachment,
             Transport::ProxyMeasured(Arc::new(settings)),
+        )
+    }
+    /// Explicit fixed proxy over the original Common authenticated UDP owner.
+    #[cfg(unix)]
+    pub fn proxy_common_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureClient(credentials),
+            attachment,
+            Transport::ProxyCommon(Arc::new(profile)),
+        )
+    }
+    /// Same fixed Common proxy selection with the existing server admission owner.
+    #[cfg(unix)]
+    pub fn proxy_common_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        credentials: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::SecureServer(Box::new(SecureServer {
+                credentials,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::ProxyCommon(Arc::new(profile)),
         )
     }
     /// Explicit same-socket Noise/member/Swift client, with deferred device work.
@@ -433,6 +466,7 @@ impl Prepared {
         matches!(
             &self.data.transport,
             Transport::SecureUdpSwift(_)
+                | Transport::ProxyCommon(_)
                 | Transport::SecureUdpTransaction(_)
                 | Transport::SecureUdpCommon(_)
                 | Transport::SecureUdpCommonCarrier { .. }
@@ -695,7 +729,15 @@ impl Prepared {
                 None
             }
             #[cfg(unix)]
-            Transport::SecureUdpCommon(profile) => {
+            Transport::SecureUdpCommon(profile) | Transport::ProxyCommon(profile) => {
+                if profile.proxy_config().is_some()
+                    != matches!(&transport, Transport::ProxyCommon(_))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Common proxy requires explicit proxy service selection",
+                    ));
+                }
                 let session = profile.settings();
                 let (noise, role) = match &endpoint {
                     Endpoint::SecureClient(credentials) => {
@@ -718,7 +760,9 @@ impl Prepared {
                         ));
                     }
                 };
-                if noise.profile() != session.profile || !attachment.readable_kind() {
+                if noise.profile() != session.profile
+                    || (profile.proxy_config().is_none() && !attachment.readable_kind())
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "common UDP profile/credentials or readable attachment differ",
@@ -795,7 +839,14 @@ impl Prepared {
                 raw.validate(profile, role)?;
                 None
             }
+            #[cfg(unix)]
             Transport::SecureUdpCommonCarrier { profile, outer } => {
+                if profile.proxy_config().is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Common proxy requires its explicit protected UDP service",
+                    ));
+                }
                 let session = profile.settings();
                 let (noise, role) = match &endpoint {
                     Endpoint::CommonCarrierClient { outer: tls, inner } => {

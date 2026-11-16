@@ -466,6 +466,47 @@ fn pending_prepare(lab: &Lab) -> Result<Option<(control_owner::Incoming, Duratio
 }
 
 #[test]
+fn immutable_dispatch_refuses_same_configuration_prepare_before_admission() -> Result {
+    let mut lab = Lab::new()?;
+    assert_eq!(
+        lab.states[1].dispatch_preparations(&mut lab.owners[1], false, || Ok(lab.now))?,
+        Progress::Idle
+    );
+    let current = *lab.states[0].current();
+    lab.propose(current)?;
+    let mut pending = None;
+    for _ in 0..500 {
+        lab.step([true, false])?;
+        lab.drive()?;
+        if let Some(view) = pending_prepare(&lab)? {
+            pending = Some(view);
+            break;
+        }
+    }
+    let pending = pending.ok_or("same-configuration PREPARE never arrived")?;
+    let before = lab.states[1].usage();
+    let original = lab.states[1].engine(Epoch(10))? as *const l2tunnel::record_engine::Engine;
+    let error = lab.states[1]
+        .dispatch_preparations(&mut lab.owners[1], false, || Ok(lab.now))
+        .err()
+        .ok_or("immutable PREPARE was admitted")?;
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(pending_prepare(&lab)?.as_ref(), Some(&pending));
+    assert_eq!(lab.states[1].usage(), before);
+    assert_eq!(lab.states[1].epoch(), Epoch(10));
+    assert_eq!(lab.states[1].current(), &current);
+    assert_eq!(lab.states[1].peer().phase(), tx::Phase::Idle);
+    assert!(lab.states[1].peer().operation().is_none());
+    assert!(lab.states[1].prepared.is_none());
+    assert!(lab.states[1].pending_admission.is_none());
+    assert_eq!(
+        lab.states[1].engine(Epoch(10))? as *const l2tunnel::record_engine::Engine,
+        original
+    );
+    Ok(())
+}
+
+#[test]
 fn held_complete_common_prepare_keeps_exact_custody_while_liveness_confirms() -> Result {
     let mut lab = Lab::new()?;
     lab.propose(fixture::values()?[1])?;

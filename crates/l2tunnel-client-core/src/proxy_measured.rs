@@ -20,9 +20,7 @@ pub use runtime::{
 pub const MAX_POLICY_BYTES: usize = 65_536;
 /// Exact separately authenticated public profile identifier.
 pub const PROFILE: &str = "measured-relay-v1";
-#[cfg(unix)]
 mod status;
-#[cfg(unix)]
 pub use status::{
     AckRate, Aggregate, AppliedTargets, Capabilities, Carrier, LaneMode, LocalSnapshot, Profile,
     ServiceLatency, TargetPhase, UdpCover,

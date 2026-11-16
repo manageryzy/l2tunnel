@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::time::{Instant, Sleep};
 
+#[cfg(unix)]
 pub mod common;
 mod status;
 pub use status::{

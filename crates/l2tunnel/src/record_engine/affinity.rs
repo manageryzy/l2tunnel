@@ -8,6 +8,9 @@ impl Engine {
         identity: ProfileIdentity,
         bytes: &[u8],
     ) -> Result<(), Error> {
+        if self.proxy_records() {
+            return Ok(());
+        }
         let local = self.configuration.descriptor().local(self.context.role);
         if local.send().common().pipeline().flows.mapping
             != pipeline::Mapping::ConnectionRoundRobinLearned

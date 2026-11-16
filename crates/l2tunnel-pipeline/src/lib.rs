@@ -485,6 +485,44 @@ impl Pipeline {
         .map_err(|(kind, _)| kind)
     }
 
+    /// Admit one opaque record on an explicitly ordered proxy aggregate lane.
+    /// Native parsers never produce this typed namespace. The caller owns the
+    /// original TCP-flow arbitration; this queue still charges every byte/slot.
+    pub fn enqueue_proxy_borrowed(
+        &mut self,
+        bytes: &[u8],
+        received: Duration,
+        now: Duration,
+        original_deadline: Duration,
+    ) -> Result<PacketMetadata, PipelineError> {
+        if self.config.flows.channels != 1
+            || !matches!(self.config.profile, Profile::TunDrr(_))
+            || bytes.is_empty()
+            || bytes.len() > self.config.parse.max_packet_bytes
+        {
+            return Err(PipelineError::InvalidConfig);
+        }
+        self.enqueue_classified_timed(
+            Input::Borrowed(bytes),
+            1,
+            PacketTiming {
+                received,
+                admitted: now,
+                original_deadline: Some(original_deadline),
+            },
+            Classification {
+                key: FlowKey::proxy_records(),
+                kind: l2tunnel_packet::PacketKind::ProxyRecord,
+                observed_bytes: bytes.len(),
+                ethernet: None,
+                ip: None,
+                transport: None,
+                arp: None,
+            },
+        )
+        .map_err(|(kind, _)| kind)
+    }
+
     fn enqueue_input<'a>(
         &mut self,
         input: Input<'a>,
@@ -508,14 +546,31 @@ impl Pipeline {
         weight: u32,
         timing: PacketTiming,
     ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
-        let now = timing.admitted;
-        if timing.received > now || timing.original_deadline.is_some_and(|cap| now >= cap) {
+        if timing.received > timing.admitted
+            || timing
+                .original_deadline
+                .is_some_and(|cap| timing.admitted >= cap)
+        {
             return Err((PipelineError::Timing, input));
         }
         let classification = match self.classify(input.bytes()) {
             Ok(value) => value,
             Err(error) => return Err((PipelineError::Parse(error), input)),
         };
+        self.enqueue_classified_timed(input, weight, timing, classification)
+    }
+
+    fn enqueue_classified_timed<'a>(
+        &mut self,
+        input: Input<'a>,
+        weight: u32,
+        timing: PacketTiming,
+        classification: Classification,
+    ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
+        let now = timing.admitted;
+        if timing.received > now || timing.original_deadline.is_some_and(|cap| now >= cap) {
+            return Err((PipelineError::Timing, input));
+        }
         let key = classification.key;
         let (total, per_flow) = match self.preflight(key, input.bytes().len(), weight) {
             Ok(value) => value,

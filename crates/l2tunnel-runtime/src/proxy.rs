@@ -12,6 +12,11 @@ use std::{io, time::Duration};
 
 mod actor;
 mod arbiter;
+/// Explicit fixed proxy over authenticated Common records on Unix.
+#[cfg(unix)]
+pub mod common;
+#[cfg(unix)]
+pub(crate) mod common_bridge;
 mod config;
 /// Explicit measured-profile actor over the same bounded retained-lane machinery.
 /// Client selection and native advertised-window qualification are separate gates.

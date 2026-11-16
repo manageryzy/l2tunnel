@@ -192,6 +192,14 @@ impl Owner {
         metadata: pipeline::PacketMetadata,
         bytes: &[u8],
     ) -> Result<Option<ProfileIdentity>, Error> {
+        if metadata.classification.kind == l2tunnel_packet::PacketKind::ProxyRecord
+            && metadata
+                .timing
+                .original_deadline
+                .is_none_or(|deadline| duration(now) >= deadline)
+        {
+            return Err(Error::Expired);
+        }
         match self {
             Self::Connections(owner) => owner.offer(now, metadata, bytes),
             _ => self.offer(now, metadata.binding.channel, bytes),
