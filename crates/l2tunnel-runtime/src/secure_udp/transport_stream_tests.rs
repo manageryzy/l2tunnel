@@ -148,9 +148,28 @@ fn explicit_streams_and_legacy_keep_exact_native_bytes_and_policy_on_both_covers
                         + snapshot.performance.feedback_packets,
                     snapshot.counters.wire_packets
                 );
+                // A peer can close its socket during cancellation while the
+                // other side still attempts Control. Charge attempts separately
+                // from actual whole writes, preserving every recorded path drop.
+                let counters = &snapshot.counters;
                 assert_eq!(
-                    snapshot.counters.wire_bytes,
-                    snapshot.counters.socket_accepted_ip_bytes
+                    counters.wire_packets,
+                    counters
+                        .socket_accepted_packets
+                        .checked_add(counters.socket_drops)
+                        .ok_or("fixture packet accounting overflow")?,
+                    "{appearance:?}/streams={selected}/role={:?}: {counters:?}",
+                    snapshot.info.role,
+                );
+                let dropped_bytes = counters
+                    .wire_bytes
+                    .checked_sub(counters.socket_accepted_ip_bytes)
+                    .ok_or("accepted bytes exceed attempted bytes")?;
+                assert_eq!(
+                    dropped_bytes == 0,
+                    counters.socket_drops == 0,
+                    "{appearance:?}/streams={selected}/role={:?}: {counters:?}",
+                    snapshot.info.role,
                 );
                 assert_eq!(snapshot.info.authenticated.configuration, [3; 32]);
                 let local = (snapshot.info.local_addr, snapshot.info.peer_addr);

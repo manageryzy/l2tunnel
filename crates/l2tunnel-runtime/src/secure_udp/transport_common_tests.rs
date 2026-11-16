@@ -279,11 +279,12 @@ impl<D: PacketDevice<Error = io::Error> + AsRawFd> Fixture<D> {
             endpoint.driver.submit_control(now)?;
             let before = endpoint.driver.counters.socket_accepted_packets;
             let drops = endpoint.driver.counters.socket_drops;
-            endpoint.driver.send(
-                &endpoint.socket,
-                now,
-                endpoint.driver.origin + duration(now),
-            )?;
+            // Keep the same injected clock through every physical send in this
+            // deterministic turn; wall time may outrun it under a loaded runner.
+            let instant = endpoint.driver.origin + duration(now);
+            endpoint
+                .driver
+                .send_sampled(&endpoint.socket, now, instant, || instant)?;
             sent[side] = endpoint.driver.counters.socket_accepted_packets - before;
             assert_eq!(endpoint.driver.counters.socket_drops, drops);
         }

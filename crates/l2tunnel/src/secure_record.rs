@@ -6,6 +6,10 @@
 use crate::{cover, security};
 use std::fmt;
 
+#[path = "secure_record_framing.rs"]
+mod framing;
+use framing::{Format, Route};
+
 /// Explicit selected v2 consumption; legacy constructors and bytes are unchanged.
 #[path = "secure_record_refresh.rs"]
 pub mod refresh;
@@ -176,7 +180,7 @@ impl Records {
         control: Scope,
         data: Scope,
     ) -> Result<Self, Error> {
-        capacity_for(cover, limits, protection, limits.max_body_bytes)?;
+        Format::Initial.capacity(cover, limits, protection, limits.max_body_bytes)?;
         let data_sender = root.sender(security::Purpose::Data, lane, limits, protection)?;
         let data_receiver = root.receiver(security::Purpose::Data, lane, limits, protection)?;
         let control_sender =
@@ -201,11 +205,8 @@ impl Records {
 
     /// Exact checked capacities before reserving a sending packet number.
     pub fn capacity(&self, plaintext_bytes: usize) -> Result<Capacity, Error> {
-        if matches!(self.owners, Owners::Refreshable(_)) {
-            refresh::capacity(self.cover, self.limits, self.protection, plaintext_bytes)
-        } else {
-            capacity_for(self.cover, self.limits, self.protection, plaintext_bytes)
-        }
+        self.format()
+            .capacity(self.cover, self.limits, self.protection, plaintext_bytes)
     }
 
     /// Inspect the next unique class-specific number without reserving it.
@@ -353,19 +354,8 @@ impl Records {
         if matches!(self.owners, Owners::Refreshable(_)) {
             return Err(security::refresh::Error::Mode.into());
         }
-        if outer.phase != cover::Phase::Established {
-            return Err(Error::Phase);
-        }
-        let capacity = self.capacity(plaintext.len())?;
-        if workspace.len() < capacity.seal_workspace_bytes || output.len() < capacity.packet_bytes {
-            return Err(Error::OutputTooSmall);
-        }
-        let route = route_for(class, scope);
-        let metadata = security::Metadata {
-            epoch: scope.epoch,
-            configuration: scope.configuration,
-            extra: &route,
-        };
+        let capacity = self.preflight(outer, plaintext.len(), workspace, output)?;
+        let route = Route::new(class, scope);
         let packet = &mut workspace[ROUTE_BYTES..capacity.seal_workspace_bytes];
         let Owners::Legacy {
             data_sender,
@@ -376,18 +366,10 @@ impl Records {
             return Err(security::refresh::Error::Mode.into());
         };
         let sealed = match class {
-            Class::User => data_sender.seal(metadata, plaintext, packet)?,
-            Class::Control => control_sender.seal(metadata, plaintext, packet)?,
+            Class::User => data_sender.seal(route.metadata(), plaintext, packet)?,
+            Class::Control => control_sender.seal(route.metadata(), plaintext, packet)?,
         };
-        workspace[..ROUTE_BYTES].copy_from_slice(&route);
-        let bytes =
-            self.cover
-                .encode(outer, &workspace[..capacity.seal_workspace_bytes], output)?;
-        Ok(Sealed {
-            number: sealed.number,
-            generation: sealed.generation,
-            bytes,
-        })
+        self.finish_cover(outer, route.bytes, sealed, workspace, output)
     }
 
     /// Authenticate one covered record before exposing its authority/plaintext.
@@ -402,29 +384,8 @@ impl Records {
         if matches!(self.owners, Owners::Refreshable(_)) {
             return Err(security::refresh::Error::Mode.into());
         }
-        let decoded = self.cover.decode(packet)?;
-        if decoded.phase != cover::Phase::Established {
-            return Err(Error::Phase);
-        }
-        let (class, hinted_epoch, route) = parse_route(decoded.protected)?;
-        let scope = self.registered_scope(class, hinted_epoch)?;
-        let protected = decoded
-            .protected
-            .get(ROUTE_BYTES..)
-            .ok_or(Error::Malformed)?;
-        let body_bytes = protected
-            .len()
-            .checked_sub(self.protection.overhead_bytes())
-            .ok_or(Error::Malformed)?;
-        let capacity = self.capacity(body_bytes)?;
-        if workspace.len() < capacity.open_workspace_bytes || plaintext.len() < body_bytes {
-            return Err(Error::OutputTooSmall);
-        }
-        let metadata = security::Metadata {
-            epoch: scope.epoch,
-            configuration: scope.configuration,
-            extra: &route,
-        };
+        let incoming = self.incoming(packet, workspace, plaintext)?;
+        let route = incoming.route;
         let Owners::Legacy {
             data_receiver,
             control_receiver,
@@ -433,14 +394,16 @@ impl Records {
         else {
             return Err(security::refresh::Error::Mode.into());
         };
-        let opened = match class {
-            Class::User => data_receiver.open(metadata, protected, workspace)?,
-            Class::Control => control_receiver.open(metadata, protected, workspace)?,
+        let opened = match route.class {
+            Class::User => data_receiver.open(route.metadata(), incoming.protected, workspace)?,
+            Class::Control => {
+                control_receiver.open(route.metadata(), incoming.protected, workspace)?
+            }
         };
         plaintext[..opened.bytes].copy_from_slice(&workspace[..opened.bytes]);
         Ok(Opened {
-            class,
-            scope,
+            class: route.class,
+            scope: route.scope,
             number: opened.number,
             generation: opened.generation,
             bytes: opened.bytes,
@@ -459,58 +422,4 @@ impl Records {
             Class::Control => Err(Error::Scope),
         }
     }
-}
-
-fn capacity_for(
-    cover: cover::Config,
-    limits: security::Limits,
-    protection: security::Protection,
-    plaintext_bytes: usize,
-) -> Result<Capacity, Error> {
-    if plaintext_bytes > limits.max_body_bytes {
-        return Err(Error::TooLarge);
-    }
-    let protected_bytes = plaintext_bytes
-        .checked_add(protection.overhead_bytes())
-        .and_then(|bytes| bytes.checked_add(ROUTE_BYTES))
-        .ok_or(Error::TooLarge)?;
-    let packet_bytes = protected_bytes
-        .checked_add(cover.overhead(cover::Phase::Established, protected_bytes)?)
-        .ok_or(Error::TooLarge)?;
-    if packet_bytes > cover.limits().max_packet_bytes {
-        return Err(Error::TooLarge);
-    }
-    let open_workspace_bytes = plaintext_bytes
-        .checked_add(protection.tag_bytes())
-        .ok_or(Error::TooLarge)?;
-    Ok(Capacity {
-        plaintext_bytes,
-        seal_workspace_bytes: protected_bytes,
-        open_workspace_bytes,
-        packet_bytes,
-    })
-}
-
-fn route_for(class: Class, scope: Scope) -> [u8; ROUTE_BYTES] {
-    let mut route = [0; ROUTE_BYTES];
-    route[0] = class as u8;
-    route[1..9].copy_from_slice(&scope.epoch.0.to_be_bytes());
-    route
-}
-
-fn parse_route(protected: &[u8]) -> Result<(Class, security::Epoch, [u8; ROUTE_BYTES]), Error> {
-    let route: [u8; ROUTE_BYTES] = protected
-        .get(..ROUTE_BYTES)
-        .ok_or(Error::Malformed)?
-        .try_into()
-        .map_err(|_| Error::Malformed)?;
-    let class = match route[0] {
-        1 => Class::User,
-        2 => Class::Control,
-        _ => return Err(Error::Malformed),
-    };
-    let epoch = security::Epoch(u64::from_be_bytes(
-        route[1..9].try_into().map_err(|_| Error::Malformed)?,
-    ));
-    Ok((class, epoch, route))
 }

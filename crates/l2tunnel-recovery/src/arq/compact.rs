@@ -199,7 +199,10 @@ impl CompactFeedback<'_> {
                 && self.bit((source.0 - self.start) as usize))
     }
 }
-/// Actual selected packet fields, separate from legacy L2ARv1.
+/// Borrowed source or feedback fields for transmission and parsed reception.
+///
+/// The descriptor carries no authentication, replay or physical-send authority.
+/// Its current serializer preserves L2ARv2, separate from legacy L2ARv1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactPacketView<'a> {
     /// Stable source identity, unique attempt serial and exact opaque payload.
@@ -214,6 +217,9 @@ pub enum CompactPacketView<'a> {
     /// Actual variable receipt window.
     Feedback(CompactFeedback<'a>),
 }
+
+mod wire;
+use wire::parse_compact;
 /// Validate encoding/context/profile only; caller supplies authentication and replay.
 pub fn inspect_compact_packet<'a>(
     packet: &'a [u8],
@@ -656,84 +662,6 @@ fn delay_micros(delay: Duration) -> Result<u64, RecoveryError> {
     }
     Ok(micros as u64)
 }
-fn common(out: &mut [u8], context: RecoveryContext, mode: CompactRecovery, kind: u8) {
-    write_common(out, context, Profile::Selective, kind);
-    out[4] = 2;
-    out[5] = mode.code();
-}
-fn parse_compact(
-    packet: &[u8],
-    context: RecoveryContext,
-    config: CompactArqConfig,
-) -> Result<CompactPacketView<'_>, RecoveryError> {
-    if packet.len() < COMMON_HEADER_BYTES || packet.get(..4) != Some(b"L2AR") || packet[4] != 2 {
-        return Err(RecoveryError::MalformedPacket);
-    }
-    if packet[5] != config.recovery.code() {
-        return Err(RecoveryError::WrongProfile);
-    }
-    if packet[7] > 1
-        || packet[7] == context.role.code()
-        || u128::from_be_bytes(field(packet, 8)?) != context.session
-        || u64::from_be_bytes(field(packet, 24)?) != context.epoch
-    {
-        return Err(RecoveryError::WrongContext);
-    }
-    match packet[6] {
-        1 => {
-            let source = u64::from_be_bytes(field(packet, 32)?);
-            let serial = u64::from_be_bytes(field(packet, 40)?);
-            let length = u32::from_be_bytes(field(packet, 48)?) as usize;
-            if source == u64::MAX || serial == 0 {
-                return Err(RecoveryError::CounterExhausted);
-            }
-            if length > config.bounds.max_source_bytes {
-                return Err(RecoveryError::SourceTooLarge);
-            }
-            if packet.len() != COMPACT_DATA_HEADER_BYTES + length {
-                return Err(RecoveryError::MalformedPacket);
-            }
-            Ok(CompactPacketView::Data {
-                source: SourceId(source),
-                serial,
-                payload: &packet[COMPACT_DATA_HEADER_BYTES..],
-            })
-        }
-        2 => {
-            let prefix = u64::from_be_bytes(field(packet, 32)?);
-            let start = u64::from_be_bytes(field(packet, 40)?);
-            let count = u16::from_be_bytes(field(packet, 48)?);
-            let serial = u64::from_be_bytes(field(packet, 68)?);
-            let required = COMPACT_FEEDBACK_HEADER_BYTES + usize::from(count).div_ceil(8);
-            if packet.len() != required
-                || required > config.maximum_feedback_bytes
-                || field::<2>(packet, 50)? != [0, 0]
-                || start < prefix
-                || start.checked_add(u64::from(count)).is_none()
-                || serial == 0
-            {
-                return Err(RecoveryError::MalformedPacket);
-            }
-            let bitmap = &packet[COMPACT_FEEDBACK_HEADER_BYTES..];
-            if (count > 0 && start == prefix && bitmap[0] & 1 != 0)
-                || (count % 8 != 0 && bitmap.last().is_some_and(|last| *last >> (count % 8) != 0))
-            {
-                return Err(RecoveryError::MalformedPacket);
-            }
-            Ok(CompactPacketView::Feedback(CompactFeedback {
-                prefix,
-                start,
-                count,
-                serial,
-                bitmap,
-                echo: u64::from_be_bytes(field(packet, 52)?),
-                receiver_delay_us: u64::from_be_bytes(field(packet, 60)?),
-            }))
-        }
-        _ => Err(RecoveryError::MalformedPacket),
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Selection {
     Source {
@@ -1126,20 +1054,23 @@ impl Engine {
             } else {
                 None
             };
-            common(output, self.context, state.receive.recovery, 2);
-            output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
-            output[40..48].copy_from_slice(&start.to_be_bytes());
-            output[48..50].copy_from_slice(&count.to_be_bytes());
-            output[50..52].fill(0);
-            output[52..60].copy_from_slice(&state.last_received_serial.to_be_bytes());
-            output[60..68].copy_from_slice(&delay.to_be_bytes());
-            output[68..76].copy_from_slice(&serial.to_be_bytes());
-            output[76..required].fill(0);
+            let (header, bitmap) = output[..required].split_at_mut(COMPACT_FEEDBACK_HEADER_BYTES);
+            bitmap.fill(0);
             for offset in 0..usize::from(count) {
                 if self.received.contains_key(&SourceId(start + offset as u64)) {
-                    output[76 + offset / 8] |= 1 << (offset % 8);
+                    bitmap[offset / 8] |= 1 << (offset % 8);
                 }
             }
+            CompactPacketView::Feedback(CompactFeedback {
+                prefix: self.receive_prefix,
+                start,
+                count,
+                echo: state.last_received_serial,
+                receiver_delay_us: delay,
+                serial,
+                bitmap,
+            })
+            .encode_legacy_header(self.context, state.receive.recovery, header)?;
             let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
             state.bitmap_cursor = start + u64::from(count);
             if state
@@ -1183,11 +1114,12 @@ impl Engine {
         let history_index = state.history_slot(serial)?;
         let rto = state.rto()?;
         now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?;
-        common(output, self.context, state.send.recovery, 1);
-        output[32..40].copy_from_slice(&source.0.to_be_bytes());
-        output[40..48].copy_from_slice(&serial.to_be_bytes());
-        output[48..52].copy_from_slice(&(flight.payload.len() as u32).to_be_bytes());
-        output[52..required].copy_from_slice(&flight.payload);
+        CompactPacketView::Data {
+            source,
+            serial,
+            payload: &flight.payload,
+        }
+        .encode_legacy_into(self.context, state.send.recovery, output)?;
         let flight = self
             .sent
             .get_mut(&source)

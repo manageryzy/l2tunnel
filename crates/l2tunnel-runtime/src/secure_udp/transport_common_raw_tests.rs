@@ -145,7 +145,7 @@ fn requested(
         + record::ROUTE_BYTES
         + security::Protection::ChaCha20Poly1305.overhead_bytes()
         + 13;
-    resources.security.packets_per_key = 1024;
+    // Keep the base rollover interval within its inherited per-key byte cap.
     resources.lifetime.lease = Duration::from_secs(30);
     resources.native.stall_timeout = Duration::from_secs(5);
     resources.rolling_work = Some(work());

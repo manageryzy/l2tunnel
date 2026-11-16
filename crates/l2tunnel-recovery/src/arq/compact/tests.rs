@@ -212,19 +212,19 @@ fn exactly_three_later_bits_first_flight_once_and_stale_feedback_new_echo() -> R
     Ok(())
 }
 
-fn incoming(config: CompactArqConfig, source: u64, serial: u64, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![0; COMPACT_DATA_HEADER_BYTES + payload.len()];
-    common(
-        &mut bytes,
+fn incoming(config: CompactArqConfig, source: u64, serial: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    let descriptor = CompactPacketView::Data {
+        source: SourceId(source),
+        serial,
+        payload,
+    };
+    let mut bytes = vec![0; descriptor.legacy_encoded_len()?];
+    descriptor.encode_legacy_into(
         context(EndpointRole::Initiator),
         config.recovery(),
-        1,
-    );
-    bytes[32..40].copy_from_slice(&source.to_be_bytes());
-    bytes[40..48].copy_from_slice(&serial.to_be_bytes());
-    bytes[48..52].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    bytes[52..].copy_from_slice(payload);
-    bytes
+        &mut bytes,
+    )?;
+    Ok(bytes)
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn rotating_feedback_reaches8192_and_keeps_three_charged_tail_reports_and_strict
 {
     let policy = config(CompactRecovery::Guarded, 8192, 4, 77)?;
     let mut receiver = CompactRepeat::new(policy, context(EndpointRole::Responder))?;
-    let source = incoming(policy, 8191, u64::MAX, b"last");
+    let source = incoming(policy, 8191, u64::MAX, b"last")?;
     receiver.receive(&source, Duration::ZERO)?;
     let usage = receiver.storage_usage().ok_or("reserved usage")?;
     let mut now = ms(5);
@@ -263,12 +263,12 @@ fn rotating_feedback_reaches8192_and_keeps_three_charged_tail_reports_and_strict
     assert_eq!(receiver.poll_feedback(now + ms(5), &mut [0; 128])?, None);
     assert_eq!(receiver.statistics().feedback_sent, 1026);
     assert_eq!(receiver.retained().receive_records, 1);
-    let mut invalid = feedback_bytes(policy, 0, 1, 1, &[2]);
+    let mut invalid = feedback_bytes(policy, 0, 1, 1, &[2])?;
     assert_eq!(
         inspect_compact_packet(&invalid, context(EndpointRole::Initiator), policy),
         Err(RecoveryError::MalformedPacket)
     );
-    invalid = feedback_bytes(policy, 0, 1, 1, &[1]);
+    invalid = feedback_bytes(policy, 0, 1, 1, &[1])?;
     invalid[50] = 1;
     assert_eq!(
         inspect_compact_packet(&invalid, context(EndpointRole::Initiator), policy),
@@ -282,20 +282,27 @@ fn feedback_bytes(
     start: u64,
     count: u16,
     bitmap: &[u8],
-) -> Vec<u8> {
-    let mut bytes = vec![0; COMPACT_FEEDBACK_HEADER_BYTES + bitmap.len()];
-    common(
-        &mut bytes,
+) -> Result<Vec<u8>> {
+    let descriptor = CompactPacketView::Feedback(CompactFeedback {
+        prefix,
+        start,
+        count: 0,
+        echo: 0,
+        receiver_delay_us: 0,
+        serial: 1,
+        bitmap: &[],
+    });
+    let mut bytes = vec![0; descriptor.legacy_encoded_len()?];
+    descriptor.encode_legacy_into(
         context(EndpointRole::Responder),
         config.recovery(),
-        2,
-    );
-    bytes[32..40].copy_from_slice(&prefix.to_be_bytes());
-    bytes[40..48].copy_from_slice(&start.to_be_bytes());
+        &mut bytes,
+    )?;
+    // Start with the shared canonical header, then inject the requested bitmap
+    // verbatim so malformed padding remains a parser test, not an encode refusal.
     bytes[48..50].copy_from_slice(&count.to_be_bytes());
-    bytes[68..76].copy_from_slice(&1_u64.to_be_bytes());
-    bytes[76..].copy_from_slice(bitmap);
-    bytes
+    bytes.extend_from_slice(bitmap);
+    Ok(bytes)
 }
 
 #[test]
@@ -400,7 +407,7 @@ fn bounded_gap_uses_any_last_feedback_and_only_advancing_qualified_prefix() -> R
     policy.timing.feedback_interval = ms(10);
     let mut receiver = CompactRepeat::new(policy, context(EndpointRole::Responder))?;
     for (source, serial) in [(1, 1), (3, 2), (4, 3)] {
-        receiver.receive(&incoming(policy, source, serial, &[source as u8]), ms(10))?;
+        receiver.receive(&incoming(policy, source, serial, &[source as u8])?, ms(10))?;
     }
     assert_eq!(receiver.feedback_deadline(), Some(ms(10)));
     let first = feedback(&mut receiver, ms(10))?;
@@ -408,18 +415,18 @@ fn bounded_gap_uses_any_last_feedback_and_only_advancing_qualified_prefix() -> R
         inspect_compact_packet(&first, context(EndpointRole::Initiator), policy)?,
         CompactPacketView::Feedback(CompactFeedback { prefix: 0, .. })
     ));
-    receiver.receive(&incoming(policy, 5, 4, b"five"), ms(11))?;
+    receiver.receive(&incoming(policy, 5, 4, b"five")?, ms(11))?;
     assert_eq!(receiver.feedback_deadline(), Some(ms(20)));
-    receiver.receive(&incoming(policy, 0, 5, b"zero"), ms(12))?;
+    receiver.receive(&incoming(policy, 0, 5, b"zero")?, ms(12))?;
     assert_eq!(receiver.feedback_deadline(), Some(ms(20)));
-    receiver.receive(&incoming(policy, 6, 6, b"six"), ms(15))?;
+    receiver.receive(&incoming(policy, 6, 6, b"six")?, ms(15))?;
     assert_eq!(receiver.feedback_deadline(), Some(ms(15)));
     let second = feedback(&mut receiver, ms(15))?;
     assert!(matches!(
         inspect_compact_packet(&second, context(EndpointRole::Initiator), policy)?,
         CompactPacketView::Feedback(CompactFeedback { prefix: 2, .. })
     ));
-    receiver.receive(&incoming(policy, 6, 7, b"six"), ms(16))?;
+    receiver.receive(&incoming(policy, 6, 7, b"six")?, ms(16))?;
     assert_eq!(receiver.feedback_deadline(), Some(ms(25)));
     assert_eq!(receiver.statistics().duplicates, 1);
     Ok(())

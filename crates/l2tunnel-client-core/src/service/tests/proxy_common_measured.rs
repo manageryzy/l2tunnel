@@ -267,13 +267,31 @@ async fn measured_pressure(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> Res
     let mut pressure_since = None;
     let mut pressure_progress = None;
     let mut resume = false;
+    let mut follow_up_started = false;
+    let mut follow_up_submitted = 0;
+    let initial_forward_bytes = 16385;
     timeout(Duration::from_secs(15), async {
         loop {
             for side in 0..2 {
                 let engine = &mut engines[side];
-                if sent[side] < inputs[side].len() {
-                    match engine.write(&inputs[side][sent[side]..]) {
-                        Ok(bytes) => sent[side] += bytes,
+                // Keep real demand for the quiet recovery interval after pressure
+                // clears; idle applications correctly cannot qualify target growth.
+                if side == 0 && evidence.cleared && sent[0] == initial_forward_bytes {
+                    follow_up_started = true;
+                }
+                let limit = if side == 0 && !follow_up_started {
+                    initial_forward_bytes
+                } else {
+                    inputs[side].len()
+                };
+                if sent[side] < limit {
+                    match engine.write(&inputs[side][sent[side]..limit]) {
+                        Ok(bytes) => {
+                            sent[side] += bytes;
+                            if side == 0 && follow_up_started {
+                                follow_up_submitted += bytes;
+                            }
+                        }
                         Err(TcpError::NotConnected) => {}
                         Err(error) => return Err(Error::from(error)),
                     }
@@ -313,19 +331,19 @@ async fn measured_pressure(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> Res
                     pressure_progress = Some((
                         evidence.physical_packets,
                         evidence.kinds,
-                        aggregates.each_ref().map(|a| a.service_latency.as_ref().map_or(0, |l| l.reply_at_micros)),
                     ));
                 }
             }
-            if let (Some(since), Some((packets, kinds, replies))) = (pressure_since, pressure_progress) {
+            if let (Some(since), Some((packets, kinds))) = (pressure_since, pressure_progress) {
                 let live = handles.iter().all(|handle| proxy_frame(handle).ok()
                     .and_then(|frame| frame.common)
                     .is_some_and(|common| common.liveness.last_pong_micros.is_some()));
+                // Echo shares the user path; release the deliberately held native
+                // reads without waiting for its sample. Final measurement, clearing
+                // and growth assertions below still require actual completed echoes.
                 if since.elapsed() >= Duration::from_millis(100) && evidence.reduced && live
                     && (0..2).all(|side| evidence.physical_packets[side] > packets[side]
-                        && evidence.kinds[side][1] > kinds[side][1]
-                        && aggregates[side].service_latency.as_ref().is_some_and(|latency|
-                            latency.fresh && latency.reply_at_micros > replies[side]))
+                        && evidence.kinds[side][1] > kinds[side][1])
                 {
                     resume = true;
                 }
@@ -341,6 +359,8 @@ async fn measured_pressure(hosts: &[Arc<Host>; 2], handles: &[Handle; 2]) -> Res
         }
     }).await.map_err(|error| format!("native measured fixture timed out: {error}; {evidence:?}; sent={sent:?}, received={:?}, native={:?}",
         [got[0].len(), got[1].len()], engines.each_ref().map(TcpEngine::status)))??;
+    assert!(follow_up_started);
+    assert_eq!(follow_up_submitted, 16384);
     assert_eq!(got[0], inputs[1]);
     assert_eq!(got[1], inputs[0]);
     assert!(evidence.pressure && evidence.reduced && evidence.cleared);

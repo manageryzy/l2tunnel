@@ -5,14 +5,14 @@
 //! the distinct consecutive unit-ID space before any native delivery.
 
 use crate::{
-    aligned_receiver::{Direction, RecordId, Scope, SourceId, SymbolIdentity},
+    aligned_receiver::{RecordId, Scope, SourceId, SymbolIdentity},
     packed,
+    source_identity::{self, Layout, word64},
 };
-use l2tunnel_core::Epoch;
 use std::fmt;
 
 /// Fixed source identity header, before per-unit u64 record IDs and inner bytes.
-pub const HEADER_BYTES: usize = 56;
+pub const HEADER_BYTES: usize = Layout::Packed.header_bytes();
 /// Negotiated finite source geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -148,18 +148,18 @@ pub fn encode(
         return Err(Error::OutputTooSmall { needed });
     }
     output[..HEADER_BYTES].fill(0);
-    output[..4].copy_from_slice(b"L2PK");
-    output[4] = 1;
-    output[5] = match identity.scope.direction {
-        Direction::InitiatorToResponder => 0,
-        Direction::ResponderToInitiator => 1,
-    };
+    source_identity::encode(
+        Layout::Packed,
+        source_identity::Identity {
+            scope: identity.scope,
+            source: identity.source,
+        },
+        output,
+    )
+    .map_err(header_error)?;
     output[6] = records.len() as u8;
     output[8..10].copy_from_slice(&(config.symbol_bytes as u16).to_be_bytes());
     output[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    output[12..28].copy_from_slice(&identity.scope.session);
-    output[28..36].copy_from_slice(&identity.scope.epoch.0.to_be_bytes());
-    output[36..44].copy_from_slice(&identity.source.0.to_be_bytes());
     output[44..52].copy_from_slice(&identity.first_unit.0.to_be_bytes());
     for (index, record) in records.iter().enumerate() {
         let start = HEADER_BYTES + index * 8;
@@ -249,33 +249,17 @@ pub fn decode(config: Config, expected: Scope, input: &[u8]) -> Result<View<'_>,
     config.max_source_bytes()?;
     scope_valid(expected)?;
     if input.len() < HEADER_BYTES
-        || input[..4] != *b"L2PK"
-        || input[4] != 1
         || input[7] != 0
         || input[52..56] != [0; 4]
         || usize::from(u16::from_be_bytes([input[8], input[9]])) != config.symbol_bytes
     {
         return Err(Error::Malformed);
     }
-    let direction = match input[5] {
-        0 => Direction::InitiatorToResponder,
-        1 => Direction::ResponderToInitiator,
-        _ => return Err(Error::Malformed),
-    };
-    let mut session = [0; 16];
-    session.copy_from_slice(&input[12..28]);
-    let scope = Scope {
-        session,
-        epoch: Epoch(word64(input, 28)),
-        direction,
-    };
-    if scope != expected {
-        return Err(Error::Scope);
-    }
+    let header = source_identity::decode(Layout::Packed, expected, input).map_err(header_error)?;
     let identity = Identity {
-        scope,
-        source: SourceId(word64(input, 36)),
-        first_unit: SourceId(word64(input, 44)),
+        scope: header.identity.scope,
+        source: header.identity.source,
+        first_unit: SourceId(word64(header.tail, 0)),
     };
     let count = usize::from(input[6]);
     count_valid(config, identity, count)?;
@@ -297,17 +281,11 @@ pub fn decode(config: Config, expected: Scope, input: &[u8]) -> Result<View<'_>,
         count: count as u8,
     })
 }
-fn word64(input: &[u8], start: usize) -> u64 {
-    u64::from_be_bytes([
-        input[start],
-        input[start + 1],
-        input[start + 2],
-        input[start + 3],
-        input[start + 4],
-        input[start + 5],
-        input[start + 6],
-        input[start + 7],
-    ])
+fn header_error(error: source_identity::Error) -> Error {
+    match error {
+        source_identity::Error::Malformed => Error::Malformed,
+        source_identity::Error::Scope => Error::Scope,
+    }
 }
 
 #[cfg(test)]

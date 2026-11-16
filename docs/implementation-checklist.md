@@ -7,6 +7,15 @@ acceptance test exist; add `Evidence:` with a code/test/receipt link on that ite
 Mark planned, contract-tested, implemented and integration-tested scope explicitly.
 Do not check remote/native/privileged gates on the basis of local builds.
 
+The planned [CWC-01..CWC-18 compact-wire ledger](modules/compact-wire-cleanup.md)
+keeps every task unchecked. The first batch implements actual codec, recovery,
+security and facade boundary cleanup while preserving legacy bytes; its full
+runtime regression qualification remains open in the
+[checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence). The new
+union, ordinary 24-byte/20-byte targets, protection choice, raw handoff and actual
+runtime/API/native qualification require their own evidence; no existing P-*,
+47-mode or SW-11 parent deliverable is reduced or completed by that cleanup.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

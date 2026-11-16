@@ -4,6 +4,15 @@ Status: parity inventory, audited against the working Python sources and saved e
 
 The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
 
+The planned [compact-wire cleanup](modules/compact-wire-cleanup.md) preserves all
+47 complete definitions and SW-11. A typed variable-length header union and one
+selected final protection replace redundant encoding only after explicit version
+selection and acceptance. The first structural batch preserves legacy bytes;
+passing protocol regressions and remaining runtime failures are recorded in its
+[checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
+Ordinary 24-byte/20-byte targets and four-byte data-check candidates remain
+unqualified; authenticated control/retiring ACKs and full raw/native scope remain required.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

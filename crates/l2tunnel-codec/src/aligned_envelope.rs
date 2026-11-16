@@ -1,14 +1,16 @@
 //! Exact absolute-identity envelope for an externally authenticated aligned symbol.
 //! This parser supplies no integrity protection or cryptographic evidence.
 
-use crate::aligned_receiver::{Direction, RecordId, Scope, SourceId, SymbolIdentity};
-use l2tunnel_core::Epoch;
+use crate::{
+    aligned_receiver::{RecordId, Scope, SymbolIdentity},
+    source_identity::{self, Layout},
+};
 use std::fmt;
 
 /// Bytes added before the unchanged Python aligned symbol.
-pub const HEADER_BYTES: usize = 48;
+pub const HEADER_BYTES: usize = Layout::Aligned.header_bytes();
 /// Envelope format version, independent of the Python inner format.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = source_identity::VERSION;
 
 /// Structural, scope or caller-buffer failure, without state mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,16 +55,16 @@ pub fn encode(identity: SymbolIdentity, symbol: &[u8], output: &mut [u8]) -> Res
     if output.len() < needed {
         return Err(Error::OutputTooSmall { needed });
     }
-    output[..4].copy_from_slice(b"L2AS");
-    output[4] = VERSION;
-    output[5] = match identity.scope.direction {
-        Direction::InitiatorToResponder => 0,
-        Direction::ResponderToInitiator => 1,
-    };
+    source_identity::encode(
+        Layout::Aligned,
+        source_identity::Identity {
+            scope: identity.scope,
+            source: identity.source,
+        },
+        output,
+    )
+    .map_err(header_error)?;
     output[6..8].copy_from_slice(&(symbol.len() as u16).to_be_bytes());
-    output[8..24].copy_from_slice(&identity.scope.session);
-    output[24..32].copy_from_slice(&identity.scope.epoch.0.to_be_bytes());
-    output[32..40].copy_from_slice(&identity.source.0.to_be_bytes());
     output[40..48].copy_from_slice(&identity.record.0.to_be_bytes());
     output[HEADER_BYTES..needed].copy_from_slice(symbol);
     Ok(needed)
@@ -83,28 +85,12 @@ pub fn decode(
         return Err(Error::Configuration);
     }
     if input.len() != HEADER_BYTES + symbol_bytes
-        || input[..4] != *b"L2AS"
-        || input[4] != VERSION
         || usize::from(u16::from_be_bytes([input[6], input[7]])) != symbol_bytes
     {
         return Err(Error::Malformed);
     }
-    let direction = match input[5] {
-        0 => Direction::InitiatorToResponder,
-        1 => Direction::ResponderToInitiator,
-        _ => return Err(Error::Malformed),
-    };
-    let mut session = [0; 16];
-    session.copy_from_slice(&input[8..24]);
-    let scope = Scope {
-        session,
-        epoch: Epoch(word(input, 24)),
-        direction,
-    };
-    if scope != expected {
-        return Err(Error::Scope);
-    }
-    let record = RecordId(word(input, 40));
+    let header = source_identity::decode(Layout::Aligned, expected, input).map_err(header_error)?;
+    let record = RecordId(source_identity::word64(header.tail, 0));
     let symbol = &input[HEADER_BYTES..];
     if u16::from(symbol[0]) >= channels
         || u16::from_be_bytes([symbol[1], symbol[2]]) != record.0 as u16
@@ -113,16 +99,17 @@ pub fn decode(
     }
     Ok(View {
         identity: SymbolIdentity {
-            scope,
-            source: SourceId(word(input, 32)),
+            scope: header.identity.scope,
+            source: header.identity.source,
             record,
         },
         symbol,
     })
 }
 
-fn word(input: &[u8], offset: usize) -> u64 {
-    let mut value = [0; 8];
-    value.copy_from_slice(&input[offset..offset + 8]);
-    u64::from_be_bytes(value)
+fn header_error(error: source_identity::Error) -> Error {
+    match error {
+        source_identity::Error::Malformed => Error::Malformed,
+        source_identity::Error::Scope => Error::Scope,
+    }
 }

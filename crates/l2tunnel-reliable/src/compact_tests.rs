@@ -50,6 +50,27 @@ fn budget() -> OutboundBudget {
     }
 }
 
+fn assert_compact_descriptor(
+    packet: &[u8],
+    sender: EndpointRole,
+    policy: CompactArqConfig,
+) -> Result {
+    let peer = match sender {
+        EndpointRole::Initiator => EndpointRole::Responder,
+        EndpointRole::Responder => EndpointRole::Initiator,
+    };
+    let inner = &packet[ENVELOPE_BYTES..];
+    let descriptor = l2tunnel_recovery::inspect_compact_packet(inner, context(peer), policy)?;
+    let mut encoded = vec![0xaa; inner.len()];
+    assert_eq!(descriptor.legacy_encoded_len()?, inner.len());
+    assert_eq!(
+        descriptor.encode_legacy_into(context(sender), policy.recovery(), &mut encoded)?,
+        inner.len(),
+    );
+    assert_eq!(encoded, inner);
+    Ok(())
+}
+
 #[test]
 fn compact_r0_duplex_geometry_budget_and_actual_storage_without_fec() -> Result {
     let forward = policy(32, CompactRecovery::Guarded, 70)?;
@@ -120,6 +141,7 @@ fn compact_r0_duplex_geometry_budget_and_actual_storage_without_fec() -> Result 
     assert_eq!(exact, OutboundBudget::default());
     assert_eq!(out[ENVELOPE_BYTES + 4], 2);
     assert_eq!(a.inspect_output(&out[..length])?, RecordKind::Source);
+    assert_compact_descriptor(&out[..length], EndpointRole::Initiator, forward.arq())?;
     let view = inspect_compact_structural(
         &out[..length],
         EndpointRole::Initiator,
@@ -196,6 +218,11 @@ fn compact_r0_deferred_feedback_keeps_original_arrival_and_exact_pending_output(
         .ok_or("feedback")?;
     assert_eq!(exact, OutboundBudget::default());
     assert_eq!(feedback_length, ENVELOPE_BYTES + 76);
+    assert_compact_descriptor(
+        &feedback[..feedback_length],
+        EndpointRole::Responder,
+        policy(32, CompactRecovery::Guarded, 70)?.arq(),
+    )?;
     let feedback_token = b.pending_output().ok_or("feedback witness")?;
     b.confirm_output(ms(15), feedback_token)?;
     let before = (a.now, a.statistics(), a.arq_statistics(), a.storage());

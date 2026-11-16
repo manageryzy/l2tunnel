@@ -4,6 +4,16 @@ Status: architecture contract under implementation. Runnable Linux TCP/TLS and
 protected UDP slices have finite native receipts; broad carrier/mode/platform
 coverage remains unfinished. See [current evidence](implementation-status.md).
 
+The new [compact-wire cleanup plan](modules/compact-wire-cleanup.md) targets one
+typed, variable-length final encoding and selected protection, initial-only
+appearance and an ordinary 24-byte overhead target, with 20 bytes an optimization
+target. The first batch is structural actual-call-site deduplication preserving
+legacy bytes; compact runtime, crypto/provider choices and size qualification
+remain planned. Full context/control/raw ownership, all 47 modes and SW-11 remain intact.
+The structural prerequisite is implemented with passing protocol regressions;
+full runtime regression qualification remains open. See the plan's
+[first checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

@@ -521,3 +521,86 @@ fn selected_facade_never_bypasses_key_deadline_through_legacy_or_bad_outer_input
     assert_eq!(a.next_number(Class::User), PacketNumber(0));
     Ok(())
 }
+
+#[test]
+fn refresh_record_capacity_refusal_preserves_buffers_numbers_and_receive_retry() -> Result {
+    for appearance in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for protection in [Protection::ChaCha20Poly1305, Protection::HmacSha256] {
+            let ([mut a, mut b], _) = records(appearance, protection, Profile::Ik)?;
+            let body = [0, 0xff, 0x31, 0, 0];
+            let capacity = a.capacity(body.len())?;
+            assert_eq!(
+                capacity.seal_workspace_bytes,
+                records::ROUTE_BYTES
+                    + sec::refresh::PREFIX_BYTES
+                    + protection.tag_bytes()
+                    + body.len()
+            );
+            for class in [Class::User, Class::Control] {
+                let mut workspace = vec![0xa5; capacity.seal_workspace_bytes];
+                let mut packet = vec![0x5a; capacity.packet_bytes];
+                let meta = outer(7, cover::Phase::Established);
+                assert_eq!(
+                    a.seal_at(
+                        Time(10),
+                        class,
+                        meta,
+                        &body,
+                        &mut workspace[..capacity.seal_workspace_bytes - 1],
+                        &mut packet,
+                    ),
+                    Err(records::Error::OutputTooSmall)
+                );
+                assert_eq!(
+                    a.seal_at(
+                        Time(10),
+                        class,
+                        meta,
+                        &body,
+                        &mut workspace,
+                        &mut packet[..capacity.packet_bytes - 1],
+                    ),
+                    Err(records::Error::OutputTooSmall)
+                );
+                assert!(workspace.iter().all(|byte| *byte == 0xa5));
+                assert!(packet.iter().all(|byte| *byte == 0x5a));
+                assert_eq!(a.next_number(class), PacketNumber(0));
+                let sent = a.seal_at(Time(10), class, meta, &body, &mut workspace, &mut packet)?;
+                assert_eq!(sent.record.bytes, packet.len());
+                assert_eq!(sent.record.number, PacketNumber(0));
+
+                let mut scratch = vec![0xa5; capacity.open_workspace_bytes];
+                let mut plain = vec![0x5a; body.len()];
+                assert_eq!(
+                    b.open_at(
+                        Time(11),
+                        &packet,
+                        &mut scratch[..capacity.open_workspace_bytes - 1],
+                        &mut plain,
+                    ),
+                    Err(records::Error::OutputTooSmall)
+                );
+                assert_eq!(
+                    b.open_at(
+                        Time(11),
+                        &packet,
+                        &mut scratch,
+                        &mut plain[..body.len() - 1]
+                    ),
+                    Err(records::Error::OutputTooSmall)
+                );
+                assert!(scratch.iter().all(|byte| *byte == 0xa5));
+                assert!(plain.iter().all(|byte| *byte == 0x5a));
+                let opened = b.open_at(Time(11), &packet, &mut scratch, &mut plain)?;
+                assert_eq!(opened.record.class, class);
+                assert_eq!(opened.record.number, sent.record.number);
+                assert_eq!(plain, body);
+                assert!(
+                    b.open_at(Time(11), &packet, &mut scratch, &mut plain)
+                        .is_err()
+                );
+            }
+        }
+    }
+    Ok(())
+}

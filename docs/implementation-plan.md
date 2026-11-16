@@ -6,6 +6,15 @@ applications. The [current evidence](implementation-status.md) distinguishes
 runnable slices from pending work; no milestone heading implies all its gates passed.
 All requirements remain tracked until their acceptance gates are met.
 
+The [compact-wire workstream](modules/compact-wire-cleanup.md) now tracks CWC-01
+through CWC-18: one typed variable-length encoding, initial-only appearance,
+explicit data-check candidates, authenticated control and complete native/raw
+ownership. Its ordinary 24-byte target (20-byte optimization) is unqualified.
+The actual-call-site structural prerequisite is implemented with passing protocol
+regressions; full runtime qualification remains open in the
+[first checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
+Install and validate compact runtime separately, retaining all 47/full SW-11 requirements.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

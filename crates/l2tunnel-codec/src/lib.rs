@@ -43,6 +43,8 @@ pub trait RecordCodec {
 /// Bounded aligned channel admission and explicit native delivery ownership.
 pub mod aligned_receiver;
 
+mod source_identity;
+
 /// Absolute identity envelope requiring enclosing carrier integrity.
 pub mod aligned_envelope;
 

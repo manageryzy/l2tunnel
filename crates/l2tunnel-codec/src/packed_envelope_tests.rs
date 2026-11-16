@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use crate::aligned_receiver::Direction;
+use l2tunnel_core::Epoch;
 
 fn config() -> Config {
     Config {

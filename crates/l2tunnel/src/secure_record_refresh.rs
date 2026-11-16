@@ -1,7 +1,8 @@
 //! Explicit common-v2 facade on the existing Records scope/cover owner.
 use super::{
-    Capacity, Class, Error, Opened as RecordOpened, Owners, ROUTE_BYTES, Records, Scope,
-    Sealed as RecordSealed, parse_route, route_for,
+    Class, Error, Opened as RecordOpened, Owners, ROUTE_BYTES, Records, Scope,
+    Sealed as RecordSealed,
+    framing::{Format, Route},
 };
 use crate::{
     cover,
@@ -38,32 +39,6 @@ pub(super) fn class(value: Class) -> sec::Class {
         Class::Control => sec::Class::Management,
     }
 }
-pub(super) fn capacity(
-    cover: cover::Config,
-    limits: security::Limits,
-    protection: security::Protection,
-    body: usize,
-) -> Result<Capacity, Error> {
-    if body > limits.max_body_bytes {
-        return Err(Error::TooLarge);
-    }
-    let protected = body
-        .checked_add(sec::PREFIX_BYTES + protection.tag_bytes())
-        .and_then(|n| n.checked_add(ROUTE_BYTES))
-        .ok_or(Error::TooLarge)?;
-    let packet = protected
-        .checked_add(cover.overhead(cover::Phase::Established, protected)?)
-        .ok_or(Error::TooLarge)?;
-    if protected > cover.limits().max_protected_bytes || packet > cover.limits().max_packet_bytes {
-        return Err(Error::TooLarge);
-    }
-    Ok(Capacity {
-        plaintext_bytes: body,
-        seal_workspace_bytes: protected,
-        open_workspace_bytes: body + protection.tag_bytes(),
-        packet_bytes: packet,
-    })
-}
 impl Records {
     /// Consume only a real confirmed selected initial Noise owner. Membership
     /// admission is a separate required controller gate, not inferred from this type.
@@ -79,7 +54,7 @@ impl Records {
         now: Time,
         session_expires: Time,
     ) -> Result<Self, Error> {
-        capacity(cover, limits, protection, limits.max_body_bytes)?;
+        Format::Refreshable.capacity(cover, limits, protection, limits.max_body_bytes)?;
         let handshake_bytes = 168usize;
         if handshake_bytes > cover.limits().max_protected_bytes
             || handshake_bytes
@@ -175,40 +150,16 @@ impl Records {
     fn covered(
         &self,
         outer: cover::PacketMeta,
-        route: [u8; 9],
+        route: [u8; ROUTE_BYTES],
         raw: sec::Sealed,
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
-        workspace[..ROUTE_BYTES].copy_from_slice(&route);
-        let bytes =
-            self.cover
-                .encode(outer, &workspace[..ROUTE_BYTES + raw.record.bytes], output)?;
         Ok(Sealed {
-            record: RecordSealed {
-                number: raw.record.number,
-                generation: raw.record.generation,
-                bytes,
-            },
+            record: self.finish_cover(outer, route, raw.record, workspace, output)?,
             key_epoch: raw.key_epoch,
             ratchet_base: raw.ratchet_base,
         })
-    }
-    fn preflight(
-        &self,
-        outer: cover::PacketMeta,
-        body: usize,
-        workspace: &[u8],
-        output: &[u8],
-    ) -> Result<Capacity, Error> {
-        if outer.phase != cover::Phase::Established {
-            return Err(Error::Phase);
-        }
-        let capacity = self.capacity(body)?;
-        if workspace.len() < capacity.seal_workspace_bytes || output.len() < capacity.packet_bytes {
-            return Err(Error::OutputTooSmall);
-        }
-        Ok(capacity)
     }
     /// Timed selected emission; the ordinary un-timed API cannot bypass key expiry.
     pub fn seal_at(
@@ -255,19 +206,15 @@ impl Records {
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
         let capacity = self.preflight(outer, body.len(), workspace, output)?;
-        let route = route_for(class_id, scope);
+        let route = Route::new(class_id, scope);
         let raw = self.refreshed_mut()?.seal(
             sec::Tick(now.0),
             class(class_id),
-            security::Metadata {
-                epoch: scope.epoch,
-                configuration: scope.configuration,
-                extra: &route,
-            },
+            route.metadata(),
             body,
             &mut workspace[ROUTE_BYTES..capacity.seal_workspace_bytes],
         )?;
-        self.covered(outer, route, raw, workspace, output)
+        self.covered(outer, route.bytes, raw, workspace, output)
     }
     /// Timed actual authentication with continuing shared replay across key slots.
     pub fn open_at(
@@ -278,40 +225,20 @@ impl Records {
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
         self.refreshed_mut()?.check_time(sec::Tick(now.0))?;
-        let decoded = self.cover.decode(packet)?;
-        if decoded.phase != cover::Phase::Established {
-            return Err(Error::Phase);
-        }
-        let (class_id, epoch, route) = parse_route(decoded.protected)?;
-        let scope = self.registered_scope(class_id, epoch)?;
-        let raw = decoded
-            .protected
-            .get(ROUTE_BYTES..)
-            .ok_or(Error::Malformed)?;
-        let body = raw
-            .len()
-            .checked_sub(sec::PREFIX_BYTES + self.protection.tag_bytes())
-            .ok_or(Error::Malformed)?;
-        let capacity = self.capacity(body)?;
-        if workspace.len() < capacity.open_workspace_bytes || plaintext.len() < body {
-            return Err(Error::OutputTooSmall);
-        }
+        let incoming = self.incoming(packet, workspace, plaintext)?;
+        let route = incoming.route;
         let opened = self.refreshed_mut()?.open(
             sec::Tick(now.0),
-            class(class_id),
-            security::Metadata {
-                epoch: scope.epoch,
-                configuration: scope.configuration,
-                extra: &route,
-            },
-            raw,
+            class(route.class),
+            route.metadata(),
+            incoming.protected,
             workspace,
         )?;
         plaintext[..opened.record.bytes].copy_from_slice(&workspace[..opened.record.bytes]);
         Ok(Opened {
             record: RecordOpened {
-                class: class_id,
-                scope,
+                class: route.class,
+                scope: route.scope,
                 number: opened.record.number,
                 generation: opened.record.generation,
                 bytes: opened.record.bytes,
@@ -320,8 +247,8 @@ impl Records {
             ratchet_base: opened.ratchet_base,
         })
     }
-    fn maintenance_route(&self) -> [u8; 9] {
-        let mut route = route_for(Class::Control, self.control);
+    fn maintenance_route(&self) -> [u8; ROUTE_BYTES] {
+        let mut route = Route::new(Class::Control, self.control).bytes;
         route[0] = 4;
         route
     }
