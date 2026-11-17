@@ -36,7 +36,9 @@ length-prefixed source extent. Existing reserved decoder rows restore the omitte
 algebraic zero tail; repair equations retain their complete actual generation
 width. Common configuration/catalog domains are v5 with unchanged policy bytes.
 The [batch18 local evidence](modules/buffer-observability.md#coordinated-local-buffer-batch18-validation)
-passes; native qualification and full acceptance gates remain open.
+passes. [Native18](modules/buffer-observability.md#native18-exact-source-fill-and-remaining-admission-stalls)
+observes zero Cauchy systematic fill; its selected data phases still fail their
+original acceptance criteria. Native throughput and full acceptance gates remain open.
 
 Rolling, Research and sliding repairs serialize the maximum encoded source
 extent in their complete support. The receiver restores omitted zero columns in

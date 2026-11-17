@@ -1,8 +1,11 @@
 # Implementation checklist and evidence ledger
 
 The selected [Block FEC systematic extent correction](modules/compact-wire-cleanup.md#exact-block-fec-systematic-extents-2026-11-17)
-removes separately observed coded fill and passes the required batch18 continuation;
-native qualification is pending. It does not close CWC-03 or any full-matrix gate.
+removes separately observed coded fill and passes the required batch18 continuation.
+The [native18 observations](modules/buffer-observability.md#native18-exact-source-fill-and-remaining-admission-stalls)
+confirm zero systematic fill in the observed Cauchy population and fresh cancellation
+timing. All three selected data phases remain unqualified. CWC-03 and every
+full-matrix gate remain open.
 
 Current Aligned exact-source extent correction and scoped evidence are tracked in
 [the cutover ledger](modules/compact-wire-cleanup.md#exact-aligned-source-extents-2026-11-17).
@@ -166,6 +169,14 @@ GF multiplication and reserve-only empty receiver pools pass the
 [required batch18 continuation](modules/buffer-observability.md#coordinated-local-buffer-batch18-validation). Their [source and measurement boundaries](modules/buffer-observability.md#cancellation-timing-and-bounded-execution-validation)
 retain original caps and distinguish primitive microbenchmarks, constructor
 write counts and actual native performance. No complete gate closes.
+
+The [native18 continuation](modules/buffer-observability.md#native18-exact-source-fill-and-remaining-admission-stalls)
+retains the original benchmark quotas despite changed derived owner sizes.
+Rolling Bank construction falls from about 8.1 seconds to about 0.10 seconds,
+but its decoder/debt expiry remains. Cauchy records 57.016339 seconds of completed
+staged-source admission waiting; Cauchy and QUIC exhaust their original workload
+bounds. Exact identity/frontier and selected-wake/QUIC ticket observations remain
+the next implementation work. No passing throughput or full BP row is inferred.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

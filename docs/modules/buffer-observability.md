@@ -1318,3 +1318,70 @@ concise report. The Cauchy sender has 103 completed refusal-to-admission waits,
 send-capacity reason intervals overlap. The maximum identity is unavailable in
 that version; temporal proximity to a Pipeline maximum does not identify the
 same packet. Exact cross-layer provenance remains required.
+
+### Native18 exact source fill and remaining admission stalls
+
+The [source-bound analysis](../../work/aligned-extents-20261117/native18-analysis1/findings1.md)
+and [population report](../../work/aligned-extents-20261117/native18-analysis1/extracted1/report.md)
+retain source `d92d25601713fca822caf6d349b85f1e22e4734d` and executable SHA256
+`b8074cebeba4219ef7c919bc87e9f4b24ce7e5f76f8eac3afd3a015d2d298d3d`.
+The original 100/10 Mbit/s, 35 ms per direction, independent 15% per-direction
+loss, 16-flow TUN workload and all original deadlines remain unchanged. The
+fresh plan exporter increases four derived resource fields as current owner
+sizes change. Its incompatible comparison is preserved; the separate
+[validated continuation](../../work/aligned-extents-20261117/matrix-plans18-baseline-quota-validation1.json)
+restores the exact original configured quotas and policy bytes, retains actual
+current capacity metadata and uses current v5 configuration/catalog digests.
+All three real constructors accept those original quotas. This does not imply
+every one of the eighty planned combinations has been run on this build.
+
+| Forward case | Data outcome | Qualified Mbit/s | Requested local shutdown |
+|---|---|---|---|
+| Aligned Cauchy UDP | Original workload bound exhausted | Unavailable | Passed |
+| Swift real QUIC | Original workload bound exhausted | Unavailable | Passed |
+| Rolling UDP | Original protocol expiry | Unavailable | Failed |
+
+The unsuccessful QUIC phase records an unqualified 0.37648 Mbit/s sample; it
+does not become a passing throughput result. Missing Cauchy throughput is not
+zero. Eight buffer owner files and six wire reports validate without invalid
+flags. All six Common execution providers now retain valid wall spans: four
+`driver_future_drop` boundaries for Cauchy/QUIC and two
+`loop_stop_before_settlement` boundaries for Rolling. All final protocol and
+management source samples are fresh with no source-unavailable events.
+
+Selected Cauchy systematic emissions contain exactly zero serialized algebraic
+fill: 6,000 a-to-b and 2,706 b-to-a emissions. This verifies that observed source
+population, not every fragment or repair. Meaningful source zeros remain data.
+Same-emission framing around the encoded codec body is measured as follows;
+warmup, retries and drain remain included in these lifetime populations.
+
+| Case / direction | Codec-covered emissions | IPv4 bytes outside codec body mean / p99 |
+|---|---:|---:|
+| Cauchy a-to-b | 7,187 | 69.198831 / 73 |
+| Cauchy b-to-a | 2,941 | 67.006460 / 72 |
+| Rolling a-to-b | 934 | 60.267666 / 68 |
+| Rolling b-to-a | 62 | 69.870968 / 105 |
+
+Record protection is 21 bytes mean/p99 in all six accepted-emission populations.
+These figures are not full original-native overhead. Swift stream/native joins
+and genuine QUIC physical packet mapping remain unavailable; independent
+percentiles are never added.
+
+Rolling Bank construction measures 96.832/101.935 ms versus native17's
+8.096277/8.140896 s. This finite result is consistent with removal of redundant
+receiver zero writes but does not isolate concurrent host effects or qualify
+data performance. Cauchy construction measures 33.106/37.941 ms and Swift QUIC
+42.595/45.672 ms. Rolling still expires first on server DecoderJob RepairId404,
+support [723,851), and client EncoderDebt [295,934). These independent clocks
+must not be compared as a shared timeline. No protocol cap was increased.
+
+Cauchy a-to-b has 152 completed staged-source refusal-to-admission episodes,
+57.016339 s total, maximum 2.802700 s, plus one unresolved episode censored at
+157.639 ms. Its capacity and sequence-window reason intervals overlap; the
+generic runtime table's zero entries do not erase this separate provider.
+Rolling source-admission waiting totals 6.395946/0.005407 s. Exact staged-source
+identity and ARQ frontier, TLS selection/poll/wake observations, and QUIC ticket
+acceptance-to-upper-take attribution remain required to distinguish these
+dependencies. Occupancy and temporal proximity alone do not establish causality.
+BP-01 through BP-24, all current-build matrix directions and full original-native
+overhead remain open.
