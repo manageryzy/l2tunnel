@@ -239,6 +239,240 @@ def protocol_provider(value):
     return result
 
 
+def management_provider(value, finished=None):
+    """Validate the bounded management sidecar; never infer or merge wait time."""
+    result = {'status': 'unavailable', 'issues': [], 'coverage_gaps': [],
+              'definition': 'Management-stream observations stay separate from generic/carrier '
+                            'wait rankings and union percentages. Sampled occupancy is not blockage; '
+                            'ordinary reused-ID submissions have count-only refusals.'}
+    if value is None:
+        return result
+    issues, gaps = result['issues'], result['coverage_gaps']
+    path = 'management_streams'
+
+    def number(obj, key, prefix, nullable=False):
+        require(key in obj, prefix + ': missing ' + key)
+        return uint(obj[key], prefix + '.' + key, nullable)
+
+    def boolean(obj, key, prefix, invalid=False):
+        require(type(obj.get(key)) is bool, prefix + '.' + key + ': expected boolean')
+        if invalid and obj[key]:
+            issues.append(prefix + ': producer invalid flag ' + key)
+
+    def hex_string(value, length, prefix):
+        require(isinstance(value, str) and len(value) == length and
+                all(c in '0123456789abcdef' for c in value), prefix + ': invalid hex identity')
+
+    def identity(value, prefix):
+        value = object_value(value, prefix)
+        require(number(value, 'submission', prefix) > 0 and
+                number(value, 'origin_epoch', prefix) > 0, prefix + ': invalid submission identity')
+        require(0 < number(value, 'bytes', prefix) <= 65_536, prefix + ': invalid message extent')
+        hex_string(value.get('origin_digest_hex'), 64, prefix)
+        require(number(value, 'original_deadline_us', prefix) > 0, prefix + ': invalid original deadline')
+        return value
+
+    gauge_names = {
+        'outbound_messages', 'outbound_payload_bytes', 'outbound_fragment_bytes',
+        'outbound_combined_bytes', 'confirmed_retry_metadata', 'awaiting_semantic_accepted',
+        'source_confirmation_custody', 'unsubmitted_fragments', 'incomplete_messages',
+        'reassembly_reserved_bytes', 'held_complete_bytes', 'recovery_send_records',
+        'recovery_send_payload_bytes', 'recovery_receive_records', 'recovery_receive_payload_bytes',
+        'wrapper_outgoing', 'wrapper_confirmed', 'wrapper_held', 'wrapper_dispatched', 'wrapper_leased'}
+    try:
+        value = object_value(value, path)
+        require('schema' not in value or (type(value['schema']) is int and value['schema'] == 1),
+                path + ': unsupported provider schema')
+        version = number(value, 'version', path)
+        require(version in (0, 1, 2), path + ': unsupported stream grammar version')
+        require(number(value, 'sample_interval_us', path) > 0, path + ': invalid sampling interval')
+        samples = number(value, 'samples', path)
+        for key in ('counter_overflow', 'clock_regression', 'invalid_occupancy'):
+            boolean(value, key, path, True)
+        for key in ('retired_owners_omitted', 'unavailable_samples'):
+            if number(value, key, path):
+                gaps.append(key + '=' + str(value[key]))
+        first = number(value, 'first_sample_us', path, True)
+        last = number(value, 'last_sample_us', path, True)
+        if last is not None and finished is not None and last > finished:
+            issues.append(path + ': storage sample follows owner finish')
+        rows = value.get('streams')
+        require(isinstance(rows, list) and len(rows) <= 4, path + ': invalid stream array bound')
+        for key in ('binding', 'shared_quota', 'reservation', 'frozen_submission_wait'):
+            require(key in value, path + ': missing ' + key)
+        binding = value['binding']
+        control_epoch = None
+        if samples == 0:
+            if (first is not None or rows or binding is not None or version != 0 or
+                    any(value[key] is not None for key in
+                        ('shared_quota', 'reservation', 'frozen_submission_wait'))):
+                issues.append(path + ': observed owner values without a sample')
+            gaps.append('management owners have no storage sample; unavailable is not zero')
+        else:
+            require(first is not None and last is not None and version != 0,
+                    path + ': sampled owner is missing observation boundaries')
+            if first > last:
+                issues.append(path + ': last sample precedes first')
+            binding = object_value(binding, path + '.binding')
+            hex_string(binding.get('session_hex'), 32, path + '.binding.session_hex')
+            require(number(binding, 'lane', path) <= 0xffff_ffff, path + ': invalid lane')
+            require(binding.get('role') in ('Client', 'Server'), path + ': unknown role')
+            control_epoch = number(binding, 'control_epoch', path)
+            require(control_epoch > 0, path + ': invalid control epoch')
+        quota = value['shared_quota']
+        if quota is not None:
+            quota = object_value(quota, path + '.shared_quota')
+            for used, cap in (('packets_left', 'packets_per_interval'),
+                              ('bytes_left', 'bytes_per_interval')):
+                if number(quota, used, path) > number(quota, cap, path):
+                    issues.append(path + ': shared allowance exceeds its configured cap')
+            number(quota, 'refill_at_us', path)
+        elif samples:
+            gaps.append('shared management policy allowance unavailable')
+        reservation = value['reservation']
+        if reservation is not None:
+            reservation = identity(reservation, path + '.reservation')
+        allowed = ('Transaction', 'Liveness', 'DataFeedback') + (('Lifecycle',) if version == 2 else ())
+        seen, epochs = set(), set()
+        for index, row in enumerate(rows):
+            prefix = path + '.streams[' + str(index) + ']'
+            row = object_value(row, prefix)
+            stream = row.get('stream')
+            require(stream in allowed and stream not in seen, prefix + ': unknown/duplicate stream')
+            seen.add(stream)
+            epoch = number(row, 'stream_control_epoch', prefix)
+            require(epoch > 0 and epoch not in epochs, prefix + ': invalid/duplicate stream epoch')
+            epochs.add(epoch)
+            if control_epoch is not None:
+                # Checked v1/v2 namespace map from control_streams::delivery_binding.
+                expected = control_epoch * len(allowed) + allowed.index(stream) + 1
+                if expected > U64_MAX or epoch != expected:
+                    issues.append(prefix + ': stream epoch differs from selected binding grammar')
+            require(0 < number(row, 'samples', prefix) <= samples, prefix + ': invalid sample count')
+            successful = number(row, 'last_successful_owner_us', prefix)
+            if last is not None and successful > last:
+                issues.append(prefix + ': owner observation follows sample time')
+            boolean(row, 'owner_failed', prefix)
+            if row['owner_failed']:
+                gaps.append(stream + ': sampled owner failed; this is not diagnostic invalidity')
+            message = number(row, 'held_message', prefix, True)
+            deadline = number(row, 'held_original_deadline_us', prefix, True)
+            if (message is None) != (deadline is None) or message == 0:
+                issues.append(prefix + ': inconsistent held-message identity/deadline')
+            number(row, 'source_scratch_capacity_bytes', prefix)
+            if number(row, 'ordinary_submit_refusals', prefix, True) is None:
+                gaps.append(stream + ': ordinary submission refusal count unavailable')
+            require('ordinary_submit_duration_us' in row and row['ordinary_submit_duration_us'] is None,
+                    prefix + ': ordinary reused-ID refusal duration must remain unknown')
+            gauges = row.get('gauges')
+            require(isinstance(gauges, list) and len(gauges) <= 20, prefix + ': invalid gauge array bound')
+            names, unknown = set(), 0
+            for item in gauges:
+                item = object_value(item, prefix + '.gauge')
+                name = item.get('name')
+                require(isinstance(name, str) and name in gauge_names and name not in names,
+                        prefix + ': unknown/duplicate gauge')
+                names.add(name)
+                require(item.get('unit') == ('bytes' if name.endswith('_bytes') else 'items'),
+                        prefix + '.' + name + ': wrong gauge unit')
+                used, cap, high = (number(item, key, prefix + '.' + name, True)
+                                  for key in ('used', 'capacity', 'high_water'))
+                if (used is None) != (high is None):
+                    issues.append(prefix + '.' + name + ': inconsistent occupancy availability')
+                if used is None:
+                    unknown += 1
+                elif ((cap is not None and (used > cap or (high is not None and high > cap))) or
+                      (high is not None and used > high)):
+                    issues.append(prefix + '.' + name + ': impossible occupancy')
+            if names != gauge_names:
+                gaps.append(stream + ': missing sampled gauges: ' + ', '.join(sorted(gauge_names - names)))
+            if unknown:
+                gaps.append(stream + ': unknown occupancy gauges=' + str(unknown))
+        if samples and seen != set(allowed):
+            gaps.append('selected management stream samples missing: ' + ', '.join(sorted(set(allowed) - seen)))
+        wait = value['frozen_submission_wait']
+        if wait is None:
+            gaps.append('immutable frozen submission timing unavailable')
+        else:
+            prefix = path + '.frozen_submission_wait'
+            wait = object_value(wait, prefix)
+            require(wait.get('stream') == 'Transaction', prefix + ': unknown timed stream')
+            for key in ('clock_regression', 'identity_mismatch', 'counter_overflow'):
+                boolean(wait, key, prefix, True)
+            counts = [number(wait, key, prefix) for key in ('wrapper_entry_refusals', 'message_capacity_refusals')]
+            elapsed, episodes = 0, 0
+            for kind in ('completed', 'censored'):
+                count = number(wait, kind + '_episodes', prefix)
+                duration_us = number(wait, kind + '_us', prefix)
+                elapsed += duration_us
+                episodes += count
+                if count == 0 and duration_us:
+                    issues.append(prefix + ': duration without ' + kind + ' episode')
+            observed = number(wait, 'observed_at_us', prefix, True)
+            terminal = number(wait, 'terminal_at_us', prefix, True)
+            opened = number(wait, 'open_us', prefix, True)
+            maximum = number(wait, 'maximum_us', prefix)
+            start = number(wait, 'first_refusal_us', prefix, True)
+            latest = number(wait, 'last_refusal_us', prefix, True)
+            for key in ('pending', 'terminal_kind', 'last_resolved'):
+                require(key in wait, prefix + ': missing ' + key)
+            pending = wait['pending']
+            if pending is not None:
+                pending = identity(pending, prefix + '.pending')
+                if (opened is None or start is None or latest is None or observed is None or
+                        not start <= latest <= observed or opened != observed - start or
+                        latest >= pending['original_deadline_us']):
+                    issues.append(prefix + ': inconsistent open reservation interval')
+                if reservation != pending:
+                    issues.append(prefix + ': open reservation differs from actual retained reservation')
+            elif opened is not None or start is not None or latest is not None:
+                issues.append(prefix + ': open interval without an exact pending reservation')
+            elapsed += opened or 0
+            episodes += int(opened is not None)
+            if (elapsed > U64_MAX or maximum > elapsed or maximum < (opened or 0) or
+                    episodes > sum(counts) or sum(counts) > U64_MAX or
+                    (observed is not None and elapsed > observed)):
+                issues.append(prefix + ': inconsistent duration/refusal totals')
+            if samples and observed is None:
+                gaps.append('frozen timing observation boundary unavailable')
+            if observed is not None and last is not None and observed > last:
+                issues.append(prefix + ': frozen observation follows storage sample')
+            if terminal is None:
+                if finished is not None:
+                    issues.append(prefix + ': finished owner lacks management timing stop')
+                if wait['terminal_kind'] is not None or (observed is not None and observed != last):
+                    issues.append(prefix + ': inconsistent live observation boundary')
+            elif (terminal != observed or pending is not None or
+                  wait['terminal_kind'] not in ('OwnerFailure', 'MetricStop')):
+                issues.append(prefix + ': inconsistent terminal censor boundary')
+            resolved = wait['last_resolved']
+            if resolved is not None:
+                resolved = object_value(resolved, prefix + '.last_resolved')
+                exact = identity(resolved.get('identity'), prefix + '.last_resolved.identity')
+                began = number(resolved, 'first_refusal_us', prefix)
+                ended = number(resolved, 'resolved_at_us', prefix)
+                message = number(resolved, 'wire_message', prefix, True)
+                outcome = resolved.get('outcome')
+                require(outcome in ('Admitted', 'Cancelled', 'OwnerFailure', 'MetricStop'),
+                        prefix + ': unknown resolution outcome')
+                kind = 'completed' if outcome == 'Admitted' else 'censored'
+                if (ended < began or began >= exact['original_deadline_us'] or
+                        (observed is not None and ended > observed) or
+                        (start is not None and ended > start) or wait[kind + '_episodes'] == 0 or
+                        ended - began > wait[kind + '_us'] or ended - began > maximum or
+                        (outcome in ('Admitted', 'Cancelled') and ended >= exact['original_deadline_us']) or
+                        ((message is not None) != (outcome == 'Admitted')) or message == 0):
+                    issues.append(prefix + ': inconsistent latest exact resolution')
+            elif wait['completed_episodes'] or wait['censored_episodes']:
+                issues.append(prefix + ': completed/censored episodes lack latest resolution')
+        gaps.append('partial: fragment admission, receipt acceptance, dispatch/dependency and retired tails remain untimed')
+        result['status'] = 'invalid_observations' if issues else 'validated_known_fields_partial'
+    except ValueError as error:
+        issues.append(str(error))
+        result['status'] = 'invalid_or_unrecognized_shape'
+    return result
+
+
 def normalize(value, source, digest):
     value = object_value(value, 'input')
     require(type(value.get('schema')) is int and value['schema'] == 1,
@@ -317,6 +551,8 @@ def normalize(value, source, digest):
                                 row['class'], row['reason']))
     protocol = protocol_provider(value.get('protocol_buffers'))
     issues.extend(protocol['issues'])
+    management = management_provider(value.get('management_streams'), finished)
+    issues.extend(management['issues'])
     ratio = None
     if not issues and span is not None and span > 0:
         ratio = 100.0 * union['observed_us'] / span
@@ -331,6 +567,7 @@ def normalize(value, source, digest):
         ('invalid_observations' if issues else 'unknown_or_zero_observed_span'),
         'wait_ranking': waits, 'count_only_refusals': counts, 'occupancy': occupancy,
         'protocol_provider_validation': protocol,
+        'management_provider_validation': management,
         'provider_metadata': {key: item for key, item in value.items() if key not in CORE_FIELDS},
         'provider_metadata_definition': 'Preserved source fields; no queue usage derived from provider space or limits.',
     }
@@ -402,6 +639,10 @@ def markdown(report):
         lines.extend(['', 'Protocol provider: ' + cell(protocol['status']) + '. ' +
                       protocol['definition']])
         lines.extend('- ' + cell(gap) for gap in protocol['coverage_gaps'])
+        management = owner['management_provider_validation']
+        lines.extend(['', 'Management provider: ' + cell(management['status']) + '. ' +
+                      management['definition']])
+        lines.extend('- ' + cell(gap) for gap in management['coverage_gaps'])
         if owner['issues']:
             lines.extend(['', 'Diagnostic invalidity (values retained, percentage suppressed):'])
             lines.extend('- ' + cell(issue) for issue in owner['issues'])

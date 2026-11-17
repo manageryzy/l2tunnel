@@ -91,6 +91,15 @@ pub(super) struct Reservation {
 }
 
 impl Reservation {
+    pub(super) fn submission_id(self) -> u64 {
+        self.submission.0
+    }
+    pub(super) fn origin_scope(self) -> sc::Scope {
+        self.context.origin()
+    }
+    pub(super) fn length(self) -> usize {
+        self.length
+    }
     pub(super) fn deadline(&self) -> Duration {
         self.deadline
     }
@@ -626,6 +635,9 @@ impl Owner {
         validate_reservation(streamed, output)?;
         let i = index(streams::Stream::Transaction);
         if streamed.outgoing[i].len() >= streamed.settings.streams[i].max_outbound_messages {
+            if let Some(timing) = &mut streamed.buffer_timing {
+                timing.refused(output.reservation, now, buffers::Refusal::WrapperEntries);
+            }
             return Ok(Attempt::Blocked);
         }
         let next = streamed.next[i].checked_add(1).ok_or_else(exhausted)?;
@@ -636,6 +648,14 @@ impl Owner {
             output.deadline(),
         ) {
             Ok(ticket) => {
+                if let Some(timing) = &mut streamed.buffer_timing {
+                    timing.resolved(
+                        output.reservation,
+                        now,
+                        buffers::WaitOutcome::Admitted,
+                        Some(ticket.message()),
+                    );
+                }
                 let token = Token {
                     binding,
                     kind: TokenKind::Streamed {
@@ -655,8 +675,18 @@ impl Owner {
                 output.token = Some(token);
                 Ok(Attempt::Complete(token))
             }
-            Err(messages::Error::Backpressure) => Ok(Attempt::Blocked),
-            Err(error) => Err(protocol(error)),
+            Err(messages::Error::Backpressure) => {
+                if let Some(timing) = &mut streamed.buffer_timing {
+                    timing.refused(output.reservation, now, buffers::Refusal::MessageCapacity);
+                }
+                Ok(Attempt::Blocked)
+            }
+            Err(error) => {
+                if let Some(timing) = &mut streamed.buffer_timing {
+                    timing.stop(now, buffers::WaitOutcome::OwnerFailure);
+                }
+                Err(protocol(error))
+            }
         }
     }
 
@@ -681,6 +711,14 @@ impl Owner {
         }
         let streamed = self.leased_mut()?;
         validate_reservation(streamed, output)?;
+        if let Some(timing) = &mut streamed.buffer_timing {
+            timing.resolved(
+                output.reservation,
+                now,
+                buffers::WaitOutcome::Cancelled,
+                None,
+            );
+        }
         streamed.reservation = None;
         output.cancelled = true;
         Ok(())

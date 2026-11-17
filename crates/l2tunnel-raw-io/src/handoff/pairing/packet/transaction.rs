@@ -1852,6 +1852,12 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if let Err(e) = lock(&self.budget).map(|mut b| b.quota = 32) {
             return Poll::Ready(Err(self.fail(e)));
         }
+        self.poll_progress_remaining(cx)
+    }
+    /// Continue this physical work turn without replenishing its original quota.
+    /// A runtime may use remaining work after committing fresh output following
+    /// its initial receipt poll. Pacing, lane fairness and deadlines are unchanged.
+    pub fn poll_progress_remaining(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         match self.turn(cx) {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => Poll::Pending,

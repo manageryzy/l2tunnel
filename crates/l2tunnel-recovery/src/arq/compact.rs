@@ -986,6 +986,7 @@ impl Engine {
                         .received
                         .keys()
                         .filter(|source| source.0 >= self.receive_prefix)
+                        .take(3)
                         .count();
                     let allowed = state
                         .last_feedback

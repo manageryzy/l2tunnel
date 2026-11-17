@@ -21,6 +21,39 @@ impl common::Runtime {
     }
 }
 
+impl Drop for Driver {
+    fn drop(&mut self) {
+        if self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.buffer_metrics.as_ref())
+            .is_none_or(crate::buffer_metrics::Observer::is_finished)
+        {
+            return;
+        }
+        // The source owners still exist here. Future cancellation bypasses the
+        // loop epilogue, so freeze observations before any field is released.
+        // No I/O, receipt settlement, protocol tick or deadline is performed.
+        let instant = Instant::now();
+        let now = clock(self.origin, instant).ok();
+        let observed = self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.buffer_metrics.as_ref())
+            .and_then(|metrics| metrics.elapsed_at(instant));
+        if let Some(now) = now.filter(|now| observed == Some(*now)) {
+            self.finish_buffer_metrics_at(now, crate::buffer_metrics::SourceBoundary::DriverDrop);
+        } else if let Some(metrics) = self
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.buffer_metrics.as_mut())
+        {
+            metrics
+                .source_terminal_attempt(crate::buffer_metrics::SourceBoundary::DriverDrop, None);
+        }
+    }
+}
+
 impl Driver {
     pub(super) fn sample_raw_buffers<R: super::raw_carrier::RawBacking>(
         &mut self,
@@ -46,7 +79,20 @@ impl Driver {
         }
     }
 
-    fn sample_protocol_buffers(&mut self, now: u64, force: bool) {
+    fn sample_management_buffers(&mut self, now: u64, force: bool) {
+        let Some(report) = self
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.buffer_metrics.as_mut())
+            .and_then(crate::buffer_metrics::Observer::management_buffers)
+        else {
+            return;
+        };
+        if report.due(now, force) {
+            report.sample(&self.control, now);
+        }
+    }
+    fn sample_protocol_buffers(&mut self, now: u64, force: bool) -> bool {
         use crate::buffer_metrics::protocol_buffers::Identity;
         let epochs = self.common_epochs();
         let owner::DataOwner::Common(state) = &self.owner;
@@ -55,13 +101,13 @@ impl Driver {
             .as_deref_mut()
             .and_then(|r| r.buffer_metrics.as_mut())
         else {
-            return;
+            return false;
         };
         let Some(protocol) = metrics.protocol_buffers() else {
-            return;
+            return false;
         };
         if !protocol.due(now, force) {
-            return;
+            return false;
         }
         let mut identities = [None; 2];
         let mut identity_failed = false;
@@ -87,10 +133,10 @@ impl Driver {
         }
         if identity_failed {
             protocol.defer_sample(now);
-            return;
+            return false;
         }
         if !protocol.begin(now, identities) {
-            return;
+            return false;
         }
         for (epoch, identity) in epochs.into_iter().zip(identities) {
             if let (Some(epoch), Some(identity)) = (epoch, identity)
@@ -99,9 +145,11 @@ impl Driver {
                 protocol.sample_engine(identity, now, engine);
             }
         }
+        true
     }
 
     pub(super) fn sample_common_buffers(&mut self, now: u64) {
+        self.sample_management_buffers(now, false);
         self.sample_protocol_buffers(now, false);
         let Some(runtime) = self.common.as_deref_mut() else {
             return;
@@ -175,15 +223,39 @@ impl Driver {
         }
     }
     pub(super) fn finish_buffer_metrics(&mut self, now: u64) {
-        self.sample_protocol_buffers(now, true);
+        self.finish_buffer_metrics_at(now, crate::buffer_metrics::SourceBoundary::LoopStop);
+    }
+    fn finish_buffer_metrics_at(
+        &mut self,
+        now: u64,
+        boundary: crate::buffer_metrics::SourceBoundary,
+    ) {
+        let Some(metrics) = self
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.buffer_metrics.as_mut())
+            .filter(|metrics| !metrics.is_finished())
+        else {
+            return;
+        };
+        metrics.source_terminal_attempt(boundary, Some(now));
+        self.control.finish_buffer_metrics(duration(now));
+        self.sample_management_buffers(now, true);
+        let protocol_sampled = self.sample_protocol_buffers(now, true);
         self.sample_common_buffers(now);
         if let Some(metrics) = self
             .common
             .as_deref_mut()
             .and_then(|r| r.buffer_metrics.as_mut())
         {
-            if let Some(protocol) = metrics.protocol_buffers() {
-                protocol.finish_staged_admission(now);
+            if protocol_sampled {
+                if let Some(protocol) = metrics.protocol_buffers() {
+                    protocol.finish_staged_admission(now);
+                }
+            } else if metrics.protocol_buffers().is_some() {
+                // A previous sample at the same tick is not proof that this
+                // terminal source observation succeeded. Never extend it.
+                metrics.source_terminal_unavailable();
             }
             metrics.finish_at(now);
         }

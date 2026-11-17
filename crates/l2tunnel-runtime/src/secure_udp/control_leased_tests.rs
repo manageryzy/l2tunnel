@@ -542,6 +542,15 @@ fn source_acks_cannot_supply_complete_confirmation_before_actual_acceptance() ->
         lab.pump()?;
     }
     assert_eq!(lab.owners[0].retained().send_records, 0);
+    let Backend::Streamed(streamed) = &lab.owners[0].backend else {
+        return Err("expected actual streamed owner".into());
+    };
+    let snapshot = streamed.owners[0].buffer_snapshot();
+    assert_eq!(snapshot.retained.recovery.send_records, 0);
+    assert_eq!(snapshot.awaiting_accepted, 1);
+    assert_eq!(snapshot.confirmed_metadata, 0);
+    assert_eq!(snapshot.retained.outbound_messages, 1);
+    assert!(!snapshot.counter_overflow);
     let mut called = false;
     assert_eq!(
         lab.owners[0].with_confirmed(frozen.token().ok_or("missing token")?, lab.now, |_| {
@@ -1046,6 +1055,7 @@ fn refused_next_logical_output_keeps_candidate_bytes_id_and_original_cap() -> Re
     let mut selected = settings();
     selected.streams[0].max_outbound_messages = 1;
     let mut lab = Lab::with_settings(selected)?;
+    lab.owners[0].enable_buffer_metrics();
     let prepare = lab.prepare()?;
     let first = lab.send(0, &prepare)?;
     let staged = lab.dispatched(1)?;
@@ -1066,6 +1076,7 @@ fn refused_next_logical_output_keeps_candidate_bytes_id_and_original_cap() -> Re
     let id = frozen.submission();
     let deadline = frozen.deadline();
     assert_eq!(id.0, 2);
+    let first_refusal = lab.now;
     for _ in 0..20 {
         assert_eq!(
             lab.owners[0].submit_frozen(&mut frozen, lab.now)?,
@@ -1082,6 +1093,21 @@ fn refused_next_logical_output_keeps_candidate_bytes_id_and_original_cap() -> Re
             .freeze_transaction(&lab.peers[0], &barrier, lab.now)
             .is_err()
     );
+    let before = management_report(&lab.owners[0], lab.now)?;
+    assert_eq!(before["streams"][0]["stream"], "Transaction");
+    assert_eq!(
+        before["frozen_submission_wait"]["wrapper_entry_refusals"],
+        20
+    );
+    assert_eq!(before["frozen_submission_wait"]["completed_episodes"], 0);
+    assert_eq!(
+        before["frozen_submission_wait"]["first_refusal_us"],
+        u64::try_from(first_refusal.as_micros())?
+    );
+    assert_eq!(
+        before["frozen_submission_wait"]["pending"]["submission"],
+        id.0
+    );
     lab.owners[0].retire(first.token().ok_or("missing first token")?, lab.now)?;
     assert!(matches!(
         lab.owners[0].submit_frozen(&mut frozen, lab.now)?,
@@ -1089,6 +1115,28 @@ fn refused_next_logical_output_keeps_candidate_bytes_id_and_original_cap() -> Re
     ));
     assert_eq!(frozen.submission(), id);
     assert_eq!(frozen.envelope(), exact);
+    let after = management_report(&lab.owners[0], lab.now)?;
+    assert_eq!(after["frozen_submission_wait"]["completed_episodes"], 1);
+    assert_eq!(after["frozen_submission_wait"]["censored_episodes"], 0);
+    assert!(after["frozen_submission_wait"]["pending"].is_null());
+    assert_eq!(
+        after["frozen_submission_wait"]["completed_us"],
+        u64::try_from((lab.now - first_refusal).as_micros())?
+    );
+    assert_eq!(
+        after["frozen_submission_wait"]["last_resolved"]["identity"]["original_deadline_us"],
+        u64::try_from(deadline.as_micros())?
+    );
+    assert_eq!(
+        after["frozen_submission_wait"]["last_resolved"]["outcome"],
+        "Admitted"
+    );
+    assert_eq!(after["binding"]["control_epoch"], 1);
+    assert_eq!(
+        after["streams"].as_array().ok_or("missing streams")?.len(),
+        3
+    );
+    assert_eq!(after["invalid_occupancy"], false);
     Ok(())
 }
 
@@ -1856,5 +1904,143 @@ fn nontransaction_hint_does_not_authorize_unsupported_or_substituted_data_feedba
         let mut output = [0; 2048];
         assert!(lab.owners[1].next(lab.now, &mut output).is_err());
     }
+    Ok(())
+}
+
+// These reports observe actual MessageOwner and transaction output state. They
+// do not replace ARQ/semantic custody with fabricated metric queue values.
+fn management_report(owner: &Owner, at: Duration) -> Result<serde_json::Value> {
+    let mut report = buffers::Report::new()?;
+    let charged = report.heap_bytes();
+    report.sample(owner, u64::try_from(at.as_micros())?);
+    assert_eq!(report.heap_bytes(), charged);
+    let mut output = Vec::new();
+    report.write(&mut output)?;
+    Ok(serde_json::from_slice(&output)?)
+}
+
+fn refused_management_prepare() -> Result<(Lab, FrozenOutput, Vec<u8>)> {
+    let mut selected = settings();
+    selected.streams[0].max_outbound_messages = 1;
+    let mut lab = Lab::with_settings(selected)?;
+    lab.owners[0].enable_buffer_metrics();
+    // A genuine ordinary profile-control admission occupies the bounded
+    // Transaction wrapper until its own actual semantic receipt/retirement.
+    assert!(
+        lab.owners[0]
+            .submit(
+                data_scope(1, &modes()[0])?,
+                sc::Body::ProfileControl {
+                    tag: sc::ProfileTag::SlotReuseV1,
+                    bytes: &[0x42]
+                },
+                lab.now,
+                CAP_DURATION,
+                false
+            )?
+            .is_some()
+    );
+    let prepare = lab.prepare()?;
+    let mut frozen = lab.owners[0].freeze_transaction(&lab.peers[0], &prepare, lab.now)?;
+    lab.now = Duration::from_millis(1);
+    assert_eq!(
+        lab.owners[0].submit_frozen(&mut frozen, lab.now)?,
+        Attempt::Blocked
+    );
+    lab.now = Duration::from_millis(3);
+    assert_eq!(
+        lab.owners[0].submit_frozen(&mut frozen, lab.now)?,
+        Attempt::Blocked
+    );
+    Ok((lab, frozen, prepare))
+}
+
+#[test]
+fn management_frozen_wait_censors_cancellation_expiry_and_metric_stop_separately() -> Result {
+    for outcome in ["Cancelled", "OwnerFailure", "MetricStop"] {
+        let (mut lab, mut frozen, prepare) = refused_management_prepare()?;
+        let deadline = frozen.deadline();
+        let exact = frozen.envelope().to_vec();
+        lab.now = Duration::from_millis(5);
+        match outcome {
+            "Cancelled" => {
+                let tick = lab.tick()?;
+                lab.peers[1].receive_until(verified(mg::Role::Client), &prepare, tick, CAP)?;
+                let ready = lab.peers[1]
+                    .staged(tx::Fence::new(&[0, 0])?, tick)?
+                    .outbound
+                    .ok_or("missing genuine READY supersession")?;
+                lab.peers[0].receive_until(verified(mg::Role::Server), &ready, tick, CAP)?;
+                lab.owners[0].cancel_frozen(&lab.peers[0], &mut frozen, lab.now)?;
+            }
+            "OwnerFailure" => {
+                lab.now = deadline;
+                assert_eq!(
+                    lab.owners[0]
+                        .submit_frozen(&mut frozen, lab.now)
+                        .err()
+                        .ok_or("expired reservation admitted")?
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+            }
+            _ => lab.owners[0].finish_buffer_metrics(lab.now),
+        }
+        assert_eq!(frozen.deadline(), deadline);
+        assert_eq!(frozen.envelope(), exact);
+        let report = management_report(&lab.owners[0], lab.now)?;
+        let wait = &report["frozen_submission_wait"];
+        assert_eq!(wait["completed_episodes"], 0);
+        assert_eq!(wait["censored_episodes"], 1);
+        assert_eq!(wait["wrapper_entry_refusals"], 2);
+        assert_eq!(
+            wait["censored_us"],
+            u64::try_from((lab.now - Duration::from_millis(1)).as_micros())?
+        );
+        assert_eq!(wait["last_resolved"]["outcome"], outcome);
+        assert!(wait["pending"].is_null());
+        assert_eq!(
+            wait["last_resolved"]["identity"]["original_deadline_us"],
+            u64::try_from(deadline.as_micros())?
+        );
+        // Cleanup/another stop must not extend an already closed interval.
+        lab.owners[0].finish_buffer_metrics(lab.now + Duration::from_millis(1));
+        let terminal = management_report(&lab.owners[0], lab.now + Duration::from_millis(1))?;
+        assert_eq!(
+            terminal["frozen_submission_wait"]["censored_us"],
+            wait["censored_us"]
+        );
+        assert_eq!(
+            terminal["frozen_submission_wait"]["last_resolved"],
+            wait["last_resolved"]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn management_ordinary_reused_submission_id_is_count_only() -> Result {
+    let mut selected = settings();
+    selected.streams[1].max_outbound_messages = 1;
+    let mut lab = Lab::with_settings(selected)?;
+    lab.owners[0].enable_buffer_metrics();
+    for nonce in 1..=3 {
+        let admitted = lab.owners[0].submit(
+            control_scope(),
+            sc::Body::Ping { nonce },
+            lab.now,
+            CAP_DURATION,
+            false,
+        )?;
+        assert_eq!(admitted.is_some(), nonce == 1);
+        lab.now += Duration::from_millis(1);
+    }
+    let report = management_report(&lab.owners[0], lab.now)?;
+    assert_eq!(report["streams"][1]["stream"], "Liveness");
+    assert_eq!(report["streams"][1]["ordinary_submit_refusals"], 2);
+    assert!(report["streams"][1]["ordinary_submit_duration_us"].is_null());
+    assert_eq!(report["frozen_submission_wait"]["completed_episodes"], 0);
+    assert_eq!(report["frozen_submission_wait"]["censored_episodes"], 0);
+    assert!(report["frozen_submission_wait"]["pending"].is_null());
     Ok(())
 }

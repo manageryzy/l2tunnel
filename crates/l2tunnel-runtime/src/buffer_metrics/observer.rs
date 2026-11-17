@@ -10,15 +10,40 @@ use tokio::time::Instant;
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
+/// Provenance of a final source-owner observation attempt, not a success claim.
+#[derive(Clone, Copy)]
+pub(crate) enum SourceBoundary {
+    LoopStop,
+    DriverDrop,
+    ObserverDropWithoutSource,
+}
+impl SourceBoundary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoopStop => "loop_stop",
+            Self::DriverDrop => "driver_drop",
+            Self::ObserverDropWithoutSource => "observer_drop_without_source",
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct SourceTerminal {
+    boundary: SourceBoundary,
+    attempted_at: Option<u64>,
+    unavailable: bool,
+}
+
 pub(crate) struct Observer {
     collector: Collector,
     path: PathBuf,
     label: &'static str,
     origin: Instant,
     finished: Option<u64>,
+    source_terminal: Option<SourceTerminal>,
     // Reserve one slot only when diagnostics are enabled. Keeping this large
     // snapshot inline also enlarges disabled adapters and nested setup futures.
     protocol: Vec<super::protocol_buffers::ProtocolBuffers>,
+    management: Vec<crate::secure_udp::control::buffers::Report>,
     udp_socket: Vec<super::udp_socket::Snapshot>,
     udp_socket_allocation_failed: bool,
     raw: Vec<crate::secure_udp::raw_buffer_metrics::Snapshot>,
@@ -77,7 +102,9 @@ impl Observer {
             quic: Self::quic_storage("test")?,
             origin,
             finished: None,
+            source_terminal: None,
             protocol: Vec::new(),
+            management: Vec::new(),
             udp_socket: Vec::new(),
             udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
@@ -126,7 +153,9 @@ impl Observer {
             quic: Self::quic_storage(label)?,
             origin,
             finished: None,
+            source_terminal: None,
             protocol: Vec::new(),
+            management: Vec::new(),
             udp_socket: Vec::new(),
             udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
@@ -148,6 +177,26 @@ impl Observer {
             .push(super::udp_socket::Snapshot::read(socket));
     }
 
+    pub(crate) fn configure_management_buffers(&mut self) -> io::Result<()> {
+        if !self.management.is_empty() || self.is_finished() {
+            return Err(io::Error::other("management observer already configured"));
+        }
+        self.management
+            .try_reserve_exact(1)
+            .map_err(io::Error::other)?;
+        self.management
+            .push(crate::secure_udp::control::buffers::Report::new()?);
+        Ok(())
+    }
+    pub(crate) fn management_buffers(
+        &mut self,
+    ) -> Option<&mut crate::secure_udp::control::buffers::Report> {
+        if self.is_finished() {
+            None
+        } else {
+            self.management.first_mut()
+        }
+    }
     pub(crate) fn configure_protocol_buffers(
         &mut self,
         maximum_owners: usize,
@@ -243,6 +292,15 @@ impl Observer {
             )
             .saturating_add(self.path.capacity())
             .saturating_add(
+                self.management.capacity()
+                    * std::mem::size_of::<crate::secure_udp::control::buffers::Report>(),
+            )
+            .saturating_add(
+                self.management
+                    .first()
+                    .map_or(0, crate::secure_udp::control::buffers::Report::heap_bytes),
+            )
+            .saturating_add(
                 self.udp_socket.capacity() * std::mem::size_of::<super::udp_socket::Snapshot>(),
             )
             .saturating_add(
@@ -263,6 +321,24 @@ impl Observer {
                 self.raw.capacity()
                     * std::mem::size_of::<crate::secure_udp::raw_buffer_metrics::Snapshot>(),
             )
+    }
+    pub(crate) fn source_terminal_attempt(
+        &mut self,
+        boundary: SourceBoundary,
+        attempted_at: Option<u64>,
+    ) {
+        if !self.is_finished() && self.source_terminal.is_none() {
+            self.source_terminal = Some(SourceTerminal {
+                boundary,
+                attempted_at,
+                unavailable: attempted_at.is_none(),
+            });
+        }
+    }
+    pub(crate) fn source_terminal_unavailable(&mut self) {
+        if let Some(value) = &mut self.source_terminal {
+            value.unavailable = true;
+        }
     }
     pub(crate) fn finish_at(&mut self, now: u64) {
         if self.finished.is_none() && self.collector.finish(now).is_ok() {
@@ -383,8 +459,30 @@ impl Observer {
         } else {
             write!(writer, "null")?;
         }
+        write!(writer, ",\"source_terminal_sample\":")?;
+        if let Some(value) = self.source_terminal {
+            write!(
+                writer,
+                "{{\"definition\":\"final protocol and management owner sample attempt; inspect provider timestamps and invalidity for actual coverage; no raw/carrier final observation is implied\",\"boundary\":\"{}\",\"attempted_at_us\":",
+                value.boundary.label()
+            )?;
+            optional(writer, value.attempted_at)?;
+            write!(
+                writer,
+                ",\"source_unavailable_events\":{}}}",
+                u8::from(value.unavailable)
+            )?;
+        } else {
+            write!(writer, "null")?;
+        }
         write!(writer, ",\"protocol_buffers\":")?;
         if let Some(snapshot) = self.protocol.first() {
+            snapshot.write(writer)?;
+        } else {
+            write!(writer, "null")?;
+        }
+        write!(writer, ",\"management_streams\":")?;
+        if let Some(snapshot) = self.management.first() {
             snapshot.write(writer)?;
         } else {
             write!(writer, "null")?;
@@ -416,6 +514,17 @@ impl Observer {
 
 impl Drop for Observer {
     fn drop(&mut self) {
+        if self.source_terminal.is_none()
+            && (!self.protocol.is_empty() || !self.management.is_empty())
+        {
+            // An observer alone cannot prove that a prior source snapshot is
+            // still current. Preserve it unchanged and report the missing owner.
+            self.source_terminal = Some(SourceTerminal {
+                boundary: SourceBoundary::ObserverDropWithoutSource,
+                attempted_at: None,
+                unavailable: true,
+            });
+        }
         let now = self.finished.unwrap_or_else(|| self.now());
         self.finish_at(now);
         if let Err(error) = self.persist(self.finished.unwrap_or(now)) {
@@ -581,6 +690,51 @@ mod tests {
         let persisted: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         assert_eq!(persisted, value);
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn observer_without_source_reports_terminal_unavailable_without_extrapolation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::pause();
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-buffer-report-source-unavailable-{}.bmetrics",
+            std::process::id()
+        ));
+        let mut observer = Observer::for_test(Instant::now(), path.clone())?;
+        observer.configure_protocol_buffers(1, l2tunnel_management::Role::Client)?;
+        observer.configure_management_buffers()?;
+        let key = Key {
+            site: Site::CommonUserSlot,
+            lane: Lane::Shared,
+            class: Class::User,
+        };
+        observer
+            .collector()
+            .sample(key, 0, super::super::Occupancy::default())
+            .map_err(|_| "sample")?;
+        tokio::time::advance(std::time::Duration::from_micros(50_000)).await;
+        drop(observer);
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        std::fs::remove_file(path)?;
+        assert_eq!(value["finished_at_us"], 50_000);
+        assert_eq!(
+            value["source_terminal_sample"]["boundary"],
+            "observer_drop_without_source"
+        );
+        assert!(value["source_terminal_sample"]["attempted_at_us"].is_null());
+        assert_eq!(
+            value["source_terminal_sample"]["source_unavailable_events"],
+            1
+        );
+        assert!(
+            value["protocol_buffers"]["epochs"]
+                .as_array()
+                .ok_or("epochs")?
+                .is_empty()
+        );
+        assert_eq!(value["management_streams"]["samples"], 0);
+        assert!(value["management_streams"]["last_sample_us"].is_null());
+        assert!(value["management_streams"]["frozen_submission_wait"].is_null());
         Ok(())
     }
 }

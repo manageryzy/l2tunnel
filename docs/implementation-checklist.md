@@ -95,6 +95,18 @@ passes strict workspace Clippy, corrected preview tests and all 318 runtime test
 the intermittent raw failure remains unresolved. Native qualification is separate.
 No complete BP or CWC gate closes.
 
+The [native13 comparison](modules/buffer-observability.md#native13-service-cost-repair-and-observed-remaining-limits)
+qualifies Aligned Compact forward UDP at 30.9297344 Mbit/s and raw at 5.803584
+Mbit/s under the original impairment, with both requested disconnects passing.
+UDP receiver kernel drops remain 105; raw sender receipt waits remain substantial.
+The new exports reveal missing final protocol sampling on future cancellation.
+[Management stream instrumentation](modules/buffer-observability.md#management-stream-buffer-instrumentation)
+passes fifteen focused actual control fixtures and nineteen report tests;
+actual cancellation sampling and same-turn raw remaining-quota scheduling now
+pass the [complete required local check14](../work/aligned-extents-20261117/required-buffer-checks14-attempt1/validation.json)
+with unchanged source (2267 Rust, 448 tooling and 1658 simulator cases). Native
+qualification and remaining BP-16 intervals stay open. No complete BP gate closes.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

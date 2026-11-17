@@ -4,6 +4,10 @@ use std::task::Poll;
 
 async fn poll_raw_once(socket: &mut RawIo, receive: bool) -> Result {
     socket.begin_turn();
+    poll_raw_current_turn(socket, receive).await
+}
+
+async fn poll_raw_current_turn(socket: &mut RawIo, receive: bool) -> Result {
     let raw = socket.final_raw_mut().ok_or("actual raw owner")?;
     poll_fn(|cx| {
         Poll::Ready(match raw.poll_ready(cx, receive) {
@@ -171,5 +175,120 @@ async fn half_raw_drains_both_received_lanes_and_rotates_under_first_lane_load()
     assert_eq!(second.upper_control.counters.verifier_rejected.packets, 0);
     assert_eq!(second.upper_control.queued_packets, 0);
     assert_eq!(pair.bd.records.compact_check_status().control, 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_new_final_output_progresses_after_idle_receipt_poll_without_new_turn() -> Result {
+    for half in [false, true] {
+        let mut pair = Box::pin(selected_runtime_pair(
+            half,
+            security::compact::Protection::HmacSha256,
+        ))
+        .await?;
+        for _ in 0..4 {
+            progress_owner(&mut pair.a, &mut pair.ad).await?;
+            progress_owner(&mut pair.b, &mut pair.bd).await?;
+        }
+        for management in [false, true] {
+            let now = Instant::now();
+            let deadline = pair.ad.origin + duration(pair.ad.lease);
+            // Reproduce the real Driver order: poll retained receipts before
+            // committing fresh, authenticated User or Control ciphertext.
+            pair.a.begin_turn();
+            pair.a.observe_completions().await;
+            stage_candidate(&mut pair, management, 31)?;
+            assert!(pair.a.take_user()?.is_none());
+            assert!(pair.a.take_control()?.is_none());
+            poll_raw_current_turn(&mut pair.a, false).await?;
+            let progress = if management {
+                pair.a.take_control()?.ok_or("same-turn Control receipt")?.0
+            } else {
+                pair.a.take_user()?.ok_or("same-turn User receipt")?.1
+            };
+            let raw_carrier::SendProgress::Whole { receipt, late } = progress else {
+                return Err("same-turn receipt was not physical".into());
+            };
+            assert!(!late);
+            assert_eq!(receipt.accepted_at, now);
+            assert_eq!(receipt.deadline, deadline);
+            assert_eq!(Instant::now(), now);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_fresh_output_repoll_keeps_original_turn_quota_and_pending_identity() -> Result {
+    for half in [false, true] {
+        let mut pair = Box::pin(selected_runtime_pair(
+            half,
+            security::compact::Protection::HmacSha256,
+        ))
+        .await?;
+        for _ in 0..4 {
+            progress_owner(&mut pair.a, &mut pair.ad).await?;
+            progress_owner(&mut pair.b, &mut pair.bd).await?;
+        }
+        let now = Instant::now();
+        let deadline = pair.ad.origin + duration(pair.ad.lease);
+        pair.a.begin_turn();
+        pair.a.observe_completions().await;
+        let mut accepted = 0;
+        // Each real PacketIo receive/authentication reservation and each send
+        // spends the same original 32-unit budget. Fresh commits cannot reset it.
+        for value in 0..=32 {
+            stage_candidate(&mut pair, false, value)?;
+            poll_raw_current_turn(&mut pair.a, false).await?;
+            if let Some((_, raw_carrier::SendProgress::Whole { receipt, late })) =
+                pair.a.take_user()?
+            {
+                assert!(!late);
+                assert_eq!(receipt.accepted_at, now);
+                assert_eq!(receipt.deadline, deadline);
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(accepted > 0 && accepted < 32);
+        let before = pair
+            .a
+            .final_raw_mut()
+            .ok_or("actual raw owner")?
+            .buffer_snapshot(now);
+        let pending = before.user.ok_or("quota-blocked User")?;
+        assert!(pending.token_retained);
+        assert!(!pending.receipt_retained);
+        assert_eq!(pending.deadline, deadline);
+        let lane = before.carrier.lanes[0].ok_or("actual data lane")?;
+        assert!(lane.send_io.turn_budget_refusals > 0);
+        assert_eq!(lane.send_io.would_block_observations, 0);
+        assert_eq!(lane.send_io.pacing_refusals, 0);
+        for _ in 0..3 {
+            poll_raw_current_turn(&mut pair.a, false).await?;
+            assert!(pair.a.take_user()?.is_none());
+        }
+        let retained = pair
+            .a
+            .final_raw_mut()
+            .ok_or("actual raw owner")?
+            .buffer_snapshot(now);
+        assert_eq!(retained.user, Some(pending));
+        assert_eq!(
+            retained.carrier.lanes[0].ok_or("actual data lane")?.send_io,
+            lane.send_io
+        );
+        // Only the next caller work turn replenishes the original quota.
+        poll_raw_once(&mut pair.a, false).await?;
+        let (_, progress) = pair.a.take_user()?.ok_or("next-turn physical receipt")?;
+        let raw_carrier::SendProgress::Whole { receipt, late } = progress else {
+            return Err("next-turn receipt was not physical".into());
+        };
+        assert!(!late);
+        assert_eq!(receipt.accepted_at, now);
+        assert_eq!(receipt.deadline, deadline);
+        assert_eq!(Instant::now(), now);
+    }
     Ok(())
 }

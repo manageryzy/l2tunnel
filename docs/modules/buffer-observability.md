@@ -58,7 +58,7 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Sampled codec/recovery export preserves full independent owner incarnation; exact staged-source admission waits retain the same identity. Remaining lifecycle/source-free/native wait timing is pending. |
 | BP-14 | Common native read slab and exclusive unsealed/sealed User slot | Sampled runtime occupancy, actual held-input capacity and User send/receipt waits implemented. Raw metadata preparation reasons and full receipt latency decomposition pending. |
 | BP-15 | Native output pool/device credit/receipts | Runtime occupancy, actual pool-acquire refusal counts and device-write WouldBlock intervals implemented. A refused scan lease does not prove useful native output exists, so its interval remains unmeasured. Native credit/controller internals remain BP-03. |
-| BP-16 | Management message/recovery/reassembly/semantic/dispatch slots | Existing expiry snapshots retained; stream-specific occupancy and submission/dispatch/dependency timing pending. |
+| BP-16 | Management message/recovery/reassembly/semantic/dispatch slots | Bounded per-stream occupancy and exact frozen Transaction submission refusal-to-admission timing are implemented and pass focused actual-owner tests. Ordinary reused-ID submissions are count-only; fragment, receipt, dispatch and dependency intervals remain pending. Runtime terminal export qualification remains separate. |
 | BP-17 | Proxy channels/writer/Bridge/ring/measured ledger/relay buffers | Actual selected-frame receipt-ring refusal intervals and bounded receipt/import/callback timing export implemented. Focused current validation is recorded separately; writer/channel/relay occupancy, publication-to-import timing and complete measured-ledger attribution remain pending. |
 | BP-18 | Raw candidate classes/pinned input/bitmap/prepared/tracked/receipts | Typed prepare reasons, per-class gauges/counters and terminal scalar retention implemented. Exact opt-in per-lane PacketIo intervals and Common scalar export pass focused local fixtures; native interval qualification is pending. Quota/pacing and prepare refusals remain separate untimed counts. Candidate residence, custody and peer-credit wait attribution remain incomplete. Bitmap is coverage state, not buffered packet bytes. |
 | BP-19 | OpenVPN submissions/held datagrams/receive/setup buffers | Class/channel fullness, socket waits and receive drops pending. |
@@ -604,3 +604,109 @@ deadlines and pending receipt identities, without polling I/O or extending any
 limit. The final runtime continuation did not reproduce that failure, so the new
 trace has no observed failure sample yet. Native throughput qualification of this
 batch is still separate.
+
+### Native13 service-cost repair and observed remaining limits
+
+The [stable release13](../../work/aligned-extents-20261117/matrix-source-binding-13.json)
+binds checkpoint `4bacdc1` and binary `dc5d38f0b75f3789104f5175d630e87cbd4339a4ce6efb389b29abeac1872718`.
+Two affected forward phases run in parallel under the unchanged 100/10 Mbit/s,
+70 ms RTT and 15% independent loss per direction.
+[The source-bound comparison](../../work/aligned-extents-20261117/native13-raw-udp-analysis1/report.md)
+qualifies ten-second receiver goodput of 30.9297344 Mbit/s for Aligned Compact UDP
+and 5.803584 Mbit/s for raw TCP. Both setup and requested bilateral disconnect
+pass, and all owned namespaces are removed. Native12 UDP failed before a complete
+sample; native12 raw measured 5.4178368 Mbit/s. Two runs with different service
+code and different finite loss realizations do not isolate a causal speedup.
+
+The same persistent UDP receiver socket records 105 additional kernel drops,
+also reflected in namespace RcvbufErrors/InErrors, versus native12's 2005. Client
+socket drops remain zero. Capture and kernel-counter windows differ, so the
+small packet-count mismatch is retained rather than forced into an exact join.
+Original UDP receive/send socket limits both read 212992 kernel accounting bytes.
+No socket limit or protocol timeout was enlarged.
+
+The [four current buffer exports](../../work/aligned-extents-20261117/buffer-native13-report1/analysis.md)
+validate their known fields. Raw sender receipt wait occupies 75.727% of its
+observed lifetime; receiver wait occupies 37.199%. These are combined adapter/
+carrier intervals, not demonstrated kernel blocking. Neither UDP owner records
+an interval at the currently timed singleton hooks. Sampled UDP sender retention
+reaches 5009/8192 sources; raw reaches 7620/8192. None records an exact staged-source
+capacity/window refusal. Missing timed hooks remain unknown.
+
+All four exports expose a terminal coverage gap: last protocol samples precede
+generic observer stop by 25352--627037 microseconds, and staged terminal markers
+are absent. The client disconnect cancels the owning future before its normal
+metrics epilogue. These samples do not qualify fresh final protocol censoring;
+the diagnostic-only cancellation fix is tracked in the following source batch.
+
+[Native13 measured layers](../../work/aligned-extents-20261117/native13-overhead-analysis1/report.md)
+retain separate emission populations in both directions. Same-emission IP bytes
+outside the codec body are 60.626/61 B mean/p99 forward and 60.044/61 B reverse
+for UDP; raw is 71.903/73 B and 70.799/71 B. Full original-native overhead remains
+unavailable. The [updated mixed-source matrix](../../work/aligned-extents-20261117/matrix-report-repairs13-complete1/report.md)
+contains 16 passed, 185 failed, 32 bound-exhausted and 7 not-run selected phases;
+most selected sessions retain older binaries. It is not a same-build matrix.
+
+### Management-stream buffer instrumentation
+
+The following source batch samples actual three/four-stream MessageOwners and
+wrapper retention at most once per 100 ms plus terminal observation. Stream
+identity includes the fixed control binding and actual control epoch. ARQ
+confirmation, semantic ACCEPTED, queued confirmation custody, held reassembly,
+wrapper dispatch and policy allowance remain separate. Sampled high-water values
+are not continuous maxima. No payload, message digest or key is exported.
+
+Only the exact immutable frozen Transaction reservation receives a timed
+refusal-to-admission episode. Repeated wrapper/message capacity refusals retain
+the original start and deadline. Admission completes it; genuine cancellation,
+observed owner failure or metric stop censors it with a distinct label. Ordinary
+submissions can reuse an unadmitted ID for different bytes, so their refusals are
+count-only. Other internal management waits remain required under BP-16.
+
+The opt-in observer uses fallible bounded backing; fixed Timing storage is charged
+through the existing Streamed layout. The
+[focused continuation](../../work/aligned-extents-20261117/management-focused14b/receipt.json)
+passes strict management/runtime Clippy, fifteen actual control fixtures and
+nineteen report-tool tests. The first attempt retained two lint errors, corrected
+without suppressions. Report validation preserves unavailable fields and never
+adds management intervals to the overlapping generic union. Final cancellation
+sampling now passes actual-owner fixtures as described below; current native
+export and the complete BP-16 gate remain open.
+
+### Same-turn raw progress and cancellation sampling
+
+This coordinated source batch corrects a raw adapter scheduling dependency.
+An initial completion poll could consume the adapter's single-poll marker before
+new User/Control output was committed. The newly committed packet then waited
+for another Driver turn even when PacketIo had not blocked. The adapter now
+allows fresh output to use the existing remaining physical work quota; the
+carrier continuation does not replenish the original 32-unit allowance. Exact
+custody tokens, original deadlines, lane fairness and pacing remain unchanged.
+Real Full/Half owner regressions cover same-time physical completion and quota
+exhaustion. Both regressions pass the required local check below; native
+qualification remains separate.
+
+An unfinished Common Driver now samples actual protocol and management owners
+from Drop before releasing those fields. It verifies the fresh runtime timestamp
+uses the original Driver/observer time domain and reuses the existing terminal
+freeze ordering. No I/O, receipt settlement, protocol tick or deadline renewal is
+performed. The export distinguishes normal loop stop, Driver destruction and
+observer-only fallback. Missing source access or a failed forced observation
+remains explicitly unavailable; old snapshots are never extrapolated. Actual
+dropped-future and fallback regressions pass the required local check. Raw and maintained
+carrier owners outside Driver retain separate terminal coverage.
+
+The batch also short-circuits Compact gap evidence after three qualifying keys,
+the only threshold consumed by the existing decision. Immutable iteration and
+a pure predicate make the boolean decision identical; existing actual Python
+differential and bounded-fast-retry cases remain its validation boundary. No
+performance effect is claimed before renewed measurement.
+
+The [complete required local check14](../../work/aligned-extents-20261117/required-buffer-checks14-attempt1/validation.json)
+passes on unchanged source: 2267 Rust cases including doctests, 448 Python tooling
+cases, and 1658 simulator cases. The same process passes formatting, strict
+workspace Clippy and rustdoc, codec no-default-features checks, and the external
+Common CLI. Earlier failed receipts remain retained. This fresh local pass does
+not establish native throughput, full buffer coverage or remote platform support.
+The next native run checks all three Aligned Compact raw/UDP directions plus
+Swift ARQ TLS reverse and QUIC forward under the original impairment and bounds.

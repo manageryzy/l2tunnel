@@ -138,3 +138,82 @@ impl Owner {
         }
     }
 }
+
+/// Bounded live storage facts. Queue custody is not a missing-ACK assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferSnapshot {
+    /// Exact authenticated per-stream binding, independent of data epochs.
+    pub binding: delivery::Binding,
+    /// Actual current payload/recovery ownership, including reserved completion bytes.
+    pub retained: Retained,
+    /// Exact immutable capacities and service policy; no inferred capacities.
+    pub settings: Settings,
+    /// Last successful observation; this getter does not advance the owner.
+    pub last_successful_at: Duration,
+    /// Actual sticky owner error, if any.
+    pub owner_error: Option<Error>,
+    /// Confirmed retry metadata awaiting explicit retirement.
+    pub confirmed_metadata: usize,
+    /// Unconfirmed messages without a consumed exact ACCEPTED receipt.
+    pub awaiting_accepted: usize,
+    /// Sources still queued for the bounded confirmation sweep, including ACKed sources.
+    pub source_confirmation_custody: usize,
+    /// Canonical fragments not yet submitted to recovery.
+    pub remaining_fragments: usize,
+    /// Exact complete incoming message held for semantic acceptance.
+    pub held_message: Option<u64>,
+    /// Its original nonrenewable deadline.
+    pub held_deadline: Option<Duration>,
+    /// A diagnostic sum exceeded its representable bound.
+    pub counter_overflow: bool,
+}
+impl Owner {
+    /// Read at most the configured 64 outbound entries, without ACK consumption,
+    /// payload inspection, allocation, clock access or protocol progress.
+    pub fn buffer_snapshot(&self) -> BufferSnapshot {
+        let mut snapshot = BufferSnapshot {
+            binding: self.binding,
+            retained: self.retained(),
+            settings: self.settings,
+            last_successful_at: self.last_now,
+            owner_error: self.failed,
+            confirmed_metadata: 0,
+            awaiting_accepted: 0,
+            source_confirmation_custody: 0,
+            remaining_fragments: 0,
+            held_message: self.held.as_ref().map(|held| held.ticket.message),
+            held_deadline: self.held.as_ref().map(|held| held.deadline),
+            counter_overflow: false,
+        };
+        for entry in self.outbound.iter() {
+            for (total, count) in [
+                (
+                    &mut snapshot.confirmed_metadata,
+                    usize::from(entry.confirmed),
+                ),
+                (
+                    &mut snapshot.awaiting_accepted,
+                    usize::from(!entry.confirmed && !entry.accepted),
+                ),
+                (
+                    &mut snapshot.source_confirmation_custody,
+                    entry.sources.len(),
+                ),
+                (
+                    &mut snapshot.remaining_fragments,
+                    entry
+                        .batch
+                        .fragments
+                        .len()
+                        .saturating_sub(entry.next_fragment),
+                ),
+            ] {
+                match total.checked_add(count) {
+                    Some(value) => *total = value,
+                    None => snapshot.counter_overflow = true,
+                }
+            }
+        }
+        snapshot
+    }
+}

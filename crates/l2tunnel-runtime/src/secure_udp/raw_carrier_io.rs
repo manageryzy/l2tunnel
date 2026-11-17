@@ -358,6 +358,7 @@ pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     control: Option<Pending>,
     failure: Option<raw::Error>,
     polled: bool,
+    fresh_output: bool,
     prepare_observations: [PrepareObservations; 4],
 }
 impl<I: PacketIo + Send + 'static> RawAdapter<I> {
@@ -426,6 +427,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                         .commit_final_record(token, bytes)
                         .map_err(raw_error)?,
                 );
+                self.fresh_output = true;
             }
             self.fail()?;
             return Ok(SendProgress::Pending);
@@ -468,6 +470,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             control: None,
             failure: None,
             polled: false,
+            fresh_output: false,
             prepare_observations: [PrepareObservations::default(); 4],
         };
         if result.capacity_bytes()? != plan.capacity_bytes() {
@@ -680,8 +683,10 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         Ok(())
     }
     fn progress(&mut self, cx: &mut Context<'_>, receive: bool) -> io::Result<bool> {
-        if !self.polled && self.failure.is_none() {
+        if (!self.polled || self.fresh_output) && self.failure.is_none() {
+            let first_poll = !self.polled;
             self.polled = true;
+            self.fresh_output = false;
             if let Some(control) = &mut self.control {
                 let bytes = control.bytes;
                 if let Err(error) = Self::stage(
@@ -696,10 +701,18 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                     });
                 }
             }
-            if self.failure.is_none()
-                && let Poll::Ready(Err(error)) = self.carrier.poll_progress(cx)
-            {
-                self.failure = Some(error);
+            if self.failure.is_none() {
+                // The initial receipt poll can precede a new final commit. Let
+                // that output use this turn's remaining work without granting
+                // another quota or waiting solely for the next carrier tick.
+                let progress = if first_poll {
+                    self.carrier.poll_progress(cx)
+                } else {
+                    self.carrier.poll_progress_remaining(cx)
+                };
+                if let Poll::Ready(Err(error)) = progress {
+                    self.failure = Some(error);
+                }
             }
         }
         let mut ready = self.collect_receipts()?;
@@ -937,6 +950,7 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
     }
     fn begin_turn(&mut self) {
         self.polled = false;
+        self.fresh_output = false;
     }
     fn user_pending(&self) -> bool {
         self.user
@@ -1040,6 +1054,7 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                 bytes,
             )?;
         }
+        self.fresh_output |= pending.token.is_some();
         self.control = Some(pending);
         Ok(SendProgress::Pending)
     }

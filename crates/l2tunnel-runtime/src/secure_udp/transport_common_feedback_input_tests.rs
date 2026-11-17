@@ -490,6 +490,11 @@ async fn actual_common_protocol_buffers_sample_real_engine_before_terminal_freez
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     std::fs::remove_file(path)?;
     assert_eq!(json["finished_at_us"], now + 50_000);
+    assert_eq!(json["source_terminal_sample"]["boundary"], "loop_stop");
+    assert_eq!(
+        json["source_terminal_sample"]["source_unavailable_events"],
+        0
+    );
     let provider = &json["protocol_buffers"];
     assert_eq!(provider["identity_errors"], 0);
     assert_eq!(provider["staged_terminal_unavailable"], 0);
@@ -522,6 +527,138 @@ async fn actual_common_protocol_buffers_sample_real_engine_before_terminal_freez
     assert!(
         wait["pending"].is_null(),
         "nonempty retention alone must not open a wait"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_common_future_samples_live_protocol_and_management_before_owner_release() -> Result
+{
+    use std::{future::Future, task::Poll};
+    let kind = cover::Appearance::QuicLike;
+    let (contracts, _) = super::compact::selected_compact(kind)?;
+    let fixture = Fixture::from_contracts_with_tail(kind, contracts, false).await?;
+    let [mut a, _b] = fixture.endpoints;
+    tokio::time::pause();
+    let path = std::env::temp_dir().join(format!(
+        "l2tunnel-protocol-buffer-dropped-future-{}.bmetrics",
+        std::process::id()
+    ));
+    let role = common_contract::mg_role(a.driver.info.role);
+    let current = a.driver.common_state()?.current();
+    let local = current.descriptor().local(role);
+    let needed = common_contract::maximum_body(local.send(), local.receive())?
+        .checked_add(a.driver.config.control.wire_overhead)
+        .and_then(|bytes| bytes.checked_add(a.driver.reserve))
+        .ok_or("actual wire requirement overflow")?;
+    let ready = a.driver.origin + duration(a.driver.bucket.ready_at(needed)?);
+    tokio::time::sleep_until(ready).await;
+    let now = clock(a.driver.origin, Instant::now())?;
+    let mut observer = crate::buffer_metrics::Observer::for_test(a.driver.origin, path.clone())?;
+    observer.configure_protocol_buffers(1, role)?;
+    observer.configure_management_buffers()?;
+    a.driver.control.enable_buffer_metrics();
+    a.driver
+        .common
+        .as_deref_mut()
+        .ok_or("Common owner")?
+        .buffer_metrics = Some(observer);
+    a.driver.sample_common_buffers(now);
+    let epoch = a.driver.common_state()?.epoch();
+    a.driver
+        .common_state_mut()?
+        .entry(epoch)?
+        .enqueue_borrowed(engine::Tick(now), &frame(28_881, 72))?;
+    a.driver.progress_common(now)?;
+    assert!(
+        !a.driver
+            .send_common_user_with(now, |_| Err(io::ErrorKind::WouldBlock.into()))?
+    );
+    assert!(
+        a.driver
+            .common_state_mut()?
+            .entry(epoch)?
+            .pending_carrier_output()
+            .is_some()
+    );
+    let deadline = add(now, a.driver.config.lifetime.pong_timeout)?.min(a.driver.lease);
+    let control_scope = envelope_scope(a.driver.records.control_scope());
+    assert!(
+        a.driver
+            .control
+            .submit(
+                control_scope,
+                control::Body::Ping { nonce: 92 },
+                duration(now),
+                duration(deadline),
+                true
+            )?
+            .is_some()
+    );
+    let origin = a.driver.origin;
+    // This polled future owns the actual authenticated Driver, just as the
+    // service's inline session future does. Cancellation skips its continuation.
+    let mut running = Box::pin(async move {
+        std::future::pending::<()>().await;
+        drop(a);
+    });
+    std::future::poll_fn(|cx| {
+        assert!(running.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::advance(Duration::from_micros(50_000)).await;
+    let stopped = clock(origin, Instant::now())?;
+    assert_eq!(stopped, now + 50_000);
+    drop(running);
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    std::fs::remove_file(path)?;
+    assert_eq!(json["finished_at_us"], stopped);
+    assert_eq!(json["source_terminal_sample"]["boundary"], "driver_drop");
+    assert_eq!(json["source_terminal_sample"]["attempted_at_us"], stopped);
+    assert_eq!(
+        json["source_terminal_sample"]["source_unavailable_events"],
+        0
+    );
+    let protocol = &json["protocol_buffers"];
+    assert_eq!(protocol["identity_errors"], 0);
+    assert_eq!(protocol["staged_terminal_unavailable"], 0);
+    let observed = &protocol["epochs"][0];
+    assert_eq!(observed["epoch"], epoch.0);
+    assert_eq!(observed["samples"], 2);
+    assert_eq!(observed["last_sample_us"], stopped);
+    let row = &observed["owners"][0];
+    let retention = row["gauges"]
+        .as_array()
+        .ok_or("actual gauges")?
+        .iter()
+        .find(|value| value["name"] == "arq_send_records")
+        .ok_or("actual ARQ retention")?;
+    assert!(retention["used"].as_u64().is_some_and(|used| used > 0));
+    assert_eq!(row["staged_admission"]["terminal_at_us"], stopped);
+    assert_eq!(
+        row["staged_admission"]["union"]["censored_episodes"], 0,
+        "retained data without actual refusal cannot become a wait"
+    );
+    let management = &json["management_streams"];
+    assert_eq!(management["samples"], 2);
+    assert_eq!(management["last_sample_us"], stopped);
+    assert_eq!(management["unavailable_samples"], 0);
+    assert_eq!(
+        management["frozen_submission_wait"]["terminal_at_us"],
+        stopped
+    );
+    assert_eq!(
+        management["frozen_submission_wait"]["terminal_kind"],
+        "MetricStop"
+    );
+    assert_eq!(management["frozen_submission_wait"]["censored_episodes"], 0);
+    assert!(
+        json["invalid"]
+            .as_object()
+            .ok_or("invalid flags")?
+            .values()
+            .all(|value| value == false)
     );
     Ok(())
 }

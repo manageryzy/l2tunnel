@@ -17,7 +17,7 @@ use std::collections::TryReserveError;
 mod observer;
 pub(crate) mod protocol_buffers;
 mod udp_socket;
-pub(crate) use observer::Observer;
+pub(crate) use observer::{Observer, SourceBoundary};
 
 /// Stable bounded hook sites; unobserved sites are not evidence of zero pressure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

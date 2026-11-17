@@ -91,6 +91,23 @@ fn four_actual_reserved_owners_charge_exact_plans_and_v1_rejects_without_upgrade
     let selected = selected_v2();
     let wrapper = wrapper_storage::Plan::new_v2(selected, base())?;
     let owner = make_v2(mg::Role::Client)?;
+    let report = management_report(&owner, Duration::ZERO)?;
+    assert_eq!(report["version"], streams::v2::VERSION);
+    assert_eq!(
+        report["streams"]
+            .as_array()
+            .ok_or("missing v2 streams")?
+            .len(),
+        4
+    );
+    assert_eq!(report["streams"][3]["stream"], "Lifecycle");
+    assert_eq!(
+        report["streams"][3]["stream_control_epoch"],
+        streams::v2::delivery_binding(binding(mg::Role::Client), streams::Stream::Lifecycle)?
+            .control_epoch
+    );
+    assert_eq!(report["invalid_occupancy"], false);
+    assert!(report["frozen_submission_wait"].is_null());
     let mut snapshot = Vec::new();
     owner.write_failure_snapshot(Duration::from_secs(10), &mut snapshot)?;
     let snapshot = std::str::from_utf8(&snapshot)?;

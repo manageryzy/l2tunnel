@@ -14,6 +14,8 @@ use std::{io, time::Duration};
 mod v2;
 pub use v2::SettingsV2;
 
+#[path = "control_buffers.rs"]
+pub(crate) mod buffers;
 #[path = "control_leased.rs"]
 mod leased;
 #[path = "control_wrapper_storage.rs"]
@@ -171,6 +173,7 @@ struct Held {
 }
 
 struct Streamed {
+    buffer_timing: Option<buffers::Timing>,
     leased: bool,
     reservation: Option<leased::Reservation>,
     owners: StreamOwners,
@@ -860,6 +863,7 @@ impl Owner {
                 StreamOwners::Three(actual)
             };
             Ok(Streamed {
+                buffer_timing: None,
                 leased: false,
                 reservation: None,
                 owners,
@@ -1040,7 +1044,12 @@ impl Owner {
                         streamed.next[i] = next;
                         Ok(Some(token))
                     }
-                    Err(messages::Error::Backpressure) => Ok(None),
+                    Err(messages::Error::Backpressure) => {
+                        if let Some(timing) = &mut streamed.buffer_timing {
+                            timing.ordinary_refused(i);
+                        }
+                        Ok(None)
+                    }
                     Err(error) => Err(protocol(error)),
                 }
             }
@@ -1725,6 +1734,13 @@ impl Owner {
     }
 
     fn observe(&mut self, now: Duration) -> io::Result<()> {
+        let result = self.observe_inner(now);
+        if result.is_err() && now >= self.now {
+            self.buffer_failure(now);
+        }
+        result
+    }
+    fn observe_inner(&mut self, now: Duration) -> io::Result<()> {
         if self.failed {
             return Err(protocol("control proof callback failed"));
         }

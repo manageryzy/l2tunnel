@@ -758,13 +758,18 @@ impl Driver {
                 .max()
                 .unwrap_or(1);
             metrics.configure_protocol_buffers(maximum_owners, role)?;
+            metrics.configure_management_buffers()?;
         }
         let reuse_owner = if contract.connection_reuse() {
             Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
         } else {
             None
         };
-        let control = plans.construct(config, binding, control_scope, data_scope, wrapper_plan)?;
+        let mut control =
+            plans.construct(config, binding, control_scope, data_scope, wrapper_plan)?;
+        if buffer_metrics.is_some() {
+            control.enable_buffer_metrics();
+        }
         let buffers = buffers::Buffers::with_plan(buffer_plan)?;
         let inputs = buffers::Inputs::with_plan(input_plan)?;
         let input_capacity = inputs.capacity_bytes();
