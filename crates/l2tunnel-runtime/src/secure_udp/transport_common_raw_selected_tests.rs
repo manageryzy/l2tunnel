@@ -145,3 +145,6 @@ async fn selected_compact_raw_services_alternate_management_and_both_half_lanes(
 
 #[path = "transport_common_raw_pending_tests.rs"]
 mod pending;
+
+#[path = "transport_common_raw_receive_tests.rs"]
+mod receive_fairness;

@@ -35,9 +35,25 @@ remains unmeasured; these results do not qualify the complete matrix.
 
 The next [joined framing and native-admission batch](modules/compact-wire-cleanup.md#joined-framing-and-successful-native-admission-observations)
 implements correlated schema3 observations and actual successful-codec admission
-metadata; shared validation remains pending. The newly requested all-buffer
-backpressure instrumentation is tracked in the [complete buffer coverage inventory](modules/buffer-observability.md);
-nonempty queues, residence time and downstream blockage must remain distinct.
+metadata. The buffer continuation retains the
+[required batch check](../work/aligned-extents-20261117/required-buffer-checks3-attempt1/validation.json)
+and [remaining-stage receipt](../work/aligned-extents-20261117/required-buffer-checks3-continuation1.json):
+305 runtime and 173 raw cases pass; 195 client cases pass with the measured QUIC
+callback deadline failure still open. Strict Clippy/rustdoc and the external
+Common CLI probe pass. The subsequent
+[diagnosed proxy run](../work/aligned-extents-20261117/proxy-timing-validation3/receipt.json)
+passes 70 proxy component cases but reproduces that original deadline failure;
+it does not qualify native throughput. The [affected-owner follow-up](../work/aligned-extents-20261117/required-buffer-checks3-continuation2.json)
+passes the Aligned scan repair, exact CompactARQ failure snapshots and sampled
+QUIC transport statistics with 306 runtime cases and strict Clippy/rustdoc.
+Native validation remains separate.
+
+The requested all-buffer backpressure instrumentation is tracked in the
+[complete buffer coverage inventory](modules/buffer-observability.md). Nonempty
+queues, residence time and downstream blockage remain distinct. The first real
+export covers 12 owner reports across four failed/bound-exhausted native9 cases;
+no complete BP row, full overhead quantile or full matrix gate closes through
+partial diagnostic coverage.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

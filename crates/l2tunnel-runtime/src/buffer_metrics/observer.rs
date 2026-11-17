@@ -19,10 +19,36 @@ pub(crate) struct Observer {
     // Reserve one slot only when diagnostics are enabled. Keeping this large
     // snapshot inline also enlarges disabled adapters and nested setup futures.
     raw: Vec<crate::secure_udp::raw_buffer_metrics::Snapshot>,
+    proxy: Vec<crate::proxy::timing::Snapshot>,
     quic: Vec<crate::secure_udp::maintained_io::quic_metrics::Snapshot>,
 }
 
 impl Observer {
+    fn proxy_storage(label: &str) -> io::Result<Vec<crate::proxy::timing::Snapshot>> {
+        let mut values = Vec::new();
+        if label == "proxy_bridge" {
+            values.try_reserve_exact(1).map_err(io::Error::other)?;
+        }
+        Ok(values)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_proxy_test(origin: Instant, path: PathBuf) -> io::Result<Self> {
+        let mut value = Self::for_test(origin, path)?;
+        value.label = "proxy_bridge";
+        value.proxy = Self::proxy_storage("proxy_bridge")?;
+        Ok(value)
+    }
+    pub(crate) fn retain_proxy(&mut self, snapshot: crate::proxy::timing::Snapshot) {
+        if self.is_finished() || self.proxy.capacity() == 0 {
+            return;
+        }
+        if let Some(old) = self.proxy.first_mut() {
+            *old = snapshot;
+        } else {
+            self.proxy.push(snapshot);
+        }
+    }
+
     fn quic_storage(
         label: &str,
     ) -> io::Result<Vec<crate::secure_udp::maintained_io::quic_metrics::Snapshot>> {
@@ -49,6 +75,7 @@ impl Observer {
             origin,
             finished: None,
             raw: Self::raw_storage()?,
+            proxy: Self::proxy_storage("test")?,
         })
     }
 
@@ -94,6 +121,7 @@ impl Observer {
             origin,
             finished: None,
             raw: Self::raw_storage()?,
+            proxy: Self::proxy_storage(label)?,
         }))
     }
 
@@ -120,6 +148,25 @@ impl Observer {
             }
         }
     }
+    pub(crate) fn quic_transport_due(&self, lane: usize, now: u64) -> bool {
+        !self.is_finished()
+            && self
+                .quic
+                .first()
+                .is_some_and(|value| value.transport_due(lane, now))
+    }
+    pub(crate) fn sample_quic_transport(
+        &mut self,
+        lane: usize,
+        now: u64,
+        sample: crate::secure_udp::maintained_io::quic_metrics::TransportSample,
+    ) {
+        if !self.is_finished()
+            && let Some(value) = self.quic.first_mut()
+        {
+            value.sample_transport(lane, now, sample);
+        }
+    }
     pub(crate) fn sample_quic(
         &mut self,
         lane: usize,
@@ -134,6 +181,14 @@ impl Observer {
     pub(crate) fn heap_bytes(&self) -> usize {
         self.collector
             .heap_bytes()
+            .saturating_add(
+                self.proxy.capacity() * std::mem::size_of::<crate::proxy::timing::Snapshot>(),
+            )
+            .saturating_add(
+                self.proxy
+                    .first()
+                    .map_or(0, |snapshot| snapshot.owner_heap_bytes),
+            )
             .saturating_add(self.path.capacity())
             .saturating_add(
                 self.quic.capacity()
@@ -243,6 +298,12 @@ impl Observer {
         }
         write!(writer, ",\"quic\":")?;
         if let Some(snapshot) = self.quic.first() {
+            snapshot.write(writer)?;
+        } else {
+            write!(writer, "null")?;
+        }
+        write!(writer, ",\"proxy\":")?;
+        if let Some(snapshot) = self.proxy.first() {
             snapshot.write(writer)?;
         } else {
             write!(writer, "null")?;

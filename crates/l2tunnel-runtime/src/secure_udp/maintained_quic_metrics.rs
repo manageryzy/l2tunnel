@@ -5,6 +5,9 @@ use crate::buffer_metrics::{
 };
 use l2tunnel_quic::common::BufferSnapshot;
 use std::io::{self, Write};
+#[path = "maintained_quic_transport_metrics.rs"]
+mod transport;
+pub(crate) use transport::Sample as TransportSample;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Snapshot {
@@ -21,9 +24,22 @@ struct Provider {
     maximum_available: usize,
     invalid: bool,
     overflow: bool,
+    transport: Option<transport::Summary>,
 }
 
 impl Snapshot {
+    pub(crate) fn transport_due(&self, lane: usize, now: u64) -> bool {
+        self.lanes
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|value| transport::Summary::due(value.transport.as_ref(), now))
+    }
+    pub(crate) fn sample_transport(&mut self, lane: usize, now: u64, sample: TransportSample) {
+        if let Some(value) = self.lanes.get_mut(lane).and_then(Option::as_mut) {
+            transport::Summary::sample(&mut value.transport, now, sample);
+        }
+    }
+
     pub(crate) fn sample(&mut self, lane: usize, value: BufferSnapshot) {
         let Some(slot) = self.lanes.get_mut(lane) else {
             return;
@@ -37,6 +53,7 @@ impl Snapshot {
             maximum_available: value.available_payload_bytes,
             invalid: false,
             overflow: false,
+            transport: None,
         });
         state.invalid |= value.invalid_slot_observation
             || value.available_payload_bytes > state.send_capacity
@@ -67,7 +84,7 @@ impl Snapshot {
             first = false;
             write!(
                 out,
-                "{{\"lane\":{lane},\"samples\":{},\"configured_send_buffer_bytes\":{},\"configured_receive_buffer_bytes\":{},\"available_payload_bytes\":{},\"minimum_available_payload_bytes\":{},\"maximum_available_payload_bytes\":{},\"outgoing_used_bytes\":null,\"incoming_used_bytes\":null,\"invalid\":{},\"overflow\":{}}}",
+                "{{\"lane\":{lane},\"samples\":{},\"configured_send_buffer_bytes\":{},\"configured_receive_buffer_bytes\":{},\"available_payload_bytes\":{},\"minimum_available_payload_bytes\":{},\"maximum_available_payload_bytes\":{},\"outgoing_used_bytes\":null,\"incoming_used_bytes\":null,\"invalid\":{},\"overflow\":{}",
                 value.samples,
                 value.send_capacity,
                 value.receive_capacity,
@@ -77,6 +94,13 @@ impl Snapshot {
                 value.invalid,
                 value.overflow
             )?;
+            write!(out, ",\"transport_statistics\":")?;
+            if let Some(value) = &value.transport {
+                value.write(out)?;
+            } else {
+                write!(out, "null")?;
+            }
+            write!(out, "}}")?;
         }
         write!(out, "]}}")
     }

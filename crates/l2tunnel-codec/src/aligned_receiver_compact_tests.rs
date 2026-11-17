@@ -224,3 +224,86 @@ fn compact_four_byte_predictive_unit_decodes_without_padding() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn compact_same_tick_admission_and_duplicate_never_renew_original_expiry() -> TestResult {
+    for reserved in [false, true] {
+        let mut receiver = receiver(limits(64), reserved)?;
+        let identity = SymbolIdentity {
+            scope: scope(),
+            source: SourceId(1),
+            record: RecordId(1),
+        };
+        let bytes = [0, 0, 1, 2, 0, 3, 9, 0, 0];
+        receiver.tick(Tick(1))?;
+        receiver.admit_authenticated(identity, &bytes, Tick(1))?;
+        assert_eq!(receiver.deadline(), Some(Tick(101)));
+        for _ in 0..32 {
+            assert_eq!(
+                receiver.admit_authenticated(identity, &bytes, Tick(1))?,
+                Admission::Duplicate
+            );
+        }
+        receiver.tick(Tick(100))?;
+        assert_eq!(
+            receiver.admit_authenticated(identity, &bytes, Tick(100))?,
+            Admission::Duplicate
+        );
+        assert_eq!(receiver.deadline(), Some(Tick(101)));
+        assert_eq!(receiver.tick(Tick(101)), Err(Error::Expired));
+        assert_eq!(
+            receiver.tick(Tick(100)),
+            Err(Error::Expired),
+            "sticky expiry precedes memoization and regression"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_failed_batches_restore_expiry_check_clock_with_retained_ledger() -> TestResult {
+    for reserved in [false, true] {
+        let mut receiver = receiver(limits(64), reserved)?;
+        let identity = |source, record| SymbolIdentity {
+            scope: scope(),
+            source: SourceId(source),
+            record: RecordId(record),
+        };
+        let first = [0, 0, 1, 2, 0, 3, 9, 0, 0];
+        let next = [0, 0, 2, 2, 0, 3, 8, 0, 0];
+        let conflict = [0, 0, 2, 2, 0, 3, 7, 0, 0];
+        receiver.admit_authenticated(identity(1, 1), &first, Tick(1))?;
+        let before = receiver.status();
+        let bad = [
+            AuthenticatedSymbol {
+                identity: identity(2, 2),
+                bytes: &next,
+            },
+            AuthenticatedSymbol {
+                identity: identity(2, 2),
+                bytes: &conflict,
+            },
+        ];
+        assert_eq!(
+            receiver.admit_batch_authenticated(&bad, Tick(50)),
+            Err(Error::Conflict)
+        );
+        assert_eq!(receiver.status(), before);
+        assert_eq!(receiver.last_time, Some(Tick(1)));
+        let unresolved = [AuthenticatedSymbol {
+            identity: identity(2, 2),
+            bytes: &next,
+        }];
+        assert_eq!(
+            receiver.admit_validated_batch_authenticated(&unresolved, Tick(50)),
+            Err(Error::UnresolvedContext)
+        );
+        assert_eq!(receiver.status(), before);
+        assert_eq!(receiver.last_time, Some(Tick(1)));
+        assert_eq!(receiver.tick(Tick(0)), Err(Error::Time));
+        receiver.tick(Tick(2))?;
+        assert_eq!(receiver.deadline(), Some(Tick(101)));
+        assert_eq!(receiver.tick(Tick(101)), Err(Error::Expired));
+    }
+    Ok(())
+}

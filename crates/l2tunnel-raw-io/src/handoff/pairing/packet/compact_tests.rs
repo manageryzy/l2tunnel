@@ -228,6 +228,8 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
             .clone();
         assert_eq!(exact.len(), 40 + protected.len());
         assert_eq!(&exact[40..], &protected);
+        a.enable_send_timing()?;
+        assert!(matches!(a.enable_send_timing(), Err(Error::Configuration)));
         let before_send = a.buffer_snapshot(Instant::now()).lanes[0]
             .ok_or("snapshot lane")?
             .send_io;
@@ -240,6 +242,11 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         assert_eq!(lane_snapshot.pending_ip_bytes, exact.len());
         assert!(lane_snapshot.packet_io_pending);
         assert!(lane_snapshot.send_io.blocked);
+        let timing = lane_snapshot.send_timing.ok_or("actual PacketIo timing")?;
+        assert!(timing.open_micros.is_some());
+        assert!(timing.would_block_observations > 0);
+        assert_eq!(timing.completed.episodes, 0);
+        assert!(lane_snapshot.send_timing_capacity_bytes > 0);
         assert!(lane_snapshot.send_io.would_block_observations > 0);
         assert_eq!(
             lane_snapshot.send_io.would_block_episodes,
@@ -274,6 +281,10 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
             before_send.resumed_episodes + 1
         );
         assert!(!resumed.send_io.blocked);
+        let timing = resumed.send_timing.ok_or("actual resumed timing")?;
+        assert_eq!(timing.completed.episodes, 1);
+        assert_eq!(timing.open_micros, None);
+        assert!(!timing.invalid_clock);
         assert_eq!(sent.token, receipt);
         assert!(a.take_sent_record(PairLane::First)?.is_none());
         let input = b.final_input(PairLane::First)?.ok_or("input")?;
@@ -533,6 +544,7 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
             false,
         )
         .await?;
+        a.enable_send_timing()?;
         let terminal_pointer = a.terminal_buffers.as_ptr();
         let terminal_capacity = a.terminal_snapshot_capacity_bytes();
         assert_eq!(terminal_capacity, std::mem::size_of::<BufferSnapshot>());
@@ -593,6 +605,13 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
         assert_eq!(frozen.captured_at, deadline);
         assert_eq!(frozen.unavailable_lanes, 0);
         assert!(frozen.lanes[0].ok_or("retained lane snapshot")?.completed);
+        assert!(
+            frozen.lanes[0]
+                .ok_or("retained timing lane")?
+                .send_timing
+                .ok_or("terminal timing")?
+                .stopped
+        );
         assert_eq!(
             a.buffer_snapshot(deadline + Duration::from_secs(100)),
             frozen

@@ -1012,6 +1012,17 @@ impl Engine {
     pub fn queue_usage(&self) -> pipeline::QueueUsage {
         self.pipeline.usage()
     }
+    /// Exact shared Aligned/Packed CompactARQ terminal evidence. Other families,
+    /// including independent connection collections, are outside this snapshot.
+    pub fn compact_retry_failure_snapshot(
+        &self,
+    ) -> Option<l2tunnel_recovery::CompactRetryFailureSnapshot> {
+        match &self.owner {
+            Owner::Aligned(owner) => owner.compact_retry_failure_snapshot(),
+            Owner::Packed(owner) => owner.compact_retry_failure_snapshot(),
+            _ => None,
+        }
+    }
     /// Actual original fatal error, retained for cleanup and observability.
     pub const fn failure(&self) -> Option<Error> {
         self.failure

@@ -350,6 +350,32 @@ impl Carrier {
         if let Backend::Quic(values) = &self.backend {
             for (index, value) in values.iter().enumerate() {
                 quic_metrics::lower(&mut self.buffer_metrics, index, value.buffer_snapshot());
+                if let Some(metrics) = self.buffer_metrics.as_mut() {
+                    let now = metrics.now();
+                    if metrics.quic_transport_due(index, now) {
+                        // Public provider facts sampled at a diagnostic cadence only.
+                        // No timer, driver wake, queue allowance or admission is changed.
+                        let stats = value.transport_statistics();
+                        let micros = stats.path.rtt.as_micros();
+                        metrics.sample_quic_transport(
+                            index,
+                            now,
+                            quic_metrics::TransportSample {
+                                rtt_us: micros.min(u128::from(u64::MAX)) as u64,
+                                rtt_conversion_overflow: micros > u128::from(u64::MAX),
+                                cwnd_bytes: stats.path.cwnd,
+                                congestion_events: stats.path.congestion_events,
+                                lost_quic_packets: stats.path.lost_packets,
+                                lost_quic_bytes: stats.path.lost_bytes,
+                                sent_quic_packets: stats.path.sent_packets,
+                                udp_tx_datagrams: stats.udp_tx.datagrams,
+                                udp_rx_datagrams: stats.udp_rx.datagrams,
+                                udp_tx_payload_bytes: stats.udp_tx.bytes,
+                                udp_rx_payload_bytes: stats.udp_rx.bytes,
+                            },
+                        );
+                    }
+                }
                 quic_metrics::input(
                     &mut self.buffer_metrics,
                     Some(index),

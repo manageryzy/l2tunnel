@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 #[derive(Default)]
 struct Probe {
     sent: AtomicUsize,
+    receive_calls: AtomicUsize,
     syns: AtomicUsize,
     dropped: AtomicUsize,
     blocked: AtomicBool,
@@ -36,6 +37,7 @@ struct PacketLink {
 }
 impl PacketIo for PacketLink {
     fn receive(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
+        self.probe.receive_calls.fetch_add(1, Ordering::Relaxed);
         match self.incoming.try_recv() {
             Ok(bytes) => {
                 let target = output

@@ -471,3 +471,185 @@ fn newer_echo_cannot_retire_an_earlier_unobserved_physical_history_entry() -> Re
     assert_eq!(sender.source_deadline(), Some(ms(165)));
     Ok(())
 }
+
+#[test]
+fn retry_failure_snapshot_preserves_original_attempt_times_and_last_applied_feedback() -> Result {
+    let original = config(CompactRecovery::Guarded, 16, 64, 78)?;
+    let policy = CompactArqConfig::new(
+        original.bounds(),
+        original.timing(),
+        original.maximum_feedback_bytes(),
+        original.history_entries(),
+        2,
+        original.recovery(),
+    )?;
+    let mut sender = CompactRepeat::new(policy, context(EndpointRole::Initiator))?;
+    let mut receiver = CompactRepeat::new(policy, context(EndpointRole::Responder))?;
+    let usage = sender.storage_usage();
+    sender.submit(b"lost", ms(0))?;
+    let mut bytes = [0; 128];
+    sender
+        .poll_source(ms(0), &mut bytes)?
+        .ok_or("first attempt")?;
+    assert_eq!(sender.retry_failure_snapshot(), None);
+    let first = sender
+        .pending_transmission(SourceId(0))
+        .ok_or("first custody")?;
+    sender.confirm_transmission_at(ms(20), ms(10), first)?;
+    let later = emit(&mut sender, ms(20), ms(20), b"later")?;
+    receiver.receive(&later, ms(50))?;
+    let ack = feedback(&mut receiver, ms(55))?;
+    sender.receive_at(&ack, ms(100), ms(100))?;
+    assert_eq!(sender.statistics().feedback_received, 1);
+    sender
+        .poll_source(ms(160), &mut bytes)?
+        .ok_or("only retry")?;
+    let retry = sender
+        .pending_transmission(SourceId(0))
+        .ok_or("retry custody")?;
+    sender.confirm_transmission_at(ms(500), ms(170), retry)?;
+    assert_eq!(sender.retry_failure_snapshot(), None);
+    assert_eq!(
+        sender.poll_source(ms(501), &mut bytes),
+        Err(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        })
+    );
+    let snapshot = sender
+        .retry_failure_snapshot()
+        .ok_or("exact failed owner")?;
+    assert_eq!(
+        (snapshot.failed_at, snapshot.last_successful_at),
+        (ms(501), ms(500))
+    );
+    assert_eq!(
+        (
+            snapshot.source,
+            snapshot.attempts,
+            snapshot.maximum_attempts,
+            snapshot.source_bytes
+        ),
+        (SourceId(0), 2, 2, 4)
+    );
+    assert_eq!(
+        (
+            snapshot.attempt_serial,
+            snapshot.prepared_at,
+            snapshot.accepted_at
+        ),
+        (3, ms(160), Some(ms(170)))
+    );
+    assert_eq!(snapshot.retry_at, ms(170).checked_add(snapshot.attempt_rto));
+    assert!(!snapshot.fast && !snapshot.physical_pending && !snapshot.acknowledged);
+    assert_eq!(
+        (
+            snapshot.send_base,
+            snapshot.next_source,
+            snapshot.retained.send_records
+        ),
+        (0, 2, 1)
+    );
+    assert_eq!(snapshot.maximum_peer_feedback_serial, 1);
+    assert_eq!(
+        snapshot.last_peer_feedback,
+        Some(CompactPeerFeedbackSnapshot {
+            arrival: ms(100),
+            prefix: 0,
+            start: 0,
+            count: 2,
+            echo: 2,
+            receiver_delay_us: 5000,
+            serial: 1,
+        })
+    );
+    assert_eq!(
+        (
+            snapshot.statistics.transmissions,
+            snapshot.statistics.retransmissions
+        ),
+        (3, 1)
+    );
+    assert_eq!(snapshot.statistics.feedback_received, 1);
+    assert_eq!(sender.storage_usage(), usage);
+    assert_eq!(
+        sender.poll_source(ms(2000), &mut bytes),
+        Err(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        })
+    );
+    assert_eq!(sender.retry_failure_snapshot(), Some(snapshot));
+    Ok(())
+}
+
+#[test]
+fn retry_failure_snapshot_distinguishes_fast_limit_before_armed_timeout() -> Result {
+    let original = config(CompactRecovery::FirstFlight, 16, 64, 78)?;
+    let policy = CompactArqConfig::new(
+        original.bounds(),
+        original.timing(),
+        original.maximum_feedback_bytes(),
+        original.history_entries(),
+        1,
+        original.recovery(),
+    )?;
+    let mut sender = CompactRepeat::new(policy, context(EndpointRole::Initiator))?;
+    let mut receiver = CompactRepeat::new(policy, context(EndpointRole::Responder))?;
+    let mut packets = Vec::new();
+    for byte in 0..4 {
+        packets.push(emit(&mut sender, ms(0), ms(0), &[byte])?);
+    }
+    for packet in &packets[1..] {
+        receiver.receive(packet, ms(30))?;
+    }
+    // Independent prepared custody may still be settled after this owner fails.
+    sender.submit(b"held", ms(0))?;
+    let mut bytes = [0; 128];
+    sender
+        .poll_source(ms(0), &mut bytes)?
+        .ok_or("held attempt")?;
+    let held = sender
+        .pending_transmission(SourceId(4))
+        .ok_or("held custody")?;
+    let ack = feedback(&mut receiver, ms(35))?;
+    sender.receive_at(&ack, ms(70), ms(70))?;
+    assert_eq!(
+        sender.poll_source(ms(70), &mut bytes),
+        Err(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        })
+    );
+    let snapshot = sender.retry_failure_snapshot().ok_or("fast failed owner")?;
+    assert_eq!(
+        (
+            snapshot.failed_at,
+            snapshot.attempts,
+            snapshot.maximum_attempts
+        ),
+        (ms(70), 1, 1)
+    );
+    assert!(snapshot.fast);
+    assert!(
+        snapshot
+            .retry_at
+            .is_some_and(|deadline| deadline > snapshot.failed_at)
+    );
+    assert_eq!(
+        (
+            snapshot.statistics.transmissions,
+            snapshot.statistics.retransmissions
+        ),
+        (5, 0)
+    );
+    assert_eq!(
+        snapshot.last_peer_feedback.ok_or("applied feedback")?.count,
+        4
+    );
+    assert_eq!(
+        sender.confirm_transmission_at(ms(2000), ms(100), held),
+        Err(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        })
+    );
+    assert_eq!(sender.retry_failure_snapshot(), Some(snapshot));
+    Ok(())
+}

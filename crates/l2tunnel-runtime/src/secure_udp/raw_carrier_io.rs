@@ -344,6 +344,7 @@ pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     bootstrap_geometry: raw::RecordGeometry,
     prepared: Option<(PairLane, FinalOutputToken)>,
     control_cursor: usize,
+    input_cursor: usize,
     addresses: (SocketAddr, SocketAddr),
     lanes: usize,
     client: bool,
@@ -447,12 +448,13 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         let client = carrier.info().is_client;
         let control_bytes = buffer(plan.maximum)?;
         let input_bytes = buffer(plan.maximum)?;
-        let result = Self {
+        let mut result = Self {
             carrier,
             geometry,
             bootstrap_geometry: geometry,
             prepared: None,
             control_cursor: 0,
+            input_cursor: 0,
             addresses,
             lanes,
             client,
@@ -467,6 +469,14 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         };
         if result.capacity_bytes()? != plan.capacity_bytes() {
             return Err(protocol("raw adapter capacity differs"));
+        }
+        // Diagnostic backing is separate from unchanged protocol quotas and is
+        // reported per lane; only actual inner PacketIo edges update durations.
+        if std::env::var_os("L2TUNNEL_BUFFER_METRICS")
+            .or_else(|| std::env::var_os("L2TUNNEL_WIRE_METRICS"))
+            .is_some()
+        {
+            result.carrier.enable_send_timing().map_err(raw_error)?;
         }
         Ok(result)
     }
@@ -625,6 +635,47 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         }
         Ok(completed)
     }
+    // Promote only existing bounded custody. This never polls PacketIo or
+    // resets its per-turn allowance; the caller still owns its receive budget.
+    fn promote_input(&mut self) -> io::Result<()> {
+        if self.input.is_none()
+            && self.failure.is_none()
+            && let Some(record) = self.carrier.record()
+        {
+            let target = self
+                .input_bytes
+                .get_mut(..record.bytes.len())
+                .ok_or_else(|| protocol("raw incoming capacity differs"))?;
+            target.copy_from_slice(&record.bytes);
+            let input = Input {
+                bytes: record.bytes.len(),
+                received: record.received_at,
+                final_metadata: None,
+            };
+            self.carrier.consume_record().map_err(raw_error)?;
+            self.input = Some(input);
+        }
+        if self.input.is_none() && self.failure.is_none() && self.carrier.final_records_enabled() {
+            for offset in 0..self.lanes {
+                let index = (self.input_cursor + offset) % self.lanes;
+                let lane = [PairLane::First, PairLane::Second][index];
+                if let Some(candidate) = self.carrier.final_input(lane).map_err(raw_error)? {
+                    let bytes = candidate.bytes();
+                    self.input_bytes
+                        .get_mut(..bytes.len())
+                        .ok_or_else(|| protocol("raw final incoming capacity"))?
+                        .copy_from_slice(bytes);
+                    self.input = Some(Input {
+                        bytes: bytes.len(),
+                        received: candidate.received_at(),
+                        final_metadata: Some((lane, candidate.metadata())),
+                    });
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
     fn progress(&mut self, cx: &mut Context<'_>, receive: bool) -> io::Result<bool> {
         if !self.polled && self.failure.is_none() {
             self.polled = true;
@@ -649,47 +700,8 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             }
         }
         let mut ready = self.collect_receipts()?;
-        if self.input.is_none()
-            && receive
-            && self.failure.is_none()
-            && let Some(record) = self.carrier.record()
-        {
-            let target = self
-                .input_bytes
-                .get_mut(..record.bytes.len())
-                .ok_or_else(|| protocol("raw incoming capacity differs"))?;
-            target.copy_from_slice(&record.bytes);
-            let input = Input {
-                bytes: record.bytes.len(),
-                received: record.received_at,
-                final_metadata: None,
-            };
-            self.carrier.consume_record().map_err(raw_error)?;
-            self.input = Some(input);
-        }
-        if self.input.is_none()
-            && receive
-            && self.failure.is_none()
-            && self.carrier.final_records_enabled()
-        {
-            for lane in [PairLane::First, PairLane::Second]
-                .into_iter()
-                .take(self.lanes)
-            {
-                if let Some(candidate) = self.carrier.final_input(lane).map_err(raw_error)? {
-                    let bytes = candidate.bytes();
-                    self.input_bytes
-                        .get_mut(..bytes.len())
-                        .ok_or_else(|| protocol("raw final incoming capacity"))?
-                        .copy_from_slice(bytes);
-                    self.input = Some(Input {
-                        bytes: bytes.len(),
-                        received: candidate.received_at(),
-                        final_metadata: Some((lane, candidate.metadata())),
-                    });
-                    break;
-                }
-            }
+        if receive {
+            self.promote_input()?;
         }
         ready |= self
             .user
@@ -768,6 +780,10 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .commit_final_input(lane, metadata, verdict)
             .map_err(raw_error);
         self.input = None;
+        if result.is_ok() {
+            // A consumed verifier rejection advances an opportunity, not authority.
+            self.input_cursor = (usize::from(lane_number(lane)) + 1) % self.lanes;
+        }
         result
     }
     fn prepare_final(
@@ -1058,6 +1074,7 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
         Ok(None)
     }
     fn try_receive(&mut self, output: &mut [u8]) -> io::Result<(usize, Instant)> {
+        self.promote_input()?;
         let input = self.input.as_ref().ok_or(io::ErrorKind::WouldBlock)?;
         let target = output
             .get_mut(..input.bytes)

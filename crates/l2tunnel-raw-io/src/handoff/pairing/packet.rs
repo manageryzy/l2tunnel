@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 /// Explicit final Records framing over the same original raw owners.
 pub mod compact;
 mod diagnostics;
+mod send_timing;
+pub use send_timing::{SendTimingSnapshot, SendTimingTotal};
 mod gate;
 mod transaction;
 pub use diagnostics::{

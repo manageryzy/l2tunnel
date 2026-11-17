@@ -588,6 +588,7 @@ pub(super) struct GateIo<I: PacketIo> {
     pending: Option<([u8; 32], usize)>,
     pub last_send_at: Option<Instant>,
     pub send_observations: SendIoSnapshot,
+    pub send_timing: Vec<super::send_timing::SendTiming>,
 }
 impl<I: PacketIo> GateIo<I> {
     pub fn new(io: I, state: GateState, budget: SharedBudget) -> Self {
@@ -598,6 +599,7 @@ impl<I: PacketIo> GateIo<I> {
             pending: None,
             last_send_at: None,
             send_observations: SendIoSnapshot::default(),
+            send_timing: Vec::new(),
         }
     }
     pub fn original(self) -> I {
@@ -618,8 +620,11 @@ impl<I: PacketIo> GateIo<I> {
         Ok(())
     }
     pub fn cancel_pending(&mut self) {
-        self.pending = None;
+        let retained = self.pending.take().is_some();
         self.send_observations.cancel();
+        if retained && let Some(timing) = self.send_timing.first_mut() {
+            timing.cancelled(Instant::now());
+        }
     }
     pub fn pending(&self) -> bool {
         self.pending.is_some()
@@ -738,7 +743,11 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
         match self.io.send(bytes) {
             Ok(()) => {
                 self.send_observations.success();
-                self.last_send_at = Some(Instant::now());
+                let accepted_at = Instant::now();
+                self.last_send_at = Some(accepted_at);
+                if let Some(timing) = self.send_timing.first_mut() {
+                    timing.accepted(accepted_at);
+                }
                 self.pending = None;
                 let mut state = lock(&self.state).map_err(io::Error::other)?;
                 state.sent_packets = sent.0;
@@ -763,6 +772,9 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     self.send_observations.would_block();
+                    if let Some(timing) = self.send_timing.first_mut() {
+                        timing.blocked(Instant::now());
+                    }
                 }
                 Err(e)
             }

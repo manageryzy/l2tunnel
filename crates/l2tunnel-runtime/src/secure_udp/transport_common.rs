@@ -543,7 +543,7 @@ impl Driver {
         use crate::initialization_timing::{
             Outcome as TimingOutcome, Owner as TimingOwner, Stage as TimingStage, Timing,
         };
-        let mut timing = Timing::from_environment(TimingOwner::CommonConstruction, origin);
+        let mut timing = Timing::from_environment(TimingOwner::CommonConstruction, Instant::now());
         timing.enter_at(TimingStage::ContractAndRecords, Instant::now());
         if Instant::now() >= input.deadline || origin >= input.deadline {
             return Err(io::Error::new(

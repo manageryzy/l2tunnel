@@ -252,6 +252,9 @@ impl<E: fmt::Display> fmt::Display for CompactPollError<E> {
 }
 impl<E: std::error::Error + 'static> std::error::Error for CompactPollError<E> {}
 
+mod diagnostics;
+pub use diagnostics::{CompactPeerFeedbackSnapshot, CompactRetryFailureSnapshot};
+
 mod body;
 pub use body::{
     COMPACT_BODY_DATA_MAX_HEADER_BYTES, COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES,
@@ -296,6 +299,8 @@ pub(crate) struct State {
     highest_received: Option<u64>,
     feedback_serial: u64,
     received_feedback_serial: u64,
+    last_peer_feedback: Option<CompactPeerFeedbackSnapshot>,
+    retry_failure: Option<CompactRetryFailureSnapshot>,
     bitmap_cursor: u64,
     feedback_events: usize,
     feedback_repeats: u8,
@@ -455,6 +460,8 @@ impl CompactRepeat {
             highest_received: None,
             feedback_serial: 0,
             received_feedback_serial: 0,
+            last_peer_feedback: None,
+            retry_failure: None,
             bitmap_cursor: 0,
             feedback_events: 0,
             feedback_repeats: 0,
@@ -1098,6 +1105,15 @@ impl Engine {
                 }
             }
         }
+        state.last_peer_feedback = Some(CompactPeerFeedbackSnapshot {
+            arrival,
+            prefix: feedback.prefix,
+            start: feedback.start,
+            count: feedback.count,
+            echo: feedback.echo,
+            receiver_delay_us: feedback.receiver_delay_us,
+            serial: feedback.serial,
+        });
         self.statistics.feedback_received = self.statistics.feedback_received.saturating_add(1);
         Ok(())
     }
@@ -1249,6 +1265,7 @@ impl Engine {
                     .ok_or(RecoveryError::MalformedPacket)?;
                 if flight.attempts >= state.send.maximum_attempts {
                     let error = RecoveryError::RetryExhausted { source };
+                    self.note_compact_retry_failure(source, now);
                     self.failure = Some(error);
                     return Err(error);
                 }
@@ -1355,6 +1372,7 @@ impl Engine {
             .ok_or(RecoveryError::MalformedPacket)?;
         if flight.attempts >= state.send.maximum_attempts {
             let error = RecoveryError::RetryExhausted { source };
+            self.note_compact_retry_failure(source, now);
             self.failure = Some(error);
             return Err(error.into());
         }

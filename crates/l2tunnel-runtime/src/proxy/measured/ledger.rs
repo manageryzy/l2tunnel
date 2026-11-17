@@ -263,6 +263,38 @@ impl Ledger {
     }
     /// Import exact local facts before expiry processing, without releasing any
     /// Flight/token or advancing semantic flush. Includes every Data ordinal.
+    pub(in crate::proxy) fn physical_observed(&self) -> u64 {
+        self.physical_observed
+    }
+    pub(in crate::proxy) fn visit_timing_pending(
+        &self,
+        origin: Instant,
+        at: Instant,
+        censored: bool,
+        observe: &mut dyn FnMut(crate::proxy::timing::Event),
+    ) {
+        for entry in self.entries.iter().flatten() {
+            let Some(admitted) =
+                origin.checked_add(std::time::Duration::from_micros(entry.admitted.0))
+            else {
+                observe(crate::proxy::timing::Event::Invalid);
+                continue;
+            };
+            observe(if censored {
+                crate::proxy::timing::Event::Censored {
+                    admitted,
+                    physical: entry.physical,
+                    at,
+                }
+            } else {
+                crate::proxy::timing::Event::GateCandidate {
+                    admitted,
+                    physical: entry.physical,
+                    at,
+                }
+            });
+        }
+    }
     pub fn observe_physical(
         &mut self,
         count: u64,

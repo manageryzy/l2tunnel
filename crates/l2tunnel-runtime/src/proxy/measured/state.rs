@@ -59,6 +59,8 @@ pub struct Snapshot {
     /// At most configured N lifetime rows, including tombstones.
     pub flows: Vec<FlowSnapshot>,
 }
+type CallbackDiagnostic<'a> = (Instant, &'a mut dyn FnMut(crate::proxy::timing::Event));
+
 pub(in crate::proxy) struct State {
     pub config: Config,
     pub controller: measurement::Controller,
@@ -150,6 +152,49 @@ impl State {
         self.ledger
             .observe_physical(count, receipts, origin, observed)
     }
+    pub(in crate::proxy) fn observe_physical_diagnosed(
+        &mut self,
+        count: u64,
+        receipts: [Option<PhysicalWrite>; PHYSICAL_SLOTS],
+        origin: Instant,
+        observed: Instant,
+        terminal: bool,
+        mut observe: impl FnMut(crate::proxy::timing::Event),
+    ) -> io::Result<()> {
+        let before = self.ledger.physical_observed();
+        self.observe_physical(count, receipts, origin, observed)?;
+        let at = Instant::now();
+        for receipt in receipts.into_iter().flatten() {
+            if receipt.ordinal.is_some_and(|n| n > before && n <= count) {
+                observe(crate::proxy::timing::Event::Imported {
+                    receipt,
+                    at,
+                    terminal,
+                });
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::proxy) fn callbacks_physical_diagnosed(
+        &mut self,
+        table: &session::Table,
+        count: u64,
+        origin: Instant,
+        observed: Instant,
+        mut observe: impl FnMut(crate::proxy::timing::Event),
+    ) -> io::Result<()> {
+        let elapsed = observed
+            .checked_duration_since(origin)
+            .ok_or_else(|| invalid("measured callback clock regressed"))?;
+        let now = Micros(u64::try_from(elapsed.as_micros()).map_err(io::Error::other)?);
+        self.callbacks_inner(
+            table,
+            count,
+            now,
+            Some(observed),
+            Some((origin, &mut observe)),
+        )
+    }
     pub fn callbacks_physical(
         &mut self,
         table: &session::Table,
@@ -161,10 +206,10 @@ impl State {
             .checked_duration_since(origin)
             .ok_or_else(|| invalid("measured callback clock regressed"))?;
         let now = Micros(u64::try_from(elapsed.as_micros()).map_err(io::Error::other)?);
-        self.callbacks_inner(table, count, now, Some(observed))
+        self.callbacks_inner(table, count, now, Some(observed), None)
     }
     pub fn callbacks(&mut self, table: &session::Table, count: u64, now: Micros) -> io::Result<()> {
-        self.callbacks_inner(table, count, now, None)
+        self.callbacks_inner(table, count, now, None, None)
     }
     fn callbacks_inner(
         &mut self,
@@ -172,9 +217,21 @@ impl State {
         count: u64,
         now: Micros,
         observed: Option<Instant>,
+        mut diagnostic: Option<CallbackDiagnostic<'_>>,
     ) -> io::Result<()> {
         // Deadline validation must precede any release, even for already flushed bytes.
-        self.controller.tick(table, now).map_err(io::Error::other)?;
+        if let (Some(at), Some((origin, observe))) = (observed, diagnostic.as_mut()) {
+            observe(crate::proxy::timing::Event::Gate { at });
+            self.ledger
+                .visit_timing_pending(*origin, at, false, *observe);
+        }
+        let gate = self.controller.tick(table, now);
+        if gate.is_err()
+            && let Some((_, observe)) = diagnostic.as_mut()
+        {
+            observe(crate::proxy::timing::Event::GateFailed);
+        }
+        gate.map_err(io::Error::other)?;
         self.ledger.observe_flushed(count)?;
         for _ in 0..self.config.service.callback_work_per_turn {
             let Some(next) = self.ledger.next_completed() else {
@@ -193,6 +250,12 @@ impl State {
             if let Some(physical) = next.physical {
                 let callback =
                     observed.ok_or_else(|| invalid("physical callback watermark missing"))?;
+                if let Some((_, observe)) = diagnostic.as_mut() {
+                    observe(crate::proxy::timing::Event::Callback {
+                        receipt: physical,
+                        at: callback,
+                    });
+                }
                 self.physical_callbacks[((next.ordinal - 1) % PHYSICAL_SLOTS as u64) as usize] =
                     Some(PhysicalCallback {
                         token: next.token,

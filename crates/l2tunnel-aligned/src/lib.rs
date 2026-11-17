@@ -1126,6 +1126,12 @@ impl Endpoint {
     pub fn statistics(&self) -> l2tunnel_reliable::Statistics {
         self.recovery.statistics()
     }
+    /// Exact failed shared CompactARQ owner, without polling or time changes.
+    pub fn compact_retry_failure_snapshot(
+        &self,
+    ) -> Option<l2tunnel_recovery::CompactRetryFailureSnapshot> {
+        self.recovery.compact_retry_failure_snapshot()
+    }
     /// Actual ARQ timeout and source ownership counters.
     pub fn arq_statistics(&self) -> l2tunnel_recovery::Statistics {
         self.recovery.arq_statistics()

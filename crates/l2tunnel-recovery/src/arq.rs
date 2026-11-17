@@ -13,9 +13,9 @@ use backing::{Received, Sent};
 pub use compact::{
     COMPACT_BODY_DATA_MAX_HEADER_BYTES, COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES,
     COMPACT_DATA_HEADER_BYTES, COMPACT_FEEDBACK_HEADER_BYTES, CompactArqConfig, CompactBounds,
-    CompactFeedback, CompactPacketKind, CompactPacketView, CompactPollError, CompactRecovery,
-    CompactRepeat, CompactTiming, CompactTimingSnapshot, inspect_compact_body,
-    inspect_compact_packet,
+    CompactFeedback, CompactPacketKind, CompactPacketView, CompactPeerFeedbackSnapshot,
+    CompactPollError, CompactRecovery, CompactRepeat, CompactRetryFailureSnapshot, CompactTiming,
+    CompactTimingSnapshot, inspect_compact_body, inspect_compact_packet,
 };
 pub(crate) use compact::{History as CompactHistory, Meta as CompactMeta, State as CompactState};
 

@@ -409,6 +409,21 @@ where
                 .control
                 .write_failure_snapshot(duration(observed), &mut io::stderr().lock());
         }
+        // At most two actual retained shared epochs; no payload or per-packet log.
+        if let Ok(state) = driver.common_state() {
+            for epoch in driver.common_epochs().into_iter().flatten() {
+                if let Ok(engine) = state.engine(epoch)
+                    && let Some(snapshot) = engine.compact_retry_failure_snapshot()
+                {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "Common CompactARQ retry failure: role={:?} epoch={} snapshot={snapshot:?}",
+                        driver.role(),
+                        epoch.0,
+                    );
+                }
+            }
+        }
     }
     let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {

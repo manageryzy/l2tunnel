@@ -96,6 +96,7 @@ struct Receipts {
     completed: Option<PhysicalWrite>,
 }
 struct State {
+    timing: super::timing::Observer,
     receipts: Option<Receipts>,
     retirement: Option<Retirement>,
     generation: u64,
@@ -128,8 +129,54 @@ impl State {
 
 /// One retained outgoing slot shared with Common's physical completion owner.
 #[derive(Clone)]
-pub(crate) struct Bridge(Arc<Mutex<State>>);
+pub(crate) struct Bridge(Arc<Mutex<State>>, bool);
 impl Bridge {
+    pub(crate) fn timing_enabled(&self) -> bool {
+        self.1
+    }
+    pub(crate) fn timing_event(&self, event: super::timing::Event) {
+        if self.1
+            && let Ok(mut state) = self.0.lock()
+        {
+            state.timing.event(event);
+        }
+    }
+    pub(crate) fn timing_enter(&self, stage: super::timing::Stage, now: Instant) {
+        if self.1
+            && let Ok(mut state) = self.0.lock()
+        {
+            state.timing.enter(stage, now);
+        }
+    }
+    pub(crate) fn timing_finish(&self, now: Instant) {
+        if self.1
+            && let Ok(mut state) = self.0.lock()
+        {
+            state.timing.finish(now);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn timing_for_test(
+        &mut self,
+        origin: Instant,
+        path: std::path::PathBuf,
+    ) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("test Bridge lock"))?
+            .timing = super::timing::Observer::for_test(origin, path)?;
+        self.1 = true;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn timing_json(&self) -> io::Result<Vec<u8>> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("test Bridge lock"))?
+            .timing
+            .test_json()
+    }
+
     /// Actual single Bridge metadata owner, including Pending and both optional
     /// receipt/retirement states once. Arc bookkeeping and allocator overhead are
     /// outside this component extent; no payload storage or extra queue is added.
@@ -215,6 +262,9 @@ impl Bridge {
                 .checked_sub(receipts.acknowledged_users)
                 .ok_or_else(|| io::Error::other("Common receipt watermark"))?;
             if held >= 2 {
+                if state.timing.enabled() {
+                    state.timing.receipt_refused(held, Instant::now());
+                }
                 state.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
@@ -272,6 +322,10 @@ impl Bridge {
             return Err(state.fail(io::ErrorKind::InvalidData, "Common receipt acknowledgement"));
         }
         receipts.acknowledged_users = count;
+        let held = receipts.written_users - receipts.acknowledged_users;
+        if state.timing.enabled() {
+            state.timing.receipt_cleared(held, Instant::now());
+        }
         if let Some(waker) = state.writer.take() {
             waker.wake();
         }
@@ -754,6 +808,7 @@ impl Bridge {
                 receipts.physical_users = ordinal;
             }
         }
+        state.timing.event(super::timing::Event::Whole(physical));
         if let Some(failure) = original_failure {
             return Err(failure.error());
         }
@@ -895,29 +950,35 @@ fn pair_selected(
             "proxy Common bridge bounds",
         ));
     }
+    let timing = super::timing::Observer::from_environment();
+    let timing_enabled = timing.enabled();
     let (port, stream) = UnixDatagram::pair()?;
     port.set_nonblocking(true)?;
     stream.set_nonblocking(true)?;
-    let bridge = Bridge(Arc::new(Mutex::new(State {
-        receipts: None,
-        retirement: retained.then_some(Retirement {
-            cap: None,
-            identity: None,
-            source: None,
-            physical: false,
-            confirmed: false,
-            peer_eof: false,
-            actor_joined: false,
-            liveness_quiesced: false,
-            retired: false,
-            waiter: None,
-        }),
-        generation: 0,
-        pending: None,
-        failure: None,
-        reader: None,
-        writer: None,
-    })));
+    let bridge = Bridge(
+        Arc::new(Mutex::new(State {
+            timing,
+            receipts: None,
+            retirement: retained.then_some(Retirement {
+                cap: None,
+                identity: None,
+                source: None,
+                physical: false,
+                confirmed: false,
+                peer_eof: false,
+                actor_joined: false,
+                liveness_quiesced: false,
+                retired: false,
+                waiter: None,
+            }),
+            generation: 0,
+            pending: None,
+            failure: None,
+            reader: None,
+            writer: None,
+        })),
+        timing_enabled,
+    );
     Ok((
         RecordPort {
             socket: port,

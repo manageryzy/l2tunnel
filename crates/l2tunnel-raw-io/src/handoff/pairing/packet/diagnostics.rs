@@ -217,6 +217,10 @@ pub struct LaneBufferSnapshot {
     pub prepare: [PrepareSnapshot; 4],
     /// Actual PacketIo and separate local scheduling observations.
     pub send_io: SendIoSnapshot,
+    /// Exact actual PacketIo edge timing when explicitly enabled; otherwise unmeasured.
+    pub send_timing: Option<super::SendTimingSnapshot>,
+    /// Actual optional timing-cell backing, diagnostic memory outside protocol quotas.
+    pub send_timing_capacity_bytes: usize,
 }
 
 /// Snapshot does no I/O and grants no replay, credit, delivery or liveness authority.

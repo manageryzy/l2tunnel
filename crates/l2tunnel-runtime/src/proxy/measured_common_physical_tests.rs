@@ -218,13 +218,18 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
     };
     let WriterHarness {
         mut port,
-        bridge,
+        mut bridge,
         tx,
         progress,
         task,
         controls: _controls,
         events: _events,
     } = start(actual_start).await?;
+    let diagnostic_path = std::env::temp_dir().join(format!(
+        "proxy-physical-coalesced-{}.bmetrics",
+        std::process::id()
+    ));
+    bridge.timing_for_test(origin, diagnostic_path.clone())?;
     let at = micros(origin)?;
     let (first, first_token, first_bytes) = admit(
         &mut state,
@@ -257,20 +262,34 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
     let mut blocked = Box::pin(bridge.prepare_user_receipt(3));
     assert!(once(blocked.as_mut()).is_pending());
     drop(blocked);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let mut blocked = Box::pin(bridge.prepare_user_receipt(3));
+    assert!(once(blocked.as_mut()).is_pending());
+    drop(blocked);
     assert_eq!(state.ledger.counts(), (0, 2));
     let mut wrong = coalesced.physical;
     wrong[1].as_mut().ok_or("second actual fact")?.ordinal = Some(1);
     assert!(
         state
-            .observe_physical(2, wrong, origin, Instant::now())
+            .observe_physical_diagnosed(2, wrong, origin, Instant::now(), false, |event| bridge
+                .timing_event(event))
             .is_err()
     );
     assert!(
         state.ledger.retained_physical(first)?.is_none(),
         "all facts preflight atomically"
     );
-    state.observe_physical(2, coalesced.physical, origin, Instant::now())?;
-    state.callbacks_physical(&lab.a.actor.table, 2, origin, Instant::now())?;
+    state.observe_physical_diagnosed(
+        2,
+        coalesced.physical,
+        origin,
+        Instant::now(),
+        false,
+        |event| bridge.timing_event(event),
+    )?;
+    state.callbacks_physical_diagnosed(&lab.a.actor.table, 2, origin, Instant::now(), |event| {
+        bridge.timing_event(event)
+    })?;
     bridge.acknowledge_user_receipts(2)?;
     assert_eq!(state.ledger.counts(), (0, 1));
     assert_eq!(
@@ -345,8 +364,17 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
     completed(&mut port, &bridge, 4).await?;
     let four = completed(&mut port, &bridge, 5).await?;
     let coalesced = users(&progress, 4).await?;
-    state.observe_physical(4, coalesced.physical, origin, Instant::now())?;
-    state.callbacks_physical(&lab.a.actor.table, 4, origin, Instant::now())?;
+    state.observe_physical_diagnosed(
+        4,
+        coalesced.physical,
+        origin,
+        Instant::now(),
+        false,
+        |event| bridge.timing_event(event),
+    )?;
+    state.callbacks_physical_diagnosed(&lab.a.actor.table, 4, origin, Instant::now(), |event| {
+        bridge.timing_event(event)
+    })?;
     bridge.acknowledge_user_receipts(4)?;
     let snapshot = state.snapshot(&lab.a.actor.table, micros(origin)?)?;
     let second_view = snapshot
@@ -358,8 +386,17 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
     assert_eq!(second_view.token, second_token);
     assert_eq!(second_view.accepted_at, two.accepted_at);
     assert_eq!(state.ledger.counts(), (0, 1));
-    state.observe_physical(4, coalesced.physical, origin, Instant::now())?;
-    state.callbacks_physical(&lab.a.actor.table, 4, origin, Instant::now())?;
+    state.observe_physical_diagnosed(
+        4,
+        coalesced.physical,
+        origin,
+        Instant::now(),
+        false,
+        |event| bridge.timing_event(event),
+    )?;
+    state.callbacks_physical_diagnosed(&lab.a.actor.table, 4, origin, Instant::now(), |event| {
+        bridge.timing_event(event)
+    })?;
     assert_eq!(state.ledger.counts(), (0, 0));
     let snapshot = state.snapshot(&lab.a.actor.table, micros(origin)?)?;
     let third_view = snapshot
@@ -372,16 +409,54 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
     assert_eq!(third_view.accepted_at, four.accepted_at);
     assert!(third_view.callback_observed_at >= third_view.physical_observed_at);
     let callbacks = snapshot.physical_callbacks;
-    state.observe_physical(4, coalesced.physical, origin, Instant::now())?;
-    state.callbacks_physical(&lab.a.actor.table, 4, origin, Instant::now())?;
+    state.observe_physical_diagnosed(
+        4,
+        coalesced.physical,
+        origin,
+        Instant::now(),
+        false,
+        |event| bridge.timing_event(event),
+    )?;
+    state.callbacks_physical_diagnosed(&lab.a.actor.table, 4, origin, Instant::now(), |event| {
+        bridge.timing_event(event)
+    })?;
     assert_eq!(
         state
             .snapshot(&lab.a.actor.table, micros(origin)?)?
             .physical_callbacks,
         callbacks
     );
+    bridge.timing_finish(Instant::now());
+    let diagnostic: serde_json::Value = serde_json::from_slice(&bridge.timing_json()?)?;
+    assert_eq!(diagnostic["invalid"], false);
+    assert_eq!(
+        diagnostic["durations"]["whole_accept_to_common_observe"]["samples"],
+        4
+    );
+    assert_eq!(
+        diagnostic["durations"]["whole_common_observe_to_live_import"]["samples"], 4,
+        "coalesced and repeated watch reads do not duplicate validated imports"
+    );
+    assert_eq!(
+        diagnostic["durations"]["measured_accept_to_successful_callback"]["samples"], 3,
+        "transparent native writes are not measured-controller callbacks"
+    );
+    assert_eq!(diagnostic["receipt_ring"]["refusals"], 2);
+    assert_eq!(diagnostic["receipt_ring"]["cleared"]["samples"], 1);
+    assert!(
+        diagnostic["receipt_ring"]["cleared"]["sum_us"]
+            .as_u64()
+            .ok_or("duration")?
+            >= 1000
+    );
     task.abort();
     let _ = task.await;
+    drop(port);
+    drop(bridge);
+    let exported: serde_json::Value = serde_json::from_slice(&std::fs::read(&diagnostic_path)?)?;
+    assert_eq!(exported["owner"], "proxy_bridge");
+    assert_eq!(exported["proxy"], diagnostic);
+    std::fs::remove_file(diagnostic_path)?;
     Ok(())
 }
 
@@ -541,13 +616,18 @@ async fn measured_common_exact_physical_fact_survives_original_callback_and_brid
     };
     let WriterHarness {
         mut port,
-        bridge,
+        mut bridge,
         tx,
         progress,
         task,
         controls: _controls,
         events: _events,
     } = start(actual_start).await?;
+    let diagnostic_path = std::env::temp_dir().join(format!(
+        "proxy-physical-expired-{}.bmetrics",
+        std::process::id()
+    ));
+    bridge.timing_for_test(origin, diagnostic_path.clone())?;
     let at = micros(origin)?;
     let (id, _token, bytes) = admit(
         &mut state,
@@ -602,7 +682,9 @@ async fn measured_common_exact_physical_fact_survives_original_callback_and_brid
         .ok_or("retained actual measured owner")?;
     assert!(
         state
-            .callbacks_physical(&lab.a.actor.table, 1, origin, Instant::now())
+            .callbacks_physical_diagnosed(&lab.a.actor.table, 1, origin, Instant::now(), |event| {
+                bridge.timing_event(event)
+            })
             .is_err()
     );
     assert_eq!(state.ledger.counts(), (0, 1));
@@ -625,7 +707,25 @@ async fn measured_common_exact_physical_fact_survives_original_callback_and_brid
             .iter()
             .all(Option::is_none)
     );
+    lab.a.actor.timing_finish(Instant::now());
+    let diagnostic: serde_json::Value = serde_json::from_slice(&bridge.timing_json()?)?;
+    assert_eq!(diagnostic["invalid"], false);
+    assert_eq!(diagnostic["terminal_ledger_observed"], true);
+    assert_eq!(diagnostic["failed_gates"], 1);
+    assert_eq!(
+        diagnostic["durations"]["whole_common_observe_to_terminal_import"]["samples"],
+        1
+    );
+    assert_eq!(
+        diagnostic["durations"]["measured_accept_to_successful_callback"]["samples"],
+        0
+    );
+    assert_eq!(diagnostic["censored_with_physical"], 1);
     let _ = task.await;
+    drop(lab);
+    drop(port);
+    drop(bridge);
+    std::fs::remove_file(diagnostic_path)?;
 
     let (mut port, mut stream, bridge) =
         common_bridge::pair_retained(128, Duration::from_millis(10))?;

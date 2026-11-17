@@ -22,6 +22,7 @@ mod config;
 /// Client selection and native advertised-window qualification are separate gates.
 pub mod measured;
 mod record;
+pub(crate) mod timing;
 #[path = "proxy/io.rs"]
 mod transport;
 mod wire;

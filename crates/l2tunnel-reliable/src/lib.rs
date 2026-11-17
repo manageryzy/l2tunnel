@@ -1356,6 +1356,12 @@ impl Reliable {
     pub fn statistics(&self) -> Statistics {
         self.statistics
     }
+    /// Exact failed shared CompactARQ owner; legacy recovery returns None.
+    pub fn compact_retry_failure_snapshot(
+        &self,
+    ) -> Option<l2tunnel_recovery::CompactRetryFailureSnapshot> {
+        self.arq.compact().ok()?.retry_failure_snapshot()
+    }
     /// Underlying stable source/attempt/receipt statistics.
     pub fn arq_statistics(&self) -> ArqStatistics {
         self.arq.statistics()

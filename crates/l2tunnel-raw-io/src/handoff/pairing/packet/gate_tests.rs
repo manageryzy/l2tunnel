@@ -62,6 +62,10 @@ async fn send_diagnostics_separate_actual_packet_io_refusal_from_local_schedulin
     let policy = state.policy;
     let budget = Arc::new(Mutex::new(Budget::new(policy, Instant::now())));
     let mut gate = GateIo::new(TestIo { blocked: true }, state, budget.clone());
+    let origin = Instant::now();
+    gate.send_timing.try_reserve_exact(1)?;
+    gate.send_timing
+        .push(super::super::send_timing::SendTiming::new(origin, false));
     let mut bytes = vec![0; 45];
     packet::encode(
         raw(true, 0),
@@ -89,6 +93,16 @@ async fn send_diagnostics_separate_actual_packet_io_refusal_from_local_schedulin
     );
     assert_eq!(gate.send_observations.pacing_refusals, 1);
     assert_eq!(gate.send_observations.would_block_episodes, 0);
+    assert_eq!(
+        gate.send_timing[0]
+            .snapshot(Instant::now())
+            .would_block_observations,
+        0
+    );
+    assert_eq!(
+        gate.send_timing[0].snapshot(Instant::now()).open_micros,
+        None
+    );
     lock(&budget)?.byte_tokens = u64::from(policy.burst_bytes);
     for _ in 0..2 {
         assert_eq!(
@@ -100,13 +114,51 @@ async fn send_diagnostics_separate_actual_packet_io_refusal_from_local_schedulin
     assert_eq!(gate.send_observations.would_block_observations, 2);
     assert_eq!(gate.send_observations.would_block_episodes, 1);
     assert!(gate.send_observations.blocked);
+    tokio::time::advance(Duration::from_millis(10)).await;
+    lock(&budget)?.quota = 0;
+    assert_eq!(
+        gate.send(&bytes).err().ok_or("later quota refusal")?.kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        gate.send_timing[0].snapshot(Instant::now()).open_micros,
+        Some(10_000)
+    );
+    assert_eq!(
+        gate.send_timing[0]
+            .snapshot(Instant::now())
+            .would_block_observations,
+        2
+    );
+    lock(&budget)?.quota = 32;
+    tokio::time::advance(Duration::from_millis(5)).await;
     gate.io.blocked = false;
     gate.send(&bytes)?;
+    let timed = gate.send_timing[0].snapshot(Instant::now());
+    assert_eq!(
+        timed.completed,
+        SendTimingTotal {
+            episodes: 1,
+            micros: 15_000
+        }
+    );
+    assert_eq!(timed.open_micros, None);
     assert_eq!(gate.send_observations.resumed_episodes, 1);
     assert!(!gate.send_observations.blocked);
     gate.io.blocked = true;
     assert!(gate.send(&bytes).is_err());
+    tokio::time::advance(Duration::from_millis(4)).await;
     gate.cancel_pending();
+    gate.cancel_pending();
+    let timed = gate.send_timing[0].snapshot(Instant::now());
+    assert_eq!(
+        timed.cancelled,
+        SendTimingTotal {
+            episodes: 1,
+            micros: 4_000
+        }
+    );
+    assert_eq!(timed.completed.episodes, 1);
     assert_eq!(gate.send_observations.would_block_episodes, 2);
     assert_eq!(gate.send_observations.cancelled_episodes, 1);
     assert!(!gate.send_observations.blocked);

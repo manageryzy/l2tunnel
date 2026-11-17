@@ -966,6 +966,13 @@ impl Receiver {
         if self.last_time.is_some_and(|last| now < last) {
             return Err(Error::Time);
         }
+        // An accepted tick already checked every retained deadline. Insertions
+        // use this tick plus a strictly positive lifetime; removals cannot add
+        // earlier deadlines. Batch rollback restores time with the old ledger.
+        // Keep sticky failure and regression checks ahead of this fast path.
+        if self.last_time == Some(now) {
+            return Ok(());
+        }
         if self.records.iter().flatten().any(|e| now >= e.deadline)
             || self.proofs.iter().flatten().any(|p| now >= p.deadline)
         {

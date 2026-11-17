@@ -84,6 +84,13 @@ impl<I: PacketIo> Detached<I> {
             completed: self.completed.is_some(),
             prepare: self.prepare_observations,
             send_io: self.io.send_observations,
+            send_timing: self
+                .io
+                .send_timing
+                .first()
+                .map(|timing| timing.snapshot(now)),
+            send_timing_capacity_bytes: self.io.send_timing.capacity()
+                * std::mem::size_of::<super::send_timing::SendTiming>(),
         })
     }
     fn retirement_threshold(&self) -> Result<u64, Error> {
@@ -1120,6 +1127,41 @@ fn counter_digest(m: MessageStatus, b: BridgeProof) -> [u8; 32] {
 }
 
 impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
+    /// Enable exact per-lane PacketIo timing once on the actual ready owner.
+    /// All diagnostic backing is reserved before any lane is changed. This performs
+    /// no I/O, changes no transport quota and does not renew an existing deadline.
+    /// If a lane is already blocked, its earlier interval remains explicitly unknown.
+    pub fn enable_send_timing(&mut self) -> Result<(), Error> {
+        self.check()?;
+        if !self.ready
+            || self
+                .lanes
+                .iter()
+                .flatten()
+                .any(|lane| !lane.io.send_timing.is_empty())
+        {
+            return Err(Error::Configuration);
+        }
+        let mut cells = [Vec::new(), Vec::new()];
+        for (index, lane) in self.lanes.iter().enumerate() {
+            if lane.is_some() {
+                cells[index]
+                    .try_reserve_exact(1)
+                    .map_err(|_| Error::Capacity)?;
+            }
+        }
+        let now = Instant::now();
+        for (lane, mut cell) in self.lanes.iter_mut().zip(cells) {
+            if let Some(lane) = lane {
+                cell.push(super::send_timing::SendTiming::new(
+                    now,
+                    lane.io.send_observations.blocked,
+                ));
+                lane.io.send_timing = cell;
+            }
+        }
+        Ok(())
+    }
     /// Read only bounded scalar custody. Terminal observations are frozen before release.
     /// Missing/poisoned observations never replace the original transport failure.
     pub fn buffer_snapshot(&self, now: Instant) -> BufferSnapshot {
@@ -1473,7 +1515,13 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     fn fail(&mut self, e: Error) -> Error {
         let e = self.fault.get_or_insert(e).clone();
         if self.terminal_buffers.is_empty() {
-            let snapshot = self.buffer_snapshot(Instant::now());
+            let now = Instant::now();
+            for lane in self.lanes.iter_mut().flatten() {
+                if let Some(timing) = lane.io.send_timing.first_mut() {
+                    timing.terminal(now);
+                }
+            }
+            let snapshot = self.buffer_snapshot(now);
             self.terminal_buffers.push(snapshot);
         }
         for (saved, lane) in self.terminal_sent.iter_mut().zip(&mut self.lanes) {
@@ -1800,6 +1848,11 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     }
     /// Drop all originals without polling a TCP shutdown or claiming a clean close.
     pub fn abort(mut self) {
+        for lane in self.lanes.iter_mut().flatten() {
+            if let Some(timing) = lane.io.send_timing.first_mut() {
+                timing.terminal(Instant::now());
+            }
+        }
         self.lanes = [None, None];
         self.records.clear();
     }

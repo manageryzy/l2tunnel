@@ -91,7 +91,7 @@ impl Snapshot {
         optional(out, self.carrier_captured_at_us)?;
         write!(
             out,
-            ",\"capture_stage\":\"last_sample_before_common_terminal_settlement\",\"terminal_definition\":\"raw carrier released-state flag; a stopped Common loop can still have terminal false\",\"terminal\":{},\"unavailable_lanes\":{},\"timing\":\"raw refusal counts and PacketIo episodes are untimed; candidate ages are residence, not blocked intervals; terminal lane values retain their capture boundary\",\"counter_saturation\":\"u64::MAX is a saturated lower bound\",\"lanes\":[",
+            ",\"capture_stage\":\"last_sample_before_common_terminal_settlement\",\"terminal_definition\":\"raw carrier released-state flag; a stopped Common loop can still have terminal false\",\"terminal\":{},\"unavailable_lanes\":{},\"timing\":\"local quota/pacing and prepare refusals remain untimed; optional PacketIo timing uses synchronous actual inner-send edges, never periodic count reconstruction; lane intervals overlap and must not be summed; candidate ages are residence, not blocked intervals\",\"counter_saturation\":\"u64::MAX is a saturated lower bound\",\"lanes\":[",
             self.raw.carrier.terminal, self.raw.carrier.unavailable_lanes
         )?;
         for (index, lane) in self.raw.carrier.lanes.iter().enumerate() {
@@ -246,7 +246,7 @@ fn write_lane(
     let io = value.send_io;
     write!(
         out,
-        "],\"send_io\":{{\"turn_budget_refusals\":{},\"pacing_refusals\":{},\"packet_io_attempts\":{},\"would_block_observations\":{},\"would_block_episodes\":{},\"resumed_episodes\":{},\"cancelled_episodes\":{},\"blocked\":{},\"duration_us\":null}}}}",
+        "],\"send_io\":{{\"turn_budget_refusals\":{},\"pacing_refusals\":{},\"packet_io_attempts\":{},\"would_block_observations\":{},\"would_block_episodes\":{},\"resumed_episodes\":{},\"cancelled_episodes\":{},\"blocked\":{},\"duration_us\":null,\"timing\":",
         io.turn_budget_refusals,
         io.pacing_refusals,
         io.packet_io_attempts,
@@ -255,6 +255,42 @@ fn write_lane(
         io.resumed_episodes,
         io.cancelled_episodes,
         io.blocked
+    )?;
+    if let Some(timing) = value.send_timing {
+        write_send_timing(out, timing)?;
+    } else {
+        write!(out, "null")?;
+    }
+    write!(
+        out,
+        ",\"diagnostic_heap_bytes\":{}}}}}",
+        value.send_timing_capacity_bytes
+    )
+}
+
+fn write_send_timing(out: &mut impl Write, value: raw::SendTimingSnapshot) -> io::Result<()> {
+    write!(
+        out,
+        "{{\"observed_micros\":{},\"would_block_observations\":{},\"completed\":{{\"episodes\":{},\"micros\":{}}},\"cancelled\":{{\"episodes\":{},\"micros\":{}}},\"terminal\":{{\"episodes\":{},\"micros\":{}}},\"open_micros\":",
+        value.observed_micros,
+        value.would_block_observations,
+        value.completed.episodes,
+        value.completed.micros,
+        value.cancelled.episodes,
+        value.cancelled.micros,
+        value.terminal.episodes,
+        value.terminal.micros
+    )?;
+    optional(out, value.open_micros)?;
+    write!(
+        out,
+        ",\"maximum_micros\":{},\"left_censored_episodes\":{},\"durations_are_lower_bounds\":{},\"stopped\":{},\"invalid_clock\":{},\"counter_overflow\":{}}}",
+        value.maximum_micros,
+        value.left_censored_episodes,
+        value.durations_are_lower_bounds,
+        value.stopped,
+        value.invalid_clock,
+        value.counter_overflow
     )
 }
 
@@ -354,6 +390,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_packet_io_timing_json_preserves_censored_episodes_and_unknown_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timing = raw::SendTimingSnapshot {
+            observed_micros: 90,
+            would_block_observations: 4,
+            completed: raw::SendTimingTotal {
+                episodes: 1,
+                micros: 10,
+            },
+            cancelled: raw::SendTimingTotal {
+                episodes: 1,
+                micros: 20,
+            },
+            terminal: raw::SendTimingTotal {
+                episodes: 1,
+                micros: 30,
+            },
+            maximum_micros: 30,
+            left_censored_episodes: 1,
+            durations_are_lower_bounds: true,
+            stopped: true,
+            ..raw::SendTimingSnapshot::default()
+        };
+        let mut bytes = Vec::new();
+        write_send_timing(&mut bytes, timing)?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(value["completed"]["micros"], 10);
+        assert_eq!(value["cancelled"]["micros"], 20);
+        assert_eq!(value["terminal"]["micros"], 30);
+        assert_eq!(value["left_censored_episodes"], 1);
+        assert_eq!(value["durations_are_lower_bounds"], true);
+        assert_eq!(value["stopped"], true);
+        assert!(value["open_micros"].is_null());
+        Ok(())
+    }
+
+    #[test]
     fn raw_json_keeps_lane_class_refusal_and_untimed_terminal_semantics()
     -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
@@ -412,6 +485,8 @@ mod tests {
                 last_refusal: Some(reason),
                 ..raw::PrepareSnapshot::default()
             }; 4],
+            send_timing: None,
+            send_timing_capacity_bytes: 0,
             send_io: raw::SendIoSnapshot {
                 would_block_observations: 10,
                 would_block_episodes: 2,

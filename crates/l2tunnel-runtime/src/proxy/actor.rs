@@ -45,6 +45,19 @@ pub(super) type CommonRetirement = super::common_bridge::Bridge;
 pub(super) enum CommonRetirement {}
 #[cfg(not(unix))]
 impl CommonRetirement {
+    fn timing_enabled(&self) -> bool {
+        match *self {}
+    }
+    fn timing_event(&self, _event: super::timing::Event) {
+        match *self {}
+    }
+    fn timing_enter(&self, _stage: super::timing::Stage, _now: Instant) {
+        match *self {}
+    }
+    fn timing_finish(&self, _now: Instant) {
+        match *self {}
+    }
+
     pub(super) async fn prepare_user_receipt(&self, _ordinal: u64) -> io::Result<()> {
         match *self {}
     }
@@ -511,12 +524,23 @@ impl Actor {
             progress.users = count;
             progress.physical = physical;
         }
-        state.observe_physical(
-            progress.users,
-            progress.physical,
-            self.start,
-            Instant::now(),
-        )?;
+        if bridge.timing_enabled() {
+            state.observe_physical_diagnosed(
+                progress.users,
+                progress.physical,
+                self.start,
+                Instant::now(),
+                terminal,
+                |event| bridge.timing_event(event),
+            )?;
+        } else {
+            state.observe_physical(
+                progress.users,
+                progress.physical,
+                self.start,
+                Instant::now(),
+            )?;
+        }
         Ok(progress)
     }
     fn measured_callbacks(&mut self) -> io::Result<()> {
@@ -527,18 +551,50 @@ impl Actor {
         let now = self.micros()?;
         if let Some(state) = &mut self.measured {
             if let Some(bridge) = &self.retirement {
-                state.callbacks_physical(
-                    &self.table,
-                    progress.users,
-                    self.start,
-                    Instant::now(),
-                )?;
+                if bridge.timing_enabled() {
+                    state.callbacks_physical_diagnosed(
+                        &self.table,
+                        progress.users,
+                        self.start,
+                        Instant::now(),
+                        |event| bridge.timing_event(event),
+                    )?;
+                } else {
+                    state.callbacks_physical(
+                        &self.table,
+                        progress.users,
+                        self.start,
+                        Instant::now(),
+                    )?;
+                }
                 bridge.acknowledge_user_receipts(progress.users)?;
             } else {
                 state.callbacks(&self.table, progress.users, now)?;
             }
         }
         Ok(())
+    }
+    fn timing_enter(&self, stage: super::timing::Stage) {
+        if let Some(bridge) = &self.retirement
+            && bridge.timing_enabled()
+        {
+            bridge.timing_enter(stage, Instant::now());
+        }
+    }
+    fn timing_finish(&self, now: Instant) {
+        if let Some(bridge) = &self.retirement
+            && bridge.timing_enabled()
+        {
+            if let Some(state) = &self.measured {
+                bridge.timing_event(super::timing::Event::TerminalLedger);
+                state
+                    .ledger
+                    .visit_timing_pending(self.start, now, true, &mut |event| {
+                        bridge.timing_event(event)
+                    });
+            }
+            bridge.timing_finish(now);
+        }
     }
     async fn wait_service(&mut self, tick: &mut tokio::time::Interval, deadline: Option<Instant>) {
         // An actual whole-write completion must wake its measured callback;
@@ -1404,11 +1460,14 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
                     .chain(actor.deadline)
                     .min();
             }
+            actor.timing_enter(super::timing::Stage::Wait);
             actor.wait_service(&mut tick, deadline).await;
+            actor.timing_enter(super::timing::Stage::Import);
             // Keep already completed physical facts before abort, expiry, or any
             // other terminal branch can bypass the semantic callback phase.
             actor.observe_measured_physical(false)?;
             actor.measured_deadlines(Instant::now())?;
+            actor.timing_enter(super::timing::Stage::BeforeCallback);
             if let Some(at) = *quiesce.borrow() {
                 actor.drain(at)?;
             }
@@ -1449,7 +1508,9 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
                 }
             }
             actor.service_control()?;
+            actor.timing_enter(super::timing::Stage::Callback);
             actor.measured_callbacks()?;
+            actor.timing_enter(super::timing::Stage::UserAndNative);
             if actor.started && !actor.closing {
                 if let Some(state) = &mut actor.measured {
                     state.wire_pressure = false;
@@ -1488,10 +1549,12 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
                 // Final credit is admitted before the matching fence ACK.
                 actor.service_control()?;
             }
+            actor.timing_enter(super::timing::Stage::Publish);
             actor.publish(&control.status, actor.snapshot(None), false)?;
             if let Some(report) = actor.shutdown()? {
                 return Ok(report);
             }
+            actor.timing_enter(super::timing::Stage::Yield);
             actor.cooperate_after_turn().await;
         }
     }
@@ -1570,6 +1633,7 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             "original proxy abort deadline",
         ));
     }
+    actor.timing_finish(Instant::now());
     let mut status = actor.snapshot(
         outcome
             .as_ref()
