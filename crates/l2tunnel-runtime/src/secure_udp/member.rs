@@ -30,6 +30,10 @@ pub mod carrier;
 #[path = "member_raw_carrier.rs"]
 pub mod raw_carrier;
 
+/// Initial-only member acceptance over the actual retained TLS/QUIC owner.
+#[path = "member_maintained.rs"]
+pub mod maintained;
+
 use super::raw_carrier_io::{NoRaw, RawBacking};
 
 pub(super) const ROUTE: u8 = 3;
@@ -1054,9 +1058,9 @@ async fn send_backing<R: RawBacking>(
 ) -> io::Result<()> {
     match socket {
         establish::SocketBacking::Udp(socket) => send(socket, packet).await,
-        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
-            socket.send_control(packet, deadline).await
-        }
+        establish::SocketBacking::Carrier(_)
+        | establish::SocketBacking::Raw(_)
+        | establish::SocketBacking::Maintained(_) => socket.send_control(packet, deadline).await,
     }
 }
 async fn receive_backing<R: RawBacking>(
@@ -1065,9 +1069,9 @@ async fn receive_backing<R: RawBacking>(
 ) -> io::Result<usize> {
     match socket {
         establish::SocketBacking::Udp(socket) => receive(socket, output).await,
-        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
-            socket.recv(output).await
-        }
+        establish::SocketBacking::Carrier(_)
+        | establish::SocketBacking::Raw(_)
+        | establish::SocketBacking::Maintained(_) => socket.recv(output).await,
     }
 }
 async fn send_acceptance_backing<R: RawBacking>(
@@ -1077,9 +1081,9 @@ async fn send_acceptance_backing<R: RawBacking>(
 ) -> io::Result<()> {
     match socket {
         establish::SocketBacking::Udp(socket) => send_acceptance(socket, packet).await,
-        establish::SocketBacking::Carrier(_) | establish::SocketBacking::Raw(_) => {
-            socket.send_control(packet, deadline).await
-        }
+        establish::SocketBacking::Carrier(_)
+        | establish::SocketBacking::Raw(_)
+        | establish::SocketBacking::Maintained(_) => socket.send_control(packet, deadline).await,
     }
 }
 async fn send(socket: &UdpSocket, packet: &[u8]) -> io::Result<()> {

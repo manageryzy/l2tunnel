@@ -25,7 +25,7 @@ fn project(snapshot: service::SetupObservation) -> Option<Value> {
         .runtime
         .and_then(|runtime| runtime.bootstrap)
         .map(|stats| {
-            json!({
+            let mut value = json!({
                 "received_datagrams": stats.received_datagrams,
                 "ignored_datagrams": stats.ignored_datagrams,
                 "emitted_datagrams": stats.emitted_datagrams,
@@ -39,7 +39,14 @@ fn project(snapshot: service::SetupObservation) -> Option<Value> {
                 "gate_retries": stats.gate_retries,
                 "bootstrap_fresh": stats.bootstrap_fresh,
                 "bootstrap_replays": stats.bootstrap_replays,
-            })
+            });
+            if stats.maintained_accepted_records != 0 || stats.maintained_accepted_record_bytes != 0
+            {
+                value["maintained_accepted_records"] = json!(stats.maintained_accepted_records);
+                value["maintained_accepted_record_bytes"] =
+                    json!(stats.maintained_accepted_record_bytes);
+            }
+            value
         });
     let control = snapshot
         .runtime
@@ -361,6 +368,8 @@ mod tests {
                 emitted_datagrams: u64::MAX,
                 emitted_udp_bytes: u64::MAX,
                 socket_sent_datagrams: u64::MAX,
+                maintained_accepted_records: u64::MAX,
+                maintained_accepted_record_bytes: u64::MAX,
                 socket_sent_udp_bytes: u64::MAX,
                 socket_drops: u64::MAX,
                 socket_receive_errors: u64::MAX,
@@ -389,7 +398,7 @@ mod tests {
         assert_eq!(value["reason"], "membership_deadline");
         assert_eq!(
             value["bootstrap"].as_object().map(|object| object.len()),
-            Some(13)
+            Some(15)
         );
         assert_eq!(
             value["control"].as_object().map(|object| object.len()),

@@ -1,4 +1,5 @@
 //! Actual original-datagram custody for the existing sole runtime loop.
+use super::maintained_carrier::MaintainedIo;
 use super::raw_carrier::{NoRaw, RawBacking};
 use super::*;
 use crate::secure_udp::original_datagram::{
@@ -9,7 +10,22 @@ use std::{
     task::{Context, Poll},
 };
 
-pub(in crate::secure_udp) use super::raw_carrier::{PhysicalReceipt, SendProgress, UserIdentity};
+pub(in crate::secure_udp) use super::raw_carrier::{AcceptedReceipt, SendProgress, UserIdentity};
+
+/// Actual framing fact retained by the outer owner, not inferred from payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InputFraming {
+    Bootstrap,
+    Final,
+}
+impl From<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming> for InputFraming {
+    fn from(value: l2tunnel_openvpn::wire_carrier::common::ReceiveFraming) -> Self {
+        match value {
+            l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::DataV1 => Self::Bootstrap,
+            l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::Final => Self::Final,
+        }
+    }
+}
 
 struct Pending {
     ticket: Option<PendingSend>,
@@ -31,7 +47,7 @@ pub(super) struct CarrierIo {
     control_bytes: Vec<u8>,
     input: Vec<u8>,
     input_length: Option<usize>,
-    input_framing: Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
+    input_framing: Option<InputFraming>,
     user: Option<User>,
     control: Option<Control>,
 }
@@ -71,6 +87,7 @@ pub(super) enum IoOwner<R: RawBacking = NoRaw> {
     Udp(tokio::net::UdpSocket),
     Carrier(Vec<CarrierIo>),
     Raw(Vec<R>),
+    Maintained(Vec<MaintainedIo>),
 }
 impl From<tokio::net::UdpSocket> for IoOwner {
     fn from(socket: tokio::net::UdpSocket) -> Self {
@@ -78,6 +95,11 @@ impl From<tokio::net::UdpSocket> for IoOwner {
     }
 }
 impl IoOwner {
+    pub(super) fn from_maintained(
+        carrier: crate::secure_udp::maintained_io::Carrier,
+    ) -> io::Result<Self> {
+        MaintainedIo::new(carrier).map(Self::Maintained)
+    }
     pub(super) fn from_original(datagram: OriginalDatagram) -> io::Result<Self> {
         if datagram.outer_info().is_none()
             || datagram.geometry().extra_wire_bytes != usize::from(!datagram.final_records())
@@ -128,18 +150,21 @@ impl<R: RawBacking> IoOwner<R> {
     pub(super) fn check_physical_failure(&self) -> io::Result<()> {
         match self {
             Self::Raw(values) => values[0].check_failure(),
+            Self::Maintained(values) => values[0].check_failure(),
             _ => Ok(()),
         }
     }
     pub(super) fn physical_wake(&self) -> io::Result<Option<Instant>> {
         match self {
             Self::Raw(values) => values[0].next_wake().map(Some),
+            Self::Maintained(values) => Ok(values[0].next_deadline()),
             _ => Ok(None),
         }
     }
     pub(super) fn adapter_capacity_bytes(&self) -> io::Result<usize> {
         match self {
             Self::Udp(_) => Ok(0),
+            Self::Maintained(values) => values[0].usage().map(|usage| usage.capacity_bytes),
             Self::Raw(values) => values
                 .first()
                 .ok_or_else(|| protocol("missing raw singleton"))?
@@ -166,6 +191,7 @@ impl<R: RawBacking> IoOwner<R> {
             capacity_bytes: self.adapter_capacity_bytes()?,
             allocations: match self {
                 Self::Udp(_) => 0,
+                Self::Maintained(values) => values[0].usage()?.allocations,
                 Self::Carrier(_) => 3,
                 Self::Raw(values) => values[0].allocations(),
             },
@@ -177,11 +203,12 @@ impl<R: RawBacking> IoOwner<R> {
             Self::Udp(socket) => Ok((socket.local_addr()?, socket.peer_addr()?)),
             Self::Carrier(values) => Ok(values[0].datagram.addresses()),
             Self::Raw(values) => Ok(values[0].addresses()),
+            Self::Maintained(values) => Ok(values[0].addresses()),
         }
     }
     pub(super) fn extra_wire_bytes(&self) -> usize {
         match self {
-            Self::Udp(_) | Self::Raw(_) => 0,
+            Self::Udp(_) | Self::Raw(_) | Self::Maintained(_) => 0,
             Self::Carrier(values) => values[0].datagram.geometry().extra_wire_bytes,
         }
     }
@@ -192,6 +219,7 @@ impl<R: RawBacking> IoOwner<R> {
             } else {
                 28
             }),
+            Self::Maintained(values) => Ok(values[0].geometry().charged_overhead_bytes),
             Self::Raw(values) => values[0]
                 .geometry()
                 .ip_tcp_bytes
@@ -210,11 +238,15 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Udp(_) => None,
             Self::Raw(values) => Some(values[0].geometry().max_record_bytes),
+            Self::Maintained(values) => Some(values[0].geometry().max_record_bytes),
             Self::Carrier(values) => Some(values[0].datagram.geometry().max_datagram_bytes),
         }
     }
     pub(super) fn is_raw(&self) -> bool {
         matches!(self, Self::Raw(_))
+    }
+    pub(super) fn is_maintained(&self) -> bool {
+        matches!(self, Self::Maintained(_))
     }
     pub(super) fn is_carrier(&self) -> bool {
         !matches!(self, Self::Udp(_))
@@ -227,6 +259,7 @@ impl<R: RawBacking> IoOwner<R> {
                 .as_ref()
                 .is_some_and(|u| u.pending.result.is_none()),
             Self::Raw(values) => values[0].user_pending(),
+            Self::Maintained(values) => values[0].user_pending(),
         }
     }
 
@@ -242,6 +275,7 @@ impl<R: RawBacking> IoOwner<R> {
             Self::Udp(_) => false,
             Self::Carrier(values) => values[0].control.is_some(),
             Self::Raw(values) => values[0].control_pending(),
+            Self::Maintained(values) => values[0].control_pending(),
         }
     }
 
@@ -249,6 +283,7 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Udp(_) => true,
             Self::Raw(values) => values[0].receive_ready(),
+            Self::Maintained(values) => values[0].receive_ready(),
             Self::Carrier(values) => values[0].input_length.is_some(),
         }
     }
@@ -256,6 +291,7 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Udp(_) => None,
             Self::Raw(values) => values[0].deadline(),
+            Self::Maintained(values) => values[0].next_deadline(),
             Self::Carrier(values) => {
                 let value = &values[0];
                 value
@@ -272,6 +308,7 @@ impl<R: RawBacking> IoOwner<R> {
     pub(super) fn admission_wake(&self, now: Instant) -> Option<Instant> {
         match self {
             Self::Udp(_) | Self::Raw(_) => None,
+            Self::Maintained(values) => values[0].admission_wake(now),
             Self::Carrier(values) => {
                 let value = &values[0];
                 if value
@@ -313,6 +350,7 @@ impl<R: RawBacking> IoOwner<R> {
     ) -> io::Result<SendProgress> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, identity.deadline),
+            Self::Maintained(values) => values[0].try_user(identity, bytes, hold),
             Self::Raw(values) => {
                 if hold {
                     values[0].try_user_held(identity, bytes)
@@ -361,6 +399,7 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Udp(_) => None,
             Self::Raw(values) => values[0].user_accepted_at(),
+            Self::Maintained(values) => values[0].user_accepted_at(),
             Self::Carrier(values) => values[0]
                 .user
                 .as_ref()
@@ -378,6 +417,9 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Raw(values) => Ok(values[0]
                 .earliest_input_for_ordering_at()?
+                .is_some_and(|at| at <= accepted)),
+            Self::Maintained(values) => Ok(values[0]
+                .earliest_input_at()
                 .is_some_and(|at| at <= accepted)),
             // OpenVPN payloads have not passed Records yet. Their inner
             // authenticated observation is assigned at the sole opener, not
@@ -412,6 +454,7 @@ impl<R: RawBacking> IoOwner<R> {
         match self {
             Self::Udp(socket) => udp_write(socket, bytes, deadline),
             Self::Raw(values) => values[0].stage_control(bytes, cost, deadline, bootstrap),
+            Self::Maintained(values) => values[0].stage_control(bytes, cost, deadline, bootstrap),
             Self::Carrier(values) => {
                 let value = &mut values[0];
                 if value.control.is_some() {
@@ -456,6 +499,9 @@ impl<R: RawBacking> IoOwner<R> {
         if let Self::Raw(values) = self {
             return values[0].take_control();
         }
+        if let Self::Maintained(values) = self {
+            return values[0].take_control();
+        }
         let Self::Carrier(values) = self else {
             return Ok(None);
         };
@@ -472,6 +518,9 @@ impl<R: RawBacking> IoOwner<R> {
     }
     pub(super) fn take_user(&mut self) -> io::Result<Option<(UserIdentity, SendProgress)>> {
         if let Self::Raw(values) = self {
+            return values[0].take_user();
+        }
+        if let Self::Maintained(values) = self {
             return values[0].take_user();
         }
         let Self::Carrier(values) = self else {
@@ -507,15 +556,14 @@ impl<R: RawBacking> IoOwner<R> {
     pub(super) fn try_receive_at(
         &mut self,
         output: &mut [u8],
-    ) -> io::Result<(
-        usize,
-        Option<Instant>,
-        Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
-    )> {
+    ) -> io::Result<(usize, Option<Instant>, Option<InputFraming>)> {
         if let Self::Raw(values) = self {
             return values[0]
                 .try_receive(output)
                 .map(|(bytes, at)| (bytes, Some(at), None));
+        }
+        if let Self::Maintained(values) = self {
+            return values[0].receive(output);
         }
         let bytes = self.try_receive(output)?;
         let framing = match self {
@@ -527,6 +575,7 @@ impl<R: RawBacking> IoOwner<R> {
     pub(super) fn try_receive(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Udp(socket) => socket.try_recv(output),
+            Self::Maintained(values) => values[0].receive(output).map(|(bytes, _, _)| bytes),
             Self::Raw(values) => values[0].try_receive(output).map(|(bytes, _)| bytes),
             Self::Carrier(values) => {
                 let value = &mut values[0];
@@ -546,12 +595,22 @@ impl<R: RawBacking> IoOwner<R> {
             Self::Udp(socket) if receive => socket.readable().await,
             Self::Udp(_) => std::future::pending().await,
             Self::Raw(values) => std::future::poll_fn(|cx| values[0].poll_ready(cx, receive)).await,
+            Self::Maintained(values) => {
+                std::future::poll_fn(|cx| values[0].poll_ready(cx, receive)).await
+            }
             Self::Carrier(values) => {
                 std::future::poll_fn(|cx| values[0].poll_ready(cx, receive)).await
             }
         }
     }
     pub(super) async fn observe_completions(&mut self) {
+        if let Self::Maintained(values) = self {
+            std::future::poll_fn(|cx| {
+                let _ = values[0].poll_ready(cx, false);
+                Poll::Ready(())
+            })
+            .await;
+        }
         if let Self::Raw(values) = self {
             std::future::poll_fn(|cx| {
                 let _ = values[0].poll_ready(cx, false);
@@ -601,7 +660,7 @@ impl CarrierIo {
                     Poll::Pending => {}
                     Poll::Ready(Ok((length, framing))) => {
                         self.input_length = Some(length);
-                        self.input_framing = framing;
+                        self.input_framing = framing.map(Into::into);
                         ready = true;
                     }
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -698,10 +757,12 @@ fn udp_write(
         28
     };
     Ok(SendProgress::Whole {
-        receipt: PhysicalReceipt {
+        receipt: AcceptedReceipt {
             record_bytes: written,
             udp_bytes: Some(written),
-            ip_bytes: written.checked_add(overhead).ok_or_else(exhausted)?,
+            charged_bytes: written.checked_add(overhead).ok_or_else(exhausted)?,
+            socket_ip_bytes: Some(written.checked_add(overhead).ok_or_else(exhausted)?),
+            boundary: super::super::SendBoundary::SocketAccepted,
             accepted_at,
             deadline,
         },
@@ -767,15 +828,10 @@ impl Driver {
         };
         let control = control.and_then(|value| {
             if let Some((SendProgress::Whole { receipt, late }, cost)) = value {
-                self.counters.socket_accepted_packets =
-                    self.counters.socket_accepted_packets.saturating_add(1);
-                self.counters.socket_accepted_ip_bytes = self
-                    .counters
-                    .socket_accepted_ip_bytes
-                    .saturating_add(receipt.ip_bytes as u64);
-                if cost != receipt.ip_bytes
+                self.observe_carrier_acceptance(receipt)?;
+                if cost != receipt.charged_bytes
                     || receipt.udp_bytes.is_some_and(|bytes| {
-                        bytes < receipt.record_bytes || bytes > receipt.ip_bytes
+                        bytes < receipt.record_bytes || bytes > receipt.charged_bytes
                     })
                 {
                     return Err(protocol("carrier Control physical charge differs"));
@@ -943,3 +999,46 @@ impl Driver {
 #[cfg(test)]
 #[path = "transport_carrier_tests.rs"]
 mod tests;
+
+impl Driver {
+    pub(super) fn observe_carrier_acceptance(
+        &mut self,
+        receipt: AcceptedReceipt,
+    ) -> io::Result<()> {
+        let expected = self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.contract.maintained_outer())
+            .map_or(super::super::SendBoundary::SocketAccepted, |outer| {
+                outer.requested().kind.send_boundary()
+            });
+        if receipt.boundary != expected
+            || receipt.socket_ip_bytes.is_some()
+                != (expected == super::super::SendBoundary::SocketAccepted)
+        {
+            return Err(protocol(
+                "carrier receipt boundary differs from actual selected owner",
+            ));
+        }
+        if let Some(bytes) = receipt.socket_ip_bytes {
+            self.counters.socket_accepted_packets =
+                self.counters.socket_accepted_packets.saturating_add(1);
+            self.counters.socket_accepted_ip_bytes = self
+                .counters
+                .socket_accepted_ip_bytes
+                .saturating_add(bytes as u64);
+        } else {
+            self.counters.maintained_accepted_records =
+                self.counters.maintained_accepted_records.saturating_add(1);
+            self.counters.maintained_accepted_record_bytes = self
+                .counters
+                .maintained_accepted_record_bytes
+                .saturating_add(receipt.record_bytes as u64);
+            self.counters.maintained_accepted_charge_bytes = self
+                .counters
+                .maintained_accepted_charge_bytes
+                .saturating_add(receipt.charged_bytes as u64);
+        }
+        Ok(())
+    }
+}

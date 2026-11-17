@@ -5,6 +5,7 @@ use l2tunnel::record_configuration::Configuration;
 use l2tunnel_runtime::secure_udp::transport;
 
 pub(super) mod carrier;
+pub(super) mod maintained;
 pub(super) mod raw;
 
 pub(super) async fn establish(

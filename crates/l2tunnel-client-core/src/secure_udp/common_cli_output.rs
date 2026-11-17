@@ -26,7 +26,10 @@ pub(super) fn requested_tls(
 }
 
 pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>> {
-    let resources = if profile.raw_policy().is_some() {
+    let resources = if profile.maintained_settings().is_some() {
+        profile.maintained_session()?;
+        profile.requested_resources(role)
+    } else if profile.raw_policy().is_some() {
         profile.validate_raw_request()?;
         profile.requested_resources(role)
     } else {
@@ -51,6 +54,21 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
             "reconcile_timeout_ms":parameters.protocol.reconcile_timeout_ms,"max_operation_ms":parameters.max_operation_ms,
             "retained_bytes":parameters.retained_bytes},
     }))?);
+    if let Some(value) =
+        crate::secure_udp::common_status::MaintainedCarrier::observe(profile, None)?
+    {
+        output[0]["udp_cover"] = output[0]["carrier"].clone();
+        output[0]["carrier"] = json!(value.requested.carrier);
+        output[0]["requested_configuration"] = json!(profile.requested_configuration()?.0);
+        output[0]["requested_envelope"] = json!(profile.requested_envelope().as_bytes());
+        output[0]["configuration_scope"] = json!("requested_base_E0");
+        output[0]["effective_configuration"] = Value::Null;
+        output[0]["effective_envelope"] = Value::Null;
+        output[0]["effective_catalog"] = Value::Null;
+        output[0]["authenticated_outer_binding_required"] = json!(true);
+        output[0]["maintained_carrier"] = serde_json::to_value(value).map_err(io::Error::other)?;
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
     if let Some(requested) = profile.compact_wire() {
         output[0]["compact_wire"] = json!({
             "requested":crate::secure_udp::common_status::CompactWireSelection::from_selection(requested)?,

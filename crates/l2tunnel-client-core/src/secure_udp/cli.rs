@@ -12,6 +12,8 @@ mod common_cli;
 mod common_cli_output;
 #[path = "common_proxy_cli.rs"]
 mod common_proxy_cli;
+#[path = "maintained_cli.rs"]
+mod maintained_cli;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use common_proxy_cli::event as proxy_event_for_test;
 #[cfg(all(test, target_os = "linux"))]
@@ -39,8 +41,9 @@ pub(super) const OPTIONS: &[&str] = &[
     "--swift-transaction-plan",
     "--common-transaction-plan",
     "--proxy-close",
+    "--maintained-policy",
 ];
-pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate. Explicit --carrier openvpn-like --record-profile common --common-transaction-plan PATH additionally requires --udp-cover quic-like|media-like and a complete outer_carrier version1/openvpn_wire_common object in the plan. Connect uses the existing --ca DER --server-name DNS trust inputs; serve uses --cert DER --key PKCS8, with the same member identity/pin as the inner session. The actual raw TLS/member carrier has no standalone RAW64 gate: --admission-key-file/--cookie-key-file and standalone protection/drain/stats flags are refused; inner --session-admission-key-file and server-only --session-cookie-key-file remain required. Offline inspection reports requested E0 and binding required; only actual outer authentication supplies effective E1/H0/catalog. No default or fallback changes. Explicit --carrier raw-packet --record-profile common additionally requires --raw-policy strict raw-common-carrier-v1 JSON, --raw-mark NONZERO_U32, --udp-cover, --duplex half|full and first-tuple --remote/--listen. Tuples come from the raw policy; --udp-bind/--udp-peer are refused. It reuses API4 and actual original TLS/Noise/member owners. Offline inspection excludes the privileged mark. Kernel/firewall/native qualification remains separate. Explicit --traffic proxy --proxy-policy JSON_FILE with the Common plan selects the fixed full/TUN/one-channel/one-descriptor Aligned direct-ARQ proxy over quic-like|media-like. Its actual Proxy backend uses local API1 status/drain-proxy/disconnect/fresh-reconnect, not native-Common API4 controls. inspect-common-transaction-plan reports requested-only proxy policy and bounded route pages. Explicit --traffic proxy-measured additionally requires --proxy-close retained and the complete strict measured policy; it uses the same actual measured Common backend/API1, without native TCP RTT/cwnd/rwnd claims. Raw/OpenVPN, Half, multi-channel, live catalog switches and native qualification remain unsupported. Omitting --proxy-close preserves fixed v1 graceful_close=false. Explicit --proxy-close retained selects authenticated retained EOF/ARQ retirement using the original drain cap; both peers must select it.";
+pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate. Explicit --carrier openvpn-like --record-profile common --common-transaction-plan PATH additionally requires --udp-cover quic-like|media-like and a complete outer_carrier version1/openvpn_wire_common object in the plan. Connect uses the existing --ca DER --server-name DNS trust inputs; serve uses --cert DER --key PKCS8, with the same member identity/pin as the inner session. The actual raw TLS/member carrier has no standalone RAW64 gate: --admission-key-file/--cookie-key-file and standalone protection/drain/stats flags are refused; inner --session-admission-key-file and server-only --session-cookie-key-file remain required. Offline inspection reports requested E0 and binding required; only actual outer authentication supplies effective E1/H0/catalog. No default or fallback changes. Explicit --carrier raw-packet --record-profile common additionally requires --raw-policy strict raw-common-carrier-v1 JSON, --raw-mark NONZERO_U32, --udp-cover, --duplex half|full and first-tuple --remote/--listen. Tuples come from the raw policy; --udp-bind/--udp-peer are refused. It reuses API4 and actual original TLS/Noise/member owners. Offline inspection excludes the privileged mark. Kernel/firewall/native qualification remains separate. Explicit --traffic proxy --proxy-policy JSON_FILE with the Common plan selects the fixed full/TUN/one-channel/one-descriptor Aligned direct-ARQ proxy over quic-like|media-like. Its actual Proxy backend uses local API1 status/drain-proxy/disconnect/fresh-reconnect, not native-Common API4 controls. inspect-common-transaction-plan reports requested-only proxy policy and bounded route pages. Explicit --traffic proxy-measured additionally requires --proxy-close retained and the complete strict measured policy; it uses the same actual measured Common backend/API1, without native TCP RTT/cwnd/rwnd claims. Raw/OpenVPN, Half, multi-channel, live catalog switches and native qualification remain unsupported. Omitting --proxy-close preserves fixed v1 graceful_close=false. Explicit --proxy-close retained selects authenticated retained EOF/ARQ retirement using the original drain cap; both peers must select it. Explicit --carrier tcp|quic --record-profile common additionally requires --maintained-policy strict version1 JSON, an explicit compact_wire Common plan and --udp-cover for the initial inner bootstrap only. Full/Half tuples and conservative geometry come from that policy; --udp-bind/--udp-peer are refused. Data, feedback and management then use retained original TLS/QUIC owners. Mandatory outer AEAD remains additional to inner Records. TLS --sni may differ from the authenticated --server-name; genuine QUIC independent SNI is unavailable. Maintained proxy/measured selection is unsupported and fails before startup.";
 
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
@@ -75,11 +78,12 @@ impl From<Selection> for Common {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum Carrier {
     OriginalUdp,
     OpenVpn,
     RawPacket,
+    Maintained(Box<secure_udp::maintained::Settings>),
 }
 struct RawSelected {
     settings: crate::raw_packet::common::Settings,
@@ -152,6 +156,24 @@ impl Selected {
                     peers,
                     member,
                 )?;
+                if let Carrier::Maintained(settings) = &self.1 {
+                    common.carrier_geometry(&mut raw, settings.geometry.max_bootstrap_bytes)?;
+                    common.bootstrap_arq_geometry(&mut raw)?;
+                    // Share final Records backing capacity while keeping actual setup
+                    // protected bytes and ARQ packets within the bootstrap maximum.
+                    raw.cover.max_packet_bytes = settings.geometry.max_record_bytes;
+                    let maximum_body = settings
+                        .geometry
+                        .max_record_bytes
+                        .checked_sub(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+                        .ok_or_else(|| {
+                            input("maintained final record cannot fit authentication")
+                        })?;
+                    return plan
+                        .build_maintained(connection, raw, peers, maximum_body, **settings)
+                        .map(Box::new)
+                        .map(Built::Records);
+                }
                 if let Some(selected) = &self.2 {
                     let policy = selected.settings.packet_policy();
                     let geometry = policy.record_geometry().map_err(io::Error::other)?;
@@ -242,7 +264,36 @@ fn selection_for(
     let records_plan = options.contains_key("--common-transaction-plan");
     let raw_selected = options.get("--carrier").map(String::as_str) == Some("raw-packet")
         && (records_plan || options.get("--record-profile").map(String::as_str) == Some("common"));
-    let carrier = if raw_selected {
+    let maintained_selected = matches!(
+        options.get("--carrier").map(String::as_str),
+        Some("tcp" | "quic")
+    ) && (records_plan
+        || options.get("--record-profile").map(String::as_str) == Some("common"));
+    let carrier = if maintained_selected {
+        if !records_plan {
+            return Err(input(
+                "maintained Common requires its complete transaction plan",
+            ));
+        }
+        let settings = maintained_cli::read(
+            &bounded_file(required(options, "--maintained-policy")?, 16 * 1024)?,
+            config,
+        )?;
+        let expected = if matches!(
+            settings.transport,
+            secure_udp::maintained::Transport::Tls(_)
+        ) {
+            "tcp"
+        } else {
+            "quic"
+        };
+        if options.get("--carrier").map(String::as_str) != Some(expected) {
+            return Err(input(
+                "maintained policy transport differs from explicit carrier",
+            ));
+        }
+        Carrier::Maintained(Box::new(settings))
+    } else if raw_selected {
         if !records_plan {
             return Err(input("raw Common requires its complete transaction plan"));
         }
@@ -259,9 +310,19 @@ fn selection_for(
     } else {
         Carrier::OriginalUdp
     };
+    if options.contains_key("--maintained-policy") && !maintained_selected {
+        return Err(input(
+            "maintained policy requires explicit TCP/QUIC Common selection",
+        ));
+    }
     let appearance = match options.get("--carrier").map(String::as_str) {
         Some("quic-like") => l2tunnel_cover::Appearance::QuicLike,
         Some("media-like") => l2tunnel_cover::Appearance::MediaLike,
+        Some("tcp" | "quic") if maintained_selected => match required(options, "--udp-cover")? {
+            "quic-like" => l2tunnel_cover::Appearance::QuicLike,
+            "media-like" => l2tunnel_cover::Appearance::MediaLike,
+            _ => return Err(input("maintained Common requires explicit bootstrap cover")),
+        },
         Some("raw-packet") if carrier == Carrier::RawPacket => {
             match required(options, "--udp-cover")? {
                 "quic-like" => l2tunnel_cover::Appearance::QuicLike,
@@ -293,7 +354,7 @@ fn selection_for(
             return Ok(None);
         }
     };
-    let proxy = common_proxy_cli::selection(options, config, records_plan, carrier)?;
+    let proxy = common_proxy_cli::selection(options, config, records_plan, &carrier)?;
     let allowed = [
         "--carrier",
         "--record-profile",
@@ -330,12 +391,15 @@ fn selection_for(
     }
     if options.get("--record-profile").map(String::as_str)
         != Some(if records_plan { "common" } else { "swift" })
-        || carrier != Carrier::RawPacket && config.duplex != Duplex::Full
+        || !matches!(carrier, Carrier::RawPacket | Carrier::Maintained(_))
+            && config.duplex != Duplex::Full
         || config.compression != Compression::None
         || options.keys().any(|key| {
             !(allowed.contains(&key.as_str())
                 || OPTIONS.contains(&key.as_str())
                 || carrier != Carrier::OriginalUdp && carrier_options.contains(&key.as_str())
+                || matches!(carrier, Carrier::Maintained(_))
+                    && ["--remote", "--listen"].contains(&key.as_str())
                 || carrier == Carrier::RawPacket
                     && ["--raw-policy", "--raw-mark", "--remote", "--listen"]
                         .contains(&key.as_str())
@@ -475,7 +539,34 @@ fn selection_for(
     } else {
         None
     };
-    let (local, peer) = if let Some(raw) = &raw {
+    let (local, peer) = if let Carrier::Maintained(settings) = &carrier {
+        if ["--udp-bind", "--udp-peer"]
+            .iter()
+            .any(|key| options.contains_key(*key))
+        {
+            return Err(input(
+                "maintained tuples come only from --maintained-policy",
+            ));
+        }
+        let pair = if role == security::Role::Initiator {
+            (settings.first.client, settings.first.server)
+        } else {
+            (settings.first.server, settings.first.client)
+        };
+        if !inspection {
+            let key = if command == "connect" {
+                "--remote"
+            } else {
+                "--listen"
+            };
+            if address(key)? != settings.first.server {
+                return Err(input(
+                    "maintained remote/listen differs from first actual tuple",
+                ));
+            }
+        }
+        pair
+    } else if let Some(raw) = &raw {
         let (local, peer) = raw.settings.forward();
         (SocketAddr::V4(local), SocketAddr::V4(peer))
     } else {
@@ -664,24 +755,7 @@ impl Common {
         let (_, maximum_body) = self.carrier_geometry(settings, geometry.max_record_bytes)?;
         // Bootstrap ARQ geometry derives from the selected real covered record;
         // no explicit catalog source, native, body or channel value is rewritten.
-        settings.gate.arq.max_source_bytes = settings
-            .cover
-            .max_protected_bytes
-            .checked_sub(gate::CONTROL_OVERHEAD + l2tunnel_recovery::DATA_HEADER_BYTES + 1)
-            .ok_or_else(|| input("raw bootstrap cannot hold maintained control framing"))?
-            .min(1200);
-        settings.gate.arq.send_bytes = settings
-            .gate
-            .arq
-            .max_source_bytes
-            .checked_mul(settings.gate.arq.send_records)
-            .ok_or_else(|| input("raw bootstrap send geometry overflow"))?;
-        settings.gate.arq.receive_bytes = settings
-            .gate
-            .arq
-            .max_source_bytes
-            .checked_mul(settings.gate.arq.receive_records)
-            .ok_or_else(|| input("raw bootstrap receive geometry overflow"))?;
+        self.bootstrap_arq_geometry(settings)?;
         let physical = geometry
             .ip_tcp_bytes
             .checked_add(geometry.record_overhead_bytes)
@@ -693,6 +767,27 @@ impl Common {
             .and_then(|v| v.checked_add(physical))
             .ok_or_else(|| input("raw Common full overhead overflow"))?;
         Ok((overhead, maximum_body))
+    }
+    fn bootstrap_arq_geometry(self, settings: &mut secure_udp::Settings) -> io::Result<()> {
+        settings.gate.arq.max_source_bytes = settings
+            .cover
+            .max_protected_bytes
+            .checked_sub(gate::CONTROL_OVERHEAD + l2tunnel_recovery::DATA_HEADER_BYTES + 1)
+            .ok_or_else(|| input("carrier bootstrap cannot hold maintained control framing"))?
+            .min(1200);
+        settings.gate.arq.send_bytes = settings
+            .gate
+            .arq
+            .max_source_bytes
+            .checked_mul(settings.gate.arq.send_records)
+            .ok_or_else(|| input("carrier bootstrap send geometry overflow"))?;
+        settings.gate.arq.receive_bytes = settings
+            .gate
+            .arq
+            .max_source_bytes
+            .checked_mul(settings.gate.arq.receive_records)
+            .ok_or_else(|| input("carrier bootstrap receive geometry overflow"))?;
+        Ok(())
     }
     fn carrier_geometry(
         self,
@@ -1119,7 +1214,35 @@ pub(super) async fn execute(
                     service::Prepared::proxy_common_client(*profile, credentials, attachment)?
                 }
                 Built::Records(profile) => {
-                    if let Some(raw) = &selected.2 {
+                    if let Carrier::Maintained(settings) = &selected.1 {
+                        let member = std::sync::Arc::new(
+                            MemberKey::from_pkcs8(&member_der).map_err(auth_error)?,
+                        );
+                        let name = required(options, "--server-name")?.to_owned();
+                        let outer = match settings.transport {
+                            secure_udp::maintained::Transport::Tls(_) => {
+                                secure_udp::maintained::Client::Tls(service::Client {
+                                    remote: settings.first.server,
+                                    tls: tls_frontend::client(options)?,
+                                    server_name: name,
+                                    member,
+                                })
+                            }
+                            secure_udp::maintained::Transport::Quic(_) => {
+                                secure_udp::maintained::Client::Quic {
+                                    roots: vec![bounded_file(required(options, "--ca")?, 65536)?],
+                                    server_name: name,
+                                    member,
+                                }
+                            }
+                        };
+                        service::Prepared::secure_udp_common_maintained_client(
+                            *profile,
+                            outer,
+                            credentials,
+                            attachment,
+                        )?
+                    } else if let Some(raw) = &selected.2 {
                         let mark = raw.mark.ok_or_else(|| input("runtime raw mark absent"))?;
                         let opener =
                             crate::raw_packet::common::PacketOpener::new(move |config, role| {
@@ -1192,7 +1315,34 @@ pub(super) async fn execute(
                     service::Prepared::proxy_common_server(*profile, credentials, attachment)?
                 }
                 Built::Records(profile) => {
-                    if let Some(raw) = &selected.2 {
+                    if let Carrier::Maintained(settings) = &selected.1 {
+                        let certs = vec![bounded_file(required(options, "--cert")?, 65536)?];
+                        let key = bounded_file(required(options, "--key")?, 65536)?;
+                        let members = MemberAllowlist::new(&[auth::MemberPublicKey(member.0)])
+                            .map_err(auth_error)?;
+                        let outer = match settings.transport {
+                            secure_udp::maintained::Transport::Tls(_) => {
+                                secure_udp::maintained::Server::Tls(service::Server {
+                                    listen: settings.first.server,
+                                    tls: ServerTls::from_der(&certs, &key).map_err(auth_error)?,
+                                    members,
+                                })
+                            }
+                            secure_udp::maintained::Transport::Quic(_) => {
+                                secure_udp::maintained::Server::Quic {
+                                    certs,
+                                    key: zeroize::Zeroizing::new(key),
+                                    members,
+                                }
+                            }
+                        };
+                        service::Prepared::secure_udp_common_maintained_server(
+                            *profile,
+                            outer,
+                            credentials,
+                            attachment,
+                        )?
+                    } else if let Some(raw) = &selected.2 {
                         let mark = raw.mark.ok_or_else(|| input("runtime raw mark absent"))?;
                         let opener =
                             crate::raw_packet::common::PacketOpener::new(move |config, role| {

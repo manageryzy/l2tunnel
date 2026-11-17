@@ -409,14 +409,17 @@ impl CommonTransactionContract {
         Ok(())
     }
 }
-fn maximum_native(catalog: &common::Catalog) -> io::Result<usize> {
+pub(super) fn maximum_native(catalog: &common::Catalog) -> io::Result<usize> {
     [mg::Role::Client, mg::Role::Server]
         .into_iter()
         .map(|role| catalog.initial().direction(role).max_native())
         .max()
         .ok_or_else(|| invalid("raw Common native policy absent"))
 }
-fn bind_covers(hash: &mut digest::Context, covers: [cover::Config; 2]) -> io::Result<()> {
+pub(super) fn bind_covers(
+    hash: &mut digest::Context,
+    covers: [cover::Config; 2],
+) -> io::Result<()> {
     for (index, config) in covers.into_iter().enumerate() {
         hash.update(&[match config.appearance() {
             cover::Appearance::QuicLike => 1,
@@ -450,7 +453,10 @@ fn bind_covers(hash: &mut digest::Context, covers: [cover::Config; 2]) -> io::Re
     }
     Ok(())
 }
-fn bind_settings(hash: &mut digest::Context, settings: TransactionSettings) -> io::Result<()> {
+pub(super) fn bind_settings(
+    hash: &mut digest::Context,
+    settings: TransactionSettings,
+) -> io::Result<()> {
     for value in [
         settings.protocol.retry_ms,
         settings.protocol.phase_timeout_ms,
@@ -462,7 +468,7 @@ fn bind_settings(hash: &mut digest::Context, settings: TransactionSettings) -> i
     }
     Ok(())
 }
-fn finish(hash: digest::Context) -> [u8; 32] {
+pub(super) fn finish(hash: digest::Context) -> [u8; 32] {
     let mut out = [0; 32];
     out.copy_from_slice(hash.finish().as_ref());
     out

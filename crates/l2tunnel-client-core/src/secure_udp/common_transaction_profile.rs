@@ -11,6 +11,8 @@ use std::io;
 
 #[path = "common_transaction_profile_compact.rs"]
 mod compact;
+#[path = "common_transaction_profile_maintained.rs"]
+mod maintained;
 #[path = "common_transaction_profile_raw.rs"]
 mod raw;
 
@@ -30,6 +32,7 @@ pub struct Profile {
     data: ConfigDigest,
     carrier: Option<CarrierBinding>,
     raw: Option<raw::RawSelection>,
+    maintained: Option<Box<maintained::Selection>>,
     requested_catalog: Option<Catalog>,
     proxy: Option<l2tunnel_runtime::proxy::Config>,
     proxy_retirement: bool,
@@ -250,6 +253,20 @@ impl Profile {
         catalog: Catalog,
         parameters: transport::TransactionSettings,
     ) -> io::Result<Self> {
+        Self::select_reuse_application(&mut settings, parameters);
+        let mut profile = Self::new(
+            connection, settings, peers, initiator, responder, catalog, parameters,
+        )?;
+        profile.connection_reuse = true;
+        for role in [security::Role::Initiator, security::Role::Responder] {
+            profile.runtime_contract(role)?;
+        }
+        Ok(profile)
+    }
+    fn select_reuse_application(
+        settings: &mut Settings,
+        parameters: transport::TransactionSettings,
+    ) {
         let mut hash = digest::Context::new(&digest::SHA256);
         hash.update(b"l2tunnel/shared-client/slot-reuse/v1\0");
         hash.update(&settings.application.0);
@@ -263,14 +280,6 @@ impl Profile {
             hash.update(&value.to_be_bytes());
         }
         settings.application = ConfigDigest(super::finish(hash));
-        let mut profile = Self::new(
-            connection, settings, peers, initiator, responder, catalog, parameters,
-        )?;
-        profile.connection_reuse = true;
-        for role in [security::Role::Initiator, security::Role::Responder] {
-            profile.runtime_contract(role)?;
-        }
-        Ok(profile)
     }
     /// True only for the explicit immutable SlotReuseV1 contract selection.
     pub const fn connection_reuse(&self) -> bool {
@@ -283,6 +292,33 @@ impl Profile {
     #[allow(clippy::too_many_arguments)]
     fn new_selected(
         connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        proxy: Option<l2tunnel_runtime::proxy::Config>,
+        compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
+    ) -> io::Result<Self> {
+        Self::new_selected_for(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            raw_policy,
+            proxy,
+            compact_wire,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_selected_for(
+        connection: ConnectionConfig,
         mut settings: Settings,
         peers: establish::Peers,
         initiator: transport::Config,
@@ -292,6 +328,7 @@ impl Profile {
         raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
         proxy: Option<l2tunnel_runtime::proxy::Config>,
         compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
+        maintained: Option<super::maintained::Settings>,
     ) -> io::Result<Self> {
         let base = connection.session()?;
         if initiator.rolling_fragments != responder.rolling_fragments {
@@ -313,7 +350,7 @@ impl Profile {
                 "fragment selection requires a coded catalog member",
             ));
         }
-        if (raw_policy.is_none() && connection.duplex != Duplex::Full)
+        if (raw_policy.is_none() && maintained.is_none() && connection.duplex != Duplex::Full)
             || connection.compression != Compression::None
             || catalog.initial().duplex() != connection.duplex
         {
@@ -414,6 +451,7 @@ impl Profile {
             data,
             carrier: None,
             raw: None,
+            maintained: None,
             requested_catalog: None,
             proxy,
             proxy_retirement: false,
@@ -421,6 +459,9 @@ impl Profile {
             connection_reuse: false,
             compact_wire,
         };
+        if let Some(settings) = maintained {
+            return result.select_maintained(settings);
+        }
         if let Some(policy) = raw_policy {
             return result.select_raw(policy);
         }
@@ -472,7 +513,7 @@ impl Profile {
                 "explicit Common proxy supports only its original protected UDP owner",
             ));
         }
-        if self.carrier.is_some() || self.raw.is_some() {
+        if self.carrier.is_some() || self.raw.is_some() || self.maintained.is_some() {
             return Err(invalid("common profile already bound to an outer session"));
         }
         if outer.endpoints()
@@ -539,6 +580,9 @@ impl Profile {
     }
     /// Original offline setup identity H0, before a fresh outer session is known.
     pub fn requested_configuration(&self) -> io::Result<security::ConfigDigest> {
+        if let Some(value) = &self.maintained {
+            return Ok(value.requested);
+        }
         if let Some(raw) = self.raw {
             return Ok(raw.requested);
         }
@@ -549,6 +593,9 @@ impl Profile {
     }
     /// Original offline common envelope E0, without a fabricated outer proof.
     pub fn requested_envelope(&self) -> EnvelopeDigest {
+        if let Some(value) = &self.maintained {
+            return value.envelope;
+        }
         if let Some(raw) = self.raw {
             return raw.envelope;
         }
@@ -564,6 +611,9 @@ impl Profile {
     /// identity; selected final Records geometry belongs to the runtime contract.
     pub fn establish_config(&self, role: security::Role) -> io::Result<establish::Config> {
         let mut config = self.settings.runtime(role, self.peers)?;
+        if self.maintained.is_some() {
+            return self.establish_maintained(config, role);
+        }
         if self.compact_wire.is_some() && self.raw.is_none() && self.carrier.is_none() {
             config.binding.configuration = self.compact_contract(role)?.expected_configuration().0;
         }
@@ -610,6 +660,9 @@ impl Profile {
     }
     /// Actual setup/Control digest consumed by the maintained authentication factories.
     pub fn configuration(&self) -> io::Result<security::ConfigDigest> {
+        if let Some(value) = &self.maintained {
+            return Ok(value.configuration);
+        }
         if let Some(raw) = self.raw {
             return Ok(raw.configuration);
         }
@@ -628,6 +681,9 @@ impl Profile {
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
+        if self.maintained.is_some() {
+            return self.maintained_contract(role);
+        }
         if self.raw.is_some() {
             return self.raw_contract(role);
         }

@@ -27,21 +27,25 @@ pub(in crate::secure_udp) struct UserIdentity {
     pub(in crate::secure_udp) bytes: usize,
     pub(in crate::secure_udp) deadline: Instant,
 }
-/// Private carrier-neutral physical receipt; no TCP bytes are labeled UDP.
+/// Carrier acceptance with an explicit observation boundary and admission charge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::secure_udp) struct PhysicalReceipt {
+pub(in crate::secure_udp) struct AcceptedReceipt {
     pub(in crate::secure_udp) record_bytes: usize,
     pub(in crate::secure_udp) udp_bytes: Option<usize>,
-    pub(in crate::secure_udp) ip_bytes: usize,
+    pub(in crate::secure_udp) charged_bytes: usize,
+    pub(in crate::secure_udp) socket_ip_bytes: Option<usize>,
+    pub(in crate::secure_udp) boundary: super::SendBoundary,
     pub(in crate::secure_udp) accepted_at: Instant,
     pub(in crate::secure_udp) deadline: Instant,
 }
-impl From<SendReceipt> for PhysicalReceipt {
+impl From<SendReceipt> for AcceptedReceipt {
     fn from(receipt: SendReceipt) -> Self {
         Self {
             record_bytes: receipt.datagram_bytes,
             udp_bytes: Some(receipt.udp_bytes),
-            ip_bytes: receipt.ip_bytes,
+            charged_bytes: receipt.ip_bytes,
+            socket_ip_bytes: Some(receipt.ip_bytes),
+            boundary: super::SendBoundary::SocketAccepted,
             accepted_at: receipt.accepted_at,
             deadline: receipt.deadline,
         }
@@ -51,7 +55,7 @@ impl From<SendReceipt> for PhysicalReceipt {
 pub(in crate::secure_udp) enum SendProgress {
     Pending,
     Whole {
-        receipt: PhysicalReceipt,
+        receipt: AcceptedReceipt,
         late: bool,
     },
 }
@@ -212,7 +216,7 @@ struct Pending {
     bytes: usize,
     cost: usize,
     deadline: Instant,
-    receipt: Option<PhysicalReceipt>,
+    receipt: Option<AcceptedReceipt>,
 }
 struct User {
     identity: UserIdentity,
@@ -494,10 +498,12 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                                 }
                             } else {
                                 pending.token = None;
-                                pending.receipt = Some(PhysicalReceipt {
+                                pending.receipt = Some(AcceptedReceipt {
                                     record_bytes: pending.bytes,
                                     udp_bytes: None,
-                                    ip_bytes: pending.cost,
+                                    charged_bytes: pending.cost,
+                                    socket_ip_bytes: Some(pending.cost),
+                                    boundary: super::SendBoundary::SocketAccepted,
                                     accepted_at: sent.sent_at,
                                     deadline: pending.deadline,
                                 });

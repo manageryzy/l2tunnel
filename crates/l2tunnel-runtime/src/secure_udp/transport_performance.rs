@@ -3,12 +3,20 @@
 use super::{Bucket, SCALE};
 
 /// Cumulative runtime counters; compare only within one session and policy epoch.
+/// Historical `*_ip_bytes` names mean configured admission charges on maintained
+/// TLS/QUIC. Their actual packetization, ACKs and retries require separate capture.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Performance {
     /// Complete outer driver iterations.
     pub loop_turns: u64,
     /// UDP readable branches selected, including stale readiness.
     pub udp_ready_events: u64,
+    /// Maintained TLS/QUIC adapter readiness, never UDP socket readability.
+    pub maintained_ready_events: u64,
+    /// Complete logical records returned by maintained TLS/QUIC adapters.
+    pub maintained_batch_records: u64,
+    /// Maintained record batches consuming the current ingress work quota.
+    pub maintained_batch_limit_hits: u64,
     /// Native readiness observations processed, including pre-drain and stale readiness.
     pub native_ready_events: u64,
     /// Timer branches actually selected.

@@ -963,18 +963,13 @@ impl Driver {
     pub(super) fn complete_common_carrier(
         &mut self,
         identity: carrier::UserIdentity,
-        receipt: impl Into<carrier::PhysicalReceipt>,
+        receipt: impl Into<carrier::AcceptedReceipt>,
         late: bool,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<bool> {
         let receipt = receipt.into();
         // Physical facts are irreversible, including completion observed after a cap.
-        self.counters.socket_accepted_packets =
-            self.counters.socket_accepted_packets.saturating_add(1);
-        self.counters.socket_accepted_ip_bytes = self
-            .counters
-            .socket_accepted_ip_bytes
-            .saturating_add(receipt.ip_bytes as u64);
+        self.observe_carrier_acceptance(receipt)?;
         let pending = self
             .common
             .as_deref_mut()
@@ -988,8 +983,8 @@ impl Driver {
             || receipt.record_bytes != identity.bytes
             || receipt
                 .udp_bytes
-                .is_some_and(|bytes| bytes < receipt.record_bytes || bytes > receipt.ip_bytes)
-            || pending.cost != receipt.ip_bytes
+                .is_some_and(|bytes| bytes < receipt.record_bytes || bytes > receipt.charged_bytes)
+            || pending.cost != receipt.charged_bytes
             || !self.scope_registered(pending.scope)
         {
             return Err(protocol(

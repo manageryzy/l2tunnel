@@ -30,7 +30,10 @@ pub(super) fn preflight(command: &str, options: &BTreeMap<String, String>) -> io
         .map(String::as_str)
         .unwrap_or("frame");
     let supported = match carrier {
-        "tcp" if !inspection => records == "frame",
+        "tcp" => {
+            (!inspection && records == "frame")
+                || (records == "common" && options.contains_key("--maintained-policy"))
+        }
         "raw-packet" if records == "common" => options.contains_key("--common-transaction-plan"),
         "raw-packet" if !inspection => records == "frame",
         "openvpn-like" => records == "common" && options.contains_key("--common-transaction-plan"),

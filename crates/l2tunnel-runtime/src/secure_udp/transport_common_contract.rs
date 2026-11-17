@@ -5,6 +5,8 @@ use l2tunnel::{record_configuration as common, record_engine as engine};
 #[path = "transport_managed_contract.rs"]
 mod managed;
 pub use managed::FreshKeyPolicy;
+#[path = "transport_maintained_contract.rs"]
+mod maintained;
 #[path = "transport_raw_contract.rs"]
 mod raw;
 
@@ -29,6 +31,7 @@ pub struct CommonTransactionContract {
     extra_wire_bytes: usize,
     outer: Option<establish::carrier::AuthenticatedOuter>,
     raw: Option<establish::raw_carrier::AuthenticatedRaw>,
+    maintained: Option<crate::secure_udp::maintained::Authenticated>,
     compact_wire: Option<record::compact::Selection>,
 }
 
@@ -518,6 +521,7 @@ impl CommonTransactionContract {
             outer,
             raw,
             compact_wire,
+            maintained: None,
         };
         for value in result.catalog.configurations(envelope).map_err(invalid)? {
             result.resolve(value)?;
@@ -545,6 +549,7 @@ impl CommonTransactionContract {
         use l2tunnel_core::traffic::TcpControl;
         if self.catalog.descriptors().len() != 1
             || self.outer.is_some()
+            || self.maintained.is_some()
             || self.raw.is_some() != raw
             || self.initial.descriptor().duplex() != core::Duplex::Full
             || self.managed.is_some()
@@ -638,7 +643,8 @@ impl CommonTransactionContract {
     pub fn extra_wire_bytes(&self) -> usize {
         self.extra_wire_bytes
     }
-    /// Exact selected physical headers, independent of UDP/OpenVPN/raw naming.
+    /// Selected admission overhead. Maintained TLS/QUIC use an explicit allowance;
+    /// their packetization, ACKs and retransmissions are not physical observations.
     pub fn physical_overhead_bytes(&self) -> io::Result<usize> {
         if self.compact_wire.is_some() {
             // The validated selected geometry exists during pure peer preflight,

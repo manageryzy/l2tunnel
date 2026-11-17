@@ -81,14 +81,14 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
     let missing = Path::new("/not-read/common-proxy-policy");
     let base = options(missing, missing);
     let connection = configuration(&base)?;
-    assert!(selection(&base, connection, true, Carrier::OriginalUdp)?);
+    assert!(selection(&base, connection, true, &Carrier::OriginalUdp)?);
     assert!(!retained(&base)?);
     let mut closing = base.clone();
     closing.insert("--proxy-close".into(), "retained".into());
-    assert!(selection(&closing, connection, true, Carrier::OriginalUdp)? && retained(&closing)?);
+    assert!(selection(&closing, connection, true, &Carrier::OriginalUdp)? && retained(&closing)?);
     closing.insert("--proxy-close".into(), "unknown".into());
     assert_eq!(
-        selection(&closing, connection, true, Carrier::OriginalUdp)
+        selection(&closing, connection, true, &Carrier::OriginalUdp)
             .err()
             .map(|e| e.kind()),
         Some(io::ErrorKind::InvalidInput)
@@ -108,7 +108,7 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
     }
     for carrier in [Carrier::OpenVpn, Carrier::RawPacket] {
         assert_eq!(
-            selection(&base, connection, true, carrier)
+            selection(&base, connection, true, &carrier)
                 .err()
                 .map(|e| e.kind()),
             Some(io::ErrorKind::InvalidInput)
@@ -116,10 +116,10 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
     }
     let mut half = connection;
     half.duplex = Duplex::Half;
-    assert!(selection(&base, half, true, Carrier::OriginalUdp).is_err());
+    assert!(selection(&base, half, true, &Carrier::OriginalUdp).is_err());
     let mut tap = connection;
     tap.layer = l2tunnel_device::PacketLayer::Ethernet;
-    assert!(selection(&base, tap, true, Carrier::OriginalUdp).is_err());
+    assert!(selection(&base, tap, true, &Carrier::OriginalUdp).is_err());
     let mut unknown = base.clone();
     unknown.insert("--unused-proxy-mode".into(), "on".into());
     assert_eq!(

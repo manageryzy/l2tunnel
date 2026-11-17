@@ -12,7 +12,7 @@ pub(super) fn selection(
     options: &BTreeMap<String, String>,
     connection: ConnectionConfig,
     common_plan: bool,
-    carrier: Carrier,
+    carrier: &Carrier,
 ) -> io::Result<bool> {
     if !options.contains_key("--traffic")
         && !options.contains_key("--proxy-policy")
@@ -30,7 +30,7 @@ pub(super) fn selection(
             "Common proxy requires explicit proxy/proxy-measured traffic and complete Common plan",
         ));
     }
-    if carrier != Carrier::OriginalUdp
+    if carrier != &Carrier::OriginalUdp
         || connection.duplex != Duplex::Full
         || connection.layer != l2tunnel_device::PacketLayer::Ip
         || connection.compression != Compression::None

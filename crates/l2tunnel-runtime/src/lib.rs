@@ -19,6 +19,8 @@ pub mod proxy;
 pub mod quic;
 /// Explicit original-owner raw packet phase with common MUX and maintained recovery.
 pub mod raw_packet;
+/// Bounded Common framing on the original authenticated retained TCP/TLS owners.
+pub mod retained_tls;
 /// Explicit rolling-frame recovery over retained authenticated UDP/QUIC owners.
 pub mod rolling;
 /// Same-socket cookie/Noise/member authentication with bounded final-flight custody.

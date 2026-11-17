@@ -167,7 +167,7 @@ impl CommonTransactionContract {
     }
 
     pub(crate) fn on_outer_carrier(&self) -> bool {
-        self.outer.is_some()
+        self.outer.is_some() || self.maintained.is_some()
     }
 
     /// Exact explicit final-wire selection; absence retains legacy framing.

@@ -103,6 +103,12 @@ pub struct Driver {
     pub refill_discarded_bytes: u64,
     /// Same named observation and units as transport::Performance.
     pub bucket_tokens_bytes: u64,
+    /// Actual maintained TLS/QUIC readiness, separate from raw UDP readiness.
+    pub maintained_ready_events: u64,
+    /// Complete records observed at the maintained boundary.
+    pub maintained_batch_records: u64,
+    /// Actual maintained receive work-bound hits.
+    pub maintained_batch_limit_hits: u64,
 }
 impl From<transport::Performance> for Driver {
     fn from(value: transport::Performance) -> Self {
@@ -141,6 +147,9 @@ impl From<transport::Performance> for Driver {
             refill_generated_bytes: value.refill_generated_bytes,
             refill_discarded_bytes: value.refill_discarded_bytes,
             bucket_tokens_bytes: value.bucket_tokens_bytes,
+            maintained_ready_events: value.maintained_ready_events,
+            maintained_batch_records: value.maintained_batch_records,
+            maintained_batch_limit_hits: value.maintained_batch_limit_hits,
         }
     }
 }
@@ -676,6 +685,9 @@ mod tests {
             refill_generated_bytes: 32,
             refill_discarded_bytes: 33,
             bucket_tokens_bytes: 34,
+            maintained_ready_events: 35,
+            maintained_batch_records: 36,
+            maintained_batch_limit_hits: 37,
         };
         let value = serde_json::to_value(Driver::from(source))?;
         let object = value
@@ -716,6 +728,9 @@ mod tests {
             "refill_generated_bytes",
             "refill_discarded_bytes",
             "bucket_tokens_bytes",
+            "maintained_ready_events",
+            "maintained_batch_records",
+            "maintained_batch_limit_hits",
         ];
         assert_eq!(object.len(), expected.len());
         for (index, name) in expected.iter().enumerate() {

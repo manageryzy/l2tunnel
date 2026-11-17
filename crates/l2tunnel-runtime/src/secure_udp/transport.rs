@@ -59,6 +59,8 @@ pub use transaction_contract::TransactionContract;
 mod carrier;
 #[path = "transport_common_research_order.rs"]
 mod common_research_order;
+#[path = "transport_maintained_carrier.rs"]
+mod maintained_carrier;
 #[path = "transport_raw_send.rs"]
 mod raw_send;
 use super::raw_carrier_io as raw_carrier;
@@ -93,7 +95,7 @@ mod generic;
 mod generic_actions;
 pub use common::{
     CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, SameFlowRecovery,
-    common_channel, run_common, run_common_on_carrier, run_common_on_raw,
+    common_channel, run_common, run_common_on_carrier, run_common_on_maintained, run_common_on_raw,
 };
 pub use common_contract::{CommonTransactionContract, FreshKeyPolicy};
 pub use generic::{
@@ -422,6 +424,12 @@ where
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
+            // Maintained transports may complete custom futures without yielding.
+            // Hand control back after each bounded work turn so their driver tasks
+            // remain schedulable during continuous ready receipts or input.
+            if socket.is_maintained() {
+                tokio::task::yield_now().await;
+            }
             socket.begin_turn();
             if socket.is_carrier() {
                 socket.observe_completions().await;
@@ -491,7 +499,8 @@ where
                 event=next_io(&mut socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
                 IoEvent::Udp=>{
                     native_first=true;
-                    if !socket.is_raw() {driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);}
+                    if socket.is_maintained() {driver.performance.counters.maintained_ready_events=driver.performance.counters.maintained_ready_events.saturating_add(1);}
+                    else if !socket.is_raw() {driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);}
                     let maximum=if socket.receive_ready() {driver.config.work.receive_packets.min(driver.ingress.left)}else{0};
                     let mut batch=0u64;
                     for _ in 0..maximum {
@@ -500,7 +509,10 @@ where
                         match socket.try_receive_at(&mut inputs.datagram) {
                             Ok((length,received,framing))=>{
                                 batch+=1;
-                                if !socket.is_raw() {
+                                if socket.is_maintained() {
+                                    driver.performance.counters.maintained_batch_records=driver.performance.counters.maintained_batch_records.saturating_add(1);
+                                    if batch==u64::from(maximum) {driver.performance.counters.maintained_batch_limit_hits=driver.performance.counters.maintained_batch_limit_hits.saturating_add(1);}
+                                } else if !socket.is_raw() {
                                     driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
                                     if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
                                 }
@@ -1180,6 +1192,12 @@ pub struct Counters {
     pub socket_accepted_packets: u64,
     /// IP bytes accepted by the socket, not measured physical transmission.
     pub socket_accepted_ip_bytes: u64,
+    /// Maintained TLS flush or Quinn DATAGRAM acceptance; never a socket-send claim.
+    pub maintained_accepted_records: u64,
+    /// Inner record bytes accepted at the selected maintained transport boundary.
+    pub maintained_accepted_record_bytes: u64,
+    /// Configured admission charge for accepted maintained records, not captured IP bytes.
+    pub maintained_accepted_charge_bytes: u64,
     /// Transient native UDP send failures.
     pub socket_drops: u64,
     /// Charged transient receive failures.
@@ -2459,6 +2477,8 @@ impl Driver {
                 )?
                 .is_some()
         {
+            #[cfg(test)]
+            self.trace_liveness("pong-submitted", nonce, now);
             self.pong = None;
             self.pong_deadline = None;
         }
@@ -2491,6 +2511,8 @@ impl Driver {
             && let Some(challenge) = &mut self.challenge
         {
             challenge.submitted = true;
+            #[cfg(test)]
+            self.trace_liveness("ping-submitted", nonce, now);
         }
         Ok(())
     }
@@ -2659,6 +2681,8 @@ impl Driver {
             }
             match command {
                 Command::Ping(nonce) => {
+                    #[cfg(test)]
+                    self.trace_liveness("ping-received", nonce, now);
                     if nonce > self.remote_ping {
                         self.remote_ping = nonce;
                         self.pong = Some(nonce);
@@ -2667,6 +2691,8 @@ impl Driver {
                     }
                 }
                 Command::Pong(nonce) => {
+                    #[cfg(test)]
+                    self.trace_liveness("pong-received", nonce, now);
                     if self.challenge.as_ref().is_some_and(|challenge| {
                         challenge.submitted && challenge.nonce == nonce && now < challenge.deadline
                     }) {
@@ -2692,6 +2718,23 @@ impl Driver {
         }
         self.control_work = self.config.streams.is_some();
         Ok(())
+    }
+    #[cfg(test)]
+    fn trace_liveness(&self, event: &str, nonce: u64, now: u64) {
+        if std::env::var_os("L2TUNNEL_MAINTAINED_TRACE").is_some()
+            && self
+                .common
+                .as_deref()
+                .is_some_and(|runtime| runtime.contract.maintained_outer().is_some())
+        {
+            eprintln!(
+                "maintained-live session={:?} role={:?} event={event} nonce={nonce} now={now} outstanding={:?} deadline={:?}",
+                self.info.binding.session,
+                self.info.role,
+                self.live.outstanding,
+                self.live.deadline_micros
+            );
+        }
     }
     #[cfg(test)]
     fn receive(
@@ -2774,7 +2817,7 @@ impl Driver {
         original: Instant,
         instant: Instant,
         resolve: Option<&Resolver>,
-        framing: l2tunnel_openvpn::wire_carrier::common::ReceiveFraming,
+        framing: impl Into<carrier::InputFraming>,
     ) -> io::Result<()> {
         if received > now || original > instant || clock(self.origin, original)? != received {
             return Err(invalid("carrier input arrived after observation"));
@@ -2787,7 +2830,7 @@ impl Driver {
             instant,
             resolve,
             None,
-            Some(framing),
+            Some(framing.into()),
             |_| Ok(()),
         )
     }
@@ -2840,7 +2883,7 @@ impl Driver {
         instant: Instant,
         resolve: Option<&Resolver>,
         carrier: Option<raw_compact::FinalMetadata>,
-        framing: Option<l2tunnel_openvpn::wire_carrier::common::ReceiveFraming>,
+        framing: Option<carrier::InputFraming>,
         mut commit: impl FnMut(raw_compact::FinalAcceptance<()>) -> io::Result<()>,
     ) -> io::Result<()> {
         if received > now {
@@ -2868,7 +2911,7 @@ impl Driver {
         }
         if self.records.is_compact()
             && carrier.is_none()
-            && framing != Some(l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::Final)
+            && framing != Some(carrier::InputFraming::Final)
         {
             // The authenticated selection uses appearance only for setup tails;
             // ordinary established compact records have no cover envelope.
@@ -2878,7 +2921,7 @@ impl Driver {
             {
                 return Ok(());
             }
-            if framing == Some(l2tunnel_openvpn::wire_carrier::common::ReceiveFraming::DataV1) {
+            if framing == Some(carrier::InputFraming::Bootstrap) {
                 // Explicit bootstrap framing never falls through to a final record,
                 // even when its inner media header overlaps a final route selector.
                 self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
@@ -3368,6 +3411,8 @@ impl Driver {
         };
         if let Some(raw) = runtime.contract.raw_outer() {
             raw.geometry().ip_tcp_bytes + raw.geometry().record_overhead_bytes
+        } else if let Some(outer) = runtime.contract.maintained_outer() {
+            outer.requested().geometry.bootstrap_overhead_bytes
         } else {
             self.ip + usize::from(runtime.contract.on_outer_carrier())
         }

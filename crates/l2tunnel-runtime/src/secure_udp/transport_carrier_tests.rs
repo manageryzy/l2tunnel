@@ -139,7 +139,11 @@ async fn actual_outer_io_keeps_separate_tickets_and_only_reports_whole_original_
                 return Err("queue admission became completion".into());
             };
             assert_eq!(
-                (receipt.record_bytes, receipt.udp_bytes, receipt.ip_bytes),
+                (
+                    receipt.record_bytes,
+                    receipt.udp_bytes,
+                    receipt.charged_bytes
+                ),
                 (4, Some(5), 33)
             );
             assert!(!late);
@@ -154,7 +158,7 @@ async fn actual_outer_io_keeps_separate_tickets_and_only_reports_whole_original_
                 (
                     receipt.record_bytes,
                     receipt.udp_bytes,
-                    receipt.ip_bytes,
+                    receipt.charged_bytes,
                     cost
                 ),
                 (7, Some(8), 36, 36)

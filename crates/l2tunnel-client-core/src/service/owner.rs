@@ -196,6 +196,11 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             common::establish(&shared, &plan, accepted, deadline, profile)
         ),
         #[cfg(unix)]
+        Transport::SecureUdpCommonMaintained(profile) => selected!(
+            deadline,
+            common::maintained::establish(&shared, &plan, accepted, deadline, profile)
+        ),
+        #[cfg(unix)]
         Transport::SecureUdpCommonRaw {
             profile,
             raw,

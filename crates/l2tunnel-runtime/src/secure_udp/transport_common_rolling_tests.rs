@@ -1,5 +1,7 @@
 //! Actual bounded rolling service and physical output custody in the common loop.
 use super::*;
+#[path = "transport_common_maintained_tests.rs"]
+mod maintained;
 use l2tunnel::{
     codec, fec::rolling, record_configuration as c, record_engine as engine, rolling_records,
 };

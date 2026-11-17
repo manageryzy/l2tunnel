@@ -32,6 +32,10 @@ pub mod carrier;
 #[path = "establish_raw_carrier.rs"]
 pub mod raw_carrier;
 
+/// Initial-only Noise on an actual retained TLS or genuine QUIC owner.
+#[path = "establish_maintained.rs"]
+pub mod maintained;
+
 // Only the carrier branch needs retained send tickets. The UDP branch keeps its
 // original borrowed I/O and test hooks, without a per-packet allocation.
 #[allow(clippy::large_enum_variant)]
@@ -39,6 +43,7 @@ pub(in crate::secure_udp) enum SocketBacking<R: RawBacking = NoRaw> {
     Udp(UdpSocket),
     Carrier(super::original_datagram::OriginalDatagram),
     Raw(R),
+    Maintained(super::maintained_io::Carrier),
 }
 impl<R: RawBacking> SocketBacking<R> {
     pub(in crate::secure_udp) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -46,6 +51,7 @@ impl<R: RawBacking> SocketBacking<R> {
             Self::Udp(socket) => socket.local_addr(),
             Self::Carrier(socket) => Ok(socket.addresses().0),
             Self::Raw(socket) => Ok(socket.addresses().0),
+            Self::Maintained(socket) => Ok(socket.addresses().0),
         }
     }
     pub(in crate::secure_udp) fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -53,6 +59,7 @@ impl<R: RawBacking> SocketBacking<R> {
             Self::Udp(socket) => socket.peer_addr(),
             Self::Carrier(socket) => Ok(socket.addresses().1),
             Self::Raw(socket) => Ok(socket.addresses().1),
+            Self::Maintained(socket) => Ok(socket.addresses().1),
         }
     }
     fn physical_overhead(&self) -> io::Result<usize> {
@@ -74,6 +81,9 @@ impl<R: RawBacking> SocketBacking<R> {
                 .ip_tcp_bytes
                 .checked_add(socket.geometry().record_overhead_bytes)
                 .ok_or_else(|| io::Error::other("raw physical overhead overflow")),
+            // This existing setup seam carries a configured admission allowance;
+            // maintained transports do not expose a per-record physical IP fact.
+            Self::Maintained(socket) => Ok(socket.geometry().bootstrap_overhead_bytes),
         }
     }
     pub(in crate::secure_udp) fn receive_capacity(&self, maximum: usize) -> io::Result<usize> {
@@ -81,6 +91,7 @@ impl<R: RawBacking> SocketBacking<R> {
             Self::Udp(_) => maximum,
             Self::Carrier(socket) => maximum.max(socket.geometry().max_datagram_bytes),
             Self::Raw(socket) => maximum.max(socket.geometry().max_record_bytes),
+            Self::Maintained(socket) => maximum.max(socket.geometry().max_bootstrap_bytes),
         };
         maximum
             .checked_add(1)
@@ -89,7 +100,7 @@ impl<R: RawBacking> SocketBacking<R> {
     pub(in crate::secure_udp) fn into_udp(self) -> io::Result<UdpSocket> {
         match self {
             Self::Udp(socket) => Ok(socket),
-            Self::Carrier(_) | Self::Raw(_) => Err(io::Error::new(
+            Self::Carrier(_) | Self::Raw(_) | Self::Maintained(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "carrier custody is not a UDP handoff",
             )),
@@ -100,7 +111,7 @@ impl<R: RawBacking> SocketBacking<R> {
     ) -> io::Result<super::original_datagram::OriginalDatagram> {
         match self {
             Self::Carrier(socket) => Ok(socket),
-            Self::Udp(_) | Self::Raw(_) => Err(io::Error::new(
+            Self::Udp(_) | Self::Raw(_) | Self::Maintained(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "noncarrier custody is not an original-datagram handoff",
             )),
@@ -112,6 +123,17 @@ impl<R: RawBacking> SocketBacking<R> {
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "actual raw custody required",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) fn into_maintained(
+        self,
+    ) -> io::Result<super::maintained_io::Carrier> {
+        match self {
+            Self::Maintained(socket) => Ok(socket),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "actual maintained custody required",
             )),
         }
     }
@@ -138,6 +160,19 @@ impl<R: RawBacking> SocketBacking<R> {
                 })
                 .await
             }
+            Self::Maintained(socket) => {
+                let deadline = socket.setup_deadline();
+                let received = socket.recv(output, deadline).await?;
+                // Initial parsers never reinterpret selected final records as
+                // bootstrap, even if a peer races its own completed handoff.
+                Ok(
+                    if received.framing == super::maintained_io::Framing::Bootstrap {
+                        received.bytes
+                    } else {
+                        0
+                    },
+                )
+            }
         }
     }
     pub(in crate::secure_udp) async fn send_control(
@@ -145,6 +180,17 @@ impl<R: RawBacking> SocketBacking<R> {
         bytes: &[u8],
         deadline: Instant,
     ) -> io::Result<()> {
+        if let Self::Maintained(socket) = self {
+            socket
+                .send(
+                    super::maintained_io::Class::Control,
+                    bytes,
+                    deadline,
+                    super::maintained_io::Framing::Bootstrap,
+                )
+                .await?;
+            return Ok(());
+        }
         if let Self::Raw(socket) = self {
             return timeout_at(
                 deadline,
@@ -276,14 +322,22 @@ pub struct Statistics {
     pub received_datagrams: u64,
     /// Input discarded without authentication or protocol progress.
     pub ignored_datagrams: u64,
-    /// Complete covered packets handed to a bounded socket/send slot.
+    /// Attempted complete covered records handed to a bounded socket/send slot.
+    /// The historical name does not imply a maintained transport datagram.
     pub emitted_datagrams: u64,
-    /// Complete covered UDP payload bytes handed off, excluding IP/UDP.
+    /// Attempted original covered-record bytes, excluding outer framing/protection.
+    /// For maintained TLS/QUIC this historical name is not a UDP or IP wire count.
     pub emitted_udp_bytes: u64,
     /// Complete datagrams accepted by the native socket during establishment.
     pub socket_sent_datagrams: u64,
     /// UDP payload bytes accepted by the native socket during establishment.
     pub socket_sent_udp_bytes: u64,
+    /// Complete bootstrap records accepted by TLS flush or Quinn's send facility.
+    /// These are not native socket writes, TCP ACKs or peer deliveries.
+    pub maintained_accepted_records: u64,
+    /// Original covered bootstrap bytes at the named maintained acceptance boundary.
+    /// Outer framing, TLS/QUIC encryption and retransmissions are not included.
+    pub maintained_accepted_record_bytes: u64,
     /// Admitted send attempts lost to a transient path/socket condition.
     pub socket_drops: u64,
     /// Transient receive failures, charged against the finite receive-work quota.
@@ -1638,14 +1692,38 @@ fn emitted(statistics: &mut Statistics, bytes: usize) {
 fn ignored(statistics: &mut Statistics) {
     statistics.ignored_datagrams = statistics.ignored_datagrams.saturating_add(1);
 }
-fn sent(statistics: &mut Statistics, bytes: usize, accepted: bool) {
-    if accepted {
-        statistics.socket_sent_datagrams = statistics.socket_sent_datagrams.saturating_add(1);
-        statistics.socket_sent_udp_bytes = statistics
-            .socket_sent_udp_bytes
-            .saturating_add(bytes as u64);
-    } else {
-        statistics.socket_drops = statistics.socket_drops.saturating_add(1);
+enum SendAcceptance {
+    Socket,
+    Maintained,
+    Dropped,
+}
+impl From<bool> for SendAcceptance {
+    fn from(accepted: bool) -> Self {
+        if accepted {
+            Self::Socket
+        } else {
+            Self::Dropped
+        }
+    }
+}
+fn sent(statistics: &mut Statistics, bytes: usize, accepted: impl Into<SendAcceptance>) {
+    match accepted.into() {
+        SendAcceptance::Socket => {
+            statistics.socket_sent_datagrams = statistics.socket_sent_datagrams.saturating_add(1);
+            statistics.socket_sent_udp_bytes = statistics
+                .socket_sent_udp_bytes
+                .saturating_add(bytes as u64);
+        }
+        SendAcceptance::Maintained => {
+            statistics.maintained_accepted_records =
+                statistics.maintained_accepted_records.saturating_add(1);
+            statistics.maintained_accepted_record_bytes = statistics
+                .maintained_accepted_record_bytes
+                .saturating_add(bytes as u64);
+        }
+        SendAcceptance::Dropped => {
+            statistics.socket_drops = statistics.socket_drops.saturating_add(1);
+        }
     }
 }
 fn received_length(
@@ -1695,12 +1773,16 @@ async fn send_backing<R: RawBacking>(
     socket: &mut SocketBacking<R>,
     bytes: &[u8],
     deadline: Instant,
-) -> Result<bool, Error> {
+) -> Result<SendAcceptance, Error> {
     match socket {
-        SocketBacking::Udp(socket) => send(socket, bytes, deadline).await,
+        SocketBacking::Udp(socket) => send(socket, bytes, deadline).await.map(Into::into),
         SocketBacking::Carrier(_) | SocketBacking::Raw(_) => {
             socket.send_control(bytes, deadline).await?;
-            Ok(true)
+            Ok(SendAcceptance::Socket)
+        }
+        SocketBacking::Maintained(_) => {
+            socket.send_control(bytes, deadline).await?;
+            Ok(SendAcceptance::Maintained)
         }
     }
 }

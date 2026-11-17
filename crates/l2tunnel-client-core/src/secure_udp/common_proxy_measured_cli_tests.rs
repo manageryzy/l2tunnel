@@ -26,7 +26,7 @@ fn measured_common_requires_retained_before_files_and_preserves_complete_policy(
     let mut selected = options(missing, missing);
     selected.insert("--traffic".into(), "proxy-measured".into());
     let connection = configuration(&selected)?;
-    assert!(selection(&selected, connection, true, Carrier::OriginalUdp).is_err());
+    assert!(selection(&selected, connection, true, &Carrier::OriginalUdp).is_err());
     assert_eq!(
         super::super::super::selection_for("connect", &selected, connection, true)
             .err()
@@ -38,17 +38,17 @@ fn measured_common_requires_retained_before_files_and_preserves_complete_policy(
         &selected,
         connection,
         true,
-        Carrier::OriginalUdp
+        &Carrier::OriginalUdp
     )?);
     for carrier in [Carrier::OpenVpn, Carrier::RawPacket] {
-        assert!(selection(&selected, connection, true, carrier).is_err());
+        assert!(selection(&selected, connection, true, &carrier).is_err());
     }
     let mut half = connection;
     half.duplex = Duplex::Half;
-    assert!(selection(&selected, half, true, Carrier::OriginalUdp).is_err());
+    assert!(selection(&selected, half, true, &Carrier::OriginalUdp).is_err());
     let mut wrong = selected.clone();
     wrong.insert("--proxy-close".into(), "legacy".into());
-    assert!(selection(&wrong, connection, true, Carrier::OriginalUdp).is_err());
+    assert!(selection(&wrong, connection, true, &Carrier::OriginalUdp).is_err());
     let policy = document();
     let file = Temporary::new(&serde_json::to_vec(&policy).map_err(io::Error::other)?)?;
     selected.insert(

@@ -3,9 +3,12 @@
 //! This is distinct from custom QUIC-like headers. No native devices, MUX or
 //! recovery engine are provided. QUIC always encrypts; configured ALPN is visible.
 
+pub mod common;
 mod config;
 mod owned_endpoint;
-pub use config::{ClientConfig, EndpointLimits, Profile, ServerConfig, Traffic, session_config};
+pub use config::{
+    ClientConfig, DatagramFormat, EndpointLimits, Profile, ServerConfig, Traffic, session_config,
+};
 
 use std::fmt;
 use std::io;
@@ -432,6 +435,10 @@ impl AuthenticatedConnection {
     pub fn info(&self) -> &SessionInfo {
         &self.control.session.info
     }
+    /// Actual authenticated carrier profile, before any caller-owned Common handoff.
+    pub fn profile(&self) -> Profile {
+        self.control.session.profile
+    }
     /// Current authenticated QUIC peer endpoint, for an additional configured-address admission check.
     /// Address matching is not a substitute for certificate/member authentication.
     pub fn peer_addr(&self) -> SocketAddr {
@@ -457,7 +464,7 @@ fn finish_connection(
 ) -> Result<AuthenticatedConnection, Error> {
     if connection
         .max_datagram_size()
-        .is_none_or(|max| max < HEADER + profile.max_datagram_bytes)
+        .is_none_or(|max| max < profile.maximum_carrier_bytes())
     {
         return Err(Error::Protocol("negotiated DATAGRAM capacity too small"));
     }
@@ -560,6 +567,11 @@ impl DatagramSender {
     /// Cancellation can consume a sequence but never reuses one.
     pub async fn send(&mut self, payload: &[u8]) -> Result<u64, Error> {
         self.session.check()?;
+        if self.session.profile.datagram_format != DatagramFormat::Legacy {
+            return Err(Error::Configuration(
+                "selected Common requires its actual carrier owner",
+            ));
+        }
         if !self
             .session
             .profile
@@ -640,6 +652,11 @@ impl DatagramReceiver {
     /// A cancelled wait is safe and does not mutate the replay window.
     pub async fn receive(&mut self, output: &mut [u8]) -> Result<Received, Error> {
         self.session.check()?;
+        if self.session.profile.datagram_format != DatagramFormat::Legacy {
+            return Err(Error::Configuration(
+                "selected Common requires its actual carrier owner",
+            ));
+        }
         if !self
             .session
             .profile
@@ -672,7 +689,7 @@ impl DatagramReceiver {
         }
         let len = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
         if len == 0
-            || len > self.session.profile.max_datagram_bytes
+            || len > self.session.profile.maximum_bootstrap_bytes()
             || len > output.len()
             || packet.len() != HEADER + len
         {

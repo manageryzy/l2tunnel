@@ -10,6 +10,10 @@ pub mod control;
 pub mod diagnostics;
 /// Original connected UDP admission, maintained Noise and bootstrap custody.
 pub mod establish;
+/// Genuine maintained compatibility carriers and their explicit acceptance boundaries.
+pub mod maintained;
+/// Bounded ownership of original TLS/QUIC I/O through the Common handoff.
+pub mod maintained_io;
 /// Actual existing-member proof and authenticated acceptance on that same socket.
 pub mod member;
 /// Single original UDP/OpenVPN owner with explicit physical-send completion tickets.
@@ -28,3 +32,15 @@ mod diagnostics_tests;
 #[allow(dead_code)]
 // Pure runtime adapter is exercised separately; no periodic default is installed.
 pub mod session_refresh;
+
+/// The precise local send boundary used for custody and recovery timing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SendBoundary {
+    /// A complete UDP/raw packet was accepted by the original socket/PacketIo.
+    #[default]
+    SocketAccepted,
+    /// The original maintained TLS stream accepted and flushed a complete frame.
+    TlsStreamFlushed,
+    /// Quinn accepted the DATAGRAM; scheduling and UDP transmission remain downstream.
+    QuicDatagramAccepted,
+}

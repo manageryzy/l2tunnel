@@ -411,3 +411,100 @@ async fn actual_tag8_prepared_service_authenticates_catalog_delivers_tcp_and_rep
 
 #[path = "secure_udp_common_reuse.rs"]
 mod reuse;
+
+#[test]
+fn maintained_requested_reuse_is_explicit_and_commits_before_outer_authentication() -> Result {
+    let hosts = support::hosts();
+    let selected = selected_reuse(&hosts, false)?;
+    let original = selected.profile;
+    let mut settings = original.settings();
+    settings.cover.max_packet_bytes = 1250;
+    settings.cover.max_protected_bytes = 1220;
+    settings.gate.arq.max_source_bytes = 1000;
+    settings.gate.arq.send_bytes = 1000 * settings.gate.arq.send_records;
+    settings.gate.arq.receive_bytes = 1000 * settings.gate.arq.receive_records;
+    let mut resources = [
+        original.runtime_contract(Role::Initiator)?.resources(),
+        original.runtime_contract(Role::Responder)?.resources(),
+    ];
+    for resource in &mut resources {
+        resource.security.max_body_bytes = 1200;
+        resource.control.wire_overhead = 91;
+        for stream in &mut resource.streams.as_mut().ok_or("missing streams")?.streams {
+            stream.delivery.wire_overhead = 91 + l2tunnel_management::control_streams::HEADER_BYTES;
+        }
+    }
+    let old = original.catalog().initial();
+    let mut record = *old.profile();
+    let common::Profile::PerConnectionCompact { forward, reverse } = &mut record else {
+        return Err("missing connection profile".into());
+    };
+    for direction in [forward, reverse] {
+        direction.compact.recovery = CompactReliableConfig::new(
+            direction.compact.recovery.arq(),
+            79 + connections::route::HEADER_BYTES,
+        )?;
+    }
+    let descriptor = common::Descriptor::new(
+        1500,
+        Duplex::Full,
+        *old.direction(DataRole::Client).common(),
+        *old.direction(DataRole::Server).common(),
+        record,
+    )?;
+    let maintained = crate::secure_udp::maintained::Settings {
+        first: settings.gate.path,
+        second: None,
+        transport: crate::secure_udp::maintained::Transport::Tls(
+            l2tunnel_runtime::retained_tls::Limits {
+                max_record_bytes: 1430,
+                record_timeout: Duration::from_secs(2),
+            },
+        ),
+        geometry: l2tunnel_runtime::secure_udp::maintained::Geometry {
+            path_mtu: 1500,
+            max_record_bytes: 1430,
+            max_bootstrap_bytes: 1430,
+            charged_overhead_bytes: 70,
+            bootstrap_overhead_bytes: 70,
+            framing_bytes: 5,
+        },
+    };
+    let wire = l2tunnel::secure_record::compact::Selection {
+        protection: l2tunnel_security::compact::Protection::Aes128Ccm4,
+        limits: l2tunnel_security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    };
+    let construct = |reuse| {
+        let make = if reuse {
+            common_transaction_profile::Profile::new_maintained_compact_with_connection_reuse
+        } else {
+            common_transaction_profile::Profile::new_maintained_compact
+        };
+        make(
+            original.connection(),
+            settings,
+            original.peers(),
+            resources[0],
+            resources[1],
+            common::Catalog::new(descriptor, &[descriptor]).map_err(io::Error::other)?,
+            original.parameters(),
+            maintained,
+            wire,
+        )
+    };
+    let fixed = construct(false)?;
+    let reuse = construct(true)?;
+    assert!(!fixed.connection_reuse() && reuse.connection_reuse());
+    assert_ne!(
+        fixed.requested_configuration()?,
+        reuse.requested_configuration()?
+    );
+    assert_ne!(fixed.maintained_session()?, reuse.maintained_session()?);
+    assert_eq!(fixed.catalog().descriptors(), reuse.catalog().descriptors());
+    assert!(reuse.maintained_binding().is_none());
+    assert!(reuse.runtime_contract(Role::Initiator).is_err());
+    Ok(())
+}

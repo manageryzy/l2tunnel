@@ -20,8 +20,11 @@ pub use rolling_ingress::{
     RollingIngressLimits, RollingIngressObservation, RollingIngressPolicies, RollingIngressStatus,
 };
 
+#[path = "common_maintained_status.rs"]
+mod maintained;
 #[path = "common_raw_status.rs"]
 mod raw;
+pub use maintained::{MaintainedCarrier, MaintainedLane, MaintainedPolicy};
 pub use raw::{RawCarrier, RawFinalFraming, RawLane, RawPacketPolicy};
 
 #[path = "common_connection_status.rs"]
@@ -234,6 +237,9 @@ pub struct Status {
     /// Present only after the actual original raw TCP carrier authenticates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_carrier: Option<RawCarrier>,
+    /// Explicit maintained request and actual Driver observations; absent for legacy carriers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintained_carrier: Option<Box<MaintainedCarrier>>,
     /// Data algorithm, separate from carrier selection.
     pub algorithm: String,
     /// Actual required integrity/confidentiality profile.
@@ -391,15 +397,23 @@ mod observe {
             let configuration = profile.configuration()?;
             let settings = profile.settings();
             let effective = profile.establish_config(info.role)?;
-            let expected = match (profile.carrier_binding(), profile.raw_binding()) {
-                (Some(outer), None) => {
-                    outer.expected_binding(effective, profile.peers(), info.binding.session)
+            let expected = if let Some(outer) = profile.maintained_binding() {
+                outer.expected_binding(effective, profile.peers(), info.binding.session)
+            } else {
+                match (profile.carrier_binding(), profile.raw_binding()) {
+                    (Some(outer), None) => {
+                        outer.expected_binding(effective, profile.peers(), info.binding.session)
+                    }
+                    (None, Some(outer)) => {
+                        outer.expected_binding(effective, profile.peers(), info.binding.session)
+                    }
+                    (None, None) => {
+                        effective.expected_binding(profile.peers(), info.binding.session)
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(invalid("conflicting original carrier bindings"));
+                    }
                 }
-                (None, Some(outer)) => {
-                    outer.expected_binding(effective, profile.peers(), info.binding.session)
-                }
-                (None, None) => effective.expected_binding(profile.peers(), info.binding.session),
-                (Some(_), Some(_)) => return Err(invalid("conflicting original carrier bindings")),
             }
             .map_err(invalid)?;
             let path = settings.gate.path;
@@ -542,10 +556,13 @@ mod observe {
                 })
                 .transpose()?;
             let raw_carrier = RawCarrier::observe(profile, configuration, udp_cover, snapshot)?;
+            let maintained_carrier = MaintainedCarrier::observe(profile, snapshot)?.map(Box::new);
             Ok(Self {
                 generation,
                 next_request_key: None,
-                carrier: if raw_carrier.is_some() {
+                carrier: if let Some(value) = &maintained_carrier {
+                    &value.requested.carrier
+                } else if raw_carrier.is_some() {
                     "raw-packet"
                 } else if original_carrier.is_some() {
                     "openvpn-like"
@@ -555,6 +572,7 @@ mod observe {
                 .into(),
                 original_carrier,
                 raw_carrier,
+                maintained_carrier,
                 algorithm: "common-records".into(),
                 protection: profile
                     .compact_wire()

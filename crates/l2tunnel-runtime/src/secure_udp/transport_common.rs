@@ -16,6 +16,9 @@ pub(crate) use proxy_records::{run_common_proxy_records, run_common_proxy_record
 #[path = "transport_common_raw.rs"]
 mod raw;
 pub use raw::run_common_on_raw;
+#[path = "transport_common_maintained.rs"]
+mod maintained;
+pub use maintained::run_common_on_maintained;
 
 /// Observed recovery of the same connected UDP flow, not peer-state reconciliation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,6 +40,11 @@ pub struct SameFlowRecovery {
 /// Actual generic transaction state, separate from legacy Swift policy status.
 #[derive(Clone, Debug)]
 pub struct CommonSnapshot {
+    /// Actual maintained TLS/QUIC policy and original authenticated lanes.
+    /// Its geometry is an admission allowance, not a measured wire-byte total.
+    pub maintained: Option<crate::secure_udp::maintained::Authenticated>,
+    /// Actual local send completion boundary used to start recovery timers.
+    pub send_boundary: crate::secure_udp::SendBoundary,
     /// Explicit selected final record format; None preserves legacy framing.
     pub compact_wire: Option<record::compact::Selection>,
     /// Actual single-protection geometry installed on the original raw owner.
@@ -71,9 +79,9 @@ pub struct CommonSnapshot {
     pub resource_preallocation_complete: bool,
     /// Actual current common record owner observations.
     pub engine: engine::Statistics,
-    /// Actual local full-wire byte rate.
+    /// Selected local admission byte rate; maintained carriers use an allowance.
     pub send_rate: u64,
-    /// Actual remote full-wire byte rate.
+    /// Selected remote admission byte rate; maintained carriers use an allowance.
     pub receive_rate: u64,
     /// Actual local sending width.
     pub send_channels: u16,
@@ -463,6 +471,7 @@ impl Driver {
         if contract.refresh_selection().is_some()
             || contract.extra_wire_bytes() != 0
             || contract.raw_outer().is_some()
+            || contract.maintained_outer().is_some()
         {
             return Err(invalid("legacy Common requires unselected legacy contract"));
         }
@@ -919,6 +928,13 @@ impl Driver {
         counters.native_storage_capacity_bytes = self.native.capacity_bytes();
         counters.workspace_capacity_bytes = self.buffers.capacity_bytes();
         Ok(CommonSnapshot {
+            maintained: runtime.contract.maintained_outer(),
+            send_boundary: runtime
+                .contract
+                .maintained_outer()
+                .map_or(crate::secure_udp::SendBoundary::SocketAccepted, |outer| {
+                    outer.requested().kind.send_boundary()
+                }),
             compact_wire: runtime.contract.compact_wire(),
             compact_check_status: self.records.compact_check_status(),
             compact_feedback_number: runtime.compact_feedback_number,

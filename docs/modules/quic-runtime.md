@@ -9,6 +9,15 @@ QUIC DATAGRAM data. It is separate from custom `QuicLike` UDP and never changes
 existing custom UDP selections. No TCP socket is required. Hot switching remains
 unsupported and requires a fresh authenticated connection for profile changes.
 
+The description above and the fixed-profile acceptance ledger below apply to
+`runtime::quic` legacy entry points. The additive selected
+[Common maintained path](maintained-common-carriers.md) uses its own authenticated
+`DatagramFormat::CommonCompact` profile on the same genuine connection(s), then
+runs the existing Common epoch/management machinery. It sends Common feedback
+and control through DATAGRAMs; the retained reliable stream is monitored for
+connection lifecycle. This distinction does not retroactively change historical
+fixed-profile receipts or claim complete switching/Python/native qualification.
+
 ## API and composition
 
 `quic::Config::new(duplex, application_id, path_mtu, ipv6)` constructs finite

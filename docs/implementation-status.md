@@ -27,6 +27,20 @@ retirement. The [new batch receipt](../work/compact-carrier-migration-20261116/b
 records required-check results separately. Full SW-11/all47, native/platform,
 original MTU/repair/performance and ISP classification gates retain their definitions.
 
+The 2026-11-17 [maintained TLS/QUIC migration](modules/maintained-common-carriers.md)
+installs the selected compact Common path on original TCP/TLS and genuine Quinn
+Full/Half connections. Eight actual-connection runtime cases and two shared-service
+cases pass on the final Linux source, covering both data suites, four record
+families, authenticated switching/liveness and release. Shared API/CLI status
+separates requested and effective owners, configured admission charges, and
+TLS-flush/Quinn-acceptance receipts. Genuine outer TLS/QUIC AEAD remains additional.
+The [batch receipt](../work/maintained-compact-20261117/maintained-compact-scoped-validation.json)
+preserves initial failures and required-check continuations. Workspace tests pass
+2,532 cases with two OpenVPN timeouts and two ignored tests; both timeouts pass
+unchanged-binary exact follow-ups, with cause unqualified. This is finite loopback
+evidence, not a pristine suite pass or native/platform/performance qualification.
+Maintained proxy, scoped IPv6 and full parent gates remain explicitly unfinished.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

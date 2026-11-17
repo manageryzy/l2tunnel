@@ -508,3 +508,6 @@ mod research_common;
 
 #[path = "secure_udp_common_wire.rs"]
 mod compact_wire;
+
+#[path = "secure_udp_common_maintained.rs"]
+mod maintained_carrier;

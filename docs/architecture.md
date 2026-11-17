@@ -28,6 +28,18 @@ geometry remains separate from actual final 49/61-byte IPv4/TCP data/control
 geometry. Full SW-11/all47, native/platform, geometry, protocol-identification and
 performance gates retain their complete definitions and scoped evidence.
 
+The additive [maintained-carrier migration](modules/maintained-common-carriers.md)
+connects the selected Common record path to genuine Quinn DATAGRAMs and ordinary
+TCP/TLS Full/Half owners. Initial-only Noise/member acceptance follows actual
+outer authentication on the same original connection(s); final compact Records
+retain maintained TLS/QUIC encryption as an additional outer layer. Final Common
+feedback and management share the selected carrier. Admission allowances and
+TLS-flush/Quinn-acceptance counters are distinct from physical socket/wire facts.
+The eight actual-connection runtime cases and two shared-service cases pass in
+the final-source Linux regression; the linked module records exact commands and
+remaining aggregate failures. Existing legacy defaults/receipts, complete SW-11/
+all47, proxy, native/platform and measured performance requirements remain unchanged.
+
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy
 admission-time repair credit and actual source/repair batch packing, measured

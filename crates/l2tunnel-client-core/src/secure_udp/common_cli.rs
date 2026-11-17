@@ -225,6 +225,53 @@ impl Plan {
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
     ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.build_selected_on(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            overhead,
+            raw,
+            proxy,
+            measured,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_maintained(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        maintained: secure_udp::maintained::Settings,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
+        self.validate_carrier(false)?;
+        self.build_selected_on(
+            connection,
+            settings,
+            peers,
+            maximum_body,
+            maintained.geometry.charged_overhead_bytes,
+            None,
+            None,
+            None,
+            Some(maintained),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_selected_on(
+        &self,
+        connection: ConnectionConfig,
+        settings: secure_udp::Settings,
+        peers: establish::Peers,
+        maximum_body: usize,
+        overhead: usize,
+        raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
+        measured: Option<l2tunnel_runtime::proxy::measured::Config>,
+        maintained: Option<secure_udp::maintained::Settings>,
+    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
         // Config shares a legacy-shaped resource container. These explicit inert
         // fields are not selected, hashed or resolved by CommonTransactionContract.
         let inert = l2tunnel_swift::policy::Direction {
@@ -250,7 +297,9 @@ impl Plan {
             },
         };
         let overhead = if self.compact_wire.is_some() {
-            let physical: usize = if let Some(policy) = raw {
+            let physical: usize = if let Some(selected) = maintained {
+                selected.geometry.charged_overhead_bytes
+            } else if let Some(policy) = raw {
                 policy
                     .record_geometry()
                     .map_err(io::Error::other)?
@@ -300,6 +349,23 @@ impl Plan {
             config.rolling_work = self.rolling_work;
             config.ack_coalescing = ack;
             config.rolling_ingress = rolling;
+        }
+        if let Some(maintained) = maintained {
+            let selection = self
+                .compact_wire
+                .ok_or_else(|| invalid("maintained Common requires explicit compact_wire"))?
+                .build()?;
+            return secure_udp::common_transaction_profile::Profile::new_maintained_compact(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                maintained,
+                selection,
+            );
         }
         if let Some(policy) = raw {
             if let Some(selection) = self.compact_wire {

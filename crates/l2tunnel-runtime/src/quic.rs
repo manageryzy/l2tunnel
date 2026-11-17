@@ -210,6 +210,7 @@ impl Config {
         };
         Ok(Profile {
             application_id: self.application_id,
+            datagram_format: carrier::DatagramFormat::Legacy,
             traffic,
             lane: if lane == Lane::First { 0 } else { 1 },
             max_datagram_bytes: self.payload_bytes()?,

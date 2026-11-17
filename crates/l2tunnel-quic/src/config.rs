@@ -26,6 +26,14 @@ impl Traffic {
         }
     }
 }
+/// Explicit framing selection, authenticated before carrier member acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatagramFormat {
+    /// Existing private envelope and carrier-owned replay window.
+    Legacy,
+    /// Explicit Common bootstrap followed by externally protected compact records.
+    CommonCompact,
+}
 /// Canonical peer-agreed profile, included in the member authentication digest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Profile {
@@ -35,11 +43,13 @@ pub struct Profile {
     pub traffic: Traffic,
     /// Physical lane identity included in the authenticated profile.
     pub lane: u32,
-    /// Maximum application payload per DATAGRAM, excluding the 48-byte envelope.
+    /// Explicit authenticated framing; legacy callers retain their original bytes.
+    pub datagram_format: DatagramFormat,
+    /// Maximum application payload for Legacy, or complete final Common record.
     pub max_datagram_bytes: usize,
     /// Queue byte allowance in maximum-sized record units, including metadata headroom.
     /// Smaller records may occupy more entries. Receive metadata is charged by
-    /// Quinn; send entry count is bounded by our minimum 49-byte envelope.
+    /// Quinn; send entry count uses the selected minimum complete DATAGRAM size.
     pub queued_datagrams: usize,
     /// Per-connection reliable control send/receive window in bytes.
     pub control_window_bytes: usize,
@@ -57,6 +67,7 @@ impl Profile {
             application_id,
             traffic: Traffic::FullDuplex,
             lane: 0,
+            datagram_format: DatagramFormat::Legacy,
             max_datagram_bytes: 1024,
             queued_datagrams: 32,
             control_window_bytes: 65536,
@@ -72,10 +83,16 @@ impl Profile {
                 "application identifier must be explicitly configured",
             ));
         }
+        let envelope = match self.datagram_format {
+            DatagramFormat::Legacy => HEADER,
+            DatagramFormat::CommonCompact => 0,
+        };
         if !(1200..=65507).contains(&self.udp_payload_ceiling)
             || self.max_datagram_bytes == 0
             || self.max_datagram_bytes
-                > usize::from(self.udp_payload_ceiling).saturating_sub(128 + HEADER)
+                > usize::from(self.udp_payload_ceiling).saturating_sub(128 + envelope)
+            || (self.datagram_format == DatagramFormat::CommonCompact
+                && self.max_datagram_bytes <= HEADER)
             || !(1..=1024).contains(&self.queued_datagrams)
             || !(1024..=1048576).contains(&self.control_window_bytes)
         {
@@ -86,6 +103,39 @@ impl Profile {
         valid_duration(self.idle_timeout)?;
         valid_duration(self.io_timeout)?;
         Ok(())
+    }
+    /// Complete maximum DATAGRAM queued in maintained QUIC, excluding QUIC framing.
+    pub fn maximum_carrier_bytes(self) -> usize {
+        self.max_datagram_bytes
+            .saturating_add(if self.datagram_format == DatagramFormat::Legacy {
+                HEADER
+            } else {
+                0
+            })
+    }
+    /// Maximum payload accepted under the retained post-member bootstrap envelope.
+    pub fn maximum_bootstrap_bytes(self) -> usize {
+        match self.datagram_format {
+            DatagramFormat::Legacy => self.max_datagram_bytes,
+            DatagramFormat::CommonCompact => self.max_datagram_bytes.saturating_sub(HEADER),
+        }
+    }
+    /// Configured maintained queue bytes; neither packet emission nor exact heap usage.
+    pub fn datagram_queue_bytes(self) -> Result<usize, Error> {
+        self.validate()?;
+        self.maximum_carrier_bytes()
+            .checked_add(64)
+            .and_then(|value| value.checked_mul(self.queued_datagrams))
+            .ok_or(Error::Configuration("datagram queue overflow"))
+    }
+    /// Conservative send-entry count from the authenticated minimum record size.
+    pub fn maximum_queued_send_entries(self) -> Result<usize, Error> {
+        let minimum = if self.datagram_format == DatagramFormat::Legacy {
+            HEADER + 1
+        } else {
+            9
+        };
+        Ok(self.datagram_queue_bytes()?.div_ceil(minimum))
     }
 }
 /// Local endpoint resource ceilings, not negotiated application semantics.
@@ -129,7 +179,10 @@ fn valid_duration(value: Duration) -> Result<(), Error> {
 pub fn session_config(base: SessionConfig, profile: Profile) -> Result<SessionConfig, Error> {
     profile.validate()?;
     let mut bytes = Vec::with_capacity(160);
-    bytes.extend_from_slice(b"l2tunnel/genuine-quic/profile/v1\0");
+    bytes.extend_from_slice(match profile.datagram_format {
+        DatagramFormat::Legacy => b"l2tunnel/genuine-quic/profile/v1\0",
+        DatagramFormat::CommonCompact => b"l2tunnel/genuine-quic/common-compact/v1\0",
+    });
     bytes.push(match base.layer {
         l2tunnel_device::PacketLayer::Ethernet => 1,
         l2tunnel_device::PacketLayer::Ip => 2,
@@ -305,9 +358,7 @@ fn transport(profile: Profile, server: bool) -> Result<quinn::TransportConfig, E
     config.mtu_discovery_config(None);
     config.crypto_buffer_size(65536);
     config.allow_spin(false);
-    let bytes = (HEADER + profile.max_datagram_bytes + 64)
-        .checked_mul(profile.queued_datagrams)
-        .ok_or(Error::Configuration("datagram queue overflow"))?;
+    let bytes = profile.datagram_queue_bytes()?;
     config.datagram_receive_buffer_size(Some(bytes));
     config.datagram_send_buffer_size(bytes);
     Ok(config)
