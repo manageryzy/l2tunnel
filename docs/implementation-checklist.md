@@ -181,9 +181,15 @@ the next implementation work. No passing throughput or full BP row is inferred.
 The [batch19 staged-source and selected-wake implementation](modules/buffer-observability.md#exact-staged-identity-and-selected-wake-observations)
 and [QUIC ticket custody](modules/buffer-observability.md#exact-maintained-quic-ticket-custody),
 plus [same-budget Rolling encoder batching](modules/buffer-observability.md#same-budget-rolling-encoder-batching),
-pass [coordinated local validation](modules/buffer-observability.md#coordinated-local-buffer-batch19-validation);
-native validation remains pending. Identity attachments do not create another
-wait union, and selected Pending time is not buffer backpressure. All original algorithm, resource and coverage gates remain.
+pass [coordinated local validation](modules/buffer-observability.md#coordinated-local-buffer-batch19-validation).
+The [native19 continuation](modules/buffer-observability.md#native19-exact-admission-barriers-and-lower-quic-acceptance)
+qualifies one finite QUIC forward phase at 0.2826496 Mbit/s; Cauchy/TLS exhaust
+their original workload bounds and Rolling reaches its original recovery expiry.
+It identifies a 9.003333-second Cauchy oldest-hole admission barrier and 51.924798
+seconds of QUIC User ticket first-poll-to-queue-acceptance waiting. All twelve
+buffer owners validate. Identity attachments do not create another wait union,
+and selected Pending time is not buffer backpressure. All original algorithm,
+resource and coverage gates remain.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

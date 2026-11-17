@@ -1388,8 +1388,8 @@ overhead remain open.
 
 ### Exact staged identity and selected-wake observations
 
-Batch19 implementation passes the coordinated local checks below; native
-validation remains pending. The existing staged-source wait remains the only duration aggregate.
+Batch19 implementation passes the coordinated local checks below; the finite
+native19 findings are recorded below. The existing staged-source wait remains the only duration aggregate.
 Optional prepaid Reliable metadata retains the pending, last, maximum completed
 and maximum censored source identities, with actual first/latest count, byte and
 sequence-span admission predicates. Oldest retained flight state distinguishes
@@ -1419,8 +1419,8 @@ schema1 keeps seventeen stages and explicitly unavailable selection facts.
 
 ### Exact maintained QUIC ticket custody
 
-Batch19 implementation passes the coordinated local checks below; native
-validation remains pending. Two fixed live cells and eight fixed lane/class/consumer summaries
+Batch19 implementation passes the coordinated local checks below; the finite
+native19 findings are recorded below. Two fixed live cells and eight fixed lane/class/consumer summaries
 observe successful lower submission, first actual lower poll, returned queue
 acceptance, lower result storage, Common wrapper observation and actual upper
 take. Exact owner/serial/class identity and the original Common User epoch,
@@ -1447,8 +1447,8 @@ source or spend beyond the original copy/field/metadata allowance. Cached
 coefficients, per-call cursor, immutable output, memory reservation, expiry and
 failure ordering remain unchanged. Passing focused coverage checks exact
 partial-work cursors/charges, zero allowances, an independently generated Python
-equation and the original expiry. Native validation remains pending; this
-source-level reduction does not yet establish a throughput gain.
+equation and the original expiry. Native19 still reaches the original Rolling
+expiry; this source-level reduction does not establish a throughput gain.
 
 
 ### Coordinated local buffer batch19 validation
@@ -1477,3 +1477,58 @@ Compact keeps its explicit base. Only that private implementation body changes;
 formatting, affected strict Clippy, recovery tests and staged diagnostic callers
 pass. No benchmark policy, work allowance, deadline or memory quota changes.
 Full buffer coverage and the full current-build native matrix remain open.
+
+### Native19 exact admission barriers and lower QUIC acceptance
+
+The [source-bound findings](../../work/aligned-extents-20261117/native19-analysis1/findings1.json)
+and [canonical extraction](../../work/aligned-extents-20261117/native19-analysis1/extracted1/analysis.json)
+cover four finite cases from `e00e0856817202e22bf109bc398ec2f4a3ff3cca`.
+All retain Full/TUN, sixteen real kernel TCP flows, 100/10 Mbit/s, 35 ms delay
+and 15% independent loss each way, two-second warmup, ten-second sample and
+the original quotas and deadlines. Source, binaries and helpers remain stable;
+owned namespace cleanup and output ownership restoration complete.
+
+| Case | Direction | Qualified goodput | Outcome |
+|---|---|---:|---|
+| Aligned Cauchy UDP | Forward | Unavailable | Original workload bound exhausted |
+| Rolling UDP | Forward | Unavailable | Original recovery expiry |
+| Swift genuine QUIC | Forward | 0.2826496 Mbit/s | Data phase and local disconnect pass |
+| Swift genuine TLS | Reverse | Unavailable | Original workload bound exhausted |
+
+Cauchy and TLS sample-window values, 0.4089152 and 0.2583232 Mbit/s, are
+unqualified because their whole phases fail. Requested local disconnect passes
+for Cauchy, QUIC and TLS; it fails for Rolling and does not prove bilateral
+protocol drain. One QUIC pass is not repeated stability or throughput-improvement
+evidence. Twelve buffer owners, eight wire owners and eight Common schema 2
+execution snapshots validate without rejection.
+
+Cauchy client staged-source admission waits total 57.247704 seconds completed
+and 0.170968 seconds censored. Its maximum completed wait, source 1844 / Flow 12 /
+channel 11 / native record 58, lasts 9.003333 seconds. Oldest source 1780 stays
+unacknowledged while retained count falls from 19 to 1 of 64; only the sequence-span
+predicate blocks. Attempts rise from 1 to 7, with no held physical transmission
+at either endpoint observation. A real input retires one 1252-byte source 38 us
+before admission. This establishes the oldest-hole admission barrier, without
+distinguishing lost source, lost feedback or feedback semantics. ACK prefix and
+bitmap remain unavailable in this executable. Overlapping reason intervals are
+not added to this wait total.
+
+QUIC client User tickets record 51.924798 seconds across 2,877 completed intervals
+from first lower poll to returned queue acceptance, maximum 3.074046 seconds.
+Creation-to-first-poll totals 31,592 us, maximum 807 us; acceptance-to-latch totals
+1,827 us, latch-to-upper-observation 11,996 us and upper-observation-to-take 30,320 us.
+The boundary is Quinn `send_datagram_wait`: it is DATAGRAM queue acceptance,
+not STREAM flow control or physical IP transmission. Provider queue, congestion
+and pacing dependencies require separate evidence; independent populations and
+percentiles must not be summed. TLS winning-poll-entry lateness maxima are
+2,382/2,245 us for a/b; these wall-clock maxima alone do not establish kernel
+or network causality.
+
+Record protection remains 21 bytes mean/p99 in all eight emission populations.
+Systematic source fill remains zero in Cauchy's 5,024/2,475 and Rolling's 1,150/81
+a/b emissions. Same-emission IPv4 bytes outside codec body have mean/p99 of
+69.399692/73 and 68.164140/72 B for Cauchy a/b, and 60.207826/68 and 71.740741/105 B
+for Rolling. These warmup/retry/drain populations are not full original-native
+overhead. Swift stream/native and TLS/QUIC physical-packet joins remain unavailable.
+BP-01 through BP-24, the full 20-algorithm by 4-carrier by 3-phase current-build
+matrix and full original-native overhead remain open.
