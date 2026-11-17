@@ -271,6 +271,8 @@ pub(super) struct PendingIngress {
     pub(super) deadline: u64,
 }
 pub(super) struct Runtime {
+    pub(super) buffer_metrics: Option<crate::buffer_metrics::Observer>,
+    pub(super) next_raw_buffer_sample: u64,
     pub(super) wire_metrics: Option<wire_metrics::Observer>,
     pub(super) wire_sample: Option<wire_metrics::Sample>,
     pub(super) compact_arq_trace: Option<compact_arq_trace::Observer>,
@@ -431,8 +433,13 @@ fn reserve_common_state(
     identity: transaction::Identity,
     transaction_binding: delivery::Binding,
     external: usize,
+    timing: &mut crate::initialization_timing::Timing,
 ) -> io::Result<owner::ReservedCommonState> {
     let config = contract.resources();
+    timing.enter_at(
+        crate::initialization_timing::Stage::BankConstruction,
+        Instant::now(),
+    );
     let mut bank = common_engines::Bank::new_selected(
         identity,
         core::Epoch(config.data_epoch.0),
@@ -448,7 +455,15 @@ fn reserve_common_state(
         config.rolling_fragments,
         Some(contract.feedback_overhead_bytes()?),
     )?;
+    timing.enter_at(
+        crate::initialization_timing::Stage::BankActivation,
+        Instant::now(),
+    );
     bank.enable_compact_wire(contract.feedback_overhead_bytes()?)?;
+    timing.enter_at(
+        crate::initialization_timing::Stage::TransactionConstruction,
+        Instant::now(),
+    );
     let state = transactions::CommonState::new(
         identity,
         core::Epoch(config.data_epoch.0),
@@ -525,6 +540,11 @@ impl Driver {
         companion: S,
         finish: impl FnOnce(S, Self) -> io::Result<T>,
     ) -> io::Result<T> {
+        use crate::initialization_timing::{
+            Outcome as TimingOutcome, Owner as TimingOwner, Stage as TimingStage, Timing,
+        };
+        let mut timing = Timing::from_environment(TimingOwner::CommonConstruction, origin);
+        timing.enter_at(TimingStage::ContractAndRecords, Instant::now());
         if Instant::now() >= input.deadline || origin >= input.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -600,6 +620,7 @@ impl Driver {
             local_role: role,
             control_epoch: config.control_epoch.0,
         };
+        timing.enter_at(TimingStage::ControlAndExternalPlanning, Instant::now());
         let plans = provision::ControlPlan::new(&contract, binding)?;
         let wrapper_plan = plans.wrapper(config.control)?;
         let message_bytes = plans.capacity_bytes()?;
@@ -687,6 +708,7 @@ impl Driver {
             epoch: config.data_epoch.0,
             role,
         };
+        timing.enter_at(TimingStage::EngineAndBankPlanning, Instant::now());
         let initial_plan = engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
             contract.initial(),
             context,
@@ -714,9 +736,12 @@ impl Driver {
         // Allocate only after the complete external subtotal passed its admission.
         // Explicit diagnostics have their own bounded, reported heap; they never
         // borrow protocol storage or enlarge the authenticated protocol quota.
+        timing.enter_at(TimingStage::AuxiliaryConstruction, Instant::now());
         let wire_metrics =
             wire_metrics::Observer::from_environment(input.cover.limits().max_packet_bytes)?;
         let compact_arq_trace = compact_arq_trace::Observer::from_environment()?;
+        let buffer_metrics =
+            crate::buffer_metrics::Observer::from_environment_at("common", origin)?;
         let reuse_owner = if contract.connection_reuse() {
             Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
         } else {
@@ -770,8 +795,10 @@ impl Driver {
             identity,
             control.transaction_binding()?,
             external,
+            &mut timing,
         )?;
-        assemble_common_driver(move || {
+        timing.enter_at(TimingStage::DriverAssembly, Instant::now());
+        let result = assemble_common_driver(move || {
             let reserve = contract.reserve()?;
             let current = contract.initial();
             let local_policy = current.descriptor().local(role);
@@ -787,6 +814,8 @@ impl Driver {
                 .transpose()?;
             let common = owner::StateCell::new(Runtime {
                 wire_metrics,
+                buffer_metrics,
+                next_raw_buffer_sample: 0,
                 wire_sample: None,
                 compact_arq_trace,
                 #[cfg(unix)]
@@ -870,7 +899,16 @@ impl Driver {
                     terminal: None,
                 },
             )
-        })
+        });
+        timing.end_at(
+            Instant::now(),
+            if result.is_ok() {
+                TimingOutcome::Complete
+            } else {
+                TimingOutcome::Failed
+            },
+        );
+        result
     }
 
     pub(super) fn snapshot_common(&self, now: u64, running: bool) -> io::Result<CommonSnapshot> {

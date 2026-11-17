@@ -198,6 +198,20 @@ impl Sender {
             repairs_due: self.repairs_due,
         }
     }
+    /// Read actual queue/window occupancy without polling or updating any timer.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::SenderBuffers {
+        crate::diagnostics::SenderBuffers {
+            packing_bytes: self.queue.len(),
+            packing_capacity_bytes: self.config.queue_bytes,
+            source_records: self.sources.len(),
+            source_capacity_records: self.config.flow_sources,
+            source_bytes: self.sources.iter().map(|source| source.payload.len()).sum(),
+            source_capacity_bytes: self.config.flow_sources * self.config.symbol_bytes(),
+            retry_entries: self.retransmit.len(),
+            retry_capacity_entries: self.config.flow_sources,
+            repairs_due: self.repairs_due,
+        }
+    }
     /// Whether one more maximum-size native packet fits in the packing queue.
     pub fn has_room(&self) -> bool {
         self.queue

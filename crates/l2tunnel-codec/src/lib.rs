@@ -13,6 +13,9 @@ pub mod aligned_body;
 /// Fallible backing plans for the actual aligned and packed codec owners.
 pub mod aligned_storage;
 
+/// Allocation-free codec retention snapshots and typed actual refusal categories.
+pub mod diagnostics;
+
 mod fragment;
 mod frame;
 

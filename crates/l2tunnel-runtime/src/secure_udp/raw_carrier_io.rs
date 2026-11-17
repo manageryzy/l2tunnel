@@ -60,12 +60,73 @@ pub(in crate::secure_udp) enum SendProgress {
     },
 }
 
+/// Observed adapter refusal; it never identifies pacing as socket blocking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::secure_udp) enum PrepareRefusal {
+    LocalCustody {
+        lane: Option<u8>,
+        prepared: bool,
+        user: bool,
+        control: bool,
+    },
+    Carrier {
+        lane: u8,
+        reason: raw::FinalPrepareBlocked,
+    },
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::secure_udp) struct PrepareObservations {
+    /// Calls skipped due to local custody, including control calls before checking whether due.
+    pub local_custody_refusals: u64,
+    pub carrier_refusals: u64,
+    pub ready: u64,
+    /// Historical latest refusal, not a claim of currently blocked transport.
+    pub last_refusal: Option<PrepareRefusal>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::secure_udp) struct PendingBufferSnapshot {
+    pub lane: u8,
+    pub record_bytes: usize,
+    pub charged_bytes: usize,
+    pub bootstrap: bool,
+    pub token_retained: bool,
+    pub receipt_retained: bool,
+    pub deadline_remaining_micros: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::secure_udp) struct PreparedBufferSnapshot {
+    pub lane: u8,
+    pub kind: FinalKind,
+    pub record_bytes: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::secure_udp) struct InputBufferSnapshot {
+    pub record_bytes: usize,
+    pub age_micros: u64,
+    pub final_kind: Option<FinalKind>,
+}
+/// Bounded scalar state; the nested carrier may retain an earlier terminal boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::secure_udp) struct BufferSnapshot {
+    pub captured_at: Instant,
+    pub carrier: raw::BufferSnapshot,
+    pub prepared: Option<PreparedBufferSnapshot>,
+    pub user: Option<PendingBufferSnapshot>,
+    pub control: Option<PendingBufferSnapshot>,
+    pub input: Option<InputBufferSnapshot>,
+    pub control_capacity_bytes: usize,
+    pub input_capacity_bytes: usize,
+    /// Data, feedback, upper-control and carrier-control observations, in that order.
+    pub prepare: [PrepareObservations; 4],
+}
+
 /// The old concrete APIs use this uninhabited default; no dummy raw owner exists.
 #[derive(Clone, Copy)]
 pub(in crate::secure_udp) enum NoRaw {}
 
 /// Narrow I/O ownership seam; this is not a protocol or authentication state machine.
 pub(in crate::secure_udp) trait RawBacking: Send {
+    fn buffer_snapshot(&self, now: Instant) -> BufferSnapshot;
     fn geometry(&self) -> raw::RecordGeometry;
     fn final_input_metadata(&self) -> Option<FinalMetadata>;
     fn commit_final_input(
@@ -111,6 +172,9 @@ pub(in crate::secure_udp) trait RawBacking: Send {
     ) -> Poll<io::Result<()>>;
 }
 impl RawBacking for NoRaw {
+    fn buffer_snapshot(&self, _: Instant) -> BufferSnapshot {
+        match *self {}
+    }
     fn final_input_metadata(&self) -> Option<FinalMetadata> {
         match *self {}
     }
@@ -218,6 +282,19 @@ struct Pending {
     deadline: Instant,
     receipt: Option<AcceptedReceipt>,
 }
+impl Pending {
+    fn buffer_snapshot(&self, now: Instant) -> PendingBufferSnapshot {
+        PendingBufferSnapshot {
+            lane: lane_number(self.lane),
+            record_bytes: self.bytes,
+            charged_bytes: self.cost,
+            bootstrap: self.bootstrap,
+            token_retained: self.token.is_some(),
+            receipt_retained: self.receipt.is_some(),
+            deadline_remaining_micros: micros(self.deadline.saturating_duration_since(now)),
+        }
+    }
+}
 struct User {
     identity: UserIdentity,
     pending: Pending,
@@ -251,6 +328,7 @@ impl Plan {
             .size()
             .checked_add(maximum.checked_mul(2).ok_or_else(exhausted)?)
             .and_then(|n| n.checked_add(ranges))
+            .and_then(|n| n.checked_add(carrier.terminal_snapshot_capacity_bytes()))
             .ok_or_else(exhausted)?;
         Ok(Self { maximum, capacity })
     }
@@ -276,8 +354,22 @@ pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     control: Option<Pending>,
     failure: Option<raw::Error>,
     polled: bool,
+    prepare_observations: [PrepareObservations; 4],
 }
 impl<I: PacketIo + Send + 'static> RawAdapter<I> {
+    fn observe_prepare_refusal(&mut self, kind: FinalKind, refusal: PrepareRefusal) {
+        let observation = &mut self.prepare_observations[kind_index(kind)];
+        let count = match refusal {
+            PrepareRefusal::LocalCustody { .. } => &mut observation.local_custody_refusals,
+            PrepareRefusal::Carrier { .. } => &mut observation.carrier_refusals,
+        };
+        *count = count.saturating_add(1);
+        observation.last_refusal = Some(refusal);
+    }
+    fn observe_prepare_ready(&mut self, kind: FinalKind) {
+        let observation = &mut self.prepare_observations[kind_index(kind)];
+        observation.ready = observation.ready.saturating_add(1);
+    }
     fn try_user_inner(
         &mut self,
         identity: UserIdentity,
@@ -371,6 +463,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             control: None,
             failure: None,
             polled: false,
+            prepare_observations: [PrepareObservations::default(); 4],
         };
         if result.capacity_bytes()? != plan.capacity_bytes() {
             return Err(protocol("raw adapter capacity differs"));
@@ -620,6 +713,36 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
     }
 }
 impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
+    fn buffer_snapshot(&self, now: Instant) -> BufferSnapshot {
+        BufferSnapshot {
+            captured_at: now,
+            carrier: self.carrier.buffer_snapshot(now),
+            prepared: self
+                .prepared
+                .as_ref()
+                .map(|(lane, token)| PreparedBufferSnapshot {
+                    lane: lane_number(*lane),
+                    kind: token.metadata().kind(),
+                    record_bytes: token.metadata().payload_bytes(),
+                }),
+            user: self
+                .user
+                .as_ref()
+                .map(|user| user.pending.buffer_snapshot(now)),
+            control: self
+                .control
+                .as_ref()
+                .map(|pending| pending.buffer_snapshot(now)),
+            input: self.input.as_ref().map(|input| InputBufferSnapshot {
+                record_bytes: input.bytes,
+                age_micros: micros(now.saturating_duration_since(input.received)),
+                final_kind: input.final_metadata.map(|(_, metadata)| metadata.kind()),
+            }),
+            control_capacity_bytes: self.control_bytes.capacity(),
+            input_capacity_bytes: self.input_bytes.capacity(),
+            prepare: self.prepare_observations,
+        }
+    }
     fn final_input_metadata(&self) -> Option<FinalMetadata> {
         self.input
             .as_ref()
@@ -664,27 +787,67 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
         if self.control.as_ref().is_some_and(|p| p.lane == lane)
             || self.user.as_ref().is_some_and(|u| u.pending.lane == lane)
         {
+            self.observe_prepare_refusal(
+                kind,
+                PrepareRefusal::LocalCustody {
+                    lane: Some(lane_number(lane)),
+                    prepared: false,
+                    user: self.user.as_ref().is_some_and(|u| u.pending.lane == lane),
+                    control: self.control.as_ref().is_some_and(|p| p.lane == lane),
+                },
+            );
             return Ok(None);
         }
-        match self.carrier.prepare_final_record(lane, kind, bytes) {
-            Ok(token) => {
+        match self
+            .carrier
+            .prepare_final_record_observed(lane, kind, bytes)
+        {
+            Ok(raw::FinalPrepareOutcome::Ready(token)) => {
                 let metadata = token.metadata();
                 self.prepared = Some((lane, token));
+                self.observe_prepare_ready(kind);
                 Ok(Some(metadata))
             }
-            Err(raw::Error::Busy) => Ok(None),
+            Ok(raw::FinalPrepareOutcome::Blocked(reason)) => {
+                self.observe_prepare_refusal(
+                    kind,
+                    PrepareRefusal::Carrier {
+                        lane: lane_number(lane),
+                        reason,
+                    },
+                );
+                Ok(None)
+            }
             Err(error) => Err(raw_error(error)),
         }
     }
     fn prepare_final_control(&mut self) -> io::Result<Option<(FinalMetadata, FinalControl)>> {
         self.fail()?;
         if self.prepared.is_some() || self.control.is_some() {
+            self.observe_prepare_refusal(
+                FinalKind::CarrierControl,
+                PrepareRefusal::LocalCustody {
+                    lane: None,
+                    prepared: self.prepared.is_some(),
+                    user: false,
+                    control: self.control.is_some(),
+                },
+            );
             return Ok(None);
         }
         for offset in 0..self.lanes {
             let index = (self.control_cursor + offset) % self.lanes;
             let lane = [PairLane::First, PairLane::Second][index];
             if self.user.as_ref().is_some_and(|u| u.pending.lane == lane) {
+                self.observe_prepare_refusal(
+                    FinalKind::CarrierControl,
+                    PrepareRefusal::LocalCustody {
+                        lane: Some(lane_number(lane)),
+                        prepared: false,
+                        user: true,
+                        control: false,
+                    },
+                );
                 continue;
             }
             if let Some(control) = self.carrier.poll_final_control(lane).map_err(raw_error)? {
@@ -692,14 +855,26 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                     .encoded_bytes()
                     .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
                     .ok_or_else(exhausted)?;
-                match self.carrier.prepare_final_control(lane, control, bytes) {
-                    Ok(token) => {
+                match self
+                    .carrier
+                    .prepare_final_control_observed(lane, control, bytes)
+                {
+                    Ok(raw::FinalPrepareOutcome::Ready(token)) => {
                         let metadata = token.metadata();
                         self.prepared = Some((lane, token));
                         self.control_cursor = (index + 1) % self.lanes;
+                        self.observe_prepare_ready(FinalKind::CarrierControl);
                         return Ok(Some((metadata, control)));
                     }
-                    Err(raw::Error::Busy) => {}
+                    Ok(raw::FinalPrepareOutcome::Blocked(reason)) => {
+                        self.observe_prepare_refusal(
+                            FinalKind::CarrierControl,
+                            PrepareRefusal::Carrier {
+                                lane: lane_number(lane),
+                                reason,
+                            },
+                        );
+                    }
                     Err(error) => return Err(raw_error(error)),
                 }
             }
@@ -729,10 +904,11 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             .checked_add(self.control_bytes.capacity())
             .and_then(|n| n.checked_add(self.input_bytes.capacity()))
             .and_then(|n| n.checked_add(ranges))
+            .and_then(|n| n.checked_add(self.carrier.terminal_snapshot_capacity_bytes()))
             .ok_or_else(exhausted)
     }
     fn allocations(&self) -> usize {
-        3 + self.carrier.lane_count()
+        4 + self.carrier.lane_count()
     }
     fn next_wake(&self) -> io::Result<Instant> {
         self.carrier.next_wake().map_err(raw_error)
@@ -940,6 +1116,23 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             Err(e) => Poll::Ready(Err(e)),
         }
     }
+}
+fn lane_number(lane: PairLane) -> u8 {
+    match lane {
+        PairLane::First => 0,
+        PairLane::Second => 1,
+    }
+}
+fn kind_index(kind: FinalKind) -> usize {
+    match kind {
+        FinalKind::Data => 0,
+        FinalKind::Feedback => 1,
+        FinalKind::Control => 2,
+        FinalKind::CarrierControl => 3,
+    }
+}
+fn micros(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 fn buffer(bytes: usize) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();

@@ -20,6 +20,7 @@
 
 mod byte_queue;
 pub mod control;
+pub mod diagnostics;
 pub mod flow;
 pub mod gf;
 pub mod header;

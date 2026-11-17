@@ -1,6 +1,9 @@
 //! Authenticated carrier ownership and bounded Common runtime integration.
+pub(crate) mod buffer_metrics;
 /// Canonical native limits and configuration digests shared by current profiles.
 pub mod configuration;
+/// Opt-in bounded setup and local API timing; not protocol authority.
+pub mod initialization_timing;
 /// Explicit bounded TUN TCP ownership over the selected Common carrier.
 pub mod proxy;
 /// Bounded Common framing on the original authenticated retained TCP/TLS owners.

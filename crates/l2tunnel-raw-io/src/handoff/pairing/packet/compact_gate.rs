@@ -11,6 +11,53 @@ fn candidate_class(kind: FinalKind) -> u8 {
 }
 
 impl GateState {
+    pub(in crate::handoff::pairing::packet) fn final_candidate_diagnostics(
+        &self,
+        now: Instant,
+    ) -> ([CandidateBufferSnapshot; 3], Option<FinalKind>, Option<u64>) {
+        let upper = self.final_upper_capacity();
+        let capacities = [
+            4,
+            if upper == 0 { 1 } else { upper },
+            self.final_bulk_capacity(),
+        ];
+        let mut snapshots = [CandidateBufferSnapshot::default(); 3];
+        for (index, snapshot) in snapshots.iter_mut().enumerate() {
+            snapshot.capacity_packets = capacities[index];
+            snapshot.capacity_payload_bytes =
+                capacities[index] * (usize::from(self.policy.mtu) - 40);
+            snapshot.counters = self.candidate_counters[index];
+        }
+        let mut selected_age = None;
+        for cell in &self.incoming {
+            if let Some(metadata) = cell.final_metadata {
+                let snapshot = &mut snapshots[usize::from(candidate_class(metadata.kind))];
+                snapshot.queued_packets += 1;
+                snapshot.queued_payload_bytes += cell.body.len();
+                let age = diagnostics::age_micros(now, cell.received_at);
+                snapshot.oldest_age_micros =
+                    Some(snapshot.oldest_age_micros.map_or(age, |old| old.max(age)));
+                if self.final_selected == Some(metadata) {
+                    selected_age = Some(age);
+                }
+            }
+        }
+        (
+            snapshots,
+            self.final_selected.map(|metadata| metadata.kind),
+            selected_age,
+        )
+    }
+    fn observe_final_admission(&mut self, kind: FinalKind, bytes: usize) {
+        let class = usize::from(candidate_class(kind));
+        let (packets, payload_bytes) = &mut self.candidate_queued[class];
+        *packets = packets.saturating_add(1);
+        *payload_bytes = payload_bytes.saturating_add(bytes);
+        let counters = &mut self.candidate_counters[class];
+        counters.admitted.record(bytes);
+        counters.high_water_packets = counters.high_water_packets.max(*packets);
+        counters.high_water_payload_bytes = counters.high_water_payload_bytes.max(*payload_bytes);
+    }
     // These are untrusted candidate shares, not authenticated control authority.
     // At capacity one, upper control and bulk retain the original shared slot.
     pub(in crate::handoff::pairing::packet) fn final_upper_capacity(&self) -> usize {
@@ -67,6 +114,10 @@ impl GateState {
             return Err(Error::Proof);
         }
         let cell = self.incoming.remove(index).ok_or(Error::Proof)?;
+        let (packets, bytes) =
+            &mut self.candidate_queued[usize::from(candidate_class(metadata.kind))];
+        *packets = packets.saturating_sub(1);
+        *bytes = bytes.saturating_sub(cell.body.len());
         self.final_selected = None;
         self.final_candidate_turn = (candidate_class(metadata.kind) + 1) % 3;
         Ok(cell)
@@ -84,6 +135,9 @@ impl GateState {
             return self.reject();
         };
         if packet.payload.len() < 5 || bytes.len() > usize::from(self.policy.mtu) {
+            self.candidate_counters[usize::from(candidate_class(kind))]
+                .preflight_rejected
+                .record(packet.payload.len());
             return self.reject();
         }
         let control = kind == FinalKind::CarrierControl;
@@ -124,6 +178,9 @@ impl GateState {
                 && (self.records_outstanding + finals >= usize::from(self.policy.queue_packets)
                     || class_full))
         {
+            self.candidate_counters[usize::from(candidate_class(kind))]
+                .capacity_refused
+                .record(packet.payload.len());
             return self.reject();
         }
         let metadata = FinalMetadata {
@@ -137,6 +194,9 @@ impl GateState {
             payload_bytes: u16::try_from(packet.payload.len()).map_err(|_| Error::Capacity)?,
         };
         if self.validate_final(metadata).is_err() {
+            self.candidate_counters[usize::from(candidate_class(kind))]
+                .preflight_rejected
+                .record(packet.payload.len());
             return self.reject();
         }
         let fence = self.fence.as_ref().ok_or(Error::Proof)?;
@@ -160,6 +220,7 @@ impl GateState {
                 body: metadata.payload_bytes,
             },
         });
+        self.observe_final_admission(kind, packet.payload.len());
         Ok(())
     }
     /// Read-only raw geometry/replay preflight before the sole verifier commits.
@@ -223,7 +284,30 @@ impl GateState {
         }
         Ok(f.retired)
     }
-    pub(in crate::handoff::pairing::packet) fn reject_final(&mut self) -> Result<(), Error> {
+    pub(in crate::handoff::pairing::packet) fn reject_final_preflight(
+        &mut self,
+        metadata: FinalMetadata,
+    ) -> Result<(), Error> {
+        self.candidate_counters[usize::from(candidate_class(metadata.kind))]
+            .preflight_rejected
+            .record(metadata.payload_bytes());
         self.reject()
+    }
+    pub(in crate::handoff::pairing::packet) fn reject_final_verdict(
+        &mut self,
+        metadata: FinalMetadata,
+    ) -> Result<(), Error> {
+        self.candidate_counters[usize::from(candidate_class(metadata.kind))]
+            .verifier_rejected
+            .record(metadata.payload_bytes());
+        self.reject()
+    }
+    pub(in crate::handoff::pairing::packet) fn accept_final_verdict(
+        &mut self,
+        metadata: FinalMetadata,
+    ) {
+        self.candidate_counters[usize::from(candidate_class(metadata.kind))]
+            .accepted
+            .record(metadata.payload_bytes());
     }
 }

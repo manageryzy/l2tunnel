@@ -63,7 +63,12 @@ async fn ready(
     mut runtime: RunFuture,
 ) -> io::Result<Active> {
     setup::stage(shared, accepted.operation, SetupStage::DriverReadiness);
-    std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
+    use l2tunnel_runtime::initialization_timing::{
+        Outcome as TimingOutcome, Owner as TimingOwner, Stage as TimingStage, Timing,
+    };
+    let mut timing = Timing::from_environment(TimingOwner::CommonReadiness, Instant::now());
+    timing.enter_at(TimingStage::FirstRunning, Instant::now());
+    let result = std::future::poll_fn(|cx| match runtime.as_mut().poll(cx) {
         Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -88,7 +93,16 @@ async fn ready(
             accepted.operation,
             SetupFailureReason::ReadinessEnded,
         );
-    })?;
+    });
+    timing.end_at(
+        Instant::now(),
+        if result.is_ok() {
+            TimingOutcome::Complete
+        } else {
+            TimingOutcome::Failed
+        },
+    );
+    result?;
     check(deadline)?;
     Ok(Active {
         runtime,

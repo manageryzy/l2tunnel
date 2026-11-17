@@ -247,6 +247,21 @@ pub struct Collection {
     compact_wire: bool,
 }
 impl Collection {
+    /// Visit every actual owner separately, retaining its current incarnation label.
+    /// The bounded read-only scan allocates no collection or diagnostic state.
+    pub fn visit_codec_buffers(
+        &self,
+        mut visit: impl FnMut(OwnerId, u64, l2tunnel_codec::diagnostics::DuplexBuffers),
+    ) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            // Construction bounds the actual cohort to the u16 route domain.
+            visit(
+                OwnerId(index as u16),
+                slot.incarnation,
+                slot.endpoint.codec_buffer_snapshot(),
+            );
+        }
+    }
     /// Select compact nested recovery bodies and route arms before any admission.
     /// The caller binds this format into authenticated session establishment.
     pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {

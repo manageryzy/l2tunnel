@@ -719,7 +719,9 @@ blocked intervals plus transition reasons, and retain which owners are unmeasure
 Overlapping buffer wait intervals must not be summed as elapsed wall time.
 Public protocol libraries retain injected time; no real clock, runtime dependency,
 per-packet log or unbounded trace is introduced. This requested instrumentation
-is planned; a first subset cannot qualify all internal buffers.
+is being implemented through the [BP-01 through BP-24 coverage inventory](buffer-observability.md).
+A first subset cannot qualify all internal buffers; unmeasured owners and
+count-only aggregate refusals remain explicit.
 
 ## Accepted direction and open engineering choices
 

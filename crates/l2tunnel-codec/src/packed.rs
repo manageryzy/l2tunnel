@@ -250,6 +250,16 @@ pub enum Push {
     /// A sealed source still owns the only buffer; no new unit was accepted.
     Backpressure,
 }
+impl Push {
+    /// Classify the actual non-consuming push result; no clock or state is changed.
+    pub const fn buffer_refusal(self) -> Option<crate::diagnostics::PackingBlock> {
+        match self {
+            Self::Accepted => None,
+            Self::FlushRequired => Some(crate::diagnostics::PackingBlock::FlushRequired),
+            Self::Backpressure => Some(crate::diagnostics::PackingBlock::SealedSource),
+        }
+    }
+}
 /// Immutable source awaiting bounded recovery handoff.
 #[derive(Clone, Copy, Debug)]
 pub struct Pending<'a> {
@@ -443,6 +453,20 @@ impl Packer {
             bytes: self.length,
             deadline_micros: self.deadline,
             sealed: self.reason.is_some(),
+        }
+    }
+    /// Exact source occupancy; partial timer holds are not marked as blocked.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::PackingBuffers {
+        crate::diagnostics::PackingBuffers {
+            source: crate::diagnostics::Retention {
+                items: usize::from(self.count != 0),
+                item_capacity: 1,
+                bytes: self.length,
+                byte_capacity: self.config.symbol_bytes,
+            },
+            units: usize::from(self.count),
+            unit_capacity: MAX_UNITS,
+            sealed: self.reason,
         }
     }
 }

@@ -151,6 +151,14 @@ impl Driver {
                     .as_deref_mut()
                     .ok_or_else(|| protocol("Common ingress owner missing"))?
                     .pending_ingress = None;
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    runtime.buffer_event(
+                        crate::buffer_metrics::Site::NativeIngress,
+                        crate::buffer_metrics::Reason::BufferCapacity,
+                        now,
+                        false,
+                    );
+                }
                 self.counters.native_read = self.counters.native_read.saturating_add(1);
                 Ok(true)
             }
@@ -160,7 +168,17 @@ impl Driver {
                     l2tunnel_pipeline::PipelineError::Budget(_)
                     | l2tunnel_pipeline::PipelineError::Flow(l2tunnel_packet::FlowError::Capacity),
                 ),
-            ))) => Ok(false),
+            ))) => {
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    runtime.buffer_event(
+                        crate::buffer_metrics::Site::NativeIngress,
+                        crate::buffer_metrics::Reason::BufferCapacity,
+                        now,
+                        true,
+                    );
+                }
+                Ok(false)
+            }
             Err(error) => Err(protocol(error)),
         }
     }

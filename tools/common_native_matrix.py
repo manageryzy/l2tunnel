@@ -218,20 +218,29 @@ class Case:
         argv = self.prefix(role, args)
         self.command_index += 1
         name = f'command-{self.command_index:04}.log'
-        self.commands.append({'argv': argv, 'log': name})
+        receipt = {'argv': argv, 'log': name, 'started_wall_ns': time.time_ns()}
+        self.commands.append(receipt)
         until = min(self.deadline, deadline or self.deadline)
+        started = time.monotonic()
         with (self.output / name).open('xb') as stream:
             process = subprocess.Popen(argv, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            receipt['pid'] = process.pid
             try:
                 code = process.wait(timeout=min(BOUNDS['command_seconds'], max(.001, until - time.monotonic())))
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                receipt.update(timed_out=True, requested_signal='SIGKILL')
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait(timeout=2)
                 raise
+            finally:
+                receipt.update(returncode=process.returncode, elapsed_seconds=time.monotonic() - started,
+                               finished_wall_ns=time.time_ns())
+                self.save()
         raw = (self.output / name).read_bytes()
         require(len(raw) < BOUNDS['log_bytes'], 'command log bound exhausted')
-        self.commands[-1]['returncode'] = code
-        self.save()
         if code and not allow_failure:
             raise RuntimeError(f'command exit {code}: see {name}')
         return raw.decode('utf-8', errors='replace')
@@ -266,14 +275,43 @@ class Case:
     def stop(self, child, requested=signal.SIGTERM, deadline=None):
         process = child['process']
         until = deadline if deadline is not None else min(self.deadline, time.monotonic() + 5)
-        if process.poll() is None:
-            remaining = until - time.monotonic()
-            os.killpg(process.pid, requested if remaining > 0 else signal.SIGKILL)
+        started = time.monotonic()
+        receipt = {'started_wall_ns': time.time_ns(), 'signals': []}
+        child.setdefault('stops', []).append(receipt)
+        self.value.setdefault('child_stops', []).append({'label': child['label'], 'pid': process.pid,
+                                                       'observation': receipt})
+
+        def send(sig):
+            item = {'signal': signal.Signals(sig).name, 'elapsed_seconds': time.monotonic() - started}
+            receipt['signals'].append(item)
             try:
-                process.wait(timeout=max(0, min(3, remaining)))
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=max(0, min(2, until - time.monotonic())))
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                item['already_exited'] = True
+
+        try:
+            if process.poll() is None:
+                # TERM gets the remainder of the original three-second graceful
+                # allowance if an INT-handling capture process has not exited.
+                graceful_until = min(until, started + 3)
+                send(requested if graceful_until > time.monotonic() else signal.SIGKILL)
+                try:
+                    first_until = min(graceful_until, started + 1.5) if requested == signal.SIGINT else graceful_until
+                    process.wait(timeout=max(0, first_until - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    if requested == signal.SIGINT and time.monotonic() < graceful_until:
+                        send(signal.SIGTERM)
+                        try:
+                            process.wait(timeout=max(0, graceful_until - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            pass
+                    if process.poll() is None:
+                        send(signal.SIGKILL)
+                        process.wait(timeout=max(0, min(2, until - time.monotonic())))
+        finally:
+            receipt.update(returncode=process.returncode, elapsed_seconds=time.monotonic() - started,
+                           finished_wall_ns=time.time_ns())
+            self.save()
         return process.returncode
 
 
@@ -507,6 +545,7 @@ def phase(case, name, binary, secrets, daemons):
             result['captures'][surface] = entry
             try:
                 entry['returncode'] = case.stop(child, signal.SIGINT, deadline=cleanup_deadline)
+                entry['stop'] = child['stops'][-1]
                 require(entry['returncode'] == 0, 'tcpdump did not exit cleanly')
                 entry['counters'] = observe.capture_counters(child['log'])
                 entry['summary'] = observe.capture_summary(child['capture'], addresses, sample_wall)
@@ -606,7 +645,8 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
         for child in reversed(case.children):
             try:
                 code = case.stop(child, signal.SIGINT if child.get('capture') else signal.SIGTERM, deadline=cleanup_deadline)
-                case.value['cleanup']['children'].append({'label': child['label'], 'returncode': code})
+                case.value['cleanup']['children'].append({'label': child['label'], 'returncode': code,
+                                                        'stops': child.get('stops', [])})
             except Exception as error:
                 case.value['cleanup']['children'].append({'label': child['label'], 'error': str(error)})
         if (output / 'metrics').is_dir():

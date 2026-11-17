@@ -40,6 +40,79 @@ fn fixture_with_policy(policy: PacketPolicy) -> R<(GateState, PacketSealer)> {
 }
 #[path = "candidate_tests.rs"]
 mod candidates;
+
+#[tokio::test(start_paused = true)]
+async fn send_diagnostics_separate_actual_packet_io_refusal_from_local_scheduling() -> R {
+    struct TestIo {
+        blocked: bool,
+    }
+    impl PacketIo for TestIo {
+        fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+            Ok(None)
+        }
+        fn send(&mut self, _: &[u8]) -> io::Result<()> {
+            if self.blocked {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let (state, _) = fixture()?;
+    let policy = state.policy;
+    let budget = Arc::new(Mutex::new(Budget::new(policy, Instant::now())));
+    let mut gate = GateIo::new(TestIo { blocked: true }, state, budget.clone());
+    let mut bytes = vec![0; 45];
+    packet::encode(
+        raw(true, 0),
+        1000,
+        2000,
+        32768,
+        &[0x80, 0, 0, 0, 0],
+        &mut bytes,
+    )?;
+    lock(&budget)?.quota = 0;
+    assert_eq!(
+        gate.send(&bytes).err().ok_or("quota refusal")?.kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(gate.send_observations.turn_budget_refusals, 1);
+    assert_eq!(gate.send_observations.packet_io_attempts, 0);
+    {
+        let mut b = lock(&budget)?;
+        b.quota = 32;
+        b.byte_tokens = 0;
+    }
+    assert_eq!(
+        gate.send(&bytes).err().ok_or("pacing refusal")?.kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(gate.send_observations.pacing_refusals, 1);
+    assert_eq!(gate.send_observations.would_block_episodes, 0);
+    lock(&budget)?.byte_tokens = u64::from(policy.burst_bytes);
+    for _ in 0..2 {
+        assert_eq!(
+            gate.send(&bytes).err().ok_or("actual refusal")?.kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    assert_eq!(gate.send_observations.packet_io_attempts, 2);
+    assert_eq!(gate.send_observations.would_block_observations, 2);
+    assert_eq!(gate.send_observations.would_block_episodes, 1);
+    assert!(gate.send_observations.blocked);
+    gate.io.blocked = false;
+    gate.send(&bytes)?;
+    assert_eq!(gate.send_observations.resumed_episodes, 1);
+    assert!(!gate.send_observations.blocked);
+    gate.io.blocked = true;
+    assert!(gate.send(&bytes).is_err());
+    gate.cancel_pending();
+    assert_eq!(gate.send_observations.would_block_episodes, 2);
+    assert_eq!(gate.send_observations.cancelled_episodes, 1);
+    assert!(!gate.send_observations.blocked);
+    assert_eq!(lock(&gate.state)?.sent_packets, 1);
+    Ok(())
+}
 fn seal(sealer: &mut PacketSealer, kind: wire::Kind, offset: u64, body: &[u8]) -> R<Vec<u8>> {
     let plain = wire::Header {
         kind,

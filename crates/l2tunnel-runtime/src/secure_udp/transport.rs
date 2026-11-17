@@ -85,6 +85,8 @@ mod common_reuse;
 pub use common_reuse::{
     ConnectionReuseError, ConnectionReuseOutcome, ConnectionReusePhase, ConnectionReuseSnapshot,
 };
+#[path = "transport_buffer_metrics.rs"]
+mod buffer_metrics;
 #[path = "transport_common_contract.rs"]
 mod common_contract;
 #[path = "transport_common_fragments.rs"]
@@ -201,6 +203,8 @@ where
             }
             let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
+            driver.sample_common_buffers(now);
+            driver.sample_raw_buffers(&mut socket, instant, false);
             if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             driver.service_common_ingress(now, &mut inputs.native)?;
             driver.collect_native(now)?;
@@ -326,6 +330,11 @@ where
             }
         }
     }.await;
+    let metric_stop = sample();
+    driver.sample_raw_buffers(&mut socket, metric_stop, true);
+    if let Ok(now) = clock(origin, metric_stop) {
+        driver.finish_buffer_metrics(now);
+    }
     // Retain every already observed Common physical fact before dropping its
     // exact carrier witness, including cancellation before the next work turn.
     // This performs no I/O poll and never replaces an earlier observed error.

@@ -95,7 +95,17 @@ fn actual_compact_native_window_waits_for_device_receipt_not_recovery_ack() -> R
             a.enqueue_borrowed(Tick(0), &first)?;
             a.enqueue_borrowed(Tick(0), &second)?;
             assert!(a.admit_borrowed(Tick(0))?.is_some());
-            assert!(a.admit_borrowed(Tick(0))?.is_none());
+            let mut refusal = None;
+            assert!(
+                a.admit_borrowed_diagnosed(Tick(0), |value| refusal = Some(value))?
+                    .is_none()
+            );
+            let refusal = refusal.ok_or("actual native-window refusal")?;
+            assert_eq!(
+                refusal.reason,
+                super::super::AdmissionBlock::NativeDeliveryWindow
+            );
+            assert_eq!(refusal.bytes, second.len());
             let mut forward = Link::new(&c, role)?;
             let mut reverse = Link::new(&c, peer)?;
             let mut clock = 1;
@@ -135,7 +145,12 @@ fn actual_compact_native_window_waits_for_device_receipt_not_recovery_ack() -> R
                         assert_eq!(status.delivered.bytes, first.len() as u64);
                         assert_eq!(status.flushed_total.records, 1);
                         assert_eq!(status.outstanding.records, 0);
-                        assert!(a.admit_borrowed(Tick(clock))?.is_some());
+                        let mut refused = false;
+                        assert!(
+                            a.admit_borrowed_diagnosed(Tick(clock), |_| refused = true)?
+                                .is_some()
+                        );
+                        assert!(!refused);
                         assert_eq!(a.storage_usage(), Some(usage));
                         written = true;
                         break;

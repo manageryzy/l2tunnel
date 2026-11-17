@@ -196,6 +196,19 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// Classify an actual receive refusal without changing its retry/failure semantics.
+    pub const fn buffer_refusal(self) -> Option<crate::diagnostics::ReceiveBlock> {
+        use crate::diagnostics::ReceiveBlock;
+        match self {
+            Self::RecordWindow => Some(ReceiveBlock::RecordWindow),
+            Self::SourceWindow => Some(ReceiveBlock::SourceWindow),
+            Self::Capacity => Some(ReceiveBlock::ReceiverResources),
+            Self::UnresolvedContext => Some(ReceiveBlock::MissingContext),
+            _ => None,
+        }
+    }
+}
 /// Distinct outcomes that never imply native device acceptance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
@@ -889,6 +902,55 @@ impl Receiver {
             status.early_tombstones += usize::from(entry.early_delivered);
         }
         status
+    }
+    /// Bounded read-only scan of retained proofs and records, with separate head reserves.
+    /// This allocates nothing; callers choose their diagnostic sampling cadence.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::ReceiverBuffers {
+        use crate::diagnostics::{ReceiverBuffers, Retention};
+        let channels = usize::from(self.limits.channels);
+        let mut result = ReceiverBuffers {
+            source_proofs: Retention {
+                item_capacity: self.limits.source_window,
+                byte_capacity: self.limits.source_window * self.limits.body.symbol_bytes,
+                ..Retention::default()
+            },
+            heads: Retention {
+                item_capacity: channels,
+                byte_capacity: channels * 65_535,
+                ..Retention::default()
+            },
+            lookahead: Retention {
+                item_capacity: self.limits.lookahead_records,
+                byte_capacity: self.limits.lookahead_bytes,
+                ..Retention::default()
+            },
+            head_fragments: 0,
+            head_fragment_capacity: channels * self.limits.max_fragments_per_record,
+            lookahead_fragments: 0,
+            lookahead_fragment_capacity: self.limits.lookahead_fragments,
+            pending_native_bytes: self.pending.map(|value| value.written),
+            native_capacity_bytes: self.native.len(),
+        };
+        for proof in self.proofs.iter().flatten() {
+            result.source_proofs.items += 1;
+            result.source_proofs.bytes += proof.bytes.len();
+        }
+        for record in self.records.iter().flatten() {
+            let head = self.channels[usize::from(record.channel.0)].expected == Some(record.id);
+            let retention = if head {
+                &mut result.heads
+            } else {
+                &mut result.lookahead
+            };
+            retention.items += 1;
+            retention.bytes += record.bytes.len();
+            if head {
+                result.head_fragments += record.pieces.len();
+            } else {
+                result.lookahead_fragments += record.pieces.len();
+            }
+        }
+        result
     }
     fn find(&self, channel: ChannelId, record: RecordId) -> Option<usize> {
         self.records.iter().position(|entry| {

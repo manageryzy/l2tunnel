@@ -1,5 +1,6 @@
 //! Same-loop Common packet service; security and physical custody stay singular.
 use super::*;
+use crate::buffer_metrics::{Reason, Site};
 use l2tunnel::{record_bank, record_configuration as configuration, record_engine as engine};
 use l2tunnel_reliable::OutboundBudget;
 
@@ -376,8 +377,29 @@ impl Driver {
             let origin = NativeOrigin::new(&self.info, scope, records::Direction::Receive);
             let owner::DataOwner::Common(state) = &mut self.owner;
             let Some(mut lease) = self.native.common_mut()?.acquire() else {
+                if let Some(metrics) = self
+                    .common
+                    .as_deref_mut()
+                    .and_then(|r| r.buffer_metrics.as_mut())
+                {
+                    // A scan lease can be refused before prepare_native proves a
+                    // packet deliverable. Count the refusal without inventing a
+                    // useful-output waiting interval.
+                    let _ = metrics.collector().refused(
+                        crate::buffer_metrics::Key {
+                            site: Site::NativeOutputQueue,
+                            lane: crate::buffer_metrics::Lane::Shared,
+                            class: crate::buffer_metrics::Class::Shared,
+                        },
+                        Reason::BufferCapacity,
+                        now,
+                    );
+                }
                 break;
             };
+            if let Some(runtime) = self.common.as_deref_mut() {
+                runtime.buffer_event(Site::NativeOutputQueue, Reason::BufferCapacity, now, false);
+            }
             budget -= 1;
             let result = state
                 .entry(epoch)?
@@ -523,7 +545,18 @@ impl Driver {
                 .native_write_would_block
                 .saturating_add(1);
         }
-        if !self.check_expiry_with_completion(sample()?, Some(since), Some(metadata.deadline))? {
+        let after = sample()?;
+        if let Ok(progress) = result.as_ref()
+            && let Some(runtime) = self.common.as_deref_mut()
+        {
+            runtime.buffer_event(
+                Site::NativeDeviceWrite,
+                Reason::SocketWrite,
+                after,
+                !progress,
+            );
+        }
+        if !self.check_expiry_with_completion(after, Some(since), Some(metadata.deadline))? {
             return Ok(false);
         }
         result
@@ -618,7 +651,11 @@ impl Driver {
             for _ in 0..self.config.work.native_read_batch {
                 let Some(admitted) = state
                     .entry(epoch)?
-                    .admit_borrowed_observed(engine::Tick(now))
+                    .admit_borrowed_diagnosed(engine::Tick(now), |refusal| {
+                        if let Some(runtime) = self.common.as_deref_mut() {
+                            buffer_metrics::admission_refused(runtime, now, refusal);
+                        }
+                    })
                     .map_err(protocol)?
                 else {
                     break;
@@ -998,7 +1035,12 @@ impl Driver {
                 socket.try_user(identity, &runtime.wire[..pending.sealed.bytes])?
             };
             match progress {
-                carrier::SendProgress::Pending => Ok(false),
+                carrier::SendProgress::Pending => {
+                    if let Some(runtime) = self.common.as_deref_mut() {
+                        runtime.buffer_event(Site::CommonUserSlot, Reason::ReceiptWait, now, true);
+                    }
+                    Ok(false)
+                }
                 carrier::SendProgress::Whole { receipt, late } => {
                     self.complete_common_carrier(identity, receipt, late, &mut sample)
                 }
@@ -1065,6 +1107,12 @@ impl Driver {
         let accepted = clock(self.origin, receipt.accepted_at);
         let at = completed.as_ref().copied().unwrap_or(u64::MAX);
         let physical_at = accepted.as_ref().copied().unwrap_or(u64::MAX);
+        if let Ok(at) = completed.as_ref()
+            && let Some(runtime) = self.common.as_deref_mut()
+        {
+            runtime.buffer_event(Site::CommonUserSlot, Reason::ReceiptWait, *at, false);
+            runtime.buffer_event(Site::CommonUserSlot, Reason::SocketWrite, *at, false);
+        }
         if let Some(trace) = self
             .common
             .as_deref_mut()
@@ -1228,6 +1276,9 @@ impl Driver {
                 }
                 let sampled = sample();
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
+                if let Ok(at) = sampled.as_ref() {
+                    runtime.buffer_event(Site::CommonUserSlot, Reason::SocketWrite, *at, false);
+                }
                 if let Some(trace) = self
                     .common
                     .as_deref_mut()
@@ -1298,7 +1349,10 @@ impl Driver {
                 io::ErrorKind::WriteZero,
                 "partial Common UDP handoff",
             )),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                runtime.buffer_event(Site::CommonUserSlot, Reason::SocketWrite, now, true);
+                Ok(false)
+            }
             Err(error)
                 if matches!(
                     error.kind(),

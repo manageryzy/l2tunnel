@@ -1,5 +1,8 @@
 //! Private, bounded Unix API transport; wire types live in the portable schema.
 use super::*;
+use l2tunnel_runtime::initialization_timing::{
+    Outcome as TimingOutcome, Owner as TimingOwner, Stage as TimingStage, Timing,
+};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::io;
@@ -8,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::Instant;
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 8192;
@@ -91,9 +95,15 @@ impl Server {
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Response>,
     {
+        let mut timing = Timing::from_environment(TimingOwner::LocalApi, Instant::now());
         loop {
             let (mut stream, _) = self.listener.accept().await?;
-            if stream.peer_cred()?.uid() != self.uid {
+            timing.accepted_at(Instant::now());
+            let credentials = stream.peer_cred().inspect_err(|_| {
+                timing.end_request_at(Instant::now(), TimingOutcome::Failed);
+            })?;
+            if credentials.uid() != self.uid {
+                timing.end_request_at(Instant::now(), TimingOutcome::Failed);
                 continue;
             }
             let request = match tokio::time::timeout(
@@ -103,16 +113,22 @@ impl Server {
             .await
             {
                 Ok(Ok(request)) if supported_version(request.version) => request,
-                _ => continue,
+                _ => {
+                    timing.end_request_at(Instant::now(), TimingOutcome::Failed);
+                    continue;
+                }
             };
+            timing.enter_at(TimingStage::ApiHandler, Instant::now());
             let limit = response_limit(request.version);
             let response = handler(request).await;
+            timing.enter_at(TimingStage::ApiReply, Instant::now());
             // A disconnected or non-reading client cannot terminate/block the API.
-            let _reply = tokio::time::timeout(
+            let reply = tokio::time::timeout(
                 Duration::from_secs(5),
                 write_json(&mut stream, &response, limit),
             )
             .await;
+            timing.replied_at(Instant::now(), matches!(reply, Ok(Ok(()))));
         }
     }
 }

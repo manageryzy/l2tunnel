@@ -3,6 +3,7 @@ use super::*;
 use crate::handoff::pairing::packet::compact::{
     BootstrapDirection, FinalAcceptance, FinalControl, FinalKind,
 };
+use crate::handoff::pairing::packet::{FinalPrepareBlocked, FinalPrepareOutcome};
 
 #[test]
 fn compact_final_raw_authenticated_source_route_retains_data_authority() {
@@ -139,6 +140,14 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
             b.receive_range_capacity_bytes()?,
             bitmap_bytes * b.lane_count()
         );
+        assert_eq!(
+            a.terminal_snapshot_capacity_bytes(),
+            std::mem::size_of::<BufferSnapshot>()
+        );
+        assert_eq!(
+            b.terminal_snapshot_capacity_bytes(),
+            std::mem::size_of::<BufferSnapshot>()
+        );
         for index in 0..2 {
             if index < if half { 2 } else { 1 } {
                 let local = a_limits[index].ok_or("local lane limits")?;
@@ -161,6 +170,31 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
             a.stage_setup_record(PairLane::First, RecordKind::Data, b"legacy"),
             Err(Error::Configuration)
         ));
+        // Observe the exact horizon refusal before a reservation consumes any extent.
+        let allocated = {
+            let mut state = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?;
+            let fence = state.fence.as_mut().ok_or("fence")?;
+            let previous = fence.allocated;
+            fence.allocated = fence.peer_retired + fence.peer_horizon - 8 * 536;
+            previous
+        };
+        let blocked = a.prepare_final_record_observed(PairLane::First, FinalKind::Data, 5)?;
+        let FinalPrepareOutcome::Blocked(FinalPrepareBlocked::PeerHorizon {
+            requested_end,
+            allowed_end,
+            reserved_bytes,
+            ..
+        }) = blocked
+        else {
+            return Err("expected typed peer horizon refusal".into());
+        };
+        assert_eq!(requested_end, allowed_end + 5);
+        assert_eq!(reserved_bytes, 8 * 536);
+        {
+            let mut state = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?;
+            state.fence.as_mut().ok_or("fence")?.allocated = allocated;
+        }
+        assert!(a.lanes[0].as_ref().ok_or("lane")?.final_prepared.is_none());
         let protected = [0x80, 0, 0, 0, 0, 0x41, 0x42, 0x43, 0x44];
         let prepare = a.prepare_final_record(PairLane::First, FinalKind::Data, protected.len())?;
         let metadata = prepare.metadata();
@@ -171,6 +205,14 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
                 .local_horizon_bytes
         );
         assert_eq!(a.lane_limits()?, a_limits);
+        assert!(matches!(
+            a.prepare_final_record_observed(PairLane::First, FinalKind::Feedback, 21)?,
+            FinalPrepareOutcome::Blocked(FinalPrepareBlocked::LocalCustody {
+                prepared: true,
+                pending: false,
+                ..
+            })
+        ));
         assert!(matches!(
             a.prepare_final_record(PairLane::First, FinalKind::Feedback, 21),
             Err(Error::Busy)
@@ -186,10 +228,25 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
             .clone();
         assert_eq!(exact.len(), 40 + protected.len());
         assert_eq!(&exact[40..], &protected);
+        let before_send = a.buffer_snapshot(Instant::now()).lanes[0]
+            .ok_or("snapshot lane")?
+            .send_io;
         fault.block_all.store(true, Ordering::SeqCst);
         for _ in 0..3 {
             tick(&mut a, &mut b).await?;
         }
+        let blocked_snapshot = a.buffer_snapshot(Instant::now());
+        let lane_snapshot = blocked_snapshot.lanes[0].ok_or("snapshot lane")?;
+        assert_eq!(lane_snapshot.pending_ip_bytes, exact.len());
+        assert!(lane_snapshot.packet_io_pending);
+        assert!(lane_snapshot.send_io.blocked);
+        assert!(lane_snapshot.send_io.would_block_observations > 0);
+        assert_eq!(
+            lane_snapshot.send_io.would_block_episodes,
+            before_send.would_block_episodes + 1
+        );
+        assert_eq!(lane_snapshot.prepare[0].peer_horizon_refusals, 1);
+        assert_eq!(lane_snapshot.prepare[1].local_custody_refusals, 2);
         assert!(a.take_sent_record(PairLane::First)?.is_none());
         assert_eq!(
             fault.pending.lock().map_err(|_| "lock")?.as_deref(),
@@ -211,6 +268,12 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         })
         .await?;
         let sent = a.take_sent_record(PairLane::First)?.ok_or("receipt")?;
+        let resumed = a.buffer_snapshot(Instant::now()).lanes[0].ok_or("snapshot lane")?;
+        assert_eq!(
+            resumed.send_io.resumed_episodes,
+            before_send.resumed_episodes + 1
+        );
+        assert!(!resumed.send_io.blocked);
         assert_eq!(sent.token, receipt);
         assert!(a.take_sent_record(PairLane::First)?.is_none());
         let input = b.final_input(PairLane::First)?.ok_or("input")?;
@@ -470,6 +533,10 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
             false,
         )
         .await?;
+        let terminal_pointer = a.terminal_buffers.as_ptr();
+        let terminal_capacity = a.terminal_snapshot_capacity_bytes();
+        assert_eq!(terminal_capacity, std::mem::size_of::<BufferSnapshot>());
+        assert!(a.terminal_buffers.is_empty());
         let deadline = a.setup_deadline();
         assert!(matches!(
             a.enable_final_records([0; 32], |_, _| true),
@@ -518,10 +585,25 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
         assert!(a.lanes.iter().all(Option::is_none));
         assert!(a.records.is_empty());
         assert!(matches!(a.fault, Some(Error::Expired)));
+        assert_eq!(a.terminal_buffers.as_ptr(), terminal_pointer);
+        assert_eq!(a.terminal_snapshot_capacity_bytes(), terminal_capacity);
+        assert_eq!(a.terminal_buffers.len(), 1);
+        let frozen = a.buffer_snapshot(Instant::now());
+        assert!(frozen.terminal);
+        assert_eq!(frozen.captured_at, deadline);
+        assert_eq!(frozen.unavailable_lanes, 0);
+        assert!(frozen.lanes[0].ok_or("retained lane snapshot")?.completed);
+        assert_eq!(
+            a.buffer_snapshot(deadline + Duration::from_secs(100)),
+            frozen
+        );
         assert!(matches!(
             a.enable_final_records([0; 32], |_, _| true),
             Err(Error::Expired)
         ));
+        assert_eq!(a.terminal_buffers.as_ptr(), terminal_pointer);
+        assert_eq!(a.terminal_buffers.len(), 1);
+        assert_eq!(a.buffer_snapshot(Instant::now()), frozen);
         let observed = a.take_sent_record_observed(PairLane::First)?;
         let actual = observed.sent.ok_or("original receipt was lost")?;
         assert_eq!(actual.token, sent.token);

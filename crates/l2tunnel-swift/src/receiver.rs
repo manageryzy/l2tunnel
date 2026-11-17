@@ -350,6 +350,26 @@ impl Receiver {
     pub fn stats(&self) -> ReceiverStats {
         self.stats
     }
+    /// Bounded read-only scan of actual source, equation and ordered stream retention.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::ReceiverBuffers {
+        let positions = self.config.flow_sources + self.config.window;
+        let rows = 2 * self.config.window;
+        crate::diagnostics::ReceiverBuffers {
+            source_positions: self.slots.len(),
+            source_capacity_positions: positions,
+            known_sources: self.slots.iter().flatten().count(),
+            source_bytes: self.slots.iter().flatten().map(Vec::len).sum(),
+            source_capacity_bytes: positions * self.config.symbol_bytes(),
+            rows: self.rows.len(),
+            row_capacity: rows,
+            row_bytes: self.rows.iter().map(|row| row.data.len()).sum(),
+            row_capacity_bytes: rows * (self.config.symbol_bytes() + 2),
+            stream_bytes: self.stream.len(),
+            stream_capacity_bytes: self.config.flow_sources * self.config.symbol_bytes()
+                + self.config.max_packet
+                + FRAME_PREFIX,
+        }
+    }
     /// Sources known to exist that are not yet delivered in order.
     pub fn pending(&self) -> u32 {
         // Bounded by the flow window, which fits 16 bits.

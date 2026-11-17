@@ -9,6 +9,9 @@ use super::*;
 use std::future::Future;
 use tokio::time::{Instant, timeout_at};
 
+mod buffers;
+pub use buffers::{BufferSnapshot, SlotSnapshot};
+
 mod send;
 pub use send::{AcceptanceStatus, PendingSend, SendFailure, SendReceipt};
 

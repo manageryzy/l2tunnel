@@ -6,6 +6,40 @@ use l2tunnel_core::Epoch;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn buffer_snapshot_distinguishes_timer_hold_sealed_source_and_staged_frame() -> TestResult {
+    let mut sender = Sender::new(scope(), config(64))?;
+    sender.stage_raw(ChannelId(0), b"first", 0)?;
+    let held = sender.buffer_snapshot();
+    assert_eq!(held.stage.stage.items, 0);
+    assert_eq!(held.packing.source.items, 1);
+    assert_eq!(held.packing.source.bytes, 11);
+    assert_eq!(held.packing.source.byte_capacity, 64);
+    assert_eq!(held.packing.units, 1);
+    assert_eq!(held.packing.unit_capacity, 4);
+    assert_eq!(held.packing.sealed, None);
+    sender.poll(500)?;
+    let sealed = sender.buffer_snapshot();
+    assert_eq!(sealed.packing.source, held.packing.source);
+    assert_eq!(sealed.packing.sealed, Some(packed::SealReason::Timer));
+    sender.stage_raw(ChannelId(1), b"next", 500)?;
+    let staged = sender.buffer_snapshot();
+    assert_eq!(staged.stage.stage.items, 1);
+    assert_eq!(staged.packing, sealed.packing);
+    assert_eq!(
+        sender.stage_raw(ChannelId(0), b"refused", 500),
+        Err(Error::Busy)
+    );
+    assert_eq!(sender.buffer_snapshot(), staged);
+    sender.commit_source()?;
+    assert_eq!(sender.buffer_snapshot().packing.source.items, 0);
+    assert_eq!(sender.buffer_snapshot().stage.stage.items, 1);
+    sender.poll(500)?;
+    assert_eq!(sender.buffer_snapshot().stage.stage.items, 0);
+    assert_eq!(sender.buffer_snapshot().packing.source.bytes, 10);
+    Ok(())
+}
+
+#[test]
 fn clock_exhaustion_rejects_fresh_ownership_and_is_terminal_for_an_owned_frame() -> TestResult {
     let config = config(64);
     let error = Error::Packing(packed::Error::ClockExhausted);

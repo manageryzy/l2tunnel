@@ -18,6 +18,8 @@ pub mod member;
 /// Single original UDP/OpenVPN owner with explicit physical-send completion tickets.
 pub mod original_datagram;
 // Portable same-owner raw I/O; actual packet opening remains platform-specific.
+#[path = "transport_raw_buffer_metrics.rs"]
+pub(crate) mod raw_buffer_metrics;
 mod raw_carrier_io;
 /// Native forwarding and fixed authenticated control on the original socket.
 pub mod transport;

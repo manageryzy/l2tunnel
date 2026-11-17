@@ -5,6 +5,10 @@
 //! TLS stream; it does not assert an IP packet write, TCP acknowledgment or peer
 //! delivery. This adapter owns no recovery algorithm, timer task or native I/O.
 
+use crate::buffer_metrics::{
+    Class as MetricClass, Collector, Extent, Key, Lane as MetricLane, Observer, Occupancy, Reason,
+    Site,
+};
 use l2tunnel_auth::{AuthenticatedConnection, SessionInfo, TlsIoProfile};
 use l2tunnel_core::{ConfigDigest, Duplex};
 use l2tunnel_security::Role;
@@ -464,6 +468,7 @@ pub struct Adapter {
     control_lane: usize,
     receive_lane: usize,
     failed: Option<Failure>,
+    metrics: Option<Observer>,
 }
 impl Adapter {
     /// Allocate the preflighted new storage after the enclosing retained-budget check.
@@ -518,7 +523,7 @@ impl Adapter {
             .max_record_bytes
             .checked_add(FRAMING_BYTES)
             .ok_or_else(exhausted)?;
-        Ok(Self {
+        let mut adapter = Self {
             owner,
             next: Some(0),
             info: link.info,
@@ -538,7 +543,15 @@ impl Adapter {
             control_lane: 0,
             receive_lane: 0,
             failed: None,
-        })
+            metrics: Observer::from_environment("retained_tls")?,
+        };
+        for class in [Class::User, Class::Control] {
+            metric_output(&mut adapter.metrics, class, &adapter.output[class.index()]);
+        }
+        for (index, lane) in adapter.lanes.iter().enumerate() {
+            metric_input(&mut adapter.metrics, index, &lane.input, plan.limits);
+        }
+        Ok(adapter)
     }
     /// Public actual-session observations; this does not release the stream owners.
     pub fn info(&self) -> Info {
@@ -619,6 +632,7 @@ impl Adapter {
         before(deadline)?;
         let output = &mut self.output[class.index()];
         if output.pending.is_some() {
+            metric_blocked(&mut self.metrics, submission_key(class), Reason::QueueFull);
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let serial = self.next.ok_or_else(exhausted)?;
@@ -649,6 +663,7 @@ impl Adapter {
             operation_deadline,
             receipt: None,
         });
+        metric_output(&mut self.metrics, class, output);
         self.next = serial.checked_add(1);
         if class == Class::Control {
             self.control_lane = (lane + 1) % self.plan.lanes;
@@ -681,6 +696,12 @@ impl Adapter {
         if let Some(receipt) = self.output[index].pending.as_ref().and_then(|p| p.receipt) {
             self.output[index].pending = None;
             token.consumed = true;
+            metric_progress(
+                &mut self.metrics,
+                submission_key(token.class),
+                Reason::QueueFull,
+            );
+            metric_output(&mut self.metrics, token.class, &self.output[index]);
             return Poll::Ready(Ok(receipt));
         }
         if let Err(error) = self.check_failure() {
@@ -704,7 +725,13 @@ impl Adapter {
         }
         let mut progressed = false;
         for index in 0..self.lanes.len() {
-            match poll_write(&mut self.lanes[index], index, &mut self.output, cx) {
+            match poll_write(
+                &mut self.lanes[index],
+                index,
+                &mut self.output,
+                &mut self.metrics,
+                cx,
+            ) {
                 Ok(progress) => progressed |= progress,
                 Err(error) => return Poll::Ready(Err(self.fail(error))),
             }
@@ -717,7 +744,13 @@ impl Adapter {
             }) {
                 return Poll::Ready(Err(self.fail(expired())));
             }
-            match poll_read(&mut self.lanes[index], index, self.plan.limits, cx) {
+            match poll_read(
+                &mut self.lanes[index],
+                index,
+                self.plan.limits,
+                &mut self.metrics,
+                cx,
+            ) {
                 Ok(progress) => progressed |= progress,
                 Err(error) => {
                     let peer_close = error.kind() == io::ErrorKind::UnexpectedEof
@@ -770,6 +803,7 @@ impl Adapter {
                 }
                 output[..received.bytes].copy_from_slice(&input.bytes[..received.bytes]);
                 input.reset();
+                metric_input(&mut self.metrics, index, input, self.plan.limits);
                 self.receive_lane = (index + 1) % self.lanes.len();
                 return Poll::Ready(Ok(received));
             }
@@ -782,6 +816,9 @@ impl Adapter {
     fn fail_with_close(&mut self, error: io::Error, peer_close: bool) -> io::Error {
         if self.failed.is_none() {
             self.failed = Some(Failure::new(error, peer_close));
+            if let Some(metrics) = self.metrics.as_mut() {
+                metrics.finish_at(metrics.now());
+            }
             // Both original Half connections fail together. Completed output facts
             // remain available through their original tokens after the I/O drops.
             self.lanes.clear();
@@ -797,6 +834,7 @@ fn poll_write(
     lane: &mut Lane,
     index: usize,
     outputs: &mut [Output; 2],
+    metrics: &mut Option<Observer>,
     cx: &mut Context<'_>,
 ) -> io::Result<bool> {
     if lane.active.is_none() {
@@ -818,6 +856,9 @@ fn poll_write(
     let Some(class) = lane.active else {
         return Ok(false);
     };
+    let write_key = lane_key(Site::TlsWrite, index, metric_class(class));
+    let flush_key = lane_key(Site::TlsFlush, index, metric_class(class));
+    metric_resumed(metrics, write_key, Reason::WorkBudget);
     let output = &mut outputs[class.index()];
     let Some(pending) = output.pending.as_mut() else {
         return Err(invalid("retained TLS active output missing"));
@@ -833,7 +874,10 @@ fn poll_write(
                 .as_mut()
                 .poll_write(cx, &output.bytes[pending.offset..pending.length])
             {
-                Poll::Pending => return Ok(progressed),
+                Poll::Pending => {
+                    metric_blocked(metrics, write_key, Reason::IoPending);
+                    return Ok(progressed);
+                }
                 Poll::Ready(Err(error)) => return Err(error),
                 Poll::Ready(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
                 Poll::Ready(Ok(bytes)) => {
@@ -841,12 +885,16 @@ fn poll_write(
                     if pending.offset > pending.length {
                         return Err(invalid("retained TLS writer exceeded original record"));
                     }
+                    metric_progress(metrics, write_key, Reason::IoPending);
                     progressed = true;
                 }
             }
         } else {
             match lane.writer.as_mut().poll_flush(cx) {
-                Poll::Pending => return Ok(progressed),
+                Poll::Pending => {
+                    metric_blocked(metrics, flush_key, Reason::FlushPending);
+                    return Ok(progressed);
+                }
                 Poll::Ready(Err(error)) => return Err(error),
                 Poll::Ready(Ok(())) => {
                     let flushed_at = Instant::now();
@@ -860,12 +908,15 @@ fn poll_write(
                         boundary: SendBoundary::TlsStreamFlushed,
                         lane: index,
                     });
+                    metric_progress(metrics, flush_key, Reason::FlushPending);
+                    metric_output(metrics, class, output);
                     lane.active = None;
                     return Ok(true);
                 }
             }
         }
     }
+    metric_blocked(metrics, write_key, Reason::WorkBudget);
     cx.waker().wake_by_ref();
     Ok(progressed)
 }
@@ -873,9 +924,12 @@ fn poll_read(
     lane: &mut Lane,
     index: usize,
     limits: Limits,
+    metrics: &mut Option<Observer>,
     cx: &mut Context<'_>,
 ) -> io::Result<bool> {
     let input = &mut lane.input;
+    let key = lane_key(Site::TlsInput, index, MetricClass::Shared);
+    metric_resumed(metrics, key, Reason::WorkBudget);
     if input.ready.is_some() {
         return Ok(false);
     }
@@ -897,7 +951,10 @@ fn poll_read(
         };
         let mut read = ReadBuf::new(destination);
         match lane.reader.as_mut().poll_read(cx, &mut read) {
-            Poll::Pending => return Ok(progressed),
+            Poll::Pending => {
+                metric_input(metrics, index, input, limits);
+                return Ok(progressed);
+            }
             Poll::Ready(Err(error)) => return Err(error),
             Poll::Ready(Ok(())) => {
                 let bytes = read.filled().len();
@@ -943,14 +1000,133 @@ fn poll_read(
                             lane: index,
                         });
                         input.deadline = None;
+                        metric_input(metrics, index, input, limits);
                         return Ok(true);
                     }
                 }
             }
         }
     }
+    metric_input(metrics, index, input, limits);
+    metric_blocked(metrics, key, Reason::WorkBudget);
     cx.waker().wake_by_ref();
     Ok(progressed)
+}
+
+fn metric_class(class: Class) -> MetricClass {
+    match class {
+        Class::User => MetricClass::User,
+        Class::Control => MetricClass::Management,
+    }
+}
+fn submission_key(class: Class) -> Key {
+    Key {
+        site: Site::TlsSubmission,
+        lane: MetricLane::Shared,
+        class: metric_class(class),
+    }
+}
+fn lane_key(site: Site, index: usize, class: MetricClass) -> Key {
+    Key {
+        site,
+        lane: if index == 0 {
+            MetricLane::First
+        } else {
+            MetricLane::Second
+        },
+        class,
+    }
+}
+fn metric_update(metrics: &mut Option<Observer>, update: impl FnOnce(&mut Collector, u64)) {
+    if let Some(metrics) = metrics.as_mut() {
+        let now = metrics.now();
+        // Terminal receipt cleanup may continue after the first failure. Keep
+        // unresolved intervals censored at that failure instead of extending them.
+        if !metrics.is_finished() {
+            update(metrics.collector(), now);
+        }
+    }
+}
+fn metric_blocked(metrics: &mut Option<Observer>, key: Key, reason: Reason) {
+    metric_update(metrics, |collector, now| {
+        let _ = collector.blocked(key, reason, now);
+    });
+}
+fn metric_progress(metrics: &mut Option<Observer>, key: Key, reason: Reason) {
+    metric_update(metrics, |collector, now| {
+        let _ = collector.progress(key, reason, now);
+    });
+}
+fn metric_resumed(metrics: &mut Option<Observer>, key: Key, reason: Reason) {
+    metric_update(metrics, |collector, now| {
+        if collector
+            .reason(key, reason, now)
+            .is_ok_and(|state| state.blocked.open_us.is_some())
+        {
+            let _ = collector.progress(key, reason, now);
+        }
+    });
+}
+fn metric_output(metrics: &mut Option<Observer>, class: Class, output: &Output) {
+    let key = submission_key(class);
+    metric_update(metrics, |collector, now| {
+        let _ = collector.sample(
+            key,
+            now,
+            Occupancy {
+                bytes: Some(Extent {
+                    used: output
+                        .pending
+                        .as_ref()
+                        .map_or(0, |pending| pending.length as u64),
+                    capacity: Some(output.bytes.len() as u64),
+                }),
+                items: Some(Extent {
+                    used: u64::from(output.pending.is_some()),
+                    capacity: Some(1),
+                }),
+            },
+        );
+        let _ = collector.sample(
+            Key {
+                site: Site::TlsReceipt,
+                ..key
+            },
+            now,
+            Occupancy {
+                bytes: None,
+                items: Some(Extent {
+                    used: u64::from(
+                        output
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.receipt.is_some()),
+                    ),
+                    capacity: Some(1),
+                }),
+            },
+        );
+    });
+}
+fn metric_input(metrics: &mut Option<Observer>, index: usize, input: &Input, limits: Limits) {
+    // An occupied input cell suppresses another read, but says nothing about
+    // whether more peer bytes are ready. Record occupancy, not an inferred wait.
+    metric_update(metrics, |collector, now| {
+        let _ = collector.sample(
+            lane_key(Site::TlsInput, index, MetricClass::Shared),
+            now,
+            Occupancy {
+                bytes: Some(Extent {
+                    used: (input.prefix_used + input.body_used) as u64,
+                    capacity: Some((limits.max_record_bytes + FRAMING_BYTES) as u64),
+                }),
+                items: Some(Extent {
+                    used: u64::from(input.prefix_used != 0 || input.body_used != 0),
+                    capacity: Some(1),
+                }),
+            },
+        );
+    });
 }
 fn buffer(bytes: usize) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();

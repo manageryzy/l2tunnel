@@ -1,6 +1,9 @@
 //! Actual maintained-owner custody, separate from physical datagram acceptance.
 use super::maintained::{Authenticated, Geometry, Kind, Lane, QuicQueues, Request};
+use crate::buffer_metrics::{Observer, Reason as BufferReason, Site as BufferSite};
 use crate::retained_tls as tls;
+#[path = "maintained_quic_metrics.rs"]
+pub(crate) mod quic_metrics;
 use crate::retained_tls::failure::Failure;
 use l2tunnel_auth::SessionConfig;
 use l2tunnel_core::Duplex;
@@ -143,6 +146,7 @@ pub struct Carrier {
     capacity: usize,
     allocations: usize,
     failed: Option<Failure>,
+    buffer_metrics: Option<Observer>,
 }
 impl Carrier {
     /// Preflight new retained TLS/wrapper backing, verify real policy and then own it.
@@ -303,12 +307,17 @@ impl Carrier {
         capacity: usize,
         allocations: usize,
     ) -> io::Result<Self> {
+        let buffer_metrics = if matches!(&backend, Backend::Quic(_)) {
+            Observer::from_environment("maintained_quic")?
+        } else {
+            None
+        };
         let owner = NEXT_OWNER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| exhausted())?;
-        Ok(Self {
+        let mut carrier = Self {
             backend,
             proof,
             owner,
@@ -321,7 +330,70 @@ impl Carrier {
             capacity,
             allocations,
             failed: None,
-        })
+            buffer_metrics,
+        };
+        carrier.observe_buffers();
+        Ok(carrier)
+    }
+    fn observe_buffers(&mut self) {
+        if self
+            .buffer_metrics
+            .as_ref()
+            .is_none_or(Observer::is_finished)
+        {
+            return;
+        }
+        let capacity = self
+            .geometry()
+            .max_record_bytes
+            .max(self.geometry().max_bootstrap_bytes);
+        if let Backend::Quic(values) = &self.backend {
+            for (index, value) in values.iter().enumerate() {
+                quic_metrics::lower(&mut self.buffer_metrics, index, value.buffer_snapshot());
+                quic_metrics::input(
+                    &mut self.buffer_metrics,
+                    Some(index),
+                    self.input[index].as_ref().map(|value| value.bytes.len()),
+                    capacity,
+                );
+            }
+            for class in [Class::User, Class::Control] {
+                let output = self.output[class.index()].as_ref();
+                // The lower future owns caller bytes only while unresolved.
+                // A completed wrapper slot can retain a receipt but no payload.
+                let bytes = output
+                    .filter(|value| value.result.is_none())
+                    .and_then(|value| match &value.pending {
+                        Pending::Quic(token) => Some(token.record_bytes()),
+                        Pending::Tls(_) => None,
+                    });
+                let accepted =
+                    output
+                        .and_then(|value| value.result.as_ref())
+                        .is_some_and(|value| {
+                            matches!(
+                                value,
+                                Ok(_) | Err(SendFailure::Expired { accepted: Some(_) })
+                            )
+                        });
+                quic_metrics::output(
+                    &mut self.buffer_metrics,
+                    class,
+                    output.is_some(),
+                    bytes.unwrap_or(0),
+                    accepted,
+                    capacity,
+                );
+            }
+        }
+    }
+    /// Sample the sole runtime copy without granting it receive authority.
+    pub(crate) fn observe_runtime_input(&mut self, bytes: Option<usize>) {
+        let capacity = self
+            .geometry()
+            .max_record_bytes
+            .max(self.geometry().max_bootstrap_bytes);
+        quic_metrics::input(&mut self.buffer_metrics, None, bytes, capacity);
     }
     /// Actual verified proof; copying it never constructs an owner.
     pub fn authenticated(&self) -> Authenticated {
@@ -497,6 +569,14 @@ impl Carrier {
             return Err(invalid("maintained final records not selected"));
         }
         if self.output[class.index()].is_some() {
+            quic_metrics::event(
+                &mut self.buffer_metrics,
+                BufferSite::CarrierSubmission,
+                None,
+                class,
+                BufferReason::QueueFull,
+                true,
+            );
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let serial = self.next.ok_or_else(exhausted)?;
@@ -515,9 +595,35 @@ impl Carrier {
                 } else {
                     usize::from(values.len() == 2 && server)
                 };
-                let token = values[lane]
+                let token = match values[lane]
                     .try_send(quic_class(class), bytes, deadline, quic_framing(framing))
-                    .map_err(quic_error)?;
+                    .map_err(quic_error)
+                {
+                    Ok(token) => {
+                        quic_metrics::event(
+                            &mut self.buffer_metrics,
+                            BufferSite::CarrierSubmission,
+                            Some(lane),
+                            class,
+                            BufferReason::QueueFull,
+                            false,
+                        );
+                        token
+                    }
+                    Err(error) => {
+                        if error.kind() == io::ErrorKind::WouldBlock {
+                            quic_metrics::event(
+                                &mut self.buffer_metrics,
+                                BufferSite::CarrierSubmission,
+                                Some(lane),
+                                class,
+                                BufferReason::QueueFull,
+                                true,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 let effective = token.deadline();
                 (Pending::Quic(token), lane, effective)
             }
@@ -533,6 +639,7 @@ impl Carrier {
         if class == Class::Control {
             self.control_lane = (control_lane + 1) % self.lane_count();
         }
+        self.observe_buffers();
         Ok(PendingSend {
             owner: self.owner,
             serial,
@@ -553,6 +660,7 @@ impl Carrier {
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let geometry = self.geometry();
         let mut progress = false;
+        let mut metric_terminal = false;
         // Every entry point services both retained classes. Preserve Control
         // priority even when the caller is polling its User ticket first.
         for class in [Class::Control, Class::User] {
@@ -596,8 +704,37 @@ impl Carrier {
                     }
                 }
                 (Backend::Quic(_), Pending::Quic(token)) => match Pin::new(token).poll(cx) {
-                    Poll::Pending => None,
-                    Poll::Ready(value) => Some(map_quic_send(value, output.lane)),
+                    Poll::Pending => {
+                        // Observe this existing await without inferring provider
+                        // queue fullness or changing its original receipt clock.
+                        quic_metrics::event(
+                            &mut self.buffer_metrics,
+                            BufferSite::QuicSend,
+                            Some(output.lane),
+                            class,
+                            BufferReason::CarrierAdmission,
+                            true,
+                        );
+                        None
+                    }
+                    Poll::Ready(value) => {
+                        let value = map_quic_send(value, output.lane);
+                        if matches!(
+                            &value,
+                            Ok(_) | Err(SendFailure::Expired { accepted: Some(_) })
+                        ) {
+                            quic_metrics::event(
+                                &mut self.buffer_metrics,
+                                BufferSite::QuicSend,
+                                Some(output.lane),
+                                class,
+                                BufferReason::CarrierAdmission,
+                                false,
+                            );
+                        }
+                        metric_terminal |= value.is_err();
+                        Some(value)
+                    }
                 },
                 _ => Some(Err(SendFailure::Ticket)),
             };
@@ -643,6 +780,10 @@ impl Carrier {
         if self.failed.is_none() {
             self.failed = failed;
         }
+        self.observe_buffers();
+        if metric_terminal || self.failed.is_some() {
+            quic_metrics::finish(&mut self.buffer_metrics);
+        }
         if let Some(error) = &self.failed {
             return Poll::Ready(Err(error.error()));
         }
@@ -672,9 +813,19 @@ impl Carrier {
         {
             self.output[index] = None;
             token.consumed = true;
+            quic_metrics::event(
+                &mut self.buffer_metrics,
+                BufferSite::CarrierSubmission,
+                None,
+                token.class,
+                BufferReason::QueueFull,
+                false,
+            );
+            self.observe_buffers();
             return Poll::Ready(result);
         }
         if let Err(error) = self.check_failure() {
+            quic_metrics::finish(&mut self.buffer_metrics);
             self.output[index] = None;
             token.consumed = true;
             return Poll::Ready(Err(SendFailure::Io(error)));
@@ -733,6 +884,7 @@ impl Carrier {
                 lane,
             }
         };
+        self.observe_buffers();
         // This is a rejection-only physical-lane filter. The inner Records owner
         // remains the sole authority for authentication, replay and liveness.
         let wrong_data_lane = rejects_data_lane(

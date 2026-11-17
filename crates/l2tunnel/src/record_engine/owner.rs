@@ -197,11 +197,12 @@ impl Owner {
         }
     }
 
-    pub(super) fn offer_queued(
+    pub(super) fn offer_queued_diagnosed(
         &mut self,
         now: Tick,
         metadata: pipeline::PacketMetadata,
         bytes: &[u8],
+        on_block: &mut impl FnMut(super::AdmissionBlock),
     ) -> Result<Option<ObservedProfileIdentity>, Error> {
         if metadata.classification.kind == l2tunnel_packet::PacketKind::ProxyRecord
             && metadata
@@ -212,8 +213,18 @@ impl Owner {
             return Err(Error::Expired);
         }
         match self {
-            Self::Connections(owner) => owner.offer(now, metadata, bytes),
-            _ => self.offer(now, metadata.binding.channel, bytes),
+            Self::Connections(owner) => owner.offer_diagnosed(now, metadata, bytes, on_block),
+            _ => {
+                let result = self.offer(now, metadata.binding.channel, bytes)?;
+                if result.is_none() {
+                    on_block(if matches!(self, Self::Swift(_)) {
+                        super::AdmissionBlock::SwiftPackingQueue
+                    } else {
+                        super::AdmissionBlock::CodecStage
+                    });
+                }
+                Ok(result)
+            }
         }
     }
 

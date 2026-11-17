@@ -182,6 +182,13 @@ pub(super) enum SenderOwner {
     Packed(Vec<packed_sender::Sender>),
 }
 impl SenderOwner {
+    pub(super) fn buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::SendBuffers {
+        use l2tunnel_codec::diagnostics::SendBuffers;
+        match self {
+            Self::Aligned(sender) => SendBuffers::Aligned(sender[0].buffer_snapshot()),
+            Self::Packed(sender) => SendBuffers::Packed(sender[0].buffer_snapshot()),
+        }
+    }
     pub(super) fn is_pending(&self) -> bool {
         match self {
             Self::Aligned(s) => s[0].is_pending(),
@@ -611,5 +618,9 @@ impl Endpoint {
     /// Retained source/unit/native ownership without consuming or acknowledging it.
     pub fn status(&self) -> Status {
         self.0.status()
+    }
+    /// Actual nested codec retention; this does not poll recovery or consume output.
+    pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
+        self.0.codec_buffer_snapshot()
     }
 }

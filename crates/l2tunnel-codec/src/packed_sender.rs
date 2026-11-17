@@ -76,6 +76,16 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// Map only actual stage refusal; clock, ownership and format errors stay errors.
+    pub const fn buffer_refusal(self) -> Option<crate::diagnostics::StageBlock> {
+        match self {
+            Self::Busy => Some(crate::diagnostics::StageBlock::RetainedFrame),
+            Self::Aligned(error) => error.buffer_refusal(),
+            _ => None,
+        }
+    }
+}
 /// Current local ownership; no field is a peer acknowledgment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Status {
@@ -530,6 +540,15 @@ impl Sender {
             next_unit: self.next_unit,
             first_unit: self.first_unit,
             failure: self.failure,
+        }
+    }
+    /// Observe the separate native stage and packed source without polling either.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::PackedBuffers {
+        let mut packing = self.packing.buffer_snapshot();
+        packing.unit_capacity = usize::from(self.config.max_units);
+        crate::diagnostics::PackedBuffers {
+            stage: self.aligned.buffer_snapshot(),
+            packing,
         }
     }
 }

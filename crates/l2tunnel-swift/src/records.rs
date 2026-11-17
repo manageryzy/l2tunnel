@@ -492,6 +492,29 @@ impl Engine {
     pub fn body_limit(&self) -> usize {
         self.limit
     }
+    /// One channel's actual buffers; absent asymmetric directions remain None.
+    pub fn channel_buffer_snapshot(
+        &self,
+        channel: ChannelId,
+    ) -> crate::diagnostics::ChannelBuffers {
+        crate::diagnostics::ChannelBuffers {
+            send: self
+                .senders
+                .get(channel.index())
+                .map(Sender::buffer_snapshot),
+            receive: self
+                .receivers
+                .get(channel.index())
+                .map(Receiver::buffer_snapshot),
+        }
+    }
+    /// Actual shared native-packing occupancy and bound, counted once across channels.
+    pub fn packing_buffer_snapshot(&self) -> (usize, usize) {
+        (
+            self.senders.iter().map(Sender::queued).sum(),
+            self.send.codec.queue_bytes,
+        )
+    }
     /// Whether the shared packing queue can admit a maximum native record.
     pub fn has_room(&self) -> bool {
         let queued: usize = self.senders.iter().map(Sender::queued).sum();

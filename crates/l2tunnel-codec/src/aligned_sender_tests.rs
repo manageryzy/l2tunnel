@@ -36,6 +36,9 @@ fn hex(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 #[test]
 fn native_observation_counts_complete_fragment_framing_once_after_success() -> TestResult {
     let mut sender = Sender::new(scope(), config(32, 0, 7))?;
+    let empty = sender.buffer_snapshot();
+    assert_eq!(empty.stage.items, 0);
+    assert_eq!(empty.stage.item_capacity, 1);
     let mut native = [0; 70];
     native[..3].copy_from_slice(&[1, 2, 3]);
     let (identity, observation) = sender.stage_raw_observed(ChannelId(0), &native)?;
@@ -47,10 +50,19 @@ fn native_observation_counts_complete_fragment_framing_once_after_success() -> T
     assert_eq!(observation.kind, aligned_body::BodyKind::Raw);
     assert_eq!(observation.codec_net_gain_bytes(), -3);
     assert_eq!(observation.net_gain_bytes(), -35);
+    let retained = sender.buffer_snapshot();
+    assert_eq!(retained.stage.items, 1);
+    assert_eq!(retained.stage.bytes, 73);
+    assert_eq!(retained.remaining_bytes, 73);
     assert_eq!(
         sender.stage_raw_observed(ChannelId(0), &native),
         Err(Error::Busy)
     );
+    assert_eq!(
+        Error::Busy.buffer_refusal(),
+        Some(crate::diagnostics::StageBlock::RetainedFrame)
+    );
+    assert_eq!(sender.buffer_snapshot(), retained);
     let mut body = Vec::new();
     let mut wire_bytes = 0;
     let mut units = 0;
@@ -61,12 +73,15 @@ fn native_observation_counts_complete_fragment_framing_once_after_success() -> T
         body.extend_from_slice(&unit.bytes[8..]);
         wire_bytes += unit.bytes.len();
         units += 1;
+        let remaining = sender.buffer_snapshot().remaining_bytes;
         sender.commit_unit()?;
+        assert!(sender.buffer_snapshot().remaining_bytes < remaining);
     }
     assert_eq!(units, 4);
     assert_eq!(wire_bytes, 105);
     assert_eq!(&body[..3], &[2, 0, 70]);
     assert_eq!(&body[3..], native);
+    assert_eq!(sender.buffer_snapshot(), empty);
     assert!(sender.stage_raw_observed(ChannelId(2), &native).is_err());
     let (next, again) = sender.stage_raw_observed(ChannelId(0), &native)?;
     assert_eq!(next.record, RecordId(8));

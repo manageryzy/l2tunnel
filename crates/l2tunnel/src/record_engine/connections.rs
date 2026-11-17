@@ -91,11 +91,12 @@ impl Connections {
         })
     }
 
-    pub(super) fn offer(
+    pub(super) fn offer_diagnosed(
         &mut self,
         now: Tick,
         metadata: pipeline::PacketMetadata,
         bytes: &[u8],
+        on_block: &mut impl FnMut(AdmissionBlock),
     ) -> Result<Option<ObservedProfileIdentity>, Error> {
         let id = self
             .collection
@@ -106,6 +107,7 @@ impl Connections {
             .admission_open(id)
             .map_err(Error::Connections)?
         {
+            on_block(AdmissionBlock::ConnectionRetirement);
             return Ok(None);
         }
         if self
@@ -127,6 +129,9 @@ impl Connections {
                     bytes,
                 )
                 .map(|identity| {
+                    if identity.is_none() {
+                        on_block(AdmissionBlock::ConnectionUnreliableSlot);
+                    }
                     identity.map(|identity| ObservedProfileIdentity {
                         identity: ProfileIdentity::UnreliableNative(identity),
                         encoding: NativeEncodingObservation::unencoded(bytes.len()),
@@ -137,6 +142,9 @@ impl Connections {
         self.collection
             .offer_recovered_observed(id, metadata.classification.key, duration(now), bytes)
             .map(|value| {
+                if value.is_none() {
+                    on_block(AdmissionBlock::CodecStage);
+                }
                 value.map(|(identity, encoding)| ObservedProfileIdentity {
                     identity: ProfileIdentity::Connection(identity),
                     encoding: encoding.into(),

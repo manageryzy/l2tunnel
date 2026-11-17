@@ -62,6 +62,15 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// Classify an actual rejected operation without inferring a wait from occupancy.
+    pub const fn buffer_refusal(self) -> Option<crate::diagnostics::StageBlock> {
+        match self {
+            Self::Busy => Some(crate::diagnostics::StageBlock::RetainedFrame),
+            _ => None,
+        }
+    }
+}
 impl From<aligned_body::Error> for Error {
     fn from(value: aligned_body::Error) -> Self {
         Self::Body(value)
@@ -252,6 +261,28 @@ impl Sender {
     /// Whether one native frame still has symbols awaiting recovery ownership.
     pub fn is_pending(&self) -> bool {
         self.pending.is_some()
+    }
+    /// Observe the sole stage without constructing a symbol or advancing its cursor.
+    pub fn buffer_snapshot(&self) -> crate::diagnostics::StageBuffers {
+        let (bytes, remaining) = self.pending.map_or((0, 0), |pending| {
+            let bytes = pending.context_len + pending.body_len;
+            let consumed = if pending.context {
+                0
+            } else {
+                pending.context_len
+            };
+            (bytes, bytes - consumed - pending.offset)
+        });
+        crate::diagnostics::StageBuffers {
+            stage: crate::diagnostics::Retention {
+                items: usize::from(self.pending.is_some()),
+                item_capacity: 1,
+                bytes,
+                byte_capacity: self.bodies.len(),
+            },
+            remaining_bytes: remaining,
+            unit_scratch_capacity: self.symbol.len(),
+        }
     }
     /// Next unused record identity; None means the channel is exhausted.
     pub fn next_record(&self, channel: ChannelId) -> Result<Option<RecordId>, Error> {

@@ -63,6 +63,13 @@ fn native_observation_preserves_literal_expansion_delta_and_meaningful_zeros() -
         assert_eq!(peer.pop()?.ok_or(Error::Admission)?, expected);
     }
     assert!(peer.pop()?.is_none());
+    assert_eq!(
+        peer.channel_buffer_snapshot(channel)
+            .receive
+            .ok_or(Error::Admission)?
+            .stream_bytes,
+        0
+    );
     assert_eq!(engine.stats().native_read, 3);
     assert_eq!(engine.stats().sender.packets, 3);
     Ok(())
@@ -77,12 +84,27 @@ fn native_observation_refusal_does_not_allocate_identity_or_advance_context() ->
     let first = packet(1234, 0, 8);
     let next = packet(1234, 1, 8);
     observed(engine.offer_on_channel_observed(0, channel, &first)?)?;
+    let retained = engine.channel_buffer_snapshot(channel);
+    let send = retained.send.ok_or(Error::Admission)?;
+    assert_eq!(send.packing_bytes, 51);
+    assert_eq!(
+        engine.packing_buffer_snapshot(),
+        (51, settings.codec.queue_bytes)
+    );
     assert_eq!(
         engine.offer_on_channel_observed(0, channel, &next)?,
         ObservedAdmission::Full
     );
     assert_eq!(engine.stats().native_read, 1);
+    assert_eq!(engine.channel_buffer_snapshot(channel), retained);
     assert!(engine.poll(0, RecordNumber(0), true)?.is_some());
+    let emitted = engine
+        .channel_buffer_snapshot(channel)
+        .send
+        .ok_or(Error::Admission)?;
+    assert_eq!(emitted.packing_bytes, 0);
+    assert_eq!(emitted.source_records, 1);
+    assert_eq!(emitted.source_bytes, 51);
     let (identity, encoding) = observed(engine.offer_on_channel_observed(0, channel, &next)?)?;
     assert_eq!(identity.record, NativeRecordId(1));
     assert_eq!(encoding.kind, header::EncodingKind::Delta);

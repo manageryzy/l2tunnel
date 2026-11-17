@@ -126,11 +126,33 @@ async fn common_outgoing_fifo_backpressures_before_large_user_queue_hides_contro
             Poll::Ready(Ok(_))
         ));
     }
+    let before = a.buffer_snapshot();
+    assert_eq!(before.user_slots.used, Some(0));
+    assert_eq!(before.control_slots.used, Some(0));
+    assert_eq!(
+        before.outgoing_send_buffer_capacity,
+        geometry.maintained_send_queue_bytes
+    );
+    assert_eq!(
+        before.incoming_receive_buffer_capacity,
+        geometry.maintained_queue_bytes
+    );
+    assert!(before.available_payload_bytes < body.len());
+    assert_eq!(before.outgoing_used_bytes, None);
+    assert_eq!(before.incoming_used_bytes, None);
     let mut held = a.try_send(Class::User, &body, original, Framing::Final)?;
+    assert_eq!(a.buffer_snapshot().user_slots.used, Some(1));
+    assert_eq!(a.buffer_snapshot().control_slots.used, Some(0));
     assert!(Pin::new(&mut held).poll(&mut context).is_pending());
+    assert_eq!(
+        a.buffer_snapshot().available_payload_bytes,
+        before.available_payload_bytes
+    );
+    assert!(!a.buffer_snapshot().invalid_slot_observation);
     assert_eq!(a.acceptance_status()?.accepted_datagrams, 2);
     assert_eq!(held.deadline(), original);
     drop(held);
+    assert_eq!(a.buffer_snapshot().user_slots.used, Some(0));
     let control = [0x80; 21];
     a.try_send(Class::Control, &control, original, Framing::Final)?
         .await?;

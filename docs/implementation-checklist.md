@@ -36,7 +36,7 @@ remains unmeasured; these results do not qualify the complete matrix.
 The next [joined framing and native-admission batch](modules/compact-wire-cleanup.md#joined-framing-and-successful-native-admission-observations)
 implements correlated schema3 observations and actual successful-codec admission
 metadata; shared validation remains pending. The newly requested all-buffer
-backpressure instrumentation is planned with an explicit coverage inventory;
+backpressure instrumentation is tracked in the [complete buffer coverage inventory](modules/buffer-observability.md);
 nonempty queues, residence time and downstream blockage must remain distinct.
 
 This remains the persistent progress ledger. Unchecked work is required;

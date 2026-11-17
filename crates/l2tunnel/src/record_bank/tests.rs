@@ -239,10 +239,12 @@ fn every_real_family_transition_publishes_the_exact_virgin_and_preserves_current
             assert_eq!(bank.engine(current)?.statistics(), old_statistics);
             assert_eq!(bank.engine(current)?.queue_usage(), old_queue);
             assert_eq!(bank.retire(current), Err(Error::NotDrained));
+            let mut refusals = 0;
             let admitted = bank
                 .entry(current)?
-                .admit_borrowed_observed(engine::Tick(0))?
+                .admit_borrowed_diagnosed(engine::Tick(0), |_| refusals += 1)?
                 .ok_or("actual old admission")?;
+            assert_eq!(refusals, 0);
             assert_eq!(admitted.metadata, metadata);
             let encoding = admitted.permit.encoding;
             assert_eq!(encoding.original_native_bytes, bytes.len());
@@ -261,9 +263,15 @@ fn every_real_family_transition_publishes_the_exact_virgin_and_preserves_current
             }
             assert!(
                 bank.entry(current)?
-                    .admit_borrowed_observed(engine::Tick(0))?
+                    .admit_borrowed_diagnosed(engine::Tick(0), |_| refusals += 1)?
                     .is_none()
             );
+            assert_eq!(refusals, 0, "an empty Pipeline is not backpressure");
+            let usage = bank.usage();
+            let mut snapshots = 0;
+            bank.entry(current)?.visit_codec_buffers(|_| snapshots += 1);
+            assert!(snapshots > 0);
+            assert_eq!(bank.usage(), usage);
             assert_eq!(bank.engine(current)?.statistics().admitted, 1);
             // Teardown releases this deliberately undrained old owner, without a clean-retire claim.
         }

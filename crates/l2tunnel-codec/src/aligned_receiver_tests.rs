@@ -154,11 +154,23 @@ fn lookahead_saturation_preserves_head_reservation_and_immutable_pending_native(
     let mut receiver = Receiver::new(scope(), config)?;
     receiver.admit_authenticated(identity(1, 1), &raw(1460, 0, 1, b"later"), Tick(1))?;
     let before = receiver.status();
+    let buffers = receiver.buffer_snapshot();
+    assert_eq!(buffers.heads.items, 0);
+    assert_eq!(buffers.lookahead.items, 1);
+    assert_eq!(buffers.lookahead.item_capacity, 1);
+    assert_eq!(buffers.lookahead.bytes, 8);
+    assert_eq!(buffers.lookahead.byte_capacity, 8);
+    assert_eq!(buffers.source_proofs.items, 1);
     assert_eq!(
         receiver.admit_authenticated(identity(2, 2), &raw(1460, 0, 2, b"third"), Tick(2)),
         Err(Error::Capacity)
     );
     assert_eq!(receiver.status(), before);
+    assert_eq!(receiver.buffer_snapshot(), buffers);
+    assert_eq!(
+        Error::Capacity.buffer_refusal(),
+        Some(crate::diagnostics::ReceiveBlock::ReceiverResources)
+    );
     receiver.admit_authenticated(
         identity(0, 0),
         &raw(1460, 0, 0, b"head consumes only its progress reserve"),
@@ -166,6 +178,10 @@ fn lookahead_saturation_preserves_head_reservation_and_immutable_pending_native(
     )?;
     assert_eq!(receiver.prepare(ChannelId(0), Tick(3), 1)?, Prepared::Ready);
     let pending = receiver.pending().ok_or("pending")?.bytes.to_vec();
+    assert_eq!(
+        receiver.buffer_snapshot().pending_native_bytes,
+        Some(pending.len())
+    );
     assert_eq!(receiver.expected(ChannelId(0))?, Some(RecordId(0)));
     for time in 4..20 {
         assert_eq!(
@@ -181,6 +197,9 @@ fn lookahead_saturation_preserves_head_reservation_and_immutable_pending_native(
         vec![(0, 1, b"later".to_vec()), (0, 2, b"third".to_vec())]
     );
     assert_eq!(receiver.status().retained_records, 0);
+    assert_eq!(receiver.buffer_snapshot().heads.items, 0);
+    assert_eq!(receiver.buffer_snapshot().lookahead.items, 0);
+    assert_eq!(receiver.buffer_snapshot().pending_native_bytes, None);
     Ok(())
 }
 #[test]

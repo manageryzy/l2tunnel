@@ -84,6 +84,18 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         kind: FinalKind,
         protected_bytes: usize,
     ) -> Result<FinalOutputToken, Error> {
+        match self.prepare_final_record_observed(lane, kind, protected_bytes)? {
+            FinalPrepareOutcome::Ready(token) => Ok(token),
+            FinalPrepareOutcome::Blocked(_) => Err(Error::Busy),
+        }
+    }
+    /// Same reservation and precedence, retaining the actual bounded refusal reason.
+    pub fn prepare_final_record_observed(
+        &mut self,
+        lane: PairLane,
+        kind: FinalKind,
+        protected_bytes: usize,
+    ) -> Result<FinalPrepareOutcome, Error> {
         if kind == FinalKind::CarrierControl {
             return Err(Error::Configuration);
         }
@@ -96,6 +108,18 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         control: FinalControl,
         protected_bytes: usize,
     ) -> Result<FinalOutputToken, Error> {
+        match self.prepare_final_control_observed(lane, control, protected_bytes)? {
+            FinalPrepareOutcome::Ready(token) => Ok(token),
+            FinalPrepareOutcome::Blocked(_) => Err(Error::Busy),
+        }
+    }
+    /// Same strong-control reservation with a typed observed refusal.
+    pub fn prepare_final_control_observed(
+        &mut self,
+        lane: PairLane,
+        control: FinalControl,
+        protected_bytes: usize,
+    ) -> Result<FinalPrepareOutcome, Error> {
         self.prepare_final_inner(
             lane,
             FinalKind::CarrierControl,
@@ -109,7 +133,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         kind: FinalKind,
         control: Option<FinalControl>,
         protected_bytes: usize,
-    ) -> Result<FinalOutputToken, Error> {
+    ) -> Result<FinalPrepareOutcome, Error> {
         self.check_live()?;
         let context = self.final_context.ok_or(Error::Configuration)?;
         let count = self.count();
@@ -128,7 +152,15 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             || owner.tracked.is_some()
             || owner.completed.is_some()
         {
-            return Err(Error::Busy);
+            let reason = FinalPrepareBlocked::LocalCustody {
+                pending: owner.pending.is_some(),
+                packet_io_pending: owner.io.pending(),
+                prepared: owner.final_prepared.is_some(),
+                tracked: owner.tracked.is_some(),
+                completed: owner.completed.is_some(),
+            };
+            owner.prepare_observations[diagnostics::prepare_index(kind)].refuse(reason);
+            return Ok(FinalPrepareOutcome::Blocked(reason));
         }
         match control {
             Some(FinalControl::Ping(value))
@@ -137,7 +169,9 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                         && Instant::now().saturating_duration_since(owner.last_ping)
                             < TRANSITION_RETRY_INTERVAL) =>
             {
-                return Err(Error::Busy);
+                let reason = FinalPrepareBlocked::ControlRetry;
+                owner.prepare_observations[diagnostics::prepare_index(kind)].refuse(reason);
+                return Ok(FinalPrepareOutcome::Blocked(reason));
             }
             Some(FinalControl::Pong(value)) if owner.pong != Some(value) => {
                 return Err(Error::Configuration);
@@ -154,13 +188,22 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             return Err(Error::Exhausted);
         }
         let reserve = kind.reserve() * (u64::from(self.policy.mtu) - 40);
-        if end
-            > f.peer_retired
-                .checked_add(f.peer_horizon)
-                .ok_or(Error::Exhausted)?
-                .saturating_sub(reserve)
-        {
-            return Err(Error::Busy);
+        let allowed_end = f
+            .peer_retired
+            .checked_add(f.peer_horizon)
+            .ok_or(Error::Exhausted)?
+            .saturating_sub(reserve);
+        if end > allowed_end {
+            let reason = FinalPrepareBlocked::PeerHorizon {
+                requested_end: end,
+                allowed_end,
+                allocated: f.allocated,
+                peer_retired: f.peer_retired,
+                horizon_bytes: f.peer_horizon,
+                reserved_bytes: reserve,
+            };
+            owner.prepare_observations[diagnostics::prepare_index(kind)].refuse(reason);
+            return Ok(FinalPrepareOutcome::Blocked(reason));
         }
         let metadata = FinalMetadata {
             context,
@@ -180,11 +223,13 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             payload_bytes: u16::try_from(protected_bytes).map_err(|_| Error::Capacity)?,
         };
         owner.final_prepared = Some((metadata, control));
-        Ok(FinalOutputToken {
+        let observations = &mut owner.prepare_observations[diagnostics::prepare_index(kind)];
+        observations.ready = observations.ready.saturating_add(1);
+        Ok(FinalPrepareOutcome::Ready(FinalOutputToken {
             metadata,
             end,
             control,
-        })
+        }))
     }
     /// Release an uncommitted reservation. It never rewinds an external nonce.
     pub fn cancel_final_record(&mut self, token: FinalOutputToken) -> Result<(), Error> {
@@ -395,7 +440,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                 }));
             }
             state.consume_final_candidate(index)?;
-            state.reject_final()?;
+            state.reject_final_preflight(metadata)?;
         }
     }
     /// Commit the sole verifier's result for exactly the previously inspected candidate.
@@ -416,7 +461,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         let index = state.selected_final_candidate(metadata)?;
         let Some(verdict) = verdict else {
             state.consume_final_candidate(index)?;
-            state.reject_final()?;
+            state.reject_final_verdict(metadata)?;
             return Ok(());
         };
         if (metadata.kind != FinalKind::Data && !verdict.authenticated)
@@ -426,6 +471,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         }
         let retired = state.commit_final(metadata)?;
         let received_at = state.consume_final_candidate(index)?.received_at;
+        state.accept_final_verdict(metadata);
         drop(state);
         match verdict.control {
             Some(FinalControl::Window) => {}

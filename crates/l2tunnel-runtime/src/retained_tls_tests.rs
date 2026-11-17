@@ -12,6 +12,138 @@ use tokio::{
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+fn attach_buffer_metrics(adapter: &mut Adapter) -> io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "l2tunnel-tls-buffer-{}-{}.bmetrics",
+        std::process::id(),
+        adapter.owner
+    ));
+    adapter.metrics = Some(Observer::for_test(Instant::now(), path.clone())?);
+    Ok(path)
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_tls_buffer_metrics_observe_actual_refusal_until_progress() -> TestResult {
+    let (mut adapter, mut peer) = framing_pair(3)?;
+    let path = attach_buffer_metrics(&mut adapter)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut token = adapter.try_send(Class::User, &[7], deadline, Framing::Final)?;
+    assert_eq!(
+        adapter
+            .try_send(Class::User, &[8], deadline, Framing::Final)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::WouldBlock)
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(adapter.poll_send(&mut cx, &mut token).is_pending());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    assert!(adapter.poll_send(&mut cx, &mut token).is_pending());
+    peer.read_exact(&mut [0; 3]).await?;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(matches!(
+        adapter.poll_send(&mut cx, &mut token),
+        Poll::Ready(Ok(_))
+    ));
+    let metrics = adapter.metrics.as_mut().ok_or("metrics missing")?;
+    let now = metrics.now();
+    let write = metrics
+        .collector()
+        .reason(
+            lane_key(Site::TlsWrite, 0, MetricClass::User),
+            Reason::IoPending,
+            now,
+        )
+        .map_err(|_| "invalid write observation")?;
+    assert_eq!(
+        (
+            write.refusals,
+            write.blocked.episodes,
+            write.blocked.completed_us
+        ),
+        (2, 1, 15_000)
+    );
+    let slot = metrics
+        .collector()
+        .reason(submission_key(Class::User), Reason::QueueFull, now)
+        .map_err(|_| "invalid slot observation")?;
+    assert_eq!(
+        (slot.blocked.episodes, slot.blocked.completed_us),
+        (1, 15_000)
+    );
+    assert_eq!(
+        metrics
+            .collector()
+            .owner(now)
+            .map(|owner| owner.blocked.completed_us),
+        Ok(15_000)
+    );
+    assert_eq!(
+        metrics
+            .collector()
+            .key(submission_key(Class::User))
+            .bytes
+            .high_water,
+        Some(6)
+    );
+    // Idle reads produce no inferred receive-blocking episode.
+    assert_eq!(
+        metrics
+            .collector()
+            .reason(
+                lane_key(Site::TlsInput, 0, MetricClass::Shared),
+                Reason::IoPending,
+                now
+            )
+            .map(|state| state.observed),
+        Ok(false)
+    );
+    drop(adapter);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_tls_buffer_metrics_censor_original_timeout_without_fake_progress() -> TestResult {
+    let (mut adapter, _peer) = framing_pair(1)?;
+    let path = attach_buffer_metrics(&mut adapter)?;
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let mut token = adapter.try_send(Class::User, &[7], deadline, Framing::Final)?;
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(adapter.poll_send(&mut cx, &mut token).is_pending());
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(
+        matches!(adapter.poll_send(&mut cx, &mut token), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let metrics = adapter.metrics.as_mut().ok_or("metrics missing")?;
+    let now = metrics.now();
+    let state = metrics
+        .collector()
+        .reason(
+            lane_key(Site::TlsWrite, 0, MetricClass::User),
+            Reason::IoPending,
+            now,
+        )
+        .map_err(|_| "invalid censored observation")?;
+    assert_eq!(
+        (
+            state.blocked.completed_episodes,
+            state.blocked.censored_episodes,
+            state.blocked.censored_us,
+            state.blocked.open_us
+        ),
+        (0, 1, 20_000, None)
+    );
+    assert_eq!(
+        metrics.collector().owner(now).map(|owner| owner.invalid),
+        Ok(crate::buffer_metrics::Invalid::default())
+    );
+    drop(adapter);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 fn limits() -> Limits {
     Limits {
         max_record_bytes: 1024,

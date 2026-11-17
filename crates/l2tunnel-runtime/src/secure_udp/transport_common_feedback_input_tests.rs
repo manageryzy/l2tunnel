@@ -32,6 +32,15 @@ async fn actual_udp_metrics_require_receipt_identity_and_preserve_late_acceptanc
             path.clone(),
             1500,
         )?);
+        let buffer_path = path.with_extension("bmetrics");
+        a.driver
+            .common
+            .as_deref_mut()
+            .ok_or("Common owner")?
+            .buffer_metrics = Some(crate::buffer_metrics::Observer::for_test(
+            a.driver.origin,
+            buffer_path.clone(),
+        )?);
         let now = clock(a.driver.origin, Instant::now())?;
         let epoch = a.driver.common_state()?.epoch();
         a.driver
@@ -53,6 +62,10 @@ async fn actual_udp_metrics_require_receipt_identity_and_preserve_late_acceptanc
         assert!(
             !a.driver
                 .send_common_user_with(now, |_| Err(io::ErrorKind::WouldBlock.into()))?
+        );
+        assert!(
+            !a.driver
+                .send_common_user_with(now + 1, |_| Err(io::ErrorKind::WouldBlock.into()))?
         );
         let (identity, wire) = {
             let runtime = a.driver.common.as_deref().ok_or("Common owner")?;
@@ -154,8 +167,48 @@ async fn actual_udp_metrics_require_receipt_identity_and_preserve_late_acceptanc
                 + u64::try_from(receipt.socket_ip_bytes.ok_or("actual UDP IP bytes")?)?
         );
         assert_eq!(socket_owner.addresses()?, a.original);
+        let terminal_at = clock(a.driver.origin, identity.deadline)?;
+        let buffer = a
+            .driver
+            .common
+            .as_deref_mut()
+            .ok_or("Common owner")?
+            .buffer_metrics
+            .as_mut()
+            .ok_or("buffer observer")?;
+        let key = crate::buffer_metrics::Key {
+            site: crate::buffer_metrics::Site::CommonUserSlot,
+            lane: crate::buffer_metrics::Lane::Shared,
+            class: crate::buffer_metrics::Class::Shared,
+        };
+        let waiting = buffer
+            .collector()
+            .reason(key, crate::buffer_metrics::Reason::SocketWrite, terminal_at)
+            .map_err(|_| "metric clock")?;
+        assert_eq!(waiting.refusals, 2);
+        assert_eq!(waiting.blocked.episodes, 1);
+        assert_eq!(
+            waiting.blocked.completed_episodes,
+            u64::from(!wrong_identity)
+        );
+        assert_eq!(waiting.blocked.open_us.is_some(), wrong_identity);
+        buffer.finish_at(terminal_at);
+        let frozen = buffer
+            .collector()
+            .reason(key, crate::buffer_metrics::Reason::SocketWrite, terminal_at)
+            .map_err(|_| "metric clock")?;
+        assert_eq!(frozen.blocked.censored_episodes, u64::from(wrong_identity));
+        drop(
+            a.driver
+                .common
+                .as_deref_mut()
+                .ok_or("Common owner")?
+                .buffer_metrics
+                .take(),
+        );
         drop(metrics);
         std::fs::remove_file(path)?;
+        std::fs::remove_file(buffer_path)?;
     }
     Ok(())
 }

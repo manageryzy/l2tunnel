@@ -1141,6 +1141,13 @@ impl Endpoint {
             failure: self.failure,
         }
     }
+    /// Read the actual codec stage and receiver; recovery buffers remain separate.
+    pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
+        l2tunnel_codec::diagnostics::DuplexBuffers {
+            send: self.sender.buffer_snapshot(),
+            receive: self.receiver.buffer_snapshot(),
+        }
+    }
     fn advance(&mut self, now: Duration) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);

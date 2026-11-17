@@ -20,6 +20,7 @@ struct Detached<I: PacketIo> {
     pending: Option<Pending>,
     tracked: Option<RecordToken>,
     completed: Option<SentRecord>,
+    prepare_observations: [PrepareSnapshot; 4],
     last_transition: Option<Instant>,
     last_transition_kind: Option<wire::Kind>,
     copies: u16,
@@ -47,6 +48,44 @@ struct Pending {
     retired: u64,
 }
 impl<I: PacketIo> Detached<I> {
+    fn buffer_snapshot(&self, now: Instant) -> Result<LaneBufferSnapshot, Error> {
+        let state = lock(&self.io.state)?;
+        let ([carrier_control, upper_control, bulk], selected_kind, selected_age_micros) =
+            state.final_candidate_diagnostics(now);
+        let fence = state.fence.as_ref();
+        Ok(LaneBufferSnapshot {
+            carrier_control,
+            upper_control,
+            bulk,
+            candidate_capacity_packets: usize::from(state.policy.queue_packets) + 4,
+            upper_bulk_shared_slot: state.policy.queue_packets == 1,
+            bootstrap_records_outstanding: state.records_outstanding,
+            bootstrap_control_queued: state
+                .incoming
+                .iter()
+                .filter(|cell| cell.final_metadata.is_none() && cell.header.kind.control())
+                .count(),
+            total_gate_rejected_packets: state.rejected_packets,
+            selected_kind,
+            selected_age_micros,
+            local_horizon_bytes: fence.map(|f| f.local_horizon),
+            peer_horizon_bytes: fence.map(|f| f.peer_horizon),
+            send_debt_bytes: fence.map(|f| f.allocated.saturating_sub(f.peer_retired)),
+            retired_bytes: fence.map(|f| f.retired),
+            prepared_payload_bytes: self
+                .final_prepared
+                .map_or(0, |(metadata, _)| metadata.payload_bytes()),
+            pending_ip_bytes: self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.bytes.len()),
+            packet_io_pending: self.io.pending(),
+            tracked: self.tracked.is_some(),
+            completed: self.completed.is_some(),
+            prepare: self.prepare_observations,
+            send_io: self.io.send_observations,
+        })
+    }
     fn retirement_threshold(&self) -> Result<u64, Error> {
         let state = lock(&self.io.state)?;
         let maximum = u64::from(state.policy.mtu)
@@ -302,6 +341,7 @@ pub struct PacketSetup<'a, I: PacketIo + Send + 'static> {
     armed: [u8; 32],
     frozen: [Option<FrozenTls>; 2],
     detached: [Option<Detached<I>>; 2],
+    terminal_buffers: Vec<BufferSnapshot>,
     carrier: Option<PacketCarrier<I>>,
     done: bool,
 }
@@ -313,6 +353,8 @@ impl<I: PacketIo + Send + 'static> Unpin for PacketSetup<'_, I> {}
 pub struct PacketCarrier<I: PacketIo + Send + 'static> {
     lanes: [Option<Detached<I>>; 2],
     terminal_sent: [Option<SentRecord>; 2],
+    // One slot reserved before attachment, populated once before owner release.
+    terminal_buffers: Vec<BufferSnapshot>,
     info: PairInfo,
     policy: PacketPolicy,
     policy_digest: [u8; 32],
@@ -392,6 +434,7 @@ fn configuration<I: PacketIo + Send + 'static>(
     let range_capacity = GateState::planned_range_capacity_bytes(config.packet)?;
     let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
         + std::mem::size_of::<PacketCarrier<I>>()
+        + std::mem::size_of::<BufferSnapshot>()
         + profile.count
             * (std::mem::size_of::<GateIo<I>>()
                 + std::mem::size_of::<GateState>()
@@ -444,17 +487,35 @@ fn begin<'a, I: PacketIo + Send + 'static>(
         let second_state = second
             .map(|value| GateState::new(value, config.packet, deadline))
             .transpose()?;
-        Ok((pair, policy, deadline, count, first_state, second_state))
-    })();
-    let (pair, policy_digest, deadline, count, first_state, second_state) = match prepared {
-        Ok(p) => p,
-        Err(error) => {
-            return Err(PacketStartFailure {
-                inputs: Box::new(inputs),
-                error,
-            });
+        // Terminal failure must retain scalar evidence without allocating or
+        // keeping a large snapshot inline through every setup owner move.
+        let mut terminal_buffers = Vec::new();
+        terminal_buffers
+            .try_reserve_exact(1)
+            .map_err(|_| Error::Capacity)?;
+        if terminal_buffers.capacity() != 1 {
+            return Err(Error::Capacity);
         }
-    };
+        Ok((
+            pair,
+            policy,
+            deadline,
+            count,
+            first_state,
+            second_state,
+            terminal_buffers,
+        ))
+    })();
+    let (pair, policy_digest, deadline, count, first_state, second_state, terminal_buffers) =
+        match prepared {
+            Ok(p) => p,
+            Err(error) => {
+                return Err(PacketStartFailure {
+                    inputs: Box::new(inputs),
+                    error,
+                });
+            }
+        };
     let budget = Arc::new(Mutex::new(Budget::new(config.packet, start)));
     let mut states = [None, None];
     let client = matches!(credentials, Credentials::Client(..));
@@ -513,6 +574,7 @@ fn begin<'a, I: PacketIo + Send + 'static>(
         armed: [0; 32],
         frozen: [None, None],
         detached: [None, None],
+        terminal_buffers,
         carrier: None,
         done: false,
     })
@@ -821,6 +883,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             pending: None,
             tracked: None,
             completed: None,
+            prepare_observations: [PrepareSnapshot::default(); 4],
             last_transition: None,
             last_transition_kind: None,
             copies: 0,
@@ -852,6 +915,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
         self.carrier = Some(PacketCarrier {
             lanes: std::mem::take(&mut self.detached),
             terminal_sent: [None, None],
+            terminal_buffers: std::mem::take(&mut self.terminal_buffers),
             info,
             policy: self.policy,
             policy_digest: self.policy_digest,
@@ -1056,6 +1120,28 @@ fn counter_digest(m: MessageStatus, b: BridgeProof) -> [u8; 32] {
 }
 
 impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
+    /// Read only bounded scalar custody. Terminal observations are frozen before release.
+    /// Missing/poisoned observations never replace the original transport failure.
+    pub fn buffer_snapshot(&self, now: Instant) -> BufferSnapshot {
+        if let Some(snapshot) = self.terminal_buffers.first() {
+            return *snapshot;
+        }
+        let mut snapshot = BufferSnapshot {
+            captured_at: now,
+            terminal: self.fault.is_some(),
+            lanes: [None, None],
+            unavailable_lanes: 0,
+        };
+        for (index, lane) in self.lanes.iter().enumerate() {
+            if let Some(lane) = lane {
+                match lane.buffer_snapshot(now) {
+                    Ok(value) => snapshot.lanes[index] = Some(value),
+                    Err(_) => snapshot.unavailable_lanes |= 1 << index,
+                }
+            }
+        }
+        snapshot
+    }
     fn count(&self) -> usize {
         if self.info.duplex == Duplex::Full {
             1
@@ -1386,6 +1472,10 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     }
     fn fail(&mut self, e: Error) -> Error {
         let e = self.fault.get_or_insert(e).clone();
+        if self.terminal_buffers.is_empty() {
+            let snapshot = self.buffer_snapshot(Instant::now());
+            self.terminal_buffers.push(snapshot);
+        }
         for (saved, lane) in self.terminal_sent.iter_mut().zip(&mut self.lanes) {
             if saved.is_none()
                 && let Some(lane) = lane
@@ -1489,6 +1579,11 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                 .checked_add(lock(&lane.io.state)?.range_capacity_bytes())
                 .ok_or(Error::Capacity)
         })
+    }
+    /// Actual preallocated storage for the single frozen terminal scalar snapshot.
+    /// This remains retained after the original lanes are released.
+    pub fn terminal_snapshot_capacity_bytes(&self) -> usize {
+        self.terminal_buffers.capacity() * std::mem::size_of::<BufferSnapshot>()
     }
     /// Original setup cap; observing it never grants another setup interval.
     pub fn setup_deadline(&self) -> Instant {

@@ -117,15 +117,43 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
 pub(super) fn offer(
     owner: &mut Owner,
     counts: &mut Counts,
-    mut window: Option<&mut native_window::State>,
+    window: Option<&mut native_window::State>,
     now: Tick,
     metadata: pipeline::PacketMetadata,
     width: u16,
     bytes: &[u8],
 ) -> Result<Option<ObservedProfileIdentity>, Error> {
+    offer_diagnosed(
+        owner,
+        counts,
+        window,
+        now,
+        metadata,
+        width,
+        bytes,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Existing exact admission inputs plus a non-owning diagnostic callback.
+pub(super) fn offer_diagnosed(
+    owner: &mut Owner,
+    counts: &mut Counts,
+    mut window: Option<&mut native_window::State>,
+    now: Tick,
+    metadata: pipeline::PacketMetadata,
+    width: u16,
+    bytes: &[u8],
+    on_block: &mut impl FnMut(AdmissionRefusal),
+) -> Result<Option<ObservedProfileIdentity>, Error> {
     if let Some(window) = window.as_mut()
         && !window.preview(now, bytes.len())?
     {
+        on_block(AdmissionRefusal {
+            channel: metadata.binding.channel,
+            bytes: bytes.len(),
+            reason: AdmissionBlock::NativeDeliveryWindow,
+        });
         return Ok(None);
     }
     let channel = metadata.binding.channel;
@@ -135,7 +163,13 @@ pub(super) fn offer(
     } else {
         Some(counts.next_admission(channel, width)?)
     };
-    let admitted = owner.offer_queued(now, metadata, bytes)?;
+    let admitted = owner.offer_queued_diagnosed(now, metadata, bytes, &mut |reason| {
+        on_block(AdmissionRefusal {
+            channel,
+            bytes: bytes.len(),
+            reason,
+        });
+    })?;
     if let Some(id) = admitted
         && let Some(window) = window.as_mut()
     {

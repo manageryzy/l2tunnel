@@ -103,6 +103,8 @@ pub(super) struct GateState {
     pub incoming: VecDeque<Cell>,
     final_candidate_turn: u8,
     final_selected: Option<super::compact::FinalMetadata>,
+    candidate_counters: [CandidateCounters; 3],
+    candidate_queued: [(usize, usize); 3],
     pub old_reply: Option<Vec<u8>>,
     pub last_old: Option<Instant>,
     pub deadline: Instant,
@@ -175,6 +177,8 @@ impl GateState {
             incoming: VecDeque::with_capacity(usize::from(policy.queue_packets) + 5),
             final_candidate_turn: 0,
             final_selected: None,
+            candidate_counters: [CandidateCounters::default(); 3],
+            candidate_queued: [(0, 0); 3],
             old_reply: None,
             last_old: None,
             deadline,
@@ -583,6 +587,7 @@ pub(super) struct GateIo<I: PacketIo> {
     pub budget: SharedBudget,
     pending: Option<([u8; 32], usize)>,
     pub last_send_at: Option<Instant>,
+    pub send_observations: SendIoSnapshot,
 }
 impl<I: PacketIo> GateIo<I> {
     pub fn new(io: I, state: GateState, budget: SharedBudget) -> Self {
@@ -592,6 +597,7 @@ impl<I: PacketIo> GateIo<I> {
             budget,
             pending: None,
             last_send_at: None,
+            send_observations: SendIoSnapshot::default(),
         }
     }
     pub fn original(self) -> I {
@@ -613,6 +619,7 @@ impl<I: PacketIo> GateIo<I> {
     }
     pub fn cancel_pending(&mut self) {
         self.pending = None;
+        self.send_observations.cancel();
     }
     pub fn pending(&self) -> bool {
         self.pending.is_some()
@@ -694,6 +701,10 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
         let identity = (profile::hash(bytes), bytes.len());
         let mut b = lock(&self.budget).map_err(io::Error::other)?;
         if !b.take(1) {
+            self.send_observations.turn_budget_refusals = self
+                .send_observations
+                .turn_budget_refusals
+                .saturating_add(1);
             return Err(io::ErrorKind::WouldBlock.into());
         }
         if let Some(old) = self.pending {
@@ -702,6 +713,8 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
             }
         } else {
             if !b.reserve(bytes.len(), Instant::now()) {
+                self.send_observations.pacing_refusals =
+                    self.send_observations.pacing_refusals.saturating_add(1);
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             self.pending = Some(identity);
@@ -720,8 +733,11 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
                     .ok_or_else(|| io::Error::other(Error::Exhausted))?,
             )
         };
+        self.send_observations.packet_io_attempts =
+            self.send_observations.packet_io_attempts.saturating_add(1);
         match self.io.send(bytes) {
             Ok(()) => {
+                self.send_observations.success();
                 self.last_send_at = Some(Instant::now());
                 self.pending = None;
                 let mut state = lock(&self.state).map_err(io::Error::other)?;
@@ -744,7 +760,12 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
                 }
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    self.send_observations.would_block();
+                }
+                Err(e)
+            }
         }
     }
 }

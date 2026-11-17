@@ -1128,6 +1128,7 @@ dependencies = [
  "l2tunnel-wire",
  "rcgen",
  "ring",
+ "serde_json",
  "socket2",
  "tokio",
  "zeroize",

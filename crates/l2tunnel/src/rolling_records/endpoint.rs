@@ -1341,6 +1341,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     pub fn record_status(&self) -> receiver::Status {
         self.records.status()
     }
+    /// Read actual codec retention without stepping the independent FEC owners.
+    pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
+        l2tunnel_codec::diagnostics::DuplexBuffers {
+            send: l2tunnel_codec::diagnostics::SendBuffers::Packed(self.packing.buffer_snapshot()),
+            receive: self.records.buffer_snapshot(),
+        }
+    }
     /// Constant-size actual local counters.
     pub fn statistics(&self) -> Statistics {
         self.statistics

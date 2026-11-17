@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Finite offline report checks; no native workload, sockets or compiler runs."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+try:
+    from . import buffer_metrics_report as report
+except ImportError:
+    import buffer_metrics_report as report
+
+
+def duration(completed=0, censored=0, opened=None):
+    return {'episodes': int(completed > 0) + int(censored > 0) + int(opened is not None),
+            'completed_episodes': int(completed > 0), 'censored_episodes': int(censored > 0),
+            'completed_us': completed, 'censored_us': censored, 'open_us': opened,
+            'maximum_us': max(completed, censored, opened or 0)}
+
+
+def gauge(used=None, capacity=None):
+    return {'samples': int(used is not None), 'used': used, 'capacity': capacity,
+            'high_water': used, 'minimum_known_capacity': capacity,
+            'maximum_known_capacity': capacity}
+
+
+def reason(name, blocked=None, untimed=0):
+    return {'reason': name, 'refusals': 7 if blocked else untimed,
+            'untimed_refusals': untimed, 'progress': 1,
+            'blocked': blocked or duration()}
+
+
+def fixture():
+    return {'schema': 1, 'owner': 'common', 'definition': 'finite fixture',
+            'coverage': 'partial: unhooked queues unavailable',
+            'first_observed_us': 1_000, 'last_observed_us': 1_100,
+            'observed_span_us': 100, 'finished_at_us': 1_100,
+            'diagnostic_heap_bytes': 4096,
+            'invalid': dict.fromkeys(report.INVALID_FLAGS, False),
+            'blocked_union': duration(40, 20), 'raw': None,
+            'sites': [{'site': 'CarrierSubmission', 'lane': 'First', 'class': 'User',
+                       'first_observed_us': 1_000, 'last_observed_us': 1_100,
+                       'bytes': gauge(200, 400), 'items': gauge(1, 2),
+                       'reasons': [reason('IoPending', duration(40, 20)),
+                                   reason('PeerCredit', duration(35, 15)),
+                                   reason('QueueFull', untimed=9)]}]}
+
+
+def save(directory, name, value):
+    path = Path(directory) / name
+    path.write_text(json.dumps(value), encoding='utf-8')
+    return path
+
+
+class BufferMetricsReportTests(unittest.TestCase):
+    def test_union_uses_actual_span_and_never_sums_overlapping_rows_or_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = save(directory, 'first.bmetrics', fixture())
+            second_value = fixture()
+            second_value['blocked_union'] = duration(10, 10)
+            second_value['sites'] = []
+            second = save(directory, 'second.bmetrics', second_value)
+            value = report.build_report([first, second])
+        self.assertEqual(len(value['owners']), 2)
+        self.assertNotIn('blocked_union', value)
+        a, b = value['owners']
+        self.assertEqual(a['owner_union_percent_of_observed_span'], 60)
+        self.assertEqual(b['owner_union_percent_of_observed_span'], 20)
+        self.assertEqual([row['blocked']['observed_us'] for row in a['wait_ranking']], [60, 50])
+        self.assertEqual(a['count_only_refusals'][0]['untimed_refusals'], 9)
+        self.assertIsNone(a['count_only_refusals'][0]['duration_us'])
+        self.assertEqual(a['occupancy'][0]['bytes']['high_water'], 200)
+        self.assertEqual(a['status'], 'parsed_partial_coverage')
+
+    def test_open_censored_and_completed_remain_distinct(self):
+        value = fixture()
+        value['finished_at_us'] = None
+        value['blocked_union'] = duration(30, 20, 10)
+        value['sites'][0]['reasons'] = [reason('IoPending', duration(30, 20, 10))]
+        owner = report.normalize(value, 'live.bmetrics', 'digest')
+        self.assertEqual(owner['owner_union_percent_of_observed_span'], 60)
+        wait = owner['wait_ranking'][0]['blocked']
+        self.assertEqual((wait['completed_us'], wait['censored_us'], wait['open_us']), (30, 20, 10))
+        self.assertEqual(wait['episodes'], 3)
+        value['finished_at_us'] = 1_100
+        invalid = report.normalize(value, 'terminal.bmetrics', 'digest')
+        self.assertIsNone(invalid['owner_union_percent_of_observed_span'])
+        self.assertTrue(any('uncensored' in issue for issue in invalid['issues']))
+
+    def test_partial_timing_and_unknown_gauges_do_not_become_zero_capacity(self):
+        value = fixture()
+        value['sites'][0]['reasons'][0]['untimed_refusals'] = 3
+        value['sites'][0]['bytes'] = gauge(200)
+        value['sites'][0]['items'] = gauge()
+        owner = report.normalize(value, 'partial.bmetrics', 'digest')
+        self.assertEqual(owner['wait_ranking'][0]['timing_coverage'], 'partial_timed')
+        self.assertEqual(len(owner['count_only_refusals']), 2)
+        self.assertIsNone(owner['occupancy'][0]['bytes']['capacity'])
+        self.assertEqual(owner['occupancy'][0]['bytes']['coverage'], 'capacity_unknown')
+        self.assertEqual(owner['occupancy'][0]['items']['coverage'], 'unobserved')
+
+    def test_producer_invalidity_and_impossible_values_suppress_percentage(self):
+        for flag in report.INVALID_FLAGS:
+            with self.subTest(flag=flag):
+                value = fixture()
+                value['invalid'][flag] = True
+                owner = report.normalize(value, 'invalid.bmetrics', 'digest')
+                self.assertEqual(owner['status'], 'invalid_observations')
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+                self.assertEqual(owner['blocked_union']['observed_us'], 60)
+        for change in ('span', 'capacity', 'counts'):
+            with self.subTest(change=change):
+                value = fixture()
+                if change == 'span':
+                    value['observed_span_us'] = 10
+                elif change == 'capacity':
+                    value['sites'][0]['bytes']['capacity'] = 1
+                else:
+                    value['blocked_union']['episodes'] = 9
+                self.assertTrue(report.normalize(value, 'invalid.bmetrics', 'digest')['issues'])
+
+    def test_no_hooks_and_zero_span_have_unknown_percentage(self):
+        for boundary in (None, 1_100):
+            value = fixture()
+            value.update(first_observed_us=boundary, last_observed_us=boundary,
+                         observed_span_us=None if boundary is None else 0,
+                         blocked_union=duration(), sites=[])
+            owner = report.normalize(value, 'empty.bmetrics', 'digest')
+            self.assertFalse(owner['issues'])
+            self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+
+    def test_provider_metadata_is_preserved_without_inventing_occupancy(self):
+        value = fixture()
+        raw = {'lanes': [None, {'send_io': {'would_block_observations': 4, 'duration_us': None}}],
+               'unavailable_lanes': 1, 'timing': 'untimed'}
+        quic = {'definition': 'private metadata included',
+                'lanes': [{'available_payload_bytes': 200, 'configured_limit': 1000,
+                           'receive_queue_bytes': None}]}
+        value.update(raw=raw, quic_provider=quic)
+        original = copy.deepcopy(value)
+        owner = report.normalize(value, 'providers.bmetrics', 'digest')
+        self.assertEqual(owner['provider_metadata'], {'raw': raw, 'quic_provider': quic})
+        self.assertEqual(value, original)
+        self.assertNotIn('used', owner['provider_metadata']['quic_provider']['lanes'][0])
+
+    def test_invalid_input_schema_duplicates_types_and_nonfinite_values_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bad = [dict(fixture(), schema=True), dict(fixture(), schema=2),
+                   dict(fixture(), observed_span_us=True)]
+            for index, value in enumerate(bad):
+                path = save(directory, str(index) + '.bmetrics', value)
+                result = report.build_report([path])
+                self.assertEqual(result['owners'], [])
+                self.assertEqual(len(result['rejected_inputs']), 1)
+            for raw in ('{"schema":1,"schema":1}', '{"schema":NaN}', '{broken'):
+                path = Path(directory) / 'bad.bmetrics'
+                path.write_text(raw, encoding='utf-8')
+                self.assertEqual(report.build_report([path])['owners'], [])
+        value = fixture()
+        value['sites'].append(copy.deepcopy(value['sites'][0]))
+        with self.assertRaisesRegex(ValueError, 'duplicate site'):
+            report.normalize(value, 'duplicate.bmetrics', 'digest')
+        value = fixture()
+        del value['blocked_union']['open_us']
+        with self.assertRaisesRegex(ValueError, 'missing open_us'):
+            report.normalize(value, 'missing.bmetrics', 'digest')
+
+    def test_bounded_reads_file_count_and_new_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = save(root, 'source.bmetrics', fixture())
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            output = root / 'report'
+            result = report.write_report([source], output)
+            self.assertEqual(result['owners'][0]['sha256'], digest)
+            self.assertEqual({path.name for path in output.iterdir()}, {'report.md', 'report.json'})
+            self.assertEqual(json.loads((output / 'report.json').read_text()), result)
+            self.assertIn('60.000000%', (output / 'report.md').read_text())
+            with self.assertRaisesRegex(ValueError, 'must be new'):
+                report.write_report([source], output)
+            with self.assertRaisesRegex(ValueError, 'duplicate input'):
+                report.build_report([source, source])
+            with self.assertRaisesRegex(ValueError, '1 and 64'):
+                report.build_report([root / (str(i) + '.bmetrics') for i in range(65)])
+            with patch.object(report, 'MAX_BYTES', 16):
+                rejected = report.build_report([source])['rejected_inputs']
+                self.assertIn('4 MiB bound', rejected[0]['error'])
+            alias = root / 'alias.bmetrics'
+            alias.symlink_to(source)
+            self.assertIn('non-symlink', report.build_report([alias])['rejected_inputs'][0]['error'])
+            missing = root / 'missing.bmetrics'
+            result = report.write_report([source, missing], root / 'partial')
+            self.assertEqual(len(result['owners']), 1)
+            self.assertEqual(len(result['rejected_inputs']), 1)
+            self.assertIsNone(result['rejected_inputs'][0]['measurements'])
+
+    def test_markdown_escapes_source_labels_and_preserves_unknown(self):
+        value = fixture()
+        value['owner'] = '<script>|owner\nnext'
+        value['sites'][0]['bytes'] = gauge(1)
+        owner = report.normalize(value, '/tmp/a|b.bmetrics', 'digest')
+        text = report.markdown({'status': 'parsed_partial_coverage', 'owners': [owner],
+                                'rejected_inputs': []})
+        self.assertNotIn('<script>', text)
+        self.assertIn('&lt;script&gt;&#124;owner next', text)
+        self.assertIn('capacity_unknown', text)
+        self.assertIn('unmeasured', text)
+
+
+if __name__ == '__main__':
+    unittest.main()

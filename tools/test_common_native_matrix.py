@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import signal
 import socket
 import struct
 import subprocess
@@ -48,6 +49,40 @@ def pcap(packets):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_command_timeout_preserves_actual_child_exit_and_original_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = matrix.Case(row(), None, Path(directory))
+            with patch.dict(matrix.BOUNDS, command_seconds=.1):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    case.command(None, sys.executable, '-c', 'import time; time.sleep(10)')
+            receipt = json.loads((Path(directory) / 'result.json').read_text())['commands'][0]
+            self.assertTrue(receipt['timed_out'])
+            self.assertEqual(receipt['requested_signal'], 'SIGKILL')
+            self.assertEqual(receipt['returncode'], -signal.SIGKILL)
+            self.assertGreater(receipt['pid'], 0)
+            self.assertGreaterEqual(receipt['finished_wall_ns'], receipt['started_wall_ns'])
+
+    def test_capture_int_then_term_uses_existing_graceful_budget_and_records_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = matrix.Case(row(), None, Path(directory))
+            script = ('import signal,time\n'
+                      'signal.signal(signal.SIGINT, lambda *_: print("INT", flush=True))\n'
+                      'signal.signal(signal.SIGTERM, lambda *_: exit(0))\n'
+                      'print("READY", flush=True)\n'
+                      'while True: time.sleep(.01)\n')
+            child = case.spawn(None, 'capture-signal-fixture', [sys.executable, '-c', script])
+            try:
+                case.wait_marker(child, 'READY', time.monotonic() + 2)
+                self.assertEqual(case.stop(child, signal.SIGINT, time.monotonic() + 5), 0)
+                receipt = json.loads((Path(directory) / 'result.json').read_text())['child_stops'][0]['observation']
+                self.assertEqual([entry['signal'] for entry in receipt['signals']], ['SIGINT', 'SIGTERM'])
+                self.assertLess(receipt['elapsed_seconds'], 3)
+                self.assertEqual(receipt['returncode'], 0)
+            finally:
+                if child['process'].poll() is None:
+                    child['process'].kill()
+                    child['process'].wait(timeout=2)
+
     def test_manifest_keeps_plan_refused_and_rejects_escape_or_retired_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -99,7 +99,7 @@ fn forged_kind_floods_leave_bounded_turns_for_each_other_class() -> R {
         assert_eq!(metadata.kind(), expected);
         // Simulate a failed sole-verifier attempt: only the candidate is removed.
         state.consume_final_candidate(index)?;
-        state.reject_final()?;
+        state.reject_final_verdict(metadata)?;
         insert(&mut state, expected, 100 + turn)?;
         assert_eq!(state.incoming.len(), 68);
         assert_eq!(state.incoming.capacity(), capacity);
@@ -150,5 +150,58 @@ fn capacity_one_keeps_a_shared_upper_and_bulk_slot() -> R {
     assert_eq!(state.incoming.len(), 1);
     assert_eq!(state.rejected_packets, 2);
     assert_eq!(selected_metadata(&mut state)?.1.kind(), FinalKind::Data);
+    Ok(())
+}
+
+#[test]
+fn candidate_diagnostics_distinguish_capacity_preflight_verdict_and_original_age() -> R {
+    let mut state = selected_fixture(64)?;
+    let original_capacity = state.incoming.capacity();
+    for number in 0..4 {
+        insert(&mut state, FinalKind::Control, number)?;
+    }
+    insert(&mut state, FinalKind::Control, 4)?;
+    insert(&mut state, FinalKind::Data, 5)?;
+    // Valid class and length, but wrong mirrored advertised window.
+    state.ingest_final(&outer(&[1, 0, 0, 0, 0], 2100, 1000, 32767)?)?;
+    let original = state.incoming.front().ok_or("original")?.received_at;
+    let now = original + Duration::from_millis(10);
+    let (index, selected) = selected_metadata(&mut state)?;
+    assert_eq!(selected.kind(), FinalKind::Control);
+    let ([carrier, upper, bulk], kind, age) = state.final_candidate_diagnostics(now);
+    assert_eq!(
+        [
+            carrier.capacity_packets,
+            upper.capacity_packets,
+            bulk.capacity_packets
+        ],
+        [4, 4, 60]
+    );
+    assert_eq!(
+        [
+            carrier.queued_packets,
+            upper.queued_packets,
+            bulk.queued_packets
+        ],
+        [0, 4, 1]
+    );
+    assert_eq!(upper.queued_payload_bytes, 20);
+    assert_eq!(upper.counters.high_water_packets, 4);
+    assert_eq!(upper.counters.high_water_payload_bytes, 20);
+    assert_eq!(upper.counters.capacity_refused.packets, 1);
+    assert_eq!(upper.counters.capacity_refused.payload_bytes, 5);
+    assert_eq!(carrier.counters.preflight_rejected.packets, 1);
+    assert_eq!(kind, Some(FinalKind::Control));
+    assert_eq!(age, Some(10_000));
+    state.consume_final_candidate(index)?;
+    state.reject_final_verdict(selected)?;
+    let ([_, upper, _], kind, age) = state.final_candidate_diagnostics(now);
+    assert_eq!(upper.queued_packets, 3);
+    assert_eq!(upper.counters.high_water_packets, 4);
+    assert_eq!(upper.counters.verifier_rejected.packets, 1);
+    assert_eq!((kind, age), (None, None));
+    assert_eq!(state.ranges.occupied_bytes(), 0);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, 0);
+    assert_eq!(state.incoming.capacity(), original_capacity);
     Ok(())
 }

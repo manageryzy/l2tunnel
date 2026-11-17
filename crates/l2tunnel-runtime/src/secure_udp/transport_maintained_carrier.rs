@@ -286,6 +286,7 @@ impl MaintainedIo {
             .input_meta
             .take()
             .ok_or_else(|| protocol("missing maintained input metadata"))?;
+        self.carrier.observe_runtime_input(None);
         let framing = match meta.framing {
             Framing::Bootstrap => super::carrier::InputFraming::Bootstrap,
             Framing::Final => super::carrier::InputFraming::Final,
@@ -324,7 +325,10 @@ impl MaintainedIo {
         }
         if receive && self.input_meta.is_none() {
             match self.carrier.poll_recv(cx, &mut self.input) {
-                Poll::Ready(Ok(meta)) => self.input_meta = Some(meta),
+                Poll::Ready(Ok(meta)) => {
+                    self.carrier.observe_runtime_input(Some(meta.bytes));
+                    self.input_meta = Some(meta);
+                }
                 Poll::Ready(Err(error)) => {
                     return if ready {
                         Poll::Ready(Ok(()))

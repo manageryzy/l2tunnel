@@ -200,6 +200,20 @@ impl<'a> Entry<'a> {
             .admit_borrowed_observed(now)
             .map_err(Error::Engine)
     }
+    /// Report causal refusal at the actual head attempt without retaining diagnostics.
+    pub fn admit_borrowed_diagnosed(
+        &mut self,
+        now: engine::Tick,
+        on_block: impl FnMut(engine::AdmissionRefusal),
+    ) -> Result<Option<Admission<engine::ObservedProfileIdentity>>, Error> {
+        self.engine
+            .admit_borrowed_diagnosed(now, on_block)
+            .map_err(Error::Engine)
+    }
+    /// Inspect this exact Bank generation's selected codec owners, without mutating it.
+    pub fn visit_codec_buffers(&self, visit: impl FnMut(engine::CodecBufferSnapshot)) {
+        self.engine.visit_codec_buffers(visit);
+    }
     /// Produce exact typed records under the one external shared wire allowance.
     pub fn poll(
         &mut self,

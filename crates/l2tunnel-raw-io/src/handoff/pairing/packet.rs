@@ -11,8 +11,13 @@ use std::sync::{Arc, Mutex};
 
 /// Explicit final Records framing over the same original raw owners.
 pub mod compact;
+mod diagnostics;
 mod gate;
 mod transaction;
+pub use diagnostics::{
+    BufferSnapshot, CandidateBufferSnapshot, CandidateCounters, FinalPrepareBlocked,
+    FinalPrepareOutcome, LaneBufferSnapshot, PacketCount, PrepareSnapshot, SendIoSnapshot,
+};
 use gate::{GateIo, GateState, SharedBudget};
 pub use transaction::{PacketCarrier, PacketSetup, begin_packet_client, begin_packet_server};
 

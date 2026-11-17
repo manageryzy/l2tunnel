@@ -21,10 +21,12 @@ mod errors_tests;
 pub mod storage;
 
 mod affinity;
+mod buffer_diagnostics;
 mod connection_ingress;
 /// Same-owner retirement driven by opaque authenticated selected commands.
 pub mod connection_reuse;
 mod connections;
+pub use buffer_diagnostics::{AdmissionBlock, AdmissionRefusal, CodecBufferSnapshot};
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
 pub use ingress::{IngressAdmission, IngressSnapshot};
@@ -560,6 +562,16 @@ impl Engine {
         &mut self,
         now: Tick,
     ) -> Result<Option<pipeline::Admission<ObservedProfileIdentity>>, Error> {
+        self.admit_borrowed_diagnosed(now, |_| {})
+    }
+
+    /// Preserve the same real admission and report only actual downstream refusals.
+    /// An empty Pipeline emits no callback; the caller supplies observation time.
+    pub fn admit_borrowed_diagnosed(
+        &mut self,
+        now: Tick,
+        mut on_block: impl FnMut(AdmissionRefusal),
+    ) -> Result<Option<pipeline::Admission<ObservedProfileIdentity>>, Error> {
         self.advance(now)?;
         let next = self
             .statistics
@@ -576,7 +588,16 @@ impl Engine {
             .send()
             .channels();
         match self.pipeline.offer_front_borrowed(|metadata, bytes| {
-            native_counts::offer(owner, counts, window.as_mut(), now, metadata, width, bytes)
+            native_counts::offer_diagnosed(
+                owner,
+                counts,
+                window.as_mut(),
+                now,
+                metadata,
+                width,
+                bytes,
+                &mut on_block,
+            )
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
