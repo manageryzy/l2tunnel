@@ -94,7 +94,7 @@ pub(in crate::service::owner) fn authenticate<'a>(
         check(deadline)?;
         setup::stage(shared, accepted.operation, SetupStage::Configuration);
         let phase = raw.phase(&requested)?;
-        let mut factory = match &plan.data.endpoint {
+        let factory = match &plan.data.endpoint {
             Endpoint::CommonRawClient { outer, .. } => packet::begin_packet_client(
                 original,
                 &outer.tls,
@@ -111,17 +111,16 @@ pub(in crate::service::owner) fn authenticate<'a>(
             _ => return Err(invalid("prepared raw outer endpoint mismatch")),
         }
         .map_err(|failure| raw_setup_error("factory", failure.error))?;
+        let mut factory = ObservedRawSetup {
+            factory,
+            operation: accepted.operation,
+            trace: std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some(),
+            finished: false,
+        };
         // timeout_at polls its inner future before its timer. The original service
         // cap must forbid another actual PacketIo poll even when the factory began
         // later and therefore retains a later internal setup deadline.
-        let carrier = std::future::poll_fn(|cx| {
-            if let Err(error) = check(deadline) {
-                return Poll::Ready(Err(error));
-            }
-            std::future::Future::poll(std::pin::Pin::new(&mut factory), cx)
-                .map(|result| result.map_err(|error| raw_setup_error("handoff", error)))
-        })
-        .await?;
+        let carrier = std::future::poll_fn(|cx| factory.poll(cx, deadline)).await?;
         drop(factory);
         check(deadline)?;
         let outer = authentication::raw_carrier::RawOuter::from_packet(carrier)
@@ -287,6 +286,58 @@ fn raw_setup_error(boundary: &'static str, error: packet::Error) -> io::Error {
         );
     }
     raw_error(error)
+}
+
+// Retain the actual factory until its one terminal observation. The surrounding
+// service can cancel before PacketSetup's later internal deadline; Drop observes
+// the still-owned progress before that cancellation destroys original I/O.
+struct ObservedRawSetup<'a> {
+    factory: packet::PacketSetup<'a, PacketOwner>,
+    operation: OperationId,
+    trace: bool,
+    finished: bool,
+}
+impl ObservedRawSetup<'_> {
+    fn observe_terminal(&mut self, boundary: &'static str) {
+        if !self.finished && self.trace {
+            eprintln!(
+                "Common raw setup snapshot: operation={} boundary={boundary} snapshot={:?}",
+                self.operation.value(),
+                self.factory.diagnostic_snapshot(),
+            );
+        }
+        self.finished = true;
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        deadline: Instant,
+    ) -> Poll<io::Result<packet::PacketCarrier<PacketOwner>>> {
+        if let Err(error) = check(deadline) {
+            self.observe_terminal("service-deadline");
+            return Poll::Ready(Err(error));
+        }
+        match std::future::Future::poll(std::pin::Pin::new(&mut self.factory), cx) {
+            Poll::Ready(Err(error)) => {
+                self.observe_terminal("handoff");
+                Poll::Ready(Err(raw_setup_error("handoff", error)))
+            }
+            Poll::Ready(Ok(carrier)) => {
+                self.finished = true;
+                Poll::Ready(Ok(carrier))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+impl Drop for ObservedRawSetup<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Cancellation is a boundary observation, not a claim about its cause.
+            self.observe_terminal("cancelled-before-completion");
+        }
+    }
 }
 
 struct RawSetupCause<'a>(&'a packet::Error);

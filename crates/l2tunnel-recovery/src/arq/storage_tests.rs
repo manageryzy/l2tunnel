@@ -40,10 +40,10 @@ fn make(config: ArqConfig, role: EndpointRole, reserved: bool) -> Result<Selecti
     })
 }
 fn inventory(engine: &SelectiveRepeat) -> Result<Vec<(usize, usize)>> {
-    let Sent::Reserved(sent) = &engine.0.sent else {
+    let Sent::Reserved(sent, _) = &engine.0.sent else {
         return Err("reserved send backing".into());
     };
-    let Received::Reserved(received) = &engine.0.received else {
+    let Received::Reserved(received, _) = &engine.0.received else {
         return Err("reserved receive backing".into());
     };
     let mut values = vec![
@@ -421,7 +421,7 @@ fn state_snapshot(owner: &SelectiveRepeat) -> StateSnapshot {
             .iter()
             .map(|(source, payload)| (*source, payload.clone()))
             .collect(),
-        Received::Reserved(slots) | Received::Indexed(slots) => slots
+        Received::Reserved(slots, _) | Received::Indexed(slots, _) => slots
             .iter()
             .filter_map(|slot| slot.source.map(|source| (source, slot.payload.clone())))
             .collect(),

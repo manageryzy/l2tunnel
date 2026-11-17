@@ -45,10 +45,10 @@ pub(super) type CommonRetirement = super::common_bridge::Bridge;
 pub(super) enum CommonRetirement {}
 #[cfg(not(unix))]
 impl CommonRetirement {
-    fn timing_enabled(&self) -> bool {
+    pub(super) fn timing_enabled(&self) -> bool {
         match *self {}
     }
-    fn timing_event(&self, _event: super::timing::Event) {
+    pub(super) fn timing_event(&self, _event: super::timing::Event) {
         match *self {}
     }
     fn timing_enter(&self, _stage: super::timing::Stage, _now: Instant) {
@@ -886,10 +886,18 @@ impl Actor {
         } else {
             None
         };
+        let timeline_enabled = self
+            .retirement
+            .as_ref()
+            .is_some_and(|bridge| bridge.timing_enabled());
+        // Bound the real send; another thread may dequeue before the upper sample.
+        let enqueue_before = timeline_enabled.then(Instant::now);
+        let enqueue_after;
         match selected.owner {
             Owner::Proxy(id) => {
                 let next = increment(self.sent_records)?;
                 permit.send(selected.bytes);
+                enqueue_after = timeline_enabled.then(Instant::now);
                 self.table
                     .confirm_record_sent(id, self.millis()?)
                     .map_err(error)?;
@@ -900,12 +908,14 @@ impl Actor {
                 let next = self.sent.add(n)?;
                 let records = increment(self.sent_records)?;
                 permit.send(selected.bytes);
+                enqueue_after = timeline_enabled.then(Instant::now);
                 self.sent = next;
                 self.sent_records = records;
             }
             Owner::Measurement(_) => {
                 let next = increment(self.sent_records)?;
                 permit.send(selected.bytes);
+                enqueue_after = timeline_enabled.then(Instant::now);
                 self.sent_records = next;
             }
             _ => return Err(invalid("proxy user ownership class")),
@@ -915,8 +925,18 @@ impl Actor {
                 .measured
                 .as_mut()
                 .ok_or_else(|| invalid("missing measured actor"))?;
-            if state.ledger.sent(send)? != self.sent_records {
+            let ordinal = state.ledger.sent(send)?;
+            if ordinal != self.sent_records {
                 return Err(invalid("measured all-user ordinal mismatch"));
+            }
+            if let Some((before, after)) = enqueue_before.zip(enqueue_after)
+                && let Some(bridge) = &self.retirement
+            {
+                bridge.timing_event(
+                    state
+                        .ledger
+                        .timing_handoff(ordinal, self.start, before, after),
+                );
             }
         }
         Ok(())

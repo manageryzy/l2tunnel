@@ -1,4 +1,6 @@
 //! Storage operations only; sequence, ACK and timer authority stays in Engine.
+//! Reserved/indexed occupancy is updated only with successful slot mutations.
+//! It adds no allocation and keeps length observations independent of window size.
 
 use super::{BufferSide, Flight, RecoveryError, SourceId};
 use std::{collections::BTreeMap, time::Duration};
@@ -16,14 +18,14 @@ pub(crate) struct ReceiveSlot {
 #[derive(Debug)]
 pub(super) enum Sent {
     Legacy(BTreeMap<SourceId, Flight>),
-    Reserved(Vec<SendSlot>),
-    Indexed(Vec<SendSlot>),
+    Reserved(Vec<SendSlot>, usize),
+    Indexed(Vec<SendSlot>, usize),
 }
 impl Sent {
     pub(super) fn iter(&self) -> impl Iterator<Item = (&SourceId, &Flight)> {
         let (map, slots) = match self {
             Self::Legacy(map) => (Some(map), None),
-            Self::Reserved(slots) | Self::Indexed(slots) => (None, Some(slots)),
+            Self::Reserved(slots, _) | Self::Indexed(slots, _) => (None, Some(slots)),
         };
         map.into_iter().flat_map(|map| map.iter()).chain(
             slots
@@ -36,7 +38,10 @@ impl Sent {
         self.iter().map(|(_, flight)| flight)
     }
     pub(super) fn len(&self) -> usize {
-        self.iter().count()
+        match self {
+            Self::Legacy(map) => map.len(),
+            Self::Reserved(_, occupied) | Self::Indexed(_, occupied) => *occupied,
+        }
     }
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
@@ -45,7 +50,7 @@ impl Sent {
         self.iter().min_by_key(|(source, _)| **source)
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Flight> {
-        if let Self::Indexed(slots) = self {
+        if let Self::Indexed(slots, _) = self {
             let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
             return (slot.source.as_ref() == Some(source)).then_some(&slot.flight);
         }
@@ -55,12 +60,12 @@ impl Sent {
     pub(super) fn get_mut(&mut self, source: &SourceId) -> Option<&mut Flight> {
         match self {
             Self::Legacy(map) => map.get_mut(source),
-            Self::Indexed(slots) => {
+            Self::Indexed(slots, _) => {
                 let index = (source.0 % slots.len() as u64) as usize;
                 let slot = slots.get_mut(index)?;
                 (slot.source.as_ref() == Some(source)).then_some(&mut slot.flight)
             }
-            Self::Reserved(slots) => slots
+            Self::Reserved(slots, _) => slots
                 .iter_mut()
                 .find(|slot| slot.source.as_ref() == Some(source))
                 .map(|slot| &mut slot.flight),
@@ -72,7 +77,7 @@ impl Sent {
         payload: &[u8],
         rto: Duration,
     ) -> Result<(), RecoveryError> {
-        let indexed = matches!(self, Self::Indexed(_));
+        let indexed = matches!(self, Self::Indexed(..));
         match self {
             Self::Legacy(map) => {
                 map.insert(
@@ -88,7 +93,7 @@ impl Sent {
                     },
                 );
             }
-            Self::Reserved(slots) | Self::Indexed(slots) => {
+            Self::Reserved(slots, occupied) | Self::Indexed(slots, occupied) => {
                 let index = (source.0 % slots.len() as u64) as usize;
                 let slot = if indexed {
                     slots.get_mut(index).filter(|slot| {
@@ -109,17 +114,19 @@ impl Sent {
                 slot.flight.retry_at = None;
                 slot.flight.rto = rto;
                 slot.source = Some(source);
+                // A vacant slot was admitted; occupied never exceeds slots.len().
+                *occupied += 1;
             }
         }
         Ok(())
     }
     pub(super) fn remove(&mut self, source: &SourceId) {
-        let indexed = matches!(self, Self::Indexed(_));
+        let indexed = matches!(self, Self::Indexed(..));
         match self {
             Self::Legacy(map) => {
                 map.remove(source);
             }
-            Self::Reserved(slots) | Self::Indexed(slots) => {
+            Self::Reserved(slots, occupied) | Self::Indexed(slots, occupied) => {
                 let index = (source.0 % slots.len() as u64) as usize;
                 let selected = if indexed {
                     slots
@@ -131,6 +138,7 @@ impl Sent {
                         .find(|slot| slot.source.as_ref() == Some(source))
                 };
                 if let Some(slot) = selected {
+                    *occupied -= 1;
                     slot.source = None;
                     slot.flight.payload.clear();
                     slot.flight.attempts = 0;
@@ -142,13 +150,14 @@ impl Sent {
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&SourceId, &mut Flight) -> bool) {
         match self {
             Self::Legacy(map) => map.retain(|source, flight| keep(source, flight)),
-            Self::Reserved(slots) | Self::Indexed(slots) => {
+            Self::Reserved(slots, occupied) | Self::Indexed(slots, occupied) => {
                 for slot in slots {
                     if slot
                         .source
                         .as_ref()
                         .is_some_and(|source| !keep(source, &mut slot.flight))
                     {
+                        *occupied -= 1;
                         slot.source = None;
                         slot.flight.payload.clear();
                         slot.flight.attempts = 0;
@@ -163,14 +172,14 @@ impl Sent {
 #[derive(Debug)]
 pub(super) enum Received {
     Legacy(BTreeMap<SourceId, Vec<u8>>),
-    Reserved(Vec<ReceiveSlot>),
-    Indexed(Vec<ReceiveSlot>),
+    Reserved(Vec<ReceiveSlot>, usize),
+    Indexed(Vec<ReceiveSlot>, usize),
 }
 impl Received {
     pub(super) fn iter(&self) -> impl Iterator<Item = (&SourceId, &Vec<u8>)> {
         let (map, slots) = match self {
             Self::Legacy(map) => (Some(map), None),
-            Self::Reserved(slots) | Self::Indexed(slots) => (None, Some(slots)),
+            Self::Reserved(slots, _) | Self::Indexed(slots, _) => (None, Some(slots)),
         };
         map.into_iter().flat_map(|map| map.iter()).chain(
             slots
@@ -183,7 +192,10 @@ impl Received {
         self.iter().map(|(source, _)| source)
     }
     pub(super) fn len(&self) -> usize {
-        self.iter().count()
+        match self {
+            Self::Legacy(map) => map.len(),
+            Self::Reserved(_, occupied) | Self::Indexed(_, occupied) => *occupied,
+        }
     }
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
@@ -192,7 +204,7 @@ impl Received {
         self.get(source).is_some()
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Vec<u8>> {
-        if let Self::Indexed(slots) = self {
+        if let Self::Indexed(slots, _) = self {
             let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
             return (slot.source.as_ref() == Some(source)).then_some(&slot.payload);
         }
@@ -204,12 +216,12 @@ impl Received {
         source: SourceId,
         payload: &[u8],
     ) -> Result<(), RecoveryError> {
-        let indexed = matches!(self, Self::Indexed(_));
+        let indexed = matches!(self, Self::Indexed(..));
         match self {
             Self::Legacy(map) => {
                 map.insert(source, payload.to_vec());
             }
-            Self::Reserved(slots) | Self::Indexed(slots) => {
+            Self::Reserved(slots, occupied) | Self::Indexed(slots, occupied) => {
                 let index = (source.0 % slots.len() as u64) as usize;
                 let slot = if indexed {
                     slots.get_mut(index).filter(|slot| {
@@ -224,17 +236,19 @@ impl Received {
                 slot.payload.clear();
                 slot.payload.extend_from_slice(payload);
                 slot.source = Some(source);
+                // A vacant slot was admitted; occupied never exceeds slots.len().
+                *occupied += 1;
             }
         }
         Ok(())
     }
     pub(super) fn remove(&mut self, source: &SourceId) {
-        let indexed = matches!(self, Self::Indexed(_));
+        let indexed = matches!(self, Self::Indexed(..));
         match self {
             Self::Legacy(map) => {
                 map.remove(source);
             }
-            Self::Reserved(slots) | Self::Indexed(slots) => {
+            Self::Reserved(slots, occupied) | Self::Indexed(slots, occupied) => {
                 let index = (source.0 % slots.len() as u64) as usize;
                 let selected = if indexed {
                     slots
@@ -246,6 +260,7 @@ impl Received {
                         .find(|slot| slot.source.as_ref() == Some(source))
                 };
                 if let Some(slot) = selected {
+                    *occupied -= 1;
                     slot.source = None;
                     slot.payload.clear();
                 }
@@ -253,3 +268,6 @@ impl Received {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

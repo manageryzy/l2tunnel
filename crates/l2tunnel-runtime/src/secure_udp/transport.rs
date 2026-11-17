@@ -308,11 +308,9 @@ where
                     native_first=false;
                     driver.performance.counters.native_ready_events=driver.performance.counters.native_ready_events.saturating_add(1);
                     if ready.ready().is_writable() && write_native && native_write_remaining>0 {
-                        for _ in 0..native_write_remaining {
-                            let step=driver.write_native(&mut ready,||clock(origin,sample()));
-                            if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
-                            if !step? {break;}
-                        }
+                        let written=driver.write_native_batch(&mut ready,native_write_remaining,||clock(origin,sample()));
+                        if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
+                        written?;
                     }
                     if ready.ready().is_readable() && read_native {
                         let mut batch=0u64;
@@ -1325,6 +1323,29 @@ impl Driver {
                 .min(),
         };
         if transaction_cap.is_some_and(|deadline| duration(now) >= deadline) {
+            if std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some() {
+                let owner::DataOwner::Common(state) = &self.owner;
+                let runtime = self.common.as_deref();
+                eprintln!(
+                    "Common custody expiry: now={now} selected={transaction_cap:?} operation={:?} outcome={:?} sealed={:?} unsealed={:?} raw_control={:?} deferred_feedback={:?}",
+                    state.operation_deadline(),
+                    runtime
+                        .and_then(|r| r.outcome)
+                        .map(common_actions::outcome_deadline),
+                    runtime
+                        .and_then(|r| r.sealed.as_ref())
+                        .map(|p| duration(p.deadline)),
+                    runtime
+                        .and_then(|r| r.unsealed.as_ref())
+                        .map(|p| duration(p.deadline)),
+                    runtime
+                        .and_then(|r| r.raw_control.as_ref())
+                        .map(|p| p.deadline.saturating_duration_since(self.origin)),
+                    runtime
+                        .and_then(|r| r.pending_feedback)
+                        .map(|p| duration(p.deadline)),
+                );
+            }
             self.terminal = Some(StopReason::PolicyTimeout);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1870,35 +1891,55 @@ impl Driver {
                 .native_ready_events
                 .saturating_add(1);
             let before = self.performance.counters.native_write_batch_packets;
-            let mut attempts = 0;
-            for _ in 0..self.config.work.native_write_batch {
-                if self.native.is_empty() {
-                    break;
-                }
-                attempts += 1;
-                let step = self.write_native(&mut ready, &mut now);
-                if self
+            let spent =
+                self.write_native_batch(&mut ready, self.config.work.native_write_batch, &mut now);
+            if self
+                .performance
+                .counters
+                .native_write_batch_packets
+                .saturating_sub(before)
+                == self.config.work.native_write_batch as u64
+            {
+                self.performance.counters.native_write_batch_limit_hits = self
                     .performance
                     .counters
-                    .native_write_batch_packets
-                    .saturating_sub(before)
-                    == self.config.work.native_write_batch as u64
-                {
-                    self.performance.counters.native_write_batch_limit_hits = self
-                        .performance
-                        .counters
-                        .native_write_batch_limit_hits
-                        .saturating_add(1);
-                }
-                match step {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(error) => return Poll::Ready(Err(error)),
-                }
+                    .native_write_batch_limit_hits
+                    .saturating_add(1);
             }
-            Poll::Ready(Ok(attempts))
+            Poll::Ready(spent)
         })
         .await
+    }
+    /// Drain actual native custody within the caller's remaining turn allowance.
+    /// An empty-queue channel scan consumes a slot even when it produces no packet;
+    /// context progress cannot create an unbounded loop or another write budget.
+    fn write_native_batch<D: NativeDevice>(
+        &mut self,
+        ready: &mut NativeGuard<'_, D>,
+        maximum: usize,
+        mut now: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<usize> {
+        let mut spent = 0;
+        for _ in 0..maximum {
+            if self.native.is_empty() {
+                if !self.native_deliverable()? || !self.native_room() {
+                    break;
+                }
+                spent += 1;
+                self.collect_native(now()?)?;
+                if self.native.is_empty() {
+                    continue;
+                }
+            } else {
+                spent += 1;
+            }
+            // Only a complete successful write releases the Engine token and
+            // permits a later iteration to prepare another native packet.
+            if !self.write_native(ready, &mut now)? {
+                break;
+            }
+        }
+        Ok(spent)
     }
     fn write_native<D: NativeDevice>(
         &mut self,

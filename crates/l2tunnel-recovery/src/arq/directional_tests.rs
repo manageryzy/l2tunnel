@@ -84,10 +84,10 @@ fn asymmetric_reserved_inventory_is_actual_and_one_short_refuses() -> Result {
             allocations: 8,
         })
     );
-    let Sent::Reserved(sent) = &engine.0.sent else {
+    let Sent::Reserved(sent, _) = &engine.0.sent else {
         return Err("send backing".into());
     };
-    let Received::Reserved(received) = &engine.0.received else {
+    let Received::Reserved(received, _) = &engine.0.received else {
         return Err("receive backing".into());
     };
     assert_eq!(sent.capacity(), 2);

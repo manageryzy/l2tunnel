@@ -222,6 +222,11 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                 tokio::select! {input=controls.recv()=>Ok(input.ok_or_else(||invalid("proxy control producer dropped"))?),input=users.recv(),if direction.bulk && state.ready=>Err(input.ok_or_else(||invalid("proxy user producer dropped"))?),}
             }
         };
+        let dequeued_at = (item.is_err()
+            && receipts
+                .as_ref()
+                .is_some_and(|source| source.timing_enabled()))
+        .then(Instant::now);
         let (kind, body, control) = match item {
             Err(bytes) => {
                 if state.barrier.is_some() {
@@ -252,6 +257,10 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                 if matches!(frame, ControlFrame::Quiesce)
                     && let Ok(user) = users.try_recv()
                 {
+                    let dequeued_at = receipts
+                        .as_ref()
+                        .is_some_and(|source| source.timing_enabled())
+                        .then(Instant::now);
                     delayed = Some(Output::Control(frame));
                     burst = 0;
                     let bytes = outer::encode(outer::Kind::Data, &user)?;
@@ -259,9 +268,14 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                         .users
                         .checked_add(1)
                         .ok_or_else(|| invalid("proxy user counter exhausted"))?;
-                    let physical =
-                        write_selected_frame(&mut stream, &bytes, receipts.as_ref(), Some(ordinal))
-                            .await?;
+                    let physical = write_selected_frame(
+                        &mut stream,
+                        &bytes,
+                        receipts.as_ref(),
+                        Some(ordinal),
+                        dequeued_at,
+                    )
+                    .await?;
                     publish_physical(&mut state, ordinal, physical)?;
                     state.users = state
                         .users
@@ -291,7 +305,8 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
             None
         };
         let physical =
-            write_selected_frame(&mut stream, &bytes, receipts.as_ref(), ordinal).await?;
+            write_selected_frame(&mut stream, &bytes, receipts.as_ref(), ordinal, dequeued_at)
+                .await?;
         if let Some(ordinal) = ordinal {
             publish_physical(&mut state, ordinal, physical)?;
         }
@@ -338,10 +353,17 @@ async fn write_selected_frame<W: AsyncWrite + Unpin>(
     bytes: &[u8],
     source: Option<&super::actor::CommonRetirement>,
     ordinal: Option<u64>,
+    dequeued_at: Option<Instant>,
 ) -> io::Result<Option<PhysicalWrite>> {
     if let Some(source) = source
         && let Some(ordinal) = ordinal
     {
+        // Timestamp the actual successful dequeue observation, not publication.
+        if let Some(at) = dequeued_at {
+            source.timing_event(super::timing::Event::Timeline(
+                super::timing::TimelineEvent::WriterDequeued { ordinal, at },
+            ));
+        }
         source.prepare_user_receipt(ordinal).await?;
     }
     write_frame(stream, bytes).await?;

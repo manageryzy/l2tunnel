@@ -60,10 +60,10 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-15 | Native output pool/device credit/receipts | Runtime occupancy, actual pool-acquire refusal counts and device-write WouldBlock intervals implemented. A refused scan lease does not prove useful native output exists, so its interval remains unmeasured. Native credit/controller internals remain BP-03. |
 | BP-16 | Management message/recovery/reassembly/semantic/dispatch slots | Existing expiry snapshots retained; stream-specific occupancy and submission/dispatch/dependency timing pending. |
 | BP-17 | Proxy channels/writer/Bridge/ring/measured ledger/relay buffers | Actual selected-frame receipt-ring refusal intervals and bounded receipt/import/callback timing export implemented. Focused current validation is recorded separately; writer/channel/relay occupancy, publication-to-import timing and complete measured-ledger attribution remain pending. |
-| BP-18 | Raw candidate classes/pinned input/bitmap/prepared/tracked/receipts | Typed prepare reasons, per-class gauges/counters and terminal scalar retention implemented. Exact opt-in per-lane PacketIo intervals and Common scalar export now implemented; focused validation is pending. Quota/pacing and prepare refusals remain separate untimed counts. Candidate residence, custody and peer-credit wait attribution remain incomplete. Bitmap is coverage state, not buffered packet bytes. |
+| BP-18 | Raw candidate classes/pinned input/bitmap/prepared/tracked/receipts | Typed prepare reasons, per-class gauges/counters and terminal scalar retention implemented. Exact opt-in per-lane PacketIo intervals and Common scalar export pass focused local fixtures; native interval qualification is pending. Quota/pacing and prepare refusals remain separate untimed counts. Candidate residence, custody and peer-credit wait attribution remain incomplete. Bitmap is coverage state, not buffered packet bytes. |
 | BP-19 | OpenVPN submissions/held datagrams/receive/setup buffers | Class/channel fullness, socket waits and receive drops pending. |
 | BP-20 | Retained TLS class/writer/prefix/body/input/completion slots | Actual class refusal, write/flush Pending and work-budget waits implemented; bounded occupancy sampled. TLS Pending does not prove kernel queue saturation. |
-| BP-21 | QUIC permits/tickets/DATAGRAM wait/cache/provider queues | Actual class-slot refusal and pending-send intervals, permit/cached-input gauges and provider available-payload samples implemented. Public RTT/cwnd/congestion/loss and UDP counters now have bounded per-lane sampled export, with focused validation pending. Exact provider send/receive occupancy remains unavailable; capacity minus available is not a valid occupancy calculation. Actual QUIC FIFO permit/capacity fixture passes; native9 exercises earlier diagnostic export but its finite QUIC case exhausts the original bound. |
+| BP-21 | QUIC permits/tickets/DATAGRAM wait/cache/provider queues | Actual class-slot refusal and pending-send intervals, permit/cached-input gauges and provider available-payload samples implemented. Public RTT/cwnd/congestion/loss and UDP counters now have bounded per-lane sampled export with passing focused validation and the finite native10 observation below. Exact provider send/receive occupancy remains unavailable; capacity minus available is not a valid occupancy calculation. Actual QUIC FIFO permit/capacity fixture passes; native9 exercises earlier diagnostic export but its finite QUIC case exhausts the original bound. |
 | BP-22 | Maintained carrier wrapper User/Control/cache slots | Common User completion wait implemented as combined wrapper/carrier wait. QUIC wrapper class admission, pending send and receipt-slot gauges implemented; remaining backend-specific attribution pending. |
 | BP-23 | Local request, bootstrap and joining retry buffers | Existing bounded owners retained. Opt-in constructor/readiness stages and accepted local API read/handler/reply durations implemented; listener backlog delay and full bootstrap/retry-buffer blockage attribution remain unmeasured. |
 | BP-24 | Static scratch, codec contexts, replay maps and receive bitmap | Capacity accounting only; no independent queue-wait metric. Eviction/refusal still requires an explicit counter where applicable. |
@@ -168,7 +168,8 @@ the last sample can precede terminal observation. Sampled extrema do not measure
 time spent congestion-limited, and the observers do not infer private queue
 occupancy. The native9 record has no such statistics; it cannot by itself resolve
 congestion versus local scheduling contributions to its admission waits. Focused
-cadence/counter-regression validation and a fresh native observation are pending.
+cadence/counter-regression validation passes; native10 below exercises the actual
+export. This does not supply exact provider-private queue occupancy.
 
 ### Exact raw PacketIo timing
 
@@ -196,10 +197,11 @@ the ready owner is instrumented. A Common pre-settlement sample can retain an
 open raw interval if Common stopped before raw owner failure; it is not recovery.
 Per-lane durations can overlap and are not added to the Common collector's union.
 
-Source validation is pending for this extension: deterministic edge/censoring and
-invalidity tests; the actual GateIo quota/pacing/refusal fixture; genuine Full/Half
-retained-ciphertext and exact-deadline receipt fixtures; and JSON censoring export.
-These additions do not qualify native timing or close BP-18's remaining scope.
+Local source validation passes for deterministic edge/censoring and invalidity,
+the actual GateIo quota/pacing/refusal fixture, genuine Full/Half retained-ciphertext
+and exact-deadline receipts, and JSON censoring export. The native10 raw attempt
+fails before the ready owner, so it supplies no fresh native timing qualification.
+BP-18 retains its remaining scope.
 
 ### Initialization and local API timing
 
@@ -277,3 +279,129 @@ original 50ms deadline. Receipt-ring refusal count is zero. This observation
 rules out a callback-only repair for that particular attempt; it does not locate
 all pre-acceptance delay. Gate ages, actor stage wall times and unrelated maxima
 must not be added into a fabricated per-packet delay.
+
+
+### Native10 observations and remaining bottlenecks
+
+The source-bound [release10 build](../../work/aligned-extents-20261117/matrix-source-binding-10.json)
+uses commit `8e6c4f5` and binary SHA256
+`7ee66c8faede978977f0d8b1c929c8fb8362f2ef04365d44ed26c72675ed5be1`.
+The [updated complete report](../../work/aligned-extents-20261117/matrix-report-repairs10-complete1/report.md)
+retains all 35 input roots: 80 combinations, 13 passed, 186 failed, 32
+bound-exhausted and 9 not-run selected phases. These are mixed source-bound
+versions, not a same-build qualification. The offline reporter now permits at
+most 128 explicit roots so adding receipts does not discard earlier attempts;
+this changes no protocol or lab limit.
+
+The QUIC/Swift forward phase passes at 0.243264 Mbit/s, from 304,080 unique
+application bytes in the ten-second window. Sender maintained-QUIC admission
+wait covers 89.4423% of its observation span; Common receipt wait covers 90.3374%
+of its own span and overlaps it. The sender samples RTT 70.165–74.265 ms and
+cwnd 2,944–12,529 bytes. Between first and last samples it observes 405 congestion
+events, 494 lost QUIC packets and 466,335 lost bytes. These demonstrate real
+congestion/loss and admission backpressure, but do not prove every wait is
+congestion-window limited or identify a runtime defect. Cleanup follows transfer:
+one owner is Aborted and its peer reports close/Other; successful data validation
+does not establish bilateral graceful shutdown.
+
+The UDP/Aligned Compact forward attempt still fails, at source 36,229 after
+nine transmissions. The exact terminal snapshot preserves the last applied peer
+feedback and physical acceptance. The receiver retains 8,039 sources, with
+`deliver_next=28241`, `receive_prefix=36229` and `highest_received=36287`.
+Its 2,033 native backpressure drops are authenticated input refusals; 14,246
+successful native writes and zero observed device `WouldBlock` do not implicate
+the TUN write queue. RecoveryPressure and the one-packet-per-turn native drain
+are under repair. The final window includes source 36,229, so that terminal
+snapshot alone cannot prove exactly which earlier receive refusal lost it.
+There is no qualified throughput for this failed phase.
+
+The UDP sender's owned-process CPU profile has 623 samples. Flat samples place
+20.87% in Compact selection, 17.66% in compact receive, 5.62% in Aligned custody
+deadline and 4.65% in send-store length. The receiver profiler was forcibly
+terminated and produced an invalid header; it is a tool failure, not usable
+receiver CPU evidence. This was a profiled native run, and profiling overhead is
+not assumed to be zero.
+
+The raw/Aligned Compact attempt exhausts the original 30-second setup deadline
+on both peers before Common/Noise membership observations. The current
+Configuration stage spans multiple setup owners and cannot identify the blocking
+substage. It does not exercise or qualify the ready raw receive fix. A bounded
+terminal setup snapshot is being added without changing retries or deadlines.
+
+For the failed UDP run, accepted source emissions have actual IPv4 bytes outside
+the codec body averaging 60.0945 bytes (p99 61) forward and 58.7294 bytes (p99 59)
+reverse. Common protection itself remains 21 bytes; UDP/IPv4 contributes 28.
+Canonical variable-length source/attempt identities and the codec envelope account
+for further framing. The observed systematic coded-fill histogram is zero in
+both directions. These source populations include retransmissions and exclude
+feedback; the body still contains native codec fields, so these are **not** full
+native encapsulation-overhead percentiles. QUIC outer packet attribution is still
+unavailable, even though its inner record overhead is measured.
+
+The actual [six buffer exports](../../work/aligned-extents-20261117/buffer-native10-report1/report.md)
+parse as valid partial observations. They do not close BP-01 through BP-24,
+full-native overhead quantiles, or the complete throughput matrix.
+
+### Constant-time recovery occupancy
+
+Reserved and indexed ARQ send/receive stores now maintain occupied counts at
+successful insertion and actual retirement. Failed admission, repeated removal,
+retain filtering and reused circular slots preserve the count. Length and empty
+queries no longer scan the complete configured window; slot/payload allocation,
+retry ordering, protocol bytes, bounds and deadlines are unchanged. These scalar
+fields live in the owner rather than new heap allocations.
+
+The [scoped recovery receipt](../../work/aligned-extents-20261117/occupancy-validation1/receipt.json)
+passes the complete recovery tests and strict recovery Clippy, with unchanged
+recovery source during the commands. Broader validation and native effect remain
+separate; selection, feedback history and other scans have not been removed.
+
+
+### Native refill, setup and proxy timeline checkpoint
+
+The actual Common native writer now refills after successful Engine commit within
+one unchanged turn allowance. Each attempted output or empty eligible scan uses
+that allowance; `WouldBlock` stops with the original packet, token and deadline.
+The native10 configuration has write batch 64 and disables NativeWindow on both
+sides, so delivery-receipt admission does not gate these refills. Configurations
+that explicitly enable delivery receipts retain their existing receipt gate.
+No unconditional per-turn write count is promised.
+
+Raw PacketSetup now exposes fixed scalar progress for at most two lanes and
+retains its first failed/ready observation before releasing original owners.
+The extra preallocated slot is charged against the existing metadata ceiling.
+The client failure trace also observes the earlier service deadline or future
+cancellation before destruction. Gate sampling uses `try_lock`; other existing
+status accessors can acquire bridge locks, so the whole snapshot is not claimed
+to be lock-free. The trace contains stages/counters/flags, not key material.
+
+The existing proxy provider retains two ordinal rows joined to Bridge generation
+and Common record identity. It distinguishes ledger handoff from bounds around
+actual queue publication, observed writer dequeue, Common admission, and whole
+acceptance/observation. Queue publication can race dequeue. Missing facts remain
+null, and a mismatched identity cannot replace valid facts. These are scalar
+stage observations, not additional blocked-interval samples.
+
+The [required batch attempt](../../work/aligned-extents-20261117/required-buffer-checks4-attempt1/validation.json)
+passes 82 Python preflight cases and stops on a new test's denied `expect_err`.
+After correcting that assertion, the [continuation](../../work/aligned-extents-20261117/required-buffer-checks4-continuation1.json)
+passes strict workspace Clippy/rustdoc and external Common CLI checks. Raw passes
+175 cases with two ignored and recovery passes 62. Client has 194 passed and two
+measured-proxy failures. Runtime has 307 passed and two failures: the new native
+fixture's readiness wait and a raw Frame transaction custody timeout.
+
+The new fixture had simulated `WouldBlock` while leaving its real socket writable.
+It now fills and drains the actual Unix socket queue within a fixed bound and
+keeps all four original one-second readiness caps. The [focused continuation](../../work/aligned-extents-20261117/required-buffer-checks4-focused1/receipt.json)
+passes strict runtime Clippy and the actual multiwrite/blocked-custody regression.
+The raw Frame Full/Half TAP/TUN case also passes this diagnosed rerun; the earlier
+aggregate custody failure remains unexplained. Both real TLS and QUIC measured
+proxy cases reproduce HandoffExpired with the new joined timelines. All twenty
+saved buffer exports parse as valid partial observations. There is no aggregate
+pass, native-performance qualification, or completed BP parent row.
+
+A failure-only trace now prints the six original generic custody deadline
+candidates separately: operation, retained outcome, sealed and unsealed User,
+raw control, and deferred feedback. It preserves the existing minimum/deadline
+semantics. Raw per-slot identities are unavailable at this boundary; the trace
+does not infer them from a later sample.

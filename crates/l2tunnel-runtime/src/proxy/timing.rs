@@ -7,9 +7,11 @@
 //! per packet. Actor stages measure wall time (including wait and cleanup), not
 //! backpressure; only a real selected-frame receipt-ring refusal opens a wait.
 use super::transport::PhysicalWrite;
+mod timeline;
 use crate::buffer_metrics::{Class, Extent, Key, Lane, Occupancy, Reason, Site};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
+pub(crate) use timeline::Event as TimelineEvent;
 
 static UNAVAILABLE: AtomicU8 = AtomicU8::new(0);
 /// At most one sanitized notice per reason per process; never print paths or errors.
@@ -24,6 +26,7 @@ use tokio::time::Instant;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Event {
+    Timeline(TimelineEvent),
     Whole(PhysicalWrite),
     Imported {
         receipt: PhysicalWrite,
@@ -34,6 +37,7 @@ pub(crate) enum Event {
         at: Instant,
     },
     GateCandidate {
+        ordinal: Option<u64>,
         admitted: Instant,
         physical: Option<PhysicalWrite>,
         at: Instant,
@@ -117,6 +121,7 @@ pub(crate) struct Snapshot {
     stage_censored: [u64; STAGE_NAMES.len()],
     active: Option<(Stage, Instant)>,
     imported: [Option<Imported>; 2],
+    timeline: timeline::Tail,
     held: u64,
     highwater: u64,
     refusals: u64,
@@ -172,6 +177,7 @@ impl Observer {
                 stage_censored: [0; STAGE_NAMES.len()],
                 active: None,
                 imported: [None; 2],
+                timeline: timeline::Tail::default(),
                 held: 0,
                 highwater: 0,
                 refusals: 0,
@@ -250,7 +256,11 @@ impl Observer {
         };
         let s = &mut s.value;
         match event {
-            Event::Whole(r) => s.invalid |= !s.values[0].sample(r.accepted_at, r.observed_at),
+            Event::Timeline(event) => s.timeline.observe(event),
+            Event::Whole(r) => {
+                s.invalid |= !s.values[0].sample(r.accepted_at, r.observed_at);
+                s.timeline.observe(TimelineEvent::Whole(r));
+            }
             Event::Imported {
                 receipt,
                 at,
@@ -276,11 +286,19 @@ impl Observer {
                 s.gate_physical = 0;
             }
             Event::GateCandidate {
+                ordinal,
                 admitted,
                 physical,
                 at,
             } => {
                 s.invalid |= !add(&mut s.gate_pending, 1) | !s.values[3].sample(admitted, at);
+                if let Some(ordinal) = ordinal {
+                    s.timeline.observe(TimelineEvent::Gate {
+                        ordinal,
+                        admitted,
+                        at,
+                    });
+                }
                 if let Some(r) = physical {
                     s.invalid |=
                         !add(&mut s.gate_physical, 1) | !s.values[4].sample(r.observed_at, at);
@@ -408,6 +426,8 @@ impl Snapshot {
             Some(value) => write!(out, "{value}")?,
             None => write!(out, "null")?,
         }
+        write!(out, ",\"last_two_user_timelines\":")?;
+        self.timeline.write(out, self.origin)?;
         writeln!(out, "}}")
     }
 }
@@ -476,6 +496,7 @@ mod tests {
             at: origin + Duration::from_micros(51),
         });
         observer.event(Event::GateCandidate {
+            ordinal: Some(1),
             admitted: origin,
             physical: Some(receipt),
             at: origin + Duration::from_micros(51),

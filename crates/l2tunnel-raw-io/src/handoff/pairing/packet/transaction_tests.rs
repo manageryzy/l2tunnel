@@ -245,7 +245,139 @@ async fn run(
     if early {
         assert!(early_staged);
     }
+    for setup in [&a, &b] {
+        let snapshot = setup.diagnostic_snapshot();
+        assert_eq!(snapshot.outcome, SetupOutcome::Ready);
+        assert_eq!(snapshot.stage, SetupStage::PacketConfirmation);
+        assert_eq!(snapshot.deadline, setup.deadline);
+        assert!(snapshot.pair_stage.is_none());
+    }
     Ok((ar.ok_or("client")?, br.ok_or("server")?))
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_setup_snapshot_is_read_only_and_retains_original_deadline_failure() -> R {
+    let (c, s, m, allow) = support::fixture()?;
+    for half in [false, true] {
+        let (a, b, probes) = support::inputs(half);
+        let fault = Arc::new(Fault::default());
+        for probe in &probes {
+            probe.blocked.store(true, Ordering::SeqCst);
+        }
+        let mut a = begin_packet_client(wrap(a, fault.clone()), &c, "tunnel.test", &m, config())?;
+        let mut b = begin_packet_server(wrap(b, fault), &s, &allow, config())?;
+        let initial = a.diagnostic_snapshot();
+        assert_eq!(initial.stage, SetupStage::Pairing);
+        assert_eq!(initial.pair_stage, Some(SetupPairStage::Authentication));
+        assert_eq!(initial.outcome, SetupOutcome::Pending);
+        assert_eq!(initial.lanes[1].is_some(), half);
+        for lane in initial.lanes.iter().flatten() {
+            assert!(lane.messages.is_none());
+            assert!(lane.transition.is_none());
+            assert!(lane.control_staged.is_none());
+        }
+        let before: Vec<_> = probes
+            .iter()
+            .map(|probe| probe.received.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(a.diagnostic_snapshot(), initial);
+        assert_eq!(a.terminal_setup.capacity(), 1);
+        assert!(a.terminal_setup.is_empty());
+        for (probe, before) in probes.iter().zip(before) {
+            assert_eq!(probe.received.load(Ordering::SeqCst), before);
+        }
+        poll_fn(|cx| {
+            assert!(Pin::new(&mut a).poll(cx).is_pending());
+            assert!(Pin::new(&mut b).poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(initial.deadline - Instant::now()).await;
+        for setup in [&mut a, &mut b] {
+            let result = poll_fn(|cx| Pin::new(&mut *setup).poll(cx)).await;
+            assert!(matches!(result, Err(Error::Expired)));
+            let failed = setup.diagnostic_snapshot();
+            assert_eq!(failed.deadline, initial.deadline);
+            assert_eq!(failed.stage, SetupStage::Pairing);
+            assert_eq!(failed.outcome, SetupOutcome::Failed);
+            assert_eq!(failed.observed_at, initial.deadline);
+            assert!(setup.setup.is_none());
+            assert!(setup.paired.is_none());
+        }
+        let failed = [a.diagnostic_snapshot(), b.diagnostic_snapshot()];
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for (setup, failed) in [&mut a, &mut b].into_iter().zip(failed) {
+            assert!(poll_fn(|cx| Pin::new(&mut *setup).poll(cx)).await.is_err());
+            assert_eq!(setup.diagnostic_snapshot(), failed);
+        }
+        assert!(
+            probes
+                .iter()
+                .all(|probe| probe.dropped.load(Ordering::SeqCst) == 1)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_setup_snapshot_keeps_detached_confirmation_before_terminal_release() -> R {
+    let (c, s, m, allow) = support::fixture()?;
+    let (a, b, probes) = support::inputs(false);
+    let af = Arc::new(Fault::default());
+    let bf = Arc::new(Fault::default());
+    af.blocked.store(true, Ordering::SeqCst);
+    bf.blocked.store(true, Ordering::SeqCst);
+    let mut a = begin_packet_client(wrap(a, af), &c, "tunnel.test", &m, config())?;
+    let mut b = begin_packet_server(wrap(b, bf), &s, &allow, config())?;
+    poll_fn(|cx| {
+        for setup in [&mut a, &mut b] {
+            match Pin::new(&mut *setup).poll(cx) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(_)) => return Poll::Ready(Err(Error::Proof)),
+                Poll::Pending => {}
+            }
+        }
+        if a.stage == 5 && b.stage == 5 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await?;
+    let pending = a.diagnostic_snapshot();
+    assert_eq!(pending.stage, SetupStage::PacketConfirmation);
+    assert!(pending.lanes.iter().flatten().all(|lane| lane.frozen));
+    assert!(pending.pair_stage.is_none());
+    for lane in pending.lanes.iter().flatten() {
+        assert!(lane.messages.is_some());
+        assert!(lane.transition.is_some());
+        assert!(lane.gate.ok_or("gate observation")?.installed);
+    }
+    tokio::time::advance(a.deadline - Instant::now()).await;
+    for setup in [&mut a, &mut b] {
+        assert!(matches!(
+            poll_fn(|cx| Pin::new(&mut *setup).poll(cx)).await,
+            Err(Error::Expired)
+        ));
+        let failed = setup.diagnostic_snapshot();
+        assert_eq!(failed.stage, SetupStage::PacketConfirmation);
+        assert_eq!(failed.outcome, SetupOutcome::Failed);
+        assert!(
+            failed
+                .lanes
+                .iter()
+                .flatten()
+                .all(|lane| lane.transition.is_some())
+        );
+        assert!(setup.carrier.is_none());
+        assert_eq!(setup.terminal_setup.len(), 1);
+    }
+    assert!(
+        probes
+            .iter()
+            .all(|probe| probe.dropped.load(Ordering::SeqCst) == 1)
+    );
+    Ok(())
 }
 #[tokio::test]
 async fn actual_hello_commit_and_commitack_loss_retries_preserve_full_and_half_groups() -> R {

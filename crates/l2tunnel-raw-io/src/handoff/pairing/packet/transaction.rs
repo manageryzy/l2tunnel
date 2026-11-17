@@ -6,6 +6,12 @@ use l2tunnel_raw_tcp::{handoff::QuiescentTcp, packet};
 use tokio::time::{sleep, sleep_until};
 #[path = "compact_owner.rs"]
 mod compact_owner;
+#[path = "setup_diagnostics.rs"]
+mod setup_diagnostics;
+pub use setup_diagnostics::{
+    SetupGateSnapshot, SetupLaneSnapshot, SetupOutcome, SetupPairStage, SetupSnapshot, SetupStage,
+    SetupTransitionSnapshot,
+};
 
 // This fixed interval is already committed by PacketPolicy::digest.
 const TRANSITION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -349,6 +355,7 @@ pub struct PacketSetup<'a, I: PacketIo + Send + 'static> {
     frozen: [Option<FrozenTls>; 2],
     detached: [Option<Detached<I>>; 2],
     terminal_buffers: Vec<BufferSnapshot>,
+    terminal_setup: Vec<SetupSnapshot>,
     carrier: Option<PacketCarrier<I>>,
     done: bool,
 }
@@ -442,6 +449,7 @@ fn configuration<I: PacketIo + Send + 'static>(
     let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
         + std::mem::size_of::<PacketCarrier<I>>()
         + std::mem::size_of::<BufferSnapshot>()
+        + std::mem::size_of::<SetupSnapshot>()
         + profile.count
             * (std::mem::size_of::<GateIo<I>>()
                 + std::mem::size_of::<GateState>()
@@ -503,6 +511,13 @@ fn begin<'a, I: PacketIo + Send + 'static>(
         if terminal_buffers.capacity() != 1 {
             return Err(Error::Capacity);
         }
+        let mut terminal_setup = Vec::new();
+        terminal_setup
+            .try_reserve_exact(1)
+            .map_err(|_| Error::Capacity)?;
+        if terminal_setup.capacity() != 1 {
+            return Err(Error::Capacity);
+        }
         Ok((
             pair,
             policy,
@@ -511,18 +526,27 @@ fn begin<'a, I: PacketIo + Send + 'static>(
             first_state,
             second_state,
             terminal_buffers,
+            terminal_setup,
         ))
     })();
-    let (pair, policy_digest, deadline, count, first_state, second_state, terminal_buffers) =
-        match prepared {
-            Ok(p) => p,
-            Err(error) => {
-                return Err(PacketStartFailure {
-                    inputs: Box::new(inputs),
-                    error,
-                });
-            }
-        };
+    let (
+        pair,
+        policy_digest,
+        deadline,
+        count,
+        first_state,
+        second_state,
+        terminal_buffers,
+        terminal_setup,
+    ) = match prepared {
+        Ok(p) => p,
+        Err(error) => {
+            return Err(PacketStartFailure {
+                inputs: Box::new(inputs),
+                error,
+            });
+        }
+    };
     let budget = Arc::new(Mutex::new(Budget::new(config.packet, start)));
     let mut states = [None, None];
     let client = matches!(credentials, Credentials::Client(..));
@@ -582,6 +606,7 @@ fn begin<'a, I: PacketIo + Send + 'static>(
         frozen: [None, None],
         detached: [None, None],
         terminal_buffers,
+        terminal_setup,
         carrier: None,
         done: false,
     })
@@ -1006,6 +1031,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             carrier.turn(cx)?;
             if carrier.ready {
                 self.check()?;
+                self.retain_setup_snapshot(SetupOutcome::Ready);
                 return Ok(self.carrier.take());
             }
         }
@@ -1027,6 +1053,7 @@ impl<I: PacketIo + Send + 'static> Future for PacketSetup<'_, I> {
             }
             Ok(None) => {
                 if this.timer.as_mut().poll(cx).is_ready() {
+                    this.retain_setup_snapshot(SetupOutcome::Failed);
                     this.done = true;
                     this.setup = None;
                     this.paired = None;
@@ -1044,6 +1071,7 @@ impl<I: PacketIo + Send + 'static> Future for PacketSetup<'_, I> {
                 Poll::Pending
             }
             Err(e) => {
+                this.retain_setup_snapshot(SetupOutcome::Failed);
                 this.done = true;
                 this.setup = None;
                 this.paired = None;

@@ -658,6 +658,31 @@ older binary provenance. Passing data phases with failed endpoint disconnects
 are listed separately. Per-layer schema2 extents are not full encapsulation
 mean/p99, and no CWC parent acceptance gate closes through this batch.
 
+### Bounded native batch refill after release10
+
+The release10 UDP Aligned Compact run reaches source 36,229 before exhausting
+its unchanged nine-attempt bound. The receiver retains 8,039 recovery sources,
+with receipt prefix 36,229 and ordered handoff cursor 28,241. Its 2,033
+`native_backpressure_drops` count authenticated input refusals, not failed TUN
+writes: the existing observer records 14,246 complete native writes and no device
+WouldBlock. These facts do not identify every failed source transmission or prove
+that each refusal was the same resource limit.
+
+Source review found that the sole loop prepared at most one native packet per
+epoch before its write batch, and successful writes never refilled that batch.
+The implementation now shares a bounded write/refill helper between cached
+writability and the readiness-event branch. Each write or empty-queue scan uses
+the existing remaining turn allowance; successful physical completion must
+release the exact Engine token before another packet is prepared. Blocked writes
+retain their bytes, token and original deadline. The focused actual
+Common/Aligned regression checks multiple deliveries within one grant, the cap,
+blocked custody and a failed clock sample after an already completed write.
+The corrected real-socket fixture and strict runtime lint pass in the
+[focused continuation](../../work/aligned-extents-20261117/required-buffer-checks4-focused1/receipt.json).
+The required aggregate retains measured-proxy failures and an unexplained raw
+custody timeout whose focused rerun passes; new native evidence is pending. It does not close CWC-17, the throughput matrix or any
+per-mode acceptance gate, and changes no queue, retry, lifetime or wire limit.
+
 ### Joined framing and successful native-admission observations
 
 The next implementation batch adds observer schema3. Each joined value uses one

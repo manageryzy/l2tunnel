@@ -254,6 +254,50 @@ impl Ledger {
         self.revision = revision;
         Ok(self.sent)
     }
+    /// Observe a successful all-user handoff without changing its stored clock.
+    /// The actual enqueue is bracketed because the writer may run immediately.
+    pub(in crate::proxy) fn timing_handoff(
+        &self,
+        ordinal: u64,
+        origin: Instant,
+        enqueue_before: Instant,
+        enqueue_after: Instant,
+    ) -> crate::proxy::timing::Event {
+        use crate::proxy::timing::{Event, TimelineEvent};
+        let Some(flight) = self
+            .flights
+            .iter()
+            .flatten()
+            .find(|flight| flight.ordinal == ordinal)
+        else {
+            return Event::Invalid;
+        };
+        let Some(ledger_at) = origin.checked_add(std::time::Duration::from_micros(flight.at.0))
+        else {
+            return Event::Invalid;
+        };
+        let admitted = match self
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.ordinal == Some(ordinal))
+        {
+            Some(entry) => {
+                match origin.checked_add(std::time::Duration::from_micros(entry.admitted.0)) {
+                    Some(at) => Some(at),
+                    None => return Event::Invalid,
+                }
+            }
+            None => None,
+        };
+        Event::Timeline(TimelineEvent::Handed {
+            ordinal,
+            admitted,
+            ledger_at,
+            enqueue_before,
+            enqueue_after,
+        })
+    }
     pub fn enable_physical_receipts(&mut self) -> io::Result<()> {
         if self.sent != 0 || self.flushed != 0 {
             return Err(invalid("late measured physical selection"));
@@ -288,6 +332,7 @@ impl Ledger {
                 }
             } else {
                 crate::proxy::timing::Event::GateCandidate {
+                    ordinal: entry.ordinal,
                     admitted,
                     physical: entry.physical,
                     at,

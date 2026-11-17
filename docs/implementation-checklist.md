@@ -48,12 +48,28 @@ passes the Aligned scan repair, exact CompactARQ failure snapshots and sampled
 QUIC transport statistics with 306 runtime cases and strict Clippy/rustdoc.
 Native validation remains separate.
 
+The [release10 native batch refill](modules/compact-wire-cleanup.md#bounded-native-batch-refill-after-release10)
+repairs a source-proven single-packet-per-turn restriction within the unchanged
+native write allowance. Its actual Common/Aligned custody regression is added;
+required checks and renewed native qualification remain pending.
+
 The requested all-buffer backpressure instrumentation is tracked in the
 [complete buffer coverage inventory](modules/buffer-observability.md). Nonempty
 queues, residence time and downstream blockage remain distinct. The first real
 export covers 12 owner reports across four failed/bound-exhausted native9 cases;
 no complete BP row, full overhead quantile or full matrix gate closes through
 partial diagnostic coverage.
+
+The [native10 buffer follow-up](modules/buffer-observability.md#native10-observations-and-remaining-bottlenecks)
+records a finite QUIC/Swift forward pass at 0.243264 Mbit/s, UDP/Aligned retry
+exhaustion with a receiver delivery backlog, and raw setup timeout before Common.
+The complete mixed-version report retains 13 passed, 186 failed, 32 bound-exhausted
+and 9 not-run phases. Constant-time recovery occupancy and native batch refill pass scoped checks.
+Raw setup and proxy timeline diagnostics pass their focused fixtures; the
+[checkpoint evidence](modules/buffer-observability.md#native-refill-setup-and-proxy-timeline-checkpoint)
+retains both measured-proxy failures and the unexplained aggregate raw custody
+expiry despite its passing focused rerun.
+No parent gate closes through these observations.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

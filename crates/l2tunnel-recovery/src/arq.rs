@@ -632,8 +632,8 @@ impl Construction {
             self.record_inventory(crate::storage::ConstructionEventKind::Published);
         }
         (
-            Sent::Reserved(std::mem::take(&mut self.sent)),
-            Received::Reserved(std::mem::take(&mut self.received)),
+            Sent::Reserved(std::mem::take(&mut self.sent), 0),
+            Received::Reserved(std::mem::take(&mut self.received), 0),
         )
     }
 

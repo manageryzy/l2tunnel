@@ -21,7 +21,10 @@ pub use diagnostics::{
     FinalPrepareOutcome, LaneBufferSnapshot, PacketCount, PrepareSnapshot, SendIoSnapshot,
 };
 use gate::{GateIo, GateState, SharedBudget};
-pub use transaction::{PacketCarrier, PacketSetup, begin_packet_client, begin_packet_server};
+pub use transaction::{
+    PacketCarrier, PacketSetup, SetupGateSnapshot, SetupLaneSnapshot, SetupOutcome, SetupPairStage,
+    SetupSnapshot, SetupStage, SetupTransitionSnapshot, begin_packet_client, begin_packet_server,
+};
 
 /// Immutable lane limits copied from the genuine original-owner handoff.
 /// These are byte capacities, not current occupancy or transfer authority.

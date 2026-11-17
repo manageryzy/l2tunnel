@@ -1028,3 +1028,6 @@ mod compact_wire;
 
 #[path = "transport_common_native_window_tests.rs"]
 mod native_window;
+
+#[path = "transport_common_native_batch_tests.rs"]
+mod native_batch;

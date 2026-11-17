@@ -478,8 +478,8 @@ impl CompactRepeat {
             (send.base(), receive.base()),
             context,
             Profile::Selective,
-            Sent::Indexed(sent),
-            Received::Indexed(received),
+            Sent::Indexed(sent, 0),
+            Received::Indexed(received, 0),
             Some(usage),
         );
         engine.compact = Cell(selected);

@@ -619,6 +619,8 @@ impl Bridge {
         if Instant::now() >= pending.deadline {
             return Err(state.fail(io::ErrorKind::TimedOut, "proxy Common admission deadline"));
         }
+        let first_admission = pending.identity.is_none();
+        let generation = pending.generation;
         pending.identity = Some(identity);
         if pending.final_record {
             let retirement = state.retirement.as_mut().ok_or_else(|| {
@@ -631,6 +633,22 @@ impl Bridge {
                 return Err(state.fail(io::ErrorKind::InvalidData, "Common final identity changed"));
             }
             retirement.identity = Some(identity);
+        }
+        if first_admission
+            && state.timing.enabled()
+            && let Some(ordinal) = state
+                .receipts
+                .as_ref()
+                .and_then(|receipts| receipts.prepared_user)
+        {
+            state.timing.event(super::timing::Event::Timeline(
+                super::timing::TimelineEvent::CommonAdmitted {
+                    ordinal,
+                    generation,
+                    identity,
+                    at: Instant::now(),
+                },
+            ));
         }
         Ok(())
     }
@@ -1065,6 +1083,20 @@ impl Stream {
             units: UnitReceipts::new(),
             final_record: false,
         });
+        if state.timing.enabled()
+            && let Some(ordinal) = state
+                .receipts
+                .as_ref()
+                .and_then(|receipts| receipts.prepared_user)
+        {
+            state.timing.event(super::timing::Event::Timeline(
+                super::timing::TimelineEvent::BridgeStarted {
+                    ordinal,
+                    generation,
+                    at: arrived,
+                },
+            ));
+        }
         self.generation = Some(generation);
         self.deadline = Some(Box::pin(sleep_until(deadline)));
         Ok(())

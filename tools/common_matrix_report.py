@@ -636,7 +636,8 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     require(not args.output.exists() and not args.output.is_symlink(), 'output must be a new directory; prior reports are never overwritten')
-    require(len(args.results) <= 32, 'at most32 explicit result directories')
+    # Keep earlier source-bound receipts as new diagnostic batches are added.
+    require(len(args.results) <= 128, 'at most128 explicit result directories')
     report = build_report(args.manifest, args.results)
     report['reporter_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     args.output.mkdir(parents=True, mode=0o755)
