@@ -40,9 +40,9 @@ impl Driver {
         Ok(())
     }
     /// Do not read a second packet until the issuing generation consumes this one.
-    pub(super) fn read_common_coalesced<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    pub(super) fn read_common_coalesced<D: NativeDevice>(
         &mut self,
-        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        ready: &mut NativeGuard<'_, D>,
         output: &mut [u8],
         mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {

@@ -70,7 +70,6 @@ async fn receive(endpoint: &mut Endpoint, now: u64) -> Result<Vec<u8>> {
         &input[..bytes],
         now,
         endpoint.driver.origin + duration(now),
-        None,
     )?;
     Ok(input[..bytes].to_vec())
 }
@@ -93,7 +92,10 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
                             .await?;
                     for endpoint in &fixture.endpoints {
                         assert_eq!(endpoint.driver.info.authenticated.configuration, expected.0);
-                        assert!(endpoint.driver.records.is_compact());
+                        assert_eq!(
+                            endpoint.driver.records.compact_selection().protection,
+                            protection
+                        );
                         assert_eq!(
                             endpoint
                                 .driver
@@ -185,21 +187,10 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
                     let verified = b.driver.live.last_verified_micros;
                     let mut tampered = source.clone();
                     *tampered.last_mut().ok_or("empty source")? ^= 1;
-                    b.driver.receive_selected(
-                        &tampered,
-                        now,
-                        b.driver.origin + duration(now),
-                        None,
-                    )?;
+                    b.driver
+                        .receive_selected(&tampered, now, b.driver.origin + duration(now))?;
                     assert_eq!(b.driver.live.last_verified_micros, verified);
-                    assert_eq!(
-                        b.driver
-                            .records
-                            .compact_check_status()
-                            .ok_or("compact status absent")?
-                            .data,
-                        1
-                    );
+                    assert_eq!(b.driver.records.compact_check_status().data, 1);
                     assert_eq!(receive(b, now).await?, source);
                     if protection == security::compact::Protection::ChaCha20Crc32c {
                         assert_eq!(
@@ -208,12 +199,8 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
                         );
                     }
                     let replay = b.driver.counters.replay_rejections;
-                    b.driver.receive_selected(
-                        &source,
-                        now,
-                        b.driver.origin + duration(now),
-                        None,
-                    )?;
+                    b.driver
+                        .receive_selected(&source, now, b.driver.origin + duration(now))?;
                     assert_eq!(b.driver.counters.replay_rejections, replay + 1);
 
                     // Retiring feedback uses a distinct actual PN and strong check;
@@ -247,7 +234,7 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
                         feedback.len()
                     );
                     assert_eq!(b.records.next_number(Class::User).0, 0);
-                    assert_eq!(b.records.next_feedback_number()?.0, 1);
+                    assert_eq!(b.records.next_feedback_number().0, 1);
                     assert_eq!(
                         b.snapshot_common(fixture.now, true)?
                             .compact_feedback_number,
@@ -320,7 +307,7 @@ fn selected_compact_wire_genuine_setup_original_udp_bytes_feedback_and_switch() 
                         assert!(snapshot.compact_wire.is_some());
                         assert_eq!(
                             snapshot.compact_check_status,
-                            endpoint.driver.records.compact_check_status()
+                            Some(endpoint.driver.records.compact_check_status())
                         );
                         assert!(endpoint.driver.live.last_pong_micros.is_some());
                         assert!(endpoint.driver.records.next_number(Class::Control).0 > 0);
@@ -415,9 +402,7 @@ fn mixed_selected(
             envelope,
             catalog.clone(),
             base[0].settings(),
-            base[0]
-                .compact_wire()
-                .ok_or_else(|| io::Error::other("selected compact wire"))?,
+            base[0].compact_wire(),
         )?)
     };
     Ok((
@@ -547,7 +532,7 @@ fn selected_compact_wire_mixed_algorithms_switch_and_deliver_original_udp() -> R
                             .common
                             .as_ref()
                             .ok_or("actual compact runtime")?;
-                        assert!(runtime.contract.compact_wire().is_some());
+                        assert_eq!(runtime.contract.compact_wire().protection, protection);
                         assert!(runtime.compact_feedback_number.is_some());
                         assert_eq!(*endpoint.driver.common_state()?.current(), target);
                         assert_eq!(endpoint.driver.common_state()?.epoch(), epoch);
@@ -555,7 +540,10 @@ fn selected_compact_wire_mixed_algorithms_switch_and_deliver_original_udp() -> R
                             (endpoint.socket.local_addr()?, endpoint.socket.peer_addr()?),
                             endpoint.original
                         );
-                        assert!(endpoint.driver.records.is_compact());
+                        assert_eq!(
+                            endpoint.driver.records.compact_selection().protection,
+                            protection
+                        );
                     }
                 }
             }
@@ -635,7 +623,7 @@ fn selected_compact_wire_mtu_uses_actual_union_and_preserves_storage_bounds() ->
         selected.envelope(),
         Catalog::new(descriptor, &[descriptor])?,
         base[0].settings(),
-        base[0].compact_wire().ok_or("compact selection")?,
+        base[0].compact_wire(),
     )?;
     assert_eq!(contract.initial(), selected);
     assert!(plan.heap_bytes() > 0);

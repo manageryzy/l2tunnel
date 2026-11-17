@@ -540,6 +540,24 @@ impl Actor {
         }
         Ok(())
     }
+    async fn wait_service(&mut self, tick: &mut tokio::time::Interval, deadline: Option<Instant>) {
+        // An actual whole-write completion must wake its measured callback;
+        // waiting for a periodic tick can consume the remaining original cap.
+        let progress = &mut self.writers[0].progress;
+        let observe_writer = self.measured.is_some() && progress.has_changed().is_ok();
+        if let Some(at) = deadline {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = tokio::time::sleep_until(at) => {},
+                _ = progress.changed(), if observe_writer => {},
+            }
+        } else {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = progress.changed(), if observe_writer => {},
+            }
+        }
+    }
     fn measured_deadlines(&self, now: Instant) -> io::Result<()> {
         if self.measured.is_none() {
             return Ok(());
@@ -658,14 +676,8 @@ impl Actor {
                     .as_ref()
                     .ok_or_else(|| invalid("transparent reservation missing"))?;
                 let binding = self.binding(bytes)?;
-                let body = self
-                    .config
-                    .runtime
-                    .codec()?
-                    .encode_vec(bytes)
-                    .map_err(error)?;
                 let channel = self.wire.channel(binding.key, now)?;
-                let framed = self.envelope(channel, 0, &body, false)?;
+                let framed = self.envelope(channel, 0, bytes, false)?;
                 match self.wire.push(
                     binding.key,
                     binding.weight,
@@ -724,7 +736,7 @@ impl Actor {
                 )?;
                 let framed = state
                     .framed_bytes
-                    .checked_add((bytes.len() + 48) as u64)
+                    .checked_add((bytes.len() + super::record::FRAME_OVERHEAD) as u64)
                     .ok_or_else(|| invalid("measurement byte counter exhausted"))?;
                 let admitted = increment(state.admitted[kind])?;
                 match self.wire.push(
@@ -870,12 +882,12 @@ impl Actor {
                 .receive_authenticated(&self.table, user.body, at)
                 .map_err(error)?;
         } else if user.flow == 0 {
-            let packet = self
-                .config
-                .runtime
-                .codec()?
-                .decode_vec(user.body)
-                .map_err(error)?;
+            if user.body.len() > self.config.runtime.max_packet
+                || !super::super::packet_valid(PacketLayer::Ip, user.body)
+            {
+                return Err(invalid("proxy transparent packet size/shape"));
+            }
+            let packet = user.body.to_vec();
             let binding = self.binding(&packet)?;
             if self.wire.channel(binding.key, self.start.elapsed())? != user.channel {
                 return Err(invalid("proxy transparent channel mismatch"));
@@ -971,14 +983,8 @@ impl Actor {
                     self.input_transparent = true;
                     return Ok(Some(bytes));
                 }
-                let body = self
-                    .config
-                    .runtime
-                    .codec()?
-                    .encode_vec(&bytes)
-                    .map_err(error)?;
                 let channel = self.wire.channel(binding.key, self.start.elapsed())?;
-                let record = wire::user(channel, 0, &body)?;
+                let record = wire::user(channel, 0, &bytes)?;
                 match self.wire.push(
                     binding.key,
                     binding.weight,
@@ -1172,8 +1178,10 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
     if link.binding != binding
         || device.layer() != PacketLayer::Ip
         || link.inner.layer != PacketLayer::Ip
-        || link.inner.reverse_reader.is_some() != (config.duplex == Duplex::Half)
-        || link.inner.reverse_writer.is_some() != (config.duplex == Duplex::Half)
+        || link.inner.reverse_reader.is_some()
+            != (config.duplex == Duplex::Half && !link.common_ordered)
+        || link.inner.reverse_writer.is_some()
+            != (config.duplex == Duplex::Half && !link.common_ordered)
     {
         return Err(invalid("proxy retained link/device mismatch"));
     }
@@ -1186,7 +1194,11 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
         return Err(invalid("proxy zero native seed"));
     }
     let start = Instant::now();
-    let count = if config.duplex == Duplex::Half { 2 } else { 1 };
+    let count = if config.duplex == Duplex::Half && !link.common_ordered {
+        2
+    } else {
+        1
+    };
     let (events_tx, mut events) = mpsc::channel(8);
     let (users_tx, mut users) = mpsc::channel(config.runtime.queue_packets);
     let (quiesce_tx, quiesce) = watch::channel(None);
@@ -1212,7 +1224,6 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
         Direction {
             index: 0,
             lane: receive_lane,
-            session: link.inner.receive_session,
             bulk: true,
         },
     )];
@@ -1221,7 +1232,6 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
         Direction {
             index: 0,
             lane: send_lane,
-            session: link.inner.send_session,
             bulk: true,
         },
     )];
@@ -1231,7 +1241,6 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             Direction {
                 index: 1,
                 lane: send_lane,
-                session: link.inner.send_session,
                 bulk: false,
             },
         ));
@@ -1240,7 +1249,6 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             Direction {
                 index: 1,
                 lane: receive_lane,
-                session: link.inner.receive_session,
                 bulk: false,
             },
         ));
@@ -1389,11 +1397,7 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
                     .chain(actor.deadline)
                     .min();
             }
-            if let Some(at) = deadline {
-                tokio::select! { _ = tick.tick() => {}, _ = tokio::time::sleep_until(at) => {} }
-            } else {
-                tick.tick().await;
-            }
+            actor.wait_service(&mut tick, deadline).await;
             // Keep already completed physical facts before abort, expiry, or any
             // other terminal branch can bypass the semantic callback phase.
             actor.observe_measured_physical(false)?;
@@ -1494,6 +1498,31 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
         Err(e) => Err(e),
     };
     if outcome.is_err() {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("L2TUNNEL_MEASURED_TRACE").is_some()
+            && let Some(state) = &actor.measured
+        {
+            let progress = *actor.writers[0].progress.borrow();
+            eprintln!(
+                "MEASURED_ACTOR_FAILURE originator={} error={:?} start={:?} handoff_cap={} writer_ready={} writer_users={} writer_capacity={} wire_records={} wire_bytes={}",
+                actor.originator,
+                outcome.as_ref().err(),
+                actor.start,
+                state.config.measured.ownership.handoff_timeout_micros,
+                progress.ready,
+                progress.users,
+                actor.writers[0].users.capacity(),
+                actor.wire.usage().1,
+                actor.wire.usage().0,
+            );
+            if let Ok(now) = actor.micros() {
+                state.ledger.trace_failure(now);
+            }
+            #[cfg(unix)]
+            if let Some(bridge) = &actor.retirement {
+                bridge.trace_measured_failure();
+            }
+        }
         tasks.abort_all();
         if owned_cleanup || abort.is_some() {
             // Keep the same actual children owned after an operation cap expires.

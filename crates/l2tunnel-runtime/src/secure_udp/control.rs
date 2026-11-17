@@ -312,6 +312,7 @@ fn wrapper_layout(
 
 #[derive(Clone, Copy)]
 enum Storage<'a> {
+    #[cfg(test)]
     Legacy,
     #[cfg(test)]
     ReservedArq([recovery::storage::Limits; 3]),
@@ -328,6 +329,14 @@ enum Storage<'a> {
 }
 
 impl Storage<'_> {
+    fn allows_unselected(&self) -> bool {
+        #[cfg(test)]
+        if matches!(self, Self::Legacy) {
+            return true;
+        }
+        false
+    }
+
     fn complete(&self) -> bool {
         matches!(
             self,
@@ -338,6 +347,7 @@ impl Storage<'_> {
         match self {
             Self::ReservedMessages { messages, .. } => messages.get(i).copied(),
             Self::ReservedMessagesV2 { messages, .. } => messages.get(i).copied(),
+            #[cfg(test)]
             _ => None,
         }
     }
@@ -487,6 +497,8 @@ fn construct_stream_owners(
 }
 
 impl Owner {
+    /// Construct the independent delivery component for its focused tests.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // The frozen boundary names each independent context.
     pub(crate) fn new(
         base: delivery::Settings,
@@ -540,6 +552,7 @@ impl Owner {
         ])
     }
 
+    #[cfg(test)]
     pub(crate) fn wrapper_capacity_bytes(&self) -> io::Result<usize> {
         let Backend::Streamed(streamed) = &self.backend else {
             return Err(invalid("wrapper storage requires streamed control"));
@@ -553,6 +566,7 @@ impl Owner {
     }
 
     /// Actual fallibly provisioned wrapper backing, separate from message heaps.
+    #[cfg(test)]
     pub(crate) fn wrapper_storage_usage(&self) -> io::Result<Option<wrapper_storage::Usage>> {
         match &self.backend {
             Backend::Legacy(_) => Ok(None),
@@ -596,7 +610,7 @@ impl Owner {
         storage: Storage<'_>,
         allocation: &mut wrapper_storage::Allocation,
     ) -> io::Result<Self> {
-        if selected.is_none() && !matches!(storage, Storage::Legacy) {
+        if selected.is_none() && !storage.allows_unselected() {
             return Err(invalid("reserved control requires explicit streams"));
         }
         let raw = raw_packet_bytes(base)?;
@@ -651,7 +665,7 @@ impl Owner {
         data_scope: sc::Scope,
         now: Duration,
         expires: Duration,
-        raw: usize,
+        _raw: usize,
         storage: Storage<'_>,
         allocation: &mut wrapper_storage::Allocation,
         lifecycle: Option<messages::Settings>,
@@ -673,22 +687,25 @@ impl Owner {
         } else {
             streams::VERSION
         };
-        if let Storage::ReservedMessages {
-            wrapper,
-            wrapper_limit,
-            ..
-        }
-        | Storage::ReservedMessagesV2 {
-            wrapper,
-            wrapper_limit,
-            ..
-        } = storage
-        {
-            if lifecycle.is_some() {
-                wrapper.check_selection(&settings, lifecycle, &base, wrapper_limit)?;
-            } else {
-                wrapper.check(&settings, &base, wrapper_limit)?;
+        match storage {
+            Storage::ReservedMessages {
+                wrapper,
+                wrapper_limit,
+                ..
             }
+            | Storage::ReservedMessagesV2 {
+                wrapper,
+                wrapper_limit,
+                ..
+            } => {
+                if lifecycle.is_some() {
+                    wrapper.check_selection(&settings, lifecycle, &base, wrapper_limit)?;
+                } else {
+                    wrapper.check(&settings, &base, wrapper_limit)?;
+                }
+            }
+            #[cfg(test)]
+            _ => {}
         }
         let maximum = settings
             .streams
@@ -877,6 +894,7 @@ impl Owner {
                 wrapper_limit,
                 ..
             } => wrapper.provision(wrapper_limit, allocation, build)?,
+            #[cfg(test)]
             _ => wrapper_storage::StreamedStorage::Legacy(Box::new(build(
                 std::array::from_fn(|i| {
                     Vec::with_capacity(
@@ -887,12 +905,13 @@ impl Owner {
                     )
                 }),
                 vec![0; maximum],
-                vec![0; raw],
+                vec![0; _raw],
             )?)),
         };
         Ok((Backend::Streamed(streamed), size))
     }
 
+    #[cfg(test)]
     pub(crate) fn max_packet_bytes(&self) -> usize {
         self.max_packet
     }
@@ -964,15 +983,22 @@ impl Owner {
                 if i >= streamed.owners.len() {
                     return Err(invalid("control stream not selected"));
                 }
-                if auto_retire && stream != streams::Stream::Liveness {
+                if auto_retire
+                    && !matches!(
+                        stream,
+                        streams::Stream::Liveness | streams::Stream::DataFeedback
+                    )
+                {
                     return Err(invalid("profile tokens require explicit completion"));
                 }
                 if (matches!(
                     stream,
                     streams::Stream::Liveness | streams::Stream::Lifecycle
                 ) && scope != streamed.control_scope)
-                    || (stream == streams::Stream::Transaction
-                        && scope != streamed.active
+                    || (matches!(
+                        stream,
+                        streams::Stream::Transaction | streams::Stream::DataFeedback
+                    ) && scope != streamed.active
                         && Some(scope) != streamed.draining)
                 {
                     return Err(invalid("outgoing control origin is not registered"));
@@ -1445,7 +1471,7 @@ impl Owner {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(unix, test))]
     pub(crate) fn drained(&self) -> bool {
         match &self.backend {
             Backend::Legacy(legacy) => legacy.service.drained(),
@@ -1462,7 +1488,45 @@ impl Owner {
         }
     }
 
+    /// No retained message, recovery, or staged output may be abandoned for a
+    /// maintained peer close after the independent proxy retirement barrier.
+    #[cfg(unix)]
+    pub(crate) fn retained_close_drained(&self) -> bool {
+        self.drained()
+            && match &self.backend {
+                Backend::Legacy(_) => true,
+                Backend::Streamed(streamed) => {
+                    streamed.reservation.is_none() && streamed.outgoing.iter().all(Vec::is_empty)
+                }
+            }
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    pub(crate) fn trace_retained_close(&self) {
+        if let Backend::Streamed(streamed) = &self.backend {
+            for (index, owner) in streamed.owners.iter().enumerate() {
+                let retained = owner.retained();
+                eprintln!(
+                    "PROXY_CLOSE_CONTROL index={} outgoing={} confirmed={} held={} reservation={} messages={} held_bytes={} incomplete={} recovery={:?}",
+                    index,
+                    streamed.outgoing[index].len(),
+                    streamed.outgoing[index]
+                        .iter()
+                        .filter(|entry| entry.confirmed)
+                        .count(),
+                    streamed.held[index].is_some(),
+                    streamed.reservation.is_some(),
+                    retained.outbound_messages,
+                    retained.held_bytes,
+                    retained.incomplete_messages,
+                    retained.recovery,
+                );
+            }
+        }
+    }
+
     /// Transaction presentation/receipt custody only; unrelated liveness is separate.
+    #[cfg(test)]
     pub(crate) fn has_dispatched(&self) -> bool {
         match &self.backend {
             Backend::Legacy(_) => false,
@@ -1493,6 +1557,53 @@ impl Owner {
         }
     }
 
+    /// Existing exact native receipt custody for a single data generation.
+    pub(crate) fn native_receipts_drained(&self, scope: sc::Scope) -> io::Result<bool> {
+        let Backend::Streamed(streamed) = &self.backend else {
+            return Ok(true);
+        };
+        let i = index(streams::Stream::DataFeedback);
+        if streamed.outgoing[i]
+            .iter()
+            .any(|entry| entry.scope == scope)
+            || streamed.held[i].is_some_and(|held| held.scope == scope)
+        {
+            return Ok(false);
+        }
+        if let Some(delivery) = streamed.owners[i].pending() {
+            let envelope = sc::Envelope::decode(
+                delivery.bytes(),
+                envelope_limits(streamed.settings_at(i)?.max_message_bytes)?,
+            )
+            .map_err(protocol)?;
+            if envelope.binding.scope == scope {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Existing Common readers determine the exact native identity width.
+    /// A staged reader cannot register another control origin through this hook.
+    pub(crate) fn register_record_receipts(
+        &mut self,
+        scope: sc::Scope,
+        channels: u16,
+    ) -> io::Result<()> {
+        let Backend::Streamed(streamed) = &mut self.backend else {
+            return Err(invalid(
+                "native delivery requires independent control streams",
+            ));
+        };
+        if scope != streamed.active && Some(scope) != streamed.draining {
+            return Ok(());
+        }
+        streamed
+            .gate
+            .set_receipt_policy(scope, sc::ReceiptPolicy::Record { channels })
+            .map_err(protocol)
+    }
+
     pub(crate) fn advance_scope(&mut self, scope: sc::Scope) -> io::Result<()> {
         if let Backend::Streamed(streamed) = &mut self.backend {
             let streamed = &mut **streamed;
@@ -1509,32 +1620,35 @@ impl Owner {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn retire_draining(&mut self, scope: sc::Scope) -> io::Result<()> {
         if let Backend::Streamed(streamed) = &mut self.backend {
             let streamed = &mut **streamed;
-            let i = index(streams::Stream::Transaction);
-            let pending_old = if let Some(delivery) = streamed.owners[i].pending() {
-                sc::Envelope::decode(
-                    delivery.bytes(),
-                    envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
-                )
-                .map_err(protocol)?
-                .binding
-                .scope
-                    == scope
-            } else {
-                false
-            };
-            if streamed.outgoing[i]
-                .iter()
-                .any(|entry| entry.scope == scope)
-                || streamed.held[i].is_some_and(|held| held.scope == scope)
-                || pending_old
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "old control scope still owns custody",
-                ));
+            for stream in [streams::Stream::Transaction, streams::Stream::DataFeedback] {
+                let i = index(stream);
+                let pending_old = if let Some(delivery) = streamed.owners[i].pending() {
+                    sc::Envelope::decode(
+                        delivery.bytes(),
+                        envelope_limits(streamed.settings.streams[i].max_message_bytes)?,
+                    )
+                    .map_err(protocol)?
+                    .binding
+                    .scope
+                        == scope
+                } else {
+                    false
+                };
+                if streamed.outgoing[i]
+                    .iter()
+                    .any(|entry| entry.scope == scope)
+                    || streamed.held[i].is_some_and(|held| held.scope == scope)
+                    || pending_old
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "old control scope still owns custody",
+                    ));
+                }
             }
             streamed.gate.retire_draining(scope).map_err(protocol)?;
             streamed.draining = None;
@@ -1610,26 +1724,28 @@ impl Owner {
                     }
                 }
             }
-            // Only Liveness permits automatic retirement. Inspect one rotating
-            // entry, so confirmed() cannot multiply work_per_call by the entire
-            // bounded retry ledger. Manual entries do not starve later entries.
-            let i = index(streams::Stream::Liveness);
-            if !streamed.outgoing[i].is_empty() {
-                let position = streamed.auto_cursor % streamed.outgoing[i].len();
-                let entry = &streamed.outgoing[i][position];
-                let TokenKind::Streamed { ticket, .. } = entry.token.kind else {
-                    return Err(protocol("streamed custody contains a legacy token"));
-                };
-                if entry.auto_retire
-                    && streamed.owners[i]
-                        .confirmed(ticket, now)
-                        .map_err(protocol)?
-                {
-                    streamed.owners[i].retire(ticket, now).map_err(protocol)?;
-                    streamed.outgoing[i].remove(position);
-                    streamed.auto_cursor = position;
-                } else {
-                    streamed.auto_cursor = position + 1;
+            // Inspect one rotating entry in each automatic stream. Native
+            // receipts retain the same original message deadline and bounded
+            // confirmation ledger; no recovery ACK is a device receipt.
+            for stream in [streams::Stream::Liveness, streams::Stream::DataFeedback] {
+                let i = index(stream);
+                if !streamed.outgoing[i].is_empty() {
+                    let position = streamed.auto_cursor % streamed.outgoing[i].len();
+                    let entry = &streamed.outgoing[i][position];
+                    let TokenKind::Streamed { ticket, .. } = entry.token.kind else {
+                        return Err(protocol("streamed custody contains a legacy token"));
+                    };
+                    if entry.auto_retire
+                        && streamed.owners[i]
+                            .confirmed(ticket, now)
+                            .map_err(protocol)?
+                    {
+                        streamed.owners[i].retire(ticket, now).map_err(protocol)?;
+                        streamed.outgoing[i].remove(position);
+                        streamed.auto_cursor = position;
+                    } else {
+                        streamed.auto_cursor = position + 1;
+                    }
                 }
             }
         }
@@ -1657,6 +1773,10 @@ fn opposite(role: mg::Role) -> mg::Role {
 fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
     match body {
         sc::Body::Ping { .. } | sc::Body::Pong { .. } => Ok(streams::Stream::Liveness),
+        sc::Body::NativeReceipt {
+            receipt: sc::NativeReceipt::Record { .. },
+            ..
+        } => Ok(streams::Stream::DataFeedback),
         sc::Body::ProfileControl {
             tag: sc::ProfileTag::SwiftPolicyV1 | sc::ProfileTag::SlotReuseV1,
             ..

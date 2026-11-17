@@ -9,6 +9,54 @@ type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const TURN_WIRE_BYTES: usize = 4096;
 const IP_UDP_BYTES: usize = 28;
 
+fn record_selection() -> record::compact::Selection {
+    record::compact::Selection {
+        protection: security::compact::Protection::ChaCha20Poly1305,
+        limits: security::compact::Selection {
+            max_forward_packets: 1024,
+            max_failed_checks: 64,
+        },
+    }
+}
+
+fn record_limits() -> security::Limits {
+    security::Limits {
+        max_body_bytes: 1024,
+        packets_per_key: 8,
+        max_body_bytes_per_key: 1 << 20,
+    }
+}
+
+fn record_commitment() -> [u8; 32] {
+    let selection = record_selection();
+    let limits = record_limits();
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"l2tunnel/current-record-socket-fixture/v1\0");
+    hash.update(&[security::compact::VERSION, selection.protection as u8]);
+    hash.update(&selection.limits.max_forward_packets.to_be_bytes());
+    hash.update(&selection.limits.max_failed_checks.to_be_bytes());
+    hash.update(&(limits.max_body_bytes as u64).to_be_bytes());
+    hash.update(&limits.packets_per_key.to_be_bytes());
+    hash.update(&limits.max_body_bytes_per_key.to_be_bytes());
+    let mut value = [0; 32];
+    value.copy_from_slice(hash.finish().as_ref());
+    value
+}
+
+fn record_kind(class: record::Class, body: &[u8]) -> record::compact::Kind {
+    match class {
+        record::Class::Control => record::compact::Kind::Control,
+        record::Class::User
+            if body
+                .first()
+                .is_some_and(|byte| byte & swift::KIND_MASK == swift::KIND_FEEDBACK) =>
+        {
+            record::compact::Kind::Feedback
+        }
+        record::Class::User => record::compact::Kind::Data,
+    }
+}
+
 async fn sockets() -> Result<[UdpSocket; 2]> {
     let sockets = [
         UdpSocket::bind("127.0.0.1:0").await?,
@@ -83,7 +131,7 @@ fn settings(
         gate,
         cover,
         profile,
-        application: ConfigDigest([17; 32]),
+        application: ConfigDigest(record_commitment()),
         outer: [23; 32],
         member,
         membership: Membership {
@@ -365,15 +413,10 @@ impl Endpoint {
         } else {
             mg::Role::Server
         };
-        let records = record::Records::new(
+        let records = record::Records::new_compact(
             root,
             security::LaneId(0),
-            security::Limits {
-                max_body_bytes: 1024,
-                packets_per_key: 8,
-                max_body_bytes_per_key: 1 << 20,
-            },
-            security::Protection::ChaCha20Poly1305,
+            record_limits(),
             cover,
             record::Scope {
                 epoch: security::Epoch(1),
@@ -383,9 +426,14 @@ impl Endpoint {
                 epoch: security::Epoch(10),
                 configuration,
             },
+            record_selection(),
         )?;
         let max_source = 128 + l2tunnel::recovery::DATA_HEADER_BYTES;
-        let wire_overhead = records.capacity(max_source)?.packet_bytes + IP_UDP_BYTES - max_source;
+        let wire_overhead = records
+            .capacity_for(record::compact::Kind::Control, max_source)?
+            .packet_bytes
+            + IP_UDP_BYTES
+            - max_source;
         let session = mg::SessionId(info.binding.session.0);
         let control = mg::delivery::Service::new(
             mg::delivery::Settings {
@@ -446,17 +494,28 @@ impl Endpoint {
         allowance: &mut usize,
         output: &mut Vec<Vec<u8>>,
     ) -> Result<usize> {
-        let cost = self.records.capacity(body.len())?.packet_bytes + IP_UDP_BYTES;
+        let kind = record_kind(class, body);
+        let cost = self.records.capacity_for(kind, body.len())?.packet_bytes + IP_UDP_BYTES;
         assert!(cost <= *allowance);
         let mut workspace = [0; 2048];
         let mut packet = [0; 1472];
-        let sealed = self.records.seal(
-            class,
-            outer(self.outer, cover::Phase::Established),
-            body,
-            &mut workspace,
-            &mut packet,
-        )?;
+        let metadata = outer(self.outer, cover::Phase::Established);
+        let sealed = if kind == record::compact::Kind::Feedback {
+            self.records.seal_feedback_in(
+                self.records.active_data(),
+                metadata,
+                body,
+                &mut workspace,
+                &mut packet,
+            )?
+        } else {
+            self.records
+                .seal(class, metadata, body, &mut workspace, &mut packet)?
+        };
+        assert_eq!(
+            sealed.bytes,
+            body.len() + record::compact::AUTHENTICATED_OVERHEAD
+        );
         advance(&mut self.outer)?;
         assert_eq!(cost, sealed.bytes + IP_UDP_BYTES);
         *allowance -= cost;
@@ -552,13 +611,12 @@ impl Endpoint {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
             };
-            let decoded = self.cover.decode(&packet[..length])?;
-            if self.bootstrap.receive(decoded, Instant::now())?
-                || self.joining.receive(decoded, Instant::now())?
+            // Appearance framing belongs only to the exact retained setup tails.
+            // Current final records use their independently authenticated namespace.
+            if let Ok(decoded) = self.cover.decode(&packet[..length])
+                && (self.bootstrap.receive(decoded, Instant::now())?
+                    || self.joining.receive(decoded, Instant::now())?)
             {
-                continue;
-            }
-            if decoded.phase != cover::Phase::Established {
                 continue;
             }
             let mut workspace = [0; 2048];
@@ -575,6 +633,12 @@ impl Endpoint {
                 Err(error) => return Err(error.into()),
             };
             self.largest_generation = self.largest_generation.max(opened.generation.0);
+            assert!(opened.authenticated && opened.strongly_authenticated);
+            assert_eq!(
+                opened.feedback,
+                record_kind(opened.class, &plain[..opened.bytes])
+                    == record::compact::Kind::Feedback,
+            );
             match opened.class {
                 record::Class::Control => {
                     assert_eq!(opened.scope, self.records.control_scope());

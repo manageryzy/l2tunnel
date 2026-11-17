@@ -24,6 +24,8 @@ pub struct Usage {
     pub ingress_bytes: usize,
     /// Actual selected fragment slabs and maintained reassembly heaps.
     pub fragment_bytes: usize,
+    /// Independent native delivery controller, identities and physical witness bitmaps.
+    pub native_window_bytes: usize,
     /// Exact fixed plus nested heap layouts.
     pub capacity_bytes: usize,
     /// Explicit successful nonzero constructor reservations.
@@ -270,6 +272,7 @@ pub struct Plan {
     ingress: Option<pipeline::ack_coalescing::Plan>,
     fragments: Option<fragment::Plan>,
     compact_feedback: Option<usize>,
+    native_window: Option<native_window::Plan>,
     heap_bytes: usize,
     capacity_bytes: usize,
 }
@@ -461,9 +464,15 @@ impl Plan {
                     .map_err(Error::Ingress)
             })
             .transpose()?;
+        let native_window =
+            native_window::Plan::new(&configuration, context.role, parameters.witnesses)
+                .map_err(Error::Engine)?;
         let heap_bytes = pipeline
             .capacity_bytes()
             .checked_add(record.heap_bytes())
+            .and_then(|bytes| {
+                bytes.checked_add(native_window.map_or(0, native_window::Plan::heap_bytes))
+            })
             .and_then(|bytes| bytes.checked_add(ingress.map_or(0, |plan| plan.capacity_bytes())))
             .and_then(|bytes| bytes.checked_add(fragments.map_or(0, fragment::Plan::heap_bytes)))
             .ok_or(Error::Layout)?;
@@ -481,6 +490,7 @@ impl Plan {
             ingress,
             fragments,
             compact_feedback,
+            native_window,
             heap_bytes,
             capacity_bytes,
         })
@@ -566,6 +576,22 @@ impl Engine {
             .fragments
             .map(|value| fragment::State::new(value, plan.context).map_err(Error::Fragment))
             .transpose()?;
+        let native_window = plan
+            .native_window
+            .map(native_window::State::new)
+            .transpose()
+            .map_err(Error::Engine)?;
+        let (native_window_bytes, native_window_allocations) = native_window
+            .as_ref()
+            .map(native_window::State::usage)
+            .unwrap_or((0, 0));
+        if native_window_bytes
+            != plan
+                .native_window
+                .map_or(0, native_window::Plan::heap_bytes)
+        {
+            return Err(Error::Invariant);
+        }
         let mut owner = plan.record.construct(plan.context)?;
         owner
             .enable_carrier_confirmation(&plan.configuration)
@@ -595,6 +621,7 @@ impl Engine {
         let allocations = p
             .allocations
             .checked_add(record_allocations)
+            .and_then(|count| count.checked_add(native_window_allocations))
             .and_then(|n| n.checked_add(fragment_allocations))
             .and_then(|count| {
                 count.checked_add(
@@ -611,6 +638,7 @@ impl Engine {
             record_bytes,
             ingress_bytes,
             fragment_bytes,
+            native_window_bytes,
             capacity_bytes: plan.capacity_bytes,
             allocations,
         };
@@ -625,6 +653,7 @@ impl Engine {
             Some(usage),
         );
         engine.fragments = fragments;
+        engine.native_window = native_window;
         if let Some(overhead) = plan.compact_feedback {
             engine
                 .enable_compact_wire(overhead)

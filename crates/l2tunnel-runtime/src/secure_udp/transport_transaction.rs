@@ -2,20 +2,14 @@
 //! This owner performs no I/O and supplies no physical or authentication proof.
 
 use super::super::control as control_owner;
-#[cfg(test)]
-use super::engines::Bank;
 use super::{
     TransactionSettings,
-    transaction_family::{Backend, CommonFamily, Family, Reservation, SwiftFamily},
+    transaction_family::{Backend, CommonFamily, Family, Reservation},
 };
-use l2tunnel::swift_configuration::Configuration as C;
-#[cfg(test)]
-use l2tunnel::swift_configuration::{Catalog, EnvelopeDigest};
 use l2tunnel_core::Epoch;
 use l2tunnel_management::{
     self as mg, control_streams, delivery, session_control as sc, transaction as tx,
 };
-use l2tunnel_swift::{records, storage};
 use std::{
     io,
     sync::atomic::{AtomicU64, Ordering},
@@ -768,61 +762,6 @@ impl<F: Family> TransactionState<F> {
     pub(super) fn peer(&self) -> &tx::Peer<F::Value> {
         &self.peer
     }
-    #[cfg(test)]
-    pub(super) fn output_custody_for_test(
-        &self,
-    ) -> [Option<(mg::messages::SubmissionId, Duration, bool, bool)>; 3] {
-        std::array::from_fn(|index| {
-            self.outputs[index].as_ref().map(|output| {
-                (
-                    output.frozen.submission(),
-                    output.frozen.deadline(),
-                    output.confirmed,
-                    output.frozen.context().is_final_reply(),
-                )
-            })
-        })
-    }
-    /// Generate an independent real logical retry for a final-custody test.
-    /// Ordinary State service intentionally leaves retransmission to FrozenOutput.
-    #[cfg(test)]
-    pub(super) fn independent_final_retry_for_test(
-        &mut self,
-        now: Duration,
-    ) -> io::Result<Vec<u8>> {
-        let operation = self
-            .peer
-            .operation()
-            .ok_or_else(|| invalid("test retry requires an actual retained operation"))?;
-        if self.contract.identity.role != mg::Role::Client
-            || self.peer.phase() != tx::Phase::AwaitRetireAck
-            || self.operation != Some(operation)
-            || now < self.now
-            || now >= self.contract.session_expires
-            || tick(now)? >= operation.expires()
-        {
-            return Err(invalid("test retry is outside original final custody"));
-        }
-        let effects = self.peer.poll(tick(now)?).map_err(protocol)?;
-        if effects.event.is_some() || self.peer.operation() != Some(operation) {
-            return Err(protocol("test retry reached a real lifecycle boundary"));
-        }
-        let command = effects
-            .outbound
-            .ok_or_else(|| invalid("actual final retry is not due"))?;
-        if mg::Frame::decode(
-            &command,
-            tx::configuration_limits::<F::Value>().map_err(protocol)?,
-        )
-        .map_err(protocol)?
-        .header
-        .kind
-            != mg::MessageKind::Retire
-        {
-            return Err(protocol("actual final retry is not Retire"));
-        }
-        Ok(command)
-    }
     pub(super) fn take_outcome(&mut self) -> Option<Outcome> {
         self.outcome.take()
     }
@@ -1262,28 +1201,10 @@ impl<F: Family> TransactionState<F> {
     }
 }
 
-/// Existing selected Swift runtime keeps its exact private type names.
-pub(super) type State = TransactionState<SwiftFamily>;
-pub(super) type Action = ActionFor<C>;
 /// Same actual Peer/custody implementation over complete common values.
-#[allow(dead_code)] // The actual common State precedes the selected common Driver.
 pub(super) type CommonState = TransactionState<CommonFamily>;
-#[allow(dead_code)] // Same actual lifecycle Action, awaiting the common Driver adapter.
 pub(super) type CommonAction = ActionFor<l2tunnel::record_configuration::Configuration>;
 
-impl TransactionState<SwiftFamily> {
-    pub(super) fn engine(&self, epoch: Epoch) -> io::Result<&records::Engine> {
-        self.bank.engine(epoch)
-    }
-    pub(super) fn entry(&mut self, epoch: Epoch) -> io::Result<storage::Entry<'_>> {
-        self.bank.entry(epoch)
-    }
-    pub(super) fn usage(&self) -> storage::Usage {
-        self.bank.usage()
-    }
-}
-
-#[allow(dead_code)] // Typed common accessors await the selected Driver; no erased Engine escape.
 impl TransactionState<CommonFamily> {
     pub(super) fn engine(&self, epoch: Epoch) -> io::Result<&l2tunnel::record_engine::Engine> {
         self.bank.engine(epoch)
@@ -1352,10 +1273,6 @@ fn management_kind_for<C: tx::Configuration>(bytes: &[u8]) -> io::Result<mg::Mes
             .kind,
     )
 }
-#[cfg(test)]
-fn management_kind(bytes: &[u8]) -> io::Result<mg::MessageKind> {
-    management_kind_for::<C>(bytes)
-}
 fn tick(now: Duration) -> io::Result<tx::Tick> {
     u64::try_from(now.as_millis())
         .map(tx::Tick)
@@ -1373,10 +1290,6 @@ fn protocol(error: impl std::fmt::Display) -> io::Error {
 fn unreachable_result<T>() -> io::Result<T> {
     Err(protocol("unreachable guarded transaction result"))
 }
-
-#[cfg(test)]
-#[path = "transport_transaction_tests.rs"]
-mod tests;
 
 #[cfg(test)]
 #[path = "transport_transaction_common_tests.rs"]

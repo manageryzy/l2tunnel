@@ -108,7 +108,6 @@ pub struct RollingIngressStatus {
     /// Existing C switches cannot hot-change this establishment policy.
     pub policy_switching: bool,
 }
-#[cfg(unix)]
 impl RollingIngressStatus {
     pub(super) fn observe(
         requested: RollingIngressPolicies,

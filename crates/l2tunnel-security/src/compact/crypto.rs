@@ -9,7 +9,7 @@ use ccm::{
     consts::{U4, U13},
 };
 use chacha20::cipher::{KeyIvInit, StreamCipher};
-use ring::aead;
+use ring::{aead, hmac};
 use zeroize::{Zeroize, Zeroizing};
 
 type Ccm4 = Ccm<aes::Aes128, U4, U13>;
@@ -20,6 +20,7 @@ pub(super) enum Key {
     Ccm(Ccm4),
     Crc(Zeroizing<[u8; 32]>),
     Strong(aead::LessSafeKey),
+    Mac(hmac::Key),
 }
 impl KeyMaterial for Key {
     type Selection = Protection;
@@ -36,6 +37,7 @@ impl KeyMaterial for Key {
                     .map(Self::Strong)
                     .map_err(|_| Error::Crypto)
             }
+            Protection::HmacSha256 => Ok(Self::Mac(hmac::Key::new(hmac::HMAC_SHA256, &secret[..]))),
         }
     }
 }
@@ -64,6 +66,13 @@ impl Key {
         let (body, tag) = output.split_at_mut(plaintext.len());
         body.copy_from_slice(plaintext);
         let result = match self {
+            Self::Mac(key) => {
+                let mut mac = hmac::Context::with_key(key);
+                mac.update(aad);
+                mac.update(plaintext);
+                tag.copy_from_slice(mac.sign().as_ref());
+                Ok(())
+            }
             Self::Ccm(key) => key
                 .encrypt_inout_detached(&ccm_nonce(number), aad, body.into())
                 .map(|value| tag.copy_from_slice(&value))
@@ -91,10 +100,26 @@ impl Key {
         payload: &[u8],
         body_bytes: usize,
         output: &mut [u8],
+        mac_input: &mut Vec<u8>,
     ) -> Result<(), Error> {
+        if matches!(self, Self::Mac(_))
+            && aad
+                .len()
+                .checked_add(body_bytes)
+                .is_none_or(|length| length > mac_input.capacity())
+        {
+            return Err(Error::OutputTooSmall);
+        }
         let buffer = &mut output[..payload.len()];
         buffer.copy_from_slice(payload);
         let result = match self {
+            Self::Mac(key) => {
+                mac_input.clear();
+                mac_input.extend_from_slice(aad);
+                mac_input.extend_from_slice(&payload[..body_bytes]);
+                hmac::verify(key, mac_input, &payload[body_bytes..])
+                    .map_err(|_| Error::Authentication)
+            }
             Self::Ccm(key) => {
                 let (body, tag) = buffer.split_at_mut(body_bytes);
                 let value: [u8; 4] = tag.try_into().map_err(|_| Error::Malformed)?;

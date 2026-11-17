@@ -1,4 +1,4 @@
-//! Additive Common backend using the original service actor and UDP factory.
+//! Common backend using the original service actor and UDP factory.
 
 use super::*;
 use l2tunnel::record_configuration::Configuration;
@@ -21,7 +21,7 @@ pub(super) async fn establish(
         accepted,
         deadline,
         profile.settings(),
-        profile.compact_wire().map(|_| profile.as_ref()),
+        Some(profile.as_ref()),
     )
     .await?;
     let info = session.info();
@@ -37,7 +37,7 @@ pub(super) async fn establish(
     }
     let parts = session.into_parts();
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_readable().inspect_err(|_| {
+    let device = plan.open_native().inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
     })?;
     check(deadline)?;
@@ -102,7 +102,7 @@ async fn ready(
 // continuation and the same Driver cell; no independent task is scheduled.
 #[inline(never)]
 fn make_runtime(
-    device: crate::swift::Native,
+    device: crate::native::Native,
     parts: l2tunnel_runtime::secure_udp::member::Parts,
     contract: transport::CommonTransactionContract,
     requests: transport::CommonControlRequests,

@@ -16,7 +16,7 @@ fn plans(
     maintained_plans(profile, half, hosts)
 }
 #[inline(never)]
-fn maintained_plans(
+pub(super) fn maintained_plans(
     old: common_transaction_profile::Profile,
     half: bool,
     hosts: &[Arc<Host>; 2],
@@ -103,10 +103,12 @@ fn maintained_plans(
         old.runtime_contract(Role::Responder)?.resources(),
     ];
     for value in &mut resources {
+        value.path_mtu = geometry.path_mtu;
         value.security.max_body_bytes = 1200;
         value.control.wire_overhead =
             physical + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD;
         for stream in &mut value.streams.as_mut().ok_or("missing streams")?.streams {
+            stream.path_mtu = geometry.path_mtu;
             stream.delivery.wire_overhead =
                 value.control.wire_overhead + l2tunnel_management::control_streams::HEADER_BYTES;
         }
@@ -123,6 +125,21 @@ fn maintained_plans(
             common::Profile::Aligned { forward, reverse } => {
                 forward.recovery.outer_overhead_bytes = data;
                 reverse.recovery.outer_overhead_bytes = data;
+                if old.proxy_config().is_some() {
+                    for value in [forward, reverse] {
+                        value.receiver.body.symbol_bytes = 1024;
+                        let original = 48 + value.receiver.body.symbol_bytes;
+                        let wrapped = 44 + original;
+                        value.recovery.arq.max_source_bytes = original;
+                        value.recovery.arq.send_bytes = 8 * original;
+                        value.recovery.arq.receive_bytes = 8 * original;
+                        value.recovery.fec.block.max_source_bytes = wrapped;
+                        value.recovery.fec.block.max_packet_bytes = 56 + 2 + 2 + wrapped;
+                        value.recovery.max_restored_bytes =
+                            value.recovery.max_restored_packets * wrapped;
+                        value.max_recovery_packet_bytes = value.recovery.maximum_packet_bytes()?;
+                    }
+                }
             }
             common::Profile::Packed { forward, reverse } => {
                 forward.base.recovery.outer_overhead_bytes = data;
@@ -131,7 +148,7 @@ fn maintained_plans(
             _ => return Err("unexpected fixture catalog".into()),
         }
         descriptors.push(common::Descriptor::new(
-            original.path_mtu(),
+            geometry.path_mtu,
             connection.duplex,
             *original.direction(DataRole::Client).common(),
             *original.direction(DataRole::Server).common(),
@@ -145,17 +162,41 @@ fn maintained_plans(
             max_failed_checks: 64,
         },
     };
-    let requested = common_transaction_profile::Profile::new_maintained_compact(
-        connection,
-        settings,
-        old.peers(),
-        resources[0],
-        resources[1],
-        common::Catalog::new(descriptors[0], &descriptors)?,
-        old.parameters(),
-        selected,
-        selection,
-    )?;
+    let requested = if let Some(proxy) = old.proxy_config() {
+        let mut proxy = proxy.clone();
+        proxy.duplex = connection.duplex;
+        let measured = old.proxy_measured_config().map(|value| {
+            let mut value = value.clone();
+            value.fixed = proxy.clone();
+            value
+        });
+        common_transaction_profile::Profile::new_proxy_maintained(
+            connection,
+            settings,
+            old.peers(),
+            resources[0],
+            resources[1],
+            common::Catalog::new(descriptors[0], &descriptors)?,
+            old.parameters(),
+            proxy,
+            old.proxy_retirement(),
+            measured,
+            Some(old.compact_wire()),
+            selected,
+        )?
+    } else {
+        common_transaction_profile::Profile::new_maintained_compact(
+            connection,
+            settings,
+            old.peers(),
+            resources[0],
+            resources[1],
+            common::Catalog::new(descriptors[0], &descriptors)?,
+            old.parameters(),
+            selected,
+            selection,
+        )?
+    };
     let offline = crate::secure_udp::common_status::MaintainedCarrier::observe(&requested, None)?
         .ok_or("requested maintained status absent")?;
     assert!(
@@ -198,7 +239,11 @@ fn maintained_plans(
             members,
         })
     };
-    let a = Prepared::secure_udp_common_maintained_client(
+    let a = (if requested.proxy_config().is_some() {
+        Prepared::proxy_common_maintained_client
+    } else {
+        Prepared::secure_udp_common_maintained_client
+    })(
         requested.clone(),
         outer_client,
         credentials::Client::new(
@@ -213,7 +258,11 @@ fn maintained_plans(
         )?,
         hosts[0].attachment(),
     )?;
-    let b = Prepared::secure_udp_common_maintained_server(
+    let b = (if requested.proxy_config().is_some() {
+        Prepared::proxy_common_maintained_server
+    } else {
+        Prepared::secure_udp_common_maintained_server
+    })(
         requested.clone(),
         outer_server,
         credentials::Server::new(
@@ -394,3 +443,6 @@ fn exercise(half: bool) -> Pin<Box<dyn std::future::Future<Output = Result> + Se
         .await?
     })
 }
+
+#[path = "secure_udp_common_swift_lifecycle.rs"]
+mod swift_lifecycle;

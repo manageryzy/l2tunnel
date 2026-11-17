@@ -1,7 +1,7 @@
-//! Actual TLS -> cookie/Noise -> member -> selected Records on one UDP tuple.
+//! Actual TLS -> cookie/Noise -> member handoff on the original UDP tuple.
 use super::*;
 use establish::carrier::{self as factory, Outer};
-use l2tunnel::{handshake as hs, secure_record as record};
+use l2tunnel::handshake as hs;
 use l2tunnel_auth::{ClientTls, MemberAllowlist, MemberKey, ServerTls};
 use l2tunnel_openvpn::{
     WireBudget,
@@ -277,139 +277,9 @@ async fn established(
     assert!(b.statistics().socket_sent_datagrams > 0);
     Ok((a, b, cap))
 }
-fn time(origin: Instant, at: Instant) -> io::Result<hs::Time> {
-    joining_time(origin, at)
-}
-struct Live {
-    socket: crate::secure_udp::original_datagram::OriginalDatagram,
-    cover: cover::Config,
-    bootstrap: establish::BootstrapTail,
-    joining: JoiningTail,
-    next_outer: u32,
-    deadline: Instant,
-    origin: Instant,
-}
-fn install(parts: Parts) -> TestResult<(Live, record::Records)> {
-    let origin = parts.clock_origin();
-    let spec = parts.initial.selection().spec();
-    let records = record::Records::new_refreshable(
-        parts.initial,
-        spec.lane,
-        spec.limits,
-        spec.protection,
-        parts.cover,
-        record::Scope {
-            epoch: spec.control_epoch,
-            configuration: spec.control_digest,
-        },
-        record::Scope {
-            epoch: security::Epoch(7),
-            configuration: security::ConfigDigest([21; 32]),
-        },
-        time(origin, Instant::now())?,
-        time(origin, parts.deadline)?,
-    )?;
-    Ok((
-        Live {
-            socket: parts.datagram,
-            cover: parts.cover,
-            bootstrap: parts.bootstrap,
-            joining: parts.joining,
-            next_outer: parts.next_outer,
-            deadline: parts.deadline,
-            origin,
-        },
-        records,
-    ))
-}
-async fn physical(live: &Live, class: record::Class, packet: &[u8]) -> TestResult {
-    let class = if class == record::Class::User {
-        crate::secure_udp::original_datagram::SendClass::User
-    } else {
-        crate::secure_udp::original_datagram::SendClass::Control
-    };
-    let mut ticket = live.socket.begin_send(class, packet, live.deadline)?;
-    let receipt = live.socket.wait_send(&mut ticket).await?;
-    assert_eq!(receipt.datagram_bytes, packet.len());
-    assert_eq!(receipt.udp_bytes, packet.len() + 1);
-    assert_eq!(receipt.ip_bytes, packet.len() + 29);
-    assert!(receipt.accepted_at < receipt.deadline);
-    Ok(())
-}
-async fn send_record(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    body: &[u8],
-) -> TestResult<Vec<u8>> {
-    let mut scratch = [0; 1024];
-    let mut output = [0; 1024];
-    let sealed = records.seal_at(
-        time(live.origin, Instant::now())?,
-        class,
-        metadata(live.next_outer, cover::Phase::Established),
-        body,
-        &mut scratch,
-        &mut output,
-    )?;
-    advance(&mut live.next_outer)?;
-    physical(live, class, &output[..sealed.record.bytes]).await?;
-    Ok(output[..sealed.record.bytes].to_vec())
-}
-async fn receive_record(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    body: &[u8],
-) -> TestResult {
-    let mut input = [0; 1025];
-    let mut output = [0; 1024];
-    let mut scratch = [0; 1024];
-    let mut plaintext = [0; 512];
-    loop {
-        let now = Instant::now();
-        before(now, live.deadline)?;
-        if let Some(length) = live.bootstrap.poll(
-            now,
-            metadata(live.next_outer, cover::Phase::Handshake),
-            &mut output,
-        )? {
-            advance(&mut live.next_outer)?;
-            physical(live, record::Class::Control, &output[..length]).await?;
-        }
-        if let Some(length) = live.joining.poll(
-            now,
-            metadata(live.next_outer, cover::Phase::Established),
-            &mut output,
-        )? {
-            advance(&mut live.next_outer)?;
-            physical(live, record::Class::Control, &output[..length]).await?;
-        }
-        let wake = live
-            .bootstrap
-            .deadline()
-            .unwrap_or(live.deadline)
-            .min(live.joining.deadline().unwrap_or(live.deadline))
-            .min(live.deadline);
-        tokio::select! {
-            _ = sleep_until(wake) => {},
-            received = std::future::poll_fn(|cx| live.socket.poll_receive(cx, &mut input)) => {
-                let length = received?;
-                let now = Instant::now();
-                let decoded = live.cover.decode(&input[..length])?;
-                if live.bootstrap.receive(decoded, now)? || live.joining.receive(decoded, now)? { continue; }
-                let opened = records.open_at(time(live.origin, now)?, &input[..length], &mut scratch, &mut plaintext)?;
-                assert_eq!(opened.record.class, class);
-                assert_eq!(&plaintext[..opened.record.bytes], body);
-                return Ok(());
-            }
-        }
-    }
-}
-
 #[tokio::test]
-async fn actual_openvpn_factory_member_parts_install_common_records_on_original_tuple() -> TestResult
-{
+async fn actual_openvpn_factory_member_parts_retain_initial_authority_on_original_tuple()
+-> TestResult {
     let credentials = credentials()?;
     let (a, b, cap) = established(&credentials).await?;
     let endpoints = a.outer().endpoints();
@@ -429,72 +299,28 @@ async fn actual_openvpn_factory_member_parts_install_common_records_on_original_
     )?;
     assert_eq!(a.info().member, outer.info().member);
     assert_eq!(a.info().binding, b.info().binding);
-    let (a, b) = (a.into_parts(), b.into_parts());
+    let (mut a, mut b) = (a.into_parts(), b.into_parts());
     assert_eq!((a.deadline, b.deadline), (cap, cap));
     assert_eq!((a.clock_origin(), b.clock_origin()), (a_origin, b_origin));
     assert_eq!(a.datagram.addresses(), endpoints);
     assert_eq!(b.datagram.addresses(), (endpoints.1, endpoints.0));
     assert_eq!(a.datagram.geometry().extra_wire_bytes, 1);
-    let (mut a, mut a_records) = install(a)?;
-    let (mut b, mut b_records) = install(b)?;
-    let raw = send_record(
-        &mut a,
-        &mut a_records,
-        record::Class::User,
-        b"actual common plaintext",
-    )
-    .await?;
-    assert!(
-        !raw.windows(23)
-            .any(|part| part == b"actual common plaintext")
-    );
-    receive_record(
-        &mut b,
-        &mut b_records,
-        record::Class::User,
-        b"actual common plaintext",
-    )
-    .await?;
-    // Replaying an actual sealed body is rejected by the retained inner owner.
-    let mut scratch = [0; 1024];
-    let mut plaintext = [0; 512];
-    assert!(
-        b_records
-            .open_at(
-                time(b.origin, Instant::now())?,
-                &raw,
-                &mut scratch,
-                &mut plaintext
-            )
-            .is_err()
-    );
-    send_record(
-        &mut b,
-        &mut b_records,
-        record::Class::Control,
-        b"authenticated management record",
-    )
-    .await?;
-    receive_record(
-        &mut a,
-        &mut a_records,
-        record::Class::Control,
-        b"authenticated management record",
-    )
-    .await?;
-    let user = a
-        .socket
-        .outer_physical_status()?
-        .ok_or("missing real outer physical ledger")?;
-    assert_eq!(user.user_datagrams, 1);
-    assert!(user.common_control_datagrams > 0);
+    assert_eq!(a.initial.binding(), a.info.binding);
+    assert_eq!(b.initial.binding(), b.info.binding);
+    assert_eq!(a.initial.role(), a.info.role);
+    assert_eq!(b.initial.role(), b.info.role);
+    assert_eq!(a.initial.selection(), selected()?);
+    assert_eq!(b.initial.selection(), selected()?);
+    // This is the initial handoff; final Records activation owns the later cutover.
+    assert!(!a.datagram.final_records());
+    assert!(!b.datagram.final_records());
     let mut tls = [0; 3];
     let a_tls = a
-        .socket
+        .datagram
         .outer_control()
         .ok_or_else(|| invalid("missing actual TLS"))?;
     let b_tls = b
-        .socket
+        .datagram
         .outer_control()
         .ok_or_else(|| invalid("missing actual TLS"))?;
     let (write, read) = timeout_at(cap, async {

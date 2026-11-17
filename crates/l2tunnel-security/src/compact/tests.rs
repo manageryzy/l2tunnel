@@ -32,11 +32,12 @@ pub(super) fn metadata() -> Metadata<'static> {
         extra: &[0x31],
     }
 }
-fn suites() -> [Protection; 3] {
+fn suites() -> [Protection; 4] {
     [
         Protection::Aes128Ccm4,
         Protection::ChaCha20Crc32c,
         Protection::ChaCha20Poly1305,
+        Protection::HmacSha256,
     ]
 }
 
@@ -57,7 +58,16 @@ fn selected_suites_bind_exact_context_and_reject_mutation_without_replay_commit(
         assert_eq!(&packet[..4], &[0; 4]);
         assert_eq!(sealed.number, PacketNumber(0));
         assert_eq!(packet.len(), body.len() + suite.overhead_bytes());
-        assert_ne!(&packet[4..4 + body.len()], body.as_slice());
+        if suite == Protection::HmacSha256 {
+            assert_eq!(&packet[4..4 + body.len()], body.as_slice());
+            assert_eq!(
+                receiver.reserved_bytes(),
+                super::AAD_BYTES + limits().max_body_bytes
+            );
+        } else {
+            assert_ne!(&packet[4..4 + body.len()], body.as_slice());
+            assert_eq!(receiver.reserved_bytes(), 0);
+        }
         let mut output = [0xAA; 1600];
         for wrong in [
             Metadata {

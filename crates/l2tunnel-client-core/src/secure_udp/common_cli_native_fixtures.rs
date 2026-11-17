@@ -288,7 +288,7 @@ fn document(layer: PacketLayer, appearance: l2tunnel_cover::Appearance) -> io::R
             catalog.push(hex(descriptor)?);
         }
     }
-    let old = super::super::super::transaction_cli::test_plan_value();
+    let old = super::super::super::common_plan_fixture::template();
     let mut value = json!({"version":1,"backend":"common_records_v2","initial_index":0,"catalog":catalog,"transaction":old["transaction"],"runtime":old["runtime"],"rolling_work":{"field":4096,"copies":4096,"metadata":4096}});
     value["runtime"]["report_interval_micros"] = json!(500_000);
     value["outer_carrier"] = outer_policy(&value);

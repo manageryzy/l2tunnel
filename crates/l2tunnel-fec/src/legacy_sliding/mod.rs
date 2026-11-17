@@ -147,10 +147,10 @@ impl Repair<'_> {
         if self.equation.id.0 == 0
             || self.equation.id.0 == u64::MAX
             || self.terms.len() > usize::from(config.long_window)
-            || self.equation.bytes.len() != config.recovery.width()?
         {
             return Err(Error::Length);
         }
+        self.equation.validate_extent(config.recovery.width()?)?;
         let expected = rolling::explicit::support(
             self.terms,
             self.feedback_triggered,

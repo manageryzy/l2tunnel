@@ -17,7 +17,7 @@ pub fn run_common_on_raw<D, I>(
     observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> impl Future<Output = io::Result<CommonStopped>> + Send
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
     I: PacketIo + Send + 'static,
 {
     run_prepared_common(
@@ -34,7 +34,7 @@ fn prepare_raw_runtime<D, I>(
     contract: CommonTransactionContract,
 ) -> io::Result<PreparedRuntime<D, RawAdapter<I>>>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
     I: PacketIo + Send + 'static,
 {
     contract.require_native_adapter()?;
@@ -68,16 +68,10 @@ impl Driver {
                 "actual raw owner geometry differs from genuine handoff",
             ));
         }
-        let final_geometry = if contract.compact_wire().is_some() {
-            Some(
-                parts
-                    .io
-                    .enable_final_records(contract.expected_configuration().0, parts.cover)?,
-            )
-        } else {
-            None
-        };
-        let geometry = final_geometry.unwrap_or(geometry);
+        let final_geometry = parts
+            .io
+            .enable_final_records(contract.expected_configuration().0, parts.cover)?;
+        let geometry = final_geometry;
         let origin = parts.clock_origin();
         let io_capacity = parts
             .io
@@ -99,7 +93,7 @@ impl Driver {
         // or moving this same initialized Driver into its existing fallible cell.
         Self::new_common_input(input, contract, origin, parts.io, |raw, mut driver| {
             if let Some(runtime) = &mut driver.common {
-                runtime.raw_final_geometry = final_geometry;
+                runtime.raw_final_geometry = Some(final_geometry);
             }
             if driver
                 .records

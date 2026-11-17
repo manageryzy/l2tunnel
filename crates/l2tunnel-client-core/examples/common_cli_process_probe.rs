@@ -182,7 +182,7 @@ mod probe {
                 *lock(&host.application) = Some(application);
                 host.opened.fetch_add(1, Ordering::SeqCst);
                 host.live.fetch_add(1, Ordering::SeqCst);
-                Ok(l2tunnel_client_core::swift::Native::new(Pipe {
+                Ok(l2tunnel_client_core::native::Native::new(Pipe {
                     socket,
                     host: host.clone(),
                 }))
@@ -245,14 +245,9 @@ mod probe {
             handshake_timeout: Duration::from_secs(3),
         }
     }
-    fn overhead(appearance: Appearance) -> usize {
-        28 + if appearance == Appearance::QuicLike {
-            13
-        } else {
-            14
-        } + 9
-            + security::COMMON_PREFIX_BYTES
-            + 16
+    fn overhead(_appearance: Appearance) -> usize {
+        // Appearance belongs to bootstrap; final packets carry one full-tag record.
+        28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
     }
     fn raw_settings(
         appearance: Appearance,
@@ -1307,8 +1302,8 @@ mod probe {
             .state
             .ok_or_else(|| error("missing actual Common state"))?;
         require(
-            state.transaction.is_none() && state.swift.is_none() && state.secure_udp.is_none(),
-            "Common reply projected legacy backend",
+            state.proxy.is_none(),
+            "native Common reply projected a proxy backend",
         )?;
         let status = state
             .common
@@ -1552,7 +1547,7 @@ mod probe {
             all == expected,
             "external catalog retrieval pruned or changed full64",
         )?;
-        for version in [None, Some(1), Some(2), Some(3)] {
+        for version in [None, Some(1)] {
             let count = fixture.requests[0].load(Ordering::SeqCst);
             let result = runner
                 .api(
@@ -1575,6 +1570,27 @@ mod probe {
             require(
                 fixture.requests[0].load(Ordering::SeqCst) == count + 1,
                 "CLI automatically retried version refusal",
+            )?;
+            current(&fixture.status(0)?, fixture.stages[0], epoch)?;
+        }
+        for version in [2, 3] {
+            let count = fixture.requests[0].load(Ordering::SeqCst);
+            let execution = runner
+                .api(
+                    "retired-api-version",
+                    &fixture.api[0],
+                    "disconnect",
+                    Some(version),
+                    vec![],
+                    false,
+                )
+                .await?;
+            require(
+                execution.stdout.is_empty()
+                    && String::from_utf8_lossy(&execution.stderr)
+                        .contains("api-version must be explicitly 1 or 4")
+                    && fixture.requests[0].load(Ordering::SeqCst) == count,
+                "retired API version reached the service or lost its migration diagnostic",
             )?;
             current(&fixture.status(0)?, fixture.stages[0], epoch)?;
         }

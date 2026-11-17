@@ -139,8 +139,19 @@ pub struct Repair<'a> {
     pub id: RepairId,
     /// Exact checked support and seed.
     pub support: Support,
-    /// Complete fixed-width coded bytes; trimming is not implemented.
+    /// Coded prefix through the largest original extent in the complete support.
+    /// Omitted columns are zero; decoders restore the configured logical width.
+    /// Meaningful original zero tails are included, not scanned away.
     pub bytes: &'a [u8],
+}
+
+impl Repair<'_> {
+    pub(crate) fn validate_extent(self, width: usize) -> Result<(), Error> {
+        if !(3..=width).contains(&self.bytes.len()) {
+            return Err(Error::Length);
+        }
+        Ok(())
+    }
 }
 /// Independent per-call work caps; all-zero is a no-op.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

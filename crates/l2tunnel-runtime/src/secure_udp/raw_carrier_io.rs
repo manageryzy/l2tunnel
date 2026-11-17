@@ -281,6 +281,11 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         bytes: &[u8],
         hold: bool,
     ) -> io::Result<SendProgress> {
+        if !self.carrier.final_records_enabled() {
+            return Err(protocol(
+                "raw User requires the final compact Records format",
+            ));
+        }
         if let Some(user) = &self.user {
             if user.identity != identity {
                 return Err(protocol("raw User identity changed while pending"));
@@ -309,7 +314,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             {
                 return Ok(SendProgress::Pending);
             }
-            if self.carrier.final_records_enabled() && user.pending.token.is_none() {
+            if user.pending.token.is_none() {
                 let (lane, token) = self
                     .prepared
                     .take()
@@ -322,13 +327,6 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                         .commit_final_record(token, bytes)
                         .map_err(raw_error)?,
                 );
-            } else {
-                Self::stage(
-                    &mut self.carrier,
-                    &mut user.pending,
-                    raw::RecordKind::Data,
-                    bytes,
-                )?;
             }
             self.fail()?;
             return Ok(SendProgress::Pending);
@@ -385,17 +383,19 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             return Err(protocol("raw upper custody remains at final handoff"));
         }
         self.carrier
-            .enable_final_records(binding, move |packet| {
-                cover
-                    .decode(packet)
-                    .is_ok_and(|decoded| match decoded.phase {
-                        l2tunnel::cover::Phase::Handshake => {
-                            decoded.protected.first() == Some(&super::establish::CONTROL_TAG)
-                        }
-                        l2tunnel::cover::Phase::Established => {
-                            decoded.protected.first() == Some(&super::member::ROUTE)
-                        }
-                    })
+            .enable_final_records(binding, move |direction, packet| {
+                let decoded = match direction {
+                    raw::compact::BootstrapDirection::Incoming => cover.decode(packet),
+                    raw::compact::BootstrapDirection::Outgoing => cover.decode_outgoing(packet),
+                };
+                decoded.is_ok_and(|decoded| match decoded.phase {
+                    l2tunnel::cover::Phase::Handshake => {
+                        decoded.protected.first() == Some(&super::establish::CONTROL_TAG)
+                    }
+                    l2tunnel::cover::Phase::Established => {
+                        decoded.protected.first() == Some(&super::member::ROUTE)
+                    }
+                })
             })
             .map_err(raw_error)?;
         self.geometry = self.carrier.final_geometry().map_err(raw_error)?;
@@ -458,7 +458,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             }
             carrier.stage_bootstrap_record_tracked(pending.lane, kind, bytes)
         } else {
-            carrier.stage_record_tracked(pending.lane, kind, bytes)
+            carrier.stage_setup_record_tracked(pending.lane, kind, bytes)
         };
         match staged {
             Ok(token) => pending.token = Some(token),

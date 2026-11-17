@@ -157,7 +157,6 @@ pub struct AckStatus {
     /// This establishment-bound selection cannot be changed by the existing C switch.
     pub policy_switching: bool,
 }
-#[cfg(unix)]
 impl AckStatus {
     pub(super) fn observe(
         requested: AckPolicies,

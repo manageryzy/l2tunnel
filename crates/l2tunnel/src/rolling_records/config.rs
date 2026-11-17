@@ -34,6 +34,9 @@ impl<P: RecoveryPolicy> DirectionConfig<P> {
     }
     /// Validate actual owners and every cross-owner source/record geometry.
     pub fn validate(self) -> Result<(), Error> {
+        if !self.native_policy.available() {
+            return Err(Error::Configuration);
+        }
         self.packing_plan()?;
         self.receiver_plan()?;
         self.receiver
@@ -56,7 +59,7 @@ impl<P: RecoveryPolicy> DirectionConfig<P> {
                     .clamp(69, 65535)
                     .div_ceil(self.receiver.body.symbol_bytes - 8)
             || source > self.scheduler.recovery().max_payload
-            || (self.native_policy == NativePolicy::RawIp
+            || (self.native_policy.is_stateless()
                 && (self.receiver.body.predictive
                     || self.receiver.body.elide_payload_length
                     || self.receiver.body.timestamp_pair_dictionary))
@@ -156,11 +159,7 @@ impl<P: RecoveryPolicy> Config<P> {
             let p = c.packing;
             let s = c.scheduler;
             for value in [
-                match c.native_policy {
-                    NativePolicy::EthernetHeaders => 1,
-                    NativePolicy::RawIp => 2,
-                    NativePolicy::IpHeaders => 3,
-                },
+                u64::from(c.native_policy.wire()),
                 b.max_frame_bytes as u64,
                 b.symbol_bytes as u64,
                 u64::from(b.elide_payload_length),

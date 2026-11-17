@@ -66,21 +66,3 @@ pub(super) fn update_hash(
     }
     Ok(())
 }
-
-pub(super) fn physical_requirement(
-    maximum: usize,
-    sender: mg::Role,
-    policy: engine::FragmentPolicy,
-) -> io::Result<(usize, usize)> {
-    let direction = if sender == mg::Role::Client {
-        policy.forward
-    } else {
-        policy.reverse
-    };
-    let geometry = direction.framing.geometry(maximum).map_err(invalid)?;
-    let maximum_fragment = geometry
-        .fragment_range(0)
-        .ok_or_else(|| invalid("empty selected fragment group"))?
-        .len();
-    Ok((maximum_fragment, geometry.wire_bytes()))
-}

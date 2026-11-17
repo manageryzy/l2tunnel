@@ -36,6 +36,9 @@ impl Config {
         original: usize,
         minimum_sources: usize,
     ) -> Result<(), Error> {
+        if !self.native_policy.available() {
+            return Err(Error::Configuration);
+        }
         self.receiver
             .memory_bound_bytes()
             .map_err(Error::Receiver)?;
@@ -49,7 +52,7 @@ impl Config {
         let fragments = (self.receiver.body.max_frame_bytes + 29)
             .clamp(69, 65_535)
             .div_ceil(self.receiver.body.symbol_bytes - 8);
-        if self.native_policy == NativePolicy::RawIp
+        if self.native_policy.is_stateless()
             && (self.receiver.body.elide_payload_length
                 || self.receiver.body.predictive
                 || self.receiver.body.timestamp_pair_dictionary)
@@ -91,11 +94,7 @@ impl Config {
             return Err(Error::Configuration);
         }
         let mut w = Writer::new(output);
-        w.byte(match self.native_policy {
-            NativePolicy::EthernetHeaders => 1,
-            NativePolicy::RawIp => 2,
-            NativePolicy::IpHeaders => 3,
-        })?;
+        w.byte(self.native_policy.wire())?;
         let r = self.receiver;
         let b = r.body;
         for n in [
@@ -178,12 +177,7 @@ impl Config {
             return Err(Error::Configuration);
         }
         let mut r = Reader::new(input);
-        let native_policy = match r.byte()? {
-            1 => NativePolicy::EthernetHeaders,
-            2 => NativePolicy::RawIp,
-            3 => NativePolicy::IpHeaders,
-            _ => return Err(Error::Configuration),
-        };
+        let native_policy = NativePolicy::from_wire(r.byte()?).ok_or(Error::Configuration)?;
         let body = l2tunnel_codec::aligned_body::Config {
             max_frame_bytes: r.size()?,
             symbol_bytes: r.size()?,

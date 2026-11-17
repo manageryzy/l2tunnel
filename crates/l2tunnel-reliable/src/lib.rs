@@ -1252,6 +1252,14 @@ impl Reliable {
         Ok(Some((at, bytes)))
     }
 
+    /// Service bounded receive-FEC cache eviction using caller-injected time.
+    /// This does not poll ARQ, prepare output, confirm a held physical token or
+    /// renew any original deadline. It remains usable while output is retained.
+    pub fn tick(&mut self, now: Duration) -> Result<(), Error> {
+        self.check_time(now)?;
+        self.advance(now)
+    }
+
     /// Original receive-coding expiry, independent of queued output wakeups.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         if self.failure().is_some() {

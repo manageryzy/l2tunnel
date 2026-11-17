@@ -93,14 +93,25 @@ fn transmit_source(fixture: &mut Fixture, expected: rolling::SourceId) -> Result
             .current()
             .descriptor()
             .local(common_contract::mg_role(endpoint.driver.info.role));
-        let c::DirectionProfile::Rolling { config, .. } = local.send().profile() else {
+        let c::DirectionProfile::Rolling { config, stream, .. } = local.send().profile() else {
             return Err("selected rolling owner absent".into());
         };
-        let rolling::wire::View::Source { id, .. } = rolling::wire::inspect_with(
-            config.scheduler.recovery,
-            config.scheduler.source_wire,
-            &endpoint.driver.buffers.frame[..token.emission().bytes],
-        )?
+        let context = token.context();
+        let scope = rolling::Scope {
+            session: context.session.to_be_bytes(),
+            epoch: context.epoch,
+            stream,
+            direction: match context.role {
+                mg::Role::Client => 0,
+                mg::Role::Server => 1,
+            },
+        };
+        let rolling::wire::compact::View::Data(rolling::wire::View::Source { id, .. }) =
+            rolling::wire::compact::inspect(
+                config.scheduler.recovery,
+                scope,
+                &endpoint.driver.buffers.frame[..token.emission().bytes],
+            )?
         else {
             return Err("actual original source absent".into());
         };
@@ -151,7 +162,6 @@ fn actual_common_silent_tail_rearms_native_after_bounded_short_preview() -> Resu
                 &input[..length],
                 now,
                 endpoint.driver.origin + duration(now),
-                None,
             )?;
             assert_eq!(
                 endpoint.driver.counters.received_packets,
@@ -191,7 +201,7 @@ fn actual_common_silent_tail_rearms_native_after_bounded_short_preview() -> Resu
                 endpoint.driver.progress_common(now)?;
                 endpoint.driver.collect_native(now)?;
                 endpoint.driver.service_common_rolling(now)?;
-                endpoint.driver.service_selected_control(now, None)?;
+                endpoint.driver.service_selected_control(now)?;
                 endpoint.driver.submit_control(now)?;
                 endpoint.driver.collect_native(now)?;
                 if !endpoint.driver.native.is_empty() {

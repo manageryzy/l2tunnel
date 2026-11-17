@@ -75,7 +75,7 @@ impl Profile {
             Some(selection),
         )
     }
-    /// Explicit fixed/full proxy on the maintained original raw TCP carrier.
+    /// Explicit fixed proxy on the maintained original raw TCP carrier.
     /// Complete raw geometry is requested upfront; no descriptor/body is clamped.
     #[allow(clippy::too_many_arguments)]
     pub fn new_proxy_raw(
@@ -90,15 +90,28 @@ impl Profile {
         packet: PacketPolicy,
     ) -> io::Result<Self> {
         let binding = l2tunnel_runtime::proxy::session_config(&proxy)?;
-        l2tunnel_runtime::proxy::common::validate_catalog(&proxy, &catalog)?;
-        if connection.duplex != Duplex::Full
+        let validation = {
+            #[cfg(unix)]
+            {
+                l2tunnel_runtime::proxy::common::validate_catalog(&proxy, &catalog)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Common proxy record adapter is unavailable on this platform",
+                ))
+            }
+        };
+        validation?;
+        if connection.duplex != proxy.duplex
             || connection.layer != PacketLayer::Ip
             || proxy.runtime.layer != PacketLayer::Ip
             || proxy.runtime.max_packet != connection.max_packet
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "raw Common proxy requires fixed Full TUN policy",
+                "raw Common proxy requires matching duplex and fixed TUN policy",
             ));
         }
         let mut application = digest::Context::new(&digest::SHA256);
@@ -160,45 +173,25 @@ impl Profile {
             self.settings.cover.config(security::Role::Responder)?,
         ];
         let resources = [self.initiator, self.responder];
-        let requested = if let Some(selection) = self.compact_wire {
-            transport::CommonTransactionContract::validate_raw_requested_compact(
-                base,
-                self.envelope,
-                &self.catalog,
-                resources,
-                covers,
-                self.parameters,
-                policy,
-                selection,
-            )?;
-            transport::CommonTransactionContract::raw_requested_configuration_compact(
-                base,
-                self.envelope,
-                &self.catalog,
-                resources,
-                covers,
-                self.parameters,
-                selection,
-            )?
-        } else {
-            transport::CommonTransactionContract::validate_raw_requested(
-                base,
-                self.envelope,
-                &self.catalog,
-                resources,
-                covers,
-                self.parameters,
-                policy,
-            )?;
-            transport::CommonTransactionContract::raw_requested_configuration(
-                base,
-                self.envelope,
-                &self.catalog,
-                resources,
-                covers,
-                self.parameters,
-            )?
-        };
+        transport::CommonTransactionContract::validate_raw_requested_compact(
+            base,
+            self.envelope,
+            &self.catalog,
+            resources,
+            covers,
+            self.parameters,
+            policy,
+            self.compact_wire,
+        )?;
+        let requested = transport::CommonTransactionContract::raw_requested_configuration_compact(
+            base,
+            self.envelope,
+            &self.catalog,
+            resources,
+            covers,
+            self.parameters,
+            self.compact_wire,
+        )?;
         self.raw = Some(RawSelection {
             policy,
             base,
@@ -222,22 +215,7 @@ impl Profile {
         let raw = self
             .raw
             .ok_or_else(|| invalid("Common profile has no selected raw policy"))?;
-        if let Some(selection) = self.compact_wire {
-            return transport::CommonTransactionContract::validate_raw_requested_compact(
-                raw.base,
-                raw.envelope,
-                self.requested_catalog(),
-                [self.initiator, self.responder],
-                [
-                    self.settings.cover.config(security::Role::Initiator)?,
-                    self.settings.cover.config(security::Role::Responder)?,
-                ],
-                self.parameters,
-                raw.policy,
-                selection,
-            );
-        }
-        transport::CommonTransactionContract::validate_raw_requested(
+        transport::CommonTransactionContract::validate_raw_requested_compact(
             raw.base,
             raw.envelope,
             self.requested_catalog(),
@@ -248,6 +226,7 @@ impl Profile {
             ],
             self.parameters,
             raw.policy,
+            self.compact_wire,
         )
     }
     /// Bind effective E1/H1 only to a genuine completed original PacketCarrier.
@@ -303,24 +282,7 @@ impl Profile {
         outer: AuthenticatedRaw,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        if let Some(selection) = self.compact_wire {
-            let contract = transport::CommonTransactionContract::new_on_raw_paired_compact(
-                raw.base,
-                role,
-                [self.initiator, self.responder],
-                [
-                    self.settings.cover.config(security::Role::Initiator)?,
-                    self.settings.cover.config(security::Role::Responder)?,
-                ],
-                raw.envelope,
-                self.catalog.clone(),
-                self.parameters,
-                outer,
-                selection,
-            )?;
-            return self.complete_proxy_contract(contract);
-        }
-        let contract = transport::CommonTransactionContract::new_on_raw_paired(
+        let contract = transport::CommonTransactionContract::new_on_raw_paired_compact(
             raw.base,
             role,
             [self.initiator, self.responder],
@@ -332,6 +294,7 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
             outer,
+            self.compact_wire,
         )?;
         self.complete_proxy_contract(contract)
     }

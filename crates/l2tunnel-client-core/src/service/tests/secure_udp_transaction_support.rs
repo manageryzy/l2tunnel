@@ -101,7 +101,7 @@ pub(super) struct Pair {
 impl Pair {
     pub(super) fn new(fixture: TransactionPlans, hosts: [Arc<Host>; 2]) -> Result<Self> {
         for plan in &fixture.plans {
-            assert!(plan.secure_udp_transaction());
+            assert!(plan.secure_udp_common());
         }
         let (a, run_a) = channel();
         let (b, run_b) = channel();

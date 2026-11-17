@@ -18,9 +18,6 @@ pub(super) fn selected(configuration: &configuration::Configuration) -> bool {
 
 pub(super) fn supported(configuration: &configuration::Configuration) -> bool {
     let descriptor = configuration.descriptor();
-    if descriptor.duplex() != l2tunnel_core::Duplex::Full {
-        return false;
-    }
     [Role::Client, Role::Server].into_iter().all(|role| {
         let direction = descriptor.direction(role);
         let configuration::DirectionProfile::Aligned(config) = direction.profile() else {

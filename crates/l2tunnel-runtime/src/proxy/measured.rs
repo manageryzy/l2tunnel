@@ -56,7 +56,7 @@ pub struct MemoryBound {
     pub controller: measurement::ObservationMemory,
     /// Maximum immutable admitted token slots, covering every lifetime flow.
     pub token_slots: usize,
-    /// All possible measurement copies, including 24+48 bytes per user envelope.
+    /// All possible measurement copies, including the 24-byte user envelope and bounded stream framing.
     /// This fits inside existing common caps and is not extra queue credit.
     pub all_measurement_copy_bytes: usize,
     /// Fixed immutable proof bytes, in addition to token/ordinal metadata.
@@ -211,10 +211,10 @@ impl Config {
             u64::from(s.callback_work_per_turn),
             s.plan_interval_micros,
             s.status_interval_micros,
-            44,
+            super::record::HEADER_LEN as u64,
             4,
             24,
-            48,
+            super::record::FRAME_OVERHEAD as u64,
             104,
             56,
             2,
@@ -258,6 +258,7 @@ impl Link {
                 binding,
                 originator,
                 logical,
+                common_ordered: false,
             },
         })
     }
@@ -299,6 +300,7 @@ pub async fn client_pair(
             binding,
             originator: true,
             logical,
+            common_ordered: false,
         },
     })
 }
@@ -323,6 +325,7 @@ pub async fn server_pair(
             binding,
             originator: false,
             logical,
+            common_ordered: false,
         },
     })
 }

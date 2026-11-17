@@ -424,15 +424,25 @@ fn exercise_raw_wire(
                     .raw_binding()
                     .ok_or("genuine raw binding absent")?;
                 assert_eq!(status.carrier, "raw-packet");
-                match (wire, status.compact_wire.as_ref()) {
-                    (Some(selection), Some(actual)) => {
+                match status.compact_wire.as_ref() {
+                    Some(actual) => {
                         assert_eq!(
                             actual.requested,
                             crate::secure_udp::common_status::CompactWireSelection::from_selection(
-                                selection
+                                requested.compact_wire()
                             )?
                         );
                         assert_eq!(actual.effective.as_ref(), Some(&actual.requested));
+                        let expected_data = requested.compact_wire().data_overhead() as u64;
+                        assert_eq!(actual.effective_data_overhead_bytes, Some(expected_data));
+                        let framing = raw
+                            .final_framing
+                            .as_ref()
+                            .ok_or("actual activated raw framing absent")?;
+                        assert_eq!(framing.ip_tcp_bytes, 40);
+                        assert_eq!(framing.data_overhead_bytes, 40 + expected_data);
+                        assert_eq!(framing.control_feedback_overhead_bytes, 61);
+                        assert_eq!(framing.protection_layers, 1);
                         assert_eq!(frame.requested.catalog().root(), requested.catalog().root());
                         assert_eq!(
                             frame
@@ -443,7 +453,6 @@ fn exercise_raw_wire(
                             61
                         );
                     }
-                    (None, None) => {}
                     _ => return Err("raw compact requested/effective status absent".into()),
                 }
                 assert!(status.original_carrier.is_none());

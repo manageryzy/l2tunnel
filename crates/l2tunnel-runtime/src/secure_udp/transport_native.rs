@@ -33,6 +33,7 @@ fn packet_error(error: storage::Error) -> io::Error {
 }
 
 impl<T> Queue<T> {
+    #[cfg(test)]
     pub(super) fn new(packets: usize, bytes: usize, max_native: usize) -> io::Result<Self> {
         Self::with_plan(Self::plan(packets, bytes, max_native)?)
     }

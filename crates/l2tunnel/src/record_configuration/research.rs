@@ -15,12 +15,8 @@ fn decode(
 ) -> Result<(crate::research_records::DirectionConfig, usize, u64, u32), Error> {
     padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
     let mut reader = Reader::new(input.get(..ACTIVE_BYTES).ok_or(Error::Length)?);
-    let native_policy = match reader.number()? {
-        1 => aligned::NativePolicy::EthernetHeaders,
-        2 => aligned::NativePolicy::RawIp,
-        3 => aligned::NativePolicy::IpHeaders,
-        _ => return Err(Error::Prefix),
-    };
+    let native_policy =
+        aligned::NativePolicy::from_wire(checked(reader.number()?)?).ok_or(Error::Prefix)?;
     let body = aligned_body::Config {
         max_frame_bytes: reader.size()?,
         symbol_bytes: reader.size()?,

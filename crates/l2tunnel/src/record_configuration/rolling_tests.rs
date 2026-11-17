@@ -3,6 +3,34 @@ use super::*;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn current_repair_grammar_roundtrips_both_source_formats_and_rejects_old_versions() -> TestResult {
+    for format in [
+        fec::rolling::wire::SourceWire::Padded,
+        fec::rolling::wire::SourceWire::Exact,
+    ] {
+        let config = crate::record_engine::rolling_tests::fixture(false, format)?;
+        let mut bytes = [0; CONFIGURATION_BYTES];
+        config.encode_into(&mut bytes)?;
+        assert_eq!(Configuration::decode(&bytes)?, config);
+        for offset in [
+            HEADER_BYTES + 32 + COMMON_DIRECTION_BYTES + 40 * 8,
+            HEADER_BYTES + 32 + DIRECTION_BYTES + COMMON_DIRECTION_BYTES + 40 * 8,
+        ] {
+            assert_eq!(
+                &bytes[offset..offset + 8],
+                &u64::from(format.version()).to_be_bytes()
+            );
+            for old in [1u64, 2] {
+                let mut stale = bytes;
+                stale[offset..offset + 8].copy_from_slice(&old.to_be_bytes());
+                assert_eq!(Configuration::decode(&stale), Err(Error::Prefix));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn tag4_preserves_fixed_v2_shape_and_literal_complete_directional_words() -> TestResult {
     let config =
         crate::record_engine::rolling_tests::fixture(false, fec::rolling::wire::SourceWire::Exact)?;
@@ -14,7 +42,7 @@ fn tag4_preserves_fixed_v2_shape_and_literal_complete_directional_words() -> Tes
     let forward: [u64; 44] = [
         1, 1024, 192, 1, 1, 1, 64, 3, 7, 13, 32, 32, 4, 262140, 64, 8, 5_000_000, 192, 503, 4, 13,
         4, 1_000_000, 16, 4, 2, 512, 16, 64, 2, 1_000_000, 10_000_000, 2_000_000, 16_777_216, 1, 2,
-        1000, 100, 2, 16_777_216, 2, 17, 50_000, 17,
+        1000, 100, 2, 16_777_216, 4, 17, 50_000, 17,
     ];
     let mut reverse = forward;
     for (index, value) in [
@@ -52,7 +80,7 @@ fn tag4_preserves_fixed_v2_shape_and_literal_complete_directional_words() -> Tes
     config.descriptor().encode_into(&mut descriptor)?;
     assert_eq!(Descriptor::decode(&descriptor)?, *config.descriptor());
     let mut expected_digest = digest::Context::new(&digest::SHA256);
-    expected_digest.update(b"l2tunnel/record-transaction-config/v2\0");
+    expected_digest.update(b"l2tunnel/record-transaction-config/v3\0");
     expected_digest.update(&bytes);
     assert_eq!(
         config.digest()?.0.as_slice(),
@@ -92,7 +120,7 @@ fn tag4_padding_shared_bindings_narrow_fields_and_aliases_refuse_without_output_
     for (word, value) in [
         (3, 2u64),
         (7, u64::MAX),
-        (40, 3),
+        (40, 2),
         (43, u64::from(u32::MAX) + 1),
     ] {
         let mut bad = bytes;

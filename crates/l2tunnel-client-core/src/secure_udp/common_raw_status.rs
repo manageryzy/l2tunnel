@@ -101,8 +101,7 @@ pub struct RawCarrier {
     pub profile_digest: [u8; 32],
     /// Exact per-packet IPv4 and TCP header cost.
     pub ip_tcp_bytes: u64,
-    /// Exact bootstrap protected record and phase framing cost. Legacy sessions
-    /// retain this same framing throughout their lifetime.
+    /// Exact bootstrap protected record and phase framing cost.
     pub record_overhead_bytes: u64,
     /// Exact bootstrap protected record capacity within the original MTU.
     pub max_record_bytes: u64,
@@ -116,7 +115,6 @@ pub struct RawCarrier {
     pub lanes: [Option<RawLane>; 2],
 }
 
-#[cfg(unix)]
 impl From<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy> for RawPacketPolicy {
     fn from(value: l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy) -> Self {
         use l2tunnel_raw_io::handoff::pairing::packet::Protection;
@@ -140,7 +138,6 @@ impl From<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy> for RawPacket
     }
 }
 
-#[cfg(unix)]
 impl RawCarrier {
     pub(super) fn observe(
         profile: &crate::secure_udp::common_transaction_profile::Profile,
@@ -178,10 +175,9 @@ impl RawCarrier {
         let number = |n| u64::try_from(n).map_err(invalid);
         let geometry = outer.geometry();
         let final_framing = snapshot
-            .and_then(|value| value.raw_final_geometry)
-            .map(|actual| {
-                if profile.compact_wire().is_none()
-                    || actual.ip_tcp_bytes != 40
+            .and_then(|value| value.raw_final_geometry.map(|actual| (value, actual)))
+            .map(|(value, actual)| {
+                if actual.ip_tcp_bytes != 40
                     || actual.record_overhead_bytes != 0
                     || actual.path_mtu != geometry.path_mtu
                     || actual.max_record_bytes.checked_add(actual.ip_tcp_bytes)
@@ -197,11 +193,16 @@ impl RawCarrier {
                     record_overhead_bytes: number(actual.record_overhead_bytes)?,
                     max_record_bytes: number(actual.max_record_bytes)?,
                     data_overhead_bytes: number(
-                        actual.ip_tcp_bytes + l2tunnel::secure_record::compact::DATA_OVERHEAD,
+                        actual
+                            .ip_tcp_bytes
+                            .checked_add(value.effective_data_overhead_bytes)
+                            .ok_or_else(|| invalid("actual raw data overhead overflow"))?,
                     )?,
                     control_feedback_overhead_bytes: number(
-                        actual.ip_tcp_bytes
-                            + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD,
+                        actual
+                            .ip_tcp_bytes
+                            .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+                            .ok_or_else(|| invalid("actual raw control overhead overflow"))?,
                     )?,
                     protection_layers: 1,
                 })
@@ -230,7 +231,7 @@ impl RawCarrier {
             ip_tcp_bytes: number(geometry.ip_tcp_bytes)?,
             record_overhead_bytes: number(geometry.record_overhead_bytes)?,
             max_record_bytes: number(geometry.max_record_bytes)?,
-            geometry_scope: profile.compact_wire().map(|_| "bootstrap".into()),
+            geometry_scope: Some("bootstrap".into()),
             final_framing,
             lanes,
         }))

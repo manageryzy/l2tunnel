@@ -151,6 +151,31 @@ impl Gate {
         Ok(())
     }
 
+    /// Bind native receipt grammar to an already registered exact data policy.
+    /// The trusted runtime derives this from the authenticated configuration;
+    /// this creates no scope, key, replay reset, or peer authentication.
+    pub fn set_receipt_policy(
+        &mut self,
+        scope: Scope,
+        receipts: ReceiptPolicy,
+    ) -> Result<(), Error> {
+        let policy = if self.active.scope == scope {
+            &mut self.active
+        } else {
+            self.draining
+                .as_mut()
+                .filter(|p| p.scope == scope)
+                .ok_or(Error::Scope)?
+        };
+        let next = DataPolicy {
+            receipts,
+            ..*policy
+        };
+        validate_policy(next, self.settings.limits)?;
+        *policy = next;
+        Ok(())
+    }
+
     /// Remove only the exact drained origin; sequences and fixed control persist.
     /// Cached transaction-reply authority must be integrated separately before
     /// using this operation for a complete runtime mode switch.

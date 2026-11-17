@@ -104,7 +104,6 @@ pub struct ConnectionReuseStatus {
     /// Actual retained protocol operation; None also describes selected idle.
     pub operation: Option<ConnectionReuseOperation>,
 }
-#[cfg(unix)]
 impl ConnectionReuseStatus {
     pub(super) fn observe(
         profile: &crate::secure_udp::common_transaction_profile::Profile,

@@ -455,3 +455,35 @@ fn physical_native_completion_error_cannot_reissue_the_already_written_body() ->
 
 #[path = "unreliable_tests.rs"]
 mod unreliable;
+
+#[test]
+fn current_native_compression_independent_directions_preserve_packet_layer() -> TestResult {
+    let config = config(1)?;
+    let direction = Direction {
+        compact: config.send,
+        owners: config.owners,
+        incarnation: config.incarnation,
+        unreliable: None,
+    };
+    for left in [
+        aligned::NativePolicy::RawIp,
+        aligned::NativePolicy::RawEthernet,
+        aligned::NativePolicy::Lz4Ip,
+        aligned::NativePolicy::Lz4Ethernet,
+    ] {
+        for right in [
+            aligned::NativePolicy::RawIp,
+            aligned::NativePolicy::RawEthernet,
+            aligned::NativePolicy::Lz4Ip,
+            aligned::NativePolicy::Lz4Ethernet,
+        ] {
+            let mut send = direction;
+            let mut receive = direction;
+            send.compact.native_policy = left;
+            receive.compact.native_policy = right;
+            let result = Config::from_directions(send, receive, 28, 28);
+            assert_eq!(result.is_ok(), left.is_ip() == right.is_ip());
+        }
+    }
+    Ok(())
+}

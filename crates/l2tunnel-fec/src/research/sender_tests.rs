@@ -114,7 +114,7 @@ fn credit_requires_complete_custody_and_feedback_cannot_cancel_a_frozen_repair()
     assert_eq!(repair.confirmed, 0);
     assert_eq!(repair.equation.support.start, 1);
     assert_eq!(repair.equation.support.end, 5);
-    assert_eq!(sender.pending_wire_len(), Some(wire::HEADER_BYTES + 10));
+    assert_eq!(sender.pending_wire_len(), Some(wire::HEADER_BYTES + 4));
     let mut before = [0; 90];
     sender.encode_pending(&mut before)?;
     assert_eq!(

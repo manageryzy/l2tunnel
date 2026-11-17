@@ -1,7 +1,5 @@
 //! Shared strict CLI frontend; native privileges remain in the platform adapter.
 use super::*;
-#[cfg(target_os = "linux")]
-use auth::MemberPublicKey;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -11,46 +9,20 @@ use std::path::Path;
 use std::process::ExitCode;
 #[path = "proxy/cli.rs"]
 mod proxy_frontend;
-#[cfg(all(test, unix))]
-pub(crate) use proxy_frontend::serve_for_test as serve_proxy_for_test;
-#[cfg(all(test, unix))]
-pub(crate) use proxy_frontend::serve_measured as serve_measured_for_test;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use proxy_frontend::{
     ServiceEvent as ProxyServiceEvent, ServicePresentation as ProxyServicePresentation,
     serve_shared_for_test as serve_shared_proxy_for_test,
 };
-#[path = "packed_cli.rs"]
-mod packed_frontend;
-#[path = "raw_packet/cli.rs"]
-mod raw_packet_frontend;
-#[path = "rolling/cli.rs"]
-mod rolling_frontend;
+#[path = "host_runtime_cli.rs"]
+mod host_runtime;
 #[cfg(unix)]
 #[path = "secure_udp/cli.rs"]
 pub(crate) mod secure_udp_frontend;
-#[cfg(unix)]
-#[path = "swift/cli.rs"]
-mod swift_frontend;
-#[cfg(all(test, unix))]
-pub(crate) use raw_packet_frontend::response as raw_packet_response_for_test;
-#[path = "datagram_profiling_cli.rs"]
-mod datagram_profiling;
-#[path = "delivery_cli.rs"]
-mod delivery_frontend;
-#[path = "host_runtime_cli.rs"]
-mod host_runtime;
-#[path = "profiling_cli.rs"]
-mod profiling;
-#[path = "openvpn/cli.rs"]
-mod standalone;
 #[path = "cli_tls.rs"]
 mod tls_frontend;
 
-#[cfg(target_os = "linux")]
-#[path = "service_cli.rs"]
-mod service_frontend;
-const HELP: &str = "l2tunnel serve --listen IP:PORT --device NAME --layer tap|tun --cert DER --key PKCS8 --allow-key RAW32 [--duplex half|full]\nl2tunnel connect --remote IP:PORT --device NAME --layer tap|tun --ca DER --server-name DNS --identity PKCS8 [--duplex half|full]\nl2tunnel keygen --private NEW_PKCS8_FILE --public NEW_RAW32_FILE\nOptions: --max-packet 40..65519 (default 1600); --compression off|lz4 (default off). Default carrier: TCP/TLS 1.3; no SNI. Default duplex: half (two carriers). Replace --device with --vxlan-bind IP:PORT --vxlan-peer IP:PORT --vni N for a point-to-point Ethernet VTEP. Optional --control-socket PATH exposes a private local service API. Commands: status --control-socket PATH; set-compression --control-socket PATH --compression off|lz4. Interface setup/routes belong to the caller.";
+const HELP: &str = "l2tunnel connect|serve --record-profile common --common-transaction-plan PATH --carrier CARRIER. Use inspect-common-transaction-plan before startup. Select a native --device or Ethernet --vxlan-bind/--vxlan-peer/--vni attachment. keygen creates member keys. Current local commands: status, disconnect, reconnect, drain-proxy (API1), common-catalog and switch-common-configuration (API4). Interface setup/routes belong to the caller. Legacy standalone entries are retired; Common active TUN credit and Windows service migration remain unfinished.";
 fn input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -60,11 +32,7 @@ fn options(args: &[String], allowed: &[&str]) -> io::Result<BTreeMap<String, Str
         if pair.len() != 2 || !allowed.contains(&pair[0].as_str()) || pair[1].starts_with("--") {
             return Err(input("unknown option or missing option value; use --help"));
         }
-        let maximum = if allowed.contains(&"--request-key") {
-            crate::secure_udp::common_status::CANONICAL_CHARACTERS
-        } else {
-            crate::secure_udp::transaction_status::CANONICAL_CHARACTERS
-        };
+        let maximum = crate::secure_udp::common_status::CANONICAL_CHARACTERS;
         if pair[0] == "--configuration" && pair[1].len() > maximum {
             return Err(input(format!(
                 "complete configuration exceeds{maximum} characters"
@@ -160,217 +128,6 @@ fn configuration(options: &BTreeMap<String, String>) -> io::Result<ConnectionCon
     config.session()?;
     Ok(config)
 }
-const UDP_OPTIONS: &[&str] = &[
-    "--udp-bind",
-    "--udp-peer",
-    "--udp-reverse-bind",
-    "--udp-reverse-peer",
-    "--udp-cover",
-    "--udp-protection",
-    "--path-mtu",
-    "--fec",
-    "--fec-sources",
-    "--fec-repairs",
-    "--fec-flush-ms",
-];
-const UDP_HELP: &str = r#"UDP options: --carrier udp --udp-bind IP:PORT --udp-peer IP:PORT
-  --udp-cover openvpn-like|quic-like --udp-protection aead|integrity (default aead)
-  --path-mtu N (default 1500). These covers select project-specific UDP framing.
-  They do not provide OpenVPN or QUIC interoperability.
-Half duplex also requires --udp-reverse-bind IP:PORT --udp-reverse-peer IP:PORT.
-The forward pair always carries initiator to listener; reverse carries listener to initiator.
-UDP retains authenticated TCP/TLS for bootstrap, recovery feedback and liveness.
-UDP compression is fixed for the session; --control-socket is currently TCP-only.
-Optional UDP repair: --fec none|cauchy (default none). Cauchy-only settings:
-  --fec-sources N (default 4), --fec-repairs N (default 2), --fec-flush-ms N (default 5)."#;
-fn udp_settings(
-    options: &BTreeMap<String, String>,
-    config: ConnectionConfig,
-) -> io::Result<Option<super::udp::Settings>> {
-    use super::udp::{CoverProfile, Endpoints, Protection, Settings};
-    match options
-        .get("--carrier")
-        .map(String::as_str)
-        .unwrap_or("tcp")
-    {
-        "tcp" => {
-            if UDP_OPTIONS.iter().any(|key| options.contains_key(*key)) {
-                return Err(input("UDP options require explicit --carrier udp"));
-            }
-            return Ok(None);
-        }
-        "udp" => {}
-        "quic" | "openvpn-like" => return Ok(None),
-        _ => {
-            return Err(input(
-                "implemented carriers are tcp, udp, quic and openvpn-like; raw TCP is not available",
-            ));
-        }
-    }
-    if options.contains_key("--control-socket") {
-        return Err(input(
-            "the current UDP runtime has fixed compression; local reload API is unsupported",
-        ));
-    }
-    let address = |key| {
-        required(options, key)?
-            .parse::<SocketAddr>()
-            .map_err(|_| input("UDP endpoint requires IP:PORT"))
-    };
-    let forward = Endpoints {
-        local: address("--udp-bind")?,
-        peer: address("--udp-peer")?,
-    };
-    let reverse = match (
-        options.contains_key("--udp-reverse-bind"),
-        options.contains_key("--udp-reverse-peer"),
-    ) {
-        (false, false) => None,
-        (true, true) => Some(Endpoints {
-            local: address("--udp-reverse-bind")?,
-            peer: address("--udp-reverse-peer")?,
-        }),
-        _ => {
-            return Err(input(
-                "both reverse UDP endpoint options are required together",
-            ));
-        }
-    };
-    let cover = match required(options, "--udp-cover")? {
-        "openvpn-like" => CoverProfile::OpenVpnLike,
-        "quic-like" => CoverProfile::QuicLike,
-        _ => {
-            return Err(input(
-                "UDP cover must be openvpn-like or quic-like (project-specific framing)",
-            ));
-        }
-    };
-    let protection = match options
-        .get("--udp-protection")
-        .map(String::as_str)
-        .unwrap_or("aead")
-    {
-        "aead" => Protection::ChaCha20Poly1305,
-        "integrity" => Protection::HmacSha256,
-        _ => return Err(input("UDP protection must be aead or integrity")),
-    };
-    let path_mtu = options
-        .get("--path-mtu")
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|_| input("invalid path MTU"))
-        })
-        .transpose()?
-        .unwrap_or(1500);
-    let settings = Settings {
-        forward,
-        reverse,
-        cover,
-        protection,
-        path_mtu,
-        recovery: recovery_settings(options)?,
-    };
-    settings.validate(config.duplex)?;
-    super::udp::runtime_config(config, settings)?;
-    Ok(Some(settings))
-}
-
-fn recovery_settings(options: &BTreeMap<String, String>) -> io::Result<super::udp::RecoveryMode> {
-    use super::udp::RecoveryMode;
-    Ok(
-        match options.get("--fec").map(String::as_str).unwrap_or("none") {
-            "none" => {
-                if ["--fec-sources", "--fec-repairs", "--fec-flush-ms"]
-                    .iter()
-                    .any(|key| options.contains_key(*key))
-                {
-                    return Err(input("FEC tuning requires --fec cauchy"));
-                }
-                RecoveryMode::SelectiveRepeat
-            }
-            "cauchy" => RecoveryMode::Cauchy {
-                sources: number(options, "--fec-sources", 4)?,
-                repairs: number(options, "--fec-repairs", 2)?,
-                flush_after: Duration::from_millis(number(options, "--fec-flush-ms", 5)?),
-            },
-            _ => return Err(input("FEC must be none or cauchy")),
-        },
-    )
-}
-
-const QUIC_HELP: &str = "Genuine QUIC: --carrier quic --quic-application-id HEX32, explicit --udp-bind/--udp-peer and half-duplex reverse endpoint pair. --remote/--listen must match the forward peer/local. No TCP socket is used. Existing certificates/member authentication and --path-mtu/--fec options apply. QUIC always uses AEAD; --udp-cover/--udp-protection, active TUN and local reload are unsupported. ALPN is observable; this is not HTTP/3.";
-fn quic_settings(
-    options: &BTreeMap<String, String>,
-    config: ConnectionConfig,
-) -> io::Result<Option<super::quic::Settings>> {
-    if options.get("--carrier").map(String::as_str) != Some("quic") {
-        if options.contains_key("--quic-application-id") {
-            return Err(input("QUIC application ID requires --carrier quic"));
-        }
-        return Ok(None);
-    }
-    if ["--udp-cover", "--udp-protection", "--control-socket"]
-        .iter()
-        .any(|key| options.contains_key(*key))
-    {
-        return Err(input(
-            "genuine QUIC forbids custom cover, optional protection and local reload options",
-        ));
-    }
-    let text = required(options, "--quic-application-id")?;
-    if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(input(
-            "QUIC application ID requires exactly 32 hexadecimal digits",
-        ));
-    }
-    let mut application_id = [0; 16];
-    for (index, byte) in application_id.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
-            .map_err(|_| input("invalid QUIC application ID"))?;
-    }
-    let address = |key| {
-        required(options, key)?
-            .parse::<SocketAddr>()
-            .map_err(|_| input("QUIC endpoint requires IP:PORT"))
-    };
-    let forward = super::udp::Endpoints {
-        local: address("--udp-bind")?,
-        peer: address("--udp-peer")?,
-    };
-    let reverse = match (
-        options.contains_key("--udp-reverse-bind"),
-        options.contains_key("--udp-reverse-peer"),
-    ) {
-        (false, false) => None,
-        (true, true) => Some(super::udp::Endpoints {
-            local: address("--udp-reverse-bind")?,
-            peer: address("--udp-reverse-peer")?,
-        }),
-        _ => {
-            return Err(input(
-                "both reverse QUIC endpoint options are required together",
-            ));
-        }
-    };
-    let settings = super::quic::Settings {
-        forward,
-        reverse,
-        application_id,
-        path_mtu: number(options, "--path-mtu", 1500)?,
-        recovery: recovery_settings(options)?,
-    };
-    super::quic::runtime_config(config, settings)?;
-    for (key, expected) in [("--remote", forward.peer), ("--listen", forward.local)] {
-        if options.contains_key(key) && address(key)? != expected {
-            return Err(input(
-                "QUIC remote/listen must match the actual forward peer/local endpoint",
-            ));
-        }
-    }
-    Ok(Some(settings))
-}
-
 fn number<T: std::str::FromStr>(
     options: &BTreeMap<String, String>,
     key: &str,
@@ -383,807 +140,34 @@ fn number<T: std::str::FromStr>(
         .map(|value| value.unwrap_or(default))
 }
 
-const ACTIVE_OPTIONS: &[&str] = &[
-    "--traffic",
-    "--mux-channels",
-    "--max-flows",
-    "--qos-dscp",
-    "--flow-idle-ms",
-    "--adaptive",
-    "--active-stats-ms",
-    "--active-policies",
-];
-const ACTIVE_HELP: &str = "Traffic: --traffic system|active (default system). Active requires TUN over TCP, uses per-flow credits and weighted DRR. Active-only options: --mux-channels N, --max-flows N, --qos-dscp D:W[,D:W...], --flow-idle-ms N (default 60000, 1..86400000), --adaptive off|on (default off, measured feedback). Unspecified DSCP weights are one. Optional --active-policies JSON_FILE authenticates a finite catalog and enables --control-socket for coordinated channel/weight changes. Command: set-active-policy --control-socket PATH --mux-channels N [--qos-dscp D:W,...]. Idle flow slots are retired after authenticated drain. This does not change endpoint TCP windows.";
-
-fn dscp_weights(options: &BTreeMap<String, String>) -> io::Result<[u32; 64]> {
-    let mut weights = [1; 64];
-    if let Some(policy) = options.get("--qos-dscp") {
-        let mut seen = [false; 64];
-        for entry in policy.split(',') {
-            let (dscp, weight) = entry
-                .split_once(':')
-                .ok_or_else(|| input("DSCP policy requires D:W entries"))?;
-            let dscp: usize = dscp.parse().map_err(|_| input("invalid DSCP"))?;
-            let weight: u32 = weight.parse().map_err(|_| input("invalid DSCP weight"))?;
-            if dscp >= 64 || !(1..=1024).contains(&weight) || seen[dscp] {
-                return Err(input(
-                    "DSCP entries must be unique 0..63 with weights 1..1024",
-                ));
-            }
-            seen[dscp] = true;
-            weights[dscp] = weight;
-        }
-    }
-    Ok(weights)
-}
-
-fn active_settings(
-    options: &BTreeMap<String, String>,
-    config: ConnectionConfig,
-) -> io::Result<Option<super::active::Settings>> {
-    let selected = options
-        .get("--traffic")
-        .map(String::as_str)
-        .unwrap_or("system");
-    if selected == "system" {
-        if ACTIVE_OPTIONS[1..]
-            .iter()
-            .any(|key| options.contains_key(*key))
-        {
-            return Err(input("active policy options require --traffic active"));
-        }
-        return Ok(None);
-    }
-    if selected != "active" {
-        return Err(input("traffic must be system or active"));
-    }
-    let stats_ms: u64 = number(options, "--active-stats-ms", 0)?;
-    if stats_ms != 0 && !(100..=60_000).contains(&stats_ms) {
-        return Err(input("active stats interval must be 0 or 100..60000 ms"));
-    }
-    if config.layer != PacketLayer::Ip
-        || options.get("--carrier").is_some_and(|value| value != "tcp")
-        || (options.contains_key("--control-socket") && !options.contains_key("--active-policies"))
-        || options.contains_key("--vxlan-bind")
-    {
-        return Err(input(
-            "active traffic requires TUN/TCP; a local control socket also requires --active-policies",
-        ));
-    }
-    let mut settings = super::active::Settings::new(config.runtime(), config.duplex)?;
-    settings.max_flows = number(options, "--max-flows", settings.max_flows)?;
-    settings.channels = number(options, "--mux-channels", settings.channels)?;
-    settings.adaptive = match options
-        .get("--adaptive")
-        .map(String::as_str)
-        .unwrap_or("off")
-    {
-        "off" => false,
-        "on" => true,
-        _ => return Err(input("adaptive must be off or on")),
-    };
-    settings.idle_flow_timeout =
-        std::time::Duration::from_millis(number(options, "--flow-idle-ms", 60_000)?);
-    settings.dscp_weights = dscp_weights(options)?;
-    l2tunnel_runtime::active::session_config(config.runtime(), settings)?;
-    Ok(Some(settings))
-}
-const ALIGNED_HELP: &str = "Records: --record-profile frame|aligned|packed (default frame). Aligned requires explicit --carrier udp|quic, --fec cauchy, --compression off and system traffic; --aligned-channels 1..256 (default4). Requires explicit --delivery-window bdp with canonical forward/reverse bandwidth and bootstrap RTT. All native packets share the channel pool. TUN uses raw-IP aligned bodies; TAP/VXLAN use eligible header compression and exact fallback. No local reload or active TUN combination.";
-fn aligned_settings(
-    options: &BTreeMap<String, String>,
-    config: ConnectionConfig,
-) -> io::Result<Option<super::aligned::Settings>> {
-    match options
-        .get("--record-profile")
-        .map(String::as_str)
-        .unwrap_or("frame")
-    {
-        "frame" => {
-            if options.contains_key("--aligned-channels") {
-                return Err(input(
-                    "aligned channel count requires --record-profile aligned",
-                ));
-            }
-            Ok(None)
-        }
-        "aligned" => {
-            if !matches!(
-                options.get("--carrier").map(String::as_str),
-                Some("udp" | "quic")
-            ) || options.get("--fec").map(String::as_str) != Some("cauchy")
-                || options
-                    .get("--traffic")
-                    .is_some_and(|mode| mode != "system")
-                || options.contains_key("--control-socket")
-                || ACTIVE_OPTIONS[1..]
-                    .iter()
-                    .any(|key| options.contains_key(*key))
-            {
-                return Err(input(
-                    "aligned records require UDP/QUIC, explicit Cauchy, system traffic and no control/active options",
-                ));
-            }
-            let settings = super::aligned::Settings {
-                channels: number(options, "--aligned-channels", 4)?,
-                delivery: delivery_frontend::required_settings(options, config)?,
-            };
-            settings.validate(config, recovery_settings(options)?)?;
-            if let Some(transport) = udp_settings(options, config)? {
-                super::aligned::udp_config(config, transport, settings)?;
-            }
-            if let Some(transport) = quic_settings(options, config)? {
-                super::aligned::quic_config(config, transport, settings)?;
-            }
-            Ok(Some(settings))
-        }
-        "packed" if !options.contains_key("--aligned-channels") => Ok(None),
-        _ => Err(input(
-            "record-profile must be frame, aligned or packed, with matching profile options",
-        )),
-    }
-}
-#[cfg(target_os = "linux")]
-enum Connected {
-    Active(Link, super::active::Settings),
-    ActiveManaged(Link, super::active_managed::Config),
-    Quic(
-        l2tunnel_runtime::quic::Link,
-        l2tunnel_runtime::quic::Config,
-        l2tunnel_runtime::managed::DeliveryConfig,
-    ),
-    AlignedUdp(
-        l2tunnel_runtime::aligned::UdpLink,
-        l2tunnel_runtime::udp::Config,
-        l2tunnel_runtime::aligned::Config,
-    ),
-    AlignedQuic(
-        l2tunnel_runtime::aligned::QuicLink,
-        l2tunnel_runtime::quic::Config,
-        l2tunnel_runtime::aligned::Config,
-    ),
-    PackedUdp(
-        l2tunnel_runtime::packed::UdpLink,
-        l2tunnel_runtime::udp::Config,
-        l2tunnel_runtime::packed::Config,
-    ),
-    PackedQuic(
-        l2tunnel_runtime::packed::QuicLink,
-        l2tunnel_runtime::quic::Config,
-        l2tunnel_runtime::packed::Config,
-    ),
-}
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-enum DeviceSpec {
-    Native(String),
-    Vxlan {
-        bind: SocketAddr,
-        peer: SocketAddr,
-        vni: l2tunnel_vxlan::Vni,
-    },
-}
-#[cfg(target_os = "linux")]
-impl DeviceSpec {
-    fn parse(options: &BTreeMap<String, String>, config: ConnectionConfig) -> io::Result<Self> {
-        let vxlan = ["--vxlan-bind", "--vxlan-peer", "--vni"]
-            .iter()
-            .any(|key| options.contains_key(*key));
-        match (options.get("--device"), vxlan) {
-            (Some(name), false) => Ok(Self::Native(name.clone())),
-            (None, true) if config.layer == PacketLayer::Ethernet => {
-                let bind = required(options, "--vxlan-bind")?
-                    .parse()
-                    .map_err(|_| input("invalid VXLAN bind address"))?;
-                let peer = required(options, "--vxlan-peer")?
-                    .parse()
-                    .map_err(|_| input("invalid VXLAN peer address"))?;
-                let vni = required(options, "--vni")?
-                    .parse()
-                    .map_err(|_| input("invalid VNI integer"))?;
-                let vni =
-                    l2tunnel_vxlan::Vni::new(vni).map_err(|_| input("VNI outside 24-bit range"))?;
-                if config.max_packet > 65499 {
-                    return Err(input("VXLAN native frame exceeds UDP bound"));
-                }
-                Ok(Self::Vxlan { bind, peer, vni })
-            }
-            _ => Err(input(
-                "select exactly one --device or complete Ethernet VXLAN configuration",
-            )),
-        }
-    }
-    fn open(
-        self,
-        config: ConnectionConfig,
-    ) -> io::Result<Box<dyn l2tunnel_device::PacketDevice<Error = io::Error> + Send>> {
-        match self {
-            Self::Native(name) => Ok(Box::new(l2tunnel_platform_linux::TunTap::attach(
-                &name,
-                config.layer,
-            )?)),
-            Self::Vxlan { bind, peer, vni } => {
-                Ok(Box::new(l2tunnel_platform_vxlan::VxlanDevice::bind(
-                    bind,
-                    l2tunnel_platform_vxlan::VxlanConfig {
-                        peer,
-                        vni,
-                        max_frame_bytes: config.max_packet,
-                        receive_budget: 32,
-                    },
-                )?))
-            }
-        }
-    }
-}
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     tls_frontend::preflight(command, options)?;
     let config = configuration(options)?;
-    if let Some(selected) = secure_udp_frontend::selection(command, options, config)? {
-        return secure_udp_frontend::execute(command, options, config, selected).await;
-    }
-    let profile_interval = profiling::interval(options)?;
-    let delivery = delivery_frontend::settings(options, config)?;
-    if let Some(settings) = swift_frontend::selection(options, config)? {
-        return swift_frontend::execute(command, options, config, settings).await;
-    }
-    if let Some(path) = rolling_frontend::selection(options, config)? {
-        return rolling_frontend::execute(command, options, config, path).await;
-    }
-    if let Some((path, mark)) = raw_packet_frontend::selection(options, config)? {
-        return raw_packet_frontend::execute(command, options, config, path, mark).await;
-    }
-    let packed = packed_frontend::settings(options, config)?;
-    if let Some(path) = proxy_frontend::selection(options, config)? {
-        return proxy_frontend::execute(command, options, config, path).await;
-    }
-    if let Some(settings) = standalone::settings(options, config, command)? {
-        return standalone::execute(command, options, config, settings).await;
-    }
-    let transport = udp_settings(options, config)?;
-    let quic = quic_settings(options, config)?;
-    let active = active_settings(options, config)?;
-    let aligned = aligned_settings(options, config)?;
-    let base_delivery =
-        if (transport.is_some() || quic.is_some()) && aligned.is_none() && packed.is_none() {
-            let selected = delivery_frontend::required_settings(options, config)?;
-            // Validate exact tracking/geometry bounds before credential files, sockets
-            // or native devices. Derived records retain their own authenticated policy.
-            if let Some(settings) = transport {
-                l2tunnel_runtime::udp::base_session_config(
-                    config.runtime(),
-                    super::udp::runtime_config(config, settings)?,
-                    selected,
-                )?;
-            }
-            if let Some(settings) = quic {
-                l2tunnel_runtime::quic::base_session_config(
-                    config.runtime(),
-                    super::quic::runtime_config(config, settings)?,
-                    selected,
-                )?;
-            }
-            Some(selected)
-        } else {
-            None
-        };
-    let managed_active = options
-        .get("--active-policies")
-        .map(|path| {
-            let initial = active.ok_or_else(|| input("active catalog requires active traffic"))?;
-            super::active_managed::catalog_from_json(
-                &bounded_file(path, super::active_managed::MAX_CATALOG_BYTES)?,
-                config,
-                initial,
-            )
-        })
-        .transpose()?;
-    let device_spec = DeviceSpec::parse(options, config)?;
-    // Managed TCP and base UDP share one lifecycle owner with every other
-    // frontend. Derived record profiles, QUIC and active TUN are not migrated.
-    if quic.is_none() && aligned.is_none() && packed.is_none() && active.is_none() {
-        let udp = match (transport, base_delivery) {
-            (Some(settings), Some(selected)) => Some((settings, selected)),
-            (None, _) => None,
-            (Some(_), None) => return Err(input("base UDP delivery policy absent")),
-        };
-        return service_frontend::execute(
-            command,
-            options,
-            config,
-            device_spec,
-            delivery,
-            profile_interval,
-            udp,
-        )
-        .await;
-    }
-    let api = options
-        .get("--control-socket")
-        .map(super::local::Server::bind)
-        .transpose()?;
-    let link = match command {
-        "connect" => {
-            let remote = required(options, "--remote")?
-                .parse()
-                .map_err(|_| input("remote requires IP:PORT"))?;
-            let roots = vec![bounded_file(required(options, "--ca")?, 65536)?];
-            let tls = tls_frontend::from_roots(options, &roots)?;
-            let identity =
-                MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
-                    .map_err(auth_error)?;
-            let server_name = required(options, "--server-name")?;
-            if let (Some(settings), Some(records)) = (quic, packed) {
-                let (link, profile, records) = super::packed::connect_quic(
-                    &roots,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    records,
-                )
-                .await?;
-                Connected::PackedQuic(link, profile, records)
-            } else if let (Some(settings), Some(records)) = (transport, packed) {
-                let (link, profile, records) = super::packed::connect_udp(
-                    remote,
-                    &tls,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    records,
-                )
-                .await?;
-                Connected::PackedUdp(link, profile, records)
-            } else if let (Some(settings), Some(records)) = (quic, aligned) {
-                let (link, profile, records) = super::aligned::connect_quic(
-                    &roots,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    records,
-                )
-                .await?;
-                Connected::AlignedQuic(link, profile, records)
-            } else if let (Some(settings), Some(records)) = (transport, aligned) {
-                let (link, profile, records) = super::aligned::connect_udp(
-                    remote,
-                    &tls,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    records,
-                )
-                .await?;
-                Connected::AlignedUdp(link, profile, records)
-            } else if let Some(settings) = quic {
-                let (link, profile) = super::quic::connect(
-                    &roots,
-                    server_name,
-                    &identity,
-                    config,
-                    settings,
-                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
-                )
-                .await?;
-                Connected::Quic(
-                    link,
-                    profile,
-                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
-                )
-            } else if let Some(settings) = managed_active {
-                Connected::ActiveManaged(
-                    super::active_managed::connect(
-                        remote,
-                        &tls,
-                        server_name,
-                        &identity,
-                        config,
-                        &settings,
-                    )
-                    .await?,
-                    settings,
-                )
-            } else if let Some(settings) = active {
-                Connected::Active(
-                    super::active::connect(remote, &tls, server_name, &identity, config, settings)
-                        .await?,
-                    settings,
-                )
-            } else {
-                return Err(input("managed TCP lifecycle selection was not dispatched"));
-            }
-        }
-        "serve" => {
-            let address: SocketAddr = required(options, "--listen")?
-                .parse()
-                .map_err(|_| input("listen requires IP:PORT"))?;
-            let certificate = bounded_file(required(options, "--cert")?, 65536)?;
-            let key = bounded_file(required(options, "--key")?, 65536)?;
-            let public = bounded_file(required(options, "--allow-key")?, 32)?;
-            let public: [u8; 32] = public
-                .try_into()
-                .map_err(|_| input("allow-key must contain exactly 32 raw Ed25519 public bytes"))?;
-            let certificates = vec![certificate];
-            let tls = ServerTls::from_der(&certificates, &key).map_err(auth_error)?;
-            let allowlist = MemberAllowlist::new(&[MemberPublicKey(public)]).map_err(auth_error)?;
-            if let (Some(settings), Some(records)) = (quic, packed) {
-                let listener = super::packed::QuicListener::bind(
-                    &certificates,
-                    &key,
-                    config,
-                    settings,
-                    records,
-                )?;
-                println!("Listening on packed QUIC UDP {}", settings.forward.local);
-                let (link, profile, records) = listener.accept(&allowlist).await?;
-                Connected::PackedQuic(link, profile, records)
-            } else if let (Some(settings), Some(records)) = (quic, aligned) {
-                let listener = super::aligned::QuicListener::bind(
-                    &certificates,
-                    &key,
-                    config,
-                    settings,
-                    records,
-                )?;
-                println!("Listening on aligned QUIC UDP {}", settings.forward.local);
-                let (link, profile, records) = listener.accept(&allowlist).await?;
-                Connected::AlignedQuic(link, profile, records)
-            } else if let Some(settings) = quic {
-                let listener = super::quic::Listener::bind(
-                    &certificates,
-                    &key,
-                    config,
-                    settings,
-                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
-                )?;
-                println!("Listening on QUIC UDP {}", settings.forward.local);
-                let (link, profile) = listener.accept(&allowlist).await?;
-                Connected::Quic(
-                    link,
-                    profile,
-                    base_delivery.ok_or_else(|| input("base QUIC delivery policy absent"))?,
-                )
-            } else {
-                let listener = TcpListener::bind(address).await?;
-                println!("Listening on {}", listener.local_addr()?);
-                if let (Some(settings), Some(records)) = (transport, packed) {
-                    let (link, profile, records) = super::packed::accept_udp(
-                        &listener, &tls, &allowlist, config, settings, records,
-                    )
-                    .await?;
-                    Connected::PackedUdp(link, profile, records)
-                } else if let (Some(settings), Some(records)) = (transport, aligned) {
-                    let (link, profile, records) = super::aligned::accept_udp(
-                        &listener, &tls, &allowlist, config, settings, records,
-                    )
-                    .await?;
-                    Connected::AlignedUdp(link, profile, records)
-                } else if let Some(settings) = managed_active {
-                    Connected::ActiveManaged(
-                        super::active_managed::accept(
-                            &listener, &tls, &allowlist, config, &settings,
-                        )
-                        .await?,
-                        settings,
-                    )
-                } else if let Some(settings) = active {
-                    Connected::Active(
-                        super::active::accept(&listener, &tls, &allowlist, config, settings)
-                            .await?,
-                        settings,
-                    )
-                } else {
-                    return Err(input("managed TCP lifecycle selection was not dispatched"));
-                }
-            }
-        }
-        _ => return Err(input("unsupported command")),
-    };
-    let device = device_spec.open(config)?;
-    println!(
-        "Authenticated {:?} {:?}; forwarding packet device",
-        config.layer, config.duplex
-    );
-    match link {
-        Connected::ActiveManaged(link, settings) => {
-            println!(
-                "Carrier: tcp-tls; managed active TUN policy catalog; initial channels {}; {} targets",
-                settings.initial.channels,
-                if settings.initial.adaptive {
-                    "measured adaptive"
-                } else {
-                    "static bootstrap"
-                }
-            );
-            run_active_managed(
-                device,
-                link,
-                config.runtime(),
-                settings,
-                api,
-                number(options, "--active-stats-ms", 0)?,
-            )
-            .await
-        }
-        Connected::Active(link, settings) => {
-            println!(
-                "Carrier: tcp-tls; transparent TUN active credits; weighted DRR; CRC MUX channels {}; {} targets; compression fixed",
-                settings.channels,
-                if settings.adaptive {
-                    "measured adaptive"
-                } else {
-                    "static bootstrap"
-                }
-            );
-            run_active(
-                device,
-                link,
-                config.runtime(),
-                settings,
-                number(options, "--active-stats-ms", 0)?,
-            )
-            .await
-        }
-        Connected::AlignedUdp(link, profile, records) => {
-            delivery_frontend::report(records.delivery);
-            println!(
-                "Carrier: UDP with retained TCP/TLS bootstrap/control; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
-                records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
-            );
-            l2tunnel_runtime::aligned::run_udp(device, link, config.runtime(), profile, records)
-                .await
-        }
-        Connected::PackedUdp(link, profile, records) => {
-            delivery_frontend::report(records.delivery);
-            println!(
-                "Carrier: UDP with retained TCP/TLS; record-profile packed; channels {}; hold {} us; maximum units {}; work limit {}; recovery {:?}",
-                records.pipeline.flows.channels,
-                records.protocol.hold_micros,
-                records.protocol.max_units,
-                records.protocol.work_limit,
-                profile.recovery
-            );
-            l2tunnel_runtime::packed::run_udp(device, link, config.runtime(), profile, records)
-                .await
-        }
-        Connected::PackedQuic(link, profile, records) => {
-            delivery_frontend::report(records.delivery);
-            println!(
-                "Carrier: genuine QUIC; record-profile packed; channels {}; hold {} us; maximum units {}; work limit {}; recovery {:?}",
-                records.pipeline.flows.channels,
-                records.protocol.hold_micros,
-                records.protocol.max_units,
-                records.protocol.work_limit,
-                profile.recovery
-            );
-            l2tunnel_runtime::packed::run_quic(device, link, config.runtime(), profile, records)
-                .await
-        }
-        Connected::AlignedQuic(link, profile, records) => {
-            delivery_frontend::report(records.delivery);
-            println!(
-                "Carrier: genuine QUIC over UDP only; record-profile aligned; CRC MUX channels {}; recovery {:?}; native {:?}",
-                records.pipeline.flows.channels, profile.recovery, records.protocol.native_policy
-            );
-            l2tunnel_runtime::aligned::run_quic(device, link, config.runtime(), profile, records)
-                .await
-        }
-        Connected::Quic(link, profile, delivery) => {
-            delivery_frontend::report(delivery);
-            println!(
-                "Carrier: genuine QUIC over UDP only; retained authenticated control; AEAD; recovery {:?}; compression fixed",
-                profile.recovery
-            );
-            println!(
-                "Recovery banks: send {} records/{} bytes; receive {} records/{} bytes; local queue {} packets",
-                profile.arq.send_records,
-                profile.arq.send_bytes,
-                profile.arq.receive_records,
-                profile.arq.receive_bytes,
-                config.runtime().queue_packets
-            );
-            let (observations, reporter) = datagram_profiling::channel(profile_interval);
-            datagram_profiling::observe(
-                l2tunnel_runtime::quic::run_observed(
-                    device,
-                    link,
-                    config.runtime(),
-                    profile,
-                    reporter,
-                    delivery,
-                ),
-                observations,
-                datagram_profiling::Runtime::QuicFrame,
-            )
-            .await
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn run_active<D: l2tunnel_device::PacketDevice<Error = io::Error>>(
-    device: D,
-    link: Link,
-    config: RuntimeConfig,
-    settings: super::active::Settings,
-    stats_ms: u64,
-) -> io::Result<()> {
-    use l2tunnel_runtime::active;
-    if stats_ms == 0 {
-        return active::run(device, link, config, settings, None).await;
-    }
-    let (observer, reporter) = active::observations();
-    let mut updates = observer.subscribe();
-    let runtime = active::run(device, link, config, settings, Some(reporter));
-    tokio::pin!(runtime);
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(stats_ms));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let floor = config.max_packet as u64 * settings.max_flows as u64;
-    let mut peak = floor;
-    let mut measured_growth = serde_json::Value::Null;
-    let mut observing = true;
-    loop {
-        tokio::select! {
-            result = &mut runtime => return result,
-            changed = updates.changed(), if observing => {
-                observing = changed.is_ok();
-                let status = *updates.borrow_and_update();
-                if let Some(status) = status
-                    && status.adaptive && status.engine.target.bytes > peak
-                        && status.feedback.rtt_micros.is_some()
-                        && status.feedback.delivery_bytes_per_second.is_some()
-                        && status.demanding_flows > 0 {
-                        peak = status.engine.target.bytes;
-                        measured_growth = serde_json::json!({
-                            "target_bytes": peak, "floor_bytes": floor,
-                            "rtt_micros": status.feedback.rtt_micros,
-                            "delivery_bytes_per_second": status.feedback.delivery_bytes_per_second,
-                            "demanding_flows": status.demanding_flows,
-                            "native_delivered_packets": status.delivered,
-                        });
-                }
-            }
-            _ = interval.tick() => {
-                if let Some(status) = observer.status() {
-                    println!("{}", serde_json::json!({
-                        "kind": "active_stats", "adaptive": status.adaptive,
-                        "target_bytes": status.engine.target.bytes, "target_records": status.engine.target.records,
-                        "floor_bytes": floor, "retired_flows": status.retired_flows,
-                        "rtt_micros": status.feedback.rtt_micros,
-                        "delivery_bytes_per_second": status.feedback.delivery_bytes_per_second,
-                        "demanding_flows": status.demanding_flows,
-                        "native_delivered_packets": status.delivered,
-                        "observation_flushed": status.observation_flushed,
-                        "measured_growth": measured_growth,
-                    }));
-                }
-            }
-        }
-    }
-}
-#[cfg(target_os = "linux")]
-async fn run_active_managed<D: l2tunnel_device::PacketDevice<Error = io::Error>>(
-    device: D,
-    link: Link,
-    runtime_config: RuntimeConfig,
-    settings: super::active_managed::Config,
-    api: Option<super::local::Server>,
-    stats_ms: u64,
-) -> io::Result<()> {
-    use l2tunnel_runtime::active_management;
-    let (handle, requests) = active_management::channel();
-    let runtime = active_management::run(device, link, runtime_config, settings, requests);
-    let observed = handle.clone();
-    let diagnostics = async move {
-        if stats_ms == 0 {
-            return std::future::pending::<io::Result<()>>().await;
-        }
-        let mut interval = tokio::time::interval(Duration::from_millis(stats_ms));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Some(status) = observed.status() {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "kind":"managed_active_stats", "epoch":status.epoch.0,
-                        "channels":status.mode.channels, "phase":format!("{:?}", status.phase),
-                        "admitting":status.admitting, "adaptive":status.traffic.adaptive,
-                        "target_bytes":status.traffic.engine.target.bytes,
-                        "retired_flows":status.traffic.retired_flows,
-                        "native_delivered_packets":status.traffic.delivered,
-                        "admitted_by_channel":status.admitted_by_channel,
-                        "handed_by_channel":status.handed_by_channel,
-                        "delivered_by_channel":status.delivered_by_channel,
-                    })
-                );
-            }
-        }
-    };
-    if let Some(api) = api {
-        tokio::select! {
-            result = runtime => result,
-            result = diagnostics => result,
-            result = api.serve(|request| crate::session_control::Control::active(handle.clone(), runtime_config.compression).request(request)) => result,
-        }
-    } else {
-        let _keep_control_alive = handle;
-        tokio::select! { result = runtime => result, result = diagnostics => result }
-    }
+    let selected = secure_udp_frontend::selection(command, options, config)?.ok_or_else(|| input(
+        "legacy entry retired; select --record-profile common and an explicit --carrier with --common-transaction-plan",
+    ))?;
+    secure_udp_frontend::execute(command, options, config, selected).await
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
-    let config = configuration(options)?;
-    #[cfg(unix)]
-    if secure_udp_frontend::selection(command, options, config)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "secure UDP native CLI is implemented on Linux only",
-        ));
-    }
-    #[cfg(unix)]
-    if swift_frontend::selection(options, config)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native swift CLI is implemented on Linux only",
-        ));
-    }
-    if rolling_frontend::selection(options, config)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native rolling CLI is implemented on Linux only",
-        ));
-    }
-    if raw_packet_frontend::selection(options, config)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native raw packet CLI is implemented on Linux only",
-        ));
-    }
-    packed_frontend::settings(options, config)?;
-    if proxy_frontend::selection(options, config)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native proxy CLI is currently implemented on Linux only",
-        ));
-    }
-    standalone::settings(options, config, command)?;
-    udp_settings(options, config)?;
-    quic_settings(options, config)?;
-    active_settings(options, config)?;
-    aligned_settings(options, config)?;
+async fn execute(_command: &str, _options: &BTreeMap<String, String>) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native device CLI is currently implemented on Linux only",
+        "Common native CLI service is not yet implemented on this platform",
     ))
 }
 #[cfg(unix)]
 async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
-    use super::local::{self, Action, Compression as ApiCompression, Request, VERSION};
+    use super::local::{self, Action, Request, VERSION};
     let action = match command {
         "status" => Action::Status {},
         "disconnect" => Action::Disconnect {},
         "reconnect" => Action::Reconnect {},
-        "switch-swift-configuration" => {
-            if !options.contains_key("--api-version")
-                || number(options, "--api-version", VERSION)? != local::TRANSACTION_VERSION
-            {
-                return Err(input(
-                    "complete Swift configuration requires explicit --api-version 3",
-                ));
-            }
-            Action::SwitchSwiftConfiguration {
-                configuration:
-                    crate::secure_udp::transaction_status::CanonicalConfiguration::parse(required(
-                        options,
-                        "--configuration",
-                    )?)?,
-            }
+        "switch-swift-configuration" | "set-swift" => {
+            return Err(input(
+                "Swift-only local commands are retired; use switch-common-configuration --api-version 4 with a complete catalog value",
+            ));
         }
         "switch-common-configuration" => {
             if number(options, "--api-version", VERSION)? != local::COMMON_VERSION {
@@ -1240,53 +224,12 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
                 limit,
             }
         }
-        "set-swift" => {
-            let value = |key: &str| {
-                options
-                    .get(key)
-                    .map(|text| {
-                        text.parse::<u64>()
-                            .map_err(|_| input(format!("invalid {key}")))
-                    })
-                    .transpose()
-            };
-            let policy = local::SwiftChange {
-                forward_kbit: value("--swift-forward-kbit")?,
-                reverse_kbit: value("--swift-reverse-kbit")?,
-                channels: value("--swift-channels")?,
-                window: value("--swift-window")?,
-                repair_permille: value("--swift-repair-permille")?,
-                path_mtu: value("--path-mtu")?,
-            };
-            if policy == local::SwiftChange::default() {
-                return Err(input("set-swift requires at least one value to change"));
-            }
-            Action::SetSwiftPolicy { policy }
-        }
         "drain-proxy" => Action::DrainProxy {},
-        "drain-openvpn" => Action::DrainOpenVpn {},
-        "set-compression" => Action::SwitchCompression {
-            compression: match required(options, "--compression")? {
-                "off" => ApiCompression::Off,
-                "lz4" => ApiCompression::Lz4,
-                _ => return Err(input("compression must be off or lz4")),
-            },
-        },
-        "set-active-policy" => {
-            let policy = super::active_managed::Policy {
-                channels: required(options, "--mux-channels")?
-                    .parse()
-                    .map_err(|_| input("invalid MUX channel count"))?,
-                dscp_weights: dscp_weights(options)?.to_vec(),
-            };
-            policy.mode()?;
-            Action::SwitchActivePolicy { policy }
-        }
         _ => return Err(input("unsupported local API command")),
     };
     let version = number(options, "--api-version", VERSION)?;
     if !local::supported_version(version) {
-        return Err(input("api-version must be explicitly 1, 2, 3 or 4"));
+        return Err(input("api-version must be explicitly 1 or 4"));
     }
     let response = local::request(
         required(options, "--control-socket")?,
@@ -1316,28 +259,9 @@ async fn execute_api(_command: &str, _options: &BTreeMap<String, String>) -> io:
 pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.into_iter().collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!(
-            "{HELP}\n\n{UDP_HELP}\n\n{QUIC_HELP}\n\n{ALIGNED_HELP}\n\n{ACTIVE_HELP}\nActive diagnostics: --active-stats-ms 0|100..60000 (default off)."
-        );
-        println!("\n{}", standalone::HELP);
-        println!("\n{}", proxy_frontend::HELP);
-        println!("\n{}", packed_frontend::HELP);
-        println!("\n{}", rolling_frontend::HELP);
-        #[cfg(unix)]
-        println!("\n{}", swift_frontend::HELP);
+        println!("{HELP}");
         #[cfg(unix)]
         println!("\n{}", secure_udp_frontend::HELP);
-        println!(
-            "\nHost experiment: --runtime-model multi-thread|current-thread, only for Linux quic-like/media-like Swift connect/serve. Omission keeps the existing multi-thread runtime. Explicit selection emits one host_runtime schema1 observation on stderr; it does not change peer configuration or the control backend."
-        );
-        println!("\n{}", raw_packet_frontend::HELP);
-        println!(
-            "\nTLS naming: connect --sni DNS_NAME explicitly sends that ClientHello name; --server-name remains the verified own-server identity. SNI is disabled when omitted. Supported TLS readers are TCP (system/active/proxy), raw-packet and Common OpenVPN. Other profiles reject this option. Common offline connect inspection reports requested naming only; persistent effective naming in IPC remains unavailable."
-        );
-        println!("\n{}", delivery_frontend::HELP);
-        println!(
-            "\nProfiling: --profile-ms 0|100..60000 (default off), system frame records over TCP/TLS or base UDP/QUIC. TCP emits runtime_profile schema3; base UDP/QUIC emits distinct datagram_profile schema1 latest snapshots on the selected interval and at termination. Transport timing includes async waits."
-        );
         return ExitCode::SUCCESS;
     }
     if args.as_slice() == ["--version"] {
@@ -1346,18 +270,16 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     }
     if args.as_slice() == ["plan"] {
         println!(
-            "Implemented with finite native evidence: TCP/TLS, TLS-bootstrapped protected UDP and genuine UDP-only QUIC on Linux TAP/TUN/VXLAN, paired half/full duplex, TCP compression epochs, UDP Cauchy/ARQ, measured active TUN credit/QoS and authenticated flow retirement. Broad hot switching, raw native TCP, complete Python mode parity, GUI and native non-Linux qualification remain unfinished."
+            "Current production entries use Common compact Records with explicit original UDP, OpenVPN, raw TCP, retained TLS or genuine QUIC carriers. Algorithms remain explicit catalog configurations. Common active TUN credit, Windows service, complete Python mode parity and native qualification remain unfinished."
         );
         return ExitCode::SUCCESS;
     }
     let command = &args[0];
     let mut allowed = match command.as_str() {
         "keygen" => vec!["--private", "--public"],
-        "openvpn-keygen" => vec!["--admission", "--cookie"],
-        "status" | "disconnect" | "reconnect" | "drain-proxy" | "drain-openvpn" => {
+        "status" | "disconnect" | "reconnect" | "drain-proxy" => {
             vec!["--control-socket"]
         }
-        "set-compression" => vec!["--control-socket", "--compression"],
         "switch-swift-configuration" => vec!["--control-socket", "--configuration"],
         "switch-common-configuration" => {
             vec!["--control-socket", "--configuration", "--request-key"]
@@ -1408,7 +330,6 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--swift-repair-permille",
             "--path-mtu",
         ],
-        "set-active-policy" => vec!["--control-socket", "--mux-channels", "--qos-dscp"],
         "connect" => vec![
             "--remote",
             "--control-socket",
@@ -1446,24 +367,20 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     };
     if matches!(command.as_str(), "connect" | "serve") {
-        allowed.push("--runtime-model");
-        allowed.push("--carrier");
-        allowed.push("--profile-ms");
-        allowed.extend_from_slice(delivery_frontend::OPTIONS);
-        allowed.push("--quic-application-id");
-        allowed.push("--record-profile");
-        allowed.push("--aligned-channels");
-        allowed.push("--proxy-policy");
-        allowed.extend_from_slice(UDP_OPTIONS);
-        allowed.extend_from_slice(ACTIVE_OPTIONS);
-        allowed.extend_from_slice(standalone::OPTIONS);
-        allowed.extend_from_slice(packed_frontend::OPTIONS);
-        allowed.extend_from_slice(rolling_frontend::OPTIONS);
-        #[cfg(unix)]
-        allowed.extend_from_slice(swift_frontend::OPTIONS);
+        allowed.extend_from_slice(&[
+            "--runtime-model",
+            "--carrier",
+            "--record-profile",
+            "--traffic",
+            "--proxy-policy",
+            "--udp-bind",
+            "--udp-peer",
+            "--udp-cover",
+            "--raw-policy",
+            "--raw-mark",
+        ]);
         #[cfg(unix)]
         allowed.extend_from_slice(secure_udp_frontend::OPTIONS);
-        allowed.extend_from_slice(raw_packet_frontend::OPTIONS);
     }
     let local_api = matches!(
         command.as_str(),
@@ -1474,10 +391,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             | "switch-swift-configuration"
             | "switch-common-configuration"
             | "common-catalog"
-            | "set-compression"
-            | "set-active-policy"
             | "drain-proxy"
-            | "drain-openvpn"
     );
     if local_api {
         allowed.push("--api-version");
@@ -1487,13 +401,10 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         if command == "keygen" {
             return generate(&options);
         }
-        if command == "openvpn-keygen" {
-            return standalone::generate(&options);
+        if command == "inspect-swift-transaction-plan" {
+            return Err(input("Swift-only inspection is retired; use inspect-common-transaction-plan with the complete Common plan"));
         }
-        if matches!(
-            command.as_str(),
-            "inspect-swift-transaction-plan" | "inspect-common-transaction-plan"
-        ) {
+        if command == "inspect-common-transaction-plan" {
             if (command == "inspect-common-transaction-plan")
                 != options.contains_key("--common-transaction-plan")
             {
@@ -1533,9 +444,6 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     }
 }
-#[cfg(all(test, unix))]
-#[path = "generic_cli_tests.rs"]
-mod generic_transaction_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1561,61 +469,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn carrier_options_reject_downgrades_and_incomplete_profiles() -> io::Result<()> {
-        let mut values = BTreeMap::from([
-            ("--layer".into(), "tun".into()),
-            ("--duplex".into(), "full".into()),
-        ]);
-        let config = configuration(&values)?;
-        assert!(udp_settings(&values, config)?.is_none());
-        values.insert("--udp-bind".into(), "127.0.0.1:24440".into());
-        assert!(udp_settings(&values, config).is_err());
-        values.insert("--carrier".into(), "udp".into());
-        values.insert("--udp-peer".into(), "127.0.0.2:24440".into());
-        assert!(udp_settings(&values, config).is_err());
-        values.insert("--udp-cover".into(), "quic-like".into());
-        let settings =
-            udp_settings(&values, config)?.ok_or_else(|| input("missing UDP settings"))?;
-        assert_eq!(
-            settings.protection,
-            super::super::udp::Protection::ChaCha20Poly1305
-        );
-        values.insert("--udp-protection".into(), "integrity".into());
-        assert_eq!(
-            udp_settings(&values, config)?
-                .ok_or_else(|| input("missing UDP settings"))?
-                .protection,
-            super::super::udp::Protection::HmacSha256
-        );
-        for (key, value) in [
-            ("--carrier", "raw-tcp"),
-            ("--carrier", "tcp"),
-            ("--udp-cover", "quic"),
-            ("--udp-protection", "off"),
-            ("--path-mtu", "575"),
-            ("--control-socket", "/unused/private.sock"),
-            ("--udp-reverse-bind", "127.0.0.1:24441"),
-        ] {
-            let mut bad = values.clone();
-            bad.insert(key.into(), value.into());
-            assert!(udp_settings(&bad, config).is_err());
-        }
-        let half = ConnectionConfig {
-            duplex: Duplex::Half,
-            ..config
-        };
-        assert!(udp_settings(&values, half).is_err());
-        values.insert("--udp-reverse-bind".into(), "127.0.0.1:24441".into());
-        values.insert("--udp-reverse-peer".into(), "127.0.0.2:24441".into());
-        assert!(udp_settings(&values, half)?.is_some());
-        assert!(udp_settings(&values, config).is_err());
-        Ok(())
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn base_datagram_delivery_is_required_before_credential_or_socket_io() -> io::Result<()> {
+    async fn retired_base_datagram_entry_refuses_before_credential_or_socket_io() -> io::Result<()>
+    {
         for carrier in ["udp", "quic"] {
             let mut options = BTreeMap::from([
                 ("--layer".into(), "tun".into()),
@@ -1638,268 +495,14 @@ mod tests {
                 let error = execute("connect", &options)
                     .await
                     .err()
-                    .ok_or_else(|| input("base datagram missing delivery policy accepted"))?;
+                    .ok_or_else(|| input("retired base datagram entry accepted"))?;
                 assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-                assert!(error.to_string().contains("delivery-window bdp"));
+                assert_eq!(
+                    error.to_string(),
+                    "legacy entry retired; select --record-profile common and an explicit --carrier with --common-transaction-plan"
+                );
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn fec_selection_binds_profile_and_rejects_unused_or_unbounded_knobs() -> io::Result<()> {
-        let mut values = BTreeMap::from([
-            ("--layer".into(), "tun".into()),
-            ("--duplex".into(), "full".into()),
-            ("--carrier".into(), "udp".into()),
-            ("--udp-cover".into(), "quic-like".into()),
-            ("--udp-bind".into(), "127.0.0.1:24440".into()),
-            ("--udp-peer".into(), "127.0.0.2:24440".into()),
-        ]);
-        let config = configuration(&values)?;
-        let plain = udp_settings(&values, config)?.ok_or_else(|| input("missing UDP"))?;
-        values.insert("--fec-repairs".into(), "2".into());
-        assert!(udp_settings(&values, config).is_err());
-        values.insert("--fec".into(), "cauchy".into());
-        let coded = udp_settings(&values, config)?.ok_or_else(|| input("missing UDP"))?;
-        let a = super::super::udp::runtime_config(config, plain)?;
-        let b = super::super::udp::runtime_config(config, coded)?;
-        assert_ne!(
-            l2tunnel_runtime::udp::base_session_config(
-                config.runtime(),
-                a,
-                crate::delivery_tests::policy()
-            )?,
-            l2tunnel_runtime::udp::base_session_config(
-                config.runtime(),
-                b,
-                crate::delivery_tests::policy()
-            )?
-        );
-        assert!(b.arq.max_source_bytes < a.arq.max_source_bytes);
-        for (key, value) in [
-            ("--fec", "unknown"),
-            ("--fec-sources", "0"),
-            ("--fec-sources", "17"),
-            ("--fec-repairs", "0"),
-            ("--fec-repairs", "17"),
-            ("--fec-flush-ms", "0"),
-            ("--fec-flush-ms", "200"),
-            ("--fec-sources", "-1"),
-            ("--carrier", "tcp"),
-        ] {
-            let mut bad = values.clone();
-            bad.insert(key.into(), value.into());
-            assert!(udp_settings(&bad, config).is_err(), "{key}={value}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn genuine_quic_is_explicit_bound_and_rejects_incompatible_options() -> io::Result<()> {
-        let values = BTreeMap::from([
-            ("--carrier".into(), "quic".into()),
-            ("--layer".into(), "tun".into()),
-            ("--duplex".into(), "full".into()),
-            ("--udp-bind".into(), "192.0.2.1:24440".into()),
-            ("--udp-peer".into(), "192.0.2.2:24440".into()),
-            ("--remote".into(), "192.0.2.2:24440".into()),
-            (
-                "--quic-application-id".into(),
-                "7a3820f113c842d6b6ac2784ee890311".into(),
-            ),
-        ]);
-        let config = configuration(&values)?;
-        assert!(udp_settings(&values, config)?.is_none());
-        let settings = quic_settings(&values, config)?.ok_or_else(|| input("missing QUIC"))?;
-        let profile = super::super::quic::runtime_config(config, settings)?;
-        let mut changed = settings;
-        changed.application_id[0] ^= 1;
-        assert_ne!(
-            l2tunnel_runtime::quic::base_session_config(
-                config.runtime(),
-                profile,
-                crate::delivery_tests::policy()
-            )?,
-            l2tunnel_runtime::quic::base_session_config(
-                config.runtime(),
-                super::super::quic::runtime_config(config, changed)?,
-                crate::delivery_tests::policy(),
-            )?
-        );
-        for (key, value) in [
-            ("--quic-application-id", ""),
-            ("--quic-application-id", "00000000000000000000000000000000"),
-            ("--quic-application-id", "gggggggggggggggggggggggggggggggg"),
-            ("--quic-application-id", "éééééééééééééééé"),
-            ("--remote", "192.0.2.3:24440"),
-            ("--listen", "192.0.2.3:24440"),
-            ("--path-mtu", "1227"),
-            ("--udp-cover", "quic-like"),
-            ("--udp-protection", "integrity"),
-            ("--control-socket", "/unused"),
-            ("--udp-reverse-bind", "192.0.2.1:24441"),
-            ("--carrier", "tcp"),
-            ("--fec", "unknown"),
-        ] {
-            let mut bad = values.clone();
-            bad.insert(key.into(), value.into());
-            assert!(quic_settings(&bad, config).is_err(), "{key}={value}");
-        }
-        let mut absent = values.clone();
-        absent.remove("--quic-application-id");
-        assert!(quic_settings(&absent, config).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn aligned_selection_rejects_implicit_or_incompatible_profiles() -> io::Result<()> {
-        let mut values = BTreeMap::from([
-            ("--layer".into(), "tap".into()),
-            ("--duplex".into(), "full".into()),
-            ("--carrier".into(), "udp".into()),
-            ("--udp-cover".into(), "quic-like".into()),
-            ("--udp-bind".into(), "127.0.0.1:24440".into()),
-            ("--udp-peer".into(), "127.0.0.2:24440".into()),
-            ("--fec".into(), "cauchy".into()),
-        ]);
-        let config = configuration(&values)?;
-        assert!(aligned_settings(&values, config)?.is_none());
-        values.insert("--record-profile".into(), "frame".into());
-        assert!(aligned_settings(&values, config)?.is_none());
-        values.insert("--aligned-channels".into(), "4".into());
-        assert!(aligned_settings(&values, config).is_err());
-        values.insert("--record-profile".into(), "aligned".into());
-        assert!(aligned_settings(&values, config).is_err());
-        for (key, value) in [
-            ("--delivery-window", "bdp"),
-            ("--forward-mbps", "100"),
-            ("--reverse-mbps", "10"),
-            ("--bootstrap-rtt-ms", "70"),
-        ] {
-            values.insert(key.into(), value.into());
-        }
-        assert_eq!(
-            aligned_settings(&values, config)?.map(|s| s.channels),
-            Some(4)
-        );
-        for (key, value) in [
-            ("--record-profile", "packed"),
-            ("--carrier", "tcp"),
-            ("--fec", "none"),
-            ("--fec-repairs", "0"),
-            ("--aligned-channels", "0"),
-            ("--aligned-channels", "257"),
-            ("--aligned-channels", "-1"),
-            ("--compression", "lz4"),
-            ("--traffic", "active"),
-            ("--adaptive", "off"),
-            ("--active-policies", "/unused.json"),
-            ("--control-socket", "/unused.sock"),
-            ("--mux-channels", "4"),
-            ("--max-flows", "4"),
-            ("--qos-dscp", "46:4"),
-            ("--path-mtu", "575"),
-        ] {
-            let mut bad = values.clone();
-            bad.insert(key.into(), value.into());
-            assert!(
-                aligned_settings(&bad, configuration(&bad)?).is_err(),
-                "{key}={value}"
-            );
-        }
-        for key in ["--carrier", "--fec", "--udp-peer", "--udp-cover"] {
-            let mut bad = values.clone();
-            bad.remove(key);
-            assert!(aligned_settings(&bad, config).is_err(), "missing {key}");
-        }
-        values.remove("--udp-cover");
-        values.insert("--carrier".into(), "quic".into());
-        values.insert(
-            "--quic-application-id".into(),
-            "7a3820f113c842d6b6ac2784ee890311".into(),
-        );
-        assert!(aligned_settings(&values, config)?.is_some());
-        values.insert("--aligned-channels".into(), "256".into());
-        assert_eq!(
-            aligned_settings(&values, config)?.map(|s| s.channels),
-            Some(256)
-        );
-        values.insert("--quic-application-id".into(), "00".repeat(16));
-        assert!(aligned_settings(&values, config).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn active_profile_has_strict_policy_and_no_implicit_fallback() -> io::Result<()> {
-        let mut values = BTreeMap::from([("--layer".into(), "tun".into())]);
-        let config = configuration(&values)?;
-        assert!(active_settings(&values, config)?.is_none());
-        values.insert("--qos-dscp".into(), "0:1,46:4".into());
-        assert!(active_settings(&values, config).is_err());
-        values.insert("--traffic".into(), "active".into());
-        let settings = active_settings(&values, config)?.ok_or_else(|| input("missing active"))?;
-        assert_eq!(settings.dscp_weights[46], 4);
-        assert_eq!(settings.dscp_weights[1], 1);
-        let mut idle_values = values.clone();
-        idle_values.insert("--flow-idle-ms".into(), "100".into());
-        let idle_settings = active_settings(&idle_values, config)?
-            .ok_or_else(|| input("missing active idle settings"))?;
-        assert_eq!(
-            idle_settings.idle_flow_timeout,
-            std::time::Duration::from_millis(100)
-        );
-        assert_ne!(
-            l2tunnel_runtime::active::session_config(config.runtime(), settings)?,
-            l2tunnel_runtime::active::session_config(config.runtime(), idle_settings)?
-        );
-        assert_ne!(
-            l2tunnel_runtime::active::session_config(config.runtime(), settings)?,
-            config.session()?
-        );
-        let baseline = super::super::active::Settings::new(config.runtime(), config.duplex)?;
-        assert_ne!(
-            l2tunnel_runtime::active::session_config(config.runtime(), settings)?,
-            l2tunnel_runtime::active::session_config(config.runtime(), baseline)?
-        );
-        for (key, value) in [
-            ("--traffic", "proxy"),
-            ("--carrier", "udp"),
-            ("--control-socket", "/unused"),
-            ("--mux-channels", "0"),
-            ("--max-flows", "0"),
-            ("--adaptive", "true"),
-            ("--active-stats-ms", "99"),
-            ("--active-stats-ms", "60001"),
-            ("--flow-idle-ms", "0"),
-            ("--flow-idle-ms", "86400001"),
-            ("--flow-idle-ms", "-1"),
-            ("--qos-dscp", "46:1,46:2"),
-            ("--qos-dscp", "64:1"),
-            ("--qos-dscp", "0:0"),
-            ("--qos-dscp", ""),
-            ("--qos-dscp", "1:2:"),
-            ("--qos-dscp", "-1:2"),
-        ] {
-            let mut bad = values.clone();
-            bad.insert(key.into(), value.into());
-            assert!(active_settings(&bad, config).is_err(), "{key}={value}");
-        }
-        assert!(
-            active_settings(
-                &values,
-                ConnectionConfig {
-                    layer: PacketLayer::Ethernet,
-                    ..config
-                }
-            )
-            .is_err()
-        );
-        values.insert("--active-policies".into(), "/unused/catalog.json".into());
-        values.insert("--control-socket".into(), "/unused/private.sock".into());
-        assert!(active_settings(&values, config)?.is_some());
-        values.insert("--traffic".into(), "system".into());
-        assert!(active_settings(&values, config).is_err());
         Ok(())
     }
 }

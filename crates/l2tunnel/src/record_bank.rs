@@ -353,6 +353,7 @@ fn observed(actual: &engine::Engine, plan: &engine::storage::Plan) -> Result<usi
             .checked_add(usage.record_bytes)
             .and_then(|bytes| bytes.checked_add(usage.ingress_bytes))
             .and_then(|bytes| bytes.checked_add(usage.fragment_bytes))
+            .and_then(|bytes| bytes.checked_add(usage.native_window_bytes))
             != Some(plan.heap_bytes())
         || usage.fixed_bytes.checked_add(plan.heap_bytes()) != Some(usage.capacity_bytes)
         || usage.capacity_bytes != plan.capacity_bytes()

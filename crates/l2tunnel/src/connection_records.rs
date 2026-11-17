@@ -665,7 +665,22 @@ impl Collection {
             })
             .min()
     }
-    /// Actual retained hard expiry only, never a retransmission or probe wake.
+    /// Terminal endpoint/raw/retirement caps, excluding recoverable FEC eviction.
+    pub fn custody_deadline(&self) -> Option<Duration> {
+        self.slots
+            .iter()
+            .filter_map(|s| {
+                s.endpoint
+                    .custody_deadline()
+                    .into_iter()
+                    .chain(s.raw_send.map(|r| r.deadline))
+                    .chain(s.raw_receive.map(|r| r.deadline))
+                    .chain(s.retirement.as_ref().map(retirement::State::deadline))
+                    .min()
+            })
+            .min()
+    }
+    /// Receive-maintenance expiry and terminal caps, never a retransmission wake.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         self.slots
             .iter()

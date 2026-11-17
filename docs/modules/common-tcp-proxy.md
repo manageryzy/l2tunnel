@@ -1,5 +1,11 @@
 # Explicit TCP proxy through Common records
 
+Current compact migration and validation are recorded in the
+[cutover ledger](compact-wire-cleanup.md). The older standalone TLS proxy entry
+points have been removed; the current service composes the shared proxy actor
+with an explicit Common profile and selected original carrier. The source-bound
+checkpoints below do not establish a current aggregate or native/platform pass.
+
 Status: implemented finite slice with current root Linux component and shared-service
 integration evidence in the [Batch13 receipt](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
 The receipt separately preserves the two failed existing runtime cases, their

@@ -1,5 +1,12 @@
 # Fixed and measured TCP proxy through the shared service
 
+Current cutover status: the standalone TLS constructors and runtime entries
+described in the earlier checkpoint below have been removed. Current fixed and
+measured proxy selections use the shared Common service and its selected
+carrier. See [current validation and gaps](compact-wire-cleanup.md) and
+[maintained carriers](maintained-common-carriers.md); the earlier receipts below
+do not qualify the current compact migration or restore the retired APIs.
+
 The additive [explicit Common proxy slices](common-tcp-proxy.md) now reuse
 this service and actor through a bounded record adapter. The TLS evidence below
 retains its original scope. The explicitly selected

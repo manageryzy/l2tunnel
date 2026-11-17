@@ -53,13 +53,5 @@ l2tunnel-packet = { path = "../l2tunnel-packet" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 
 [[example]]
-name = "packed_capture_audit"
-test = true
-
-[[example]]
-name = "generic_cli_process_probe"
-test = false
-
-[[example]]
 name = "common_cli_process_probe"
 test = false

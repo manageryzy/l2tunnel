@@ -5,6 +5,26 @@ use std::{future::poll_fn, time::Duration};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
+
+#[test]
+fn peer_close_classification_excludes_errors_and_local_shutdown() {
+    let application = |code| {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: bytes::Bytes::new(),
+        })
+    };
+    assert!(normal_peer_close(&application(0)));
+    for error in [
+        application(1),
+        quinn::ConnectionError::Reset,
+        quinn::ConnectionError::TimedOut,
+        quinn::ConnectionError::LocallyClosed,
+    ] {
+        assert!(!normal_peer_close(&error));
+    }
+}
+
 fn base() -> SessionConfig {
     SessionConfig {
         layer: PacketLayer::Ip,
@@ -77,6 +97,22 @@ fn selected_profile_binds_wire_and_recalculates_tiny_record_queue_bound() -> Tes
     assert!(impossible.validate().is_err());
     assert_eq!(impossible.maximum_carrier_bytes(), usize::MAX);
     Ok(())
+}
+
+#[test]
+fn selected_final_namespace_accepts_all_strong_reader_slots_without_bootstrap_overlap() {
+    for route in u8::MIN..=u8::MAX {
+        let mut record = [0; 21];
+        record[0] = route;
+        assert_eq!(
+            final_prefix(&record),
+            matches!(route, 0..=23 | 80..=121 | 128..=255)
+        );
+        assert!(!final_prefix(&record[..8]));
+    }
+    let mut bootstrap = [0; 48];
+    bootstrap[..4].copy_from_slice(b"L2QD");
+    assert!(!final_prefix(&bootstrap));
 }
 
 #[tokio::test]
@@ -181,7 +217,8 @@ async fn real_quic_selected_half_pairs_keep_bidirectional_control_and_user_direc
     assert_eq!(a[0].pair_binding(), a[1].pair_binding());
     assert_eq!(a[0].pair_binding(), b[0].pair_binding());
     assert_eq!(a[0].pair_binding(), b[1].pair_binding());
-    let bytes = [0x80; 9];
+    let mut bytes = [0; 21];
+    bytes[0] = 80;
     for lane in 0..2 {
         a[lane].select_final_records(original)?;
         b[lane].select_final_records(original)?;

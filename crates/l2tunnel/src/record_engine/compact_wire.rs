@@ -95,7 +95,6 @@ impl Engine {
         }
         if self.last.is_some()
             || self.compact_feedback_overhead.is_some()
-            || feedback_overhead < self.overhead
             || self
                 .fragments
                 .as_ref()

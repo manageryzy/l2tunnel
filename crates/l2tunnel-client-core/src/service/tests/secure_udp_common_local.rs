@@ -52,7 +52,10 @@ async fn v4_socket_full_common_status_catalog_key_replay_and_lifecycle() -> Resu
                 })
                 .await
             });
-            for version in 1..=3 {
+            // API1 remains a supported transport version, but cannot address
+            // this API4 Common actor. Retired API2/3 fail before socket I/O.
+            {
+                let version = local::VERSION;
                 let refusal = local::request(
                     &path,
                     &local::Request {
@@ -65,6 +68,22 @@ async fn v4_socket_full_common_status_catalog_key_replay_and_lifecycle() -> Resu
                 assert_eq!(refusal.code, "requires_version_4");
                 assert_eq!(refusal.version, version);
                 assert!(refusal.state.is_none());
+            }
+            let before = client.next_key().map_err(submit)?;
+            for version in [2, 3] {
+                let error = local::request(
+                    &path,
+                    &local::Request {
+                        version,
+                        action: local::Action::Status {},
+                    },
+                )
+                .await
+                .err()
+                .ok_or("retired API version accepted")?;
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), "unsupported local API version");
+                assert_eq!(client.next_key().map_err(submit)?, before);
             }
             let response = local::request(&path, &request(local::Action::Status {})).await?;
             assert!(response.ok);

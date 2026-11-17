@@ -1,6 +1,5 @@
 //! Exact optional authenticated raw ACK input selection and actual observations.
 use super::*;
-#[cfg(unix)]
 use l2tunnel_runtime::secure_udp::transport as connection;
 
 /// Complete independent Queue policy; separate from each independent recovery window.
@@ -13,7 +12,6 @@ pub struct ConnectionIngressLimits {
     pub capacity_bytes: u64,
 }
 impl ConnectionIngressLimits {
-    #[cfg(unix)]
     pub(crate) fn build(self) -> io::Result<connection::ConnectionIngressLimits> {
         if self.slots == 0 || self.capacity_bytes == 0 {
             return Err(invalid(
@@ -25,7 +23,6 @@ impl ConnectionIngressLimits {
             capacity_bytes: usize::try_from(self.capacity_bytes).map_err(invalid)?,
         })
     }
-    #[cfg(unix)]
     pub(crate) fn from_limits(value: connection::ConnectionIngressLimits) -> io::Result<Self> {
         Ok(Self {
             slots: u64::try_from(value.slots).map_err(invalid)?,
@@ -50,7 +47,6 @@ pub struct ConnectionIngressPolicies {
     pub responder: Option<ConnectionIngressLimits>,
 }
 impl ConnectionIngressPolicies {
-    #[cfg(unix)]
     pub(crate) fn build(self) -> io::Result<[Option<connection::ConnectionIngressLimits>; 2]> {
         if self.initiator.is_none() && self.responder.is_none() {
             return Err(invalid(
@@ -66,7 +62,6 @@ impl ConnectionIngressPolicies {
                 .transpose()?,
         ])
     }
-    #[cfg(unix)]
     pub(crate) fn from_policies(
         value: [Option<connection::ConnectionIngressLimits>; 2],
     ) -> io::Result<Option<Self>> {
@@ -144,7 +139,6 @@ pub struct ConnectionRecovery {
     /// Actual native writes at or after the original arrival cap.
     pub late_native_written: u64,
 }
-#[cfg(unix)]
 impl ConnectionRecovery {
     pub(super) fn observe(value: l2tunnel::record_engine::ConnectionSnapshot) -> Self {
         let raw = value.unreliable;
@@ -162,7 +156,6 @@ impl ConnectionRecovery {
         }
     }
 }
-#[cfg(unix)]
 impl ConnectionIngressStatus {
     pub(super) fn observe(
         requested: ConnectionIngressPolicies,

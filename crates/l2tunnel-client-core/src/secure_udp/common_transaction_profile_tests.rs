@@ -181,7 +181,7 @@ fn profile(
     appearance: l2tunnel_cover::Appearance,
     member: l2tunnel_identity::MemberPublicKey,
 ) -> Result<Profile> {
-    let (legacy, peers) = super::super::profile::tests::fixture(path, appearance, member)?;
+    let (legacy, peers) = super::super::common_fixture::fixture(path, appearance, member)?;
     let mut connection = legacy.connection();
     connection.max_packet = 1500;
     let mut settings = legacy.settings();
@@ -302,7 +302,7 @@ async fn genuine_outer_binds_both_roles_and_full_asymmetric_resources_without_ch
             assert_eq!(actual.expected_configuration(), bound.configuration()?);
             assert_eq!(actual.initial(), bound.initial());
             assert_eq!(actual.data_digest(), bound.data_digest());
-            assert!(actual.refresh_selection().is_none());
+            assert_eq!(actual.compact_wire(), old.compact_wire());
             assert_eq!(
                 actual.resources().work.send_batch,
                 old.resources().work.send_batch
@@ -310,7 +310,7 @@ async fn genuine_outer_binds_both_roles_and_full_asymmetric_resources_without_ch
             assert_eq!(actual.resources().security, old.resources().security);
             assert_eq!(
                 actual.resources().control.wire_overhead,
-                old.resources().control.wire_overhead + 1
+                old.resources().control.wire_overhead
             );
             for (actual, old) in actual
                 .resources()
@@ -320,10 +320,7 @@ async fn genuine_outer_binds_both_roles_and_full_asymmetric_resources_without_ch
                 .into_iter()
                 .zip(old.resources().streams.ok_or("old streams")?.streams)
             {
-                assert_eq!(
-                    actual.delivery.wire_overhead,
-                    old.delivery.wire_overhead + 1
-                );
+                assert_eq!(actual.delivery.wire_overhead, old.delivery.wire_overhead);
                 assert_eq!(actual.max_message_bytes, old.max_message_bytes);
                 assert_eq!(actual.max_fragments, old.max_fragments);
             }
@@ -348,75 +345,8 @@ async fn genuine_outer_binds_both_roles_and_full_asymmetric_resources_without_ch
             assert!(bound.runtime_contract(other).is_err());
             assert!(bound.establish_config(other).is_err());
             for original in old_catalog.descriptors() {
-                let transformed = carrier_descriptor(*original)?;
-                assert!(bound.catalog().descriptors().contains(&transformed));
-                for sender in [Role::Client, Role::Server] {
-                    assert_eq!(
-                        transformed.direction(sender).common(),
-                        original.direction(sender).common()
-                    );
-                    assert_eq!(
-                        transformed.direction(sender).channels(),
-                        original.direction(sender).channels()
-                    );
-                    assert_eq!(
-                        transformed.direction(sender).max_native(),
-                        original.direction(sender).max_native()
-                    );
-                }
-                match (*original.profile(), *transformed.profile()) {
-                    (common::Profile::Swift { .. }, common::Profile::Swift { .. }) => {
-                        assert_eq!(*original, transformed);
-                    }
-                    (
-                        common::Profile::Aligned {
-                            forward: a,
-                            reverse: b,
-                        },
-                        common::Profile::Aligned {
-                            forward: mut x,
-                            reverse: mut y,
-                        },
-                    ) => {
-                        assert_eq!(
-                            x.recovery.outer_overhead_bytes,
-                            a.recovery.outer_overhead_bytes + 1
-                        );
-                        assert_eq!(
-                            y.recovery.outer_overhead_bytes,
-                            b.recovery.outer_overhead_bytes + 1
-                        );
-                        x.recovery.outer_overhead_bytes = a.recovery.outer_overhead_bytes;
-                        y.recovery.outer_overhead_bytes = b.recovery.outer_overhead_bytes;
-                        assert_eq!(x, a);
-                        assert_eq!(y, b);
-                    }
-                    (
-                        common::Profile::Packed {
-                            forward: a,
-                            reverse: b,
-                        },
-                        common::Profile::Packed {
-                            forward: mut x,
-                            reverse: mut y,
-                        },
-                    ) => {
-                        assert_eq!(
-                            x.base.recovery.outer_overhead_bytes,
-                            a.base.recovery.outer_overhead_bytes + 1
-                        );
-                        assert_eq!(
-                            y.base.recovery.outer_overhead_bytes,
-                            b.base.recovery.outer_overhead_bytes + 1
-                        );
-                        x.base.recovery.outer_overhead_bytes = a.base.recovery.outer_overhead_bytes;
-                        y.base.recovery.outer_overhead_bytes = b.base.recovery.outer_overhead_bytes;
-                        assert_eq!(x, a);
-                        assert_eq!(y, b);
-                    }
-                    _ => return Err("fixture unexpectedly changed record family".into()),
-                }
-                actual.resolve(Configuration::new(bound.envelope(), transformed)?)?;
+                assert!(bound.catalog().descriptors().contains(original));
+                actual.resolve(Configuration::new(bound.envelope(), *original)?)?;
             }
         }
         assert_eq!(requested.configuration()?, old_h0);

@@ -1,14 +1,15 @@
 # Compact Common records on maintained TLS and QUIC
 
 Status: the retained transport adapters, actual-owner authentication handoff and
-Common runtime/service integration are implemented. The finite real-connection
-runtime matrix has passing evidence for TLS/QUIC, Full/Half and both selected
-data suites. Both shared-service cases also pass with the final source. Initial
-QUIC failures and corrected continuations are retained. The required aggregate
-has two OpenVPN timeouts with passing unchanged-binary exact follow-ups; their
-cause is unqualified. This is not a pristine all-green invocation. A successful
-adapter check does not qualify the full composition. See the preserved evidence
-below.
+Common runtime/service integration are implemented. The current compact cutover
+has passing real TLS/QUIC Full capture evidence. The two TLS Half shutdown
+failures now have passing focused continuations after cancellation ordering was
+corrected. Current proxy shared-service and aggregate qualification are pending.
+See the [current cutover ledger](compact-wire-cleanup.md)
+for current results. The finite earlier Full/Half matrix, shared-service results,
+QUIC retries and OpenVPN timeout continuations below retain their original source
+scope. They are not a pristine aggregate pass or qualification of every current
+composition.
 
 This is an additive selection for genuine TCP/TLS and genuine Quinn DATAGRAM
 transports. It is distinct from the minimal QUIC/media appearance over UDP and
@@ -57,14 +58,20 @@ replace server identity authentication.
 | Genuine QUIC | Existing 48-byte L2QD session/capability/sequence envelope and covered setup body | Exact Common Carrier-layout Records bytes in DATAGRAM | `QuicDatagramAccepted` |
 
 The TLS length includes the discriminator and body. Its five-byte framing is
-exact application overhead. A selected Common data record adds nine bytes and
-strong feedback/control adds 21 bytes before algorithm, packing, fragmentation
-or management-body fields. TLS therefore contributes 14/26 application bytes
-before those fields; genuine QUIC contributes 9/21. Mandatory TLS records,
-QUIC packet protection/headers, IP/TCP/UDP headers, ACKs, congestion behavior and
-retransmissions are additional transport costs. TLS and QUIC may split or
-coalesce application records, so those application totals are not physical
-packet sizes or a throughput prediction.
+exact application overhead. A Common data record adds 21 bytes with the default
+ChaCha20-Poly1305 protection, 37 bytes with HMAC-SHA256, or nine bytes with an
+explicit AES-CCM4 or ChaCha20/CRC32C selection. Strong feedback/control adds
+21 bytes. Proxy records carrying credit or lifecycle controls use the strong
+authenticated-data arm when ordinary data selects a short check, so their record
+overhead is 21 bytes even with that short-check selection. Before algorithm,
+packing, fragmentation or management-body fields, TLS data totals are therefore
+26/42/14 bytes respectively, and strong feedback/control totals 26 bytes;
+genuine QUIC data totals are 21/37/9 bytes and strong feedback/control totals
+21 bytes. The short-check proxy exception raises these data totals to 26 bytes
+for TLS and 21 bytes for QUIC. Mandatory TLS records, QUIC packet protection and
+headers, IP/TCP/UDP headers, ACKs, congestion behavior and retransmissions are
+additional transport costs. TLS and QUIC may split or coalesce application
+records, so these totals are not physical packet sizes or throughput predictions.
 
 The maintained Geometry separates final and bootstrap maxima and overheads.
 `charge` is a configured admission estimate; it is never a measured physical
@@ -183,9 +190,11 @@ the mandatory outer AEAD qualification. `physical_wire_bytes_observed` remains
 false. Copied requested tuples or completion of outer authentication alone do
 not populate an effective running-owner claim.
 
-Maintained proxy and measured-proxy CLI selections currently fail explicitly
-before startup. Their integration remains required work; this restriction does
-not narrow the existing proxy, TCP-window ownership or mode-parity deliverables.
+Maintained proxy and measured-proxy CLI selections are implemented through the
+shared Common client/service API and retain the original authenticated carrier
+owners. Fresh full-service qualification and aggregate validation for the current
+cutover remain pending; implementation alone does not close the existing proxy,
+TCP-window ownership or mode-parity acceptance requirements.
 The additive same-owner reuse profile has its existing Full/native-IP/
 PerConnection catalog constraints and needs actual composition evidence.
 

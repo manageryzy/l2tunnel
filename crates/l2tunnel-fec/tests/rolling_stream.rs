@@ -104,7 +104,12 @@ fn two_independent_endpoints_cross_sixteen_windows_with_loss_and_reorder() -> Re
                 }
                 let mut wire = vec![0; config.width()?];
                 let (id, support, length) = sender.take_repair(&mut wire, now)?;
-                assert_eq!(length, wire.len());
+                let extent = (support.start..support.end)
+                    .map(|source| 2 + original(source).len())
+                    .max()
+                    .ok_or("empty repair support")?;
+                assert_eq!(length, extent);
+                wire.truncate(length);
                 let packet = Repair {
                     scope: scope(),
                     id,

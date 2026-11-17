@@ -17,18 +17,39 @@ async fn compact_wire_proxy_fixed_and_measured_keep_actual_tcp_and_retirement_fo
                     max_failed_checks: 64,
                 },
             };
-            exercise(measured, selection).await?;
+            exercise(measured, selection, 1).await?;
         }
     }
     Ok(())
 }
+#[tokio::test]
+async fn compact_hmac_proxy_preserves_four_channel_actor_and_actual_tcp_close() -> Result {
+    exercise(
+        false,
+        l2tunnel::secure_record::compact::Selection {
+            protection: l2tunnel_security::compact::Protection::HmacSha256,
+            limits: l2tunnel_security::compact::Selection {
+                max_forward_packets: 8192,
+                max_failed_checks: 64,
+            },
+        },
+        4,
+    )
+    .await
+}
 async fn exercise(
     measured: bool,
     selection: l2tunnel::secure_record::compact::Selection,
+    channels: u16,
 ) -> Result {
     timeout(Duration::from_secs(35), async {
         let hosts = support::hosts();
-        let ([a, b], profile) = fixture_wire(&hosts, true, measured, Some(selection))?;
+        let ([a, b], profile) =
+            fixture_wire_channels(&hosts, true, measured, Some(selection), channels)?;
+        assert_eq!(
+            profile.proxy_config().ok_or("proxy policy")?.mux.channels,
+            channels
+        );
         let requested = CompactWireSelection::from_selection(selection)?;
         let inspected =
             crate::cli::secure_udp_frontend::proxy_inspection_for_test(&profile, Role::Initiator)?;
@@ -37,11 +58,15 @@ async fn exercise(
             serde_json::to_value(requested)?
         );
         assert!(inspected[0]["compact_wire"]["effective"].is_null());
-        assert!(profile.clone().with_compact_wire(selection).is_err());
+        let repeated = profile.clone().with_compact_wire(selection)?;
+        assert_eq!(repeated.compact_wire(), profile.compact_wire());
+        assert_eq!(repeated.configuration()?, profile.configuration()?);
+        assert_eq!(repeated.envelope(), profile.envelope());
+        assert_eq!(repeated.data_digest(), profile.data_digest());
         assert_eq!(profile.proxy_measured_config().is_some(), measured);
         for role in [Role::Initiator, Role::Responder] {
             let contract = profile.runtime_contract(role)?;
-            assert_eq!(contract.compact_wire(), Some(selection));
+            assert_eq!(contract.compact_wire(), selection);
             assert!(contract.proxy_retirement());
             assert_eq!(
                 contract.proxy_binding(),
@@ -185,11 +210,14 @@ fn compact_wire_proxy_observation_is_pending_until_actual_driver_report() -> Res
             max_failed_checks: 64,
         },
     };
-    let legacy = profile.configuration()?;
+    let original = profile.configuration()?;
     let selected = profile.clone().with_compact_wire(selection)?;
-    assert_ne!(selected.configuration()?, legacy);
-    assert_ne!(selected.envelope(), profile.envelope());
-    assert_ne!(selected.data_digest(), profile.data_digest());
+    assert_ne!(selected.configuration()?, original);
+    // Proxy records always have strong authentication. Switching from the
+    // default full tag to a short data suite changes the authenticated selection,
+    // while the effective proxy geometry and algorithm descriptor stay equal.
+    assert_eq!(selected.envelope(), profile.envelope());
+    assert_eq!(selected.data_digest(), profile.data_digest());
     let mut changed = selection;
     changed.limits.max_failed_checks += 1;
     assert_ne!(

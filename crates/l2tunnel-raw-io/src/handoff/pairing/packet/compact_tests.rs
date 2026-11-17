@@ -1,6 +1,27 @@
 //! Actual paired raw owners with a sole external verifier and unchanged receipts.
 use super::*;
-use crate::handoff::pairing::packet::compact::{FinalAcceptance, FinalControl, FinalKind};
+use crate::handoff::pairing::packet::compact::{
+    BootstrapDirection, FinalAcceptance, FinalControl, FinalKind,
+};
+
+#[test]
+fn compact_final_raw_authenticated_source_route_retains_data_authority() {
+    for slot in 0..64 {
+        let route = if slot < 22 { 2 + slot } else { 58 + slot };
+        assert_eq!(FinalKind::inspect(&[route]), Some(FinalKind::Data));
+        assert_eq!(FinalKind::inspect(&[0x80 | slot]), Some(FinalKind::Data));
+        assert_eq!(
+            FinalKind::inspect(&[0xc0 | slot]),
+            Some(FinalKind::Feedback)
+        );
+    }
+    assert_eq!(FinalKind::inspect(&[0]), Some(FinalKind::Control));
+    assert_eq!(FinalKind::inspect(&[1]), Some(FinalKind::CarrierControl));
+    for invalid in (24..80).chain(122..128) {
+        assert_eq!(FinalKind::inspect(&[invalid]), None);
+    }
+    assert_eq!(FinalKind::inspect(&[]), None);
+}
 
 async fn tick(a: &mut PacketCarrier<Link>, b: &mut PacketCarrier<Link>) -> R {
     poll_fn(|cx| {
@@ -17,13 +38,72 @@ async fn tick(a: &mut PacketCarrier<Link>, b: &mut PacketCarrier<Link>) -> R {
 
 async fn selected(half: bool, fault: Arc<Fault>) -> R<(PacketCarrier<Link>, PacketCarrier<Link>)> {
     let (mut a, mut b) = run(half, fault, Arc::new(Fault::default()), false).await?;
-    a.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
-    b.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
+    a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
+    b.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
     for _ in 0..3 {
         tick(&mut a, &mut b).await?;
     }
     assert_eq!(a.final_context, b.final_context);
     Ok((a, b))
+}
+
+#[tokio::test]
+async fn compact_final_raw_retained_retry_checks_its_original_direction() -> R {
+    for half in [false, true] {
+        let (mut a, mut b) = run(
+            half,
+            Arc::new(Fault::default()),
+            Arc::new(Fault::default()),
+            false,
+        )
+        .await?;
+        let original_deadlines = [a.deadline, b.deadline];
+        a.enable_final_records([0x42; 32], |direction, body| {
+            body == match direction {
+                BootstrapDirection::Incoming => b"to-a",
+                BootstrapDirection::Outgoing => b"to-b",
+            }
+        })?;
+        b.enable_final_records([0x42; 32], |direction, body| {
+            body == match direction {
+                BootstrapDirection::Incoming => b"to-b",
+                BootstrapDirection::Outgoing => b"to-a",
+            }
+        })?;
+        for _ in 0..3 {
+            tick(&mut a, &mut b).await?;
+        }
+        for lane in [PairLane::First, PairLane::Second]
+            .into_iter()
+            .take(if half { 2 } else { 1 })
+        {
+            assert!(matches!(
+                a.stage_bootstrap_record_tracked(lane, RecordKind::Feedback, b"to-a"),
+                Err(Error::Configuration)
+            ));
+            let a_token = a.stage_bootstrap_record_tracked(lane, RecordKind::Feedback, b"to-b")?;
+            let b_token = b.stage_bootstrap_record_tracked(lane, RecordKind::Feedback, b"to-a")?;
+            for _ in 0..3 {
+                tick(&mut a, &mut b).await?;
+            }
+            assert_eq!(
+                a.take_sent_record(lane)?
+                    .ok_or("local retry receipt")?
+                    .token,
+                a_token
+            );
+            assert_eq!(
+                b.take_sent_record(lane)?.ok_or("peer retry receipt")?.token,
+                b_token
+            );
+            assert_eq!(a.record().ok_or("local retry input")?.bytes, b"to-a");
+            assert_eq!(b.record().ok_or("peer retry input")?.bytes, b"to-b");
+            a.consume_record()?;
+            b.consume_record()?;
+        }
+        assert_eq!([a.deadline, b.deadline], original_deadlines);
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -36,7 +116,7 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         assert_eq!(geometry.record_overhead_bytes, 0);
         assert_eq!(geometry.max_record_bytes, 536);
         assert!(matches!(
-            a.stage_record(PairLane::First, RecordKind::Data, b"legacy"),
+            a.stage_setup_record(PairLane::First, RecordKind::Data, b"legacy"),
             Err(Error::Configuration)
         ));
         let protected = [0x80, 0, 0, 0, 0, 0x41, 0x42, 0x43, 0x44];
@@ -238,11 +318,12 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
         .await?;
         let deadline = a.setup_deadline();
         assert!(matches!(
-            a.enable_final_records([0; 32], |_| true),
+            a.enable_final_records([0; 32], |_, _| true),
             Err(Error::Configuration)
         ));
         assert!(a.fault.is_none());
-        let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
+        let token =
+            a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
         poll_fn(|cx| {
             for carrier in [&mut a, &mut b] {
                 if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -272,11 +353,10 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
         }
         tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
         assert_eq!(Instant::now(), deadline);
-        // The active raw lease is still live: only first final activation's
-        // original setup cap has expired, independently of active liveness.
-        a.check_live()?;
+        // The original setup cap bounds every pre-final operation, including
+        // activation, even when the raw liveness lease would still be live.
         assert!(matches!(
-            a.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail"),
+            a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail"),
             Err(Error::Expired)
         ));
         assert_eq!(a.setup_deadline(), deadline);
@@ -285,7 +365,7 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
         assert!(a.records.is_empty());
         assert!(matches!(a.fault, Some(Error::Expired)));
         assert!(matches!(
-            a.enable_final_records([0; 32], |_| true),
+            a.enable_final_records([0; 32], |_, _| true),
             Err(Error::Expired)
         ));
         let observed = a.take_sent_record_observed(PairLane::First)?;
@@ -304,7 +384,7 @@ async fn compact_final_raw_activation_at_setup_deadline_is_terminal_and_preserve
 async fn compact_final_raw_bootstrap_cap_and_existing_custody_are_not_renewed() -> R {
     let fault = Arc::new(Fault::default());
     let (mut a, mut b) = run(false, fault.clone(), Arc::new(Fault::default()), false).await?;
-    let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
+    let token = a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
     let pending = a.lanes[0]
         .as_ref()
         .ok_or("lane")?
@@ -314,8 +394,8 @@ async fn compact_final_raw_bootstrap_cap_and_existing_custody_are_not_renewed() 
         .bytes
         .clone();
     let deadline = a.deadline;
-    a.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
-    b.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
+    a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
+    b.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
     assert_eq!(a.deadline, deadline);
     assert_eq!(
         a.lanes[0]
@@ -351,7 +431,7 @@ async fn compact_final_raw_bootstrap_cap_and_existing_custody_are_not_renewed() 
     assert!(lock(&lane.io.state)?.opener.is_none());
     assert_eq!(lane.last_alive, original_liveness);
     assert!(matches!(
-        a.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail"),
+        a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail"),
         Err(Error::Configuration)
     ));
     assert!(a.final_records_enabled());
@@ -411,9 +491,9 @@ async fn compact_final_raw_strong_liveness_uses_every_original_lane() -> R {
 async fn compact_final_raw_blocked_bootstrap_ciphertext_cannot_outlive_original_cap() -> R {
     let fault = Arc::new(Fault::default());
     let (mut a, mut b) = run(false, fault.clone(), Arc::new(Fault::default()), false).await?;
-    a.stage_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
-    a.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
-    b.enable_final_records([0x42; 32], |bytes| bytes == b"setup-tail")?;
+    a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"setup-tail")?;
+    a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
+    b.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
     fault.block_all.store(true, Ordering::SeqCst);
     tick(&mut a, &mut b).await?;
     assert!(fault.pending.lock().map_err(|_| "lock")?.is_some());

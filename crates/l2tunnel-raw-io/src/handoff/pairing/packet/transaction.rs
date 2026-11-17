@@ -74,10 +74,11 @@ impl<I: PacketIo> Detached<I> {
         if state.final_context.is_some()
             && (Instant::now() >= state.deadline
                 || match kind {
-                    wire::Kind::Data | wire::Kind::Feedback => state
-                        .bootstrap_filter
-                        .as_ref()
-                        .is_none_or(|allow| !allow(body)),
+                    wire::Kind::Data | wire::Kind::Feedback => {
+                        state.bootstrap_filter.as_ref().is_none_or(|allow| {
+                            !allow(super::compact::BootstrapDirection::Outgoing, body)
+                        })
+                    }
                     wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck => false,
                     _ => true,
                 })
@@ -1023,7 +1024,9 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             return Err(e.clone());
         }
         let now = Instant::now();
-        if !self.ready && now >= self.deadline {
+        // Exporter ownership is initial-only. An unactivated carrier cannot
+        // keep an obsolete steady-state data/control path alive beyond setup.
+        if self.final_context.is_none() && now >= self.deadline {
             return Err(Error::Expired);
         }
         if self.ready
@@ -1444,15 +1447,21 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     pub fn info(&self) -> &PairInfo {
         &self.info
     }
-    /// Copy one admitted upper recovery record into the finite carrier slot.
-    pub fn stage_record(
+    /// Copy one initial Noise/member setup record into the finite carrier slot.
+    /// This exporter-protected path ends at the original setup deadline and is
+    /// unavailable after final Records activation. User traffic uses final Records.
+    pub fn stage_setup_record(
         &mut self,
         lane: PairLane,
         kind: RecordKind,
         bytes: &[u8],
     ) -> Result<(), Error> {
+        self.check_live()?;
         if self.final_context.is_some() {
             return Err(Error::Configuration);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(self.fail(Error::Expired));
         }
         self.stage_bootstrap_inner(lane, kind, bytes)
     }
@@ -1487,14 +1496,15 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             Ok(()) => Ok(()),
         }
     }
-    /// Reserve a bounded completion cell and stage one exact recovery record.
+    /// Reserve a bounded completion cell and stage one exact initial setup record.
     /// A successful return is admission only; consume its actual send receipt.
-    pub fn stage_record_tracked(
+    pub fn stage_setup_record_tracked(
         &mut self,
         lane: PairLane,
         kind: RecordKind,
         bytes: &[u8],
     ) -> Result<RecordToken, Error> {
+        self.check_live()?;
         let index = lane.index();
         let owner = self
             .lanes
@@ -1504,7 +1514,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if owner.completed.is_some() || owner.tracked.is_some() {
             return Err(Error::Busy);
         }
-        self.stage_record(lane, kind, bytes)?;
+        self.stage_setup_record(lane, kind, bytes)?;
         let owner = self.lanes[index].as_mut().ok_or(Error::Proof)?;
         let token = RecordToken(owner.pending.as_ref().ok_or(Error::Proof)?.end);
         owner.tracked = Some(token);

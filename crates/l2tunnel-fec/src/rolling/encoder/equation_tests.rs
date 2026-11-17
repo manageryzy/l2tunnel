@@ -97,7 +97,15 @@ fn research_equation_actual_python_payload_rows() -> Result<(), Box<dyn std::err
                 .step_by(2)
                 .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16))
                 .collect();
-            assert_eq!(actual.bytes, expected?.as_slice(), "{line}");
+            let extent = 2
+                + (support.start..support.end)
+                    .map(|source| 1 + source as usize % 19)
+                    .max()
+                    .ok_or(Error::Identity)?;
+            assert_eq!(actual.bytes.len(), extent, "{line}");
+            let mut expanded = vec![0; config().width()?];
+            expanded[..actual.bytes.len()].copy_from_slice(actual.bytes);
+            assert_eq!(expanded, expected?, "{line}");
             equations += 1;
         }
     }

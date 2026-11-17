@@ -19,7 +19,7 @@ pub(in crate::service::owner) async fn establish(
     } = authenticate(shared, plan, accepted, deadline, requested, outer_config).await?;
     let info = parts.info;
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_readable().inspect_err(|_| {
+    let device = plan.open_native().inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
     })?;
     check(deadline)?;
@@ -229,7 +229,7 @@ fn authenticate<'a>(
 // its constructor frames outside the selected service future's poll nesting.
 #[inline(never)]
 fn make_runtime_on_carrier(
-    device: crate::swift::Native,
+    device: crate::native::Native,
     parts: member::carrier::InitialParts,
     contract: transport::CommonTransactionContract,
     requests: transport::CommonControlRequests,

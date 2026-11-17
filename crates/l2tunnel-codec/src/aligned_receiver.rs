@@ -514,7 +514,7 @@ impl Receiver {
         Ok(shadow)
     }
     /// Classify a complete symbol using this receiver's actual scope and parser.
-    /// Only an unfragmented self-contained kind-2 frame within the explicitly
+    /// Only an unfragmented self-contained raw/LZ4 frame within the explicitly
     /// configured generic size limit qualifies. This grants no authentication,
     /// admission or native credit and changes no receiver state.
     pub fn is_independent_short(
@@ -528,8 +528,8 @@ impl Receiver {
         let parsed = parse(symbol, identity.record, self.limits)?;
         Ok(self.limits.body.independent_short_frame_bytes != 0
             && parsed.fragments == 0
-            && parsed.body.first() == Some(&2)
-            && parsed.body.len() - 3 <= self.limits.body.independent_short_frame_bytes)
+            && independent_length(parsed.body)
+                .is_some_and(|length| length <= self.limits.body.independent_short_frame_bytes))
     }
     /// Admit one authenticated complete protected symbol; errors consume no source ID.
     pub fn admit_authenticated(
@@ -708,11 +708,11 @@ impl Receiver {
                             && entry.complete()
                             && entry.pieces.is_empty()
                             && !entry.early_delivered
-                            && entry.bytes.first() == Some(&2)
                             && self.limits.body.independent_short_frame_bytes != 0
-                            && entry.bytes.len() - 3
-                                <= self.limits.body.independent_short_frame_bytes)
-                            .then_some((entry.id, i))
+                            && independent_length(&entry.bytes).is_some_and(|length| {
+                                length <= self.limits.body.independent_short_frame_bytes
+                            }))
+                        .then_some((entry.id, i))
                     })
                     .min_by_key(|(id, _)| *id)
                     .map(|(_, i)| i)
@@ -1021,6 +1021,16 @@ fn parse(symbol: &[u8], record: RecordId, limits: Limits) -> Result<Parsed<'_>, 
         })
     }
 }
+fn independent_length(body: &[u8]) -> Option<usize> {
+    let offset = match *body.first()? {
+        2 => 1,
+        crate::aligned_body::LZ4_TAG => 3,
+        _ => return None,
+    };
+    let length = body.get(offset..offset + 2)?;
+    Some(usize::from(u16::from_be_bytes([length[0], length[1]])))
+}
+
 pub(crate) fn explicit_length(body: &[u8]) -> Result<usize, Error> {
     if body.len() < 3 {
         return Err(Error::Malformed);
@@ -1032,6 +1042,14 @@ pub(crate) fn explicit_length(body: &[u8]) -> Result<usize, Error> {
         8 if (40..=crate::tcp_header::MAX_IP_HEADER_BYTES).contains(&size) => {}
         1 => cursor += 23,
         2 => {}
+        crate::aligned_body::LZ4_TAG => {
+            let original = body.get(3..5).ok_or(Error::Malformed)?;
+            let original = usize::from(u16::from_be_bytes([original[0], original[1]]));
+            if size == 0 || size + 2 >= original {
+                return Err(Error::Malformed);
+            }
+            cursor += 2;
+        }
         3 | 9 => {
             let mask = *body.get(cursor).ok_or(Error::Malformed)?;
             cursor += 1;

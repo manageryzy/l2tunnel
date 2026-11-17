@@ -327,8 +327,7 @@ impl Config {
     }
     pub(super) fn max_user(&self) -> io::Result<usize> {
         self.runtime
-            .codec()?
-            .max_encoded_len()
+            .max_packet
             .max(
                 self.relay
                     .max_record_bytes
@@ -400,7 +399,7 @@ impl Config {
             || self.mux.per_flow_records == 0
             || self.mux.per_flow_records > self.mux.queue_records
             || self.mux.per_flow_bytes > self.mux.queue_bytes
-            || self.mux.per_flow_bytes < self.max_user()? + 48
+            || self.mux.per_flow_bytes < self.max_user()? + super::record::FRAME_OVERHEAD
             || self.delivery.transparent_packets == 0
             || self.delivery.transparent_packets > 1024
             || self.delivery.transparent_bytes < self.runtime.max_packet
@@ -428,7 +427,10 @@ impl Config {
             .and_then(|v| v.checked_add(self.delivery.native_queue_bytes))
             .and_then(|v| v.checked_add(self.delivery.transparent_bytes))
             .and_then(|v| {
-                v.checked_add((self.runtime.queue_packets + 8) * (self.max_user().ok()? + 48))
+                v.checked_add(
+                    (self.runtime.queue_packets + 8)
+                        * (self.max_user().ok()? + super::record::FRAME_OVERHEAD),
+                )
             })
             .and_then(|v| v.checked_add(65536 + 4 * self.runtime.max_packet))
             .filter(|v| *v <= 268_435_456)
@@ -457,7 +459,7 @@ impl Config {
 pub fn session_config(config: &Config) -> io::Result<SessionConfig> {
     config.validate()?;
     let mut h = ring::digest::Context::new(&ring::digest::SHA256);
-    h.update(b"l2tunnel/tun-tcp-proxy-runtime/v1/retained-tls/crc32/fixed-credit/local-system-random-u64-v1\0");
+    h.update(b"l2tunnel/tun-tcp-proxy-runtime/v2/common-record-union/fixed-credit/local-system-random-u64-v1\0");
     h.update(&[
         1,
         u8::from(config.duplex == Duplex::Half),

@@ -9,10 +9,15 @@ use l2tunnel::{record_bank::storage, record_engine as engine};
 mod managed;
 #[path = "transport_common_provision.rs"]
 mod provision;
+#[cfg(unix)]
 #[path = "transport_common_proxy.rs"]
 mod proxy_records;
 pub use managed::run_common_on_carrier;
-pub(crate) use proxy_records::{run_common_proxy_records, run_common_proxy_records_on_raw};
+#[cfg(unix)]
+pub(crate) use proxy_records::{
+    run_common_proxy_records, run_common_proxy_records_on_maintained,
+    run_common_proxy_records_on_raw,
+};
 #[path = "transport_common_raw.rs"]
 mod raw;
 pub use raw::run_common_on_raw;
@@ -37,16 +42,22 @@ pub struct SameFlowRecovery {
     pub retry_at_micros: Option<u64>,
 }
 
-/// Actual generic transaction state, separate from legacy Swift policy status.
+/// Actual Common transaction and retained-carrier observations.
 #[derive(Clone, Debug)]
 pub struct CommonSnapshot {
+    /// Independent native delivery owners in actual current/draining epochs.
+    pub native_delivery: [Option<NativeDeliverySnapshot>; 2],
     /// Actual maintained TLS/QUIC policy and original authenticated lanes.
     /// Its geometry is an admission allowance, not a measured wire-byte total.
     pub maintained: Option<crate::secure_udp::maintained::Authenticated>,
     /// Actual local send completion boundary used to start recovery timers.
     pub send_boundary: crate::secure_udp::SendBoundary,
-    /// Explicit selected final record format; None preserves legacy framing.
+    /// Actual installed final record format, populated by every Common owner.
     pub compact_wire: Option<record::compact::Selection>,
+    /// Proxy records contain control and always require strong authentication.
+    pub authenticated_proxy_records: bool,
+    /// Actual final record data framing and protection bytes, excluding carrier cost.
+    pub effective_data_overhead_bytes: usize,
     /// Actual single-protection geometry installed on the original raw owner.
     pub raw_final_geometry: Option<l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry>,
     /// Last actual strong feedback PN, independent from the Data repair seed.
@@ -139,6 +150,19 @@ pub struct CommonSnapshot {
     pub path_recovery: SameFlowRecovery,
     /// Original bounded terminal category, absent while running.
     pub terminal: Option<StopReason>,
+}
+
+/// Actual native-byte window status, separate from recovery debt and TCP cwnd.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeDeliverySnapshot {
+    /// Exact original negotiated data epoch.
+    pub epoch: u64,
+    /// Exact complete policy owning these counters.
+    pub configuration: security::ConfigDigest,
+    /// Local actual admission, full-carrier acceptance and peer-device delivery.
+    pub send: Option<l2tunnel::flow_control::delivery_window::Status>,
+    /// A completed local native write awaits reliable control admission.
+    pub pending_receipt: bool,
 }
 
 /// Explicit generic local termination; no peer-confirmed clean close is implied.
@@ -243,6 +267,7 @@ pub(super) struct PendingIngress {
     pub(super) deadline: u64,
 }
 pub(super) struct Runtime {
+    #[cfg(unix)]
     pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
     pub(super) reuse_owner: Option<owner::StateCell<super::common_reuse::Installed>>,
     pub(super) contract: CommonTransactionContract,
@@ -291,7 +316,7 @@ pub fn run_common<D>(
     observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> impl Future<Output = io::Result<CommonStopped>> + Send
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     // This is actual ownership, not a copied Driver or a future-only box: the
     // same initialized security, Bank, socket and native owners enter the loop.
@@ -310,7 +335,7 @@ async fn run_prepared_common<D, R: super::raw_carrier::RawBacking>(
     mut observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> io::Result<CommonStopped>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     let PreparedRuntime {
         device,
@@ -324,7 +349,6 @@ where
         &mut driver,
         setup_deadline,
         Requests::Common(requests),
-        None,
         shutdown,
         move |driver, now, running| {
             observe(&driver.snapshot_common(now, running)?);
@@ -358,7 +382,7 @@ fn prepare_common_runtime<D>(
     contract: CommonTransactionContract,
 ) -> io::Result<PreparedRuntime<D>>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {
@@ -415,14 +439,9 @@ fn reserve_common_state(
         config.ack_coalescing,
         config.rolling_ingress,
         config.rolling_fragments,
-        contract
-            .compact_wire()
-            .map(|_| contract.feedback_overhead_bytes())
-            .transpose()?,
+        Some(contract.feedback_overhead_bytes()?),
     )?;
-    if contract.compact_wire().is_some() {
-        bank.enable_compact_wire(contract.feedback_overhead_bytes()?)?;
-    }
+    bank.enable_compact_wire(contract.feedback_overhead_bytes()?)?;
     let state = transactions::CommonState::new(
         identity,
         core::Epoch(config.data_epoch.0),
@@ -468,12 +487,13 @@ impl Driver {
         origin: Instant,
         finish: impl FnOnce(tokio::net::UdpSocket, Self) -> io::Result<T>,
     ) -> io::Result<T> {
-        if contract.refresh_selection().is_some()
-            || contract.extra_wire_bytes() != 0
+        if contract.extra_wire_bytes() != 0
             || contract.raw_outer().is_some()
             || contract.maintained_outer().is_some()
         {
-            return Err(invalid("legacy Common requires unselected legacy contract"));
+            return Err(invalid(
+                "original UDP Common requires the original UDP contract",
+            ));
         }
         contract.validate_outer(None)?;
         let addresses = (parts.socket.local_addr()?, parts.socket.peer_addr()?);
@@ -524,10 +544,10 @@ impl Driver {
         contract.resolve(contract.initial())?;
         let config = contract.resources();
         let ip = contract.physical_overhead_bytes()?;
-        let control_scope = contract.fixed_control_scope().unwrap_or(Scope {
+        let control_scope = Scope {
             epoch: config.control_epoch,
             configuration: expected,
-        });
+        };
         let data_scope = Scope {
             epoch: config.data_epoch,
             configuration: security::ConfigDigest(contract.data_digest().0),
@@ -544,64 +564,25 @@ impl Driver {
             remote: mg::EndpointId(if role == mg::Role::Client { 2 } else { 1 }),
             lane: mg::LaneId(LANE),
         };
-        let records = match input.material {
-            establish::InitialMaterial::Legacy(root) => {
-                if contract.refresh_selection().is_some() {
-                    return Err(invalid("legacy material cannot install managed Records"));
-                }
-                if let Some(selection) = contract.compact_wire() {
-                    record::Records::new_compact_with_layout(
-                        root,
-                        security::LaneId(LANE),
-                        config.security,
-                        input.cover,
-                        control_scope,
-                        data_scope,
-                        selection,
-                        if contract.on_outer_carrier() || contract.raw_outer().is_some() {
-                            record::compact::Layout::Carrier
-                        } else {
-                            record::compact::Layout::Original
-                        },
-                    )
-                } else {
-                    record::Records::new(
-                        root,
-                        security::LaneId(LANE),
-                        config.security,
-                        security::Protection::ChaCha20Poly1305,
-                        input.cover,
-                        control_scope,
-                        data_scope,
-                    )
-                }
-            }
-            establish::InitialMaterial::Managed(initial) => {
-                if Some(initial.selection()) != contract.refresh_selection()
-                    || initial.authenticated() != input.info.authenticated
-                {
-                    return Err(invalid(
-                        "managed contract differs from actual initial authority",
-                    ));
-                }
-                let elapsed = Instant::now()
-                    .checked_duration_since(origin)
-                    .ok_or_else(|| invalid("managed original clock is in the future"))?;
-                let now = u64::try_from(elapsed.as_micros()).map_err(invalid)?;
-                let expires = u64::try_from(config.lifetime.lease.as_micros()).map_err(invalid)?;
-                record::Records::new_refreshable(
-                    initial,
-                    security::LaneId(LANE),
-                    config.security,
-                    security::Protection::ChaCha20Poly1305,
-                    input.cover,
-                    control_scope,
-                    data_scope,
-                    l2tunnel::handshake::Time(now),
-                    l2tunnel::handshake::Time(expires),
-                )
-            }
-        }
+        let establish::InitialMaterial::Legacy(root) = input.material else {
+            return Err(invalid(
+                "Common requires the initial-only authenticated root",
+            ));
+        };
+        let records = record::Records::new_compact_with_layout(
+            root,
+            security::LaneId(LANE),
+            config.security,
+            input.cover,
+            control_scope,
+            data_scope,
+            contract.compact_wire(),
+            if contract.on_outer_carrier() || contract.raw_outer().is_some() {
+                record::compact::Layout::Carrier
+            } else {
+                record::compact::Layout::Original
+            },
+        )
         .map_err(invalid)?;
         let capacity = records
             .capacity(config.security.max_body_bytes)
@@ -665,8 +646,8 @@ impl Driver {
         } else {
             0
         };
-        // Common-only state has its own real cell; inactive legacy Drivers carry
-        // only the header. Validate and charge the payload before provisioning.
+        // Common state has its own cell. Validate and charge the complete
+        // payload before provisioning.
         std::alloc::Layout::array::<Runtime>(1).map_err(io::Error::other)?;
         let external = std::mem::size_of::<Driver>()
             .checked_add(std::mem::size_of::<owner::StateCell<Driver>>())
@@ -699,34 +680,19 @@ impl Driver {
             epoch: config.data_epoch.0,
             role,
         };
-        let initial_plan = if contract.compact_wire().is_some() {
-            engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
-                contract.initial(),
-                context,
-                contract.geometry(),
-                contract.native_limits()?,
-                config.ack_coalescing,
-                config.rolling_ingress,
-                common_contract::selected_fragment_policy(
-                    &contract.initial(),
-                    config.rolling_fragments,
-                ),
-                contract.feedback_overhead_bytes()?,
-            )
-        } else {
-            engine::storage::Plan::for_engine_with_fragmentation(
-                contract.initial(),
-                context,
-                contract.geometry(),
-                contract.native_limits()?,
-                config.ack_coalescing,
-                config.rolling_ingress,
-                common_contract::selected_fragment_policy(
-                    &contract.initial(),
-                    config.rolling_fragments,
-                ),
-            )
-        }
+        let initial_plan = engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+            contract.initial(),
+            context,
+            contract.geometry(),
+            contract.native_limits()?,
+            config.ack_coalescing,
+            config.rolling_ingress,
+            common_contract::selected_fragment_policy(
+                &contract.initial(),
+                config.rolling_fragments,
+            ),
+            contract.feedback_overhead_bytes()?,
+        )
         .map_err(invalid)?;
         let bank_plan = l2tunnel::record_bank::storage::Plan::for_bank(initial_plan, external)
             .map_err(invalid)?;
@@ -808,6 +774,7 @@ impl Driver {
                 .map(|interval| add(0, interval))
                 .transpose()?;
             let common = owner::StateCell::new(Runtime {
+                #[cfg(unix)]
                 proxy_bridge: None,
                 reuse_owner,
                 contract,
@@ -853,38 +820,17 @@ impl Driver {
                     outer: input.next_outer,
                     records,
                     owner: owner::DataOwner::Common(owner),
-                    generic: None,
                     common: Some(common),
-                    send: config.send,
-                    receive: config.receive,
                     source_scope: data_scope,
                     feedback_scope: data_scope,
                     target: None,
                     transaction_origin: None,
-                    resolved: None,
                     control,
-                    policy_source: None,
-                    policy_cap: None,
-                    pending_outcome: None,
                     control_work: false,
-                    waiting: None,
                     buffers,
                     inputs: Some(inputs),
                     envelope_rx: 1,
                     native: common_native::OutputQueue::Common(native),
-                    // Inactive compatibility storage: width zero cannot authorize a
-                    // Swift completion. Common uses its actual Engine tokens/counts.
-                    written: NativeWritten {
-                        origin: NativeOrigin::new(
-                            &input.info,
-                            data_scope,
-                            records::Direction::Receive,
-                        ),
-                        channels: 0,
-                        counts: [0; swift::MAX_CHANNELS],
-                    },
-                    retired_send: None,
-                    retired_receive: None,
                     bucket: Bucket::new(send_rate, burst),
                     reserve,
                     ip,
@@ -927,7 +873,34 @@ impl Driver {
         counters.native_pending_bytes = self.native.bytes();
         counters.native_storage_capacity_bytes = self.native.capacity_bytes();
         counters.workspace_capacity_bytes = self.buffers.capacity_bytes();
+        let mut native_delivery = [None; 2];
+        for (index, epoch) in self.common_epochs().into_iter().flatten().enumerate() {
+            let engine = state.engine(epoch)?;
+            let send = engine
+                .native_window_status(engine::Tick(now))
+                .map_err(protocol)?;
+            let pending_receipt = engine.pending_native_delivery().is_some();
+            let local = engine
+                .configuration()
+                .descriptor()
+                .local(common_contract::mg_role(self.info.role));
+            if send.is_some()
+                || matches!(
+                    local.receive().common().native_window(),
+                    l2tunnel::record_configuration::NativeWindow::Delivery(_)
+                )
+            {
+                native_delivery[index] = Some(NativeDeliverySnapshot {
+                    epoch: epoch.0,
+                    configuration: common_actions::common_scope(epoch, engine.configuration())?
+                        .configuration,
+                    send,
+                    pending_receipt,
+                });
+            }
+        }
         Ok(CommonSnapshot {
+            native_delivery,
             maintained: runtime.contract.maintained_outer(),
             send_boundary: runtime
                 .contract
@@ -935,8 +908,19 @@ impl Driver {
                 .map_or(crate::secure_udp::SendBoundary::SocketAccepted, |outer| {
                     outer.requested().kind.send_boundary()
                 }),
-            compact_wire: runtime.contract.compact_wire(),
-            compact_check_status: self.records.compact_check_status(),
+            compact_wire: Some(runtime.contract.compact_wire()),
+            authenticated_proxy_records: runtime.contract.proxy_binding().is_some(),
+            effective_data_overhead_bytes: {
+                let selection = runtime.contract.compact_wire();
+                if runtime.contract.proxy_binding().is_some() {
+                    selection
+                        .data_overhead()
+                        .max(record::compact::AUTHENTICATED_OVERHEAD)
+                } else {
+                    selection.data_overhead()
+                }
+            },
+            compact_check_status: Some(self.records.compact_check_status()),
             compact_feedback_number: runtime.compact_feedback_number,
             raw_final_geometry: runtime.raw_final_geometry,
             running,

@@ -1,3 +1,4 @@
+//! Original-owner bootstrap transport and setup-only custody under its fixed cap.
 use super::super::test_support::{self as support, PacketLink, Probe, R};
 use super::*;
 use std::{future::poll_fn, sync::atomic::Ordering};
@@ -76,7 +77,7 @@ async fn transfer(
     kind: RecordKind,
     bytes: &[u8],
 ) -> R {
-    a.stage_record(lane, kind, bytes)?;
+    a.stage_setup_record(lane, kind, bytes)?;
     poll_fn(|cx| {
         if let Poll::Ready(Err(e)) = a.poll_progress(cx) {
             return Poll::Ready(Err(e));
@@ -99,7 +100,7 @@ async fn transfer(
     Ok(())
 }
 #[tokio::test]
-async fn actual_original_full_tls_packet_transition_and_bidirectional_records() -> R {
+async fn actual_original_full_tls_packet_transition_and_bidirectional_setup_records() -> R {
     let (mut a, mut b, probes) = transitioned(false).await?;
     transfer(
         &mut a,
@@ -124,7 +125,7 @@ async fn actual_original_full_tls_packet_transition_and_bidirectional_records() 
     Ok(())
 }
 #[tokio::test]
-async fn actual_original_half_tls_packet_transition_and_bulk_direction() -> R {
+async fn actual_original_half_tls_packet_transition_and_setup_direction() -> R {
     let (mut a, mut b, probes) = transitioned(true).await?;
     transfer(
         &mut a,
@@ -151,7 +152,7 @@ async fn actual_original_half_tls_packet_transition_and_bulk_direction() -> R {
     )
     .await?;
     assert!(matches!(
-        a.stage_record(PairLane::Second, RecordKind::Data, b"wrong lane"),
+        a.stage_setup_record(PairLane::Second, RecordKind::Data, b"wrong lane"),
         Err(Error::Configuration)
     ));
     a.abort();
@@ -193,7 +194,7 @@ async fn tracked_record_requires_actual_send_and_preserves_original_receipt_time
     let (mut a, mut b, probes) = transitioned(false).await?;
     probes[0].blocked.store(true, Ordering::SeqCst);
     let token =
-        a.stage_record_tracked(PairLane::First, RecordKind::Data, b"exact tracked bytes")?;
+        a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"exact tracked bytes")?;
     let deadline = Instant::now() + Duration::from_secs(3);
     tokio::time::timeout_at(
         deadline,
@@ -217,7 +218,7 @@ async fn tracked_record_requires_actual_send_and_preserves_original_receipt_time
     .await??;
     assert!(a.take_sent_record(PairLane::First)?.is_none());
     assert!(matches!(
-        a.stage_record_tracked(PairLane::First, RecordKind::Data, b"cannot replace pending"),
+        a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"cannot replace pending"),
         Err(Error::Busy)
     ));
     let released = Instant::now();
@@ -241,7 +242,7 @@ async fn tracked_record_requires_actual_send_and_preserves_original_receipt_time
     )
     .await??;
     assert!(matches!(
-        a.stage_record_tracked(
+        a.stage_setup_record_tracked(
             PairLane::First,
             RecordKind::Data,
             b"completion slot remains owned"

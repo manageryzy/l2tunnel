@@ -12,7 +12,7 @@ pub fn run_common_on_maintained<D>(
     observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> impl Future<Output = io::Result<CommonStopped>> + Send
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     run_prepared_common(
         prepare(device, parts, contract),
@@ -28,7 +28,7 @@ fn prepare<D>(
     contract: CommonTransactionContract,
 ) -> io::Result<PreparedRuntime<D>>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {

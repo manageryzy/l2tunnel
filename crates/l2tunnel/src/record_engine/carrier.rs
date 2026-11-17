@@ -163,6 +163,11 @@ impl Engine {
         }
         let early_feedback =
             self.research_fragment_feedback_at_completion(now, accepted, order, true);
+        let native_confirmation = self
+            .native_window
+            .as_mut()
+            .map(|w| w.confirm(now, accepted))
+            .transpose();
         let timing = self.advance(now);
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
@@ -192,6 +197,7 @@ impl Engine {
         };
         let later_feedback =
             self.research_fragment_feedback_at_completion(now, accepted, order, false);
+        native_confirmation?;
         timing?;
         early_feedback?;
         match result {

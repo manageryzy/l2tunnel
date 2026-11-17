@@ -31,16 +31,8 @@ pub use l2tunnel_codec::aligned_receiver::{
 /// Exact issuing Reliable output awaiting whole-carrier acceptance.
 pub use l2tunnel_reliable::PreparedOutput;
 
-/// Explicit authenticated native interpretation; never inferred from packet bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativePolicy {
-    /// Ethernet eligibility checks select header compression or exact raw fallback.
-    EthernetHeaders,
-    /// Native IP is always an exact kind-2 raw body, including fragmented packets.
-    RawIp,
-    /// Native IPv4/IPv6 TCP uses explicit IP contexts/deltas, with exact raw fallback.
-    IpHeaders,
-}
+mod native_policy;
+pub use native_policy::NativePolicy;
 
 /// Complete immutable policy, including exact external wire charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,13 +61,16 @@ impl Config {
         )
     }
     fn validate_geometry(self, original: usize, minimum_source_window: usize) -> Result<(), Error> {
+        if !self.native_policy.available() {
+            return Err(Error::Configuration);
+        }
         self.receiver
             .memory_bound_bytes()
             .map_err(Error::Receiver)?;
         sender_config(self)
             .memory_bound_bytes()
             .map_err(Error::Sender)?;
-        if self.native_policy == NativePolicy::RawIp
+        if self.native_policy.is_stateless()
             && (self.receiver.body.elide_payload_length
                 || self.receiver.body.predictive
                 || self.receiver.body.timestamp_pair_dictionary)
@@ -130,11 +125,7 @@ impl Config {
         Ok(config_hash(&bytes))
     }
     fn append_fields(self, bytes: &mut Vec<u8>) {
-        bytes.push(match self.native_policy {
-            NativePolicy::EthernetHeaders => 1,
-            NativePolicy::RawIp => 2,
-            NativePolicy::IpHeaders => 3,
-        });
+        bytes.push(self.native_policy.wire());
         let limits = self.receiver;
         let body = limits.body;
         for value in [
@@ -962,6 +953,8 @@ impl Endpoint {
     /// Service injected receiver/handoff time while idle; recovery needs polls too.
     pub fn tick(&mut self, now: Duration) -> Result<(), Error> {
         self.advance(now)?;
+        let result = self.recovery.tick(now).map_err(Error::Recovery);
+        self.terminal_result(result)?;
         if self.packing.is_some() {
             self.pump_send()?;
         }
@@ -986,7 +979,24 @@ impl Endpoint {
             .map_err(Error::Recovery)
     }
 
-    /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
+    /// Terminal receiver/handoff caps, excluding recoverable FEC-cache eviction.
+    pub fn custody_deadline(&self) -> Option<Duration> {
+        if self.failure.is_some() {
+            return None;
+        }
+        self.handoff
+            .map(|(_, _, deadline)| deadline)
+            .into_iter()
+            .chain(
+                self.receiver
+                    .deadline()
+                    .map(|tick| Duration::from_millis(tick.0)),
+            )
+            .min()
+    }
+
+    /// Receive-maintenance expiry and terminal custody caps, excluding output wakes.
+    /// FEC-cache eviction is a service wake, not a retained outgoing packet cap.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         if self.failure.is_some() {
             return None;
@@ -994,12 +1004,7 @@ impl Endpoint {
         self.recovery
             .expiry_deadline()
             .into_iter()
-            .chain(self.handoff.map(|(_, _, deadline)| deadline))
-            .chain(
-                self.receiver
-                    .deadline()
-                    .map(|tick| Duration::from_millis(tick.0)),
-            )
+            .chain(self.custody_deadline())
             .min()
     }
 
@@ -1234,13 +1239,8 @@ impl Endpoint {
             if view.identity.source.0 != id {
                 return self.fail(Error::Identity);
             }
-            if self.receive_config.native_policy == NativePolicy::RawIp {
-                let symbol = view.symbol;
-                let raw = symbol[3] == 2;
-                let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-                if !raw && !fragment {
-                    return self.fail(Error::Policy);
-                }
+            if !self.receive_config.native_policy.accepts_unit(view.symbol) {
+                return self.fail(Error::Policy);
             }
             match self
                 .receiver
@@ -1295,13 +1295,8 @@ impl Endpoint {
                 if view.identity.source.0 != id {
                     return Err(Error::Identity);
                 }
-                if self.receive_config.native_policy == NativePolicy::RawIp {
-                    let symbol = view.symbol;
-                    let raw = symbol[3] == 2;
-                    let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-                    if !raw && !fragment {
-                        return Err(Error::Policy);
-                    }
+                if !self.receive_config.native_policy.accepts_unit(view.symbol) {
+                    return Err(Error::Policy);
                 }
                 match self
                     .receiver
@@ -1536,12 +1531,8 @@ fn packed_inputs<'a>(
     for (unit, symbol) in units.zip(scratch.chunks_exact_mut(width)) {
         symbol.fill(0);
         symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
-        if config.native_policy == NativePolicy::RawIp {
-            let raw = symbol[3] == 2;
-            let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-            if !raw && !fragment {
-                return Err(Error::Policy);
-            }
+        if !config.native_policy.accepts_unit(symbol) {
+            return Err(Error::Policy);
         }
         output[received] = receiver::AuthenticatedSymbol {
             identity: unit.identity,

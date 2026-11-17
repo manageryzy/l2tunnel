@@ -142,7 +142,7 @@ fn originals(
 }
 fn requested(
     duplex: core::Duplex,
-    selection: Option<record::compact::Selection>,
+    selection: record::compact::Selection,
 ) -> Result<(
     [Config; 2],
     [cover::Config; 2],
@@ -150,22 +150,10 @@ fn requested(
     TransactionSettings,
 )> {
     let kind = cover::Appearance::QuicLike;
-    let physical = PacketPolicy::new(1500).record_geometry()?.ip_bytes(1)? - 1;
-    let selected_data = 40 + record::compact::DATA_OVERHEAD;
     let mut resources = config(kind);
     resources.security.max_body_bytes = 1200;
-    resources.control.wire_overhead = physical
-        + record::ROUTE_BYTES
-        + security::Protection::ChaCha20Poly1305.overhead_bytes()
-        + 13;
-    if selection.is_some() {
-        resources.control.wire_overhead = 40 + record::compact::AUTHENTICATED_OVERHEAD;
-    }
-    let data_overhead = if selection.is_some() {
-        selected_data
-    } else {
-        resources.control.wire_overhead
-    };
+    resources.control.wire_overhead = 40 + record::compact::AUTHENTICATED_OVERHEAD;
+    let data_overhead = 40 + selection.data_overhead();
     // Keep the base rollover interval within its inherited per-key byte cap.
     resources.lifetime.lease = Duration::from_secs(30);
     resources.native.stall_timeout = Duration::from_secs(5);
@@ -356,37 +344,36 @@ struct OriginalPair {
     endpoints: (std::net::SocketAddr, std::net::SocketAddr),
 }
 
-// Construct the setup future outside its caller's poll frame. Every legacy and
-// selected fixture retains the same real owners through this shared boundary.
+// Construct the setup future outside its caller's poll frame. Every protection
+// fixture retains the same real owners through this shared boundary.
 #[inline(never)]
 fn establish_original_pair(
     half: bool,
-    selection: Option<record::compact::Selection>,
+    selection: record::compact::Selection,
 ) -> Pin<Box<dyn Future<Output = Result<OriginalPair>>>> {
-    Box::pin(establish_original_pair_inner(half, selection))
+    Box::pin(establish_original_pair_inner(half, selection, None))
 }
 
 // Complete both real setup state machines before constructing either Driver.
 async fn establish_original_pair_inner(
     half: bool,
-    selection: Option<record::compact::Selection>,
+    selection: record::compact::Selection,
+    frame_layer: Option<PacketLayer>,
 ) -> Result<OriginalPair> {
     let duplex = if half {
         core::Duplex::Half
     } else {
         core::Duplex::Full
     };
-    let (resources, covers, catalog, settings) = requested(duplex, selection)?;
+    let (resources, covers, mut catalog, settings) = requested(duplex, selection)?;
+    if let Some(layer) = frame_layer {
+        catalog = frame_replacement::catalog(&catalog, layer)?;
+    }
     let base = security::ConfigDigest([3; 32]);
     let envelope = c::EnvelopeDigest::new([0x39; 32]);
-    let requested = match selection {
-        Some(selection) => CommonTransactionContract::raw_requested_configuration_compact(
-            base, envelope, &catalog, resources, covers, settings, selection,
-        )?,
-        None => CommonTransactionContract::raw_requested_configuration(
-            base, envelope, &catalog, resources, covers, settings,
-        )?,
-    };
+    let requested = CommonTransactionContract::raw_requested_configuration_compact(
+        base, envelope, &catalog, resources, covers, settings, selection,
+    )?;
     let certificate = rcgen::generate_simple_self_signed(vec!["raw-common.test".to_owned()])?;
     let roots = vec![certificate.cert.der().to_vec()];
     let tls_client = ClientTls::from_der_roots(&roots)?;
@@ -399,7 +386,7 @@ async fn establish_original_pair_inner(
     let phase = PacketPhaseConfig {
         pair: PairConfig {
             session: SessionConfig {
-                layer: PacketLayer::Ethernet,
+                layer: frame_layer.unwrap_or(PacketLayer::Ethernet),
                 digest: requested,
             },
             messages: MessageLimits::default(),
@@ -452,8 +439,8 @@ async fn establish_original_pair_inner(
         assert_ne!(original_endpoints[0], original_endpoints[1]);
     }
     let endpoints = a.authenticated().lane_endpoints()[0].ok_or("original tuple")?;
-    let bind = |role, resources, outer| match selection {
-        Some(selection) => CommonTransactionContract::new_on_raw_paired_compact(
+    let bind = |role, resources, outer| {
+        CommonTransactionContract::new_on_raw_paired_compact(
             base,
             role,
             resources,
@@ -463,17 +450,7 @@ async fn establish_original_pair_inner(
             settings,
             outer,
             selection,
-        ),
-        None => CommonTransactionContract::new_on_raw_paired(
-            base,
-            role,
-            resources,
-            covers,
-            envelope,
-            catalog.clone(),
-            settings,
-            outer,
-        ),
+        )
     };
     let a_contract = bind(security::Role::Initiator, resources, a.authenticated())?;
     let b_contract = bind(security::Role::Responder, resources, b.authenticated())?;
@@ -482,7 +459,7 @@ async fn establish_original_pair_inner(
         b_contract.expected_configuration()
     );
     assert_ne!(a_contract.envelope(), envelope);
-    assert!(a_contract.refresh_selection().is_none());
+    assert_eq!(a_contract.compact_wire(), selection);
     let mut wrong = resources;
     wrong[1].work.send_batch += 1;
     assert!(bind(security::Role::Initiator, wrong, a.authenticated()).is_err());
@@ -559,7 +536,17 @@ async fn establish_original_pair_inner(
 #[inline(never)]
 fn exercise_original_raw(half: bool) -> Pin<Box<dyn Future<Output = Result>>> {
     Box::pin(async move {
-        let pair = establish_original_pair(half, None).await?;
+        let pair = establish_original_pair(
+            half,
+            record::compact::Selection {
+                protection: security::compact::Protection::ChaCha20Poly1305,
+                limits: security::compact::Selection {
+                    max_forward_packets: 4096,
+                    max_failed_checks: 128,
+                },
+            },
+        )
+        .await?;
         Box::pin(exercise_established_raw(half, pair)).await
     })
 }
@@ -590,22 +577,30 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
         .map(|d| C::new(a_contract.envelope(), *d))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let initial = a_contract.initial();
-    let find = |tag| {
-        targets
-            .iter()
-            .copied()
-            .find(|c| match c.descriptor().profile() {
-                c::Profile::Swift { .. } => tag == 0,
-                c::Profile::Aligned { .. } => tag == 1,
-                c::Profile::Packed { .. } => tag == 2,
-                c::Profile::Rolling { .. } => tag == 3,
-                _ => false,
-            })
-            .ok_or("actual four-family member")
+    let mut order = vec![initial];
+    order.extend(targets.iter().copied().filter(|value| *value != initial));
+    order.push(initial);
+    let expected_native = order.len() as u64;
+    let layer = if initial
+        .descriptor()
+        .direction(mg::Role::Client)
+        .native_policy()
+        .is_some_and(l2tunnel_aligned::NativePolicy::is_ip)
+    {
+        PacketLayer::Ip
+    } else {
+        PacketLayer::Ethernet
     };
-    let order = [initial, find(1)?, find(2)?, find(3)?, initial];
     let (a_device, a_host) = device()?;
     let (b_device, b_host) = device()?;
+    let a_device = frame_replacement::LayerDevice {
+        inner: a_device,
+        layer,
+    };
+    let b_device = frame_replacement::LayerDevice {
+        inner: b_device,
+        layer,
+    };
     let (a_control, a_requests) = common_channel();
     let (_b_control, b_requests) = common_channel();
     let (a_stop, a_shutdown) = oneshot::channel::<()>();
@@ -658,11 +653,28 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
                     }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                let forward = frame(4100 + index as u16, 31 + index as u8);
-                let reverse = frame(4200 + index as u16, 71 + index as u8);
+                let original_window = !matches!(
+                    target
+                        .descriptor()
+                        .direction(mg::Role::Client)
+                        .common()
+                        .native_window(),
+                    c::NativeWindow::Disabled
+                );
+                let packet = if original_window {
+                    frame_replacement::payload
+                } else {
+                    frame
+                };
+                let mut forward = packet(4100 + index as u16, 31 + index as u8);
+                let mut reverse = packet(4200 + index as u16, 71 + index as u8);
+                if layer == PacketLayer::Ip {
+                    forward.drain(..14);
+                    reverse.drain(..14);
+                }
                 assert_eq!(a_host.send(&forward).await?, forward.len());
                 assert_eq!(b_host.send(&reverse).await?, reverse.len());
-                let (mut ap, mut bp) = ([0; 2048], [0; 2048]);
+                let (mut ap, mut bp) = ([0; 8192], [0; 8192]);
                 let (an, bn) = tokio::try_join!(a_host.recv(&mut ap), b_host.recv(&mut bp))?;
                 assert_eq!(&ap[..an], reverse);
                 assert_eq!(&bp[..bn], forward);
@@ -670,7 +682,17 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
             loop {
                 let live = [a_snapshots.borrow().clone(), b_snapshots.borrow().clone()]
                     .into_iter()
-                    .all(|s| s.is_some_and(|s| s.liveness.last_pong_micros.is_some()));
+                    .all(|s| {
+                        s.is_some_and(|s| {
+                            s.liveness.last_pong_micros.is_some()
+                                && s.native_delivery.iter().flatten().all(|window| {
+                                    !window.pending_receipt
+                                        && window
+                                            .send
+                                            .is_none_or(|send| send.outstanding.records == 0)
+                                })
+                        })
+                    });
                 if live {
                     break;
                 }
@@ -686,6 +708,16 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
     };
     let (a, b, result) = tokio::join!(a_run, b_run, exercise);
     if let Err(error) = result {
+        for (index, probe) in probes.iter().enumerate() {
+            eprintln!(
+                "RAW_FAILURE_LANE endpoint={index} sent={} management={} carrier={} dropped={} blocked={}",
+                probe.sent.load(Ordering::Relaxed),
+                probe.final_management.load(Ordering::Relaxed),
+                probe.final_carrier.load(Ordering::Relaxed),
+                probe.dropped.load(Ordering::Relaxed),
+                probe.blocked.load(Ordering::Relaxed),
+            );
+        }
         let stopped = |result: &io::Result<CommonStopped>| match result {
             Ok(value) => format!(
                 "stop={:?}, elapsed={}, epoch={}, phase={:?}",
@@ -698,7 +730,7 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
         };
         let observed = |snapshot: Option<&CommonSnapshot>| match snapshot {
             Some(snapshot) => format!(
-                "elapsed={}, epoch={}, physical_epoch={}, phase={:?}, engine={:?}, control={:?}, counters={:?}, liveness={:?}",
+                "elapsed={}, epoch={}, physical_epoch={}, phase={:?}, engine={:?}, control={:?}, counters={:?}, liveness={:?}, check_status={:?}, strong_feedback_number={:?}, native_delivery={:?}",
                 snapshot.elapsed_micros,
                 snapshot.epoch.0,
                 snapshot.physical_scope.epoch.0,
@@ -707,6 +739,9 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
                 snapshot.control,
                 snapshot.counters,
                 snapshot.liveness,
+                snapshot.compact_check_status,
+                snapshot.compact_feedback_number,
+                snapshot.native_delivery,
             ),
             None => "no native readiness observation".to_owned(),
         };
@@ -723,7 +758,7 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
         assert_eq!(stopped.reason, StopReason::Cancelled);
         assert_eq!(stopped.snapshot.current, initial);
         assert_eq!(stopped.snapshot.info.binding, session);
-        assert_eq!(stopped.snapshot.counters.native_written, 5);
+        assert_eq!(stopped.snapshot.counters.native_written, expected_native);
         let expected = if index == 0 {
             endpoints
         } else {
@@ -750,3 +785,6 @@ async fn exercise_established_raw(half: bool, pair: OriginalPair) -> Result {
 
 #[path = "transport_common_raw_selected_tests.rs"]
 mod selected;
+
+#[path = "transport_common_raw_frame_tests.rs"]
+mod frame_replacement;

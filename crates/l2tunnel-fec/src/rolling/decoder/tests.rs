@@ -223,7 +223,8 @@ fn repair_copy(e: &mut Encoder, c: Config) -> Result<(RepairId, Support, Vec<u8>
     }
     let mut wire = vec![0; c.width()?];
     let (id, support, length) = e.take_repair(&mut wire, Tick(0))?;
-    assert_eq!(length, wire.len());
+    assert!(length <= wire.len());
+    wire.truncate(length);
     Ok((id, support, wire))
 }
 fn stage_repair(d: &mut Decoder, packet: &(RepairId, Support, Vec<u8>)) -> Result<(), Error> {

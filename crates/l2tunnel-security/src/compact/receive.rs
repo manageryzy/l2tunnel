@@ -16,6 +16,8 @@ pub struct Receiver {
     protection: Protection,
     selection: Selection,
     failures: u32,
+    // HMAC verification uses one bounded reserved concatenation buffer.
+    mac_input: Vec<u8>,
 }
 impl Receiver {
     pub(super) fn new(
@@ -25,6 +27,15 @@ impl Receiver {
         protection: Protection,
         selection: Selection,
     ) -> Result<Self, Error> {
+        let mut mac_input = Vec::new();
+        if protection == Protection::HmacSha256 {
+            let bytes = super::AAD_BYTES
+                .checked_add(limits.max_body_bytes)
+                .ok_or(Error::TooLarge)?;
+            mac_input
+                .try_reserve_exact(bytes)
+                .map_err(|_| Error::Allocation)?;
+        }
         Ok(Self {
             opening: Opening::new(Chain::new(root, Labels::CompactV3), protection)?,
             replay: Replay::new(),
@@ -33,6 +44,7 @@ impl Receiver {
             protection,
             selection,
             failures: 0,
+            mac_input,
         })
     }
     /// Current key generation, advanced only by an accepted check/authentication.
@@ -50,6 +62,10 @@ impl Receiver {
     /// Lifetime failed cryptographic/check attempts; success never resets the count.
     pub const fn failed_checks(&self) -> u32 {
         self.failures
+    }
+    /// Actual reserved HMAC verification scratch, excluding the inline owner.
+    pub fn reserved_bytes(&self) -> usize {
+        self.mac_input.capacity()
     }
     /// Actual selected suite; CRC does not become authentication after a valid check.
     pub const fn protection(&self) -> Protection {
@@ -109,10 +125,14 @@ impl Receiver {
         if used > self.limits.max_body_bytes_per_key {
             return Err(Error::KeyUsageExhausted);
         }
-        if let Err(error) = key
-            .key
-            .open(number, aad.as_slice(), payload, body_bytes, output)
-        {
+        if let Err(error) = key.key.open(
+            number,
+            aad.as_slice(),
+            payload,
+            body_bytes,
+            output,
+            &mut self.mac_input,
+        ) {
             // Checked before each attempt; no wrap and no successful-open reset.
             self.failures = self
                 .failures
@@ -166,6 +186,7 @@ mod tests {
             Protection::Aes128Ccm4,
             Protection::ChaCha20Crc32c,
             Protection::ChaCha20Poly1305,
+            Protection::HmacSha256,
         ] {
             let configured = Limits {
                 packets_per_key: crate::MAX_PACKETS_PER_KEY,

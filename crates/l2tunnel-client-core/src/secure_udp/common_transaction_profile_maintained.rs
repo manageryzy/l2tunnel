@@ -11,6 +11,33 @@ pub(super) struct Selection {
     outer: Option<Authenticated>,
 }
 impl Profile {
+    /// Construct the mandatory final format with full-tag data authentication.
+    /// Old input geometry is recomputed before the authenticated commitment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_maintained(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        maintained: super::super::maintained::Settings,
+    ) -> io::Result<Self> {
+        Self::new_selected_for(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            None,
+            None,
+            None,
+            Some(maintained),
+        )
+    }
     /// Explicit complete compact Common catalog over genuine maintained TLS/QUIC.
     /// The provided catalog/resources retain their exact selected geometry.
     #[allow(clippy::too_many_arguments)]
@@ -108,9 +135,7 @@ impl Profile {
             }
         }
         let base = security::ConfigDigest(super::super::finish(hash));
-        let selection = self
-            .compact_wire
-            .ok_or_else(|| invalid("maintained Common requires explicit compact wire"))?;
+        let selection = self.compact_wire;
         let covers = self.maintained_covers()?;
         for role in [security::Role::Initiator, security::Role::Responder] {
             establish::maintained::validate_requested(
@@ -246,8 +271,7 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
             outer,
-            self.compact_wire
-                .ok_or_else(|| invalid("compact wire absent"))?,
+            self.compact_wire,
         )?;
         self.complete_proxy_contract(contract)
     }

@@ -83,6 +83,7 @@ struct Retirement {
     confirmed: bool,
     peer_eof: bool,
     actor_joined: bool,
+    liveness_quiesced: bool,
     retired: bool,
     waiter: Option<Waker>,
 }
@@ -153,6 +154,44 @@ impl Bridge {
             });
         }
         Ok(())
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn trace_measured_failure(&self) {
+        let Ok(state) = self.0.lock() else {
+            return;
+        };
+        if let Some(receipts) = &state.receipts {
+            eprintln!(
+                "MEASURED_BRIDGE_RECEIPTS prepared={:?} written={} acknowledged={} physical_users={} completed={:?} physical={:?}",
+                receipts.prepared_user,
+                receipts.written_users,
+                receipts.acknowledged_users,
+                receipts.physical_users,
+                receipts.completed,
+                receipts.physical,
+            );
+        }
+        if let Some(pending) = &state.pending {
+            eprintln!(
+                "MEASURED_BRIDGE_PENDING now={:?} generation={} arrived={:?} deadline={:?} sent={} identity={:?} completed={} units={}/{} physical={:?} writer_waiting={}",
+                Instant::now(),
+                pending.generation,
+                pending.arrived,
+                pending.deadline,
+                pending.sent,
+                pending.identity,
+                pending.completed,
+                pending.units.received,
+                pending.units.count.unwrap_or(0),
+                pending.physical,
+                state.writer.is_some(),
+            );
+        } else {
+            eprintln!(
+                "MEASURED_BRIDGE_PENDING none writer_waiting={}",
+                state.writer.is_some()
+            );
+        }
     }
     /// Reserve ALL-Data ordinal provenance before writing bytes. The same writer
     /// waits before a third unacknowledged fact could overwrite the fixed ring.
@@ -334,6 +373,7 @@ impl Bridge {
         source: Option<l2tunnel_recovery::SourceId>,
         source_retired: bool,
         custody_drained: bool,
+        control_drained: bool,
     ) -> io::Result<()> {
         let mut state = self.lock()?;
         state.check()?;
@@ -352,19 +392,23 @@ impl Bridge {
                 "Common final source observation mismatch",
             ));
         }
-        if Instant::now() < cap {
-            if source.is_some() && source_retired && retirement.physical {
-                retirement.confirmed = true;
-            }
-            return Ok(());
+        let before_cap = Instant::now() < cap;
+        if before_cap && source.is_some() && source_retired && retirement.physical {
+            retirement.confirmed = true;
         }
-        if retirement.confirmed
+        let proved = retirement.confirmed
             && source_retired
             && retirement.physical
             && retirement.peer_eof
             && retirement.actor_joined
-            && custody_drained
-        {
+            && custody_drained;
+        // Latch only the existing complete data barrier. A later duplicate ACK
+        // must not restart periodic probes while original control debt drains.
+        retirement.liveness_quiesced |= proved;
+        if before_cap {
+            return Ok(());
+        }
+        if proved && control_drained {
             retirement.retired = true;
             if let Some(waker) = retirement.waiter.take() {
                 waker.wake();
@@ -377,6 +421,75 @@ impl Bridge {
             ))
         }
     }
+    /// Only the complete authenticated data/EOF/join barrier stops fresh probes.
+    /// Existing challenges and control custody retain their original deadlines.
+    pub(crate) fn liveness_quiesced(&self) -> io::Result<bool> {
+        let state = self.lock()?;
+        state.check()?;
+        Ok(state
+            .retirement
+            .as_ref()
+            .is_some_and(|owner| owner.liveness_quiesced))
+    }
+
+    /// A maintained peer close may end I/O only after the existing mutual EOF,
+    /// physical output, peer ACK and actor-join barrier is already complete.
+    /// This read-only gate grants no retirement and never changes the local cap.
+    pub(crate) fn proved_peer_close_cap(
+        &self,
+        source: Option<l2tunnel_recovery::SourceId>,
+        source_retired: bool,
+        custody_drained: bool,
+    ) -> io::Result<Option<Instant>> {
+        let state = self.lock()?;
+        state.check()?;
+        let Some(retirement) = state.retirement.as_ref() else {
+            return Ok(None);
+        };
+        if source.is_none()
+            || source != retirement.source
+            || !retirement.confirmed
+            || !source_retired
+            || !retirement.physical
+            || !retirement.peer_eof
+            || !retirement.actor_joined
+            || !custody_drained
+            || state.pending.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(retirement.cap)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn trace_retirement_failure(&self) {
+        let Ok(state) = self.0.lock() else {
+            return;
+        };
+        if let Some(owner) = &state.retirement {
+            eprintln!(
+                "PROXY_CLOSE_BRIDGE now={:?} cap={:?} failed={} pending={} source={} confirmed={} physical={} peer_eof={} actor_joined={} retired={}",
+                Instant::now(),
+                owner.cap,
+                state.failure.is_some(),
+                state.pending.is_some(),
+                owner.source.is_some(),
+                owner.confirmed,
+                owner.physical,
+                owner.peer_eof,
+                owner.actor_joined,
+                owner.retired,
+            );
+        }
+    }
+
+    /// Read the same retained barrier without advancing it or ignoring failure.
+    pub(crate) fn retired(&self) -> io::Result<bool> {
+        let state = self.lock()?;
+        state.check()?;
+        Ok(state.retirement.as_ref().is_some_and(|owner| owner.retired))
+    }
+
     /// Called only after this actor's actual fences, EOF events and child joins.
     /// The same Driver certifies local retained custody at the original cap;
     /// this wait never turns elapsed time or a physical write into peer receipt.
@@ -795,6 +908,7 @@ fn pair_selected(
             confirmed: false,
             peer_eof: false,
             actor_joined: false,
+            liveness_quiesced: false,
             retired: false,
             waiter: None,
         }),

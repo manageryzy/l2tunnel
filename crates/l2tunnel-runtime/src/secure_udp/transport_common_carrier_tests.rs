@@ -15,7 +15,7 @@ fn selected_kind(
     kind: cover::Appearance,
 ) -> Result<(establish::Config, CommonTransactionContract)> {
     let mut resources = config(kind);
-    resources.control.wire_overhead += 1;
+    resources.control.wire_overhead = 28 + record::compact::AUTHENTICATED_OVERHEAD;
     let selected = mg::messages::Settings {
         delivery: delivery::Settings {
             wire_overhead: resources.control.wire_overhead + streams::HEADER_BYTES,
@@ -54,14 +54,14 @@ fn selected_kind(
     let value = super::super::common_engines::tests::values()
         .map_err(|error| io::Error::other(error.to_string()))?[0];
     let catalog = Catalog::new(*value.descriptor(), &[*value.descriptor()])?;
-    let contract = CommonTransactionContract::new_on_carrier(
+    let contract = CommonTransactionContract::new_on_carrier_paired_compact(
         security::ConfigDigest([3; 32]),
         if client {
             security::Role::Initiator
         } else {
             security::Role::Responder
         },
-        resources,
+        [resources; 2],
         cover,
         false,
         EnvelopeDigest::new([0x39; 32]),
@@ -76,8 +76,12 @@ fn selected_kind(
             retained_bytes: 256 << 20,
         },
         *outer,
+        common_selected::default_record_selection(),
     )?;
-    assert!(contract.refresh_selection().is_none());
+    assert_eq!(
+        contract.compact_wire(),
+        common_selected::default_record_selection()
+    );
     let mut setup = factory_fixture::effective(outer, client)?;
     setup.gate.path_mtu = resources.path_mtu;
     setup.cover = cover;
@@ -237,7 +241,6 @@ async fn selected_compact_openvpn_explicit_final_route_never_enters_media_joinin
         now,
         at,
         at,
-        None,
         ReceiveFraming::DataV1,
     )?;
     assert_eq!(driver.counters.rejected_packets, rejected);
@@ -247,7 +250,6 @@ async fn selected_compact_openvpn_explicit_final_route_never_enters_media_joinin
         now,
         at,
         at,
-        None,
         ReceiveFraming::Final,
     )?;
     assert_eq!(driver.counters.rejected_packets, rejected + 1);
@@ -338,7 +340,10 @@ async fn run_initial_case(selection: Option<record::compact::Selection>) -> Resu
     exercise?;
     for (side, stopped) in [a?, b?].into_iter().enumerate() {
         assert_eq!(stopped.reason, StopReason::Cancelled);
-        assert_eq!(stopped.snapshot.compact_wire, selection);
+        assert_eq!(
+            stopped.snapshot.compact_wire,
+            Some(selection.unwrap_or_else(common_selected::default_record_selection))
+        );
         let expected = if side == 0 {
             endpoints
         } else {

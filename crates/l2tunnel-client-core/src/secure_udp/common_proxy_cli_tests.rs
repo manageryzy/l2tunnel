@@ -93,27 +93,37 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
             .map(|e| e.kind()),
         Some(io::ErrorKind::InvalidInput)
     );
-    for (key, value) in [
-        ("--traffic", "proxy-measured"),
-        ("--record-profile", "swift"),
-    ] {
-        let mut bad = base.clone();
-        bad.insert(key.into(), value.into());
-        assert_eq!(
-            super::super::selection_for("connect", &bad, connection, true)
-                .err()
-                .map(|e| e.kind()),
-            Some(io::ErrorKind::InvalidInput)
-        );
-    }
-    for carrier in [Carrier::OpenVpn, Carrier::RawPacket] {
-        assert_eq!(
-            selection(&base, connection, true, &carrier)
-                .err()
-                .map(|e| e.kind()),
-            Some(io::ErrorKind::InvalidInput)
-        );
-    }
+    let mut measured_without_retirement = base.clone();
+    measured_without_retirement.insert("--traffic".into(), "proxy-measured".into());
+    assert_eq!(
+        super::super::selection_for("connect", &measured_without_retirement, connection, true)
+            .err()
+            .map(|e| e.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    let mut other_profile = base.clone();
+    other_profile.insert("--record-profile".into(), "swift".into());
+    assert_eq!(
+        super::super::selection_for("connect", &other_profile, connection, true)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput),
+    );
+    assert_eq!(
+        selection(&base, connection, true, &Carrier::OpenVpn)
+            .err()
+            .map(|e| e.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    assert!(selection(&base, connection, true, &Carrier::RawPacket)?);
+    let mut raw_measured = measured_without_retirement;
+    raw_measured.insert("--proxy-close".into(), "retained".into());
+    assert_eq!(
+        selection(&raw_measured, connection, true, &Carrier::RawPacket)
+            .err()
+            .map(|e| e.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
     let mut half = connection;
     half.duplex = Duplex::Half;
     assert!(selection(&base, half, true, &Carrier::OriginalUdp).is_err());
@@ -133,7 +143,7 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
     descriptor
         .encode_into(&mut encoded)
         .map_err(io::Error::other)?;
-    let mut document = super::super::transaction_cli::test_plan_value();
+    let mut document = super::super::common_plan_fixture::template();
     document["backend"] = json!("common_records_v2");
     document["catalog"] = json!([encoded
         .iter()
@@ -164,16 +174,18 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
         initiator: hs::LocalSecret::new(zeroize::Zeroizing::new([21; 32])).public_key(),
         responder: hs::LocalSecret::new(zeroize::Zeroizing::new([22; 32])).public_key(),
     };
+    let rejected = selected
+        .build(
+            connection,
+            peers,
+            l2tunnel_identity::MemberPublicKey([7; 32]),
+        )
+        .err()
+        .ok_or_else(|| input("native Common catalog unexpectedly authorized proxy ownership"))?;
+    assert_eq!(rejected.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
-        selected
-            .build(
-                connection,
-                peers,
-                l2tunnel_identity::MemberPublicKey([7; 32])
-            )
-            .err()
-            .map(|e| e.kind()),
-        Some(io::ErrorKind::Unsupported)
+        rejected.to_string(),
+        "Common proxy record capacity differs from actor frames",
     );
     let wide = Temporary::new(
         br#"{"version":1,"channels":2,"time_wait_reset":"maintained","routes":[]}"#,
@@ -181,6 +193,19 @@ fn fixed_common_proxy_selection_is_explicit_and_unsupported_shapes_refuse_before
     selected_options.insert(
         "--proxy-policy".into(),
         wide.path().to_string_lossy().into_owned(),
+    );
+    let wide = super::super::selection_for("connect", &selected_options, connection, true)?
+        .ok_or_else(|| input("explicit two-channel proxy not selected"))?;
+    assert!(matches!(
+        &wide.0,
+        Choice::Proxy(_, _, Policy::Fixed(settings), false) if settings.channels == 2
+    ));
+    let too_wide = Temporary::new(
+        br#"{"version":1,"channels":257,"time_wait_reset":"maintained","routes":[]}"#,
+    )?;
+    selected_options.insert(
+        "--proxy-policy".into(),
+        too_wide.path().to_string_lossy().into_owned(),
     );
     assert!(super::super::selection_for("connect", &selected_options, connection, true).is_err());
     Ok(())
@@ -209,6 +234,8 @@ fn frame() -> io::Result<ProxyFrame> {
             requested_cover: l2tunnel_cover::Appearance::QuicLike,
             effective_cover: None,
             compact_wire: None,
+            maintained_request: None,
+            maintained: None,
             local_addr: "127.0.0.1:41921".parse().map_err(io::Error::other)?,
             peer_addr: "127.0.0.1:41922".parse().map_err(io::Error::other)?,
             installed: false,

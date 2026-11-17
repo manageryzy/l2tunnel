@@ -16,18 +16,19 @@ const MAX_MESSAGE_BYTES: usize = 2048;
 /// it deliberately does not join a potentially blocked console writer. The
 /// detached diagnostics thread therefore cannot delay native owner release.
 /// This best-effort sink is not the pending CL-27 Windows event-log facility.
-pub(crate) struct Diagnostics {
+pub struct Diagnostics {
     sender: SyncSender<String>,
 }
 
 impl Diagnostics {
     /// Start the dedicated stderr writer without transferring runtime ownership.
     #[cfg(windows)]
-    pub(crate) fn stderr() -> io::Result<Self> {
+    pub fn stderr() -> io::Result<Self> {
         Self::writer(io::stderr())
     }
 
-    fn writer(writer: impl Write + Send + 'static) -> io::Result<Self> {
+    /// Start a bounded text-only writer over an explicitly supplied output.
+    pub fn writer(writer: impl Write + Send + 'static) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(QUEUED_MESSAGES);
         let worker = thread::Builder::new()
             .name("l2tunnel-diagnostics".into())
@@ -42,7 +43,7 @@ impl Diagnostics {
     /// Returns false for a full/closed queue or a record over 2048 UTF-8 bytes.
     /// Rejection never prints the record or an output error. The caller must
     /// supply only bounded non-secret status, never credentials or payloads.
-    pub(crate) fn emit(&self, message: String) -> bool {
+    pub fn emit(&self, message: String) -> bool {
         if message.len() > MAX_MESSAGE_BYTES {
             return false;
         }

@@ -329,7 +329,9 @@ impl GateState {
                     && (!bootstrap_live
                         || match h.kind {
                             wire::Kind::Data | wire::Kind::Feedback => {
-                                bootstrap_filter.as_ref().is_none_or(|allow| !allow(body))
+                                bootstrap_filter.as_ref().is_none_or(|allow| {
+                                    !allow(super::compact::BootstrapDirection::Incoming, body)
+                                })
                             }
                             wire::Kind::Hello
                             | wire::Kind::Commit

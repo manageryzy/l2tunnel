@@ -9,9 +9,9 @@ const QUEUED_COMMANDS: usize = 4;
 const READ_BYTES: usize = 256;
 const LINE_BYTES: usize = 32;
 
-/// Strict local frontend verbs; execution belongs to the existing shared service.
+/// Strict local frontend verbs; no Windows Common service executor is installed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Command {
+pub enum Command {
     /// Observe actual service state.
     Status,
     /// Abort the current generation and remain idle.
@@ -21,7 +21,7 @@ pub(crate) enum Command {
 }
 
 /// Bounded typed commands. Closure means EOF or that the input worker ended.
-pub(crate) type Receiver = mpsc::Receiver<io::Result<Command>>;
+pub type Receiver = mpsc::Receiver<io::Result<Command>>;
 
 /// Claim standard input once for this process and start its isolated reader.
 ///
@@ -32,7 +32,7 @@ pub(crate) type Receiver = mpsc::Receiver<io::Result<Command>>;
 /// is deliberately never joined by tunnel shutdown. Reusable library callers
 /// must inject a receiver instead of creating another process stdin reader.
 #[cfg(windows)]
-pub(crate) fn stdin() -> io::Result<Receiver> {
+pub fn stdin() -> io::Result<Receiver> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static CLAIMED: AtomicBool = AtomicBool::new(false);
     CLAIMED
@@ -53,7 +53,9 @@ pub(crate) fn stdin() -> io::Result<Receiver> {
     }
 }
 
-fn reader(reader: impl Read + Send + 'static) -> io::Result<Receiver> {
+/// Start a bounded command reader over explicitly supplied input.
+/// This parses commands only; the caller must supply a service executor.
+pub fn reader(reader: impl Read + Send + 'static) -> io::Result<Receiver> {
     let (sender, receiver) = mpsc::channel(QUEUED_COMMANDS);
     let worker = thread::Builder::new()
         .name("l2tunnel-stdin-control".into())

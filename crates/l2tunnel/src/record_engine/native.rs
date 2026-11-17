@@ -21,6 +21,9 @@ impl Engine {
             }
             return Ok(NativePreparation::AlreadyPending(pending));
         }
+        if self.pending_native_delivery().is_some() {
+            return Ok(NativePreparation::Idle);
+        }
         if work == 0 {
             return Err(Error::Work);
         }
@@ -153,6 +156,9 @@ impl Engine {
             self.native_counts.commit(channel, committed);
         }
         self.pending = None;
+        if let Some(window) = &mut self.native_window {
+            window.committed(pending)?;
+        }
         if matches!(
             &self.owner,
             Owner::Rolling(_) | Owner::Research(_) | Owner::Connections(_)

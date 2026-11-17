@@ -563,9 +563,7 @@ impl Decoder {
         if repair.scope != self.scope {
             return Err(Error::Scope);
         }
-        if repair.bytes.len() != self.width {
-            return Err(Error::Length);
-        }
+        repair.validate_extent(self.width)?;
         if repair.id.0 == u64::MAX
             || self
                 .config
@@ -595,9 +593,7 @@ impl Decoder {
         if repair.scope != self.scope {
             return Err(Error::Scope);
         }
-        if repair.bytes.len() != self.width {
-            return Err(Error::Length);
-        }
+        repair.validate_extent(self.width)?;
         if repair.id.0 == 0
             || u32::try_from(repair.id.0).is_err()
             || repair.support.end == 0
@@ -633,9 +629,7 @@ impl Decoder {
         if repair.scope != self.scope {
             return Err(Error::Scope);
         }
-        if repair.bytes.len() != self.width {
-            return Err(Error::Length);
-        }
+        repair.validate_extent(self.width)?;
         if repair.id.0 == 0 || repair.id.0 == u64::MAX || repair.support.seed > 1 {
             return Err(Error::Identity);
         }
@@ -689,8 +683,10 @@ impl Decoder {
         if let Some(old) = self.history_meta[slot]
             && old.id == repair.id
         {
+            let retained = &self.history[slot * self.width..(slot + 1) * self.width];
             return if old == descriptor
-                && self.history[slot * self.width..(slot + 1) * self.width] == *repair.bytes
+                && retained[..repair.bytes.len()] == *repair.bytes
+                && retained[repair.bytes.len()..].iter().all(|byte| *byte == 0)
             {
                 Ok(Begin::Duplicate)
             } else {
@@ -707,7 +703,10 @@ impl Decoder {
         }
         let input = Input::Repair(descriptor);
         let (job_end, debt) = self.input_deadlines(input, received, now, original_deadline)?;
-        self.input.copy_from_slice(repair.bytes);
+        // One bounded clear and prefix copy restore the same logical equation
+        // used by the solver and duplicate history, without another allocation.
+        self.input.fill(0);
+        self.input[..repair.bytes.len()].copy_from_slice(repair.bytes);
         self.stage(input, job_end, debt)
     }
     fn row_start(&self, row: usize) -> usize {

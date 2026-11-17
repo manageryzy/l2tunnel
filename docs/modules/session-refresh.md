@@ -1,5 +1,12 @@
 # In-session fresh-DH refresh
 
+Current cutover status: the old `Records::new_refreshable` wrapper and its
+final-wire/runtime consumers are removed. The current Compact Records owner
+does not yet integrate this fresh-DH lifecycle. Lower handshake/security
+primitives and the complete SEC/refresh acceptance definitions remain in scope.
+The wrapper API and implementation descriptions below document the earlier
+checkpoint and design; they are not current production entry points.
+
 Status: **first pure slice implemented and protocol-tested; complete matrix, runtime integration and retained recovery remain open**, 2026-11-14.
 This child retains every deliverable of [SEC-06/SEC-08](secure-session.md),
 [the architecture](../architecture.md) and the [master ledger](../implementation-checklist.md).

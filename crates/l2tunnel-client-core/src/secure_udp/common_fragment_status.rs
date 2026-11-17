@@ -197,7 +197,6 @@ pub struct FragmentIngress {
     pub held_numbers: [Option<u64>; 3],
 }
 impl FragmentIngress {
-    #[cfg(unix)]
     fn observe(value: engine::FragmentIngressSnapshot) -> io::Result<Self> {
         Ok(Self {
             pending: [
@@ -235,7 +234,6 @@ impl From<engine::FragmentStatistics> for FragmentCounters {
     }
 }
 impl FragmentStatus {
-    #[cfg(unix)]
     pub(crate) fn observe(
         requested: engine::FragmentPolicy,
         snapshot: Option<&l2tunnel_runtime::secure_udp::transport::CommonSnapshot>,

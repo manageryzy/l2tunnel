@@ -23,16 +23,16 @@ async fn selected_runtime_pair(
             max_failed_checks: 128,
         },
     };
-    let pair = establish_original_pair(half, Some(selection)).await?;
+    let pair = establish_original_pair(half, selection).await?;
     let (a, ad) = Driver::new_common_on_raw(pair.client, pair.client_contract)?;
     let (b, bd) = Driver::new_common_on_raw(pair.server, pair.server_contract)?;
     assert_eq!(
         ad.records.compact_layout(),
-        Some(record::compact::Layout::Carrier)
+        record::compact::Layout::Carrier
     );
     assert_eq!(
         bd.records.compact_layout(),
-        Some(record::compact::Layout::Carrier)
+        record::compact::Layout::Carrier
     );
     assert_eq!(a.ip_wire_bytes()?, 40);
     assert_eq!(b.ip_wire_bytes()?, 40);
@@ -68,7 +68,6 @@ async fn progress_owner(socket: &mut RawIo, driver: &mut Driver) -> Result {
                 observed,
                 arrived,
                 now,
-                None,
                 metadata,
             )?;
         } else {
@@ -78,7 +77,6 @@ async fn progress_owner(socket: &mut RawIo, driver: &mut Driver) -> Result {
                 observed,
                 arrived,
                 now,
-                None,
             )?;
         }
     }

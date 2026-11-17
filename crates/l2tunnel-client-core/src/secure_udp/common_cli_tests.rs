@@ -18,7 +18,7 @@ fn hex(descriptor: Descriptor) -> io::Result<String> {
     Ok(bytes.iter().map(|value| format!("{value:02x}")).collect())
 }
 fn document(count: usize) -> io::Result<Value> {
-    let old = super::super::transaction_cli::test_plan_value();
+    let old = super::super::common_plan_fixture::template();
     let mut catalog = Vec::new();
     for i in 0..count {
         catalog.push(hex(descriptor(1_250_001 + i as u64)?)?);
@@ -150,10 +150,9 @@ fn carrier_plan_inspection_derives_exact_cover_capacity_and_keeps_requested_full
                 1457
             };
             assert_eq!(settings.cover.max_protected_bytes, protected);
-            assert_eq!(
-                body,
-                protected - 9 - l2tunnel_security::COMMON_PREFIX_BYTES - 16
-            );
+            // Final Records use the entire original carrier capacity; the
+            // initial appearance only constrains bootstrap protected bytes.
+            assert_eq!(body, 1471 - 21);
             let profile = plan.build(connection, settings, peers, body, overhead)?;
             assert_eq!(profile.catalog().descriptors(), plan.catalog.descriptors());
             let outer = plan.outer_config(&profile)?;
@@ -276,7 +275,7 @@ fn actual_common_profile_inspection_keeps64_full_members_in_bounded_pages() -> i
             maximum_mtu: 2000,
             profile: hs::Profile::Ik,
         };
-        let (overhead, body) = common.geometry()?;
+        let (overhead, body) = common.final_geometry()?;
         let settings = common.raw(
             1500,
             connection.handshake_timeout,
@@ -296,7 +295,7 @@ fn actual_common_profile_inspection_keeps64_full_members_in_bounded_pages() -> i
             all.extend(values.iter().cloned());
             assert!(
                 serde_json::to_vec(line).map_err(io::Error::other)?.len()
-                    < super::super::transaction_cli_output::MAX_VALUE_BYTES
+                    < super::super::common_cli_output::MAX_VALUE_BYTES
             );
         }
         let expected = profile

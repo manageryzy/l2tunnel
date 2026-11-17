@@ -1,4 +1,4 @@
-//! Explicit Wintun foreground entry point; native qualification is separate.
+//! Windows configuration and explicit execution capability reporting.
 use l2tunnel_windows::cli::{self, Command};
 use std::{
     io::{self, Write},
@@ -16,24 +16,17 @@ fn execute() -> io::Result<()> {
         ),
         Command::Plan => writeln!(
             io::stdout().lock(),
-            "Windows foreground: explicit Wintun L3 + retained TCP/TLS frame. Implementation is separate from native qualification. Windows service/named pipes, TAP L2, credential vault, sleep/recovery, and full carrier/mode qualification remain open.\n{}",
+            "Windows Common client/service binding: unsupported and pending. The obsolete managed TCP/TLS foreground path has been removed. Wintun device/configuration and bounded helper components remain available; they do not establish a tunnel. Windows service/named pipes, TAP L2, credential vault, sleep/recovery, and native carrier/mode qualification remain open.\n{}",
             l2tunnel::IMPLEMENTATION_STATUS
         ),
         Command::Connect(plan) => {
             #[cfg(windows)]
             {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(l2tunnel_windows::native::execute(*plan))
+                l2tunnel_windows::native::execute(*plan)
             }
             #[cfg(not(windows))]
             {
-                drop(plan);
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Wintun execution requires native Windows; plan/help and cross-compilation are not tunnel execution",
-                ))
+                plan.check_runtime_support()
             }
         }
     }

@@ -3,22 +3,6 @@ use super::*;
 use establish::raw_carrier::AuthenticatedRaw;
 
 impl CommonTransactionContract {
-    /// Validate a complete requested raw catalog/resources before opening originals.
-    /// This pure check returns no contract, packet owner or authentication proof.
-    #[allow(clippy::too_many_arguments)]
-    pub fn validate_raw_requested(
-        base: security::ConfigDigest,
-        envelope: common::EnvelopeDigest,
-        catalog: &common::Catalog,
-        resources: [Config; 2],
-        covers: [cover::Config; 2],
-        settings: TransactionSettings,
-        policy: l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy,
-    ) -> io::Result<()> {
-        Self::validate_raw_requested_selected(
-            base, envelope, catalog, resources, covers, settings, policy, None,
-        )
-    }
     /// Validate exact compact final geometry while retaining the complete
     /// bootstrap packet policy, covers and both endpoint resource inventories.
     #[allow(clippy::too_many_arguments)]
@@ -32,50 +16,21 @@ impl CommonTransactionContract {
         policy: l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy,
         selection: record::compact::Selection,
     ) -> io::Result<()> {
-        Self::validate_raw_requested_selected(
-            base,
-            envelope,
-            catalog,
-            resources,
-            covers,
-            settings,
-            policy,
-            Some(selection),
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn validate_raw_requested_selected(
-        base: security::ConfigDigest,
-        envelope: common::EnvelopeDigest,
-        catalog: &common::Catalog,
-        resources: [Config; 2],
-        covers: [cover::Config; 2],
-        settings: TransactionSettings,
-        policy: l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy,
-        selection: Option<record::compact::Selection>,
-    ) -> io::Result<()> {
         let geometry = policy.record_geometry().map_err(invalid)?;
-        let physical = if selection.is_some() {
-            policy
-                .final_record_geometry()
-                .map_err(invalid)?
-                .ip_tcp_bytes
-        } else {
-            geometry
-                .ip_tcp_bytes
-                .checked_add(geometry.record_overhead_bytes)
-                .ok_or_else(exhausted)?
-        };
-        let requested = Self::raw_requested_selected(
+        let physical = policy
+            .final_record_geometry()
+            .map_err(invalid)?
+            .ip_tcp_bytes;
+        let requested = Self::raw_requested_configuration_compact(
             base, envelope, catalog, resources, covers, settings, selection,
         )?;
         for (index, role) in [security::Role::Initiator, security::Role::Responder]
             .into_iter()
             .enumerate()
         {
-            if resources[index].path_mtu != geometry.path_mtu
-                || covers[index].limits().max_packet_bytes > geometry.max_record_bytes
-            {
+            establish::raw_carrier::validate_cover_geometry(covers[index], policy)
+                .map_err(invalid)?;
+            if resources[index].path_mtu != geometry.path_mtu {
                 return Err(invalid("requested raw complete record/MTU geometry"));
             }
             Self::construct_physical_selected(
@@ -87,7 +42,6 @@ impl CommonTransactionContract {
                 envelope,
                 catalog.clone(),
                 settings,
-                None,
                 0,
                 None,
                 physical,
@@ -98,10 +52,10 @@ impl CommonTransactionContract {
         }
         Ok(())
     }
-    /// Pre-TLS original raw PairConfig.session.digest for this complete request.
-    /// This is a public policy commitment, never TLS/raw/Noise authority.
+    /// Base pre-TLS policy commitment retained inside the complete current request.
+    /// This cannot select a final record format or grant TLS/raw/Noise authority.
     #[allow(clippy::too_many_arguments)]
-    pub fn raw_requested_configuration(
+    fn raw_requested_base_configuration(
         base_policy: security::ConfigDigest,
         base_envelope: common::EnvelopeDigest,
         catalog: &common::Catalog,
@@ -124,8 +78,8 @@ impl CommonTransactionContract {
         Ok(core::ConfigDigest(finish(hash)))
     }
 
-    /// Complete pre-TLS compact request. The legacy commitment remains embedded
-    /// unchanged; a distinct domain binds the final carrier layout and data suite.
+    /// Complete pre-TLS request. The base commitment binds both resource inventories;
+    /// the final domain additionally binds the carrier layout and data suite.
     #[allow(clippy::too_many_arguments)]
     pub fn raw_requested_configuration_compact(
         base_policy: security::ConfigDigest,
@@ -142,7 +96,7 @@ impl CommonTransactionContract {
                 "compact raw peers require matching security owner limits",
             ));
         }
-        let original = Self::raw_requested_configuration(
+        let original = Self::raw_requested_base_configuration(
             base_policy,
             base_envelope,
             catalog,
@@ -151,76 +105,18 @@ impl CommonTransactionContract {
             settings,
         )?;
         let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(b"l2tunnel/raw-common/compact-carrier-requested/v1\0");
+        hash.update(b"l2tunnel/raw-common/compact-carrier-requested/v2\0");
         hash.update(&original.0);
         hash.update(b"l2tunnel/records/carrier-layout/raw-tcp-aad/v1\0");
         hash.update(&[match selection.protection {
             security::compact::Protection::Aes128Ccm4 => 1,
             security::compact::Protection::ChaCha20Crc32c => 2,
-            security::compact::Protection::ChaCha20Poly1305 => {
-                return Err(invalid("compact raw data check"));
-            }
+            security::compact::Protection::ChaCha20Poly1305 => 3,
+            security::compact::Protection::HmacSha256 => 4,
         }]);
         hash.update(&selection.limits.max_forward_packets.to_be_bytes());
         hash.update(&selection.limits.max_failed_checks.to_be_bytes());
         Ok(core::ConfigDigest(finish(hash)))
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn raw_requested_selected(
-        base_policy: security::ConfigDigest,
-        base_envelope: common::EnvelopeDigest,
-        catalog: &common::Catalog,
-        resources: [Config; 2],
-        covers: [cover::Config; 2],
-        settings: TransactionSettings,
-        selection: Option<record::compact::Selection>,
-    ) -> io::Result<core::ConfigDigest> {
-        match selection {
-            Some(selection) => Self::raw_requested_configuration_compact(
-                base_policy,
-                base_envelope,
-                catalog,
-                resources,
-                covers,
-                settings,
-                selection,
-            ),
-            None => Self::raw_requested_configuration(
-                base_policy,
-                base_envelope,
-                catalog,
-                resources,
-                covers,
-                settings,
-            ),
-        }
-    }
-
-    /// Bind both exact role policies to the genuine already completed raw owner.
-    /// The complete requested catalog already uses its explicit raw geometry;
-    /// this constructor never shrinks/rebases a descriptor or invents a TLS proof.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_on_raw_paired(
-        base_policy: security::ConfigDigest,
-        role: security::Role,
-        resources: [Config; 2],
-        covers: [cover::Config; 2],
-        base_envelope: common::EnvelopeDigest,
-        catalog: common::Catalog,
-        settings: TransactionSettings,
-        outer: AuthenticatedRaw,
-    ) -> io::Result<Self> {
-        Self::new_on_raw_paired_selected(
-            base_policy,
-            role,
-            resources,
-            covers,
-            base_envelope,
-            catalog,
-            settings,
-            outer,
-            None,
-        )
     }
     /// Bind selected single-protection final Records to the genuine raw owner.
     /// Bootstrap capacity and identity still come from its completed TLS/member
@@ -237,30 +133,6 @@ impl CommonTransactionContract {
         outer: AuthenticatedRaw,
         selection: record::compact::Selection,
     ) -> io::Result<Self> {
-        Self::new_on_raw_paired_selected(
-            base_policy,
-            role,
-            resources,
-            covers,
-            base_envelope,
-            catalog,
-            settings,
-            outer,
-            Some(selection),
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn new_on_raw_paired_selected(
-        base_policy: security::ConfigDigest,
-        role: security::Role,
-        resources: [Config; 2],
-        covers: [cover::Config; 2],
-        base_envelope: common::EnvelopeDigest,
-        catalog: common::Catalog,
-        settings: TransactionSettings,
-        outer: AuthenticatedRaw,
-        selection: Option<record::compact::Selection>,
-    ) -> io::Result<Self> {
         if outer.duplex() != catalog.initial().duplex() {
             return Err(invalid("Common duplex differs from the actual raw pair"));
         }
@@ -271,7 +143,7 @@ impl CommonTransactionContract {
         if outer.role() != expected_role {
             return Err(invalid("raw proof has another actual role"));
         }
-        let requested = Self::raw_requested_selected(
+        let requested = Self::raw_requested_configuration_compact(
             base_policy,
             base_envelope,
             &catalog,
@@ -291,18 +163,11 @@ impl CommonTransactionContract {
             ));
         }
         let geometry = outer.geometry();
-        let physical = if selection.is_some() {
-            outer
-                .policy()
-                .final_record_geometry()
-                .map_err(invalid)?
-                .ip_tcp_bytes
-        } else {
-            geometry
-                .ip_tcp_bytes
-                .checked_add(geometry.record_overhead_bytes)
-                .ok_or_else(exhausted)?
-        };
+        let physical = outer
+            .policy()
+            .final_record_geometry()
+            .map_err(invalid)?
+            .ip_tcp_bytes;
         let descriptor = catalog.initial();
         let layer = match descriptor
             .direction(mg::Role::Client)
@@ -319,20 +184,16 @@ impl CommonTransactionContract {
             ));
         }
         for index in 0..2 {
-            if resources[index].path_mtu != geometry.path_mtu
-                || covers[index].limits().max_packet_bytes > geometry.max_record_bytes
-            {
+            establish::raw_carrier::validate_cover_geometry(covers[index], outer.policy())
+                .map_err(invalid)?;
+            if resources[index].path_mtu != geometry.path_mtu {
                 return Err(invalid(
                     "raw Common resources exceed actual complete record geometry",
                 ));
             }
         }
         let mut envelope = digest::Context::new(&digest::SHA256);
-        if selection.is_some() {
-            envelope.update(b"l2tunnel/raw-common/compact-carrier-envelope/v1\0");
-        } else {
-            envelope.update(b"l2tunnel/raw-common/envelope/v1\0");
-        }
+        envelope.update(b"l2tunnel/raw-common/compact-carrier-envelope/v2\0");
         envelope.update(base_envelope.as_bytes());
         envelope.update(&requested.0);
         envelope.update(catalog.root().as_bytes());
@@ -342,11 +203,7 @@ impl CommonTransactionContract {
         let mut bytes = [0; common::CONFIGURATION_BYTES];
         initial.encode_into(&mut bytes).map_err(invalid)?;
         let mut setup = digest::Context::new(&digest::SHA256);
-        if selection.is_some() {
-            setup.update(b"l2tunnel/raw-common/compact-carrier-setup/v1\0");
-        } else {
-            setup.update(b"l2tunnel/raw-common/setup/v1\0");
-        }
+        setup.update(b"l2tunnel/raw-common/compact-carrier-setup/v2\0");
         setup.update(&requested.0);
         setup.update(envelope.as_bytes());
         setup.update(&bytes);
@@ -372,7 +229,6 @@ impl CommonTransactionContract {
             envelope,
             catalog.clone(),
             settings,
-            None,
             0,
             None,
             physical,
@@ -389,7 +245,6 @@ impl CommonTransactionContract {
             envelope,
             catalog,
             settings,
-            None,
             0,
             None,
             physical,
@@ -401,7 +256,7 @@ impl CommonTransactionContract {
     /// Require this exact genuine raw handoff proof. Public observations alone
     /// cannot create the RawInitialParts needed by the consuming runtime entry.
     pub fn validate_raw(&self, actual: AuthenticatedRaw) -> io::Result<()> {
-        if self.raw != Some(actual) || self.outer.is_some() || self.managed.is_some() {
+        if self.raw != Some(actual) || self.outer.is_some() {
             return Err(invalid(
                 "actual raw outer differs from selected Common contract",
             ));

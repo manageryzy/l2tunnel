@@ -62,6 +62,35 @@ fn encoded(config: Config, phase: Phase, body: &[u8]) -> Result<Vec<u8>, Error> 
 }
 
 #[test]
+fn retained_outgoing_validation_keeps_direction_and_exact_grammar() -> Result<(), Error> {
+    for appearance in [Appearance::QuicLike, Appearance::MediaLike] {
+        let (a, b) = fixture(appearance)?;
+        for phase in [Phase::Handshake, Phase::Established] {
+            for (sender, peer) in [(a, b), (b, a)] {
+                let mut packet = encoded(sender, phase, &[0x31, 0, 0xa4])?;
+                assert_eq!(sender.decode_outgoing(&packet)?, peer.decode(&packet)?);
+                assert_eq!(sender.decode(&packet), Err(Error::IdentifierMismatch));
+                assert_eq!(
+                    peer.decode_outgoing(&packet),
+                    Err(Error::IdentifierMismatch)
+                );
+                let identifier = match (appearance, phase) {
+                    (Appearance::QuicLike, Phase::Handshake) => 6,
+                    (Appearance::QuicLike, Phase::Established) => 1,
+                    (Appearance::MediaLike, _) => 8,
+                };
+                packet[identifier] ^= 1;
+                assert_eq!(
+                    sender.decode_outgoing(&packet),
+                    Err(Error::IdentifierMismatch)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn exact_quic_initial_wire_and_borrowed_zero_tail() -> Result<(), Error> {
     let (a, b) = fixture(Appearance::QuicLike)?;
     let body = [0xa5, 0, 0];

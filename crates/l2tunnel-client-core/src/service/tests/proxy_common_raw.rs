@@ -230,14 +230,11 @@ async fn exercise_proxy_wire(wire: Option<l2tunnel::secure_record::compact::Sele
             assert_eq!(common.local_addr,addresses[side]);assert_eq!(common.peer_addr,addresses[1-side]);
             assert_eq!(common.requested_carrier,common.effective_carrier);
             assert!(!frame.released && !frame.releasing);
-            match (wire, common.compact_wire.as_ref()) {
-                (Some(selection), Some(actual)) => {
-                    assert_eq!(actual.requested, crate::secure_udp::common_status::CompactWireSelection::from_selection(selection)?);
-                    assert_eq!(actual.effective.as_ref(), Some(&actual.requested));
-                }
-                (None, None) => {}
-                _ => return Err("raw proxy compact requested/effective status absent".into()),
-            }
+            let actual = common.compact_wire.as_ref().ok_or("raw proxy compact requested/effective status absent")?;
+            assert_eq!(actual.requested, crate::secure_udp::common_status::CompactWireSelection::from_selection(requested.compact_wire())?);
+            assert_eq!(actual.effective.as_ref(), Some(&actual.requested));
+            assert_eq!(actual.authenticated_proxy_records, Some(true));
+            assert_eq!(actual.effective_data_overhead_bytes, Some(21));
         }
         assert_eq!(probes[0].opened.load(Ordering::SeqCst),1);
         assert_eq!(probes[1].opened.load(Ordering::SeqCst),1);

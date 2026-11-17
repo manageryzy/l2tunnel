@@ -1093,6 +1093,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
         };
         assert_eq!(&output[..prepared.bytes()], native);
         assert_eq!(prepared.deadline(), record_expiry);
+        assert_eq!(receiver.custody_deadline()?, Some(record_expiry));
         assert_eq!(receiver.deadline()?, Some(recovery_due));
         let retained = output.clone();
         assert_eq!(
@@ -1100,6 +1101,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
             NativePreparation::AlreadyPending(prepared)
         );
         assert_eq!(output, retained);
+        assert_eq!(receiver.custody_deadline()?, Some(record_expiry));
         receiver.commit_native(Tick(near_expiry.0 + 2), prepared.token())?;
         assert_eq!(receiver.statistics().committed, 1);
         assert!(!receiver.drained()?);

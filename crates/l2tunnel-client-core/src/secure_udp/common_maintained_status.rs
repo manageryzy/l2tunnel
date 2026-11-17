@@ -57,7 +57,6 @@ pub struct MaintainedCarrier {
     /// Configured independent public SNI is unavailable for genuine Quinn.
     pub independent_sni_supported: bool,
 }
-#[cfg(unix)]
 impl MaintainedPolicy {
     fn from_request(
         request: l2tunnel_runtime::secure_udp::maintained::Request,
@@ -85,7 +84,6 @@ impl MaintainedPolicy {
         })
     }
 }
-#[cfg(unix)]
 impl MaintainedCarrier {
     pub(crate) fn observe(
         profile: &crate::secure_udp::common_transaction_profile::Profile,
@@ -108,6 +106,17 @@ impl MaintainedCarrier {
                 "maintained runtime differs from authenticated plan",
             ));
         }
+        Self::from_observation(request, actual).map(Some)
+    }
+    pub(crate) fn from_observation(
+        request: l2tunnel_runtime::secure_udp::maintained::Request,
+        actual: Option<l2tunnel_runtime::secure_udp::maintained::Authenticated>,
+    ) -> std::io::Result<Self> {
+        if actual.is_some_and(|value| value.requested() != request) {
+            return Err(std::io::Error::other(
+                "maintained runtime policy differs from request",
+            ));
+        }
         let lanes = actual.map_or([None, None], |outer| {
             outer.lanes().map(|lane| {
                 lane.map(|lane| MaintainedLane {
@@ -118,7 +127,7 @@ impl MaintainedCarrier {
                 })
             })
         });
-        Ok(Some(Self {
+        Ok(Self {
             requested: MaintainedPolicy::from_request(request)?,
             effective: actual
                 .map(|outer| MaintainedPolicy::from_request(outer.requested()))
@@ -132,6 +141,6 @@ impl MaintainedCarrier {
                 request.kind,
                 l2tunnel_runtime::secure_udp::maintained::Kind::TlsStream
             ),
-        }))
+        })
     }
 }

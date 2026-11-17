@@ -1,4 +1,4 @@
-use super::super::{wire as outer, wire_error};
+use super::record as outer;
 use super::wire::{ControlFrame, Fence, Start};
 use super::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -48,7 +48,6 @@ pub(super) struct Progress {
 pub(super) struct Direction {
     pub index: usize,
     pub lane: u8,
-    pub session: [u8; 16],
     pub bulk: bool,
 }
 pub(super) async fn reader<R: AsyncRead + Unpin>(
@@ -61,7 +60,6 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
     quiesce: watch::Sender<Option<Instant>>,
 ) -> io::Result<()> {
     let (config, measured) = profile;
-    let mut sequence = 0u64;
     let mut seen_users = 0u64;
     let mut start = false;
     let mut ready = false;
@@ -98,18 +96,8 @@ pub(super) async fn reader<R: AsyncRead + Unpin>(
                 .map_err(|_| invalid("proxy actor stopped"))?;
             return Ok(());
         };
-        let (header, body) = outer::decode(&input, max).map_err(wire_error)?;
-        if header.session != direction.session
-            || header.epoch != l2tunnel_core::Epoch(1)
-            || header.lane != u16::from(direction.lane)
-            || header.packet_number != sequence
-        {
-            return Err(invalid("proxy outer scope/sequence"));
-        }
-        sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("proxy sequence exhausted"))?;
-        match header.kind {
+        let (kind, body) = outer::decode(&input, max)?;
+        match kind {
             outer::Kind::Data if direction.bulk && start && ready && !saw_barrier => {
                 let user = wire::decode_profile(body, &config, measured)?;
                 if saw_quiesce && user.flow != 0 && user.body.get(..6) == Some(b"LTPA\x01\x01") {
@@ -203,7 +191,6 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
     events: mpsc::Sender<Event>,
     receipts: Option<super::actor::CommonRetirement>,
 ) -> io::Result<()> {
-    let mut sequence = 0u64;
     let mut state = Progress::default();
     let mut burst = 0;
     let mut delayed = None;
@@ -267,17 +254,7 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                 {
                     delayed = Some(Output::Control(frame));
                     burst = 0;
-                    let bytes = outer::encode(
-                        outer::Header {
-                            kind: outer::Kind::Data,
-                            epoch: l2tunnel_core::Epoch(1),
-                            packet_number: sequence,
-                            session: direction.session,
-                            lane: u16::from(direction.lane),
-                        },
-                        &user,
-                    )
-                    .map_err(wire_error)?;
+                    let bytes = outer::encode(outer::Kind::Data, &user)?;
                     let ordinal = state
                         .users
                         .checked_add(1)
@@ -286,9 +263,6 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                         write_selected_frame(&mut stream, &bytes, receipts.as_ref(), Some(ordinal))
                             .await?;
                     publish_physical(&mut state, ordinal, physical)?;
-                    sequence = sequence
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("proxy sequence exhausted"))?;
                     state.users = state
                         .users
                         .checked_add(1)
@@ -305,21 +279,7 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                 (outer::Kind::Control, frame.encode(), Some(frame))
             }
         };
-        let bytes = outer::encode(
-            outer::Header {
-                kind,
-                epoch: l2tunnel_core::Epoch(1),
-                packet_number: sequence,
-                session: direction.session,
-                lane: u16::from(direction.lane),
-            },
-            &body,
-        )
-        .map_err(wire_error)?;
-        // Refuse exhaustion before a physical write can consume its Bridge fact.
-        let next_sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("proxy sequence exhausted"))?;
+        let bytes = outer::encode(kind, &body)?;
         let ordinal = if control.is_none() {
             Some(
                 state
@@ -340,7 +300,6 @@ pub(super) async fn writer_selected<W: AsyncWrite + Unpin>(
                 .checked_add(control_interval)
                 .ok_or_else(|| invalid("proxy control pacing deadline overflow"))?;
         }
-        sequence = next_sequence;
         match control {
             None => {
                 state.users = state

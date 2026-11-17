@@ -1,5 +1,5 @@
 //! Actual protected original UDP, one reserved fragment group and native custody.
-//! Imported secure test Parts are real; no fresh Noise/member handshake is claimed.
+//! The shared fixture authenticates the complete current catalog before data service.
 use super::*;
 use codec::source_copy::{Policy, Scope as CopyScope};
 use l2tunnel::record_engine::{FragmentDirection, FragmentPolicy, ReassemblyPolicies};
@@ -40,6 +40,77 @@ fn fragmented(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2]
             },
         )?,
     )?;
+    // Native width is immutable across negotiated epochs. Keep the complete
+    // catalog coherent while admitting a source that exceeds the current chunk.
+    for value in &mut selected {
+        let descriptor = value.descriptor();
+        let profile = match *descriptor.profile() {
+            c::Profile::Swift {
+                mut forward,
+                mut reverse,
+            } => {
+                for direction in [&mut forward, &mut reverse] {
+                    direction.max_native = 1500;
+                    direction.codec.max_packet = 1501;
+                }
+                c::Profile::Swift { forward, reverse }
+            }
+            c::Profile::Aligned {
+                mut forward,
+                mut reverse,
+            } => {
+                forward.receiver.body.max_frame_bytes = 1500;
+                reverse.receiver.body.max_frame_bytes = 1500;
+                c::Profile::Aligned { forward, reverse }
+            }
+            c::Profile::Packed {
+                mut forward,
+                mut reverse,
+            } => {
+                forward.base.receiver.body.max_frame_bytes = 1500;
+                reverse.base.receiver.body.max_frame_bytes = 1500;
+                c::Profile::Packed { forward, reverse }
+            }
+            c::Profile::RollingCopies {
+                mut config,
+                stream,
+                copies,
+            } => {
+                for direction in [&mut config.forward, &mut config.reverse] {
+                    direction.receiver.body.max_frame_bytes = 1500;
+                    direction.packing.sender.body = direction.receiver.body;
+                }
+                c::Profile::RollingCopies {
+                    config,
+                    stream,
+                    copies,
+                }
+            }
+            _ => return Err("unexpected fragment fixture family".into()),
+        };
+        let common = |role| -> Result<c::CommonDirection> {
+            let original = descriptor.direction(role).common();
+            let mut pipeline = original.pipeline();
+            pipeline.parse.max_packet_bytes = 1500;
+            Ok(c::CommonDirection::new(
+                original.traffic(),
+                pipeline,
+                original.bytes_per_second(),
+                original.burst_bytes(),
+                original.native_window(),
+            )?)
+        };
+        *value = C::new(
+            value.envelope(),
+            c::Descriptor::new(
+                descriptor.path_mtu(),
+                descriptor.duplex(),
+                common(mg::Role::Client)?,
+                common(mg::Role::Server)?,
+                profile,
+            )?,
+        )?;
+    }
     let direction =
         |actual: rolling_records::DirectionConfig, outer, label| -> Result<FragmentDirection> {
             let maximum = actual.maximum_packet_bytes()?;
@@ -111,10 +182,10 @@ fn fragmented(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2]
                 max_protected_bytes: 1470,
             },
         )?;
-        Ok(CommonTransactionContract::new(
+        Ok(CommonTransactionContract::new_compact_wire(
             security::ConfigDigest([3; 32]),
             role,
-            resources,
+            [resources; 2],
             cover,
             false,
             c::EnvelopeDigest::new([0x39; 32]),
@@ -128,6 +199,7 @@ fn fragmented(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2]
                 max_operation_ms: 3000,
                 retained_bytes: 256 << 20,
             },
+            default_record_selection(),
         )?)
     };
     Ok((
@@ -141,7 +213,9 @@ fn fragmented(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2]
 
 fn packet() -> Result<Vec<u8>> {
     let mut packet = frame(40_000, 103);
-    packet.resize(1000, 103);
+    // The current union elides scope and padding: use an actual source larger
+    // than the 1411-byte fragment payload at the unchanged 1500-byte path MTU.
+    packet.resize(1440, 103);
     let ip_length = u16::try_from(packet.len() - 14)?;
     let udp_length = u16::try_from(packet.len() - 34)?;
     packet[16..18].copy_from_slice(&ip_length.to_be_bytes());
@@ -301,7 +375,6 @@ fn selected_fragment_groups_use_fresh_records_and_original_udp_before_native_and
                                 &input[..length],
                                 fixture.now,
                                 target.driver.origin + duration(fixture.now),
-                                None,
                             )?;
                             replay = Some(bytes);
                         }
@@ -326,7 +399,6 @@ fn selected_fragment_groups_use_fresh_records_and_original_udp_before_native_and
                     &replay.ok_or("actual delivered protected fragment")?,
                     fixture.now,
                     target.driver.origin + duration(fixture.now),
-                    None,
                 )?;
                 assert_eq!(target.driver.counters.replay_rejections, before + 1);
                 let mut originals = Vec::new();

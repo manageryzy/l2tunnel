@@ -1,5 +1,5 @@
 //! Complete Common CLI plans reuse resource parsing, without inventing Swift policies.
-use super::transaction_cli::{RecoveryDto, RuntimeDto, TransactionDto, read_document};
+use super::common_runtime_cli::{RecoveryDto, RuntimeDto, TransactionDto, read_document};
 use crate::{ConnectionConfig, secure_udp};
 use l2tunnel::record_configuration::{Catalog, DESCRIPTOR_BYTES, Descriptor};
 use l2tunnel_runtime::secure_udp::{establish, transport};
@@ -59,6 +59,17 @@ impl Plan {
     }
     pub(super) fn report_interval(&self) -> Option<Duration> {
         self.runtime.report_interval()
+    }
+    pub(super) fn protected_body_capacity(&self, packet_bytes: usize) -> io::Result<usize> {
+        let overhead = self
+            .compact_wire
+            .map(|value| value.build().map(|selection| selection.maximum_overhead()))
+            .transpose()?
+            .unwrap_or(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD);
+        packet_bytes
+            .checked_sub(overhead)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| invalid("carrier capacity below selected final protection"))
     }
     pub(super) fn validate_carrier(&self, selected: bool) -> io::Result<()> {
         match (selected, &self.outer_carrier) {
@@ -169,6 +180,7 @@ impl Plan {
         )
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn build_proxy(
         &self,
         connection: ConnectionConfig,
@@ -189,28 +201,6 @@ impl Plan {
             None,
             Some((proxy, retained)),
             None,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_proxy_measured(
-        &self,
-        connection: ConnectionConfig,
-        settings: secure_udp::Settings,
-        peers: establish::Peers,
-        maximum_body: usize,
-        overhead: usize,
-        proxy: l2tunnel_runtime::proxy::measured::Config,
-    ) -> io::Result<secure_udp::common_transaction_profile::Profile> {
-        self.validate_carrier(false)?;
-        self.build_selected(
-            connection,
-            settings,
-            peers,
-            maximum_body,
-            overhead,
-            None,
-            None,
-            Some(proxy),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -260,13 +250,13 @@ impl Plan {
         )
     }
     #[allow(clippy::too_many_arguments)]
-    fn build_selected_on(
+    pub(super) fn build_selected_on(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
         peers: establish::Peers,
         maximum_body: usize,
-        overhead: usize,
+        _overhead: usize,
         raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
         proxy: Option<(l2tunnel_runtime::proxy::Config, bool)>,
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
@@ -296,7 +286,7 @@ impl Plan {
                 },
             },
         };
-        let overhead = if self.compact_wire.is_some() {
+        let overhead = {
             let physical: usize = if let Some(selected) = maintained {
                 selected.geometry.charged_overhead_bytes
             } else if let Some(policy) = raw {
@@ -312,8 +302,6 @@ impl Plan {
             physical
                 .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
                 .ok_or_else(|| invalid("compact control wire geometry overflow"))?
-        } else {
-            overhead
         };
         let mut configs = self.runtime.templates_for(
             self.initial().path_mtu(),
@@ -350,11 +338,42 @@ impl Plan {
             config.ack_coalescing = ack;
             config.rolling_ingress = rolling;
         }
+        let proxy = match measured.as_ref() {
+            Some(value) => Some((value.fixed.clone(), true)),
+            None => proxy,
+        };
+        if let Some((proxy, retained)) = proxy {
+            return secure_udp::common_transaction_profile::Profile::new_proxy_selected_on(
+                connection,
+                settings,
+                peers,
+                configs[0],
+                configs[1],
+                self.catalog.clone(),
+                self.parameters,
+                proxy,
+                retained,
+                measured,
+                self.compact_wire
+                    .map(|selection| selection.build())
+                    .transpose()?,
+                raw,
+                maintained,
+            );
+        }
         if let Some(maintained) = maintained {
-            let selection = self
-                .compact_wire
-                .ok_or_else(|| invalid("maintained Common requires explicit compact_wire"))?
-                .build()?;
+            let Some(selection) = self.compact_wire else {
+                return secure_udp::common_transaction_profile::Profile::new_maintained(
+                    connection,
+                    settings,
+                    peers,
+                    configs[0],
+                    configs[1],
+                    self.catalog.clone(),
+                    self.parameters,
+                    maintained,
+                );
+            };
             return secure_udp::common_transaction_profile::Profile::new_maintained_compact(
                 connection,
                 settings,
@@ -364,7 +383,7 @@ impl Plan {
                 self.catalog.clone(),
                 self.parameters,
                 maintained,
-                selection,
+                selection.build()?,
             );
         }
         if let Some(policy) = raw {
@@ -390,40 +409,6 @@ impl Plan {
                 self.catalog.clone(),
                 self.parameters,
                 policy,
-            );
-        }
-        if let Some(measured) = measured {
-            return secure_udp::common_transaction_profile::Profile::new_proxy_selected(
-                connection,
-                settings,
-                peers,
-                configs[0],
-                configs[1],
-                self.catalog.clone(),
-                self.parameters,
-                measured.fixed.clone(),
-                true,
-                Some(measured),
-                self.compact_wire
-                    .map(|selection| selection.build())
-                    .transpose()?,
-            );
-        }
-        if let Some((proxy, retained)) = proxy {
-            return secure_udp::common_transaction_profile::Profile::new_proxy_selected(
-                connection,
-                settings,
-                peers,
-                configs[0],
-                configs[1],
-                self.catalog.clone(),
-                self.parameters,
-                proxy,
-                retained,
-                None,
-                self.compact_wire
-                    .map(|selection| selection.build())
-                    .transpose()?,
             );
         }
         if let Some(selection) = self.compact_wire {

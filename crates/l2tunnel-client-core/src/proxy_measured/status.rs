@@ -1,5 +1,6 @@
 //! Bounded aggregate DTOs; no payloads, keys or per-flow dumps.
 use super::*;
+use l2tunnel_core::Duplex;
 use serde::Serialize;
 
 /// Explicit measured profile; no fallback profile is inferred.
@@ -26,6 +27,10 @@ pub enum Carrier {
     TcpTls,
     /// Original authenticated UDP owner with the explicit Common record adapter.
     CommonUdp,
+    /// Common records on the actual retained ordinary TCP/TLS owner.
+    CommonTls,
+    /// Common records on actual maintained QUIC DATAGRAM lanes.
+    CommonQuic,
 }
 /// Explicit UDP appearance, or its absence on retained TCP/TLS lanes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -227,15 +232,23 @@ impl LocalSnapshot {
         snapshot: Option<&Snapshot>,
         requested_cover: l2tunnel_cover::Appearance,
         effective_cover: Option<l2tunnel_cover::Appearance>,
+        maintained: Option<l2tunnel_runtime::secure_udp::maintained::Request>,
+        maintained_installed: bool,
     ) -> Self {
         let cover = |value| match value {
             l2tunnel_cover::Appearance::QuicLike => UdpCover::QuicLike,
             l2tunnel_cover::Appearance::MediaLike => UdpCover::MediaLike,
         };
         let mut value = Self::observed(lanes, snapshot);
-        value.capabilities.requested_carrier = Carrier::CommonUdp;
-        value.capabilities.effective_carrier =
-            (snapshot.is_some() && effective_cover.is_some()).then_some(Carrier::CommonUdp);
+        let carrier = maintained.map_or(Carrier::CommonUdp, |request| match request.kind {
+            l2tunnel_runtime::secure_udp::maintained::Kind::TlsStream => Carrier::CommonTls,
+            l2tunnel_runtime::secure_udp::maintained::Kind::QuicDatagram => Carrier::CommonQuic,
+        });
+        value.capabilities.requested_carrier = carrier;
+        value.capabilities.effective_carrier = (snapshot.is_some()
+            && effective_cover.is_some()
+            && (maintained.is_none() || maintained_installed))
+            .then_some(carrier);
         value.capabilities.requested_udp_cover = cover(requested_cover);
         value.capabilities.effective_udp_cover = snapshot.and(effective_cover).map(cover);
         value
@@ -327,15 +340,6 @@ mod tests {
                 epoch: n,
                 phase: "Quiescing".into(),
                 compression: crate::local::Compression::Off,
-                active: None,
-                openvpn_drain: None,
-                raw_packet: None,
-                rolling: None,
-                #[cfg(unix)]
-                swift: None,
-                #[cfg(unix)]
-                secure_udp: None,
-                transaction: None,
                 common: None,
                 proxy: Some(crate::local::ProxySnapshot {
                     common: None,

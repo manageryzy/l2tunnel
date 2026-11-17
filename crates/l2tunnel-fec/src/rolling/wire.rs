@@ -5,29 +5,29 @@
 //! authenticated session. This codec has no keys, replay state or transport.
 use super::{Config, Error, MAX_PAYLOAD, Repair, RepairId, Scope, SourceId, Support, add};
 
-/// Explicit context-free selected union; legacy formats remain unchanged.
+/// Explicit context-free union; the authenticated configuration binds its grammar.
 pub mod compact;
 
-/// Complete fixed version-one header, excluding the negotiated vector.
+/// Complete fixed version-three/four header, excluding the negotiated vector.
 pub const HEADER_BYTES: usize = 64;
 /// Maximum full record under the rolling payload limit; block limits are separate.
 pub const MAX_RECORD_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD + 2;
-/// Version of the original fixed-width enclosing format, distinct from compact wire.
-pub const VERSION: u8 = 1;
-/// Version whose systematic source records omit the zero tail; repairs stay full width.
-pub const EXACT_SOURCE_VERSION: u8 = 2;
+/// Version with padded sources and effective repair extents.
+pub const VERSION: u8 = 3;
+/// Version with exact sources and effective repair extents.
+pub const EXACT_SOURCE_VERSION: u8 = 4;
 
 /// Explicitly selected systematic-source encoding, bound by the authenticated policy.
 ///
-/// Both formats share the header, identities and full-width repair vectors and
+/// Both formats share the header, identities and effective repair extents and
 /// present the identical original bytes to the decoder. Each accepts only its
 /// own version byte, so records of the two formats can never be mixed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceWire {
-    /// Version 1: every source record carries its complete zero-padded vector.
+    /// Version 3: every source record carries its complete zero-padded vector.
     #[default]
     Padded,
-    /// Version 2: a source record ends after its exact original bytes. The
+    /// Version 4: a source record ends after its exact original bytes. The
     /// receiver's decoder reconstructs the same bounded zero-padded vector.
     Exact,
 }
@@ -88,9 +88,7 @@ fn source_support(id: SourceId) -> Result<Support, Error> {
     })
 }
 fn repair_shape(config: Config, repair: Repair<'_>, width: usize) -> Result<(), Error> {
-    if repair.bytes.len() != width {
-        return Err(Error::Length);
-    }
+    repair.validate_extent(width)?;
     if repair.id.0 == u64::MAX
         || config.support(repair.support.end, repair.id, repair.support.tail)? != repair.support
     {
@@ -117,9 +115,9 @@ pub fn inspect(config: Config, bytes: &[u8]) -> Result<View<'_>, Error> {
 pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<View<'_>, Error> {
     let width = config.width()?;
     let full = add(HEADER_BYTES, width)?;
-    let exact_source =
-        format == SourceWire::Exact && bytes.len() >= HEADER_BYTES && bytes[5] == SOURCE;
-    if exact_source {
+    let variable = bytes.len() >= HEADER_BYTES
+        && (bytes[5] == REPAIR || format == SourceWire::Exact && bytes[5] == SOURCE);
+    if variable {
         if bytes.len() < add(HEADER_BYTES, 3)? || bytes.len() > full {
             return Err(Error::Length);
         }
@@ -262,9 +260,9 @@ pub fn encode_source_with(
     Ok(length)
 }
 
-/// Encode a complete canonical rolling equation without trimming its vector.
+/// Encode a canonical rolling equation's complete effective prefix.
 ///
-/// The bytes may be any full-width equation; algebra and reconstructed source
+/// The bytes may be any bounded equation prefix; algebra and reconstructed source
 /// validation belong to the decoder. Every rejected call leaves output unchanged.
 pub fn encode_repair(
     config: Config,
@@ -274,9 +272,7 @@ pub fn encode_repair(
     encode_repair_with(config, SourceWire::Padded, repair, output)
 }
 
-/// Encode a complete full-width equation under the selected format's version.
-///
-/// Repair vectors are never trimmed in either format; only the version differs.
+/// Encode the actual effective equation extent under the selected source format.
 pub fn encode_repair_with(
     config: Config,
     format: SourceWire,
@@ -285,7 +281,7 @@ pub fn encode_repair_with(
 ) -> Result<usize, Error> {
     let width = config.width()?;
     repair_shape(config, repair, width)?;
-    let length = add(HEADER_BYTES, width)?;
+    let length = add(HEADER_BYTES, repair.bytes.len())?;
     if output.len() < length {
         return Err(Error::OutputTooSmall);
     }

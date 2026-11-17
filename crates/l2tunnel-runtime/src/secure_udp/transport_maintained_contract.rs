@@ -24,7 +24,7 @@ impl CommonTransactionContract {
             return Err(invalid("maintained Common security or duplex differs"));
         }
         let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(b"l2tunnel/common-maintained/compact-requested/v1\0");
+        hash.update(b"l2tunnel/common-maintained/compact-requested/v2\0");
         hash.update(&base.0);
         hash.update(envelope.as_bytes());
         hash.update(catalog.root().as_bytes());
@@ -39,9 +39,8 @@ impl CommonTransactionContract {
         hash.update(&[match selection.protection {
             security::compact::Protection::Aes128Ccm4 => 1,
             security::compact::Protection::ChaCha20Crc32c => 2,
-            security::compact::Protection::ChaCha20Poly1305 => {
-                return Err(invalid("maintained compact data check"));
-            }
+            security::compact::Protection::ChaCha20Poly1305 => 3,
+            security::compact::Protection::HmacSha256 => 4,
         }]);
         hash.update(&selection.limits.max_forward_packets.to_be_bytes());
         hash.update(&selection.limits.max_failed_checks.to_be_bytes());
@@ -74,7 +73,7 @@ impl CommonTransactionContract {
                 || resources[index]
                     .security
                     .max_body_bytes
-                    .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+                    .checked_add(selection.maximum_overhead())
                     .is_none_or(|maximum| maximum > geometry.max_record_bytes)
             {
                 return Err(invalid("maintained requested record/bootstrap geometry"));
@@ -88,13 +87,12 @@ impl CommonTransactionContract {
                 envelope,
                 catalog.clone(),
                 settings,
-                None,
                 0,
                 None,
                 geometry.charged_overhead_bytes,
                 None,
                 request.duplex,
-                Some(selection),
+                selection,
             )?;
         }
         Ok(())
@@ -197,13 +195,12 @@ impl CommonTransactionContract {
                 envelope,
                 catalog.clone(),
                 settings,
-                None,
                 0,
                 None,
                 request.geometry.charged_overhead_bytes,
                 None,
                 request.duplex,
-                Some(selection),
+                selection,
             )?;
             if index == local {
                 result = Some(candidate);
@@ -221,12 +218,7 @@ impl CommonTransactionContract {
 
     /// Require the exact owner proof consumed by the selected runtime handoff.
     pub fn validate_maintained(&self, actual: Authenticated) -> io::Result<()> {
-        if self.maintained != Some(actual)
-            || self.raw.is_some()
-            || self.outer.is_some()
-            || self.managed.is_some()
-            || self.compact_wire.is_none()
-        {
+        if self.maintained != Some(actual) || self.raw.is_some() || self.outer.is_some() {
             return Err(invalid(
                 "actual maintained owner differs from Common contract",
             ));

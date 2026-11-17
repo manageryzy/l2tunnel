@@ -30,17 +30,24 @@ pub(super) fn selection(
             "Common proxy requires explicit proxy/proxy-measured traffic and complete Common plan",
         ));
     }
-    if carrier != &Carrier::OriginalUdp
-        || connection.duplex != Duplex::Full
+    if matches!(carrier, Carrier::OpenVpn)
+        || (*carrier == Carrier::OriginalUdp && connection.duplex != Duplex::Full)
         || connection.layer != l2tunnel_device::PacketLayer::Ip
         || connection.compression != Compression::None
     {
         return Err(input(
-            "Common proxy currently requires original UDP cover, full duplex, TUN and no compression",
+            "Common proxy requires original UDP, retained TLS/QUIC or raw TCP, TUN and no compression; original UDP requires full duplex",
         ));
     }
     required(options, "--proxy-policy")?;
     let close = retained(options)?;
+    if *carrier == Carrier::RawPacket
+        && options.get("--traffic").map(String::as_str) == Some("proxy-measured")
+    {
+        return Err(input(
+            "measured Common proxy requires original UDP or retained TLS/QUIC",
+        ));
+    }
     if options.get("--traffic").map(String::as_str) == Some("proxy-measured") && !close {
         return Err(input(
             "Common measured proxy requires explicit --proxy-close retained",
@@ -79,21 +86,13 @@ pub(super) fn settings(
             path,
             crate::proxy_measured::MAX_POLICY_BYTES,
         )?)?;
-        if settings.fixed.channels != 1 {
-            return Err(input(
-                "Common proxy currently requires exactly one configured channel",
-            ));
-        }
+
         crate::proxy_measured::runtime_config(connection, &settings)?;
         return Ok(Policy::Measured(Box::new(settings)));
     }
     let settings =
         crate::proxy::Settings::from_json(&bounded_file(path, crate::proxy::MAX_POLICY_BYTES)?)?;
-    if settings.channels != 1 {
-        return Err(input(
-            "Common proxy currently requires exactly one configured channel",
-        ));
-    }
+
     crate::proxy::runtime_config(connection, &settings)?;
     Ok(Policy::Fixed(Box::new(settings)))
 }
@@ -181,14 +180,14 @@ pub(super) fn inspection(profile: &CommonProfile, role: security::Role) -> io::R
     header["capabilities"] = json!({"fixed":profile.proxy_measured_config().is_none(),"measured":profile.proxy_measured_config().is_some(),"common_record_composition":false,
         "authenticated":false,"hot_switch":false,"graceful_close":profile.proxy_retirement(),"exact_tcp_rwnd_control":false,
         "native_common_api4":false,"native_qualified":false});
-    *header = transaction_cli_output::bounded(std::mem::take(header))?;
+    *header = common_cli_output::bounded(std::mem::take(header))?;
     for (page, rules) in proxy.routes.rules().chunks(16).enumerate() {
         let rules = rules.iter().map(|rule| json!({
             "source":format!("{}/{}",rule.source.address(),rule.source.bits()),
             "destination":format!("{}/{}",rule.destination.address(),rule.destination.bits()),
             "ports":{"first":rule.ports.first,"last":rule.ports.last},
         })).collect::<Vec<_>>();
-        values.push(transaction_cli_output::bounded(json!({"event":"secure_udp_common_proxy_plan_routes","schema":1,
+        values.push(common_cli_output::bounded(json!({"event":"secure_udp_common_proxy_plan_routes","schema":1,
             "requested":true,"authenticated":false,"offset":page*16,"total":proxy.routes.rules().len(),"routes":rules}))?);
     }
     Ok(values)
@@ -203,16 +202,20 @@ pub(crate) fn event(
         cli::proxy_frontend::SharedEvent,
         service::{Observation, ProxyProfile},
     };
-    let (generation, name, outcome, selected) = match event {
+    let (generation, name, outcome, selected, requested_duplex) = match event {
         SharedEvent::Ready {
             generation,
             profile,
-            ..
+            duplex,
         } => (
             *generation,
             "secure_udp_common_proxy_ready",
             None,
             Some(*profile),
+            Some(match duplex {
+                Duplex::Full => "full",
+                Duplex::Half => "half",
+            }),
         ),
         SharedEvent::Terminal {
             generation,
@@ -221,6 +224,7 @@ pub(crate) fn event(
             *generation,
             "secure_udp_common_proxy_terminal",
             Some(outcome),
+            None,
             None,
         ),
     };
@@ -244,9 +248,13 @@ pub(crate) fn event(
             || !common.running
             || common.released
             || common.releasing
-            || common.requested_configuration != common.effective_configuration
+            || (common.maintained_carrier.is_none()
+                && common.requested_configuration != common.effective_configuration)
             || common.requested_carrier != common.effective_carrier
             || common.effective_cover != Some(common.requested_cover)
+            || common.maintained_carrier.as_ref().is_some_and(|value| {
+                value.effective.as_ref() != Some(&value.requested) || value.binding.is_none()
+            })
             || frame
                 .runtime
                 .as_ref()
@@ -274,10 +282,20 @@ pub(crate) fn event(
                     crate::local::ProxyCommonCover::QuicLike => UdpCover::QuicLike,
                     crate::local::ProxyCommonCover::MediaLike => UdpCover::MediaLike,
                 };
+                let expected_carrier = common.maintained_carrier.as_ref().map_or(
+                    MeasuredCarrier::CommonUdp,
+                    |value| {
+                        if value.requested.carrier == "tcp" {
+                            MeasuredCarrier::CommonTls
+                        } else {
+                            MeasuredCarrier::CommonQuic
+                        }
+                    },
+                );
                 if !common.graceful_close
                     || value.capabilities.effective != Some(MeasuredProfile::MeasuredRelayV1)
-                    || value.capabilities.requested_carrier != MeasuredCarrier::CommonUdp
-                    || value.capabilities.effective_carrier != Some(MeasuredCarrier::CommonUdp)
+                    || value.capabilities.requested_carrier != expected_carrier
+                    || value.capabilities.effective_carrier != Some(expected_carrier)
                     || value.capabilities.requested_udp_cover != expected
                     || value.capabilities.effective_udp_cover != Some(expected)
                     || !value.capabilities.measured_relay_targets
@@ -289,9 +307,9 @@ pub(crate) fn event(
             }
         }
     }
-    transaction_cli_output::bounded(
+    common_cli_output::bounded(
         json!({"event":name,"schema":1,"api_version":crate::local::VERSION,
-        "backend":backend(common.graceful_close,frame.effective_profile==ProxyProfile::MeasuredRelay),"generation":generation.value(),"proxy":frame.status(),"outcome":outcome}),
+        "backend":backend(common.graceful_close,frame.effective_profile==ProxyProfile::MeasuredRelay),"generation":generation.value(),"requested_duplex":requested_duplex,"proxy":frame.status(),"outcome":outcome}),
     )
 }
 

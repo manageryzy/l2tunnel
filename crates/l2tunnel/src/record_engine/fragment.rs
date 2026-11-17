@@ -475,16 +475,21 @@ impl State {
         Ok((bytes, allocations))
     }
     pub(super) fn deadline(&self) -> Option<Tick> {
-        self.group
-            .as_ref()
-            .map(|g| g.metadata.deadline)
+        self.custody_deadline()
             .into_iter()
-            .chain(self.lanes.iter().filter_map(|l| l.held.map(|i| i.cap)))
             .chain(
                 self.lanes
                     .iter()
                     .filter_map(|l| l.receiver.deadline().map(Tick)),
             )
+            .min()
+    }
+    pub(super) fn custody_deadline(&self) -> Option<Tick> {
+        self.group
+            .as_ref()
+            .map(|g| g.metadata.deadline)
+            .into_iter()
+            .chain(self.lanes.iter().filter_map(|l| l.held.map(|i| i.cap)))
             .min()
     }
     pub(super) fn tick(&mut self, now: Tick) -> Result<(), Error> {
@@ -735,6 +740,13 @@ impl Engine {
             accepted: None,
             accepted_order: None,
         });
+        if let Some(window) = &mut self.native_window {
+            window.capture(
+                witnesses
+                    .get(..prepared.witnesses)
+                    .ok_or(Error::Invariant)?,
+            )?;
+        }
         state.statistics.groups_reserved = groups;
         self.statistics.emitted = emitted;
         Ok(Some(metadata))

@@ -72,7 +72,6 @@ async fn receive_one(endpoint: &mut Endpoint, now: u64) -> Result {
         &input[..bytes],
         now,
         endpoint.driver.origin + duration(now),
-        None,
     )?;
     assert_eq!(
         endpoint.driver.counters.received_packets,
@@ -311,13 +310,23 @@ fn promoted_smaller_burst_keeps_real_old_reader_feedback_and_native_counts() -> 
                     let before = endpoint.driver.bucket.tokens;
                     let accepted = endpoint.driver.counters.socket_accepted_packets;
                     let feedback = endpoint.driver.performance.counters.feedback_packets;
-                    let number = endpoint.driver.records.next_number(Class::User);
+                    let number = endpoint.driver.records.next_feedback_number();
+                    let user_number = endpoint.driver.counters.user_number;
+                    let next_user = endpoint.driver.records.next_number(Class::User);
                     assert!(
                         endpoint
                             .driver
                             .send_common_user(&endpoint.socket, fixture.now)?
                     );
-                    assert_eq!(endpoint.driver.counters.user_number, Some(number));
+                    assert_eq!(
+                        endpoint
+                            .driver
+                            .snapshot_common(fixture.now, true)?
+                            .compact_feedback_number,
+                        Some(number)
+                    );
+                    assert_eq!(endpoint.driver.counters.user_number, user_number);
+                    assert_eq!(endpoint.driver.records.next_number(Class::User), next_user);
                     assert_eq!(
                         endpoint.driver.buffers.frame[0] & swift::KIND_MASK,
                         swift::KIND_FEEDBACK

@@ -21,21 +21,20 @@ async fn protected_control(fixture: &mut Fixture, side: usize) -> Result<Vec<u8>
     let length =
         tokio::time::timeout(Duration::from_secs(1), target.socket.recv(&mut input)).await??;
     assert_eq!(&input[..length], packet);
-    target.driver.receive_selected(
-        &input[..length],
-        now,
-        target.driver.origin + duration(now),
-        None,
-    )?;
+    target
+        .driver
+        .receive_selected(&input[..length], now, target.driver.origin + duration(now))?;
     Ok(packet)
 }
 
 #[test]
 fn same_flow_retry_retains_actual_packed_token_native_debt_and_leased_operation() -> Result {
+    // Avoid an extra by-value copy of this large fixture future in block_on.
+    // The test retains the default thread stack and all original owner checks.
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async {
+        .block_on(Box::pin(async {
             for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
                 let mut fixture = Fixture::new(kind)?.await?;
                 let contract = fixture.endpoints[0]
@@ -171,12 +170,7 @@ fn same_flow_retry_retains_actual_packed_token_native_debt_and_leased_operation(
                 assert_eq!(driver.common_state()?.peer().operation(), Some(operation));
                 assert_eq!(std::ptr::from_ref(driver.common_state()?) as usize, bank);
                 let rejected_before = driver.counters.replay_rejections;
-                driver.receive_selected(
-                    &replay,
-                    retry_at,
-                    driver.origin + duration(retry_at),
-                    None,
-                )?;
+                driver.receive_selected(&replay, retry_at, driver.origin + duration(retry_at))?;
                 assert_eq!(driver.counters.replay_rejections, rejected_before + 1);
                 assert!(
                     driver
@@ -234,7 +228,6 @@ fn same_flow_retry_retains_actual_packed_token_native_debt_and_leased_operation(
                     &input[..length],
                     retry_at,
                     target.driver.origin + duration(retry_at),
-                    None,
                 )?;
                 let front = target
                     .driver
@@ -308,7 +301,7 @@ fn same_flow_retry_retains_actual_packed_token_native_debt_and_leased_operation(
                 }
             }
             Ok(())
-        })
+        }))
 }
 
 #[test]

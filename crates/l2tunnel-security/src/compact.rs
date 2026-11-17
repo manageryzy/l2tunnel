@@ -37,6 +37,8 @@ pub enum Protection {
     ChaCha20Crc32c = 2,
     /// Maintained ChaCha20-Poly1305 with its full 16-byte tag.
     ChaCha20Poly1305 = 3,
+    /// Maintained full HMAC-SHA256 for explicitly unencrypted authenticated data.
+    HmacSha256 = 4,
 }
 impl Protection {
     /// Actual bytes appended after the encrypted body.
@@ -44,6 +46,7 @@ impl Protection {
         match self {
             Self::Aes128Ccm4 | Self::ChaCha20Crc32c => 4,
             Self::ChaCha20Poly1305 => 16,
+            Self::HmacSha256 => 32,
         }
     }
     /// Actual packet-number prefix plus check, excluding caller-owned routing.
@@ -52,7 +55,7 @@ impl Protection {
     }
     /// Whether this suite authenticates management or reliable-retiring feedback.
     pub const fn authenticated_control(self) -> bool {
-        matches!(self, Self::ChaCha20Poly1305)
+        matches!(self, Self::ChaCha20Poly1305 | Self::HmacSha256)
     }
 }
 

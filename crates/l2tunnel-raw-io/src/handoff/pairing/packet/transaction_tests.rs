@@ -1,3 +1,4 @@
+//! Bootstrap transaction, setup-only physical custody and original owner release.
 use super::super::super::test_support::{self as support, PacketLink, R};
 use super::*;
 use std::{
@@ -119,7 +120,7 @@ async fn run(
             && !early_staged
             && let Some(server) = br.as_mut()
         {
-            server.stage_record(
+            server.stage_setup_record(
                 if half {
                     PairLane::Second
                 } else {
@@ -194,7 +195,7 @@ async fn cancelled_borrow_keeps_exact_original_protected_packet_through_wouldblo
     let bf = Arc::new(Fault::default());
     let (mut a, mut b) = run(false, af.clone(), bf, false).await?;
     af.blocked.store(true, Ordering::SeqCst);
-    a.stage_record(PairLane::First, RecordKind::Data, b"held bytes")?;
+    a.stage_setup_record(PairLane::First, RecordKind::Data, b"held bytes")?;
     for _ in 0..3 {
         poll_fn(|cx| {
             let _ = a.poll_progress(cx);
@@ -246,9 +247,9 @@ async fn late_expiry_preserves_each_actual_original_lane_send_once() -> R {
     let af = Arc::new(Fault::default());
     let bf = Arc::new(Fault::default());
     let (mut a, mut b) = run(true, af, bf, false).await?;
-    let first = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"source\0\xff")?;
+    let first = a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"source\0\xff")?;
     let second =
-        a.stage_record_tracked(PairLane::Second, RecordKind::Feedback, b"control\xff\0")?;
+        a.stage_setup_record_tracked(PairLane::Second, RecordKind::Feedback, b"control\xff\0")?;
     poll_fn(|cx| {
         for carrier in [&mut a, &mut b] {
             if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -315,7 +316,7 @@ async fn failed_physical_observer_never_invents_an_unsent_wouldblock_receipt() -
     let bf = Arc::new(Fault::default());
     let (mut a, mut b) = run(false, af.clone(), bf, false).await?;
     af.blocked.store(true, Ordering::SeqCst);
-    a.stage_record_tracked(PairLane::First, RecordKind::Data, b"not physically sent")?;
+    a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"not physically sent")?;
     for _ in 0..3 {
         poll_fn(|cx| {
             let _ = a.poll_progress(cx);
@@ -351,7 +352,8 @@ async fn physical_observer_preserves_first_failure_and_legacy_successful_receipt
     let af = Arc::new(Fault::default());
     let bf = Arc::new(Fault::default());
     let (mut a, mut b) = run(false, af.clone(), bf, false).await?;
-    let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"physical fact")?;
+    let token =
+        a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"physical fact")?;
     poll_fn(|cx| {
         for carrier in [&mut a, &mut b] {
             if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -409,7 +411,8 @@ async fn physical_observer_preserves_first_failure_and_legacy_successful_receipt
         false,
     )
     .await?;
-    let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"legacy receipt")?;
+    let token =
+        a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"legacy receipt")?;
     poll_fn(|cx| {
         for carrier in [&mut a, &mut b] {
             if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -435,7 +438,8 @@ async fn physical_observer_preserves_first_failure_and_legacy_successful_receipt
     let observed = a.take_sent_record_observed(PairLane::First)?;
     assert!(observed.sent.is_none());
     assert!(observed.failure.is_none());
-    let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, b"live observer")?;
+    let token =
+        a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, b"live observer")?;
     poll_fn(|cx| {
         for carrier in [&mut a, &mut b] {
             if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -527,30 +531,12 @@ async fn expired_cached_transition_and_old_ack_cannot_send_on_active_carrier() -
     lane.progress()?;
     assert!(!lane.io.pending());
     assert!(lock(&lane.io.state)?.old_reply.is_none());
-    b.stage_record(
-        PairLane::First,
-        RecordKind::Data,
-        b"active after setup expiry",
-    )?;
-    bf.block_all.store(false, Ordering::SeqCst);
-    poll_fn(|cx| {
-        if let Poll::Ready(Err(e)) = a.poll_progress(cx) {
-            return Poll::Ready(Err(e));
-        }
-        if let Poll::Ready(Err(e)) = b.poll_progress(cx) {
-            return Poll::Ready(Err(e));
-        }
-        if a.record().is_some() {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await?;
-    assert_eq!(
-        a.record().ok_or("record")?.bytes,
-        b"active after setup expiry"
-    );
+    assert!(matches!(
+        b.stage_setup_record(PairLane::First, RecordKind::Data, b"expired setup retry"),
+        Err(Error::Expired)
+    ));
+    assert!(b.lanes.iter().all(Option::is_none));
+    assert!(matches!(b.check_live(), Err(Error::Expired)));
     Ok(())
 }
 #[tokio::test(start_paused = true)]
@@ -655,7 +641,7 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
         loop {
             assert!(next < 96);
             body[..2].copy_from_slice(&next.to_be_bytes());
-            let token = a.stage_record_tracked(PairLane::First, RecordKind::Data, &body)?;
+            let token = a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, &body)?;
             let mut sent = None;
             let mut received = false;
             poll_fn(|cx| {
@@ -766,7 +752,7 @@ async fn half_one_way_records_return_same_lane_window_after_actual_physical_send
             let mut received = false;
             poll_fn(|cx| {
                 if token.is_none() {
-                    match a.stage_record_tracked(PairLane::First, RecordKind::Data, &body) {
+                    match a.stage_setup_record_tracked(PairLane::First, RecordKind::Data, &body) {
                         Ok(value) => token = Some(value),
                         Err(Error::Busy) => {}
                         Err(error) => return Poll::Ready(Err(error)),
@@ -904,7 +890,7 @@ async fn full_upper_feedback_piggybacks_retirement_before_idle_window_claims_slo
             }
         })
         .await?;
-        a.stage_record(PairLane::First, RecordKind::Data, b"actual upper source")?;
+        a.stage_setup_record(PairLane::First, RecordKind::Data, b"actual upper source")?;
         poll_fn(|cx| {
             for carrier in [&mut a, &mut b] {
                 if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
@@ -927,7 +913,7 @@ async fn full_upper_feedback_piggybacks_retirement_before_idle_window_claims_slo
             lane.pending.is_none(),
             "new receive must leave the real upper output opportunity"
         );
-        let token = b.stage_record_tracked(
+        let token = b.stage_setup_record_tracked(
             PairLane::First,
             RecordKind::Feedback,
             b"actual upper feedback",

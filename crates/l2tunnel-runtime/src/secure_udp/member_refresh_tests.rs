@@ -1,5 +1,6 @@
+//! Actual managed initial authentication and retained joining custody only.
 use super::*;
-use l2tunnel::{handshake as hs, secure_record as record};
+use l2tunnel::handshake as hs;
 use l2tunnel_udp_control as gate;
 use std::{cell::Cell, future::poll_fn, task::Poll};
 
@@ -199,135 +200,8 @@ fn settings(established: &establish::refresh::Established) -> Settings {
         receive_packets_per_interval: 8,
     }
 }
-struct Live {
-    socket: UdpSocket,
-    cover: cover::Config,
-    bootstrap: establish::BootstrapTail,
-    joining: JoiningTail,
-    next_outer: u32,
-    deadline: Instant,
-    origin: Instant,
-}
-fn records(parts: refresh::Parts) -> Result<(Live, record::Records)> {
-    let origin = parts.clock_origin();
-    let spec = parts.initial.selection().spec();
-    let now = joining_time(origin, Instant::now())?;
-    let records = record::Records::new_refreshable(
-        parts.initial,
-        spec.lane,
-        spec.limits,
-        spec.protection,
-        parts.cover,
-        record::Scope {
-            epoch: spec.control_epoch,
-            configuration: spec.control_digest,
-        },
-        record::Scope {
-            epoch: security::Epoch(7),
-            configuration: security::ConfigDigest([21; 32]),
-        },
-        now,
-        joining_time(origin, parts.deadline)?,
-    )?;
-    Ok((
-        Live {
-            socket: parts.socket,
-            cover: parts.cover,
-            bootstrap: parts.bootstrap,
-            joining: parts.joining,
-            next_outer: parts.next_outer,
-            deadline: parts.deadline,
-            origin,
-        },
-        records,
-    ))
-}
-async fn send_record(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    body: &[u8],
-) -> Result<Vec<u8>> {
-    let mut scratch = [0; 1200];
-    let mut wire = [0; 1200];
-    let sealed = records.seal_at(
-        joining_time(live.origin, Instant::now())?,
-        class,
-        metadata(live.next_outer, cover::Phase::Established),
-        body,
-        &mut scratch,
-        &mut wire,
-    )?;
-    advance(&mut live.next_outer)?;
-    let length = timeout_at(
-        live.deadline,
-        live.socket.send(&wire[..sealed.record.bytes]),
-    )
-    .await??;
-    assert_eq!(length, sealed.record.bytes);
-    assert_eq!(sealed.record.number, security::PacketNumber(0));
-    Ok(wire[..length].to_vec())
-}
-async fn receive_record(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    expected: &[u8],
-) -> Result {
-    let mut input = [0; 1201];
-    let mut output = [0; 1200];
-    let mut scratch = [0; 1200];
-    let mut body = [0; 1200];
-    loop {
-        let now = Instant::now();
-        before(now, live.deadline)?;
-        if let Some(length) = live.bootstrap.poll(
-            now,
-            metadata(live.next_outer, cover::Phase::Handshake),
-            &mut output,
-        )? {
-            advance(&mut live.next_outer)?;
-            assert_eq!(
-                timeout_at(live.deadline, live.socket.send(&output[..length])).await??,
-                length
-            );
-        }
-        if let Some(length) = live.joining.poll(
-            now,
-            metadata(live.next_outer, cover::Phase::Established),
-            &mut output,
-        )? {
-            advance(&mut live.next_outer)?;
-            assert_eq!(
-                timeout_at(live.deadline, live.socket.send(&output[..length])).await??,
-                length
-            );
-        }
-        let wake = live
-            .bootstrap
-            .deadline()
-            .unwrap_or(live.deadline)
-            .min(live.joining.deadline().unwrap_or(live.deadline))
-            .min(live.deadline);
-        tokio::select! {
-            _ = sleep_until(wake) => {},
-            received = live.socket.recv(&mut input) => {
-                let length = received?;
-                let decoded = live.cover.decode(&input[..length])?;
-                let now = Instant::now();
-                if live.bootstrap.receive(decoded, now)? || live.joining.receive(decoded, now)? { continue; }
-                let opened = records.open_at(joining_time(live.origin, now)?, &input[..length], &mut scratch, &mut body)?;
-                assert_eq!(opened.record.class, class);
-                assert_eq!(opened.record.number, security::PacketNumber(0));
-                assert_eq!(&body[..opened.record.bytes], expected);
-                return Ok(());
-            }
-        }
-    }
-}
-
 #[tokio::test]
-async fn actual_selected_member_handoff_installs_v2_on_original_socket() -> Result {
+async fn actual_selected_member_handoff_retains_initial_authority_on_original_socket() -> Result {
     for kind in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
         for profile in [hs::Profile::Ik, hs::Profile::IkPsk2] {
             let selected = selection(5_000_000)?;
@@ -360,40 +234,8 @@ async fn actual_selected_member_handoff_installs_v2_on_original_socket() -> Resu
             assert_eq!(client.initial.pins(), server.initial.pins());
             assert_eq!(client.initial.role(), security::Role::Initiator);
             assert_eq!(server.initial.role(), security::Role::Responder);
-            let (mut client, mut client_records) = records(client)?;
-            let (mut server, mut server_records) = records(server)?;
-            let _ = send_record(
-                &mut client,
-                &mut client_records,
-                record::Class::User,
-                b"actual selected User",
-            )
-            .await?;
-            receive_record(
-                &mut server,
-                &mut server_records,
-                record::Class::User,
-                b"actual selected User",
-            )
-            .await?;
-            let _ = send_record(
-                &mut server,
-                &mut server_records,
-                record::Class::Control,
-                b"actual selected Control",
-            )
-            .await?;
-            receive_record(
-                &mut client,
-                &mut client_records,
-                record::Class::Control,
-                b"actual selected Control",
-            )
-            .await?;
             assert_eq!(client.socket.local_addr()?, client_addr);
             assert_eq!(server.socket.local_addr()?, server_addr);
-            assert_eq!(client_records.key_epoch()?, security::refresh::KeyEpoch(0));
-            assert_eq!(server_records.key_epoch()?, security::refresh::KeyEpoch(0));
         }
     }
     Ok(())

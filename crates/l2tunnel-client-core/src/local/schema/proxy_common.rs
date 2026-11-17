@@ -35,6 +35,9 @@ pub struct ProxyCommonStatus {
     /// Explicit compact request and actual installed protection/check observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_wire: Option<crate::secure_udp::common_status::CompactWireStatus>,
+    /// Requested and actual retained TLS/QUIC policy, original lanes and acceptance boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintained_carrier: Option<crate::secure_udp::common_status::MaintainedCarrier>,
     /// Original local endpoint of the retained authenticated socket.
     pub local_addr: SocketAddr,
     /// Original peer endpoint of the retained authenticated socket.

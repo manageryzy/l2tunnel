@@ -19,11 +19,13 @@ pub fn data_len(output: Output<'_>) -> Result<usize, Error> {
             }
             Ok(1 + len(u64::from(id.0)) + original.len())
         }
-        Output::Repair(repair) => Ok(1
-            + len(repair.equation.id.0)
-            + len(u64::from(repair.equation.support.end))
-            + len(u64::from(repair.confirmed))
-            + repair.equation.bytes.len()),
+        Output::Repair(repair) => {
+            repair.equation.validate_extent(rolling::MAX_PAYLOAD + 2)?;
+            Ok(1 + len(repair.equation.id.0)
+                + len(u64::from(repair.equation.support.end))
+                + len(u64::from(repair.confirmed))
+                + repair.equation.bytes.len())
+        }
     }
 }
 /// Serialize the original or actual equation directly without profile/scope duplication.

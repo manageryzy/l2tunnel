@@ -39,7 +39,6 @@ def main() -> None:
         run(sys.executable, '-m', 'unittest', 'tools.test_generic_cli_native', 'tools.test_common_carrier_cli_native', '-v')
     run(sys.executable, 'tools/check_checklists.py')
     run(sys.executable, '-m', 'unittest', 'tools.test_record_check', '-v')
-    run(sys.executable, '-m', 'unittest', 'tools.test_secure_record_perf', '-v')
     run(sys.executable, 'tools/check_smoltcp_source.py')
     run(sys.executable, 'tools/generate_tcp_header_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run(sys.executable, 'tools/generate_aligned_body_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
@@ -58,17 +57,13 @@ def main() -> None:
     if result.returncode != 2 or 'Unknown command' not in result.stderr:
         raise RuntimeError('CLI must reject unspecified network execution')
     if sys.platform == 'linux':
-        # Real two-process loopback run of the CLI base UDP path; unprivileged.
+        # Build the current daemon for the external Common CLI process probe.
         run('cargo', 'build', '--quiet', '--locked', '-p', 'l2tunneld')
         daemon = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve() / 'debug' / 'l2tunneld'
-        run(sys.executable, 'tools/udp_cli_loopback.py', str(daemon))
         # Real external CLI against authenticated shared service/Unix devices.
         # This does not attach production TAP/TUN or qualify native performance.
         directory = Path(tempfile.mkdtemp(prefix='l2tunnel-gcl-'))
         print(f'External CLI probe directory (retained on failure): {directory}', flush=True)
-        run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core',
-            '--example', 'generic_cli_process_probe', '--', '--binary', str(daemon),
-            '--work-dir', str(directory / 'probe'))
         run('cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core',
             '--example', 'common_cli_process_probe', '--', '--binary', str(daemon),
             '--work-dir', str(directory / 'common'))

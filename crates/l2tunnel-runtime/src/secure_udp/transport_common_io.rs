@@ -1,15 +1,19 @@
 //! Same-loop Common packet service; security and physical custody stay singular.
 use super::*;
 use l2tunnel::{record_bank, record_configuration as configuration, record_engine as engine};
-use l2tunnel_reliable::{OutboundBudget, RecordKind};
+use l2tunnel_reliable::OutboundBudget;
 
 impl Driver {
+    fn common_authenticated_data(&self) -> bool {
+        self.common.as_deref().is_some_and(|runtime| {
+            runtime.contract.proxy_binding().is_some()
+                && self.records.compact_selection().protection.tag_bytes() < 16
+        })
+    }
+
     /// Check the selected strong-feedback boundary before liveness or codec
     /// mutation. Public algorithm kind bytes cannot upgrade short-check Data.
     pub(super) fn validate_common_compact_route(&self, opened: record::Opened) -> io::Result<bool> {
-        if !self.records.is_compact() {
-            return Ok(true);
-        }
         if opened.class == Class::Control {
             return Ok(opened.authenticated && !opened.feedback);
         }
@@ -38,7 +42,7 @@ impl Driver {
         Ok(if kind == engine::EmissionKind::Feedback {
             opened.feedback && opened.authenticated
         } else {
-            !opened.feedback
+            !opened.feedback && (!self.common_authenticated_data() || opened.strongly_authenticated)
         })
     }
 
@@ -85,21 +89,27 @@ impl Driver {
         Ok(())
     }
 
-    /// Called once per sole-loop turn, never from per-packet progress callbacks.
+    /// Service every current owner's bounded maintenance once per sole-loop turn,
+    /// with explicit Rolling work when selected; never from per-packet callbacks.
     pub(super) fn service_common_rolling(&mut self, now: u64) -> io::Result<()> {
-        let Some(work) = self.config.rolling_work else {
-            return Ok(());
-        };
+        let work = self.config.rolling_work;
         if self.common.is_none() || !self.check_expiry(now)? {
             return Ok(());
         }
         self.retry_common_fragment_inputs(now)?;
         for epoch in self.common_epochs().into_iter().flatten() {
-            let step = self
-                .common_state_mut()?
-                .entry(epoch)?
-                .step(engine::Tick(now), work)
-                .map_err(protocol)?;
+            let step = if let Some(work) = work {
+                self.common_state_mut()?
+                    .entry(epoch)?
+                    .step(engine::Tick(now), work)
+                    .map_err(protocol)?
+            } else {
+                self.common_state_mut()?
+                    .entry(epoch)?
+                    .tick(engine::Tick(now))
+                    .map_err(protocol)?;
+                None
+            };
             if let Some(step) = step {
                 let width = usize::from(
                     self.common_state()?
@@ -134,39 +144,28 @@ impl Driver {
         Ok(())
     }
     pub(super) fn has_transactions(&self) -> bool {
-        self.generic.is_some() || self.common.is_some()
+        self.common.is_some()
     }
     pub(super) fn observation_dirty(&self) -> bool {
-        self.generic.as_ref().is_some_and(|r| r.observation_dirty)
-            || self.common.as_deref().is_some_and(|r| r.observation_dirty)
+        self.common.as_deref().is_some_and(|r| r.observation_dirty)
     }
     pub(super) fn clear_observation_dirty(&mut self) {
-        if let Some(r) = &mut self.generic {
-            r.observation_dirty = false;
-        }
         if let Some(r) = &mut self.common {
             r.observation_dirty = false;
         }
     }
     pub(super) fn native_deliverable(&self) -> io::Result<bool> {
-        if self.common.is_some() {
-            let state = self.common_state()?;
-            let runtime = self
-                .common
-                .as_deref()
-                .ok_or_else(|| protocol("common scan contract"))?;
-            Ok(self.common_epochs().into_iter().flatten().any(|epoch| {
-                runtime.native_work[(epoch.0 % 2) as usize] > 0
-                    && state
-                        .engine(epoch)
-                        .is_ok_and(|e| e.pending_native().is_none())
-            }))
-        } else {
-            Ok(self
-                .owner
-                .engine(core::Epoch(self.feedback_scope.epoch.0))?
-                .deliverable())
-        }
+        let state = self.common_state()?;
+        let runtime = self
+            .common
+            .as_deref()
+            .ok_or_else(|| protocol("common scan contract"))?;
+        Ok(self.common_epochs().into_iter().flatten().any(|epoch| {
+            runtime.native_work[(epoch.0 % 2) as usize] > 0
+                && state.engine(epoch).is_ok_and(|e| {
+                    e.pending_native().is_none() && e.pending_native_delivery().is_none()
+                })
+        }))
     }
     pub(super) fn common_epochs(&self) -> [Option<core::Epoch>; 2] {
         let Ok(state) = self.common_state() else {
@@ -230,9 +229,9 @@ impl Driver {
                     .send()
                     .max_native())
     }
-    pub(super) fn read_common_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    pub(super) fn read_common_native<D: NativeDevice>(
         &mut self,
-        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        ready: &mut NativeGuard<'_, D>,
         output: &mut [u8],
         mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
@@ -295,20 +294,21 @@ impl Driver {
         } else {
             None
         };
+        #[cfg(unix)]
         let proxy_timing = self
             .common
             .as_deref()
             .and_then(|runtime| runtime.proxy_bridge.as_ref())
             .map(|bridge| bridge.timing())
             .transpose()?;
+        #[cfg(not(unix))]
+        let proxy_timing: Option<(Instant, Instant)> = None;
         let proxy_timing = proxy_timing
             .map(|(received, deadline)| {
                 Ok::<_, io::Error>((clock(self.origin, received)?, clock(self.origin, deadline)?))
             })
             .transpose()?;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("common ingress owner"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         if let Some((received, deadline)) = proxy_timing {
             state
                 .entry(epoch)?
@@ -374,9 +374,7 @@ impl Driver {
                 continue;
             }
             let origin = NativeOrigin::new(&self.info, scope, records::Direction::Receive);
-            let owner::DataOwner::Common(state) = &mut self.owner else {
-                return Err(protocol("common extraction owner"));
-            };
+            let owner::DataOwner::Common(state) = &mut self.owner;
             let Some(mut lease) = self.native.common_mut()?.acquire() else {
                 break;
             };
@@ -446,9 +444,9 @@ impl Driver {
         }
         Ok(())
     }
-    pub(super) fn write_common_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    pub(super) fn write_common_native<D: NativeDevice>(
         &mut self,
-        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        ready: &mut NativeGuard<'_, D>,
         mut sample: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
         let before = sample()?;
@@ -480,9 +478,7 @@ impl Driver {
                 "common physical origin/identity/deadline mismatch",
             ));
         }
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("common physical owner"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         if state
             .entry(epoch)?
             .pending_native()
@@ -494,9 +490,7 @@ impl Driver {
         if matches!(&result, Ok(true)) {
             // Whole device acceptance is irreversible. Commit the actual token,
             // recycle bytes and count it before sampling a possibly failing clock.
-            let owner::DataOwner::Common(state) = &mut self.owner else {
-                return Err(protocol("common physical owner"));
-            };
+            let owner::DataOwner::Common(state) = &mut self.owner;
             let committed = state
                 .entry(epoch)?
                 .commit_native(engine::Tick(before), metadata.token)
@@ -612,27 +606,30 @@ impl Driver {
                         && reader.disposition != transaction::ReadDisposition::Staged,
                 )
             };
-            let number = self.records.next_number(Class::User);
-            let available = self.bucket.allowance().saturating_sub(self.reserve);
-            let owner::DataOwner::Common(state) = &mut self.owner else {
-                return Err(protocol("common poll owner"));
+            let number = if self.common_authenticated_data() {
+                self.records.next_feedback_number()
+            } else {
+                self.records.next_number(Class::User)
             };
+            let available = self.bucket.allowance().saturating_sub(self.reserve);
+            let owner::DataOwner::Common(state) = &mut self.owner;
             // Existing queued originals are serviced after new native ingress has
             // stopped, before Stage can capture its immutable admitted fence.
             for _ in 0..self.config.work.native_read_batch {
-                let Some(admitted) = state
+                let Some(_admitted) = state
                     .entry(epoch)?
                     .admit_borrowed(engine::Tick(now))
                     .map_err(protocol)?
                 else {
                     break;
                 };
+                #[cfg(unix)]
                 if let Some(bridge) = self
                     .common
                     .as_deref()
                     .and_then(|runtime| runtime.proxy_bridge.as_ref())
                 {
-                    let engine::ProfileIdentity::Aligned(identity) = admitted.permit else {
+                    let engine::ProfileIdentity::Aligned(identity) = _admitted.permit else {
                         return Err(protocol(
                             "Common proxy admission has another record identity",
                         ));
@@ -660,9 +657,7 @@ impl Driver {
                     .common
                     .as_deref_mut()
                     .ok_or_else(|| protocol("common witness owner"))?;
-                let owner::DataOwner::Common(state) = &mut self.owner else {
-                    return Err(protocol("common poll owner"));
-                };
+                let owner::DataOwner::Common(state) = &mut self.owner;
                 let mut entry = state.entry(epoch)?;
                 let Some(emission) = entry
                     .poll_with_feedback_overhead(
@@ -689,8 +684,7 @@ impl Driver {
                 }
                 (emission, carrier, None, None)
             };
-            let compact_feedback =
-                self.records.is_compact() && emission.kind == engine::EmissionKind::Feedback;
+            let compact_feedback = emission.kind == engine::EmissionKind::Feedback;
             let mut deadline = self
                 .common_state()?
                 .operation_deadline()
@@ -698,12 +692,13 @@ impl Driver {
                 .transpose()?
                 .unwrap_or(self.lease)
                 .min(self.lease);
-            // Soft recovery/feedback wakes do not expire retained physical custody.
+            // Receive-cache eviction and recovery wakes do not expire unrelated
+            // outgoing custody. Preserve only genuine terminal owner caps here.
             if carrier.is_some()
                 && let Some(original) = self
                     .common_state()?
                     .engine(epoch)?
-                    .expiry_deadline()
+                    .custody_deadline()
                     .map_err(protocol)?
             {
                 deadline = deadline.min(original.0);
@@ -734,6 +729,7 @@ impl Driver {
                 .get_mut(..emission.bytes)
                 .ok_or_else(|| protocol("common pending body capacity"))?
                 .copy_from_slice(&self.buffers.frame[..emission.bytes]);
+            #[cfg(unix)]
             let proxy_record = runtime.proxy_bridge.as_ref().and_then(|bridge| {
                 let identity = bridge.pending_identity()?;
                 runtime
@@ -743,6 +739,9 @@ impl Driver {
                     .find(|unit| unit.identity == identity)
                     .copied()
             });
+            #[cfg(not(unix))]
+            let proxy_record = None;
+            #[cfg(unix)]
             if proxy_record.is_some() {
                 let (_, cap) = runtime
                     .proxy_bridge
@@ -751,6 +750,7 @@ impl Driver {
                     .timing()?;
                 deadline = deadline.min(clock(self.origin, cap)?);
             }
+            #[cfg(unix)]
             if let Some(unit) = proxy_record
                 && let Some(bridge) = &runtime.proxy_bridge
                 && bridge.final_identity()? == Some(unit.identity)
@@ -758,9 +758,7 @@ impl Driver {
                 if unit.index != 0 || unit.count != 1 {
                     return Err(protocol("Common final EOF is not one actual unit"));
                 }
-                let owner::DataOwner::Common(state) = &self.owner else {
-                    return Err(protocol("Common final record lost actual Bank"));
-                };
+                let owner::DataOwner::Common(state) = &self.owner;
                 let source = state
                     .engine(epoch)?
                     .proxy_output_source(&self.buffers.frame[..emission.bytes])
@@ -772,7 +770,7 @@ impl Driver {
                 proxy_record,
                 scope,
                 number: if compact_feedback {
-                    self.records.next_feedback_number().map_err(record_error)?
+                    self.records.next_feedback_number()
                 } else {
                     number
                 },
@@ -797,6 +795,7 @@ impl Driver {
         now: u64,
         mut raw: Option<&mut R>,
     ) -> io::Result<bool> {
+        let authenticated_data = self.common_authenticated_data();
         let runtime = self
             .common
             .as_deref_mut()
@@ -813,6 +812,8 @@ impl Driver {
         }
         let kind = if pending.feedback {
             record::compact::Kind::Feedback
+        } else if authenticated_data {
+            record::compact::Kind::AuthenticatedData
         } else {
             record::compact::Kind::Data
         };
@@ -855,17 +856,14 @@ impl Driver {
                 &mut self.buffers.seal,
                 &mut self.buffers.wire,
             )
-        } else if self.records.key_epoch().is_ok() {
-            self.records
-                .seal_user_in_at(
-                    l2tunnel::handshake::Time(now),
-                    pending.scope,
-                    meta(self.outer, cover::Phase::Established),
-                    body,
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-                .map(|sealed| sealed.record)
+        } else if authenticated_data {
+            self.records.seal_authenticated_data_in(
+                pending.scope,
+                meta(self.outer, cover::Phase::Established),
+                body,
+                &mut self.buffers.seal,
+                &mut self.buffers.wire,
+            )
         } else {
             self.records.seal_user_in(
                 pending.scope,
@@ -1028,16 +1026,26 @@ impl Driver {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "whole carrier write crossed original cap",
+                    format!(
+                        "whole carrier write crossed original cap: epoch={} feedback={} deadline={} accepted={} observed={} late={}",
+                        pending.scope.epoch.0,
+                        pending.feedback,
+                        pending.deadline,
+                        physical_at,
+                        at,
+                        late
+                    ),
                 ));
             }
             self.check_expiry(at)
         })();
+        #[cfg(unix)]
         let rejected = eligibility.as_ref().err().map(io::Error::kind).or_else(|| {
             matches!(&eligibility, Ok(false)).then(|| proxy_stopped_kind(self.terminal))
         });
         // Preserve the real fact even after an earlier error, but latch that
         // error first so this call cannot publish successful flush/ordinal.
+        #[cfg(unix)]
         let proxy_completion = (|| {
             if let Some(unit) = pending.proxy_record {
                 let bridge = self
@@ -1055,6 +1063,7 @@ impl Driver {
         if !eligibility? {
             return Ok(false);
         }
+        #[cfg(unix)]
         proxy_completion?;
         self.retry_common_feedback(at)?;
         Ok(true)
@@ -1091,8 +1100,8 @@ impl Driver {
             pending.cost,
             pending.deadline,
         );
-        let next = if pending.feedback {
-            self.records.next_feedback_number().map_err(record_error)?
+        let next = if pending.feedback || self.common_authenticated_data() {
+            self.records.next_feedback_number()
         } else {
             self.records.next_number(Class::User)
         };
@@ -1148,9 +1157,11 @@ impl Driver {
                     }
                     self.check_expiry(completed)
                 })();
+                #[cfg(unix)]
                 let rejected = eligibility.as_ref().err().map(io::Error::kind).or_else(|| {
                     matches!(&eligibility, Ok(false)).then(|| proxy_stopped_kind(self.terminal))
                 });
+                #[cfg(unix)]
                 let proxy_completion = (|| {
                     if let Some(unit) = pending.proxy_record {
                         let bridge = self
@@ -1174,6 +1185,7 @@ impl Driver {
                 if !eligibility? {
                     return Ok(false);
                 }
+                #[cfg(unix)]
                 proxy_completion?;
                 self.retry_common_feedback(completed)?;
                 Ok(true)
@@ -1252,138 +1264,7 @@ impl Driver {
             .descriptor()
             .local(common_contract::mg_role(self.info.role));
         let body = &self.buffers.plain[..opened.bytes];
-        let kind = if self.records.is_compact() {
-            state.engine(epoch)?.inspect_peer(body).map_err(protocol)?
-        } else {
-            match local.receive().profile() {
-                configuration::DirectionProfile::Research { config, .. } => {
-                    let configuration::DirectionProfile::Research { config: send, .. } =
-                        local.send().profile()
-                    else {
-                        return Err(protocol("research directional family mismatch"));
-                    };
-                    // Reverse feedback describes our actual sender's negotiated policy;
-                    // source/repair records describe the peer's independent policy.
-                    if matches!(
-                        l2tunnel_fec::research::wire::inspect(send.scheduler, body),
-                        Ok(l2tunnel_fec::research::wire::View::Feedback(_))
-                    ) {
-                        engine::EmissionKind::Feedback
-                    } else {
-                        match l2tunnel_fec::research::wire::inspect(config.scheduler, body)
-                            .map_err(protocol)?
-                        {
-                            l2tunnel_fec::research::wire::View::Source { .. } => {
-                                engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
-                            }
-                            l2tunnel_fec::research::wire::View::Repair(_) => {
-                                engine::EmissionKind::Repair
-                            }
-                            l2tunnel_fec::research::wire::View::Feedback(_) => {
-                                return Err(protocol(
-                                    "research feedback policy differs from sender",
-                                ));
-                            }
-                        }
-                    }
-                }
-                configuration::DirectionProfile::Swift(_) => {
-                    match body.first().map(|lead| lead & swift::KIND_MASK) {
-                        Some(swift::KIND_SOURCE) => {
-                            engine::EmissionKind::Source(engine::SourceForm::Swift)
-                        }
-                        Some(swift::KIND_REPAIR) => engine::EmissionKind::Repair,
-                        Some(swift::KIND_FEEDBACK) => engine::EmissionKind::Feedback,
-                        _ => return Err(protocol("unknown common Swift body")),
-                    }
-                }
-                configuration::DirectionProfile::Aligned(config) => {
-                    classify(body, config.recovery, self.info.role)?
-                }
-                configuration::DirectionProfile::Packed(config) => {
-                    classify(body, config.base.recovery, self.info.role)?
-                }
-                configuration::DirectionProfile::AlignedCompact(receive) => {
-                    let configuration::DirectionProfile::AlignedCompact(send) =
-                        local.send().profile()
-                    else {
-                        return Err(protocol("compact directional family mismatch"));
-                    };
-                    classify_compact(body, send.recovery, receive.recovery, self.info.role)?
-                }
-                configuration::DirectionProfile::PackedCompact(receive) => {
-                    let configuration::DirectionProfile::PackedCompact(send) =
-                        local.send().profile()
-                    else {
-                        return Err(protocol("packed compact directional family mismatch"));
-                    };
-                    classify_compact(
-                        body,
-                        send.base.recovery,
-                        receive.base.recovery,
-                        self.info.role,
-                    )?
-                }
-                configuration::DirectionProfile::PerConnectionCompact(receive) => {
-                    let configuration::DirectionProfile::PerConnectionCompact(send) =
-                        local.send().profile()
-                    else {
-                        return Err(protocol("connection directional family mismatch"));
-                    };
-                    {
-                        let (route, _) =
-                            l2tunnel::connection_records::route::decode(body).map_err(protocol)?;
-                        let actual = state
-                            .engine(epoch)?
-                            .connection_route_incarnation(route.owner.index())
-                            .map_err(protocol)?;
-                        if route.incarnation != actual {
-                            self.counters.rejected_packets =
-                                self.counters.rejected_packets.saturating_add(1);
-                            return Ok(());
-                        }
-                        common_connections::classify_incarnation(
-                            body,
-                            *send,
-                            *receive,
-                            self.info.role,
-                            actual,
-                        )?
-                    }
-                }
-                configuration::DirectionProfile::Rolling { config, .. } => {
-                    let recovery = config.scheduler.recovery;
-                    let configuration::DirectionProfile::Rolling { config: send, .. } =
-                        local.send().profile()
-                    else {
-                        return Err(protocol("rolling directional family mismatch"));
-                    };
-                    if l2tunnel_fec::rolling::scheduler::decode_feedback(
-                        send.scheduler.recovery,
-                        body,
-                    )
-                    .is_ok()
-                    {
-                        engine::EmissionKind::Feedback
-                    } else {
-                        match l2tunnel_fec::rolling::wire::inspect_with(
-                            recovery,
-                            config.scheduler.source_wire,
-                            body,
-                        )
-                        .map_err(protocol)?
-                        {
-                            l2tunnel_fec::rolling::wire::View::Source { .. } => {
-                                engine::EmissionKind::Source(engine::SourceForm::SystematicFec)
-                            }
-                            l2tunnel_fec::rolling::wire::View::Repair(_) => {
-                                engine::EmissionKind::Repair
-                            }
-                        }
-                    }
-                }
-            }
-        };
+        let kind = state.engine(epoch)?.inspect_peer(body).map_err(protocol)?;
         let staged_reader = reader.disposition == transaction::ReadDisposition::Staged;
         let queued_rolling_input = self.config.rolling_ingress.is_some()
             && matches!(
@@ -1442,9 +1323,7 @@ impl Driver {
             original_deadline =
                 original_deadline.min(u64::try_from(cap.as_micros()).map_err(invalid)?);
         }
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("common receive owner"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         let mut entry = state.entry(epoch)?;
         let accepted = if queued_rolling_input || raw_connection {
             entry.accept_authenticated_until(
@@ -1518,6 +1397,7 @@ impl Driver {
                 .min(state.deadline())
                 .min(add(now, self.config.work.receive_interval)?);
         }
+        #[cfg(unix)]
         if let Some(cap) = self
             .common
             .as_deref()
@@ -1627,7 +1507,7 @@ impl Driver {
         {
             wake = wake.min(at);
         }
-        if self.challenge.is_none() {
+        if self.challenge.is_none() && !self.proxy_liveness_quiesced()? {
             wake = wake.min(self.next_ping);
         }
         if self.ingress.left == 0 {
@@ -1741,62 +1621,6 @@ impl Driver {
         Ok(instant.max(floor))
     }
 }
-fn classify(
-    body: &[u8],
-    config: l2tunnel_reliable::ReliableConfig,
-    role: security::Role,
-) -> io::Result<engine::EmissionKind> {
-    let sender = if role == security::Role::Initiator {
-        recovery::EndpointRole::Responder
-    } else {
-        recovery::EndpointRole::Initiator
-    };
-    let view = l2tunnel_reliable::inspect_structural(
-        body,
-        sender,
-        config.maximum_packet_bytes().map_err(protocol)?,
-        config.arq.max_source_bytes,
-        config.fec.block,
-    )
-    .map_err(protocol)?;
-    Ok(match view.kind {
-        RecordKind::Source => engine::EmissionKind::Source(engine::SourceForm::DirectArq),
-        RecordKind::Systematic => engine::EmissionKind::Source(engine::SourceForm::SystematicFec),
-        RecordKind::Repair => engine::EmissionKind::Repair,
-        RecordKind::Feedback => engine::EmissionKind::Feedback,
-    })
-}
-
-// Classification observes actual v2 source/feedback structure after the sole
-// Records opener authenticated it. It creates no new admission or replay proof.
-pub(super) fn classify_compact(
-    body: &[u8],
-    send: l2tunnel_reliable::CompactReliableConfig,
-    receive: l2tunnel_reliable::CompactReliableConfig,
-    role: security::Role,
-) -> io::Result<engine::EmissionKind> {
-    let sender = if role == security::Role::Initiator {
-        recovery::EndpointRole::Responder
-    } else {
-        recovery::EndpointRole::Initiator
-    };
-    let plan =
-        l2tunnel_reliable::storage::CompactPlan::for_duplex(send, receive).map_err(protocol)?;
-    let view = l2tunnel_reliable::inspect_compact_structural(
-        body,
-        sender,
-        plan.receive_max_packet_bytes(),
-        receive.arq(),
-        send.arq(),
-    )
-    .map_err(protocol)?;
-    match view.kind {
-        RecordKind::Source => Ok(engine::EmissionKind::Source(engine::SourceForm::DirectArq)),
-        RecordKind::Feedback => Ok(engine::EmissionKind::Feedback),
-        RecordKind::Systematic | RecordKind::Repair => Err(protocol("unexpected compact FEC body")),
-    }
-}
-
 impl Driver {
     fn retain_common_feedback_at(
         &mut self,
@@ -1919,9 +1743,7 @@ impl Driver {
             .physical_arrival
             .map(|at| self.causal_time(at))
             .transpose()?;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("retained feedback Bank missing"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         let runtime = self
             .common
             .as_deref_mut()
@@ -1981,6 +1803,7 @@ impl Driver {
 
 // A stopped Driver cannot grant a successful Bridge completion. This projection
 // preserves the Driver's actual stop reason; it never changes that reason or cap.
+#[cfg(unix)]
 fn proxy_stopped_kind(reason: Option<StopReason>) -> io::ErrorKind {
     match reason {
         Some(StopReason::Io(kind)) => kind,
@@ -1992,6 +1815,6 @@ fn proxy_stopped_kind(reason: Option<StopReason>) -> io::ErrorKind {
         ) => io::ErrorKind::TimedOut,
         Some(StopReason::Protocol) => io::ErrorKind::InvalidData,
         Some(StopReason::CounterExhausted) => io::ErrorKind::Other,
-        Some(StopReason::Cancelled) | None => io::ErrorKind::Interrupted,
+        Some(StopReason::Cancelled | StopReason::ProxyRetired) | None => io::ErrorKind::Interrupted,
     }
 }

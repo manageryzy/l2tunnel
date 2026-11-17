@@ -9,7 +9,7 @@ async fn read_one(socket: &tokio::net::UdpSocket, driver: &mut Driver) -> Result
     let length = tokio::time::timeout_at(cap, socket.recv(&mut packet)).await??;
     let at = Instant::now();
     let now = clock(driver.origin, at)?;
-    driver.receive_selected(&packet[..length], now, at, None)?;
+    driver.receive_selected(&packet[..length], now, at)?;
     Ok(now)
 }
 

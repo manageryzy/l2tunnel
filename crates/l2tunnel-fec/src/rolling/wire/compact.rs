@@ -27,6 +27,7 @@ pub fn data_len(output: Output<'_>) -> Result<usize, Error> {
             Ok(1 + len(u64::from(id.0)) + original.len())
         }
         Output::Repair(repair) => {
+            repair.validate_extent(MAX_PAYLOAD + 2)?;
             if repair.id.0 == u64::MAX {
                 return Err(Error::Identity);
             }

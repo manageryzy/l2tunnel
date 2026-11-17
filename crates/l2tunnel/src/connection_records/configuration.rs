@@ -109,8 +109,7 @@ impl Config {
         if send.owners != receive.owners
             || send.incarnation != receive.incarnation
             || send.unreliable.is_some() != receive.unreliable.is_some()
-            || (send.compact.native_policy == aligned::NativePolicy::EthernetHeaders)
-                != (receive.compact.native_policy == aligned::NativePolicy::EthernetHeaders)
+            || send.compact.native_policy.is_ip() != receive.compact.native_policy.is_ip()
         {
             return Err(Error::Configuration);
         }

@@ -96,6 +96,25 @@ impl MaintainedIo {
     pub(super) fn check_failure(&self) -> io::Result<()> {
         self.carrier.check_failure()
     }
+    #[cfg(unix)]
+    pub(super) fn retained_peer_close(&self, error: &io::Error) -> bool {
+        let lower = self.carrier.retained_peer_close(error);
+        let earliest = self.earliest_input_at();
+        #[cfg(debug_assertions)]
+        if std::env::var_os("L2TUNNEL_MEASURED_TRACE").is_some() {
+            eprintln!(
+                "MAINTAINED_CLOSE_CUSTODY user={} control={} input_meta={} earliest={earliest:?} lower={lower}",
+                self.user.is_some(),
+                self.control.is_some(),
+                self.input_meta.is_some(),
+            );
+        }
+        self.user.is_none()
+            && self.control.is_none()
+            && self.input_meta.is_none()
+            && earliest.is_none()
+            && lower
+    }
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.carrier
             .next_deadline()

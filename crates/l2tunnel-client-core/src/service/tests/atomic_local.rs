@@ -1,8 +1,8 @@
 //! Deterministic local admission/capture invariants, not authenticated runtime evidence.
 
 use super::*;
-use crate::secure_udp::{credentials, transaction_profile};
-use l2tunnel::swift_configuration::{Catalog, Configuration, Descriptor};
+use crate::secure_udp::{common_transaction_profile as transaction_profile, credentials};
+use l2tunnel::record_configuration::{Catalog, Configuration};
 use l2tunnel_handshake as hs;
 use l2tunnel_management::{control_streams, delivery, messages, transaction};
 use l2tunnel_runtime::secure_udp::{establish, member, transport};
@@ -40,7 +40,7 @@ struct Fixture {
     opened: Arc<AtomicUsize>,
 }
 fn fixture() -> Result<Fixture> {
-    let (legacy, peers) = crate::secure_udp::profile::tests::fixture(
+    let (legacy, peers) = crate::secure_udp::common_fixture::fixture(
         l2tunnel_udp_control::Path {
             client: "127.0.0.1:41321".parse()?,
             server: "127.0.0.1:41322".parse()?,
@@ -70,10 +70,18 @@ fn fixture() -> Result<Fixture> {
             streams: [stream; 3],
         });
     }
-    let initial = Descriptor::new(1500, initiator.send, initiator.receive)?;
-    let mut forward = initial.forward();
+    let initial = crate::service::prepared::transaction_tests::descriptor(
+        initiator.send,
+        initiator.receive,
+        legacy.connection().max_packet,
+    )?;
+    let mut forward = initiator.send;
     forward.records.channels = 3;
-    let target = Descriptor::new(1500, forward, initial.reverse())?;
+    let target = crate::service::prepared::transaction_tests::descriptor(
+        forward,
+        initiator.receive,
+        legacy.connection().max_packet,
+    )?;
     let profile = Arc::new(transaction_profile::Profile::new(
         legacy.connection(),
         legacy.settings(),
@@ -81,7 +89,7 @@ fn fixture() -> Result<Fixture> {
         initiator,
         responder,
         Catalog::new(initial, &[initial, target])?,
-        transaction_profile::Parameters {
+        transport::TransactionSettings {
             protocol: transaction::Settings {
                 retry_ms: 10,
                 phase_timeout_ms: 500,
@@ -113,50 +121,60 @@ fn fixture() -> Result<Fixture> {
             credentials::Secret32::new(Zeroizing::new([44; 32]))?,
         )?)
     };
-    let old = Prepared::secure_udp_client(legacy, credentials()?, attachment())?;
-    let generic =
-        Prepared::secure_udp_transaction_client((*profile).clone(), credentials()?, attachment())?;
-    let settings = profile.settings();
-    let authenticated = settings
-        .runtime(security::Role::Initiator, peers)?
-        .expected_binding(peers, security::SessionId([1; 16]))?;
-    let info = |configuration: security::ConfigDigest| member::Info {
-        // Logical service fixture only; paired service tests prove actual authentication.
-        binding: security::SessionBinding {
-            session: security::SessionId([1; 16]),
-            transcript: [2; 32],
-        },
-        authenticated: hs::Binding {
-            session: security::SessionId([1; 16]),
-            configuration: configuration.0,
-            carrier: authenticated.carrier,
-            outer: authenticated.outer,
-            member: authenticated.member,
-        },
-        member: settings.member,
+    let old_profile = Arc::new(transaction_profile::Profile::new(
+        legacy.connection(),
+        legacy.settings(),
         peers,
-        role: security::Role::Initiator,
-        local_addr: settings.gate.path.client,
-        peer_addr: settings.gate.path.server,
-        statistics: establish::Statistics::default(),
-    };
-    let (switcher, _requests) = transport::channel();
-    let old_backend = ObservedBackend::SecureUdp(Arc::new(SecureUdpBackend {
-        requested: legacy,
-        info: info(legacy.configuration(peers)?),
-        counters: Mutex::new(None),
-        switcher,
-        generation: 11,
-    }));
-    let (switcher, _requests) = transport::transaction_channel();
-    let generic_backend =
-        ObservedBackend::SecureUdpTransaction(Arc::new(SecureUdpTransactionBackend {
-            requested: profile.clone(),
-            info: info(profile.configuration()?),
-            counters: Mutex::new(None),
-            switcher,
-            generation: 22,
-        }));
+        initiator,
+        responder,
+        Catalog::new(*initial.descriptor(), &[*initial.descriptor()])?,
+        transport::TransactionSettings {
+            protocol: transaction::Settings {
+                retry_ms: 10,
+                phase_timeout_ms: 500,
+                reconcile_timeout_ms: 1000,
+            },
+            max_operation_ms: 1500,
+            retained_bytes: 16 << 20,
+        },
+    )?);
+    let old =
+        Prepared::secure_udp_common_client((*old_profile).clone(), credentials()?, attachment())?;
+    let generic =
+        Prepared::secure_udp_common_client((*profile).clone(), credentials()?, attachment())?;
+    let backend =
+        |requested: Arc<transaction_profile::Profile>, generation| -> Result<ObservedBackend> {
+            let settings = requested.settings();
+            let authenticated = requested
+                .establish_config(security::Role::Initiator)?
+                .expected_binding(peers, security::SessionId([1; 16]))?;
+            let info = member::Info {
+                // Logical custody fixture only; actual paired service tests prove authentication.
+                binding: security::SessionBinding {
+                    session: security::SessionId([1; 16]),
+                    transcript: [2; 32],
+                },
+                authenticated,
+                member: settings.member,
+                peers,
+                role: security::Role::Initiator,
+                local_addr: settings.gate.path.client,
+                peer_addr: settings.gate.path.server,
+                statistics: establish::Statistics::default(),
+            };
+            let (switcher, _requests) = transport::common_channel();
+            Ok(ObservedBackend::SecureUdpCommon(Arc::new(
+                SecureUdpCommonBackend {
+                    requested,
+                    info,
+                    counters: Mutex::new(None),
+                    switcher,
+                    generation,
+                },
+            )))
+        };
+    let old_backend = backend(old_profile, 11)?;
+    let generic_backend = backend(profile, 22)?;
     Ok(Fixture {
         old,
         generic,
@@ -225,35 +243,27 @@ fn stale_local_version_cannot_consume_key_or_mutate_the_replacement_owner() -> R
     install(&handle, &fixture.old, &fixture.old_backend, 11);
     assert!(
         handle
-            .api_version(&status_request(local::SECURE_UDP_VERSION))
+            .api_version(&status_request(local::COMMON_VERSION))
             .is_none()
     );
-    // Deterministic old-precheck/new-admission interleaving, without scheduling assumptions.
+    // Validate one generation, then replace the owner before actual admission.
     install(&handle, &fixture.generic, &fixture.generic_backend, 22);
-    for reconnect in [false, true] {
-        let before = no_effects(&handle);
-        refused(
-            handle.submit_local_lifecycle(local::SECURE_UDP_VERSION, reconnect),
-            local::SECURE_UDP_VERSION,
-            "requires_version_3",
-        )?;
-        assert_eq!(no_effects(&handle), before);
+    for version in [2, 3] {
+        for reconnect in [false, true] {
+            let before = no_effects(&handle);
+            refused(
+                handle.submit_local_lifecycle(version, reconnect),
+                version,
+                "requires_version_4",
+            )?;
+            assert_eq!(no_effects(&handle), before);
+        }
     }
     assert!(
         handle
-            .api_version(&status_request(local::TRANSACTION_VERSION))
+            .api_version(&status_request(local::COMMON_VERSION))
             .is_none()
     );
-    install(&handle, &fixture.old, &fixture.old_backend, 11);
-    for reconnect in [false, true] {
-        let before = no_effects(&handle);
-        refused(
-            handle.submit_local_lifecycle(local::TRANSACTION_VERSION, reconnect),
-            local::TRANSACTION_VERSION,
-            "unsupported_version",
-        )?;
-        assert_eq!(no_effects(&handle), before);
-    }
     assert_eq!(fixture.opened.load(Ordering::SeqCst), 0);
     Ok(())
 }
@@ -262,64 +272,54 @@ fn stale_local_version_cannot_consume_key_or_mutate_the_replacement_owner() -> R
 async fn validated_status_view_keeps_its_own_version_and_generation_after_replacement() -> Result {
     let fixture = fixture()?;
     let (handle, _run) = channel();
-    install(&handle, &fixture.old, &fixture.old_backend, 11);
-    let old = handle
-        .local_view(local::SECURE_UDP_VERSION)
-        .map_err(|_| "old view refused")?;
-    install(&handle, &fixture.generic, &fixture.generic_backend, 22);
-    let reply =
-        Handle::status_from_view(old, status_request(local::SECURE_UDP_VERSION), false).await;
-    assert_eq!(reply.version, local::SECURE_UDP_VERSION);
-    let state = reply.state.ok_or("old captured state")?;
-    assert_eq!(
-        state
-            .secure_udp
-            .as_ref()
-            .ok_or("old captured frame")?
-            .generation,
-        11
-    );
-    assert!(state.transaction.is_none());
-    assert!(handle.local_view(local::SECURE_UDP_VERSION).is_err());
-    let generic = handle
-        .local_view(local::TRANSACTION_VERSION)
-        .map_err(|_| "generic view refused")?;
-    install(&handle, &fixture.old, &fixture.old_backend, 11);
-    let reply =
-        Handle::status_from_view(generic, status_request(local::TRANSACTION_VERSION), false).await;
-    assert_eq!(reply.version, local::TRANSACTION_VERSION);
-    let state = reply.state.ok_or("generic captured state")?;
-    assert_eq!(
-        state
-            .transaction
-            .as_ref()
-            .ok_or("generic captured frame")?
-            .generation,
-        22
-    );
-    assert!(state.secure_udp.is_none());
-    assert!(handle.local_view(local::TRANSACTION_VERSION).is_err());
-    Ok(())
-}
-
-#[tokio::test]
-async fn live_backend_precedes_retained_plan_and_released_view_does_not_mix_frames() -> Result {
-    let fixture = fixture()?;
-    let (handle, _run) = channel();
-    install(&handle, &fixture.old, &fixture.old_backend, 11);
-    handle.0.lock().plan = Some(fixture.generic.clone());
-    assert!(handle.local_view(local::SECURE_UDP_VERSION).is_ok());
-    assert!(handle.local_view(local::TRANSACTION_VERSION).is_err());
-    // Retain the old frame after release, exactly as the service terminal path does.
-    handle.0.lock().backend = None;
-    let view = handle
-        .local_view(local::TRANSACTION_VERSION)
-        .map_err(|_| "retained plan view refused")?;
-    let reply =
-        Handle::status_from_view(view, status_request(local::TRANSACTION_VERSION), false).await;
-    assert_eq!(reply.version, local::TRANSACTION_VERSION);
-    let state = reply.state.ok_or("released state")?;
-    assert!(state.secure_udp.is_none() && state.transaction.is_none());
+    for (
+        before_plan,
+        before_backend,
+        before_generation,
+        after_plan,
+        after_backend,
+        after_generation,
+    ) in [
+        (
+            &fixture.old,
+            &fixture.old_backend,
+            11,
+            &fixture.generic,
+            &fixture.generic_backend,
+            22,
+        ),
+        (
+            &fixture.generic,
+            &fixture.generic_backend,
+            22,
+            &fixture.old,
+            &fixture.old_backend,
+            11,
+        ),
+    ] {
+        install(&handle, before_plan, before_backend, before_generation);
+        let captured = handle
+            .local_view(local::COMMON_VERSION)
+            .map_err(|_| "captured view refused")?;
+        install(&handle, after_plan, after_backend, after_generation);
+        let reply =
+            Handle::status_from_view(captured, status_request(local::COMMON_VERSION), false).await;
+        assert_eq!(reply.version, local::COMMON_VERSION);
+        let state = reply.state.ok_or("captured state")?;
+        assert_eq!(
+            state
+                .common
+                .as_ref()
+                .ok_or("captured Common frame")?
+                .generation,
+            before_generation
+        );
+        assert_eq!(
+            handle.snapshot().generation,
+            Some(OperationId(after_generation))
+        );
+        assert!(handle.local_view(3).is_err());
+    }
     Ok(())
 }
 
@@ -330,7 +330,7 @@ fn local_reconnect_selects_exact_retained_plan_and_key_in_the_same_admission() -
     install(&handle, &fixture.old, &fixture.old_backend, 11);
     handle.0.lock().plan = Some(fixture.generic.clone());
     let accepted = handle
-        .submit_local_lifecycle(local::SECURE_UDP_VERSION, true)
+        .submit_local_lifecycle(local::COMMON_VERSION, true)
         .map_err(|_| "matching old-version reconnect refused")?;
     assert_eq!(accepted.operation, OperationId(1));
     assert_eq!(handle.next_key().map_err(|_| "next key")?, RequestKey(2));
@@ -340,7 +340,7 @@ fn local_reconnect_selects_exact_retained_plan_and_key_in_the_same_admission() -
         return Err("wrong local lifecycle command".into());
     };
     assert!(Arc::ptr_eq(&plan.identity, &fixture.generic.identity));
-    assert!(plan.secure_udp_transaction());
+    assert!(plan.secure_udp_common());
     assert_eq!(state.snapshot.generation, Some(OperationId(11)));
     assert_eq!(fixture.opened.load(Ordering::SeqCst), 0);
     Ok(())
@@ -353,24 +353,24 @@ fn typed_retained_key_replay_still_precedes_fresh_backend_catalog_validation() -
     install(&handle, &fixture.generic, &fixture.generic_backend, 22);
     let key = handle.next_key().map_err(|_| "next key")?;
     let accepted = handle
-        .apply_transaction(fixture.target, key)
+        .apply_common(fixture.target, key)
         .map_err(|_| "initial typed admission")?;
     // Logical retained-entry test only; it does not fabricate transaction completion.
     install(&handle, &fixture.old, &fixture.old_backend, 11);
     assert_eq!(
         handle
-            .apply_transaction(fixture.target, key)
+            .apply_common(fixture.target, key)
             .map_err(|_| "retained typed replay")?,
         accepted
     );
     assert_eq!(
-        handle.apply_transaction(fixture.initial, key),
+        handle.apply_common(fixture.initial, key),
         Err(SubmitError::Conflict)
     );
     let fresh = handle.next_key().map_err(|_| "next fresh key")?;
     assert_eq!(
-        handle.apply_transaction(fixture.target, fresh),
-        Err(SubmitError::Unsupported)
+        handle.apply_common(fixture.target, fresh),
+        Err(SubmitError::InvalidConfiguration)
     );
     assert_eq!(
         handle.next_key().map_err(|_| "fresh key after refusal")?,
@@ -385,13 +385,13 @@ fn completed_lifecycle_compatibility_change_never_returns_the_new_version_frame(
     let fixture = fixture()?;
     let (handle, _run) = channel();
     install(&handle, &fixture.generic, &fixture.generic_backend, 22);
-    let reply = handle.lifecycle_reply(local::SECURE_UDP_VERSION, true, "ok", true);
-    assert_eq!(reply.version, local::SECURE_UDP_VERSION);
+    let reply = handle.lifecycle_reply(2, true, "ok", true);
+    assert_eq!(reply.version, 2);
     assert_eq!(reply.code, "outcome_unknown");
     assert!(!reply.ok && reply.state.is_none());
-    let refused = handle.lifecycle_reply(local::SECURE_UDP_VERSION, false, "busy", false);
-    assert_eq!(refused.code, "requires_version_3");
-    assert_eq!(refused.version, local::SECURE_UDP_VERSION);
+    let refused = handle.lifecycle_reply(2, false, "busy", false);
+    assert_eq!(refused.code, "requires_version_4");
+    assert_eq!(refused.version, 2);
     assert!(refused.state.is_none());
     Ok(())
 }
@@ -403,7 +403,7 @@ async fn pending_complete_configuration_is_unknown_when_service_owner_drops() ->
     install(&handle, &fixture.generic, &fixture.generic_backend, 22);
     let key = handle.next_key().map_err(|_| "next key")?;
     let accepted = handle
-        .apply_transaction(fixture.target, key)
+        .apply_common(fixture.target, key)
         .map_err(|_| "typed admission")?;
     drop(run);
     assert_eq!(
@@ -416,7 +416,7 @@ async fn pending_complete_configuration_is_unknown_when_service_owner_drops() ->
     let frame = snapshot
         .runtime
         .as_ref()
-        .and_then(Observation::secure_udp_transaction)
+        .and_then(Observation::secure_udp_common)
         .ok_or("retained generic frame")?;
     assert_eq!(frame.service_terminal, Some(Terminal::Aborted));
     assert!(frame.runtime.is_none());

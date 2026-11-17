@@ -1,6 +1,7 @@
 //! Same raw owners and physical receipts with one external Records protector.
 use super::super::compact::{
-    FinalAcceptance, FinalControl, FinalInput, FinalKind, FinalMetadata, FinalOutputToken,
+    BootstrapDirection, FinalAcceptance, FinalControl, FinalInput, FinalKind, FinalMetadata,
+    FinalOutputToken,
 };
 use super::*;
 
@@ -13,7 +14,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     pub fn enable_final_records(
         &mut self,
         binding: [u8; 32],
-        bootstrap_filter: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
+        bootstrap_filter: impl Fn(BootstrapDirection, &[u8]) -> bool + Send + Sync + 'static,
     ) -> Result<(), Error> {
         self.check_live()?;
         if !self.ready || self.final_context.is_some() || binding == [0; 32] {
@@ -25,7 +26,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if self
             .records
             .iter()
-            .any(|record| !bootstrap_filter(&record.bytes))
+            .any(|record| !bootstrap_filter(BootstrapDirection::Incoming, &record.bytes))
         {
             return Err(Error::Proof);
         }
@@ -33,12 +34,13 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             let state = lock(&lane.io.state)?;
             if state.final_context.is_some()
                 || state.fence.is_none()
-                || state
-                    .incoming
-                    .iter()
-                    .any(|cell| !cell.header.kind.control() && !bootstrap_filter(&cell.body))
+                || state.incoming.iter().any(|cell| {
+                    !cell.header.kind.control()
+                        && !bootstrap_filter(BootstrapDirection::Incoming, &cell.body)
+                })
                 || lane.early.as_ref().is_some_and(|cell| {
-                    !cell.header.kind.control() && !bootstrap_filter(&cell.body)
+                    !cell.header.kind.control()
+                        && !bootstrap_filter(BootstrapDirection::Incoming, &cell.body)
                 })
             {
                 return Err(Error::Proof);
@@ -442,6 +444,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         kind: RecordKind,
         bytes: &[u8],
     ) -> Result<RecordToken, Error> {
+        self.check_live()?;
         self.final_context.ok_or(Error::Configuration)?;
         if Instant::now() >= self.deadline {
             return Err(Error::Expired);
@@ -454,7 +457,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if lock(&owner.io.state)?
             .bootstrap_filter
             .as_ref()
-            .is_none_or(|allow| !allow(bytes))
+            .is_none_or(|allow| !allow(BootstrapDirection::Outgoing, bytes))
         {
             return Err(Error::Configuration);
         }

@@ -42,13 +42,42 @@ pub(super) struct ActionWork {
 pub(super) fn outcome_deadline(outcome: transactions::Outcome) -> Duration {
     Duration::from_millis(outcome_operation(outcome).expires().0)
 }
+type StateObservation = (
+    core::Epoch,
+    transaction::Phase,
+    Option<transaction::Operation>,
+    Scope,
+);
+
 impl Driver {
+    pub(super) fn can_admit_native(&self) -> io::Result<bool> {
+        self.can_admit_common_native()
+    }
+
+    pub(super) fn transaction_observation(&self) -> io::Result<Option<StateObservation>> {
+        let state = self.common_state()?;
+        Ok(Some((
+            state.epoch(),
+            state.peer().phase(),
+            state.peer().operation(),
+            self.feedback_scope,
+        )))
+    }
+
+    pub(super) fn report_transaction_completion(
+        &mut self,
+        sample: impl FnMut() -> io::Result<u64>,
+        observe: impl FnOnce(&Self, u64) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        self.report_common_completion(sample, observe)
+    }
+
     /// Freeze the actual queued request's cap exactly once, before allocation.
     pub(super) fn request_common(
         &mut self,
         now: u64,
         configuration: C,
-        reply: generic::TransactionReply,
+        reply: common::TransactionReply,
     ) -> io::Result<()> {
         let Some(runtime) = self.common.as_deref_mut() else {
             let _ = reply.send(Err(SwitchError::Invalid));
@@ -70,10 +99,7 @@ impl Driver {
             let _ = reply.send(Err(SwitchError::NotCoordinator));
             return Ok(());
         }
-        let owner::DataOwner::Common(state) = &self.owner else {
-            let _ = reply.send(Err(SwitchError::Invalid));
-            return Err(protocol("generic runtime lacks actual State"));
-        };
+        let owner::DataOwner::Common(state) = &self.owner;
         if self.terminal.is_some() || now >= self.lease {
             let _ = reply.send(Err(SwitchError::Closed));
             return Ok(());
@@ -90,6 +116,10 @@ impl Driver {
         }
         if runtime.contract.resolve(configuration).is_err() {
             let _ = reply.send(Err(SwitchError::Invalid));
+            return Ok(());
+        }
+        if state.current() == &configuration {
+            let _ = reply.send(Ok(state.epoch()));
             return Ok(());
         }
         let at = u64::try_from(duration(now).as_millis()).map_err(invalid)?;
@@ -120,9 +150,7 @@ impl Driver {
             .common
             .as_deref_mut()
             .ok_or_else(|| protocol("generic admission on legacy runtime"))?;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("generic admission lacks State"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         if let Some(outcome) = runtime.outcome {
             let operation = outcome_operation(outcome);
             match state.peer().operation() {
@@ -257,6 +285,7 @@ impl Driver {
     }
 
     fn progress_common_inner(&mut self, runtime: &mut common::Runtime, now: u64) -> io::Result<()> {
+        #[cfg(unix)]
         self.observe_proxy_retirement(runtime)?;
         self.progress_connection_reuse(runtime, now)?;
         self.validate_common_fence()?;
@@ -401,9 +430,7 @@ impl Driver {
                 runtime.sent = None;
                 runtime.delivered = None;
             }
-            let owner::DataOwner::Common(state) = &mut self.owner else {
-                return Err(protocol("common State missing"));
-            };
+            let owner::DataOwner::Common(state) = &mut self.owner;
             return Ok(state.complete_action(
                 &mut self.control,
                 &mut work.action,
@@ -468,9 +495,7 @@ impl Driver {
                     .admitted
                     .ok_or_else(|| protocol("common Stage lost fence"))?
                     .fence()?;
-                let owner::DataOwner::Common(state) = &mut self.owner else {
-                    return Err(protocol("common Stage owner"));
-                };
+                let owner::DataOwner::Common(state) = &mut self.owner;
                 Ok(state.complete_action(
                     &mut self.control,
                     &mut work.action,
@@ -482,7 +507,8 @@ impl Driver {
                 if !work.applied {
                     self.validate_common_fence()?;
                     let engine = self.common_state()?.engine(operation.origin().epoch)?;
-                    if !engine.drained().map_err(protocol)?
+                    if !self.control.native_receipts_drained(envelope_scope(old))?
+                        || !engine.drained().map_err(protocol)?
                         || !self.native.is_empty()
                         || runtime.sealed.is_some()
                         || runtime.unsealed.is_some()
@@ -527,9 +553,7 @@ impl Driver {
                     .delivered
                     .ok_or_else(|| protocol("common physical witness missing"))?
                     .fence()?;
-                let owner::DataOwner::Common(state) = &mut self.owner else {
-                    return Err(protocol("common Drain owner"));
-                };
+                let owner::DataOwner::Common(state) = &mut self.owner;
                 Ok(state.complete_action(
                     &mut self.control,
                     &mut work.action,
@@ -631,9 +655,7 @@ impl Driver {
         }
     }
     fn complete_common_applied(&mut self, work: &mut ActionWork, now: u64) -> io::Result<bool> {
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("common completion owner"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         Ok(state.complete_action(
             &mut self.control,
             &mut work.action,
@@ -656,7 +678,9 @@ impl Driver {
             return Ok(false);
         }
         let engine = self.common_state()?.engine(core::Epoch(old.epoch.0))?;
-        if !engine.drained().map_err(protocol)? {
+        if !self.control.native_receipts_drained(envelope_scope(old))?
+            || !engine.drained().map_err(protocol)?
+        {
             return Ok(false);
         }
         let sent = Boundary::capture(
@@ -708,22 +732,18 @@ impl Driver {
         Ok(())
     }
     fn service_common_state(&mut self, now: u64) -> io::Result<()> {
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("common service owner"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         state.service(&mut self.control, duration(now))?;
         Ok(())
     }
     pub(super) fn common_state(&self) -> io::Result<&transactions::CommonState> {
         match &self.owner {
             owner::DataOwner::Common(state) => Ok(state),
-            _ => Err(protocol("common State unavailable")),
         }
     }
     pub(super) fn common_state_mut(&mut self) -> io::Result<&mut transactions::CommonState> {
         match &mut self.owner {
             owner::DataOwner::Common(state) => Ok(state),
-            _ => Err(protocol("common State unavailable")),
         }
     }
 }

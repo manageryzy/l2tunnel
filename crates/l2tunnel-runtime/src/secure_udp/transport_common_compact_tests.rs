@@ -5,8 +5,8 @@ use l2tunnel::record_engine as engine;
 use l2tunnel_aligned as aligned;
 use l2tunnel_codec::source_copy;
 use l2tunnel_recovery::{
-    CompactArqConfig, CompactBounds, CompactPacketView, CompactRecovery, CompactTiming,
-    EndpointRole, RecoveryContext, SourceId, inspect_compact_packet,
+    CompactArqConfig, CompactBounds, CompactPacketKind, CompactPacketView, CompactRecovery,
+    CompactTiming, SourceId, inspect_compact_body,
 };
 use l2tunnel_reliable::CompactReliableConfig;
 
@@ -105,7 +105,11 @@ fn hold_output(endpoint: &mut Endpoint, now: u64, expected: engine::EmissionKind
     endpoint.driver.bucket.refill(now)?;
     let before = endpoint.driver.bucket.tokens;
     let counters = endpoint.driver.counters;
-    let number = endpoint.driver.records.next_number(Class::User);
+    let number = if expected == engine::EmissionKind::Feedback {
+        endpoint.driver.records.next_feedback_number()
+    } else {
+        endpoint.driver.records.next_number(Class::User)
+    };
     assert!(
         !endpoint
             .driver
@@ -208,20 +212,17 @@ fn hold_output(endpoint: &mut Endpoint, now: u64, expected: engine::EmissionKind
 }
 
 fn inspect<'a>(held: &'a Held, policy: CompactArqConfig) -> Result<CompactPacketView<'a>> {
-    let context = held.token.context();
     // This parser observes actual emitted plaintext; it grants no session authority.
-    Ok(inspect_compact_packet(
-        &held.plain[l2tunnel_reliable::ENVELOPE_BYTES..],
-        RecoveryContext {
-            session: context.session,
-            epoch: context.epoch,
-            role: match context.role {
-                mg::Role::Client => EndpointRole::Responder,
-                mg::Role::Server => EndpointRole::Initiator,
-            },
-        },
-        policy,
-    )?)
+    let (&kind, body) = held
+        .plain
+        .split_first()
+        .ok_or("actual Compact union absent")?;
+    let kind = match (kind, held.token.emission().kind) {
+        (1, engine::EmissionKind::Source(engine::SourceForm::DirectArq)) => CompactPacketKind::Data,
+        (2, engine::EmissionKind::Feedback) => CompactPacketKind::Feedback,
+        _ => return Err("actual Compact union differs from owned emission".into()),
+    };
+    Ok(inspect_compact_body(kind, body, policy)?)
 }
 
 async fn receive_output(endpoint: &mut Endpoint, now: u64, held: &Held, lose: bool) -> Result {
@@ -235,7 +236,6 @@ async fn receive_output(endpoint: &mut Endpoint, now: u64, held: &Held, lose: bo
             &packet[..bytes],
             now,
             endpoint.driver.origin + duration(now),
-            None,
         )?;
         assert_eq!(
             endpoint.driver.counters.received_packets,
@@ -337,7 +337,7 @@ fn actual_common_compact_loss_feedback_custody_and_negotiated_packed_switch() ->
         assert_eq!(delivered, vec![first, second]);
         let target = &mut fixture.endpoints[1];
         let before = target.driver.counters.replay_rejections;
-        target.driver.receive_selected(&retry.wire, fixture.now, target.driver.origin + duration(fixture.now), None)?;
+        target.driver.receive_selected(&retry.wire, fixture.now, target.driver.origin + duration(fixture.now))?;
         assert_eq!(target.driver.counters.replay_rejections, before + 1);
         let next_epoch = fixture.switch(values[1]).await?;
         assert_eq!(next_epoch.0, epoch.0 + 1);

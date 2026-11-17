@@ -63,7 +63,7 @@ impl Host {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(application);
             host.opened.fetch_add(1, Ordering::SeqCst);
             host.live.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::swift::Native::new(Pipe {
+            Ok(crate::native::Native::new(Pipe {
                 socket,
                 host: host.clone(),
             }))
@@ -117,8 +117,65 @@ fn packet(marker: u8, length: usize) -> Vec<u8> {
     bytes[9] = 17;
     bytes[12..20].copy_from_slice(&[198, 18, 0, 1, 198, 18, 0, 2]);
     bytes[20..24].copy_from_slice(&[0x91, marker, 0x92, marker]);
+    bytes[24..26].copy_from_slice(&((length - 20) as u16).to_be_bytes());
     bytes[28..length - 2].fill(marker);
     bytes
+}
+fn current_profile(
+    legacy: crate::secure_udp::common_fixture::Resources,
+    peers: l2tunnel_runtime::secure_udp::establish::Peers,
+) -> Result<crate::secure_udp::common_transaction_profile::Profile> {
+    use l2tunnel::record_configuration::{Catalog, Descriptor, Profile};
+    let mut a = transaction::streamed(legacy.runtime(Role::Initiator));
+    let mut b = transaction::streamed(legacy.runtime(Role::Responder));
+    // Match the finite integration pools used by transaction_plans. The Common
+    // bank reserves both directions inside the unchanged 64 MiB fixture cap.
+    for resource in [&mut a, &mut b] {
+        for direction in [&mut resource.send, &mut resource.receive] {
+            direction.records.codec.flow_sources = 64;
+            direction.records.codec.queue_bytes = 65_536;
+        }
+    }
+    let descriptor = |forward: l2tunnel_swift::policy::Direction,
+                      reverse: l2tunnel_swift::policy::Direction|
+     -> Result<Descriptor> {
+        Ok(Descriptor::new(
+            1500,
+            Duplex::Full,
+            transaction::common_service::common_direction(
+                forward.records.channels as u16,
+                legacy.connection().max_packet,
+                forward.bytes_per_second,
+            )?,
+            transaction::common_service::common_direction(
+                reverse.records.channels as u16,
+                legacy.connection().max_packet,
+                reverse.bytes_per_second,
+            )?,
+            Profile::Swift {
+                forward: forward.records,
+                reverse: reverse.records,
+            },
+        )?)
+    };
+    let initial = descriptor(a.send, a.receive)?;
+    Ok(crate::secure_udp::common_transaction_profile::Profile::new(
+        legacy.connection(),
+        legacy.settings(),
+        peers,
+        a,
+        b,
+        Catalog::new(initial, &[initial])?,
+        l2tunnel_runtime::secure_udp::transport::TransactionSettings {
+            protocol: l2tunnel_management::transaction::Settings {
+                retry_ms: 10,
+                phase_timeout_ms: 500,
+                reconcile_timeout_ms: 1000,
+            },
+            max_operation_ms: 1500,
+            retained_bytes: 64 * 1024 * 1024,
+        },
+    )?)
 }
 fn plans(
     appearance: l2tunnel_cover::Appearance,
@@ -175,11 +232,11 @@ fn plans(
         };
         let mut connection = cfg(Duplex::Full);
         connection.handshake_timeout = timeout;
-        selection.build(connection, peers, member_public)
+        current_profile(selection.build(connection, peers, member_public)?, peers)
     };
     let a = build(0, client_noise.peers(Role::Initiator))?;
     let b = build(1, server_noise.peers(Role::Responder))?;
-    let client = Prepared::secure_udp_client(
+    let client = Prepared::secure_udp_common_client(
         a,
         credentials::Client::new(
             client_noise,
@@ -188,7 +245,7 @@ fn plans(
         )?,
         hosts[0].attachment(),
     )?;
-    let server = Prepared::secure_udp_server(
+    let server = Prepared::secure_udp_common_server(
         b,
         credentials::Server::new(
             server_noise,
@@ -199,12 +256,6 @@ fn plans(
     )?;
     drop(held);
     Ok(([client, server], addresses))
-}
-fn request(action: local::Action) -> local::Request {
-    local::Request {
-        version: local::SECURE_UDP_VERSION,
-        action,
-    }
 }
 async fn connected(handle: &Handle, accepted: Accepted) -> Result<OperationId> {
     match timeout(Duration::from_secs(4), handle.wait(accepted.operation))
@@ -248,8 +299,9 @@ fn secure_udp_prepared_rejects_wrong_layer_or_unreadable_attachment_before_io() 
         l2tunnel_cover::Appearance::MediaLike,
     ] {
         let (profile, peers) =
-            crate::secure_udp::profile::tests::fixture(path, appearance, member_public)?;
-        profile.configuration(peers)?;
+            crate::secure_udp::common_fixture::fixture(path, appearance, member_public)?;
+        let profile = current_profile(profile, peers)?;
+        profile.configuration()?;
         for role in [Role::Initiator, Role::Responder] {
             for wrong_layer in [true, false] {
                 let calls = opened.clone();
@@ -278,8 +330,8 @@ fn secure_udp_prepared_rejects_wrong_layer_or_unreadable_attachment_before_io() 
                 )?;
                 let admission = credentials::Secret32::new(Zeroizing::new([44; 32]))?;
                 let result = match role {
-                    Role::Initiator => Prepared::secure_udp_client(
-                        profile,
+                    Role::Initiator => Prepared::secure_udp_common_client(
+                        profile.clone(),
                         credentials::Client::new(
                             noise,
                             identity::IdentityKey::from_pkcs8(&encoded)?,
@@ -287,8 +339,8 @@ fn secure_udp_prepared_rejects_wrong_layer_or_unreadable_attachment_before_io() 
                         )?,
                         attachment,
                     ),
-                    Role::Responder => Prepared::secure_udp_server(
-                        profile,
+                    Role::Responder => Prepared::secure_udp_common_server(
+                        profile.clone(),
                         credentials::Server::new(
                             noise,
                             admission,
@@ -350,259 +402,7 @@ async fn current_thread_secure_udp_service_preserves_full_lifecycle() -> Result 
 }
 
 async fn secure_udp_service_lifecycle_fixture() -> Result {
-    for appearance in [
-        l2tunnel_cover::Appearance::QuicLike,
-        l2tunnel_cover::Appearance::MediaLike,
-    ] {
-        let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
-        let ([client_plan, server_plan], addresses) =
-            plans(appearance, &hosts, Duration::from_secs(3), false)?;
-        assert!(
-            hosts
-                .iter()
-                .all(|host| host.opened.load(Ordering::SeqCst) == 0)
-        );
-        let (client, client_run) = channel();
-        let (server, server_run) = channel();
-        let client_task = tokio::spawn(client_run);
-        let server_task = tokio::spawn(server_run);
-        let a = client
-            .connect(client_plan.clone(), client.next_key().map_err(submit)?)
-            .map_err(submit)?;
-        let b = server
-            .connect(server_plan.clone(), server.next_key().map_err(submit)?)
-            .map_err(submit)?;
-        let (a, b) = tokio::try_join!(connected(&client, a), connected(&server, b))?;
-        let retained = admission_identity(&server_plan).await?;
-        let before = client
-            .lifecycle_request(request(local::Action::Status {}))
-            .await;
-        let original = before
-            .state
-            .as_ref()
-            .and_then(|state| state.secure_udp.as_ref())
-            .ok_or("missing secure status")?;
-        assert!(before.ok && original.running);
-        assert_eq!(
-            (original.local.as_str(), original.peer.as_str()),
-            (
-                addresses[0].to_string().as_str(),
-                addresses[1].to_string().as_str()
-            )
-        );
-        assert!(
-            !original.retained_state_recovery
-                && !original.cross_profile_switching
-                && !original.fresh_rekey
-        );
-        let old_session = original.session;
-        let directory = ApiDirectory::new()?;
-        let path = directory.0.join("api.sock");
-        let api = local::Server::bind(&path)?;
-        let api_handle = client.clone();
-        let api_task = tokio::spawn(async move {
-            api.serve(move |request| {
-                let handle = api_handle.clone();
-                async move { handle.lifecycle_request(request).await }
-            })
-            .await
-        });
-        let wire_status = local::request(&path, &request(local::Action::Status {})).await?;
-        assert_eq!(wire_status.version, local::SECURE_UDP_VERSION);
-        assert_eq!(
-            wire_status
-                .state
-                .as_ref()
-                .and_then(|state| state.secure_udp.as_ref())
-                .map(|status| status.session),
-            Some(old_session)
-        );
-        // A v1 write is refused before action admission and cannot disconnect.
-        let refused = client
-            .lifecycle_request(local::Request {
-                version: local::VERSION,
-                action: local::Action::Disconnect {},
-            })
-            .await;
-        assert_eq!(refused.code, "requires_version_2");
-        assert!(refused.state.is_none());
-        assert_eq!(client.snapshot().generation, Some(a));
-        assert_eq!(hosts[0].live.load(Ordering::SeqCst), 1);
-        let wire_refused = local::request(
-            &path,
-            &local::Request {
-                version: local::VERSION,
-                action: local::Action::Disconnect {},
-            },
-        )
-        .await?;
-        assert_eq!(wire_refused.code, "requires_version_2");
-        assert!(wire_refused.state.is_none());
-        for side in 0..2 {
-            let bytes = packet((side + 1) as u8, 1500);
-            hosts[side].send(&bytes)?;
-            hosts[1 - side].expect(&bytes).await?;
-        }
-        let changed = client
-            .request(request(local::Action::SetSwiftPolicy {
-                policy: local::SwiftChange {
-                    path_mtu: Some(1800),
-                    forward_kbit: Some(12_000),
-                    ..local::SwiftChange::default()
-                },
-            }))
-            .await;
-        assert!(changed.ok, "common policy did not commit: {changed:?}");
-        let current = changed
-            .state
-            .as_ref()
-            .and_then(|state| state.secure_udp.as_ref())
-            .ok_or("missing committed status")?;
-        assert_eq!(current.policy_epoch, 1);
-        assert_eq!(current.effective.path_mtu, 1800);
-        assert_eq!(
-            current.effective.reverse_kbit,
-            current.requested.reverse_kbit
-        );
-        assert_eq!(current.maximum_path_mtu, 2000);
-        let bytes = packet(9, 1600);
-        hosts[0].send(&bytes)?;
-        hosts[1].expect(&bytes).await?;
-        let unsupported = client
-            .request(request(local::Action::SwitchCompression {
-                compression: local::Compression::Lz4,
-            }))
-            .await;
-        assert_eq!(unsupported.version, local::SECURE_UDP_VERSION);
-        assert_eq!(unsupported.code, "unsupported");
-        let (left, right) = tokio::join!(
-            client.lifecycle_request(request(local::Action::Disconnect {})),
-            server.lifecycle_request(request(local::Action::Disconnect {}))
-        );
-        assert!(left.ok && right.ok);
-        assert!(
-            hosts
-                .iter()
-                .all(|host| host.live.load(Ordering::SeqCst) == 0)
-        );
-        assert_eq!(
-            client.wait_stopped(a).await.map_err(submit)?,
-            Terminal::Aborted
-        );
-        assert_eq!(
-            server.wait_stopped(b).await.map_err(submit)?,
-            Terminal::Aborted
-        );
-        for handle in [&client, &server] {
-            let stopped = handle.snapshot();
-            let frame = stopped
-                .runtime
-                .as_ref()
-                .and_then(Observation::secure_udp)
-                .ok_or("missing stopped shared frame")?;
-            let runtime = frame.runtime.as_ref().ok_or("missing retained runtime")?;
-            assert!(
-                runtime.running,
-                "fixture must exercise an inline drop without a final runtime report"
-            );
-            assert_eq!(frame.service_terminal, Some(Terminal::Aborted));
-            assert!(!frame.status()?.running);
-            let report = frame.performance()?.ok_or("missing stopped performance")?;
-            assert!(!report.status.running);
-            assert_eq!(report.service_terminal.as_deref(), Some("Aborted"));
-            assert_eq!(report.status.elapsed_micros, runtime.elapsed_micros);
-            assert_eq!(
-                report.status.terminal,
-                runtime.terminal.map(|reason| format!("{reason:?}"))
-            );
-            assert_eq!(report.status.wire_packets, runtime.counters.wire_packets);
-            assert_eq!(
-                report.status.native_written,
-                runtime.counters.native_written
-            );
-            assert_eq!(
-                report.performance,
-                crate::secure_udp::performance::Driver::from(runtime.performance)
-            );
-        }
-        let rebound = [
-            std::net::UdpSocket::bind(addresses[0])?,
-            std::net::UdpSocket::bind(addresses[1])?,
-        ];
-        drop(rebound);
-        let (left, right) = tokio::join!(
-            client.lifecycle_request(request(local::Action::Reconnect {})),
-            server.lifecycle_request(request(local::Action::Reconnect {}))
-        );
-        assert!(
-            left.ok && right.ok,
-            "fresh reconnect failed: {left:?} {right:?}"
-        );
-        assert_eq!(admission_identity(&server_plan).await?, retained);
-        let fresh = left
-            .state
-            .as_ref()
-            .and_then(|state| state.secure_udp.as_ref())
-            .ok_or("missing fresh status")?;
-        assert_ne!(fresh.session, old_session);
-        assert!(fresh.generation > a.value());
-        for handle in [&client, &server] {
-            let snapshot = handle.snapshot();
-            let frame = snapshot
-                .runtime
-                .as_ref()
-                .and_then(Observation::secure_udp)
-                .ok_or("missing fresh shared frame")?;
-            let report = frame.performance()?.ok_or("missing fresh performance")?;
-            assert!(report.status.running);
-            assert!(report.service_terminal.is_none());
-            assert!(frame.service_terminal.is_none());
-            assert_ne!(report.status.session, old_session);
-        }
-        assert_eq!(
-            fresh.policy_epoch, 0,
-            "fresh session is not retained-state recovery"
-        );
-        for side in 0..2 {
-            let bytes = packet((side + 20) as u8, 1400);
-            hosts[side].send(&bytes)?;
-            hosts[1 - side].expect(&bytes).await?;
-        }
-        api_task.abort();
-        let _ = api_task.await;
-        client_task.abort();
-        server_task.abort();
-        let _ = tokio::join!(client_task, server_task);
-        for handle in [&client, &server] {
-            let snapshot = handle.snapshot();
-            let frame = snapshot
-                .runtime
-                .as_ref()
-                .and_then(Observation::secure_udp)
-                .ok_or("missing closed shared frame")?;
-            let runtime = frame.runtime.as_ref().ok_or("missing last runtime")?;
-            let report = frame
-                .performance()?
-                .ok_or("missing actor-drop performance")?;
-            assert!(!report.status.running);
-            assert_eq!(frame.service_terminal, snapshot.terminal);
-            assert_eq!(report.status.elapsed_micros, runtime.elapsed_micros);
-            assert_eq!(
-                report.status.terminal,
-                runtime.terminal.map(|reason| format!("{reason:?}"))
-            );
-            assert_eq!(
-                report.status.socket_accepted_packets,
-                runtime.counters.socket_accepted_packets
-            );
-        }
-        assert!(
-            hosts
-                .iter()
-                .all(|host| host.live.load(Ordering::SeqCst) == 0)
-        );
-    }
-    Ok(())
+    transaction::transaction_service_lifecycle().await
 }
 
 struct ApiDirectory(std::path::PathBuf);

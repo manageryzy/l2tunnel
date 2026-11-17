@@ -10,18 +10,11 @@ pub use proxy_common::{ProxyCommonCover, ProxyCommonStatus};
 
 /// Current strict local protocol version.
 pub const VERSION: u16 = 1;
-/// Explicit new-profile observations/actions; never an automatic v1 downgrade.
-pub const SECURE_UDP_VERSION: u16 = 2;
-/// Explicit complete-configuration backend; never an automatic v1/v2 downgrade.
-pub const TRANSACTION_VERSION: u16 = 3;
 /// Explicit full Common configurations, with independently bounded catalog pages.
 pub const COMMON_VERSION: u16 = 4;
 /// Versions understood by the bounded local transport; backends gate actions.
 pub fn supported_version(version: u16) -> bool {
-    matches!(
-        version,
-        VERSION | SECURE_UDP_VERSION | TRANSACTION_VERSION | COMMON_VERSION
-    )
+    matches!(version, VERSION | COMMON_VERSION)
 }
 /// Supported local policy changes; peer authorization still applies separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,24 +39,6 @@ pub enum Action {
     Reconnect {},
     /// Begin proxy drain; acceptance and terminal outcome are separate.
     DrainProxy {},
-    /// Submit a standalone native drain; acceptance is not actual completion.
-    DrainOpenVpn {},
-    /// Request a coordinated peer switch; completion is not a local file edit.
-    SwitchCompression {
-        /// Target independent packet compression policy.
-        compression: Compression,
-    },
-    /// Negotiate a new swift policy on the live session. Absent values keep
-    /// what is in force; the reply reports the committed epoch.
-    SetSwiftPolicy {
-        /// Requested values.
-        policy: SwiftChange,
-    },
-    /// Negotiate one complete canonical value from the selected transaction catalog.
-    SwitchSwiftConfiguration {
-        /// Exact checked canonical bytes, without a partial-policy conversion.
-        configuration: crate::secure_udp::transaction_status::CanonicalConfiguration,
-    },
     /// Negotiate one full Common configuration through the existing service actor.
     SwitchCommonConfiguration {
         /// Exact complete anchored canonical bytes.
@@ -90,34 +65,6 @@ pub enum Action {
         /// Number of members, from one through four.
         limit: u16,
     },
-    /// Request an exact policy from the session's authenticated active catalog.
-    SwitchActivePolicy {
-        /// Complete channel/weight policy; partial local mutations are not supported.
-        policy: crate::active_managed::Policy,
-    },
-}
-/// Swift policy values to change; every field is optional.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SwiftChange {
-    /// Client-to-server budget in kilobits of IP bytes per second.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forward_kbit: Option<u64>,
-    /// Server-to-client budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse_kbit: Option<u64>,
-    /// Ordering channels.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channels: Option<u64>,
-    /// Sources covered by one repair.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<u64>,
-    /// Proportional repairs per thousand sources.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_permille: Option<u64>,
-    /// IP path MTU.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_mtu: Option<u64>,
 }
 /// One finite, versioned local request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,32 +109,9 @@ pub struct Snapshot {
     pub phase: String,
     /// Currently committed compression.
     pub compression: Compression,
-    /// Present only for the distinct managed active profile; legacy bytes stay unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<ActiveSnapshot>,
     /// Present only for an explicit proxy profile; omitted from legacy replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxySnapshot>,
-    /// Present only for the explicit standalone native-drain profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openvpn_drain: Option<crate::openvpn::drain::Snapshot>,
-    /// Actual explicit raw packet selection and bounded logical runtime status.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_packet: Option<crate::raw_packet::Snapshot>,
-    /// Present only for an explicitly authenticated rolling session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rolling: Option<crate::rolling::Snapshot>,
-    /// Present only for an explicitly authenticated swift session.
-    #[cfg(unix)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub swift: Option<crate::swift::Status>,
-    /// Present only in explicit version2 replies for the common secure UDP profile.
-    #[cfg(unix)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secure_udp: Option<crate::secure_udp::status::Status>,
-    /// Present only for explicit version3 complete-configuration observations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transaction: Option<crate::secure_udp::transaction_status::Status>,
     /// Present only for explicit APIv4 complete mixed-profile observations.
     #[serde(
         default,
@@ -282,19 +206,6 @@ pub struct ProxyCloseReport {
     /// Original authenticated physical lanes closed.
     pub tls_lanes_closed: usize,
 }
-/// Actual active policy and admission state, for CLI and future GUI status.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActiveSnapshot {
-    /// Complete locally committed policy.
-    pub policy: crate::active_managed::Policy,
-    /// Local admission gate including real Final and management flush barriers.
-    pub admitting: bool,
-    /// Whether the runtime still owns its authenticated lanes and device.
-    pub running: bool,
-    /// Canonical committed policy digest, lowercase hexadecimal.
-    pub digest: String,
-}
 /// Structured response, including the actual observed state on rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "ResponseWire")]
@@ -329,22 +240,10 @@ impl TryFrom<ResponseWire> for Response {
             return Err("Common observations require explicit API version4");
         }
         if value.version == COMMON_VERSION
-            && value.state.as_ref().is_some_and(|state| {
-                let old = state.active.is_some()
-                    || state.proxy.is_some()
-                    || state.openvpn_drain.is_some()
-                    || state.raw_packet.is_some()
-                    || state.rolling.is_some()
-                    || state.transaction.is_some();
-                #[cfg(unix)]
-                {
-                    old || state.swift.is_some() || state.secure_udp.is_some()
-                }
-                #[cfg(not(unix))]
-                {
-                    old
-                }
-            })
+            && value
+                .state
+                .as_ref()
+                .is_some_and(|state| state.proxy.is_some())
         {
             return Err("APIv4 cannot project a legacy backend");
         }

@@ -448,7 +448,7 @@ async fn establish_original_pair_inner(
         b_contract.expected_configuration()
     );
     assert_ne!(a_contract.envelope(), envelope);
-    assert!(a_contract.refresh_selection().is_none());
+    assert_eq!(a_contract.compact_wire(), selection);
     let mut wrong = resources;
     wrong[1].work.send_batch += 1;
     assert!(bind(security::Role::Initiator, wrong, a.authenticated()).is_err());
@@ -800,3 +800,48 @@ actual_case!(
     Half,
     ChaCha20Crc32c
 );
+
+#[tokio::test]
+async fn maintained_tls_half_cancellation_at_readiness_precedes_closed_peer_io() -> Result {
+    let pair = establish_original_pair(
+        maintained::Kind::TlsStream,
+        core::Duplex::Half,
+        security::compact::Protection::ChaCha20Crc32c,
+    )
+    .await?;
+    let OriginalPair {
+        client,
+        server,
+        client_contract,
+        ..
+    } = pair;
+    let (native, _host) = device()?;
+    let (cancel, cancelled) = oneshot::channel();
+    let mut cancel = Some(cancel);
+    let mut peer = Some(server);
+    let stopped = run_common_on_maintained(
+        native,
+        client,
+        client_contract,
+        None,
+        async {
+            let _ = cancelled.await;
+        },
+        move |snapshot| {
+            if snapshot.running {
+                // Make peer closure and local cancellation ready at the same
+                // boundary, before the first maintained work turn can poll I/O.
+                drop(peer.take());
+                if let Some(cancel) = cancel.take() {
+                    let _ = cancel.send(());
+                }
+            }
+        },
+    )
+    .await?;
+    assert_eq!(stopped.reason, StopReason::Cancelled);
+    assert_eq!(stopped.snapshot.counters.maintained_accepted_records, 0);
+    assert_eq!(stopped.snapshot.counters.native_read, 0);
+    assert_eq!(stopped.snapshot.counters.native_written, 0);
+    Ok(())
+}

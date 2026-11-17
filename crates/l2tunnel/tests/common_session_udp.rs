@@ -15,6 +15,54 @@ mod streams;
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const ESTABLISHED_AT: u64 = 12_000;
 
+fn record_selection() -> record::compact::Selection {
+    record::compact::Selection {
+        protection: security::compact::Protection::ChaCha20Poly1305,
+        limits: security::compact::Selection {
+            max_forward_packets: 1024,
+            max_failed_checks: 64,
+        },
+    }
+}
+
+fn record_limits() -> security::Limits {
+    security::Limits {
+        max_body_bytes: 1024,
+        packets_per_key: 8,
+        max_body_bytes_per_key: 1 << 20,
+    }
+}
+
+fn record_commitment() -> [u8; 32] {
+    let selection = record_selection();
+    let limits = record_limits();
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"l2tunnel/current-record-socket-fixture/v1\0");
+    hash.update(&[security::compact::VERSION, selection.protection as u8]);
+    hash.update(&selection.limits.max_forward_packets.to_be_bytes());
+    hash.update(&selection.limits.max_failed_checks.to_be_bytes());
+    hash.update(&(limits.max_body_bytes as u64).to_be_bytes());
+    hash.update(&limits.packets_per_key.to_be_bytes());
+    hash.update(&limits.max_body_bytes_per_key.to_be_bytes());
+    let mut value = [0; 32];
+    value.copy_from_slice(hash.finish().as_ref());
+    value
+}
+
+fn record_kind(class: record::Class, body: &[u8]) -> record::compact::Kind {
+    match class {
+        record::Class::Control => record::compact::Kind::Control,
+        record::Class::User
+            if body
+                .first()
+                .is_some_and(|byte| byte & swift::KIND_MASK == swift::KIND_FEEDBACK) =>
+        {
+            record::compact::Kind::Feedback
+        }
+        record::Class::User => record::compact::Kind::Data,
+    }
+}
+
 struct TestEntropy(u8);
 impl hs::Entropy for TestEntropy {
     fn fill(&mut self, destination: &mut [u8; 32]) -> std::result::Result<(), hs::EntropyError> {
@@ -70,7 +118,7 @@ fn authenticated_roots(
     let peers = [secrets[1].public_key(), secrets[0].public_key()];
     let binding = hs::Binding {
         session: security::SessionId([31; 16]),
-        configuration: [41; 32],
+        configuration: record_commitment(),
         carrier: [if covers[0].appearance() == cover::Appearance::QuicLike {
             51
         } else {
@@ -232,15 +280,10 @@ impl Endpoint {
         role: mg::Role,
     ) -> Result<Self> {
         let original = (socket.local_addr()?, socket.peer_addr()?);
-        let records = record::Records::new(
+        let records = record::Records::new_compact(
             root,
             security::LaneId(0),
-            security::Limits {
-                max_body_bytes: 1024,
-                packets_per_key: 8,
-                max_body_bytes_per_key: 1 << 20,
-            },
-            security::Protection::ChaCha20Poly1305,
+            record_limits(),
             cover,
             record::Scope {
                 epoch: security::Epoch(1),
@@ -250,10 +293,14 @@ impl Endpoint {
                 epoch: security::Epoch(10),
                 configuration: security::ConfigDigest([5; 32]),
             },
+            record_selection(),
         )?;
         let source_packet_bytes = 128 + l2tunnel::recovery::DATA_HEADER_BYTES;
-        let wire_overhead =
-            records.capacity(source_packet_bytes)?.packet_bytes - source_packet_bytes + 28;
+        let wire_overhead = records
+            .capacity_for(record::compact::Kind::Control, source_packet_bytes)?
+            .packet_bytes
+            - source_packet_bytes
+            + 28;
         let control = mg::delivery::Service::new(
             mg::delivery::Settings {
                 recovery: l2tunnel::recovery::ArqConfig {
@@ -309,17 +356,33 @@ fn transfer(
 ) -> Result<usize> {
     let mut workspace = [0; 2048];
     let mut packet = [0; 2048];
-    let sealed = source.records.seal(
-        class,
-        cover::PacketMeta {
-            phase: cover::Phase::Established,
-            packet_number: cover::PacketNumber(source.outer),
-            media_timestamp: cover::MediaTimestamp(source.outer.wrapping_mul(960)),
-        },
-        body,
-        &mut workspace,
-        &mut packet,
-    )?;
+    let kind = record_kind(class, body);
+    let metadata = cover::PacketMeta {
+        phase: cover::Phase::Established,
+        packet_number: cover::PacketNumber(source.outer),
+        media_timestamp: cover::MediaTimestamp(source.outer.wrapping_mul(960)),
+    };
+    let sealed = if kind == record::compact::Kind::Feedback {
+        source.records.seal_feedback_in(
+            source.records.active_data(),
+            metadata,
+            body,
+            &mut workspace,
+            &mut packet,
+        )?
+    } else {
+        source
+            .records
+            .seal(class, metadata, body, &mut workspace, &mut packet)?
+    };
+    assert_eq!(
+        sealed.bytes,
+        source.records.capacity_for(kind, body.len())?.packet_bytes
+    );
+    assert_eq!(
+        sealed.bytes,
+        body.len() + record::compact::AUTHENTICATED_OVERHEAD
+    );
     source.outer += 1;
     let dropped = match class {
         record::Class::User
@@ -345,6 +408,8 @@ fn transfer(
         .records
         .open(&received[..length], &mut workspace, &mut plaintext)?;
     assert_eq!(opened.class, class);
+    assert_eq!(opened.feedback, kind == record::compact::Kind::Feedback);
+    assert!(opened.authenticated && opened.strongly_authenticated);
     target.largest_generation = target.largest_generation.max(opened.generation.0);
     match opened.class {
         record::Class::Control => {
@@ -459,7 +524,10 @@ fn noise_swift_and_reliable_control_share_the_original_udp_pair() -> Result {
                 let mut body = Vec::new();
                 let feedback_reservation = source
                     .records
-                    .capacity(swift::FEEDBACK_HEADER + 2 * swift::MAX_REQUESTS)?
+                    .capacity_for(
+                        record::compact::Kind::Feedback,
+                        swift::FEEDBACK_HEADER + 2 * swift::MAX_REQUESTS,
+                    )?
                     .packet_bytes
                     + 28;
                 while budget
@@ -477,7 +545,11 @@ fn noise_swift_and_reliable_control_share_the_original_udp_pair() -> Result {
                     budget -= transfer(source, target, record::Class::User, &body, now, role)?;
                 }
                 if source.receiver.feedback(now, &mut body) {
-                    let cost = source.records.capacity(body.len())?.packet_bytes + 28;
+                    let cost = source
+                        .records
+                        .capacity_for(record::compact::Kind::Feedback, body.len())?
+                        .packet_bytes
+                        + 28;
                     assert!(
                         cost <= budget,
                         "fixture failed to reserve user feedback budget"

@@ -109,14 +109,14 @@ fn selected_research(
             stream: 17,
         },
     )?;
-    let contract = CommonTransactionContract::new_on_carrier(
+    let contract = CommonTransactionContract::new_on_carrier_paired_compact(
         security::ConfigDigest([3; 32]),
         if client {
             security::Role::Initiator
         } else {
             security::Role::Responder
         },
-        resources,
+        [resources; 2],
         setup.cover,
         false,
         EnvelopeDigest::new([0x39; 32]),
@@ -131,8 +131,9 @@ fn selected_research(
             retained_bytes: 256 << 20,
         },
         *outer,
+        template.compact_wire(),
     )?;
-    assert!(contract.refresh_selection().is_none());
+    assert_eq!(contract.compact_wire(), template.compact_wire());
     setup.binding.configuration = contract.expected_configuration().0;
     Ok((setup, contract))
 }

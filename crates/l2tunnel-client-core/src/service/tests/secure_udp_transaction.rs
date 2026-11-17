@@ -5,15 +5,17 @@
 //! runtime observation, rather than borrowing a later timer report.
 
 use super::*;
-use crate::secure_udp::{transaction_profile, transaction_status};
-use l2tunnel::swift_configuration::{Catalog, Configuration, Descriptor};
+use crate::secure_udp::{
+    common_status as transaction_status, common_transaction_profile as transaction_profile,
+};
+use l2tunnel::record_configuration::{Catalog, Configuration, Descriptor};
 use l2tunnel_management::{control_streams, delivery, messages, transaction};
 use l2tunnel_runtime::secure_udp::transport;
 
 #[path = "secure_udp_transaction_failures.rs"]
 mod command_failures;
 #[path = "secure_udp_common.rs"]
-mod common_service;
+pub(super) mod common_service;
 #[path = "secure_udp_transaction_lifecycle.rs"]
 mod lifecycle_failures;
 #[path = "secure_udp_transaction_setup.rs"]
@@ -52,7 +54,7 @@ struct TransactionPlans {
     outside: Configuration,
 }
 
-fn streamed(mut value: transport::Config) -> transport::Config {
+pub(super) fn streamed(mut value: transport::Config) -> transport::Config {
     let entry = messages::Settings {
         delivery: delivery::Settings {
             wire_overhead: value.control.wire_overhead + control_streams::HEADER_BYTES,
@@ -95,7 +97,7 @@ fn transaction_plans_with(
     let addresses = [held[0].local_addr()?, held[1].local_addr()?];
     let encoded = Zeroizing::new(l2tunnel_auth::MemberKey::generate_pkcs8()?);
     let member = identity::IdentityKey::from_pkcs8(&encoded)?;
-    let (legacy, peers) = crate::secure_udp::profile::tests::fixture(
+    let (legacy, peers) = crate::secure_udp::common_fixture::fixture(
         l2tunnel_udp_control::Path {
             client: addresses[0],
             server: addresses[1],
@@ -128,33 +130,41 @@ fn transaction_plans_with(
     forward.records.codec.repair_denominator = 3;
     reverse.records.codec.repair_numerator = 2;
     reverse.records.codec.repair_denominator = 7;
-    let initial_descriptor = Descriptor::new(1500, forward, reverse)?;
+    let descriptor = |forward: l2tunnel_swift::policy::Direction,
+                      reverse: l2tunnel_swift::policy::Direction|
+     -> Result<Descriptor> {
+        Ok(Descriptor::new(
+            1500,
+            Duplex::Full,
+            common_service::common_direction(
+                forward.records.channels as u16,
+                connection.max_packet,
+                forward.bytes_per_second,
+            )?,
+            common_service::common_direction(
+                reverse.records.channels as u16,
+                connection.max_packet,
+                reverse.bytes_per_second,
+            )?,
+            l2tunnel::record_configuration::Profile::Swift {
+                forward: forward.records,
+                reverse: reverse.records,
+            },
+        )?)
+    };
+    let initial_descriptor = descriptor(forward, reverse)?;
+    initiator.send = forward;
+    initiator.receive = reverse;
+    responder.send = reverse;
+    responder.receive = forward;
     forward.records.channels = 4;
     reverse.records.channels = 1;
-    let target_descriptor = Descriptor::new(1500, forward, reverse)?;
-    let engine_bytes = l2tunnel_swift::storage::Plan::for_engine(
-        initial_descriptor.forward().records,
-        initial_descriptor.reverse().records,
-    )?
-    .capacity_bytes()
-        + l2tunnel_swift::storage::Plan::for_engine(
-            target_descriptor.forward().records,
-            target_descriptor.reverse().records,
-        )?
-        .capacity_bytes();
-    assert!(
-        engine_bytes < 16 * 1024 * 1024,
-        "fixture engines require {engine_bytes} bytes"
-    );
+    let target_descriptor = descriptor(forward, reverse)?;
     forward.bytes_per_second = forward
         .bytes_per_second
         .checked_add(1)
         .ok_or("rate exhausted")?;
-    let outside_descriptor = Descriptor::new(1500, forward, reverse)?;
-    initiator.send = initial_descriptor.forward();
-    initiator.receive = initial_descriptor.reverse();
-    responder.send = initial_descriptor.reverse();
-    responder.receive = initial_descriptor.forward();
+    let outside_descriptor = descriptor(forward, reverse)?;
     let profile = transaction_profile::Profile::new(
         connection,
         settings,
@@ -162,7 +172,7 @@ fn transaction_plans_with(
         initiator,
         responder,
         Catalog::new(initial_descriptor, &[initial_descriptor, target_descriptor])?,
-        transaction_profile::Parameters {
+        transport::TransactionSettings {
             protocol: transaction::Settings {
                 retry_ms: 10,
                 phase_timeout_ms: 500,
@@ -177,7 +187,7 @@ fn transaction_plans_with(
     let outside = Configuration::new(profile.envelope(), outside_descriptor)?;
     for role in [Role::Initiator, Role::Responder] {
         assert_eq!(
-            profile.runtime_contract(role)?.config().report_interval,
+            profile.runtime_contract(role)?.resources().report_interval,
             options.report_interval
         );
     }
@@ -193,7 +203,7 @@ fn transaction_plans_with(
         options.noise_profile,
         options.psk[1].map(Zeroizing::new),
     )?;
-    let client = Prepared::secure_udp_transaction_client(
+    let client = Prepared::secure_udp_common_client(
         profile.clone(),
         credentials::Client::new(
             client_noise,
@@ -202,7 +212,7 @@ fn transaction_plans_with(
         )?,
         hosts[0].attachment(),
     )?;
-    let server = Prepared::secure_udp_transaction_server(
+    let server = Prepared::secure_udp_common_server(
         profile.clone(),
         credentials::Server::new(
             server_noise,
@@ -222,9 +232,9 @@ fn transaction_plans_with(
     })
 }
 
-fn v3(action: local::Action) -> local::Request {
+fn v4(action: local::Action) -> local::Request {
     local::Request {
-        version: local::TRANSACTION_VERSION,
+        version: local::COMMON_VERSION,
         action,
     }
 }
@@ -234,22 +244,21 @@ fn status(handle: &Handle) -> Result<transaction_status::Status> {
         .snapshot()
         .runtime
         .as_ref()
-        .and_then(Observation::secure_udp_transaction)
+        .and_then(Observation::secure_udp_common)
         .ok_or_else(|| io::Error::other("missing actual transaction frame"))?
         .status()
         .map_err(Into::into)
 }
 
 fn transaction_response(response: &local::Response) -> Result<&transaction_status::Status> {
-    assert_eq!(response.version, local::TRANSACTION_VERSION);
+    assert_eq!(response.version, local::COMMON_VERSION);
     assert!(response.ok, "transaction response rejected: {response:?}");
     let state = response
         .state
         .as_ref()
         .ok_or("missing local transaction state")?;
-    assert!(state.secure_udp.is_none() && state.swift.is_none());
     state
-        .transaction
+        .common
         .as_ref()
         .ok_or_else(|| "missing separate transaction DTO".into())
 }
@@ -272,7 +281,7 @@ fn assert_current(
     assert_eq!(value.physical_scope.map(|scope| scope.epoch), Some(epoch));
     assert_eq!(value.phase, Some(transaction_status::Phase::Idle));
     assert!(value.operation.is_none());
-    assert!(!value.cross_profile_switching && !value.retained_state_recovery && !value.fresh_rekey);
+    assert!(value.cross_profile_switching && !value.retained_state_recovery && !value.fresh_rekey);
     Ok(())
 }
 
@@ -334,6 +343,9 @@ fn assert_no_native_replay(host: &Host) -> Result {
 #[tokio::test]
 async fn actual_transaction_service_switches_twice_without_periodic_reports_and_reconnects()
 -> Result {
+    transaction_service_lifecycle().await
+}
+pub(super) async fn transaction_service_lifecycle() -> Result {
     for appearance in [
         l2tunnel_cover::Appearance::QuicLike,
         l2tunnel_cover::Appearance::MediaLike,
@@ -375,7 +387,7 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
         let old_session = before.session;
         let old_transcript = before.transcript;
         let old_setup = client.setup_observation(a).map_err(submit)?;
-        for version in [local::VERSION, local::SECURE_UDP_VERSION] {
+        for version in [local::VERSION, 2] {
             let next = client.next_key().map_err(submit)?;
             let refused = client
                 .lifecycle_request(local::Request {
@@ -383,7 +395,7 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
                     action: local::Action::Disconnect {},
                 })
                 .await;
-            assert_eq!(refused.code, "requires_version_3");
+            assert_eq!(refused.code, "requires_version_4");
             assert!(refused.state.is_none());
             assert_eq!(client.next_key().map_err(submit)?, next);
             assert_eq!(client.snapshot().generation, Some(a));
@@ -392,7 +404,7 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
         // A checked but unsupported complete C is refused before key admission.
         let key = client.next_key().map_err(submit)?;
         assert_eq!(
-            client.apply_transaction(outside, key),
+            client.apply_common(outside, key),
             Err(SubmitError::InvalidConfiguration)
         );
         assert_eq!(client.next_key().map_err(submit)?, key);
@@ -401,23 +413,26 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
         // Let the actual fixed-control challenge run; the final report below is
         // the observation, not this delay or an inferred liveness success.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let accepted = client.apply_transaction(target, key).map_err(submit)?;
+        let accepted = client.apply_common(target, key).map_err(submit)?;
+        assert_eq!(client.apply_common(target, key).map_err(submit)?, accepted);
         assert_eq!(
-            client.apply_transaction(target, key).map_err(submit)?,
-            accepted
-        );
-        assert_eq!(
-            client.apply_transaction(initial, key),
+            client.apply_common(initial, key),
             Err(SubmitError::Conflict)
         );
         let completed = timeout(Duration::from_secs(3), client.wait(accepted.operation))
             .await?
             .map_err(submit)?;
-        let Completed::Applied(first) = completed else {
+        let Completed::Common {
+            configuration,
+            outcome: Ok(epoch),
+        } = completed.clone()
+        else {
             return Err(format!("actual first switch did not apply: {completed:?}").into());
         };
-        let observed = transaction_response(&first)?;
-        assert_current(observed, target, first_epoch + 1)?;
+        assert_eq!(configuration, target);
+        assert_eq!(epoch.0, first_epoch + 1);
+        let observed = status(&client)?;
+        assert_current(&observed, target, first_epoch + 1)?;
         assert!(
             observed
                 .liveness
@@ -425,13 +440,10 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
                 .and_then(|value| value.last_pong_micros)
                 .is_some()
         );
-        assert_eq!(
-            client.apply_transaction(target, key).map_err(submit)?,
-            accepted
-        );
+        assert_eq!(client.apply_common(target, key).map_err(submit)?, accepted);
         assert_eq!(
             client.wait(accepted.operation).await.map_err(submit)?,
-            Completed::Applied(first.clone())
+            completed.clone()
         );
         assert_current(&status(&client)?, target, first_epoch + 1)?;
         expect_follower_current(&server, target, first_epoch + 1).await?;
@@ -449,13 +461,14 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
             })
             .await
         });
-        let wire_status = local::request(&api_path, &v3(local::Action::Status {})).await?;
+        let wire_status = local::request(&api_path, &v4(local::Action::Status {})).await?;
         assert_current(transaction_response(&wire_status)?, target, first_epoch + 1)?;
         let switched = timeout(
             Duration::from_secs(3),
             local::request(
                 &api_path,
-                &v3(local::Action::SwitchSwiftConfiguration {
+                &v4(local::Action::SwitchCommonConfiguration {
+                    request_key: client.next_key().map_err(submit)?.value(),
                     configuration: transaction_status::CanonicalConfiguration::from_configuration(
                         initial,
                     )?,
@@ -471,8 +484,8 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
         }
 
         let (left, right) = tokio::join!(
-            client.lifecycle_request(v3(local::Action::Disconnect {})),
-            server.lifecycle_request(v3(local::Action::Disconnect {})),
+            client.lifecycle_request(v4(local::Action::Disconnect {})),
+            server.lifecycle_request(v4(local::Action::Disconnect {})),
         );
         assert!(
             left.ok && right.ok,
@@ -495,7 +508,7 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
             .snapshot()
             .runtime
             .as_ref()
-            .and_then(Observation::secure_udp_transaction)
+            .and_then(Observation::secure_udp_common)
             .ok_or("missing retained stopped generic frame")?
             .clone();
         let stopped_status = stopped_frame.status()?;
@@ -515,8 +528,8 @@ async fn actual_transaction_service_switches_twice_without_periodic_reports_and_
         ];
         drop(held);
         let (left, right) = tokio::join!(
-            client.lifecycle_request(v3(local::Action::Reconnect {})),
-            server.lifecycle_request(v3(local::Action::Reconnect {})),
+            client.lifecycle_request(v4(local::Action::Reconnect {})),
+            server.lifecycle_request(v4(local::Action::Reconnect {})),
         );
         assert!(
             left.ok && right.ok,

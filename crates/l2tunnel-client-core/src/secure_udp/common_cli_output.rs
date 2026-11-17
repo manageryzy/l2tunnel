@@ -1,5 +1,31 @@
 //! Bounded full Common plan pages and actual shared-service events.
-use super::transaction_cli_output::bounded;
+/// Leave bounded logger-health and newline space inside the existing128KiB line.
+pub(super) const MAX_VALUE_BYTES: usize = 128 * 1024 - 2048;
+
+fn output_invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+struct Count(usize);
+impl std::io::Write for Count {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|length| *length <= MAX_VALUE_BYTES)
+            .ok_or_else(|| output_invalid("Common CLI output exceeds its value bound"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+pub(super) fn bounded(value: Value) -> io::Result<Value> {
+    serde_json::to_writer(&mut Count(0), &value)
+        .map_err(|_| output_invalid("Common CLI output exceeds its value bound"))?;
+    Ok(value)
+}
+
 use crate::secure_udp::{
     common_status::CanonicalConfiguration, common_transaction_profile::Profile,
 };
@@ -69,7 +95,8 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
         output[0]["maintained_carrier"] = serde_json::to_value(value).map_err(io::Error::other)?;
         output[0] = bounded(std::mem::take(&mut output[0]))?;
     }
-    if let Some(requested) = profile.compact_wire() {
+    {
+        let requested = profile.compact_wire();
         output[0]["compact_wire"] = json!({
             "requested":crate::secure_udp::common_status::CompactWireSelection::from_selection(requested)?,
             "effective":null,"checks":null,"feedback_packet_number":null,
@@ -188,14 +215,31 @@ pub(super) fn raw_inspection(
         "bytes_per_second":policy.bytes_per_second,"packets_per_second":policy.packets_per_second,
         "burst_bytes":policy.burst_bytes,"burst_packets":policy.burst_packets,"max_key_packets":policy.max_key_packets,"max_key_bytes":policy.max_key_bytes,
         "kernel_firewall_ready":false,"native_qualified":false,"congestion_control":false,"clean_close":false}));
-    if profile.compact_wire().is_some() {
+    {
+        let data = profile.compact_wire().data_overhead();
+        let data = if profile.proxy_config().is_some() {
+            data.max(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+        } else {
+            data
+        };
+        let data = geometry
+            .ip_tcp_bytes
+            .checked_add(data)
+            .ok_or_else(|| output_invalid("requested raw data overhead overflow"))?;
+        let control = geometry
+            .ip_tcp_bytes
+            .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+            .ok_or_else(|| output_invalid("requested raw control overhead overflow"))?;
         header.insert("outer_policy_scope".into(), json!("bootstrap"));
-        header.insert("requested_final_framing".into(), json!({
-            "ip_tcp_bytes":geometry.ip_tcp_bytes,
-            "data_overhead_bytes":geometry.ip_tcp_bytes + l2tunnel::secure_record::compact::DATA_OVERHEAD,
-            "control_feedback_overhead_bytes":geometry.ip_tcp_bytes + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD,
-            "protection_layers":1,"phase_envelope":false,"raw_datagram_envelope":false
-        }));
+        header.insert(
+            "requested_final_framing".into(),
+            json!({
+                "ip_tcp_bytes":geometry.ip_tcp_bytes,
+                "data_overhead_bytes":data,
+                "control_feedback_overhead_bytes":control,
+                "protection_layers":1,"phase_envelope":false,"raw_datagram_envelope":false
+            }),
+        );
         header.insert("effective_final_framing".into(), Value::Null);
     }
     output[0] = bounded(std::mem::take(&mut output[0]))?;

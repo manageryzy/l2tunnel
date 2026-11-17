@@ -16,7 +16,7 @@ pub struct Attachment {
 enum Open {
     Packet(Arc<dyn Fn() -> io::Result<Device> + Send + Sync>),
     #[cfg(unix)]
-    Readable(Arc<dyn Fn() -> io::Result<crate::swift::Native> + Send + Sync>),
+    Readable(Arc<dyn Fn() -> io::Result<crate::native::Native> + Send + Sync>),
 }
 impl Attachment {
     pub(super) fn open(&self) -> io::Result<Device> {
@@ -28,7 +28,7 @@ impl Attachment {
     }
     /// Fresh readiness-capable owner; absent for a plain packet provider.
     #[cfg(unix)]
-    pub(super) fn open_readable(&self) -> io::Result<crate::swift::Native> {
+    pub(super) fn open_readable(&self) -> io::Result<crate::native::Native> {
         match &self.open {
             Open::Readable(open) => open(),
             Open::Packet(_) => Err(io::Error::new(
@@ -37,16 +37,33 @@ impl Attachment {
             )),
         }
     }
-    #[cfg(unix)]
+    /// Native attachment accepted by the current platform's runtime boundary.
+    pub(super) fn open_native(&self) -> io::Result<crate::native::Native> {
+        #[cfg(unix)]
+        {
+            self.open_readable()
+        }
+        #[cfg(not(unix))]
+        {
+            self.open().map(crate::native::Native::new)
+        }
+    }
     fn readable_kind(&self) -> bool {
-        matches!(self.open, Open::Readable(_))
+        #[cfg(unix)]
+        {
+            matches!(self.open, Open::Readable(_))
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
     /// Bind a layer and a factory of devices that expose a readiness
     /// descriptor. Every backend accepts it; the swift backend requires it.
     #[cfg(unix)]
     pub fn readable(
         layer: PacketLayer,
-        open: impl Fn() -> io::Result<crate::swift::Native> + Send + Sync + 'static,
+        open: impl Fn() -> io::Result<crate::native::Native> + Send + Sync + 'static,
     ) -> Self {
         Self {
             layer,
@@ -63,14 +80,6 @@ impl Attachment {
             open: Open::Packet(Arc::new(open)),
         }
     }
-}
-/// Existing managed TCP options; no parallel mode or recovery selector.
-#[derive(Clone, Copy, Default)]
-pub struct Options {
-    /// Existing explicit canonical delivery binding, or supported legacy TCP default.
-    pub delivery: Option<managed::DeliveryConfig>,
-    /// Existing optional profiler cadence, constrained to 100..60000 ms.
-    pub profile_interval: Option<Duration>,
 }
 /// Already parsed client credentials and fixed original endpoint.
 pub struct Client {
@@ -93,8 +102,6 @@ pub struct Server {
     pub members: MemberAllowlist,
 }
 pub(super) enum Endpoint {
-    Client(Client),
-    Server(Server),
     #[cfg(unix)]
     SecureClient(crate::secure_udp::credentials::Client),
     #[cfg(unix)]
@@ -156,27 +163,16 @@ pub(super) struct CommonMaintainedServer {
 /// this is not a carrier preference list and never falls back to another variant.
 #[derive(Clone)]
 pub(super) enum Transport {
-    Managed(Options),
-    Proxy(Arc<crate::proxy::Settings>),
-    ProxyMeasured(Arc<crate::proxy_measured::Settings>),
     #[cfg(unix)]
     ProxyCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
+    #[cfg(unix)]
+    ProxyCommonMaintained(Arc<crate::secure_udp::common_transaction_profile::Profile>),
     #[cfg(unix)]
     ProxyCommonRaw {
         profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
         raw: Arc<crate::raw_packet::common::Settings>,
         opener: crate::raw_packet::common::PacketOpener,
     },
-    UdpFrame {
-        settings: crate::udp::Settings,
-        delivery: managed::DeliveryConfig,
-    },
-    #[cfg(unix)]
-    Swift(crate::swift::Settings),
-    #[cfg(unix)]
-    SecureUdpSwift(Arc<crate::secure_udp::profile::Profile>),
-    #[cfg(unix)]
-    SecureUdpTransaction(Arc<crate::secure_udp::transaction_profile::Profile>),
     #[cfg(unix)]
     SecureUdpCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
     #[cfg(unix)]
@@ -184,7 +180,7 @@ pub(super) enum Transport {
     #[cfg(unix)]
     SecureUdpCommonCarrier {
         profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
-        outer: l2tunnel_openvpn::wire_carrier::common::Config,
+        outer: Arc<l2tunnel_openvpn::wire_carrier::common::Config>,
     },
     #[cfg(unix)]
     SecureUdpCommonRaw {
@@ -193,10 +189,6 @@ pub(super) enum Transport {
         opener: crate::raw_packet::common::PacketOpener,
     },
 }
-/// Longest time a swift acceptor keeps its listener open for a peer. Each
-/// accepted TCP connection is still bound by the original handshake timeout.
-#[cfg(unix)]
-pub const SWIFT_LISTEN: Duration = Duration::from_secs(24 * 60 * 60);
 pub(super) struct Data {
     pub connection: ConnectionConfig,
     pub endpoint: Endpoint,
@@ -211,64 +203,6 @@ pub struct Prepared {
     pub(super) data: Arc<Data>,
 }
 impl Prepared {
-    /// Explicit fixed-credit maintained-TCP proxy; all attachment work is deferred.
-    pub fn proxy_client(
-        connection: ConnectionConfig,
-        credentials: Client,
-        settings: crate::proxy::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::client_endpoint(&credentials)?;
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            Transport::Proxy(Arc::new(settings)),
-        )
-    }
-    /// Fixed proxy acceptor retaining the existing full/paired TLS factory.
-    pub fn proxy_server(
-        connection: ConnectionConfig,
-        credentials: Server,
-        settings: crate::proxy::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            connection,
-            Endpoint::Server(credentials),
-            attachment,
-            Transport::Proxy(Arc::new(settings)),
-        )
-    }
-    /// Explicit measured relay targets; this does not select exact native rwnd control.
-    pub fn proxy_measured_client(
-        connection: ConnectionConfig,
-        credentials: Client,
-        settings: crate::proxy_measured::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::client_endpoint(&credentials)?;
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            Transport::ProxyMeasured(Arc::new(settings)),
-        )
-    }
-    /// Measured proxy acceptor with the same deferred attachment and TLS ownership.
-    pub fn proxy_measured_server(
-        connection: ConnectionConfig,
-        credentials: Server,
-        settings: crate::proxy_measured::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            connection,
-            Endpoint::Server(credentials),
-            attachment,
-            Transport::ProxyMeasured(Arc::new(settings)),
-        )
-    }
     /// Explicit fixed proxy over the original Common authenticated UDP owner.
     #[cfg(unix)]
     pub fn proxy_common_client(
@@ -348,68 +282,6 @@ impl Prepared {
             },
         )
     }
-    /// Explicit same-socket Noise/member/Swift client, with deferred device work.
-    #[cfg(unix)]
-    pub fn secure_udp_client(
-        profile: crate::secure_udp::profile::Profile,
-        credentials: crate::secure_udp::credentials::Client,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            profile.connection(),
-            Endpoint::SecureClient(credentials),
-            attachment,
-            Transport::SecureUdpSwift(Arc::new(profile)),
-        )
-    }
-    /// Fixed-peer acceptor retaining one admission quarantine across attempts.
-    #[cfg(unix)]
-    pub fn secure_udp_server(
-        profile: crate::secure_udp::profile::Profile,
-        credentials: crate::secure_udp::credentials::Server,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            profile.connection(),
-            Endpoint::SecureServer(Box::new(SecureServer {
-                credentials,
-                admission: tokio::sync::Mutex::new(None),
-            })),
-            attachment,
-            Transport::SecureUdpSwift(Arc::new(profile)),
-        )
-    }
-    /// Explicit complete-configuration transaction client, with deferred device work.
-    #[cfg(unix)]
-    pub fn secure_udp_transaction_client(
-        profile: crate::secure_udp::transaction_profile::Profile,
-        credentials: crate::secure_udp::credentials::Client,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            profile.connection(),
-            Endpoint::SecureClient(credentials),
-            attachment,
-            Transport::SecureUdpTransaction(Arc::new(profile)),
-        )
-    }
-    /// Explicit transaction acceptor retaining one admission owner across attempts.
-    #[cfg(unix)]
-    pub fn secure_udp_transaction_server(
-        profile: crate::secure_udp::transaction_profile::Profile,
-        credentials: crate::secure_udp::credentials::Server,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            profile.connection(),
-            Endpoint::SecureServer(Box::new(SecureServer {
-                credentials,
-                admission: tokio::sync::Mutex::new(None),
-            })),
-            attachment,
-            Transport::SecureUdpTransaction(Arc::new(profile)),
-        )
-    }
     /// Explicit mixed-profile client using the existing authenticated UDP factory.
     #[cfg(unix)]
     pub fn secure_udp_common_client(
@@ -458,7 +330,7 @@ impl Prepared {
             attachment,
             Transport::SecureUdpCommonCarrier {
                 profile: Arc::new(profile),
-                outer,
+                outer: Arc::new(outer),
             },
         )
     }
@@ -496,6 +368,40 @@ impl Prepared {
             Transport::SecureUdpCommonMaintained(Arc::new(profile)),
         )
     }
+    /// Fixed or measured proxy through the same genuine TLS/QUIC Common owner.
+    #[cfg(unix)]
+    pub fn proxy_common_maintained_client(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        outer: crate::secure_udp::maintained::Client,
+        inner: crate::secure_udp::credentials::Client,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonMaintainedClient { outer, inner },
+            attachment,
+            Transport::ProxyCommonMaintained(Arc::new(profile)),
+        )
+    }
+    /// Matching deferred acceptor with independent own TLS and Noise identities.
+    #[cfg(unix)]
+    pub fn proxy_common_maintained_server(
+        profile: crate::secure_udp::common_transaction_profile::Profile,
+        outer: crate::secure_udp::maintained::Server,
+        inner: crate::secure_udp::credentials::Server,
+        attachment: Attachment,
+    ) -> io::Result<Self> {
+        Self::new(
+            profile.connection(),
+            Endpoint::CommonMaintainedServer(Box::new(CommonMaintainedServer {
+                outer,
+                inner,
+                admission: tokio::sync::Mutex::new(None),
+            })),
+            attachment,
+            Transport::ProxyCommonMaintained(Arc::new(profile)),
+        )
+    }
     /// Explicit fixed-peer OpenVPN acceptor with independent TLS and Noise trust.
     #[cfg(unix)]
     pub fn secure_udp_common_carrier_server(
@@ -515,7 +421,7 @@ impl Prepared {
             attachment,
             Transport::SecureUdpCommonCarrier {
                 profile: Arc::new(profile),
-                outer,
+                outer: Arc::new(outer),
             },
         )
     }
@@ -570,19 +476,14 @@ impl Prepared {
     pub(super) fn secure_udp(&self) -> bool {
         matches!(
             &self.data.transport,
-            Transport::SecureUdpSwift(_)
-                | Transport::ProxyCommon(_)
+            Transport::ProxyCommon(_)
+                | Transport::ProxyCommonMaintained(_)
                 | Transport::ProxyCommonRaw { .. }
-                | Transport::SecureUdpTransaction(_)
                 | Transport::SecureUdpCommon(_)
                 | Transport::SecureUdpCommonMaintained(_)
                 | Transport::SecureUdpCommonCarrier { .. }
                 | Transport::SecureUdpCommonRaw { .. }
         )
-    }
-    #[cfg(unix)]
-    pub(super) fn secure_udp_transaction(&self) -> bool {
-        matches!(&self.data.transport, Transport::SecureUdpTransaction(_))
     }
     #[cfg(unix)]
     pub(super) fn secure_udp_common(&self) -> bool {
@@ -594,100 +495,11 @@ impl Prepared {
                 | Transport::SecureUdpCommonRaw { .. }
         )
     }
-    /// Pure validation; credentials are already parsed and no provider is invoked.
-    pub fn client(
-        connection: ConnectionConfig,
-        credentials: Client,
-        attachment: Attachment,
-        options: Options,
-    ) -> io::Result<Self> {
-        Self::client_endpoint(&credentials)?;
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            Transport::Managed(options),
-        )
-    }
-    /// Base system/frame UDP initiator with TLS-bootstrapped authentication. The
-    /// native delivery policy is mandatory; there is no legacy default. Pure
-    /// validation of the exact settings and canonical binding precedes any
-    /// credential use, socket bind or device work.
-    pub fn udp_client(
-        connection: ConnectionConfig,
-        credentials: Client,
-        settings: crate::udp::Settings,
-        delivery: managed::DeliveryConfig,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::client_endpoint(&credentials)?;
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            Transport::UdpFrame { settings, delivery },
-        )
-    }
-    /// Base system/frame UDP acceptor; same validation order as [`Self::udp_client`].
-    /// Does not bind the TCP bootstrap listener, a UDP socket or a native device.
-    pub fn udp_server(
-        connection: ConnectionConfig,
-        credentials: Server,
-        settings: crate::udp::Settings,
-        delivery: managed::DeliveryConfig,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            connection,
-            Endpoint::Server(credentials),
-            attachment,
-            Transport::UdpFrame { settings, delivery },
-        )
-    }
-    /// Swift initiator: TLS-bootstrapped authentication, then paced protected
-    /// UDP. The attachment must come from [`Attachment::readable`]. Pure
-    /// validation of the complete policy precedes any socket or device work.
-    #[cfg(unix)]
-    pub fn swift_client(
-        connection: ConnectionConfig,
-        credentials: Client,
-        settings: crate::swift::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::client_endpoint(&credentials)?;
-        Self::new(
-            connection,
-            Endpoint::Client(credentials),
-            attachment,
-            Transport::Swift(settings),
-        )
-    }
-    /// Swift acceptor; same validation as [`Self::swift_client`]. Its setup
-    /// operation may wait up to [`SWIFT_LISTEN`] for a peer.
-    #[cfg(unix)]
-    pub fn swift_server(
-        connection: ConnectionConfig,
-        credentials: Server,
-        settings: crate::swift::Settings,
-        attachment: Attachment,
-    ) -> io::Result<Self> {
-        Self::new(
-            connection,
-            Endpoint::Server(credentials),
-            attachment,
-            Transport::Swift(settings),
-        )
-    }
     /// Bound of one accepted setup operation, started at acceptance.
     pub(super) fn setup_timeout(&self) -> Duration {
-        match (&self.data.transport, &self.data.endpoint) {
-            #[cfg(unix)]
-            (Transport::Swift(_), Endpoint::Server(_)) => {
-                SWIFT_LISTEN + self.data.connection.handshake_timeout
-            }
-            _ => self.data.connection.handshake_timeout,
-        }
+        self.data.connection.handshake_timeout
     }
+
     fn client_endpoint(credentials: &Client) -> io::Result<()> {
         if credentials.remote.port() == 0
             || credentials.remote.ip().is_unspecified()
@@ -701,141 +513,13 @@ impl Prepared {
         }
         Ok(())
     }
-    /// Pure validation; does not bind listener or open a native device.
-    pub fn server(
-        connection: ConnectionConfig,
-        credentials: Server,
-        attachment: Attachment,
-        options: Options,
-    ) -> io::Result<Self> {
-        Self::new(
-            connection,
-            Endpoint::Server(credentials),
-            attachment,
-            Transport::Managed(options),
-        )
-    }
     fn new(
         connection: ConnectionConfig,
         endpoint: Endpoint,
         attachment: Attachment,
         transport: Transport,
     ) -> io::Result<Self> {
-        let profile_interval = match &transport {
-            Transport::Managed(options) => {
-                match options.delivery {
-                    Some(delivery) => {
-                        connection.session_with_delivery(delivery)?;
-                    }
-                    None => {
-                        connection.session()?;
-                    }
-                }
-                options.profile_interval
-            }
-            Transport::Proxy(settings) => {
-                let config = crate::proxy::runtime_config(connection, settings)?;
-                l2tunnel_runtime::proxy::session_config(&config)?;
-                None
-            }
-            Transport::ProxyMeasured(settings) => {
-                let config = crate::proxy_measured::runtime_config(connection, settings)?;
-                l2tunnel_runtime::proxy::measured::session_config(&config)?;
-                None
-            }
-            Transport::UdpFrame { settings, delivery } => {
-                // Same exact checks the authenticated factory repeats before I/O.
-                let profile = crate::udp::runtime_config(connection, *settings)?;
-                l2tunnel_runtime::udp::base_session_config(
-                    connection.runtime(),
-                    profile,
-                    *delivery,
-                )?;
-                None
-            }
-            #[cfg(unix)]
-            Transport::Swift(settings) => {
-                settings.session(connection)?;
-                if !attachment.readable_kind() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "swift requires a readiness-capable attachment",
-                    ));
-                }
-                None
-            }
-            #[cfg(unix)]
-            Transport::SecureUdpSwift(profile) => {
-                let session = profile.settings();
-                let (noise, role) = match &endpoint {
-                    Endpoint::SecureClient(credentials) => {
-                        if credentials.member_key() != session.member {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "configured member differs from actual credential",
-                            ));
-                        }
-                        (credentials.noise(), l2tunnel_security::Role::Initiator)
-                    }
-                    Endpoint::SecureServer(server) => (
-                        server.credentials.noise(),
-                        l2tunnel_security::Role::Responder,
-                    ),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "secure UDP requires distinct Noise credentials",
-                        ));
-                    }
-                };
-                if noise.profile() != session.profile || !attachment.readable_kind() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "secure UDP profile/credentials or readable attachment differ",
-                    ));
-                }
-                profile.configuration(noise.peers(role))?;
-                None
-            }
-            #[cfg(unix)]
-            Transport::SecureUdpTransaction(profile) => {
-                let session = profile.settings();
-                let (noise, role) = match &endpoint {
-                    Endpoint::SecureClient(credentials) => {
-                        if credentials.member_key() != session.member {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "configured member differs from actual credential",
-                            ));
-                        }
-                        (credentials.noise(), l2tunnel_security::Role::Initiator)
-                    }
-                    Endpoint::SecureServer(server) => (
-                        server.credentials.noise(),
-                        l2tunnel_security::Role::Responder,
-                    ),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "secure UDP requires distinct Noise credentials",
-                        ));
-                    }
-                };
-                if noise.profile() != session.profile || !attachment.readable_kind() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "secure UDP profile/credentials or readable attachment differ",
-                    ));
-                }
-                if noise.peers(role) != profile.peers() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "actual Noise credentials differ from transaction plan pins",
-                    ));
-                }
-                profile.runtime_contract(role)?;
-                None
-            }
+        match &transport {
             #[cfg(unix)]
             Transport::SecureUdpCommon(profile) | Transport::ProxyCommon(profile) => {
                 if profile.proxy_config().is_some()
@@ -883,7 +567,6 @@ impl Prepared {
                     ));
                 }
                 profile.runtime_contract(role)?;
-                None
             }
             #[cfg(unix)]
             Transport::SecureUdpCommonRaw { profile, raw, .. }
@@ -895,15 +578,6 @@ impl Prepared {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "raw Common proxy requires its explicit fixed service selection",
-                    ));
-                }
-                if proxy
-                    && (profile.connection().duplex != l2tunnel_core::Duplex::Full
-                        || raw.duplex() != l2tunnel_core::Duplex::Full)
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "raw Common proxy currently requires Full",
                     ));
                 }
                 let session = profile.settings();
@@ -964,10 +638,10 @@ impl Prepared {
                     ));
                 }
                 raw.validate(profile, role)?;
-                None
             }
             #[cfg(unix)]
-            Transport::SecureUdpCommonMaintained(profile) => {
+            Transport::SecureUdpCommonMaintained(profile)
+            | Transport::ProxyCommonMaintained(profile) => {
                 use crate::secure_udp::maintained::{
                     Client as OuterClient, Server as OuterServer, Transport as OuterTransport,
                 };
@@ -975,13 +649,14 @@ impl Prepared {
                     io::Error::new(io::ErrorKind::InvalidInput, "maintained policy absent")
                 })?;
                 selected.request(connection)?;
+                let proxy = matches!(&transport, Transport::ProxyCommonMaintained(_));
                 if profile.maintained_binding().is_some()
-                    || !attachment.readable_kind()
-                    || profile.proxy_config().is_some()
+                    || (!proxy && !attachment.readable_kind())
+                    || proxy != profile.proxy_config().is_some()
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "maintained native Common requires an unbound readable native plan",
+                        "maintained Common requires its explicit unbound native or proxy plan",
                     ));
                 }
                 let settings = profile.settings();
@@ -1089,7 +764,6 @@ impl Prepared {
                     ));
                 }
                 profile.maintained_session()?;
-                None
             }
             #[cfg(unix)]
             Transport::SecureUdpCommonCarrier { profile, outer } => {
@@ -1174,16 +848,14 @@ impl Prepared {
                     ));
                 }
                 profile.runtime_contract(role)?;
-                None
             }
         };
-        if attachment.layer != connection.layer
-            || profile_interval
-                .is_some_and(|d| d < Duration::from_millis(100) || d > Duration::from_secs(60))
-        {
+        // Common profiles validate their complete runtime bounds above. The
+        // retired standalone profiler has no field in these selected plans.
+        if attachment.layer != connection.layer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "attachment layer or profile interval differs",
+                "attachment layer differs from the requested connection",
             ));
         }
         Ok(Self {
@@ -1196,9 +868,8 @@ impl Prepared {
             }),
         })
     }
-    #[cfg(unix)]
-    pub(super) fn open_readable(&self) -> io::Result<crate::swift::Native> {
-        let device = self.data.attachment.open_readable()?;
+    pub(super) fn open_native(&self) -> io::Result<crate::native::Native> {
+        let device = self.data.attachment.open_native()?;
         if PacketDevice::layer(&device) != self.data.connection.layer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1207,6 +878,7 @@ impl Prepared {
         }
         Ok(device)
     }
+
     pub(super) fn open(&self) -> io::Result<Device> {
         let device = self.data.attachment.open()?;
         if device.layer() != self.data.connection.layer {
@@ -1221,4 +893,4 @@ impl Prepared {
 
 #[cfg(all(test, unix))]
 #[path = "prepared_transaction_tests.rs"]
-mod transaction_tests;
+pub(super) mod transaction_tests;

@@ -212,7 +212,12 @@ impl SenderOwner {
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                     s[0].stage_identified(channel, frame)
                 }
-                NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame),
+                NativePolicy::RawIp | NativePolicy::RawEthernet => {
+                    s[0].stage_raw_identified(channel, frame)
+                }
+                NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
+                    s[0].stage_lz4_identified(channel, frame)
+                }
             }
             .map_err(|e| {
                 if e == sender::Error::Busy {
@@ -225,7 +230,12 @@ impl SenderOwner {
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                     s[0].stage_identified(channel, frame, micros(now)?)
                 }
-                NativePolicy::RawIp => s[0].stage_raw_identified(channel, frame, micros(now)?),
+                NativePolicy::RawIp | NativePolicy::RawEthernet => {
+                    s[0].stage_raw_identified(channel, frame, micros(now)?)
+                }
+                NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
+                    s[0].stage_lz4_identified(channel, frame, micros(now)?)
+                }
             }
             .map_err(|e| {
                 if e == packed_sender::Error::Busy {
@@ -519,7 +529,12 @@ impl Endpoint {
         self.0.feedback_opportunity()
     }
 
-    /// Original recovery/receiver/handoff expiry, excluding soft output wakeups.
+    /// Terminal receiver/handoff caps, excluding recoverable FEC-cache eviction.
+    pub fn custody_deadline(&self) -> Option<Duration> {
+        self.0.custody_deadline()
+    }
+
+    /// Receive-maintenance expiry and terminal custody caps, excluding output wakes.
     pub fn expiry_deadline(&self) -> Option<Duration> {
         self.0.expiry_deadline()
     }

@@ -1,6 +1,7 @@
 //! Actual maintained-owner custody, separate from physical datagram acceptance.
 use super::maintained::{Authenticated, Geometry, Kind, Lane, Request};
 use crate::retained_tls as tls;
+use crate::retained_tls::failure::Failure;
 use l2tunnel_auth::SessionConfig;
 use l2tunnel_core::Duplex;
 use l2tunnel_quic::common as quic;
@@ -141,7 +142,7 @@ pub struct Carrier {
     final_records: bool,
     capacity: usize,
     allocations: usize,
-    failed: Option<io::Error>,
+    failed: Option<Failure>,
 }
 impl Carrier {
     /// Preflight new retained TLS/wrapper backing, verify real policy and then own it.
@@ -390,7 +391,7 @@ impl Carrier {
     /// First terminal maintained failure, without destroying saved completions.
     pub fn check_failure(&self) -> io::Result<()> {
         if let Some(error) = &self.failed {
-            return Err(copy_error(error));
+            return Err(error.error());
         }
         match &self.backend {
             Backend::Tls(value) => value[0].check_failure(),
@@ -401,6 +402,49 @@ impl Carrier {
                 Ok(())
             }
         }
+    }
+    /// Exact first peer-close error with no retained payload or output custody.
+    /// Higher layers must independently prove authenticated retirement.
+    #[cfg(unix)]
+    pub(crate) fn retained_peer_close(&self, error: &io::Error) -> bool {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("L2TUNNEL_MEASURED_TRACE").is_some() {
+            let pending = self.output.each_ref().map(|value| {
+                value
+                    .as_ref()
+                    .map(|value| (value.lane, value.result.is_some()))
+            });
+            eprintln!(
+                "MAINTAINED_CLOSE_OWNER typed={} outputs={pending:?} inputs={:?}",
+                self.failed
+                    .as_ref()
+                    .is_some_and(|failure| failure.is_peer_close(error)),
+                self.input.each_ref().map(Option::is_some),
+            );
+            if let Backend::Quic(values) = &self.backend {
+                for (lane, value) in values.iter().enumerate() {
+                    eprintln!(
+                        "MAINTAINED_QUIC_FAILURE role={} lane={lane} accepted={:?} quinn={:?}",
+                        if value.info().peer_member.is_none() {
+                            "client"
+                        } else {
+                            "server"
+                        },
+                        value.acceptance_status(),
+                        value.transport_statistics(),
+                    );
+                }
+            }
+        }
+        self.failed
+            .as_ref()
+            .is_some_and(|failure| failure.is_peer_close(error))
+            && self.output.iter().all(Option::is_none)
+            && self.input.iter().all(Option::is_none)
+            && match &self.backend {
+                Backend::Tls(value) => value[0].retained_output_empty(),
+                Backend::Quic(_) => true,
+            }
     }
     /// Enable final records after the caller installed its authenticated Common owner.
     pub fn select_final_records(&mut self, original_deadline: Instant) -> io::Result<()> {
@@ -544,13 +588,17 @@ impl Carrier {
         match &mut self.backend {
             Backend::Tls(value) => match value[0].poll_progress(cx) {
                 Poll::Ready(Ok(())) => progress = true,
-                Poll::Ready(Err(error)) => failed = Some(error),
+                Poll::Ready(Err(error)) => {
+                    let peer_close = value[0].peer_close_error(&error);
+                    failed = Some(Failure::new(error, peer_close));
+                }
                 Poll::Pending => {}
             },
             Backend::Quic(values) => {
                 for (lane, value) in values.iter_mut().enumerate() {
                     if let Poll::Ready(Err(error)) = value.poll_maintenance(cx) {
-                        failed = Some(quic_error(error));
+                        let peer_close = value.peer_close_error(&error);
+                        failed.get_or_insert_with(|| Failure::new(quic_error(error), peer_close));
                     }
                     if self.input[lane].is_none() {
                         match value.poll_recv_framed(cx) {
@@ -558,7 +606,12 @@ impl Carrier {
                                 self.input[lane] = Some(received);
                                 progress = true;
                             }
-                            Poll::Ready(Err(error)) => failed = Some(quic_error(error)),
+                            Poll::Ready(Err(error)) => {
+                                let peer_close = value.peer_close_error(&error);
+                                failed.get_or_insert_with(|| {
+                                    Failure::new(quic_error(error), peer_close)
+                                });
+                            }
                             Poll::Pending => {}
                         }
                     }
@@ -569,7 +622,7 @@ impl Carrier {
             self.failed = failed;
         }
         if let Some(error) = &self.failed {
-            return Poll::Ready(Err(copy_error(error)));
+            return Poll::Ready(Err(error.error()));
         }
         if progress || self.receive_ready() {
             Poll::Ready(Ok(()))
@@ -660,12 +713,13 @@ impl Carrier {
         };
         // This is a rejection-only physical-lane filter. The inner Records owner
         // remains the sole authority for authentication, replay and liveness.
-        let wrong_data_lane = received.framing == Framing::Final
-            && output
-                .first()
-                .is_some_and(|byte| (128..=191).contains(byte))
-            && self.proof.requested().duplex == Duplex::Half
-            && received.lane != usize::from(self.proof.info()?.peer_member.is_none());
+        let wrong_data_lane = rejects_data_lane(
+            received.framing,
+            self.proof.requested().duplex,
+            received.lane,
+            self.proof.info()?.peer_member.is_none(),
+            output.first().copied(),
+        );
         if wrong_data_lane
             || (received.framing == Framing::Final && !self.final_records)
             || (received.framing == Framing::Bootstrap && Instant::now() >= self.setup_deadline())
@@ -744,14 +798,31 @@ fn capacity_cap(bytes: usize, maximum: usize) -> io::Result<()> {
         Ok(())
     }
 }
+fn rejects_data_lane(
+    framing: Framing,
+    duplex: Duplex,
+    lane: usize,
+    client: bool,
+    prefix: Option<u8>,
+) -> bool {
+    use l2tunnel::secure_record::compact::{Kind, Layout};
+
+    framing == Framing::Final
+        && duplex == Duplex::Half
+        && prefix.is_some_and(|byte| {
+            matches!(
+                Layout::Carrier.kind(byte),
+                Ok(Kind::Data | Kind::AuthenticatedData)
+            )
+        })
+        && lane != usize::from(client)
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 fn exhausted() -> io::Error {
     io::Error::other("maintained adapter capacity or identity exhausted")
-}
-fn copy_error(error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), error.to_string())
 }
 fn quic_error(error: l2tunnel_quic::Error) -> io::Error {
     match error {
@@ -848,6 +919,58 @@ mod tests {
     use l2tunnel_quic::{self as transport, DatagramFormat, EndpointLimits, Profile};
     use std::time::Duration;
     type Failure = Box<dyn std::error::Error + Send + Sync>;
+
+    #[test]
+    fn half_input_lane_filters_both_data_authorities_without_restricting_control() {
+        // Check the boundaries of both strong-data ranges and the ordinary
+        // data range, using the same parser as the final Records owner.
+        for client in [false, true] {
+            let expected = usize::from(client);
+            for prefix in [2, 23, 80, 121, 128, 191] {
+                assert!(!rejects_data_lane(
+                    Framing::Final,
+                    Duplex::Half,
+                    expected,
+                    client,
+                    Some(prefix),
+                ));
+                assert!(rejects_data_lane(
+                    Framing::Final,
+                    Duplex::Half,
+                    1 - expected,
+                    client,
+                    Some(prefix),
+                ));
+                assert!(!rejects_data_lane(
+                    Framing::Final,
+                    Duplex::Full,
+                    0,
+                    client,
+                    Some(prefix),
+                ));
+                assert!(!rejects_data_lane(
+                    Framing::Bootstrap,
+                    Duplex::Half,
+                    1 - expected,
+                    client,
+                    Some(prefix),
+                ));
+            }
+            // Control and feedback are bidirectional. Unknown routes remain
+            // the sole Records parser's responsibility, not lane authority.
+            for prefix in [None, Some(0), Some(1), Some(192), Some(255), Some(24)] {
+                for lane in [0, 1] {
+                    assert!(!rejects_data_lane(
+                        Framing::Final,
+                        Duplex::Half,
+                        lane,
+                        client,
+                        prefix,
+                    ));
+                }
+            }
+        }
+    }
 
     async fn full() -> Result<(quic::Carrier, quic::Carrier, Request, SessionConfig), Failure> {
         let mut profile = Profile::new(*b"maintained-test1");

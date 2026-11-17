@@ -2,6 +2,15 @@
 use super::super::common_engines::tests as catalog_fixture;
 use super::*;
 use l2tunnel::record_configuration::{Catalog, Configuration as C};
+pub(super) fn default_record_selection() -> record::compact::Selection {
+    record::compact::Selection {
+        protection: security::compact::Protection::ChaCha20Poly1305,
+        limits: security::compact::Selection {
+            max_forward_packets: 8192,
+            max_failed_checks: 64,
+        },
+    }
+}
 fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
     use l2tunnel::record_configuration as c;
     let values = catalog_fixture::values().map_err(|e| io::Error::other(e.to_string()))?;
@@ -107,10 +116,10 @@ fn contracts_with_catalog_and_options(
         streams: [selected; 3],
     });
     let make = |role| -> Result<CommonTransactionContract> {
-        Ok(CommonTransactionContract::new(
+        Ok(CommonTransactionContract::new_compact_wire(
             security::ConfigDigest([3; 32]),
             role,
-            base,
+            [base; 2],
             appearance(kind, role == security::Role::Initiator)?,
             false,
             l2tunnel::record_configuration::EnvelopeDigest::new([0x39; 32]),
@@ -124,6 +133,7 @@ fn contracts_with_catalog_and_options(
                 max_operation_ms: 3000,
                 retained_bytes: 256 << 20,
             },
+            default_record_selection(),
         )?)
     };
     Ok([
@@ -202,11 +212,8 @@ impl Fixture {
         // Authenticate the requested role-local cover from the first actual
         // setup flight; changing copied Parts afterward would not be authority.
         let covers = Some([client.cover(), server.cover()]);
-        let (a, b) = if let Some(configuration) = configuration {
-            parts_pair_with_configuration(kind, covers, configuration).await?
-        } else {
-            parts_pair_with_covers(kind, covers).await?
-        };
+        let configuration = configuration.unwrap_or(client.expected_configuration());
+        let (a, b) = parts_pair_with_configuration(kind, covers, configuration).await?;
         let setup_end = a.deadline.max(b.deadline);
         let origin = Instant::now();
         let make = |parts: member::Parts, contract| -> Result<Endpoint> {
@@ -289,7 +296,7 @@ impl<D: PacketDevice<Error = io::Error> + AsRawFd> Fixture<D> {
                     Ok(())
                 },
             )?;
-            endpoint.driver.service_selected_control(now, None)?;
+            endpoint.driver.service_selected_control(now)?;
             endpoint.driver.submit_control(now)?;
             let before = endpoint.driver.counters.socket_accepted_packets;
             let drops = endpoint.driver.counters.socket_drops;
@@ -313,7 +320,6 @@ impl<D: PacketDevice<Error = io::Error> + AsRawFd> Fixture<D> {
                     &input[..bytes],
                     now,
                     target.driver.origin + duration(now),
-                    None,
                 )?;
             }
         }
@@ -451,9 +457,7 @@ impl<D: PacketDevice<Error = io::Error> + AsRawFd> Fixture<D> {
             }
             if answer.is_some()
                 && self.endpoints.iter().all(|endpoint| {
-                    let owner::DataOwner::Common(state) = &endpoint.driver.owner else {
-                        return false;
-                    };
+                    let owner::DataOwner::Common(state) = &endpoint.driver.owner;
                     state.peer().operation().is_none()
                         && state.can_admit_data()
                         && endpoint.driver.records.additional_data().is_none()
@@ -742,7 +746,6 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                         &input[..length],
                         now,
                         target.driver.origin + duration(now),
-                        None,
                     )?;
                 }
                 let mut actual = None;
@@ -837,7 +840,6 @@ fn aligned_context_progress_revisits_one_channel_after_ingress_stops() -> Result
                             &input[..length],
                             fixture.now,
                             receiver.driver.origin + duration(fixture.now),
-                            None,
                         )?;
                     }
                 }
@@ -1023,3 +1025,6 @@ mod proxy_guards;
 
 #[path = "transport_common_wire_tests.rs"]
 mod compact_wire;
+
+#[path = "transport_common_native_window_tests.rs"]
+mod native_window;

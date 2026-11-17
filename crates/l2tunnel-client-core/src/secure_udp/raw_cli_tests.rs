@@ -2,6 +2,7 @@
 use super::*;
 use l2tunnel::record_configuration as common;
 use l2tunnel_raw_io::handoff::pairing::packet::{PacketPolicy, Protection};
+use l2tunnel_security::Role;
 use serde_json::{Value, json};
 use std::{
     io::Write,
@@ -50,7 +51,7 @@ fn descriptor(duplex: Duplex, rate: u64) -> io::Result<common::Descriptor> {
     .map_err(io::Error::other)
 }
 fn plan(duplex: Duplex) -> io::Result<Value> {
-    let original = transaction_cli::test_plan_value();
+    let original = common_plan_fixture::template();
     let catalog = [
         descriptor(duplex, 1_250_001)?,
         descriptor(duplex, 1_375_007)?,
@@ -187,6 +188,65 @@ fn raw_cli_full_and_half_build_actual_requested_profiles_without_effective_autho
                 .raw_policy()
                 .ok_or_else(|| input("Profile lost raw policy"))?;
             assert_eq!(actual_policy.protection, protection);
+            let bootstrap = actual_policy.record_geometry().map_err(io::Error::other)?;
+            let final_records = actual_policy
+                .final_record_geometry()
+                .map_err(io::Error::other)?;
+            assert_eq!(
+                built.settings().cover.max_packet_bytes,
+                final_records.max_record_bytes
+            );
+            assert!(built.settings().cover.max_protected_bytes < bootstrap.max_record_bytes);
+            assert_eq!(
+                built
+                    .requested_resources(Role::Initiator)
+                    .security
+                    .max_body_bytes
+                    + built.compact_wire().maximum_overhead(),
+                final_records.max_record_bytes
+            );
+            let resources = [
+                built.requested_resources(Role::Initiator),
+                built.requested_resources(Role::Responder),
+            ];
+            let validate = |settings: secure_udp::Settings, resources| {
+                l2tunnel_runtime::secure_udp::transport::CommonTransactionContract::validate_raw_requested_compact(
+                    settings.configuration(built.peers())?,
+                    built.envelope(),
+                    built.catalog(),
+                    resources,
+                    [
+                        settings.runtime(Role::Initiator, built.peers())?.cover,
+                        settings.runtime(Role::Responder, built.peers())?.cover,
+                    ],
+                    built.parameters(),
+                    actual_policy,
+                    built.compact_wire(),
+                )
+            };
+            validate(built.settings(), resources)?;
+            for final_overflow in [false, true] {
+                let mut invalid = built.settings();
+                if final_overflow {
+                    invalid.cover.max_packet_bytes = final_records.max_record_bytes + 1;
+                } else {
+                    invalid.cover.max_protected_bytes = bootstrap.max_record_bytes;
+                }
+                assert!(validate(invalid, resources).is_err());
+                assert!(
+                    establish::raw_carrier::validate_requested(
+                        invalid.runtime(Role::Initiator, built.peers())?,
+                        built.peers(),
+                        actual_policy,
+                    )
+                    .is_err()
+                );
+            }
+            let mut oversized = resources;
+            for resource in &mut oversized {
+                resource.security.max_body_bytes += 1;
+            }
+            assert!(validate(built.settings(), oversized).is_err());
             assert_eq!(built.connection().duplex, duplex);
             assert!(built.raw_binding().is_none() && built.carrier_binding().is_none());
             assert_eq!(
@@ -348,13 +408,17 @@ fn raw_cli_rejects_shape_mark_tuple_and_legacy_policy_before_any_runtime_open() 
 }
 
 #[test]
-fn compact_wire_raw_cli_binds_both_suites_full_half_without_effective_authority() -> io::Result<()>
-{
+fn compact_wire_raw_cli_binds_all_suites_full_half_without_effective_authority() -> io::Result<()> {
     for duplex in [Duplex::Full, Duplex::Half] {
         let base = plan(duplex)?;
         let legacy_file = File::new(&base)?;
         let mut previous_suite = None;
-        for protection in ["aes-ccm-4", "chacha20-crc32c"] {
+        for (protection, data_overhead) in [
+            ("aes-ccm-4", 49),
+            ("chacha20-crc32c", 49),
+            ("chacha20-poly1305", 61),
+            ("hmac-sha256", 77),
+        ] {
             let mut value = base.clone();
             value["compact_wire"] = json!({"version":3,"data_protection":protection,
                 "max_forward_packets":8192,"max_failed_checks":64});
@@ -402,7 +466,10 @@ fn compact_wire_raw_cli_binds_both_suites_full_half_without_effective_authority(
                 assert!(header["effective_final_framing"].is_null());
                 assert_eq!(header["outer_policy_scope"], "bootstrap");
                 assert_eq!(header["outer_policy"]["record_overhead_bytes"], 112);
-                assert_eq!(header["requested_final_framing"]["data_overhead_bytes"], 49);
+                assert_eq!(
+                    header["requested_final_framing"]["data_overhead_bytes"],
+                    data_overhead
+                );
                 assert_eq!(
                     header["requested_final_framing"]["control_feedback_overhead_bytes"],
                     61

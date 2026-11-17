@@ -140,15 +140,10 @@ impl StreamEndpoint {
         role: mg::Role,
         message_limit: usize,
     ) -> Result<Self> {
-        let records = record::Records::new(
+        let records = record::Records::new_compact(
             root,
             security::LaneId(0),
-            security::Limits {
-                max_body_bytes: 1024,
-                packets_per_key: 8,
-                max_body_bytes_per_key: 1 << 20,
-            },
-            security::Protection::ChaCha20Poly1305,
+            record_limits(),
             cover,
             record::Scope {
                 epoch: security::Epoch(1),
@@ -158,9 +153,13 @@ impl StreamEndpoint {
                 epoch: security::Epoch(10),
                 configuration: security::ConfigDigest(scope()?.digest.0),
             },
+            record_selection(),
         )?;
         let wire_overhead = records
-            .capacity(FRAME_LIMITS.max_packet_bytes + streams::HEADER_BYTES)?
+            .capacity_for(
+                record::compact::Kind::Control,
+                FRAME_LIMITS.max_packet_bytes + streams::HEADER_BYTES,
+            )?
             .packet_bytes
             - FRAME_LIMITS.max_packet_bytes
             + 28;
@@ -254,6 +253,10 @@ fn transfer_stream(
         &mut workspace,
         &mut wire,
     )?;
+    assert_eq!(
+        sealed.bytes,
+        bytes + record::compact::AUTHENTICATED_OVERHEAD
+    );
     source.outer += 1;
     if drop_transaction && stream == Stream::Transaction {
         return Ok(sealed.bytes + 28);

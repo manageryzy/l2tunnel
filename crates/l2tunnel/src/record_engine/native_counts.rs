@@ -117,11 +117,17 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
 pub(super) fn offer(
     owner: &mut Owner,
     counts: &mut Counts,
+    mut window: Option<&mut native_window::State>,
     now: Tick,
     metadata: pipeline::PacketMetadata,
     width: u16,
     bytes: &[u8],
 ) -> Result<Option<ProfileIdentity>, Error> {
+    if let Some(window) = window.as_mut()
+        && !window.preview(now, bytes.len())?
+    {
+        return Ok(None);
+    }
     let channel = metadata.binding.channel;
     let raw = matches!(&*owner, Owner::Connections(owner) if owner.collection.unreliable_eligible(metadata.classification, bytes));
     let next = if raw {
@@ -130,6 +136,11 @@ pub(super) fn offer(
         Some(counts.next_admission(channel, width)?)
     };
     let admitted = owner.offer_queued(now, metadata, bytes)?;
+    if let Some(id) = admitted
+        && let Some(window) = window.as_mut()
+    {
+        window.admitted(now, id, bytes.len())?;
+    }
     if admitted.is_some()
         && let Some(next) = next
     {

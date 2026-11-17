@@ -150,11 +150,16 @@ fn legacy_actual_python_payload_vectors_recover_missing_original_without_sender(
             ..config()
         };
         let packet = repair_wire(c, &terms, fields[4] == "1")?;
-        assert_eq!(
-            &packet[wire::HEADER_BYTES + 5 * terms.len()..],
-            hex(fields[7])?,
-            "{line}"
-        );
+        let actual = &packet[wire::HEADER_BYTES + 5 * terms.len()..];
+        let extent = 2 + ids
+            .iter()
+            .map(|id| payload(*id).len())
+            .max()
+            .ok_or(Error::Identity)?;
+        assert_eq!(actual.len(), extent);
+        let mut expanded = actual.to_vec();
+        expanded.resize(c.recovery.width()?, 0);
+        assert_eq!(expanded, hex(fields[7])?, "{line}");
         // The encoder is already dropped; the receiver gets only actual records.
         let plan = storage::Plan::for_receiver(c)?;
         let mut receiver = Receiver::new_reserved(
@@ -352,7 +357,7 @@ fn legacy_wire_failures_scope_and_original_expiry_preserve_committed_state() -> 
     let packet = repair_wire(c, &terms, false)?;
     let mut terms_scratch = [terms[0]; 255];
     let mut ids = [SourceId(0); 255];
-    for length in 0..packet.len() {
+    for length in 0..wire::HEADER_BYTES + 5 * terms.len() + 3 {
         assert!(wire::inspect(c, &packet[..length], &mut terms_scratch, &mut ids).is_err());
     }
     for offset in [4, 67, wire::HEADER_BYTES + 4] {
@@ -517,11 +522,15 @@ fn legacy_actual_python_periodic_schedule_and_acknowledged_history() -> TestResu
                     assert_eq!(repair.equation.id, RepairId(serial), "{case} at {}", now.0);
                     assert!(!repair.feedback_triggered);
                     assert_eq!(repair.terms, terms, "{case} repair {serial}");
-                    assert_eq!(
-                        repair.equation.bytes,
-                        hex(row[7])?,
-                        "{case} repair {serial}"
-                    );
+                    let extent = 2 + ids
+                        .iter()
+                        .map(|id| payload(*id).len())
+                        .max()
+                        .ok_or(Error::Identity)?;
+                    assert_eq!(repair.equation.bytes.len(), extent);
+                    let mut expanded = repair.equation.bytes.to_vec();
+                    expanded.resize(c.recovery.width()?, 0);
+                    assert_eq!(expanded, hex(row[7])?, "{case} repair {serial}");
                     let generated = records
                         .iter()
                         .filter(|other| {
@@ -566,5 +575,22 @@ fn legacy_actual_python_periodic_schedule_and_acknowledged_history() -> TestResu
         assert_eq!(sender.storage_usage()?, storage);
     }
     assert_eq!(checked, 13);
+    Ok(())
+}
+
+#[test]
+fn previous_full_width_legacy_wire_version_is_refused() -> TestResult {
+    let c = config();
+    let mut bytes = source_wire(c, 0);
+    bytes[4] = 1;
+    let mut terms = [Term {
+        source: SourceId(0),
+        coefficient: 1,
+    }; 255];
+    let mut ids = [SourceId(0); 255];
+    assert!(matches!(
+        wire::inspect(c, &bytes, &mut terms, &mut ids),
+        Err(Error::Format)
+    ));
     Ok(())
 }

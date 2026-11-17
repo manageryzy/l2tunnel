@@ -2,7 +2,7 @@
 use super::*;
 
 #[test]
-fn compact_plan_is_strict_optional_and_legacy_inspection_stays_absent() -> io::Result<()> {
+fn compact_plan_is_mandatory_with_strict_optional_protection_selection() -> io::Result<()> {
     let base = document(2)?;
     assert!(decode(&base)?.compact_wire.is_none());
     let selected = json!({"version":3,"data_protection":"aes-ccm-4",
@@ -10,12 +10,18 @@ fn compact_plan_is_strict_optional_and_legacy_inspection_stays_absent() -> io::R
     for wrong in [
         Value::Null,
         json!({}),
-        json!({"version":3,"data_protection":"chacha20-poly1305",
+        json!({"version":3,"data_protection":"unknown-protection",
         "max_forward_packets":8192,"max_failed_checks":64}),
     ] {
         let mut value = base.clone();
         value["compact_wire"] = wrong;
         assert!(decode(&value).is_err());
+    }
+    for protection in ["chacha20-poly1305", "hmac-sha256"] {
+        let mut value = base.clone();
+        value["compact_wire"] = selected.clone();
+        value["compact_wire"]["data_protection"] = json!(protection);
+        assert!(decode(&value)?.compact_wire.is_some());
     }
     for field in [
         "version",
@@ -72,14 +78,21 @@ fn compact_plan_is_strict_optional_and_legacy_inspection_stays_absent() -> io::R
             peers,
             l2tunnel_identity::MemberPublicKey([7; 32]),
         )?;
-        let (overhead, body) = common.geometry()?;
+        let (overhead, body) = common.final_geometry()?;
         let legacy = decode(&base)?.build(connection, settings, peers, body, overhead)?;
         let lines = crate::cli::secure_udp_frontend::common_cli_output::inspection(
             &legacy,
             Role::Initiator,
         )?;
-        assert!(legacy.compact_wire().is_none());
-        assert!(lines[0].get("compact_wire").is_none());
+        assert_eq!(
+            legacy.compact_wire().protection,
+            l2tunnel_security::compact::Protection::ChaCha20Poly1305
+        );
+        assert_eq!(
+            lines[0]["compact_wire"]["requested"]["data_protection"],
+            "chacha20-poly1305"
+        );
+        assert_eq!(legacy.compact_wire().limits.max_failed_checks, u32::MAX);
         let mut h0 = Vec::new();
         for protection in ["aes-ccm-4", "chacha20-crc32c"] {
             let mut value = base.clone();
@@ -227,12 +240,26 @@ fn compact_wire_proxy_cli_binds_complete_policy_and_retirement_before_authentica
         peers,
         l2tunnel_identity::MemberPublicKey([7; 32]),
     )?;
-    let (overhead, maximum) = frontend.geometry()?;
+    let (overhead, maximum) = frontend.final_geometry()?;
     let mut proxy_settings =
         crate::proxy::Settings::new(crate::proxy::RoutePolicy::new(Vec::new())?);
     proxy_settings.channels = 1;
     let mut proxy = crate::proxy::runtime_config(connection, &proxy_settings)?;
     proxy.relay.max_record_bytes = 512;
+    let packet = l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy::new(1500);
+    let raw_selection = crate::raw_packet::common::Settings::from_json(
+        &serde_json::to_vec(&json!({
+            "version":1,"profile":"raw-common-carrier-v1",
+            "forward":{"local":frontend.local,"peer":frontend.peer},"reverse":null,
+            "packet":{"mtu":packet.mtu,"protection":"aead",
+                "queue_packets":packet.queue_packets,"horizon_bytes":packet.horizon_bytes,
+                "minimum_transfer_bytes":packet.minimum_transfer_bytes,
+                "bytes_per_second":packet.bytes_per_second,"packets_per_second":packet.packets_per_second,
+                "burst_bytes":packet.burst_bytes,"burst_packets":packet.burst_packets,
+                "max_key_packets":packet.max_key_packets,"max_key_bytes":packet.max_key_bytes}
+        }))
+        .map_err(io::Error::other)?,
+    )?;
     let mut digests = Vec::new();
     for protection in ["aes-ccm-4", "chacha20-crc32c"] {
         document["compact_wire"] = json!({"version":3,"data_protection":protection,
@@ -254,7 +281,14 @@ fn compact_wire_proxy_cli_binds_complete_policy_and_retirement_before_authentica
                 retained,
             )?;
             assert_eq!(profile.proxy_retirement(), retained);
-            assert!(profile.compact_wire().is_some());
+            assert_eq!(
+                profile.compact_wire().protection,
+                if protection == "aes-ccm-4" {
+                    l2tunnel_security::compact::Protection::Aes128Ccm4
+                } else {
+                    l2tunnel_security::compact::Protection::ChaCha20Crc32c
+                }
+            );
             let binding = l2tunnel_runtime::proxy::session_config(&proxy)?.digest;
             for role in [Role::Initiator, Role::Responder] {
                 let contract = profile.runtime_contract(role)?;
@@ -264,6 +298,48 @@ fn compact_wire_proxy_cli_binds_complete_policy_and_retirement_before_authentica
             }
             digests.push(profile.configuration()?);
         }
+        // The raw bootstrap uses the catalog's carrier MTU, independently of
+        // the smaller native TCP MTU used by the proxy attachment.
+        let mut raw_settings = frontend.raw(
+            plan.initial().path_mtu(),
+            connection.handshake_timeout,
+            peers,
+            l2tunnel_identity::MemberPublicKey([7; 32]),
+        )?;
+        let final_geometry = packet.final_record_geometry().map_err(io::Error::other)?;
+        let (raw_overhead, _) = frontend.raw_geometry(
+            &mut raw_settings,
+            packet.record_geometry().map_err(io::Error::other)?,
+            final_geometry,
+        )?;
+        let raw_profile = plan.build_selected_on(
+            connection,
+            raw_settings,
+            peers,
+            plan.protected_body_capacity(final_geometry.max_record_bytes)?,
+            raw_overhead,
+            Some(packet),
+            Some((proxy.clone(), true)),
+            None,
+            None,
+        )?;
+        let lines = crate::cli::secure_udp_frontend::common_cli_output::raw_inspection(
+            &raw_profile,
+            Role::Initiator,
+            &raw_selection,
+        )?;
+        assert!(raw_profile.raw_binding().is_none());
+        assert_eq!(
+            lines[0]["requested_final_framing"]["data_overhead_bytes"],
+            61
+        );
+        assert_eq!(
+            lines[0]["requested_final_framing"]["control_feedback_overhead_bytes"],
+            61
+        );
+        assert!(lines[0]["effective_final_framing"].is_null());
+        assert!(lines[0]["compact_wire"]["effective"].is_null());
+        assert_eq!(lines[0]["authenticated"], false);
     }
     for (i, digest) in digests.iter().enumerate() {
         assert!(!digests[..i].contains(digest));

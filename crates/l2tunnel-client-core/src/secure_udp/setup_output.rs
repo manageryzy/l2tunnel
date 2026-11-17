@@ -173,48 +173,20 @@ fn kind(kind: io::ErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use l2tunnel_device::PacketLayer;
     use std::{
         fs::{File, OpenOptions},
         io::{Read, Seek, Write},
         os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     fn observation() -> Result<service::SetupObservation> {
         // Only acceptance is exercised: the owner is never polled, so this
-        // fixture opens no socket, attachment or authentication exchange.
-        let certificate = rcgen::generate_simple_self_signed(vec!["setup-output.test".into()])?;
-        let tls = l2tunnel_auth::ClientTls::from_der_roots(&[certificate.cert.der().to_vec()])?;
-        let member = Arc::new(l2tunnel_auth::MemberKey::from_pkcs8(
-            &l2tunnel_auth::MemberKey::generate_pkcs8()?,
-        )?);
-        let plan = service::Prepared::client(
-            crate::ConnectionConfig {
-                layer: PacketLayer::Ip,
-                duplex: l2tunnel_core::Duplex::Full,
-                max_packet: 1600,
-                compression: crate::Compression::None,
-                handshake_timeout: Duration::from_secs(3),
-            },
-            service::Client {
-                remote: "127.0.0.1:43210".parse()?,
-                tls,
-                server_name: "setup-output.test".into(),
-                member,
-            },
-            service::Attachment::new(PacketLayer::Ip, || {
-                Err(io::Error::other("unpolled fixture"))
-            }),
-            service::Options::default(),
-        )?;
+        // service opens no transport, attachment or authentication exchange.
+        let plan = service::Prepared::unpolled_common_fixture()?;
         let (handle, _run) = service::channel();
         let key = handle
             .next_key()

@@ -44,11 +44,22 @@ impl Settings {
                     "maintained IPv6 scope and flow identifiers are not yet supported",
                 ));
             }
-            crate::udp::Endpoints {
-                local: path.client,
-                peer: path.server,
+            for address in [path.client, path.server] {
+                if address.port() == 0
+                    || address.ip().is_unspecified()
+                    || address.ip().is_multicast()
+                    || matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast())
+                {
+                    return Err(invalid(
+                        "maintained endpoints require explicit nonzero unicast addresses",
+                    ));
+                }
             }
-            .validate()?;
+            if path.client.is_ipv4() != path.server.is_ipv4() || path.client == path.server {
+                return Err(invalid(
+                    "maintained lane endpoints require one family and distinct sockets",
+                ));
+            }
             if path.client.is_ipv4() != self.first.client.is_ipv4() {
                 return Err(invalid("maintained lanes must share an address family"));
             }

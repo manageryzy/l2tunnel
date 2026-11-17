@@ -1,8 +1,13 @@
 # Windows foreground Wintun boundary
 
-This is a source implementation of the first foreground Windows L3 device
-slice. The external portable and GNU cross-build receipts below remain
-source-bound historical evidence. The integrated root portable cases and affected
+Current status: the obsolete foreground service and staging chain have been
+removed. The owner approved deleting the old entry before the Common Windows
+service migration is complete; that migration remains pending. Portable device,
+input, setup and diagnostic helpers are not an implemented tunnel service.
+
+The descriptions and receipts below document the retired foreground slice;
+they do not qualify the current application. Its prior portable and GNU checks
+are source-bound historical evidence. The earlier root portable cases and affected
 Windows GNU lint/link checks pass in the separate [Batch13 receipt](../../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
 This receipt preserves the first full-check failures and scoped continuations. Native Windows operation remains unqualified until a Windows receipt
 records actual device traffic, cancellation and resource cleanup. Compilation,

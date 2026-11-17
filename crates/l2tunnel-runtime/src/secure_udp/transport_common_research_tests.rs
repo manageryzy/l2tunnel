@@ -103,7 +103,7 @@ fn receive_wire(target: &mut Endpoint, now: u64, wire: &[u8]) -> Result {
     let before = target.driver.counters;
     target
         .driver
-        .receive_selected(wire, now, target.driver.origin + duration(now), None)?;
+        .receive_selected(wire, now, target.driver.origin + duration(now))?;
     assert_eq!(
         target.driver.counters.received_packets,
         before.received_packets + 1
@@ -135,7 +135,7 @@ async fn impaired_turn(
             endpoint.driver.collect_native(now)?;
             endpoint.driver.progress_common(now)?;
             endpoint.driver.service_common_rolling(now)?;
-            endpoint.driver.service_selected_control(now, None)?;
+            endpoint.driver.service_selected_control(now)?;
             endpoint.driver.submit_control(now)?;
             for _ in 0..endpoint.driver.config.work.send_batch {
                 let Some(bytes) = endpoint.driver.prepare_control(now)? else {
@@ -157,15 +157,12 @@ async fn impaired_turn(
                 .as_ref()
                 .and_then(|v| v.sealed.as_ref())
             {
-                let emission = pending
-                    .carrier
-                    .as_ref()
-                    .ok_or("actual Research output")?
-                    .emission();
+                let token = pending.carrier.as_ref().ok_or("actual Research output")?;
+                let emission = token.emission();
                 user = Some(emission.kind);
                 if emission.kind == engine::EmissionKind::Repair {
                     let configuration = endpoint.driver.common_state()?.current();
-                    let c::DirectionProfile::Research { config, .. } = configuration
+                    let c::DirectionProfile::Research { config, stream, .. } = configuration
                         .descriptor()
                         .local(common_contract::mg_role(endpoint.driver.info.role))
                         .send()
@@ -173,8 +170,19 @@ async fn impaired_turn(
                     else {
                         return Err("actual Research send policy".into());
                     };
-                    let research::wire::View::Repair(repair) = research::wire::inspect(
+                    let context = token.context();
+                    let scope = research::Scope {
+                        session: context.session.to_be_bytes(),
+                        epoch: context.epoch,
+                        stream,
+                        direction: match context.role {
+                            mg::Role::Client => 0,
+                            mg::Role::Server => 1,
+                        },
+                    };
+                    let research::wire::View::Repair(repair) = research::wire::compact::inspect(
                         config.scheduler,
+                        scope,
                         &endpoint.driver.buffers.frame[..emission.bytes],
                     )?
                     else {

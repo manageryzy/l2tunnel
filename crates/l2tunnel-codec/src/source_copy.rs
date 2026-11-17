@@ -61,6 +61,9 @@ impl Policy {
             return Ok(1);
         }
         let kind = unit[3];
+        if kind == crate::aligned_body::LZ4_TAG {
+            return Ok(self.copies);
+        }
         let length = usize::from(u16::from_be_bytes([unit[4], unit[5]]));
         Ok(
             if unit.len() == 6 + length

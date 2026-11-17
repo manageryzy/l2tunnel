@@ -53,7 +53,7 @@ fn reuse_flow_keys_and_action_are_strict_bounded_and_explicit_v4() -> io::Result
             .action,
         action
     );
-    for version in [VERSION, SECURE_UDP_VERSION, TRANSACTION_VERSION] {
+    for version in [VERSION, 2, 3] {
         let old = serde_json::to_string(&Request {
             version,
             action: action.clone(),

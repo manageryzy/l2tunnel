@@ -224,6 +224,7 @@ impl Plan {
 }
 
 pub(super) enum StreamedStorage {
+    #[cfg(test)]
     Legacy(Box<Streamed>),
     Reserved(Reserved),
 }
@@ -262,6 +263,7 @@ impl Reserved {
     }
 }
 impl StreamedStorage {
+    #[cfg(test)]
     pub(super) fn usage(&self) -> io::Result<Option<Usage>> {
         match self {
             Self::Legacy(_) => Ok(None),
@@ -273,6 +275,7 @@ impl Deref for StreamedStorage {
     type Target = Streamed;
     fn deref(&self) -> &Self::Target {
         match self {
+            #[cfg(test)]
             Self::Legacy(value) => value,
             // The private reserved constructor publishes exactly one immutable cell.
             Self::Reserved(reserved) => &reserved.values[0],
@@ -282,6 +285,7 @@ impl Deref for StreamedStorage {
 impl DerefMut for StreamedStorage {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
+            #[cfg(test)]
             Self::Legacy(value) => value,
             Self::Reserved(reserved) => &mut reserved.values[0],
         }

@@ -1,7 +1,17 @@
 //! Final Records metadata and control grammar, without another data protector.
 use super::{Error, PacketPolicy, RecordGeometry};
 
-pub(super) type BootstrapFilter = std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+/// Direction of a retained setup tail relative to the original local owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapDirection {
+    /// A peer packet checked before receive credit or replay state changes.
+    Incoming,
+    /// A local retry checked before original exporter staging.
+    Outgoing,
+}
+
+pub(super) type BootstrapFilter =
+    std::sync::Arc<dyn Fn(BootstrapDirection, &[u8]) -> bool + Send + Sync>;
 
 /// Fixed canonical external AAD. IP addresses, ports and checksums are excluded.
 pub const AAD_BYTES: usize = 49;
@@ -9,7 +19,7 @@ pub const AAD_BYTES: usize = 49;
 /// Exact registered Records purpose in the explicitly selected carrier namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinalKind {
-    /// Short-check user data; it grants no peer-retirement or liveness authority.
+    /// User data, including a strong retiring source arm; raw credit remains independent.
     Data,
     /// Independently strongly authenticated recovery feedback.
     Feedback,
@@ -24,7 +34,7 @@ impl FinalKind {
         match *bytes.first()? {
             0 => Some(Self::Control),
             1 => Some(Self::CarrierControl),
-            0x80..=0xbf => Some(Self::Data),
+            2..=23 | 80..=121 | 0x80..=0xbf => Some(Self::Data),
             0xc0..=0xff => Some(Self::Feedback),
             _ => None,
         }

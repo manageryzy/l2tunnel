@@ -137,7 +137,9 @@ impl<'de> Deserialize<'de> for CanonicalConfiguration {
 }
 
 // These portable accounting types retain the established schema semantics.
-pub use super::transaction_status::{
+#[path = "common_observations.rs"]
+mod observations;
+pub use observations::{
     Control, Liveness, Native, Operation, Phase, Scope, Security, Storage, Wire,
 };
 /// Maximum full configurations returned by one generation-bound catalog request.
@@ -220,6 +222,29 @@ pub struct PathRecovery {
     pub last_error: Option<String>,
     /// Original Driver clock time for the next retained User attempt.
     pub retry_at_micros: Option<u64>,
+}
+/// Actual native-delivery credit for one current or draining Common epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDelivery {
+    /// Exact negotiated epoch owning these counters.
+    pub epoch: u64,
+    /// Exact complete configuration digest for this owner.
+    pub configuration: [u8; 32],
+    /// Actual original-native admission, carrier acceptance and peer-device delivery.
+    pub send: Option<crate::raw_packet::NativeFlight>,
+    /// A real local native write awaits reliable control admission.
+    pub pending_receipt: bool,
+}
+impl From<l2tunnel_runtime::secure_udp::transport::NativeDeliverySnapshot> for NativeDelivery {
+    fn from(value: l2tunnel_runtime::secure_udp::transport::NativeDeliverySnapshot) -> Self {
+        Self {
+            epoch: value.epoch,
+            configuration: value.configuration.0,
+            send: value.send.map(Into::into),
+            pending_receipt: value.pending_receipt,
+        }
+    }
 }
 /// Separate truthful portable status for explicit finite-catalog generic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -316,6 +341,9 @@ pub struct Status {
     pub wire: Option<Wire>,
     /// Actual native physical and queue summary.
     pub native: Option<Native>,
+    /// Actual current/draining NativeWindow owners; absent before runtime observation.
+    #[serde(default)]
+    pub native_delivery: [Option<NativeDelivery>; 2],
     /// Actual fixed control retained custody.
     pub control: Option<Control>,
     /// Actual nonsecret outgoing security identifiers.
@@ -377,7 +405,6 @@ fn invalid(message: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
 
-#[cfg(unix)]
 mod observe {
     use super::*;
     use crate::secure_udp::{common_transaction_profile::Profile, member};
@@ -433,7 +460,7 @@ mod observe {
                 || snapshot.is_some_and(|value| {
                     value.info != info
                         || value.configuration != configuration
-                        || value.compact_wire != profile.compact_wire()
+                        || value.compact_wire != Some(profile.compact_wire())
                 })
             {
                 return Err(invalid(
@@ -574,17 +601,14 @@ mod observe {
                 raw_carrier,
                 maintained_carrier,
                 algorithm: "common-records".into(),
-                protection: profile
-                    .compact_wire()
-                    .map(CompactWireSelection::from_selection)
-                    .transpose()?
-                    .map_or("chacha20-poly1305", |value| value.data_protection.name())
+                protection: CompactWireSelection::from_selection(profile.compact_wire())?
+                    .data_protection
+                    .name()
                     .into(),
-                compact_wire: profile
-                    .compact_wire()
-                    .map(|requested| CompactWireStatus::observe(requested, snapshot))
-                    .transpose()?
-                    .map(Box::new),
+                compact_wire: Some(Box::new(CompactWireStatus::observe(
+                    profile.compact_wire(),
+                    snapshot,
+                )?)),
                 backend: "common_records_v2".into(),
                 running: snapshot.is_some_and(|value| value.running),
                 elapsed_micros: snapshot.map(|value| value.elapsed_micros),
@@ -652,6 +676,9 @@ mod observe {
                     received_packets: value.received_packets,
                     rejected_packets: value.rejected_packets,
                     replay_rejections: value.replay_rejections,
+                }),
+                native_delivery: snapshot.map_or([None, None], |value| {
+                    value.native_delivery.map(|owner| owner.map(Into::into))
                 }),
                 native: counters
                     .map(|value| {

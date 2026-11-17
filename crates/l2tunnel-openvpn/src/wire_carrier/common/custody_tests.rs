@@ -251,6 +251,14 @@ async fn selected_compact_openvpn_actor_preserves_final_bytes_custody_and_bounde
     for prefix in [0u8, 1, 128, 191, 192, 255] {
         assert!(actor::final_prefix(&[prefix]));
     }
+    for slot in 0..64u8 {
+        let route = if slot < 22 { slot + 2 } else { slot + 58 };
+        assert!(actor::final_prefix(&[route]));
+    }
+    for reserved in 122..128u8 {
+        assert!(!actor::final_prefix(&[reserved]));
+    }
+    assert!(!actor::final_prefix(b"L2QD"));
     let collision = b"\x80identical-inner-prefix-for-both-paths";
     let tail = a.try_send_bootstrap_until(Class::Control, collision, setup_cap)?;
     let receipt = tail.await?;
@@ -298,6 +306,18 @@ async fn selected_compact_openvpn_actor_preserves_final_bytes_custody_and_bounde
     let receipt = a.try_send_until(Class::Control, bytes, final_cap)?.await?;
     assert_eq!(receipt.ip_bytes, bytes.len() + 28);
     assert_eq!(timeout(Duration::from_secs(1), b.recv()).await??, bytes);
+    // Exercise both disjoint strong-data ranges on the original actual UDP
+    // owner. These are routing/custody bytes; Common authenticates their body.
+    for route in [2, 23, 80, 121] {
+        let mut record = [0; 21];
+        record[0] = route;
+        let receipt = a.try_send_until(Class::User, &record, final_cap)?.await?;
+        assert_eq!(receipt.udp_bytes, record.len());
+        assert_eq!(receipt.ip_bytes, record.len() + 28);
+        let received = timeout(Duration::from_secs(1), b.recv_framed()).await??;
+        assert_eq!(received.framing, ReceiveFraming::Final);
+        assert_eq!(received.bytes, record);
+    }
     assert_eq!(a.physical_status()?.tls_control_datagrams, before);
     assert_eq!(a.addresses(), addresses);
     assert_eq!(b.addresses(), (addresses.1, addresses.0));

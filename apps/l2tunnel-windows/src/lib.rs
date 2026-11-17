@@ -1,21 +1,15 @@
-//! Windows foreground presentation over the same portable client/service owner.
-/// Strict, side-effect-free command parsing and bounded credential input.
+//! Windows configuration and reusable frontend components.
+//!
+//! The application has no current Common service binding. Parsing and these
+//! independently tested helpers do not establish a native Windows tunnel.
+/// Strict, side-effect-free requested configuration parsing and capability checks.
 pub mod cli;
-/// Foreground cancellation and observation through the existing shared service.
-#[cfg(any(windows, test))]
-pub(crate) mod foreground;
-/// Actual Windows device ownership and console cancellation.
+/// Bounded text-only output, independent of tunnel ownership.
+pub mod diagnostics;
+/// Bounded local command parsing, without an installed service executor.
+pub mod input;
+/// Actual Windows execution capability reporting.
 #[cfg(windows)]
 pub mod native;
-
-#[cfg(any(windows, test))]
-mod setup;
-
-#[cfg(any(windows, test))]
-mod diagnostics;
-
-#[cfg(any(windows, test))]
-mod staging;
-
-#[cfg(any(windows, test))]
-mod input;
+/// Joined blocking setup ownership, independent of a tunnel implementation.
+pub mod setup;

@@ -1,9 +1,14 @@
 //! Explicit same-socket carrier presentation through the shared lifecycle service.
 use super::*;
-use crate::secure_udp::{self, credentials, profile::Profile};
+#[cfg(test)]
+use crate::secure_udp::common_fixture::Resources;
+use crate::secure_udp::{self, credentials};
 use l2tunnel_handshake as hs;
-use l2tunnel_runtime::secure_udp::{establish, transport};
+use l2tunnel_runtime::secure_udp::establish;
+#[cfg(test)]
+use l2tunnel_runtime::secure_udp::transport;
 use l2tunnel_security as security;
+#[cfg(test)]
 use l2tunnel_swift::{policy, records};
 use l2tunnel_udp_control as gate;
 #[path = "common_cli.rs"]
@@ -23,12 +28,13 @@ pub(crate) fn proxy_inspection_for_test(
 ) -> io::Result<Vec<serde_json::Value>> {
     common_proxy_cli::inspection(profile, role)
 }
+#[cfg(test)]
+#[path = "common_plan_fixture.rs"]
+mod common_plan_fixture;
+#[path = "common_runtime_cli.rs"]
+mod common_runtime_cli;
 #[path = "setup_output.rs"]
 mod setup_output;
-#[path = "transaction_cli.rs"]
-mod transaction_cli;
-#[path = "transaction_cli_output.rs"]
-mod transaction_cli_output;
 
 pub(super) const OPTIONS: &[&str] = &[
     "--noise-profile",
@@ -43,8 +49,9 @@ pub(super) const OPTIONS: &[&str] = &[
     "--proxy-close",
     "--maintained-policy",
 ];
-pub(super) const HELP: &str = "Common secure UDP (implementation draft): explicitly select --carrier quic-like|media-like --record-profile swift --duplex full, --udp-bind IP:PORT --udp-peer IP:PORT, --noise-profile ik|ikpsk2, --noise-private-key-file RAW32 --noise-peer-key-file RAW32 --session-admission-key-file RAW32; ikpsk2 additionally requires --noise-psk-file RAW32. Connect retains --identity PKCS8; serve requires --allow-key Ed25519_RAW32 and --session-cookie-key-file RAW32. Private files must be owned/private regular files. No TCP/TLS side connection or automatic credential generation. Without --swift-transaction-plan PATH, legacy Swift forward/reverse rates are mandatory; current --path-mtu defaults to 1500, --max-path-mtu capacity defaults to 9000 (576..9000). Cover IDs derive from ordered public Noise pins, without identification guarantees. Optional --control-socket exposes explicit local API version 2; external status/disconnect/reconnect/set-swift require --api-version 2. Fresh reconnect does not preserve old-session delivery state. Explicit --swift-transaction-plan PATH instead supplies a strict complete catalog/runtime plan, exposes API version 3 and excludes legacy mutable/report flags. switch-swift-configuration --control-socket PATH --api-version 3 --configuration EXACT608_LOWERCASE_HEX sends one complete change. inspect-swift-transaction-plan --role connect|serve with the same plan/carrier/native/public-trust inputs reads existing Noise/member credentials but requires no device, control socket, admission or cookie; it validates without authentication or runtime effects. Full recovery, cross-profile switching, other carrier/platform qualification remain open. Explicit --record-profile common --common-transaction-plan PATH selects the full Common catalog/backend and local API4. inspect-common-transaction-plan validates that full plan without startup; switch-common-configuration requires --api-version4 --request-key N and exact2608 lowercase hex; common-catalog pages the exact generation/catalog set with limit1..4. Common plans require explicit rolling_work:null or positive field/copies/metadata limits; the actual runtime contract decides support. Native production CLI qualification remains separate. Explicit --carrier openvpn-like --record-profile common --common-transaction-plan PATH additionally requires --udp-cover quic-like|media-like and a complete outer_carrier version1/openvpn_wire_common object in the plan. Connect uses the existing --ca DER --server-name DNS trust inputs; serve uses --cert DER --key PKCS8, with the same member identity/pin as the inner session. The actual raw TLS/member carrier has no standalone RAW64 gate: --admission-key-file/--cookie-key-file and standalone protection/drain/stats flags are refused; inner --session-admission-key-file and server-only --session-cookie-key-file remain required. Offline inspection reports requested E0 and binding required; only actual outer authentication supplies effective E1/H0/catalog. No default or fallback changes. Explicit --carrier raw-packet --record-profile common additionally requires --raw-policy strict raw-common-carrier-v1 JSON, --raw-mark NONZERO_U32, --udp-cover, --duplex half|full and first-tuple --remote/--listen. Tuples come from the raw policy; --udp-bind/--udp-peer are refused. It reuses API4 and actual original TLS/Noise/member owners. Offline inspection excludes the privileged mark. Kernel/firewall/native qualification remains separate. Explicit --traffic proxy --proxy-policy JSON_FILE with the Common plan selects the fixed full/TUN/one-channel/one-descriptor Aligned direct-ARQ proxy over quic-like|media-like. Its actual Proxy backend uses local API1 status/drain-proxy/disconnect/fresh-reconnect, not native-Common API4 controls. inspect-common-transaction-plan reports requested-only proxy policy and bounded route pages. Explicit --traffic proxy-measured additionally requires --proxy-close retained and the complete strict measured policy; it uses the same actual measured Common backend/API1, without native TCP RTT/cwnd/rwnd claims. Raw/OpenVPN, Half, multi-channel, live catalog switches and native qualification remain unsupported. Omitting --proxy-close preserves fixed v1 graceful_close=false. Explicit --proxy-close retained selects authenticated retained EOF/ARQ retirement using the original drain cap; both peers must select it. Explicit --carrier tcp|quic --record-profile common additionally requires --maintained-policy strict version1 JSON, an explicit compact_wire Common plan and --udp-cover for the initial inner bootstrap only. Full/Half tuples and conservative geometry come from that policy; --udp-bind/--udp-peer are refused. Data, feedback and management then use retained original TLS/QUIC owners. Mandatory outer AEAD remains additional to inner Records. TLS --sni may differ from the authenticated --server-name; genuine QUIC independent SNI is unavailable. Maintained proxy/measured selection is unsupported and fails before startup.";
+pub(super) const HELP: &str = "Common tunnel: --record-profile common --common-transaction-plan PATH selects the complete authenticated catalog and local API4. Select --carrier quic-like|media-like for one UDP socket, openvpn-like for the actual original UDP handshake, raw-packet for original raw TCP, or tcp|quic for retained TLS/QUIC. Carrier-specific plans, pinned own server trust, member credentials and Noise credentials remain explicit. Swift is a catalog algorithm and has no standalone connection mode. Appearance is limited to bootstrap; all data, recovery feedback and management use final compact Records. Omitting compact_wire selects full-tag ChaCha20-Poly1305; explicit aes-ccm-4 or chacha20-crc32c retain their documented data guarantees. inspect-common-transaction-plan validates the entire requested plan without starting a device. common-catalog and switch-common-configuration use API4 and exact complete configurations. Explicit fixed/measured proxy uses the shared proxy service and API1; unsupported carrier/duplex/channel combinations are refused before startup. Native and platform qualification remain separate from plan inspection.";
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
     pub(crate) appearance: l2tunnel_cover::Appearance,
@@ -65,6 +72,7 @@ struct Common {
     maximum_mtu: usize,
     profile: hs::Profile,
 }
+#[cfg(test)]
 impl From<Selection> for Common {
     fn from(value: Selection) -> Self {
         Self {
@@ -91,8 +99,6 @@ struct RawSelected {
 }
 pub(super) struct Selected(Choice, Carrier, Option<Box<RawSelected>>);
 enum Choice {
-    Legacy(Selection),
-    Transaction(Common, Box<transaction_cli::Plan>),
     Records(Common, Box<common_cli::Plan>),
     Proxy(
         Common,
@@ -102,27 +108,21 @@ enum Choice {
     ),
 }
 enum Built {
-    Legacy(Box<Profile>),
-    Transaction(Box<secure_udp::transaction_profile::Profile>),
     Records(Box<secure_udp::common_transaction_profile::Profile>),
     Proxy(Box<secure_udp::common_transaction_profile::Profile>),
 }
 impl Selected {
     fn common(&self) -> Common {
         match &self.0 {
-            Choice::Legacy(value) => (*value).into(),
-            Choice::Transaction(common, _)
-            | Choice::Records(common, _)
-            | Choice::Proxy(common, _, _, _) => *common,
+            Choice::Records(common, _) | Choice::Proxy(common, _, _, _) => *common,
         }
     }
+    #[cfg(test)]
     fn transaction(&self) -> bool {
-        matches!(self.0, Choice::Transaction(_, _) | Choice::Records(_, _))
+        matches!(self.0, Choice::Records(_, _))
     }
     fn report_interval(&self) -> Option<Duration> {
         match &self.0 {
-            Choice::Legacy(value) => Some(value.report.unwrap_or(Duration::from_secs(1))),
-            Choice::Transaction(_, plan) => plan.report_interval(),
             Choice::Records(_, plan) | Choice::Proxy(_, plan, _, _) => plan.report_interval(),
         }
     }
@@ -133,22 +133,6 @@ impl Selected {
         member: l2tunnel_identity::MemberPublicKey,
     ) -> io::Result<Built> {
         match &self.0 {
-            Choice::Legacy(value) => value
-                .build(connection, peers, member)
-                .map(Box::new)
-                .map(Built::Legacy),
-            Choice::Transaction(common, plan) => {
-                let (overhead, maximum_body) = common.geometry()?;
-                let raw = common.raw(
-                    plan.initial().path_mtu(),
-                    connection.handshake_timeout,
-                    peers,
-                    member,
-                )?;
-                plan.build(connection, raw, peers, maximum_body, overhead)
-                    .map(Box::new)
-                    .map(Built::Transaction)
-            }
             Choice::Records(common, plan) => {
                 let mut raw = common.raw(
                     plan.initial().path_mtu(),
@@ -162,13 +146,8 @@ impl Selected {
                     // Share final Records backing capacity while keeping actual setup
                     // protected bytes and ARQ packets within the bootstrap maximum.
                     raw.cover.max_packet_bytes = settings.geometry.max_record_bytes;
-                    let maximum_body = settings
-                        .geometry
-                        .max_record_bytes
-                        .checked_sub(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
-                        .ok_or_else(|| {
-                            input("maintained final record cannot fit authentication")
-                        })?;
+                    let maximum_body =
+                        plan.protected_body_capacity(settings.geometry.max_record_bytes)?;
                     return plan
                         .build_maintained(connection, raw, peers, maximum_body, **settings)
                         .map(Box::new)
@@ -177,38 +156,71 @@ impl Selected {
                 if let Some(selected) = &self.2 {
                     let policy = selected.settings.packet_policy();
                     let geometry = policy.record_geometry().map_err(io::Error::other)?;
-                    let (overhead, maximum_body) = common.raw_geometry(&mut raw, geometry)?;
+                    let (overhead, _) = common.raw_geometry(
+                        &mut raw,
+                        geometry,
+                        policy.final_record_geometry().map_err(io::Error::other)?,
+                    )?;
+                    let maximum_body = plan.protected_body_capacity(
+                        policy
+                            .final_record_geometry()
+                            .map_err(io::Error::other)?
+                            .max_record_bytes,
+                    )?;
                     return plan
                         .build_raw(connection, raw, peers, maximum_body, overhead, policy)
                         .map(Box::new)
                         .map(Built::Records);
                 }
                 let (overhead, maximum_body) = if self.1 == Carrier::OpenVpn {
-                    common.carrier_geometry(&mut raw, plan.outer_capacity()?)?
+                    let capacity = plan.outer_capacity()?;
+                    let (overhead, _) = common.carrier_geometry(&mut raw, capacity)?;
+                    (overhead, plan.protected_body_capacity(capacity)?)
                 } else {
-                    common.geometry()?
+                    common.plan_geometry(plan)?
                 };
                 plan.build(connection, raw, peers, maximum_body, overhead)
                     .map(Box::new)
                     .map(Built::Records)
             }
             Choice::Proxy(common, plan, settings, retained) => {
-                let (overhead, maximum_body) = common.geometry()?;
-                let raw = common.raw(
+                let mut raw = common.raw(
                     plan.initial().path_mtu(),
                     connection.handshake_timeout,
                     peers,
                     member,
                 )?;
-                match settings {
-                    common_proxy_cli::Policy::Fixed(settings) => plan.build_proxy(
-                        connection,
-                        raw,
-                        peers,
-                        maximum_body,
+                let maintained = match &self.1 {
+                    Carrier::Maintained(value) => Some(**value),
+                    _ => None,
+                };
+                let packet = self.2.as_ref().map(|value| value.settings.packet_policy());
+                let (overhead, maximum_body) = if let Some(value) = maintained {
+                    common.carrier_geometry(&mut raw, value.geometry.max_bootstrap_bytes)?;
+                    common.bootstrap_arq_geometry(&mut raw)?;
+                    raw.cover.max_packet_bytes = value.geometry.max_record_bytes;
+                    (
+                        value.geometry.charged_overhead_bytes,
+                        plan.protected_body_capacity(value.geometry.max_record_bytes)?,
+                    )
+                } else if let Some(value) = packet {
+                    let geometry = value.record_geometry().map_err(io::Error::other)?;
+                    let final_geometry = value.final_record_geometry().map_err(io::Error::other)?;
+                    let (overhead, _) = common.raw_geometry(&mut raw, geometry, final_geometry)?;
+                    (
                         overhead,
-                        crate::proxy::runtime_config(connection, settings)?,
-                        *retained,
+                        plan.protected_body_capacity(final_geometry.max_record_bytes)?,
+                    )
+                } else {
+                    common.plan_geometry(plan)?
+                };
+                let (proxy, measured) = match settings {
+                    common_proxy_cli::Policy::Fixed(settings) => (
+                        Some((
+                            crate::proxy::runtime_config(connection, settings)?,
+                            *retained,
+                        )),
+                        None,
                     ),
                     common_proxy_cli::Policy::Measured(settings) => {
                         if !*retained {
@@ -216,16 +228,23 @@ impl Selected {
                                 "Common measured proxy requires explicit retained close",
                             ));
                         }
-                        plan.build_proxy_measured(
-                            connection,
-                            raw,
-                            peers,
-                            maximum_body,
-                            overhead,
-                            crate::proxy_measured::runtime_config(connection, settings)?,
+                        (
+                            None,
+                            Some(crate::proxy_measured::runtime_config(connection, settings)?),
                         )
                     }
-                }
+                };
+                plan.build_selected_on(
+                    connection,
+                    raw,
+                    peers,
+                    maximum_body,
+                    overhead,
+                    packet,
+                    proxy,
+                    measured,
+                    maintained,
+                )
                 .map(Box::new)
                 .map(Built::Proxy)
             }
@@ -261,6 +280,11 @@ fn selection_for(
     inspection: bool,
 ) -> io::Result<Option<Selected>> {
     tls_frontend::preflight(command, options)?;
+    if options.contains_key("--swift-transaction-plan") {
+        return Err(input(
+            "the Swift-only plan is retired; use --record-profile common --common-transaction-plan PATH and local API4",
+        ));
+    }
     let records_plan = options.contains_key("--common-transaction-plan");
     let raw_selected = options.get("--carrier").map(String::as_str) == Some("raw-packet")
         && (records_plan || options.get("--record-profile").map(String::as_str) == Some("common"));
@@ -389,11 +413,9 @@ fn selection_for(
             "Common and Swift transaction plans are mutually exclusive",
         ));
     }
-    if options.get("--record-profile").map(String::as_str)
-        != Some(if records_plan { "common" } else { "swift" })
+    if options.get("--record-profile").map(String::as_str) != Some("common")
         || !matches!(carrier, Carrier::RawPacket | Carrier::Maintained(_))
             && config.duplex != Duplex::Full
-        || config.compression != Compression::None
         || options.keys().any(|key| {
             !(allowed.contains(&key.as_str())
                 || OPTIONS.contains(&key.as_str())
@@ -653,88 +675,9 @@ fn selection_for(
             raw,
         )));
     }
-    if let Some(path) = options.get("--swift-transaction-plan") {
-        if [
-            "--path-mtu",
-            "--swift-forward-kbit",
-            "--swift-reverse-kbit",
-            "--swift-channels",
-            "--swift-window",
-            "--swift-repair-permille",
-            "--swift-report-ms",
-        ]
-        .iter()
-        .any(|key| options.contains_key(*key))
-        {
-            return Err(input(
-                "transaction plan conflicts with legacy Swift mutable/report options",
-            ));
-        }
-        let plan = transaction_cli::Plan::read(std::path::Path::new(path))?;
-        let initial = plan.initial().path_mtu();
-        if !(576..=9000).contains(&maximum_mtu) || !(576..=maximum_mtu).contains(&initial) {
-            return Err(input("transaction initial MTU/capacity is out of range"));
-        }
-        return Ok(Some(Selected(
-            Choice::Transaction(
-                Common {
-                    appearance,
-                    role,
-                    local,
-                    peer,
-                    maximum_mtu,
-                    profile,
-                },
-                Box::new(plan),
-            ),
-            carrier,
-            None,
-        )));
-    }
-    let forward_kbit = required(options, "--swift-forward-kbit")?
-        .parse()
-        .map_err(|_| input("invalid forward budget"))?;
-    let reverse_kbit = required(options, "--swift-reverse-kbit")?
-        .parse()
-        .map_err(|_| input("invalid reverse budget"))?;
-    let policy = l2tunnel_swift::control::Policy {
-        path_mtu: number(options, "--path-mtu", 1500)?,
-        forward_kbit,
-        reverse_kbit,
-        channels: number(options, "--swift-channels", 16)?,
-        window: number(options, "--swift-window", 64)?,
-        repair_permille: number(options, "--swift-repair-permille", 0)?,
-    };
-
-    if !(576..=9000).contains(&policy.path_mtu)
-        || !(usize::from(policy.path_mtu)..=9000).contains(&maximum_mtu)
-        || !(64..=10_000_000).contains(&policy.forward_kbit)
-        || !(64..=10_000_000).contains(&policy.reverse_kbit)
-        || !(1..=64).contains(&policy.channels)
-        || policy.window == 0
-        || policy.repair_permille > 1000
-    {
-        return Err(input("secure UDP Swift policy/capacity is out of range"));
-    }
-    let report = match number(options, "--swift-report-ms", 0u64)? {
-        0 => None,
-        value @ 100..=60_000 => Some(Duration::from_millis(value)),
-        _ => return Err(input("report interval must be0 or100..60000ms")),
-    };
-    Ok(Some(Selected(
-        Choice::Legacy(Selection {
-            appearance,
-            role,
-            local,
-            peer,
-            policy,
-            maximum_mtu,
-            profile,
-            report,
-        }),
-        carrier,
-        None,
-    )))
+    Err(input(
+        "use --record-profile common --common-transaction-plan PATH; Swift is a catalog algorithm, not a connection mode",
+    ))
 }
 
 fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
@@ -747,25 +690,38 @@ fn public_digest(domain: &[u8], peers: establish::Peers) -> [u8; 32] {
     result
 }
 impl Common {
+    fn plan_geometry(self, plan: &common_cli::Plan) -> io::Result<(usize, usize)> {
+        let ip = if self.local.is_ipv6() { 48 } else { 28 };
+        let packet = self
+            .maximum_mtu
+            .checked_sub(ip)
+            .ok_or_else(|| input("path capacity below IP framing"))?;
+        Ok((
+            self.final_geometry()?.0,
+            plan.protected_body_capacity(packet)?,
+        ))
+    }
     fn raw_geometry(
         self,
         settings: &mut secure_udp::Settings,
         geometry: l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry,
+        final_geometry: l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry,
     ) -> io::Result<(usize, usize)> {
-        let (_, maximum_body) = self.carrier_geometry(settings, geometry.max_record_bytes)?;
+        self.carrier_geometry(settings, geometry.max_record_bytes)?;
         // Bootstrap ARQ geometry derives from the selected real covered record;
         // no explicit catalog source, native, body or channel value is rewritten.
         self.bootstrap_arq_geometry(settings)?;
-        let physical = geometry
+        // Final Records omit the bootstrap wrapper and require the corresponding
+        // larger backing buffer. Keep bootstrap protected bytes and ARQ limits.
+        settings.cover.max_packet_bytes = final_geometry.max_record_bytes;
+        let overhead = final_geometry
             .ip_tcp_bytes
-            .checked_add(geometry.record_overhead_bytes)
-            .ok_or_else(|| input("raw full physical overhead overflow"))?;
-        let overhead = self
-            .geometry()?
-            .0
-            .checked_sub(28)
-            .and_then(|v| v.checked_add(physical))
-            .ok_or_else(|| input("raw Common full overhead overflow"))?;
+            .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+            .ok_or_else(|| input("raw final control overhead overflow"))?;
+        let maximum_body = final_geometry
+            .max_record_bytes
+            .checked_sub(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+            .ok_or_else(|| input("raw final capacity below authenticated framing"))?;
         Ok((overhead, maximum_body))
     }
     fn bootstrap_arq_geometry(self, settings: &mut secure_udp::Settings) -> io::Result<()> {
@@ -833,23 +789,20 @@ impl Common {
         settings.cover.max_packet_bytes = capacity;
         settings.cover.max_protected_bytes = low;
         settings.cover.bootstrap_overhead(self.local.is_ipv6())?;
-        let maximum_body = low
-            .checked_sub(9 + security::COMMON_PREFIX_BYTES + 16)
+        let maximum_body = capacity
+            .checked_sub(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
             .ok_or_else(|| input("outer carrier cannot fit common protection"))?;
-        Ok((self.geometry()?.0, maximum_body))
+        Ok((self.final_geometry()?.0, maximum_body))
     }
-    fn geometry(self) -> io::Result<(usize, usize)> {
-        let ip = if self.local.is_ipv6() { 48 } else { 28 };
-        let header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
-            13
-        } else {
-            14
-        };
-        let overhead = ip + header + 9 + security::COMMON_PREFIX_BYTES + 16;
+    fn final_geometry(self) -> io::Result<(usize, usize)> {
+        let ip: usize = if self.local.is_ipv6() { 48 } else { 28 };
+        let overhead = ip
+            .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+            .ok_or_else(|| input("final control overhead overflow"))?;
         let maximum_body = self
             .maximum_mtu
             .checked_sub(overhead)
-            .ok_or_else(|| input("capacity below secure framing"))?;
+            .ok_or_else(|| input("final capacity below authenticated framing"))?;
         Ok((overhead, maximum_body))
     }
     fn raw(
@@ -961,15 +914,16 @@ impl Common {
         })
     }
 }
+#[cfg(test)]
 impl Selection {
     pub(crate) fn build(
         self,
         connection: ConnectionConfig,
         peers: establish::Peers,
         member: l2tunnel_identity::MemberPublicKey,
-    ) -> io::Result<Profile> {
+    ) -> io::Result<Resources> {
         let common = Common::from(self);
-        let (overhead, maximum_body) = common.geometry()?;
+        let (overhead, maximum_body) = common.final_geometry()?;
         let body = usize::from(self.policy.path_mtu)
             .checked_sub(overhead)
             .ok_or_else(|| input("path MTU below secure framing"))?;
@@ -1093,7 +1047,7 @@ impl Selection {
             wire: burst(receive.bytes_per_second)?,
             ..initiator
         };
-        Profile::new(connection, selected, initiator, responder)
+        Ok(Resources::new(connection, selected, initiator, responder))
     }
 }
 
@@ -1131,9 +1085,6 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
         ))?)
     };
     let values = match selected.build(connection, peers, member)? {
-        Built::Transaction(profile) => {
-            vec![transaction_cli_output::inspection(&profile, common.role)?]
-        }
         Built::Records(profile) => {
             if let Some(raw) = &selected.2 {
                 common_cli_output::raw_inspection(&profile, common.role, &raw.settings)?
@@ -1147,7 +1098,6 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
             }
         }
         Built::Proxy(profile) => common_proxy_cli::inspection(&profile, common.role)?,
-        Built::Legacy(_) => return Err(input("inspection requires explicit transaction plan")),
     };
     let values = common_cli_output::requested_tls(values, tls_frontend::requested(options)?)?;
     let mut stdout = io::stdout().lock();
@@ -1168,7 +1118,6 @@ pub(super) async fn execute(
     use crate::service::{self, Completed, Terminal};
     use std::path::Path;
     let report_interval = selected.report_interval();
-    let generic = selected.transaction();
     let common = selected.common();
     let noise = credentials::NoiseIdentity::new(
         credentials::read_secret(Path::new(required(options, "--noise-private-key-file")?))?,
@@ -1189,7 +1138,7 @@ pub(super) async fn execute(
     )?))?)?;
     let name = required(options, "--device")?.to_owned();
     let attachment = service::Attachment::readable(config.layer, move || {
-        Ok(crate::swift::Native::new(
+        Ok(crate::native::Native::new(
             l2tunnel_platform_linux::TunTap::attach(&name, config.layer)?,
         ))
     });
@@ -1202,18 +1151,7 @@ pub(super) async fn execute(
             let profile = selected.build(config, peers, member.public_key())?;
             let credentials = credentials::Client::new(noise, member, admission)?;
             match profile {
-                Built::Legacy(profile) => {
-                    service::Prepared::secure_udp_client(*profile, credentials, attachment)?
-                }
-                Built::Transaction(profile) => service::Prepared::secure_udp_transaction_client(
-                    *profile,
-                    credentials,
-                    attachment,
-                )?,
-                Built::Proxy(profile) => {
-                    service::Prepared::proxy_common_client(*profile, credentials, attachment)?
-                }
-                Built::Records(profile) => {
+                Built::Proxy(profile) | Built::Records(profile) => {
                     if let Carrier::Maintained(settings) = &selected.1 {
                         let member = std::sync::Arc::new(
                             MemberKey::from_pkcs8(&member_der).map_err(auth_error)?,
@@ -1236,12 +1174,11 @@ pub(super) async fn execute(
                                 }
                             }
                         };
-                        service::Prepared::secure_udp_common_maintained_client(
-                            *profile,
-                            outer,
-                            credentials,
-                            attachment,
-                        )?
+                        (if matches!(&selected.0, Choice::Proxy(..)) {
+                            service::Prepared::proxy_common_maintained_client
+                        } else {
+                            service::Prepared::secure_udp_common_maintained_client
+                        })(*profile, outer, credentials, attachment)?
                     } else if let Some(raw) = &selected.2 {
                         let mark = raw.mark.ok_or_else(|| input("runtime raw mark absent"))?;
                         let opener =
@@ -1250,7 +1187,11 @@ pub(super) async fn execute(
                             });
                         let tls = tls_frontend::client(options)?;
                         let member = MemberKey::from_pkcs8(&member_der).map_err(auth_error)?;
-                        service::Prepared::secure_udp_common_raw_client(
+                        (if matches!(&selected.0, Choice::Proxy(..)) {
+                            service::Prepared::proxy_common_raw_client
+                        } else {
+                            service::Prepared::secure_udp_common_raw_client
+                        })(
                             *profile,
                             raw.settings.clone(),
                             service::Client {
@@ -1283,10 +1224,12 @@ pub(super) async fn execute(
                                     attachment,
                                 )?
                             }
-                            None => service::Prepared::secure_udp_common_client(
-                                *profile,
-                                credentials,
-                                attachment,
+                            None => (if matches!(&selected.0, Choice::Proxy(..)) {
+                                service::Prepared::proxy_common_client
+                            } else {
+                                service::Prepared::secure_udp_common_client
+                            })(
+                                *profile, credentials, attachment
                             )?,
                         }
                     }
@@ -1303,18 +1246,7 @@ pub(super) async fn execute(
             let profile = selected.build(config, peers, member)?;
             let credentials = credentials::Server::new(noise, admission, cookie)?;
             match profile {
-                Built::Legacy(profile) => {
-                    service::Prepared::secure_udp_server(*profile, credentials, attachment)?
-                }
-                Built::Transaction(profile) => service::Prepared::secure_udp_transaction_server(
-                    *profile,
-                    credentials,
-                    attachment,
-                )?,
-                Built::Proxy(profile) => {
-                    service::Prepared::proxy_common_server(*profile, credentials, attachment)?
-                }
-                Built::Records(profile) => {
+                Built::Proxy(profile) | Built::Records(profile) => {
                     if let Carrier::Maintained(settings) = &selected.1 {
                         let certs = vec![bounded_file(required(options, "--cert")?, 65536)?];
                         let key = bounded_file(required(options, "--key")?, 65536)?;
@@ -1336,12 +1268,11 @@ pub(super) async fn execute(
                                 }
                             }
                         };
-                        service::Prepared::secure_udp_common_maintained_server(
-                            *profile,
-                            outer,
-                            credentials,
-                            attachment,
-                        )?
+                        (if matches!(&selected.0, Choice::Proxy(..)) {
+                            service::Prepared::proxy_common_maintained_server
+                        } else {
+                            service::Prepared::secure_udp_common_maintained_server
+                        })(*profile, outer, credentials, attachment)?
                     } else if let Some(raw) = &selected.2 {
                         let mark = raw.mark.ok_or_else(|| input("runtime raw mark absent"))?;
                         let opener =
@@ -1355,7 +1286,11 @@ pub(super) async fn execute(
                         .map_err(auth_error)?;
                         let members = MemberAllowlist::new(&[auth::MemberPublicKey(member.0)])
                             .map_err(auth_error)?;
-                        service::Prepared::secure_udp_common_raw_server(
+                        (if matches!(&selected.0, Choice::Proxy(..)) {
+                            service::Prepared::proxy_common_raw_server
+                        } else {
+                            service::Prepared::secure_udp_common_raw_server
+                        })(
                             *profile,
                             raw.settings.clone(),
                             service::Server {
@@ -1391,10 +1326,12 @@ pub(super) async fn execute(
                                     attachment,
                                 )?
                             }
-                            None => service::Prepared::secure_udp_common_server(
-                                *profile,
-                                credentials,
-                                attachment,
+                            None => (if matches!(&selected.0, Choice::Proxy(..)) {
+                                service::Prepared::proxy_common_server
+                            } else {
+                                service::Prepared::secure_udp_common_server
+                            })(
+                                *profile, credentials, attachment
                             )?,
                         }
                     }
@@ -1423,7 +1360,6 @@ pub(super) async fn execute(
         let mut cursor = accepted.operation.value().saturating_sub(1);
         let mut live = None;
         let mut connected = false;
-        let mut last_performance = secure_udp::performance::Cursor::default();
         let mut report_tick =
             tokio::time::interval(report_interval.unwrap_or(Duration::from_secs(1)));
         report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1442,12 +1378,7 @@ pub(super) async fn execute(
                     let generation = live;
                     live = None;
                     let terminal = terminal.map_err(submit)?;
-                    if generic {
-                        emit_transaction(life.snapshot().runtime.as_ref(), generation, TransactionEvent::Terminal(terminal), &mut output);
-                    } else {
-                        emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
-                        output.emit(serde_json::json!({"event":"secure_udp_terminal","outcome":format!("{terminal:?}")}));
-                    }
+                    emit_transaction(life.snapshot().runtime.as_ref(), generation, TransactionEvent::Terminal(terminal), &mut output);
                     if let Terminal::Failed(failure) = terminal && !local_control {
                         output.flush_turn();
                         return Err(io::Error::new(failure.kind, "secure UDP runtime failed"));
@@ -1459,22 +1390,13 @@ pub(super) async fn execute(
                     match result {
                         Completed::Connected { generation } => {
                             connected = true;
-                            if generic && let Some(previous) = live.take() {
+                            if let Some(previous) = live.take() {
                                 let terminal = life.wait_stopped(previous).await.map_err(submit)?;
                                 emit_transaction(life.snapshot().runtime.as_ref(), Some(previous), TransactionEvent::Terminal(terminal), &mut output);
                             }
                             live = Some(generation);
                             let snapshot = life.snapshot();
-                            if generic {
-                                emit_transaction(snapshot.runtime.as_ref(), Some(generation), TransactionEvent::Ready, &mut output);
-                            } else {
-                                let frame = snapshot.runtime.as_ref().and_then(service::Observation::secure_udp);
-                                match frame.map(service::SecureUdpFrame::status).transpose() {
-                                    Ok(Some(status)) => output.emit(serde_json::json!({"event":"secure_udp_ready","status":status})),
-                                    _ => output.projection_error(),
-                                }
-                                emit_performance(frame, &mut last_performance, &mut output);
-                            }
+                            emit_transaction(snapshot.runtime.as_ref(), Some(generation), TransactionEvent::Ready, &mut output);
                         }
                         Completed::Failed(failure) => {
                             let mut diagnostic = output::Sink::stderr();
@@ -1492,7 +1414,7 @@ pub(super) async fn execute(
                             }
                         },
                         Completed::Aborted => {
-                            if generic && let Some(generation) = live.take() {
+                            if let Some(generation) = live.take() {
                                 // Completion may win select before wait_stopped. Observe
                                 // the real release before forgetting its generation.
                                 let terminal = life.wait_stopped(generation).await.map_err(submit)?;
@@ -1504,11 +1426,7 @@ pub(super) async fn execute(
                     }
                 }
                 _ = report_tick.tick(), if report_interval.is_some() => {
-                    if generic {
-                        if live.is_some() { emit_transaction(life.snapshot().runtime.as_ref(), live, TransactionEvent::Status, &mut output); }
-                    } else {
-                        emit_performance(life.snapshot().runtime.as_ref().and_then(service::Observation::secure_udp), &mut last_performance, &mut output);
-                    }
+                    if live.is_some() { emit_transaction(life.snapshot().runtime.as_ref(), live, TransactionEvent::Status, &mut output); }
                 }
                 _ = output_tick.tick(), if output.has_pending() => {},
             }
@@ -1537,70 +1455,26 @@ fn emit_transaction(
     event: TransactionEvent,
     output: &mut output::Sink,
 ) {
-    if observation
-        .and_then(crate::service::Observation::secure_udp_common)
-        .is_some()
-    {
-        let value = match (
-            observation.and_then(crate::service::Observation::secure_udp_common),
-            generation,
-        ) {
-            (Some(frame), Some(generation)) => {
-                common_cli_output::event(frame, generation.value(), event)
-            }
-            _ => Err(input("missing matching Common observation")),
-        };
-        match value {
-            Ok(value) => output.emit(value),
-            Err(_) => output.projection_error(),
-        }
-        return;
-    }
     let value = match (
-        observation.and_then(crate::service::Observation::secure_udp_transaction),
+        observation.and_then(crate::service::Observation::secure_udp_common),
         generation,
     ) {
-        (Some(frame), Some(generation)) => match event {
-            TransactionEvent::Ready => transaction_cli_output::ready(frame, generation.value()),
-            TransactionEvent::Status => transaction_cli_output::status(frame, generation.value()),
-            TransactionEvent::Terminal(terminal) => {
-                transaction_cli_output::terminal(frame, generation.value(), terminal)
-            }
-        },
-        _ => Err(input("missing matching generic transaction observation")),
+        (Some(frame), Some(generation)) => {
+            common_cli_output::event(frame, generation.value(), event)
+        }
+        _ => Err(input("missing matching Common observation")),
     };
     match value {
         Ok(value) => output.emit(value),
         Err(_) => output.projection_error(),
     }
 }
+
 #[cfg(target_os = "linux")]
 enum TransactionEvent {
     Ready,
     Status,
     Terminal(crate::service::Terminal),
-}
-
-#[cfg(target_os = "linux")]
-fn emit_performance(
-    frame: Option<&crate::service::SecureUdpFrame>,
-    last: &mut secure_udp::performance::Cursor,
-    output: &mut output::Sink,
-) {
-    let report = match frame
-        .map(crate::service::SecureUdpFrame::performance)
-        .transpose()
-    {
-        Ok(Some(Some(report))) => report,
-        Ok(_) => return,
-        Err(_) => {
-            output.projection_error();
-            return;
-        }
-    };
-    if last.accept(&report) {
-        output.emit(serde_json::json!({"event":"secure_udp_performance","report":report}));
-    }
 }
 
 #[cfg(target_os = "linux")]

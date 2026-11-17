@@ -1,5 +1,5 @@
-//! Actual selected Common IP codecs over imported test session material and UDP.
-//! This is not a new handshake or privileged TUN-device qualification.
+//! Actual current Common IP codecs over authenticated test session material and UDP.
+//! Unix packet-device evidence is not privileged TUN-device qualification.
 use super::*;
 use l2tunnel::record_configuration as c;
 use l2tunnel_codec::{aligned_envelope, aligned_receiver as rx, packed_envelope};
@@ -143,10 +143,10 @@ fn selected_ip(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2
         // These Swift fields are inactive templates, never the selected codec.
         resources.send.records.layer = records::Layer::Ip;
         resources.receive.records.layer = records::Layer::Ip;
-        let value = CommonTransactionContract::new(
+        let value = CommonTransactionContract::new_compact_wire(
             security::ConfigDigest([3; 32]),
             role,
-            resources,
+            [resources; 2],
             appearance(kind, role == security::Role::Initiator)?,
             false,
             c::EnvelopeDigest::new([0x39; 32]),
@@ -160,6 +160,7 @@ fn selected_ip(kind: cover::Appearance) -> Result<([CommonTransactionContract; 2
                 max_operation_ms: 3000,
                 retained_bytes: 256 << 20,
             },
+            default_record_selection(),
         )?;
         assert_eq!(value.native_layer(), PacketLayer::Ip);
         Ok(value)
@@ -242,21 +243,34 @@ fn assert_body(fixture: &Fixture<IpDevice>, packet: &[u8], expected: &[u8]) -> R
         base.native_policy,
         l2tunnel_aligned::NativePolicy::IpHeaders
     );
-    let view = l2tunnel_reliable::inspect_structural(
-        packet,
-        l2tunnel_recovery::EndpointRole::Initiator,
-        base.max_recovery_packet_bytes,
-        base.recovery.arq.max_source_bytes,
-        base.recovery.fec.block,
+    assert!(packet.len() <= base.max_recovery_packet_bytes);
+    // Observe the actual direct/systematic selected union through its maintained
+    // parser. This separate observer grants no authentication or recovery custody.
+    let mut observer = l2tunnel_reliable::Reliable::new(
+        base.recovery,
+        l2tunnel_recovery::RecoveryContext {
+            session: u128::from_be_bytes(endpoint.driver.info.binding.session.0),
+            epoch: state.epoch().0,
+            role: l2tunnel_recovery::EndpointRole::Initiator,
+        },
     )?;
-    let (_, source) = view.source.ok_or("real source did not contain originals")?;
+    observer.enable_compact_wire(endpoint.driver.config.control.wire_overhead)?;
+    let observed = observer.inspect_output_record(packet)?;
+    assert!(matches!(
+        observed.kind,
+        l2tunnel_reliable::RecordKind::Source | l2tunnel_reliable::RecordKind::Systematic
+    ));
+    let (source, payload) = observed
+        .source
+        .ok_or("real source did not contain originals")?;
     let scope = rx::Scope {
-        session: view.sender.session.to_be_bytes(),
-        epoch: core::Epoch(view.sender.epoch),
+        session: endpoint.driver.info.binding.session.0,
+        epoch: state.epoch(),
         direction: rx::Direction::InitiatorToResponder,
     };
+    let source = rx::SourceId(source.0);
     if let Some(config) = packed {
-        let source = packed_envelope::decode(
+        let source = packed_envelope::decode_compact(
             packed_envelope::Config {
                 symbol_bytes: base.receiver.body.symbol_bytes,
                 channels: base.receiver.channels,
@@ -264,6 +278,7 @@ fn assert_body(fixture: &Fixture<IpDevice>, packet: &[u8], expected: &[u8]) -> R
             },
             scope,
             source,
+            payload,
         )?;
         let units = source.units()?.collect::<Vec<_>>();
         assert!(
@@ -275,11 +290,12 @@ fn assert_body(fixture: &Fixture<IpDevice>, packet: &[u8], expected: &[u8]) -> R
             "literal IP context/delta absent from actual Packed source"
         );
     } else {
-        let source = aligned_envelope::decode(
+        let source = aligned_envelope::decode_compact(
             scope,
+            source,
             base.receiver.body.symbol_bytes,
             base.receiver.channels,
-            source,
+            payload,
         )?;
         let body = &source.symbol[3..];
         assert_eq!(
@@ -301,7 +317,6 @@ async fn receive_packet(endpoint: &mut Endpoint<IpDevice>, now: u64, expected: &
         &input[..bytes],
         now,
         endpoint.driver.origin + duration(now),
-        None,
     )?;
     Ok(())
 }

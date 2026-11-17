@@ -648,6 +648,25 @@ impl Owner {
         .transpose()
     }
 
+    pub(super) fn custody_deadline(&self) -> Result<Option<Tick>, Error> {
+        let at = match self {
+            Self::Connections(owner) => owner.collection.custody_deadline(),
+            Self::Swift(_) => return Ok(None),
+            Self::Aligned(endpoint) => endpoint.custody_deadline(),
+            Self::Packed(endpoint) => endpoint.custody_deadline(),
+            // Rolling and Research expire their original coding/debt/output
+            // ownership terminally. Their packing and feedback wakes are separate.
+            Self::Rolling(endpoint) => return Ok(endpoint.deadline()),
+            Self::Research(endpoint) => return Ok(endpoint.deadline()),
+        };
+        at.map(|at| {
+            u64::try_from(at.as_micros())
+                .map(Tick)
+                .map_err(|_| Error::Arithmetic)
+        })
+        .transpose()
+    }
+
     pub(super) fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
         let at = match self {
             Self::Connections(owner) => owner.collection.expiry_deadline(),

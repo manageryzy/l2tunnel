@@ -1,6 +1,9 @@
 use super::*;
 use crate::rolling::{Begin, DecodeStep, Decoder, Tick, WorkBudget};
 
+#[path = "extent_tests.rs"]
+mod extent;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn config() -> Config {
@@ -34,13 +37,13 @@ fn hex(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .collect()
 }
 
-// These complete literals were produced with independent Python struct.pack,
-// not the Rust encoder. The repair body is the maintained Python PRODUCT /
+// Header literals derive from independent Python struct.pack, with the version
+// explicitly updated for effective repair extents. The repair body is the maintained Python PRODUCT /
 // compact coefficient fixture from rolling-equation-design14/oracle-vectors.json.
-const SOURCE0: &str = "4c32525701010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000000000000000000000100000000000a000000030102000000000000";
-const SOURCE1: &str = "4c32525701010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000001000000010000000200000000000a000000040000000000000000";
-const SOURCE2: &str = "4c32525701010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000002000000020000000300000000000a00000001ff00000000000000";
-const REPAIR16: &str = "4c32525701020000000102030405060708090a0b0c0d0e0f0102030405060708102030400200000000000000000000100000000000000003e3779b10000a000000456fc1000000000000";
+const SOURCE0: &str = "4c32525703010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000000000000000000000100000000000a000000030102000000000000";
+const SOURCE1: &str = "4c32525703010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000001000000010000000200000000000a000000040000000000000000";
+const SOURCE2: &str = "4c32525703010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000002000000020000000300000000000a00000001ff00000000000000";
+const REPAIR16: &str = "4c32525703020000000102030405060708090a0b0c0d0e0f0102030405060708102030400200000000000000000000100000000000000003e3779b10000a000000456fc1000000000000";
 const EQUATION: [u8; 10] = [0, 0x45, 0x6f, 0xc1, 0, 0, 0, 0, 0, 0];
 
 fn equation(id: u64, end: u32, tail: bool) -> Result<Repair<'static>, Error> {
@@ -165,10 +168,15 @@ fn commit(decoder: &mut Decoder) -> Result<(), Error> {
 }
 
 #[test]
-fn every_truncation_trailing_byte_and_wrong_extent_is_rejected() -> TestResult {
+fn source_truncation_and_repair_extent_boundaries_are_rejected() -> TestResult {
     for literal in [SOURCE0, REPAIR16] {
         let record = hex(literal)?;
-        for length in 0..record.len() {
+        let minimum = if literal == REPAIR16 {
+            HEADER_BYTES + 3
+        } else {
+            record.len()
+        };
+        for length in 0..minimum {
             assert!(matches!(
                 inspect(config(), &record[..length]),
                 Err(Error::Length)
@@ -209,7 +217,7 @@ fn version_kind_reserved_and_flag_corpus_is_structurally_rejected() -> TestResul
             );
         }
         for (index, values) in [
-            (4, &[0, 2, 255][..]),
+            (4, &[0, 1, 2, 4, 255][..]),
             (5, &[0, 3, 255][..]),
             (6, &[2, 4, 128, 255][..]),
         ] {
@@ -368,7 +376,7 @@ fn rejected_source_and_repair_encodes_leave_all_caller_bytes_unchanged() -> Test
     wrong_start.support.start += 1;
     for repair in [
         Repair {
-            bytes: &EQUATION[..9],
+            bytes: &EQUATION[..2],
             ..valid
         },
         Repair {
@@ -432,11 +440,11 @@ fn structural_scope_is_complete_and_does_not_grant_owner_authority() -> TestResu
 
 // Independent Python struct.pack literals for the exact-source format. The
 // source ends after its three original bytes, including the real trailing zero.
-const EXACT0: &str = "4c32525702010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000000000000000000000100000000000a00000003010200";
-const EXACT_REPAIR16: &str = "4c32525702020000000102030405060708090a0b0c0d0e0f0102030405060708102030400200000000000000000000100000000000000003e3779b10000a000000456fc1000000000000";
+const EXACT0: &str = "4c32525704010000000102030405060708090a0b0c0d0e0f010203040506070810203040020000000000000000000000000000000000000100000000000a00000003010200";
+const EXACT_REPAIR16: &str = "4c32525704020000000102030405060708090a0b0c0d0e0f0102030405060708102030400200000000000000000000100000000000000003e3779b10000a000000456fc1000000000000";
 
 #[test]
-fn exact_source_literal_omits_only_the_zero_tail_and_repairs_stay_full_width() -> TestResult {
+fn exact_source_literal_and_explicit_full_extent_equation_remain_exact() -> TestResult {
     let source = hex(EXACT0)?;
     assert_eq!(source.len(), HEADER_BYTES + 2 + 3);
     assert_eq!(source_len(config(), SourceWire::Exact, 3)?, 69);
@@ -485,7 +493,7 @@ fn exact_source_literal_omits_only_the_zero_tail_and_repairs_stay_full_width() -
         74
     );
     assert_eq!(&output[..74], repair);
-    // The padded format's bytes are unchanged by the additive format.
+    // Source padding remains distinct from a repair's selected extent.
     output.fill(0xa5);
     encode_source(config(), scope(), SourceId(0), &[1, 2, 0], &mut output)?;
     assert_eq!(&output[..74], hex(SOURCE0)?);
@@ -504,7 +512,7 @@ fn exact_and_padded_formats_never_accept_each_other() -> TestResult {
         assert!(inspect(config(), record).is_err());
         assert!(inspect_with(config(), SourceWire::Padded, record).is_err());
     }
-    // A padded-length source relabelled as version two is not canonical either:
+    // A padded-length source relabelled as the exact-source version is not canonical either:
     // the exact format rejects every byte after the declared original.
     let mut relabelled = hex(SOURCE0)?;
     relabelled[4] = EXACT_SOURCE_VERSION;
@@ -628,7 +636,9 @@ fn selected_compact_union_full_identity_support_and_strict_feedback_shape() -> T
         };
         assert_eq!(decoded.support, repair.support);
         assert_eq!(decoded.bytes, repair.bytes);
-        assert!(compact::inspect(config(), scope(), &output[..length - 1]).is_err());
+        // A bounded shorter equation prefix is valid; enclosing integrity
+        // protects its exact transmitted extent against network truncation.
+        assert!(compact::inspect(config(), scope(), &output[..length - 1]).is_ok());
     }
     let feedback = Feedback {
         scope: scope(),
@@ -645,5 +655,25 @@ fn selected_compact_union_full_identity_support_and_strict_feedback_shape() -> T
     assert!(compact::inspect(config(), scope(), &output[..length + 1]).is_err());
     assert!(compact::inspect(config(), scope(), &[1, 0x80, 0, 1]).is_err());
     assert!(compact::inspect(config(), scope(), &hex(SOURCE0)?).is_err());
+    Ok(())
+}
+
+#[test]
+fn previous_full_width_wire_versions_are_refused() -> TestResult {
+    for (format, literals) in [
+        (SourceWire::Padded, [SOURCE0, REPAIR16]),
+        (SourceWire::Exact, [EXACT0, EXACT_REPAIR16]),
+    ] {
+        for literal in literals {
+            let mut bytes = hex(literal)?;
+            for old in [1, 2] {
+                bytes[4] = old;
+                assert!(matches!(
+                    inspect_with(config(), format, &bytes),
+                    Err(Error::Format)
+                ));
+            }
+        }
+    }
     Ok(())
 }

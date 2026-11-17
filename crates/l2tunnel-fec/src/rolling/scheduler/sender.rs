@@ -308,10 +308,9 @@ impl Sender {
                 original.len(),
             )
             .map(Some),
-            Some(Output::Repair(_)) => self
-                .policy
-                .recovery
-                .width()?
+            Some(Output::Repair(repair)) => repair
+                .bytes
+                .len()
                 .checked_add(wire::HEADER_BYTES)
                 .map(Some)
                 .ok_or(Error::Length),

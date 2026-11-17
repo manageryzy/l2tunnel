@@ -452,7 +452,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                 self.packing.stage_identified(channel, frame, now.0)
             }
-            NativePolicy::RawIp => self.packing.stage_raw_identified(channel, frame, now.0),
+            NativePolicy::RawIp | NativePolicy::RawEthernet => {
+                self.packing.stage_raw_identified(channel, frame, now.0)
+            }
+            NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
+                self.packing.stage_lz4_identified(channel, frame, now.0)
+            }
         };
         match result {
             Ok(identity) => {
@@ -1467,12 +1472,8 @@ fn packed_view<P: RecoveryPolicy>(
 }
 
 fn check_policy<P: RecoveryPolicy>(config: DirectionConfig<P>, symbol: &[u8]) -> Result<(), Error> {
-    if config.native_policy == NativePolicy::RawIp {
-        let raw = symbol[3] == 2;
-        let fragment = symbol[3] == 4 && (symbol[6..8] != [0, 0] || symbol[8] == 2);
-        if !raw && !fragment {
-            return Err(Error::Policy);
-        }
+    if !config.native_policy.accepts_unit(symbol) {
+        return Err(Error::Policy);
     }
     Ok(())
 }

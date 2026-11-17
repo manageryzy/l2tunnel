@@ -1,4 +1,4 @@
-//! Actual protected original-UDP tag8 I/O; imported setup is not catalog-bound setup evidence.
+//! Actual authenticated original-UDP per-connection I/O with current route grammar.
 use super::*;
 use l2tunnel::{
     connection_records as connections, record_configuration as c, record_engine as engine,
@@ -71,15 +71,16 @@ fn selected(kind: cover::Appearance) -> Result<[CommonTransactionContract; 2]> {
             slots: 2,
             capacity_bytes: 1 << 20,
         });
-        Ok(CommonTransactionContract::new(
+        Ok(CommonTransactionContract::new_compact_wire(
             original.expected_configuration(),
             original.role(),
-            resources,
+            [resources; 2],
             original.cover(),
             original.ipv6(),
             original.envelope(),
             catalog.clone(),
             original.settings(),
+            original.compact_wire(),
         )?)
     };
     Ok([make(&old_contracts[0])?, make(&old_contracts[1])?])
@@ -155,11 +156,12 @@ fn emit(endpoint: &mut Endpoint, now: u64) -> Result<Option<Wire>> {
         .as_ref()
         .ok_or("actual connection carrier token")?;
     let kind = token.emission().kind;
-    let owner =
-        connections::route::decode(&endpoint.driver.buffers.frame[..token.emission().bytes])?
-            .0
-            .owner
-            .index();
+    let owner = connections::route::decode_compact(
+        &endpoint.driver.buffers.frame[..token.emission().bytes],
+    )?
+    .0
+    .owner
+    .index();
     let number = pending.sealed.number;
     let cap = pending.deadline;
     assert!(
@@ -211,7 +213,6 @@ async fn receive(endpoint: &mut Endpoint, now: u64, wire: &Wire, lose: bool) -> 
             &bytes[..length],
             now,
             endpoint.driver.origin + duration(now),
-            None,
         )?;
     }
     Ok(())
@@ -380,7 +381,6 @@ fn original_udp_sixteen_compact_owners_lossy_raw_ack_and_native_pressure_keep_cu
                     older_received,
                     fixture.now,
                     target.driver.origin + duration(fixture.now),
-                    None,
                 )?;
             }
             let before = fixture.endpoints[0]
@@ -464,7 +464,6 @@ fn original_udp_sixteen_compact_owners_lossy_raw_ack_and_native_pressure_keep_cu
                 &queued.bytes,
                 fixture.now,
                 target.driver.origin + duration(fixture.now),
-                None,
             )?;
             assert_eq!(target.driver.counters.replay_rejections, replay + 1);
             for endpoint in &fixture.endpoints {

@@ -24,14 +24,23 @@ fn fixture_wire(
     measured: bool,
     wire: Option<l2tunnel::secure_record::compact::Selection>,
 ) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
+    fixture_wire_channels(hosts, retained_close, measured, wire, 1)
+}
+fn fixture_wire_channels(
+    hosts: &[Arc<Host>; 2],
+    retained_close: bool,
+    measured: bool,
+    wire: Option<l2tunnel::secure_record::compact::Selection>,
+    channels: u16,
+) -> Result<([Prepared; 2], common_transaction_profile::Profile)> {
     let TransactionPlans {
         plans,
         profile: old,
         ..
     } = transaction_plans(l2tunnel_cover::Appearance::QuicLike, hosts)?;
     let mut resources = [
-        old.runtime_contract(Role::Initiator)?.config(),
-        old.runtime_contract(Role::Responder)?.config(),
+        old.runtime_contract(Role::Initiator)?.resources(),
+        old.runtime_contract(Role::Responder)?.resources(),
     ];
     for resource in &mut resources {
         resource.report_interval = Some(Duration::from_millis(1));
@@ -94,7 +103,7 @@ fn fixture_wire(
             },
         },
     ])?);
-    fixed.channels = 1;
+    fixed.channels = channels;
     let mut proxy = crate::proxy::runtime_config(connection, &fixed)?;
     proxy.relay.max_record_bytes = 512;
     proxy.relay.maximum = l2tunnel_tcp_proxy::Window {
@@ -551,3 +560,5 @@ mod measured_policy;
 
 #[path = "proxy_common_compact.rs"]
 mod compact_wire;
+#[path = "proxy_common_maintained.rs"]
+mod maintained;

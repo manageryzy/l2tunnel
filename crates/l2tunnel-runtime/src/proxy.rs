@@ -21,9 +21,9 @@ mod config;
 /// Explicit measured-profile actor over the same bounded retained-lane machinery.
 /// Client selection and native advertised-window qualification are separate gates.
 pub mod measured;
+mod record;
 #[path = "proxy/io.rs"]
 mod transport;
-pub(crate) use transport::control_interval;
 mod wire;
 pub use config::{
     Config, DeliveryPolicy, IpPrefix, MemoryBound, MuxPolicy, NativePolicy, PortRange, RelayPolicy,
@@ -36,6 +36,8 @@ pub struct Link {
     binding: SessionConfig,
     originator: bool,
     logical: [u8; 16],
+    // Common owns physical Full/Half lanes and presents one ordered actor port.
+    common_ordered: bool,
 }
 fn checked(connection: &AuthenticatedConnection, config: &Config) -> io::Result<bool> {
     checked_bound(connection, session_config(config)?)
@@ -62,6 +64,7 @@ impl Link {
             binding,
             originator,
             logical,
+            common_ordered: false,
         })
     }
 }
@@ -82,6 +85,7 @@ pub async fn client_pair(
         binding,
         originator: true,
         logical,
+        common_ordered: false,
     })
 }
 /// Accept the existing pairing proof without replacing either authenticated TLS object.
@@ -101,6 +105,7 @@ pub async fn server_pair(
         binding,
         originator: false,
         logical,
+        common_ordered: false,
     })
 }
 /// Observable lifecycle; only Closed represents a completed session drain.

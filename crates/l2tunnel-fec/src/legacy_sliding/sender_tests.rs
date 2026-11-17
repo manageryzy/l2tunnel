@@ -147,7 +147,7 @@ fn feedback_m_holes_emits_m_frozen_rows_and_rearms_only_feedback_repair() -> Tes
         let id = OutputId::Repair(repair.equation.id);
         let mut encoded = [0; 95];
         let count = sender.encode_pending(&mut encoded)?;
-        assert_eq!(count, wire::HEADER_BYTES + 10 + 13);
+        assert_eq!(count, wire::HEADER_BYTES + 10 + 4);
         assert_eq!(sender.pending_wire_len(), Some(count));
         assert_eq!(
             sender.receive_feedback(receipt, Tick(finished), &mut random)?,

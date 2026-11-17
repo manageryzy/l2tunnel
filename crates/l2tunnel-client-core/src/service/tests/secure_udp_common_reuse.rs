@@ -81,14 +81,17 @@ async fn exercise(wire: Option<l2tunnel::secure_record::compact::Selection>) -> 
         for handle in &handles {
             let frame = common_frame(handle)?;
             let status = frame.status()?;
+            let protection = status
+                .compact_wire
+                .as_ref()
+                .ok_or("current wire status absent")?;
             assert_eq!(
-                status.compact_wire.as_ref().map(|value| value.effective),
-                wire.map(|value| {
-                    crate::secure_udp::common_status::CompactWireSelection::from_selection(value)
-                        .map(Some)
-                })
-                .transpose()?
+                protection.requested,
+                crate::secure_udp::common_status::CompactWireSelection::from_selection(
+                    profile.compact_wire(),
+                )?
             );
+            assert_eq!(protection.effective, Some(protection.requested));
             let selected = status
                 .connection_reuse
                 .ok_or("selected idle controller absent")?;

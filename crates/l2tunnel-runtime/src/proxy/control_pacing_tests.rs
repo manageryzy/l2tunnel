@@ -107,7 +107,6 @@ async fn every_physical_control_kind_is_paced_without_catchup_or_failed_flush_pr
             Direction {
                 index: 0,
                 lane: 0,
-                session: [9; 16],
                 bulk: true,
             },
             rate,
@@ -219,7 +218,6 @@ async fn every_physical_control_kind_is_paced_without_catchup_or_failed_flush_pr
             Direction {
                 index: 0,
                 lane: 0,
-                session: [9; 16],
                 bulk: true,
             },
             16,
@@ -268,7 +266,6 @@ async fn waiting_control_slot_keeps_actual_user_records_serviceable() -> io::Res
         Direction {
             index: 0,
             lane: 0,
-            session: [9; 16],
             bulk: true,
         },
         16,
@@ -305,8 +302,8 @@ async fn waiting_control_slot_keeps_actual_user_records_serviceable() -> io::Res
     let bytes = tokio::time::timeout(Duration::from_millis(1), frame(&mut reader))
         .await
         .map_err(error)??;
-    let (header, _) = crate::wire::decode(&bytes, 1600).map_err(crate::wire_error)?;
-    assert_eq!(header.kind, crate::wire::Kind::Data);
+    let (kind, _) = crate::proxy::record::decode(&bytes, 1600)?;
+    assert_eq!(kind, crate::proxy::record::Kind::Data);
     task.abort();
     assert!(task.await.is_err());
     Ok(())
@@ -329,7 +326,6 @@ async fn buffered_or_unpaced_controls_receive_bounded_service_without_false_fail
         Direction {
             index: 0,
             lane: 0,
-            session: [9; 16],
             bulk: true,
         },
         expected,
@@ -341,18 +337,9 @@ async fn buffered_or_unpaced_controls_receive_bounded_service_without_false_fail
     let frames = [Frame::Start(expected), Frame::Ready(expected)]
         .into_iter()
         .chain((1..=15).map(Frame::Ping));
-    for (number, frame) in frames.enumerate() {
-        let bytes = crate::wire::encode(
-            crate::wire::Header {
-                kind: crate::wire::Kind::Control,
-                epoch: l2tunnel_core::Epoch(1),
-                packet_number: number as u64,
-                session: [9; 16],
-                lane: 0,
-            },
-            &frame.encode(),
-        )
-        .map_err(crate::wire_error)?;
+    for frame in frames {
+        let bytes =
+            crate::proxy::record::encode(crate::proxy::record::Kind::Control, &frame.encode())?;
         sender.write_u32(bytes.len() as u32).await?;
         sender.write_all(&bytes).await?;
     }

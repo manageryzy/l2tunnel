@@ -161,7 +161,12 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                             lose
                         }
                         Output::Repair(r) => {
-                            assert_eq!(bytes.len(), full, "repairs are never trimmed");
+                            let extent = (r.support.start..r.support.end)
+                                .map(|id| 2 + original(id).len())
+                                .max()
+                                .ok_or("empty repair support")?;
+                            assert_eq!(r.bytes.len(), extent);
+                            assert_eq!(bytes.len(), rolling::wire::HEADER_BYTES + extent);
                             tails += usize::from(r.support.tail);
                             let lose = r.id.0 % 4 == 1;
                             dropped[1] += usize::from(lose);
@@ -489,7 +494,14 @@ fn deficit_uses_committed_known_columns_and_independent_equation_rank() -> Resul
     let first = receiver.pending_feedback().ok_or("source feedback")?;
     assert_eq!((first.prefix, first.observed_end, first.deficit), (0, 4, 3));
     receiver.confirm_feedback(first.id, Tick(0))?;
+    // Independent equation for one-byte originals a/b/c/d: coefficients
+    // de/46/bc/cf produce encoded length 00eb and payload e4. Only the
+    // configured unused columns are omitted; the width field remains 34.
     let literal = unhex(include_str!("fixtures/rolling-scheduler-repair.hex"))?;
+    assert_eq!(literal[4], 3);
+    assert_eq!(&literal[60..62], &[0, 34]);
+    assert_eq!(literal.len(), rolling::wire::HEADER_BYTES + 3);
+    assert_eq!(&literal[rolling::wire::HEADER_BYTES..], &[0, 0xeb, 0xe4]);
     receiver.receive_wire(&literal, Tick(1))?;
     drive_receiver(&mut receiver, Tick(1), 1)?;
     assert_eq!(receiver.status().decoder.rank, 1);

@@ -173,13 +173,10 @@ pub(super) fn framing_pair(capacity: usize) -> io::Result<(Adapter, DuplexStream
     };
     let link = Link {
         inner: crate::Link {
-            managed_metadata: None,
             reader: Box::pin(reader),
             writer: Box::pin(writer),
             reverse_reader: None,
             reverse_writer: None,
-            receive_session: session.session_id,
-            send_session: session.session_id,
             layer: PacketLayer::Ethernet,
         },
         info: Info {
@@ -332,27 +329,46 @@ async fn retained_tls_invalid_lengths_phase_and_partial_eof_release_before_deliv
         let (mut adapter, mut peer) = framing_pair(64)?;
         peer.write_all(&frame).await?;
         let mut output = [0; 1024];
-        assert_eq!(
-            poll_fn(|cx| adapter.poll_receive(cx, &mut output))
-                .await
-                .err()
-                .map(|e| e.kind()),
-            Some(io::ErrorKind::InvalidData)
-        );
+        let error = poll_fn(|cx| adapter.poll_receive(cx, &mut output))
+            .await
+            .err()
+            .ok_or("invalid framing must be rejected")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!adapter.peer_close_error(&error));
         assert!(adapter.lanes.is_empty());
     }
     let (mut adapter, mut peer) = framing_pair(64)?;
     peer.write_all(&[0, 0, 0, 5, 1, 7]).await?;
     drop(peer);
     let mut output = [0; 1024];
-    assert_eq!(
-        poll_fn(|cx| adapter.poll_receive(cx, &mut output))
-            .await
-            .err()
-            .map(|e| e.kind()),
-        Some(io::ErrorKind::UnexpectedEof)
-    );
+    let error = poll_fn(|cx| adapter.poll_receive(cx, &mut output))
+        .await
+        .err()
+        .ok_or("a truncated frame must be rejected")?;
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(!adapter.peer_close_error(&error));
     assert!(adapter.lanes.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_tls_boundary_eof_preserves_typed_owner_close() -> TestResult {
+    let (mut adapter, mut peer) = framing_pair(64)?;
+    peer.shutdown().await?;
+    let mut output = [0; 64];
+    let error = poll_fn(|cx| adapter.poll_receive(cx, &mut output))
+        .await
+        .err()
+        .ok_or("the original stream has ended")?;
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(adapter.peer_close_error(&error));
+    assert!(adapter.retained_output_empty());
+    assert!(!adapter.peer_close_error(&io::ErrorKind::UnexpectedEof.into()));
+    let repeated = poll_fn(|cx| adapter.poll_receive(cx, &mut output))
+        .await
+        .err()
+        .ok_or("the first failure remains terminal")?;
+    assert!(adapter.peer_close_error(&repeated));
     Ok(())
 }
 

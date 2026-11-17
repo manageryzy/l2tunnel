@@ -61,6 +61,7 @@ fn compact_carrier_all_routes_and_external_metadata_are_bound_without_extra_wire
         for (kind, route, scope) in [
             (Kind::Data, 0x80, data()),
             (Kind::Feedback, 0xc0, data()),
+            (Kind::AuthenticatedData, 2, data()),
             (Kind::Control, 0, control()),
             (Kind::CarrierControl, 1, control()),
         ] {
@@ -100,7 +101,7 @@ fn compact_carrier_all_routes_and_external_metadata_are_bound_without_extra_wire
         // Management and raw carrier controls share exactly one strong counter.
         assert_eq!(a.next_number(Class::Control).0, 2);
         assert_eq!(a.next_number(Class::User).0, 1);
-        assert_eq!(a.next_feedback_number()?.0, 1);
+        assert_eq!(a.next_feedback_number().0, 2);
     }
     Ok(())
 }
@@ -126,12 +127,24 @@ fn compact_carrier_route_relabeling_cannot_cross_management_authority_or_reader_
         let packet = seal(&mut a, Kind::Data, next, aad, &[index])?;
         assert_eq!(packet[0], 0x80 | (index & 63));
         b.open_compact_with_carrier(&packet, aad, &mut [0; 1600], &mut [0; 1024])?;
+        let strong = seal(&mut a, Kind::AuthenticatedData, next, aad, &[index])?;
+        let slot = index & 63;
+        assert_eq!(strong[0], if slot < 22 { 2 + slot } else { 58 + slot });
+        assert!(
+            !(24..=79).contains(&strong[0]),
+            "all carrier bootstrap prefixes remain disjoint"
+        );
+        b.open_compact_with_carrier(&strong, aad, &mut [0; 1600], &mut [0; 1024])?;
         a.activate_data(next)?;
         b.activate_data(next)?;
         a.retire_data(old)?;
         b.retire_data(old)?;
     }
-    assert!(Layout::Carrier.kind(2).is_err());
-    assert!(Layout::Carrier.kind(0x7f).is_err());
+    for byte in (24..80).chain(122..128) {
+        assert!(Layout::Carrier.kind(byte).is_err());
+    }
+    assert_eq!(Layout::Carrier.kind(23)?, Kind::AuthenticatedData);
+    assert_eq!(Layout::Carrier.kind(80)?, Kind::AuthenticatedData);
+    assert_eq!(Layout::Carrier.kind(121)?, Kind::AuthenticatedData);
     Ok(())
 }

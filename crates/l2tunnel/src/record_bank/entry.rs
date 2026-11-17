@@ -97,6 +97,23 @@ impl<'a> Entry<'a> {
         Self { generation, engine }
     }
 
+    /// Consume an actual device receipt only after reliable control accepts it.
+    pub fn native_delivery_queued(&mut self, receipt: engine::NativeDelivery) -> Result<(), Error> {
+        self.engine
+            .native_delivery_queued(receipt)
+            .map_err(Error::Engine)
+    }
+    /// Apply exact strong authenticated native delivery in this generation.
+    pub fn accept_native_delivery(
+        &mut self,
+        received: engine::Tick,
+        now: engine::Tick,
+        identity: l2tunnel_codec::aligned_receiver::RecordIdentity,
+    ) -> Result<(), Error> {
+        self.engine
+            .accept_native_delivery(received, now, identity)
+            .map_err(Error::Engine)
+    }
     /// Exact issuing Bank generation; a copied ID confers no physical authority.
     pub const fn generation(&self) -> GenerationId {
         self.generation

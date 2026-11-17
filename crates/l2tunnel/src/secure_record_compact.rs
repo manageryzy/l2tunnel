@@ -46,7 +46,7 @@ impl From<Error> for AlgorithmError {
 /// Explicit authenticated compact selection; there is no implicit default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Selection {
-    /// Selected four-byte data check, with different integrity guarantees.
+    /// Selected data protection, including the full-tag authenticated profile.
     pub protection: sec::Protection,
     /// Bounded sequence reconstruction and lifetime failed-check allowance.
     pub limits: sec::Selection,
@@ -65,12 +65,21 @@ pub struct CheckStatus {
     pub limit: u32,
 }
 impl Selection {
-    /// Validate supported data profiles and explicit nonzero finite limits.
+    /// Actual final data framing, including the selected protection tag.
+    pub const fn data_overhead(self) -> usize {
+        PREFIX_BYTES + self.protection.tag_bytes()
+    }
+    /// Largest selected complete record overhead for bounded caller storage.
+    pub const fn maximum_overhead(self) -> usize {
+        if self.data_overhead() > AUTHENTICATED_OVERHEAD {
+            self.data_overhead()
+        } else {
+            AUTHENTICATED_OVERHEAD
+        }
+    }
+    /// Validate explicit nonzero finite limits.
     pub fn validate(self) -> Result<(), Error> {
-        if !matches!(
-            self.protection,
-            sec::Protection::Aes128Ccm4 | sec::Protection::ChaCha20Crc32c
-        ) || self.limits.max_forward_packets == 0
+        if self.limits.max_forward_packets == 0
             || self.limits.max_forward_packets > i32::MAX as u32
             || self.limits.max_failed_checks == 0
         {
@@ -94,6 +103,9 @@ impl Layout {
         match (self, byte) {
             (Self::Original, 0..=63) | (Self::Carrier, 128..=191) => Ok(Kind::Data),
             (Self::Original, 64..=127) | (Self::Carrier, 192..=255) => Ok(Kind::Feedback),
+            (Self::Original, 192..=255) | (Self::Carrier, 2..=23 | 80..=121) => {
+                Ok(Kind::AuthenticatedData)
+            }
             (Self::Original, 128) | (Self::Carrier, 0) => Ok(Kind::Control),
             (Self::Carrier, 1) => Ok(Kind::CarrierControl),
             _ => Err(Error::Malformed),
@@ -106,9 +118,15 @@ impl Layout {
         match (self, kind) {
             (Self::Original, Kind::Data) => Ok(slot),
             (Self::Original, Kind::Feedback) => Ok(0x40 | slot),
+            (Self::Original, Kind::AuthenticatedData) => Ok(0xc0 | slot),
             (Self::Original, Kind::Control) => Ok(0x80),
             (Self::Carrier, Kind::Data) => Ok(0x80 | slot),
             (Self::Carrier, Kind::Feedback) => Ok(0xc0 | slot),
+            // Skip every supported OpenVPN opcode/key byte (24..=79), including
+            // the raw bootstrap 0x48 and QUIC bootstrap 0x4c prefixes.
+            (Self::Carrier, Kind::AuthenticatedData) => {
+                Ok(if slot < 22 { 2 + slot } else { 58 + slot })
+            }
             (Self::Carrier, Kind::Control) => Ok(0),
             (Self::Carrier, Kind::CarrierControl) => Ok(1),
             _ => Err(Error::ScopeState),
@@ -121,6 +139,9 @@ impl Layout {
 pub enum Kind {
     /// Source/repair data; CRC selection grants no authenticated control rights.
     Data,
+    /// Opaque application records containing control; full-tag protection under
+    /// the feedback key and shared counter, with a distinct authenticated route.
+    AuthenticatedData,
     /// Reliable-retiring feedback under the dedicated strong domain.
     Feedback,
     /// Fixed-scope management under the independent strong domain.
@@ -131,14 +152,14 @@ pub enum Kind {
 impl Kind {
     fn class(self) -> Class {
         match self {
-            Self::Data | Self::Feedback => Class::User,
+            Self::Data | Self::AuthenticatedData | Self::Feedback => Class::User,
             Self::Control | Self::CarrierControl => Class::Control,
         }
     }
-    fn tag_bytes(self) -> usize {
+    fn tag_bytes(self, selection: Selection) -> usize {
         match self {
-            Self::Data => 4,
-            Self::Feedback | Self::Control | Self::CarrierControl => 16,
+            Self::Data => selection.protection.tag_bytes(),
+            Self::AuthenticatedData | Self::Feedback | Self::Control | Self::CarrierControl => 16,
         }
     }
 }
@@ -221,7 +242,12 @@ impl Records {
         layout: Layout,
     ) -> Result<Self, Error> {
         selection.validate()?;
-        capacity(cover, limits, 16, limits.max_body_bytes)?;
+        capacity(
+            cover,
+            limits,
+            selection.maximum_overhead() - PREFIX_BYTES,
+            limits.max_body_bytes,
+        )?;
         let mut owners = Vec::new();
         owners.try_reserve_exact(1).map_err(|_| Error::Allocation)?;
         owners.push(Owners {
@@ -275,69 +301,51 @@ impl Records {
         Ok(Self {
             cover,
             limits,
-            protection: security::Protection::ChaCha20Poly1305,
             control,
             data,
             additional: None,
-            owners: super::Owners::Compact(owners),
+            owners,
         })
     }
 
-    /// Actual installed format observation, independent of requested configuration.
-    pub fn is_compact(&self) -> bool {
-        matches!(self.owners, super::Owners::Compact(_))
-    }
     /// Actual installed data check and bounded failure/reconstruction policy.
-    pub fn compact_selection(&self) -> Option<Selection> {
-        match &self.owners {
-            super::Owners::Compact(owners) => Some(owners[0].selection),
-            _ => None,
-        }
+    pub fn compact_selection(&self) -> Selection {
+        self.owners[0].selection
     }
     /// Actual installed final namespace.
-    pub fn compact_layout(&self) -> Option<Layout> {
-        match &self.owners {
-            super::Owners::Compact(owners) => Some(owners[0].layout),
-            _ => None,
-        }
+    pub fn compact_layout(&self) -> Layout {
+        self.owners[0].layout
     }
-    /// Actual compact singleton backing, excluding this Records inline layout.
+    /// Actual singleton backing, excluding this Records inline layout.
     /// This is a Rust owner-layout charge, not allocator or crypto-provider RSS.
     pub fn compact_owner_bytes(&self) -> usize {
-        match &self.owners {
-            super::Owners::Compact(owners) => owners.capacity() * std::mem::size_of::<Owners>(),
-            _ => 0,
-        }
+        self.owners.capacity() * std::mem::size_of::<Owners>()
+            + self.owners[0].data_receiver.reserved_bytes()
+            + self.owners[0].feedback_receiver.reserved_bytes()
+            + self.owners[0].control_receiver.reserved_bytes()
     }
     /// Actual independent check budgets; no scope operation resets them.
-    pub fn compact_check_status(&self) -> Option<CheckStatus> {
-        match &self.owners {
-            super::Owners::Compact(owners) => {
-                let owner = &owners[0];
-                Some(CheckStatus {
-                    data: owner.data_receiver.failed_checks(),
-                    feedback: owner.feedback_receiver.failed_checks(),
-                    control: owner.control_receiver.failed_checks(),
-                    limit: owner.selection.limits.max_failed_checks,
-                })
-            }
-            _ => None,
+    pub fn compact_check_status(&self) -> CheckStatus {
+        let owner = &self.owners[0];
+        CheckStatus {
+            data: owner.data_receiver.failed_checks(),
+            feedback: owner.feedback_receiver.failed_checks(),
+            control: owner.control_receiver.failed_checks(),
+            limit: owner.selection.limits.max_failed_checks,
         }
     }
     /// Exact kind-specific full packet size, including its actual check.
-    /// Legacy formats keep their unchanged class-independent packet size.
     pub fn capacity_for(&self, kind: Kind, bytes: usize) -> Result<Capacity, Error> {
-        if !self.is_compact() {
-            return self.capacity(bytes);
-        }
-        capacity(self.cover, self.limits, kind.tag_bytes(), bytes)
+        capacity(
+            self.cover,
+            self.limits,
+            kind.tag_bytes(self.compact_selection()),
+            bytes,
+        )
     }
     /// Next independent strongly authenticated feedback number, without reservation.
-    pub fn next_feedback_number(&self) -> Result<security::PacketNumber, Error> {
-        match &self.owners {
-            super::Owners::Compact(owners) => Ok(owners[0].feedback_sender.next_number()),
-            _ => Err(Error::ScopeState),
-        }
+    pub fn next_feedback_number(&self) -> security::PacketNumber {
+        self.owners[0].feedback_sender.next_number()
     }
     /// Seal reliable-retiring feedback using its registered epoch and strong owner.
     /// Algorithm feedback remains lossy; no reliable control-stream bypass is added.
@@ -352,6 +360,27 @@ impl Records {
         self.seal_compact(Kind::Feedback, scope, outer, plaintext, workspace, output)
     }
 
+    /// Seal opaque records containing authenticated application control. This
+    /// shares the feedback counter and replay window, but grants no feedback
+    /// authority; changing the route invalidates the full authentication tag.
+    pub fn seal_authenticated_data_in(
+        &mut self,
+        scope: Scope,
+        outer: cover::PacketMeta,
+        plaintext: &[u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<Sealed, Error> {
+        self.seal_compact(
+            Kind::AuthenticatedData,
+            scope,
+            outer,
+            plaintext,
+            workspace,
+            output,
+        )
+    }
+
     /// Encode the actual selected CompactARQ union directly into final protection.
     /// No legacy recovery context or Reliable wrapper is serialized in this path.
     /// Call from the recovery owner's transactional encoder callback, then retain
@@ -364,9 +393,6 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, AlgorithmError> {
-        if !self.is_compact() {
-            return Err(Error::ScopeState.into());
-        }
         let kind = match view.kind() {
             CompactPacketKind::Data => Kind::Data,
             CompactPacketKind::Feedback => Kind::Feedback,
@@ -419,7 +445,7 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
-        if self.compact_layout() != Some(Layout::Carrier) {
+        if self.compact_layout() != Layout::Carrier {
             return Err(Error::ScopeState);
         }
         self.seal_compact_from(
@@ -454,10 +480,7 @@ impl Records {
         if workspace_bytes < cap.seal_workspace_bytes || output.len() < cap.packet_bytes {
             return Err(Error::OutputTooSmall);
         }
-        let super::Owners::Compact(owners) = &mut self.owners else {
-            return Err(Error::ScopeState);
-        };
-        let owner = &mut owners[0];
+        let owner = &mut self.owners[0];
         let slot = if kind.class() == Class::Control {
             0
         } else if scope == self.data {
@@ -481,7 +504,7 @@ impl Records {
         };
         let sender = match kind {
             Kind::Data => &mut owner.data_sender,
-            Kind::Feedback => &mut owner.feedback_sender,
+            Kind::AuthenticatedData | Kind::Feedback => &mut owner.feedback_sender,
             Kind::Control | Kind::CarrierControl => &mut owner.control_sender,
         };
         let sealed = sender.seal(metadata, plaintext, &mut output[1..cap.packet_bytes])?;
@@ -510,7 +533,7 @@ impl Records {
         workspace: &mut [u8],
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
-        if self.compact_layout() != Some(Layout::Carrier) {
+        if self.compact_layout() != Layout::Carrier {
             return Err(Error::ScopeState);
         }
         self.open_compact_from(packet, carrier_aad, workspace, plaintext)
@@ -524,7 +547,7 @@ impl Records {
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
         let byte = *packet.first().ok_or(Error::Malformed)?;
-        let kind = self.compact_layout().ok_or(Error::ScopeState)?.kind(byte)?;
+        let kind = self.compact_layout().kind(byte)?;
         let mut aad = [0; security::MAX_METADATA_BYTES];
         let aad_len = carrier_aad
             .len()
@@ -533,19 +556,21 @@ impl Records {
             .ok_or(Error::TooLarge)?;
         aad[0] = byte;
         aad[1..aad_len].copy_from_slice(carrier_aad);
+        let selection = self.compact_selection();
         let body_bytes = packet
             .len()
-            .checked_sub(PREFIX_BYTES + kind.tag_bytes())
+            .checked_sub(PREFIX_BYTES + kind.tag_bytes(selection))
             .ok_or(Error::Malformed)?;
         let cap = self.capacity_for(kind, body_bytes)?;
         if workspace.len() < cap.open_workspace_bytes || plaintext.len() < body_bytes {
             return Err(Error::OutputTooSmall);
         }
-        let super::Owners::Compact(owners) = &mut self.owners else {
-            return Err(Error::ScopeState);
+        let owner = &mut self.owners[0];
+        let slot = if owner.layout == Layout::Carrier && kind == Kind::AuthenticatedData {
+            if byte < 24 { byte - 2 } else { byte - 58 }
+        } else {
+            byte & 0x3f
         };
-        let owner = &mut owners[0];
-        let slot = byte & 0x3f;
         let scope = if kind.class() == Class::Control {
             self.control
         } else if slot == owner.data_slot {
@@ -557,7 +582,7 @@ impl Records {
         };
         let receiver = match kind {
             Kind::Data => &mut owner.data_receiver,
-            Kind::Feedback => &mut owner.feedback_receiver,
+            Kind::AuthenticatedData | Kind::Feedback => &mut owner.feedback_receiver,
             Kind::Control | Kind::CarrierControl => &mut owner.control_receiver,
         };
         let opened = receiver.open(
@@ -579,6 +604,7 @@ impl Records {
             feedback: kind == Kind::Feedback,
             authenticated: kind != Kind::Data
                 || owner.selection.protection != sec::Protection::ChaCha20Crc32c,
+            strongly_authenticated: kind.tag_bytes(owner.selection) >= 16,
         })
     }
 }

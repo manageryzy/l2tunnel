@@ -1,13 +1,15 @@
-//! Native Swift transport and fixed authenticated control on one retained UDP socket.
+//! Common native records and authenticated control on the selected retained carrier.
 //!
-//! Device creation and privilege belong to the caller. This Unix driver owns no
+//! Device creation and privilege belong to the caller. This driver owns no
 //! side channel and never turns a local configuration edit into a peer switch.
 
 use super::{control as control_owner, establish, member};
 use l2tunnel::secure_record::{self as record, Class, Scope};
 use l2tunnel_core as core;
 use l2tunnel_cover as cover;
-use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
+#[cfg(all(test, unix))]
+use l2tunnel_device::PacketDevice;
+use l2tunnel_device::{PacketLayer, READ_BUFFER_BYTES};
 use l2tunnel_management::{
     self as mg, control_streams as streams, delivery, session_control as control, transaction,
 };
@@ -16,12 +18,21 @@ use l2tunnel_recovery as recovery;
 use l2tunnel_security as security;
 use l2tunnel_swift::{self as swift, policy, records};
 use ring::digest;
-use std::{future::Future, io, os::fd::AsRawFd, time::Duration};
+#[cfg(all(test, unix))]
+use std::os::fd::AsRawFd;
+use std::{future::Future, io, time::Duration};
+#[cfg(all(test, unix))]
+use tokio::io::unix::AsyncFd;
 use tokio::{
-    io::{Interest, unix::AsyncFd},
+    io::Interest,
     sync::{mpsc, oneshot},
     time::{Instant, sleep_until},
 };
+
+#[path = "transport_native_ready.rs"]
+mod native_ready;
+pub use native_ready::NativeDevice;
+use native_ready::{NativeGuard, NativeReady};
 
 const SCALE: u128 = 1_000_000;
 const MAX_QUEUE: usize = 16 * 1024 * 1024;
@@ -39,9 +50,6 @@ mod owner;
 #[path = "transport_buffers.rs"]
 mod buffers;
 
-#[path = "transport_engines.rs"]
-mod engines;
-
 #[path = "transport_transaction.rs"]
 mod transactions;
 
@@ -51,10 +59,7 @@ mod transaction_family;
 #[path = "transport_common_engines.rs"]
 mod common_engines;
 
-#[path = "transport_contract.rs"]
-mod transaction_contract;
 pub use performance::Performance;
-pub use transaction_contract::TransactionContract;
 #[path = "transport_carrier.rs"]
 mod carrier;
 #[path = "transport_common_research_order.rs"]
@@ -66,7 +71,11 @@ mod raw_send;
 use super::raw_carrier_io as raw_carrier;
 #[path = "transport_common.rs"]
 mod common;
-pub(crate) use common::{run_common_proxy_records, run_common_proxy_records_on_raw};
+#[cfg(unix)]
+pub(crate) use common::{
+    run_common_proxy_records, run_common_proxy_records_on_maintained,
+    run_common_proxy_records_on_raw,
+};
 #[path = "transport_common_actions.rs"]
 mod common_actions;
 #[path = "transport_common_connections.rs"]
@@ -86,173 +95,40 @@ mod common_ingress;
 mod common_io;
 #[path = "transport_common_native.rs"]
 mod common_native;
-pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
-#[path = "transport_construction.rs"]
-mod construction;
-#[path = "transport_generic.rs"]
-mod generic;
-#[path = "transport_generic_actions.rs"]
-mod generic_actions;
+#[path = "transport_common_native_window.rs"]
+mod common_native_window;
 pub use common::{
-    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped, SameFlowRecovery,
-    common_channel, run_common, run_common_on_carrier, run_common_on_maintained, run_common_on_raw,
+    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped,
+    NativeDeliverySnapshot, SameFlowRecovery, common_channel, run_common, run_common_on_carrier,
+    run_common_on_maintained, run_common_on_raw,
 };
-pub use common_contract::{CommonTransactionContract, FreshKeyPolicy};
-pub use generic::{
-    TransactionControlHandle, TransactionControlRequests, TransactionSnapshot, TransactionStopped,
-    transaction_channel,
-};
-
-// Keep the explicit selection inline; no hidden allocation chooses a backend.
-#[allow(clippy::large_enum_variant)]
-enum Start {
-    Legacy(security::ConfigDigest, Config),
-    #[cfg(test)]
-    Transaction(TransactionContract),
-}
-// The sole loop returns no backend snapshot. In particular, Common observations
-// must not enlarge the legacy/generic constructor and readiness poll frames.
+pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
+pub use common_contract::CommonTransactionContract;
+// The sole loop returns no snapshot payload, keeping constructor and readiness
+// poll frames independent of the size of Common observations.
 struct LoopCompletion {
     reason: StopReason,
     at: u64,
 }
 enum Requests {
-    Legacy(Option<ControlRequests>),
-    Transaction(Option<TransactionControlRequests>),
     Common(Option<CommonControlRequests>),
 }
 // One bounded complete canonical request crosses the channel without a new heap owner.
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Legacy(swift::control::Policy, Reply),
-    Transaction(
-        l2tunnel::swift_configuration::Configuration,
-        generic::TransactionReply,
-    ),
     Common(common::Command),
 }
 impl Requests {
     fn enabled(&self) -> bool {
         match self {
-            Self::Legacy(value) => value.is_some(),
-            Self::Transaction(value) => value.is_some(),
             Self::Common(value) => value.is_some(),
         }
     }
     fn close(&mut self) {
         match self {
-            Self::Legacy(value) => *value = None,
-            Self::Transaction(value) => *value = None,
             Self::Common(value) => *value = None,
         }
     }
-}
-
-/// Run the explicitly selected generic transaction backend on the original socket.
-/// Resource preallocation limitations remain visible in every snapshot.
-/// Construction completes before this function returns its sole I/O future;
-/// errors are returned when awaited. Delayed polling never renews the setup cap.
-pub fn run_transaction<D>(
-    device: D,
-    parts: member::Parts,
-    contract: TransactionContract,
-    requests: Option<TransactionControlRequests>,
-    shutdown: impl Future<Output = ()> + Send,
-    observe: impl FnMut(&TransactionSnapshot) + Send,
-) -> impl Future<Output = io::Result<TransactionStopped>> + Send
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    run_prepared_transaction(
-        prepare_transaction_runtime(device, parts, contract),
-        requests,
-        shutdown,
-        observe,
-    )
-}
-
-struct PreparedTransaction<D> {
-    device: D,
-    socket: tokio::net::UdpSocket,
-    driver: owner::StateCell<Driver>,
-    setup_deadline: Instant,
-}
-
-// Keep actual construction out of the readiness future's nested poll frames.
-#[inline(never)]
-fn prepare_transaction_runtime<D>(
-    device: D,
-    parts: member::Parts,
-    contract: TransactionContract,
-) -> io::Result<PreparedTransaction<D>>
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    let layer = match contract.config().send.records.layer {
-        records::Layer::Ethernet => PacketLayer::Ethernet,
-        records::Layer::Ip => PacketLayer::Ip,
-    };
-    if device.layer() != layer {
-        return Err(invalid(
-            "authenticated native layer differs from actual device",
-        ));
-    }
-    let setup_deadline = parts.deadline;
-    let (socket, driver) =
-        Driver::new_transaction_with(parts, contract, Instant::now(), true, |socket, driver| {
-            Ok((socket, owner::StateCell::new(driver)?))
-        })?;
-    if Instant::now() >= setup_deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "original setup deadline after generic construction",
-        ));
-    }
-    Ok(PreparedTransaction {
-        device,
-        socket,
-        driver,
-        setup_deadline,
-    })
-}
-
-async fn run_prepared_transaction<D>(
-    prepared: io::Result<PreparedTransaction<D>>,
-    requests: Option<TransactionControlRequests>,
-    shutdown: impl Future<Output = ()> + Send,
-    mut observe: impl FnMut(&TransactionSnapshot) + Send,
-) -> io::Result<TransactionStopped>
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    let PreparedTransaction {
-        device,
-        socket,
-        mut driver,
-        setup_deadline,
-    } = prepared?;
-    let completion = run_driver_clock(
-        device,
-        socket.into(),
-        &mut driver,
-        setup_deadline,
-        Requests::Transaction(requests),
-        None,
-        shutdown,
-        move |driver, now, running| {
-            observe(&driver.snapshot_transaction(now, running)?);
-            Ok(())
-        },
-        Instant::now,
-    )
-    .await?;
-    if driver.common.is_some() || driver.generic.is_none() {
-        return Err(protocol("generic loop returned another backend status"));
-    }
-    Ok(TransactionStopped {
-        reason: completion.reason,
-        snapshot: driver.snapshot_transaction(completion.at, false)?,
-    })
 }
 
 /// Immutable authenticated full-wire bucket, including control and feedback.
@@ -262,133 +138,9 @@ pub struct WireBudget {
     pub burst_bytes: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "transport_tests.rs"]
 mod tests;
-
-/// Run one complete authenticated native session on the original connected socket.
-///
-/// The caller retains the immutable configuration that produced
-/// `expected_configuration`. The observer must be nonblocking. No child I/O task,
-/// fallback transport, implicit device setup or peer-confirmed close is created.
-#[allow(clippy::too_many_arguments)] // Frozen ownership boundary keeps each resource explicit.
-pub async fn run<D>(
-    device: D,
-    parts: member::Parts,
-    expected_configuration: security::ConfigDigest,
-    config: Config,
-    requests: Option<ControlRequests>,
-    resolve: Resolver,
-    shutdown: impl Future<Output = ()> + Send,
-    observe: impl FnMut(&Snapshot) + Send,
-) -> io::Result<Stopped>
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    run_clock(
-        device,
-        parts,
-        expected_configuration,
-        config,
-        requests,
-        resolve,
-        shutdown,
-        observe,
-        Instant::now,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)] // Private clock seam preserves the legacy contract.
-async fn run_clock<D>(
-    device: D,
-    parts: member::Parts,
-    expected_configuration: security::ConfigDigest,
-    config: Config,
-    requests: Option<ControlRequests>,
-    resolve: Resolver,
-    shutdown: impl Future<Output = ()> + Send,
-    mut observe: impl FnMut(&Snapshot) + Send,
-    sample: impl FnMut() -> Instant + Send,
-) -> io::Result<Stopped>
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    run_selected_clock(
-        device,
-        parts,
-        Start::Legacy(expected_configuration, config),
-        Requests::Legacy(requests),
-        Some(resolve),
-        shutdown,
-        move |driver, now, running| {
-            observe(&driver.snapshot(now, running)?);
-            Ok(())
-        },
-        sample,
-        |driver, completion| {
-            if driver.common.is_some() || driver.generic.is_some() {
-                return Err(protocol("legacy loop returned generic status"));
-            }
-            Ok(Stopped {
-                reason: completion.reason,
-                snapshot: driver.snapshot(completion.at, false)?,
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)] // One I/O loop owns either explicitly selected backend.
-async fn run_selected_clock<D, T>(
-    device: D,
-    parts: member::Parts,
-    start: Start,
-    requests: Requests,
-    resolve: Option<Resolver>,
-    shutdown: impl Future<Output = ()> + Send,
-    observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
-    mut sample: impl FnMut() -> Instant + Send,
-    finish: impl FnOnce(&Driver, LoopCompletion) -> io::Result<T> + Send,
-) -> io::Result<T>
-where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
-{
-    let config = match &start {
-        Start::Legacy(_, config) => *config,
-        #[cfg(test)]
-        Start::Transaction(contract) => contract.config(),
-    };
-    let layer = match config.send.records.layer {
-        records::Layer::Ethernet => PacketLayer::Ethernet,
-        records::Layer::Ip => PacketLayer::Ip,
-    };
-    if device.layer() != layer {
-        return Err(invalid(
-            "authenticated native layer differs from actual device",
-        ));
-    }
-    let setup_deadline = parts.deadline;
-    let origin = sample();
-    let (socket, mut driver) = match start {
-        Start::Legacy(expected, config) => Driver::new(parts, expected, config, origin)?,
-        #[cfg(test)]
-        Start::Transaction(contract) => Driver::new_transaction(parts, contract, origin)?,
-    };
-    let completion = run_driver_clock(
-        device,
-        socket.into(),
-        &mut driver,
-        setup_deadline,
-        requests,
-        resolve,
-        shutdown,
-        observe,
-        sample,
-    )
-    .await?;
-    finish(&driver, completion)
-}
 
 // The one existing loop borrows its actual Driver. Common constructs its cell
 // before polling, so construction frames do not nest inside readiness polling.
@@ -399,16 +151,16 @@ async fn run_driver_clock<D, R: raw_carrier::RawBacking>(
     driver: &mut Driver,
     setup_deadline: Instant,
     mut requests: Requests,
-    resolve: Option<Resolver>,
     shutdown: impl Future<Output = ()> + Send,
     mut observe: impl FnMut(&Driver, u64, bool) -> io::Result<()> + Send,
     mut sample: impl FnMut() -> Instant + Send,
 ) -> io::Result<LoopCompletion>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     let origin = driver.origin;
-    let mut device = AsyncFd::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
+    let mut device =
+        NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
     driver.counters.loop_input_capacity_bytes = inputs.capacity_bytes();
     let ready = sample();
@@ -430,6 +182,14 @@ where
             if socket.is_maintained() {
                 tokio::task::yield_now().await;
             }
+            // Cancellation may become ready while a maintained owner yields.
+            // Observe it before another I/O poll can write or consume peer EOF.
+            // The terminal path below still settles already retained receipts.
+            if std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_ready())
+            }).await {
+                break Ok(StopReason::Cancelled);
+            }
             socket.begin_turn();
             if socket.is_carrier() {
                 socket.observe_completions().await;
@@ -437,8 +197,7 @@ where
             }
             if driver.has_transactions(){
                 if !driver.check_expiry(clock(origin,sample())?)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                if driver.common.is_some() {driver.admit_common(||clock(origin,sample()).map(duration))?;}
-                else {driver.admit_transaction(||clock(origin,sample()).map(duration))?;}
+                driver.admit_common(||clock(origin,sample()).map(duration))?;
             }
             let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
@@ -466,7 +225,7 @@ where
                 instant=sample();now=clock(origin,instant)?;
                 if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             }
-            driver.service_selected_control(now,resolve.as_ref())?;
+            driver.service_selected_control(now)?;
             driver.submit_control(now)?;
             driver.send_selected_io_sampled(&mut socket,now,instant,&mut sample)?;
             let native_before=driver.performance.counters.native_write_batch_packets;
@@ -489,8 +248,6 @@ where
                 request=next_selected_request(&mut requests),if requests.enabled()=>{
                     driver.performance.counters.request_events=driver.performance.counters.request_events.saturating_add(1);
                     match request {
-                        Some(Request::Legacy(requested,reply))=>driver.request(clock(origin,sample())?,requested,reply,resolve.as_ref().ok_or_else(||protocol("legacy resolver missing"))?)?,
-                        Some(Request::Transaction(configuration,reply))=>driver.request_transaction(clock(origin,sample())?,configuration,reply)?,
                         Some(Request::Common(common::Command::Switch(configuration,reply)))=>driver.request_common(clock(origin,sample())?,configuration,reply)?,
                         Some(Request::Common(common::Command::Reuse(request,reply)))=>driver.request_connection_reuse(clock(origin,sample())?,request,reply)?,
                         None=>requests.close(),
@@ -529,11 +286,11 @@ where
                                 }else{
                                     let received_time=received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time);
                                     if let Some(metadata)=metadata {
-                                        driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref(),metadata)?;
+                                        driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,metadata)?;
                                     }else if let Some(framing)=framing {
-                                        driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref(),framing)?;
+                                        driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,framing)?;
                                     }else{
-                                        driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,resolve.as_ref())?;
+                                        driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at)?;
                                     }
                                 }
                             },
@@ -569,16 +326,61 @@ where
             }
         }
     }.await;
-    // On a Research refusal/cancellation, retain every already observed physical
-    // fact before dropping its exact carrier witness. This performs no I/O poll.
-    let result = if socket.is_carrier() && driver.research_carrier_selected() {
+    // Retain every already observed Common physical fact before dropping its
+    // exact carrier witness, including cancellation before the next work turn.
+    // This performs no I/O poll and never replaces an earlier observed error.
+    #[cfg(unix)]
+    let mut terminal_facts_clear = true;
+    let result = if socket.is_carrier() && driver.common.is_some() {
         let facts = driver.complete_carrier_io_terminal(&mut socket, &mut sample);
+        #[cfg(unix)]
+        {
+            terminal_facts_clear = facts.is_ok();
+        }
         match result {
             Err(error) => Err(error),
             Ok(reason) => facts.map(|()| reason),
         }
     } else {
         result
+    };
+    #[cfg(all(unix, debug_assertions))]
+    if let Err(error) = &result
+        && std::env::var_os("L2TUNNEL_MEASURED_TRACE").is_some()
+    {
+        driver.trace_proxy_peer_close_refusal(
+            terminal_facts_clear,
+            socket.retained_peer_close(error),
+        );
+    }
+    // A peer may release its maintained owner after its own earlier drain cap.
+    // Only an already proved mutual EOF/ACK/physical/join barrier can stop I/O
+    // here. Keep the local original cap and return a typed retirement result;
+    // the coordinator must synchronously finish the already joined actor.
+    #[cfg(unix)]
+    let result = match result {
+        Err(error) if terminal_facts_clear && socket.retained_peer_close(&error) => {
+            match driver.proved_proxy_peer_close_cap().ok().flatten() {
+                Some(cap) => {
+                    tokio::select! {
+                        biased;
+                        () = &mut shutdown => Ok(StopReason::Cancelled),
+                        () = sleep_until(cap) => {
+                            let retired = driver.common.as_deref()
+                                .ok_or_else(|| protocol("proxy retirement owner missing"))
+                                .and_then(|runtime| driver.observe_proxy_retirement(runtime));
+                            if retired.is_err() {
+                                Err(error)
+                            } else {
+                                Ok(StopReason::ProxyRetired)
+                            }
+                        }
+                    }
+                }
+                None => Err(error),
+            }
+        }
+        other => other,
     };
     let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {
@@ -594,19 +396,6 @@ where
         ),
     };
     driver.terminal = Some(reason);
-    if let Some(reply) = driver.waiting.take() {
-        let _ = reply.send(Err(SwitchError::Closed));
-    }
-    if let Some(generic) = &mut driver.generic
-        && let Some(request) = generic.request.take()
-    {
-        let _ = request.reply.send(Err(SwitchError::Closed));
-    }
-    if let Some(generic) = &mut driver.generic
-        && let Some((reply, _)) = generic.completion.take()
-    {
-        let _ = reply.send(Err(SwitchError::Closed));
-    }
     if let Some(common) = &mut driver.common {
         if let Some(request) = common.request.take() {
             let _ = request.reply.send(Err(SwitchError::Closed));
@@ -619,17 +408,17 @@ where
     result.map(|reason| LoopCompletion { reason, at: now })
 }
 
-enum IoEvent<'a, D: AsRawFd> {
+enum IoEvent<'a, D: NativeDevice> {
     Udp,
-    Native(tokio::io::unix::AsyncFdReadyMutGuard<'a, D>),
+    Native(NativeGuard<'a, D>),
     Timer,
 }
 
 // The caller polls shutdown and control first. Alternate ready I/O priorities so
 // elapsed receive work cannot renew UDP's quota ahead of every native read.
-async fn next_io<'a, D: AsRawFd, R: raw_carrier::RawBacking>(
+async fn next_io<'a, D: NativeDevice, R: raw_carrier::RawBacking>(
     socket: &mut carrier::IoOwner<R>,
-    device: &'a mut AsyncFd<D>,
+    device: &'a mut NativeReady<D>,
     interest: Interest,
     native: bool,
     udp: bool,
@@ -655,23 +444,13 @@ async fn next_io<'a, D: AsRawFd, R: raw_carrier::RawBacking>(
 
 async fn next_selected_request(requests: &mut Requests) -> Option<Request> {
     match requests {
-        Requests::Legacy(Some(requests)) => requests
-            .0
-            .recv()
-            .await
-            .map(|(value, reply)| Request::Legacy(value, reply)),
-        Requests::Transaction(Some(requests)) => requests
-            .0
-            .recv()
-            .await
-            .map(|(value, reply)| Request::Transaction(value, reply)),
         Requests::Common(Some(requests)) => requests.0.recv().await.map(Request::Common),
         _ => std::future::pending().await,
     }
 }
 
-fn try_native_write<D: PacketDevice<Error = io::Error> + AsRawFd>(
-    ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+fn try_native_write<D: NativeDevice>(
+    ready: &mut NativeGuard<'_, D>,
     packet: &[u8],
 ) -> io::Result<bool> {
     match ready.get_inner_mut().transmit(packet) {
@@ -683,8 +462,8 @@ fn try_native_write<D: PacketDevice<Error = io::Error> + AsRawFd>(
         Err(error) => Err(error),
     }
 }
-fn try_native_read<D: PacketDevice<Error = io::Error> + AsRawFd>(
-    ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+fn try_native_read<D: NativeDevice>(
+    ready: &mut NativeGuard<'_, D>,
     output: &mut [u8],
 ) -> io::Result<Option<usize>> {
     match ready.get_inner_mut().receive(output) {
@@ -776,8 +555,8 @@ pub struct Config {
     pub security: security::Limits,
     /// Fixed reliable control retention, retry and wire service bounds.
     pub control: delivery::Settings,
-    /// Explicit authenticated independent-stream selection; None preserves the
-    /// legacy control bytes and global envelope sequence without fallback.
+    /// Explicit authenticated independent-stream selection. Current Common
+    /// construction requires streams and rejects an absent selection.
     pub streams: Option<control_owner::Settings>,
     /// Immutable nonzero common control scope epoch.
     pub control_epoch: security::Epoch,
@@ -789,19 +568,19 @@ pub struct Config {
     pub work: WorkBudget,
     /// Explicit per-directional-scheduler rolling work cap per sole-loop turn.
     /// Two retained generations can service at most four directional schedulers.
-    /// None preserves legacy policy and cannot select a rolling record catalog.
+    /// None cannot select a rolling record catalog.
     pub rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
     /// Optional per-generation authenticated Rolling wire-input custody.
-    /// None preserves direct decoder admission and every legacy resource digest.
+    /// None preserves direct decoder admission and the base resource digest.
     pub rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     /// Explicit local Benchmark ACK ingress, immutable in the authenticated Common envelope.
-    /// None preserves transparent behavior and all legacy resource digest bytes.
+    /// None preserves transparent behavior and the base resource digest.
     pub ack_coalescing: Option<l2tunnel_pipeline::ack_coalescing::Policy>,
     /// Explicit deferred authenticated per-connection raw ACK input storage.
     /// None preserves old resource digests and cannot select a raw tag8 catalog.
     pub connection_ingress: Option<ConnectionIngressLimits>,
     /// Complete global selected Rolling fragmentation policy, authenticated at establishment.
-    /// None retains legacy packet geometry and resource digest bytes.
+    /// None retains unfragmented packet geometry and the base resource digest.
     pub rolling_fragments: Option<l2tunnel::record_engine::FragmentPolicy>,
     /// Independent retained native output bounds.
     pub native: NativeBudget,
@@ -950,68 +729,6 @@ impl Config {
                 )
                 .map_err(invalid)?;
             }
-        }
-        Ok(())
-    }
-    /// Validate actual selected cover and family against full admitted wire limits.
-    pub fn validate_cover(&self, selected: cover::Config, ipv6: bool) -> io::Result<()> {
-        self.validate()?;
-        let ip = if ipv6 { 48 } else { 28 };
-        let protected = self
-            .security
-            .max_body_bytes
-            .checked_add(
-                record::ROUTE_BYTES + security::Protection::ChaCha20Poly1305.overhead_bytes(),
-            )
-            .ok_or_else(|| invalid("common packet size overflow"))?;
-        let overhead = selected
-            .overhead(cover::Phase::Established, protected)
-            .map_err(invalid)?;
-        let packet = protected
-            .checked_add(overhead)
-            .ok_or_else(|| invalid("cover size overflow"))?;
-        if packet > selected.limits().max_packet_bytes {
-            return Err(invalid(
-                "common packet exceeds admitted cover/storage ceiling",
-            ));
-        }
-        let fixed = ip
-            + record::ROUTE_BYTES
-            + security::Protection::ChaCha20Poly1305.overhead_bytes()
-            + overhead;
-        let current = self
-            .send
-            .records
-            .codec
-            .datagram_bytes
-            .max(self.receive.records.codec.datagram_bytes)
-            .max(
-                self.control.recovery.max_source_bytes
-                    + recovery::DATA_HEADER_BYTES
-                    + self.control_wrapper_bytes(),
-            );
-        if current
-            .checked_add(fixed)
-            .is_none_or(|bytes| bytes > self.path_mtu)
-        {
-            return Err(invalid("current records exceed explicit active path MTU"));
-        }
-        let reserve = self
-            .control
-            .recovery
-            .max_source_bytes
-            .checked_add(recovery::DATA_HEADER_BYTES + recovery::ACK_PACKET_BYTES)
-            .and_then(|bytes| bytes.checked_add(2 * (fixed + self.control_wrapper_bytes())))
-            .ok_or_else(|| invalid("control reserve overflow"))?;
-        if self.control.wire_overhead != fixed
-            || self
-                .path_mtu
-                .checked_add(reserve)
-                .is_none_or(|required| required > self.wire.burst_bytes)
-        {
-            return Err(invalid(
-                "exact control overhead/shared reserve/burst geometry",
-            ));
         }
         Ok(())
     }
@@ -1166,6 +883,9 @@ impl Config {
 pub enum StopReason {
     /// Explicit local cancellation; no peer-confirmed close is claimed.
     Cancelled,
+    /// The retained Common proxy barrier completed at its original local cap.
+    /// The proxy coordinator must still observe its joined actor's final result.
+    ProxyRetired,
     /// Original established lease ended.
     LeaseExpired,
     /// Original authenticated challenge deadline ended.
@@ -1248,87 +968,10 @@ pub struct Liveness {
     /// Last new correctly matching authenticated Pong.
     pub last_pong_micros: Option<u64>,
 }
-/// Coalesced actual running/terminal state, without keys or native handles.
-#[derive(Clone, Debug)]
-pub struct Snapshot {
-    /// True only after complete native runtime attachment.
-    pub running: bool,
-    /// Time since the one driver origin.
-    pub elapsed_micros: u64,
-    /// Actual completed membership and original endpoints.
-    pub info: member::Info,
-    /// Actual full authenticated configuration digest.
-    pub configuration: security::ConfigDigest,
-    /// Selected independent Liveness/SwiftPolicyV1 framing. Generic Management
-    /// and DataFeedback remain unsupported by this Swift runtime. This runtime
-    /// observation does not upgrade the legacy local API schema.
-    pub control_streams: bool,
-    /// Original policy deadline retained through final message custody.
-    pub policy_deadline_micros: Option<u64>,
-    /// A policy source or applied incoming command still awaits custody release.
-    pub policy_receipt_pending: bool,
-    /// Current outgoing records/rate.
-    pub send: policy::Direction,
-    /// Current incoming records/rate.
-    pub receive: policy::Direction,
-    /// Completed local distributed policy observation.
-    pub committed: policy::Committed,
-    /// The original active transaction, if any.
-    pub pending: Option<policy::Pending>,
-    /// Full Swift/header observations across resets.
-    pub swift: records::Stats,
-    /// Current unconfirmed recovery source count.
-    pub swift_unconfirmed: usize,
-    /// Bounded per-channel observations, without changing protocol state.
-    pub channels: Vec<records::ChannelStats>,
-    /// Actual scheduling, wire-credit and native-pressure observations.
-    pub performance: Performance,
-    /// Fixed reliable control retention.
-    pub control: recovery::Retained,
-    /// Wire, security and native counters.
-    pub counters: Counters,
-    /// Fixed-control challenge observations.
-    pub liveness: Liveness,
-    /// Explicit terminal category, absent while running.
-    pub terminal: Option<StopReason>,
-}
-/// Explicit local stop; not a peer-confirmed clean shutdown.
-#[derive(Clone, Debug)]
-pub struct Stopped {
-    /// Original local termination reason.
-    pub reason: StopReason,
-    /// Final bounded observation.
-    pub snapshot: Snapshot,
-}
+#[path = "transport_switch_error.rs"]
+mod switch_error;
 /// Local policy request failure; teardown cannot imply rollback.
-pub use crate::swift::SwitchError;
-type Reply = oneshot::Sender<Result<u64, SwitchError>>;
-/// Shared bounded policy request producer; dropping a waiter never cancels it.
-#[derive(Clone)]
-pub struct ControlHandle(mpsc::Sender<(swift::control::Policy, Reply)>);
-/// Unique bounded local request owner for the driver.
-pub struct ControlRequests(mpsc::Receiver<(swift::control::Policy, Reply)>);
-/// Allocate exactly one queued policy request.
-pub fn channel() -> (ControlHandle, ControlRequests) {
-    let (tx, rx) = mpsc::channel(1);
-    (ControlHandle(tx), ControlRequests(rx))
-}
-impl ControlHandle {
-    /// Wait for actual peer-coordinated completion, not local configuration change.
-    pub async fn switch(&self, requested: swift::control::Policy) -> Result<u64, SwitchError> {
-        let (tx, rx) = oneshot::channel();
-        self.0
-            .try_send((requested, tx))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => SwitchError::Busy,
-                mpsc::error::TrySendError::Closed(_) => SwitchError::Closed,
-            })?;
-        rx.await.unwrap_or(Err(SwitchError::Closed))
-    }
-}
-/// Trusted deterministic policy resolution; every result is revalidated at use.
-pub type Resolver = Box<dyn Fn(&swift::control::Policy) -> Option<policy::Resolved> + Send + Sync>;
-
+pub use switch_error::SwitchError;
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
@@ -1339,12 +982,6 @@ fn envelope_scope(scope: Scope) -> control::Scope {
     control::Scope {
         epoch: core::Epoch(scope.epoch.0),
         digest: core::ConfigDigest(scope.configuration.0),
-    }
-}
-fn policy_reply(outcome: policy::Outcome) -> Result<u64, SwitchError> {
-    match outcome {
-        policy::Outcome::Applied(epoch) => Ok(epoch.0),
-        policy::Outcome::Rejected => Err(SwitchError::Rejected),
     }
 }
 #[derive(Debug)]
@@ -1362,19 +999,7 @@ fn record_error(error: record::Error) -> io::Error {
     match error {
         record::Error::Security(
             security::Error::CounterExhausted | security::Error::KeyUsageExhausted,
-        )
-        | record::Error::Refresh(security::refresh::Error::Protection(
-            security::Error::CounterExhausted | security::Error::KeyUsageExhausted,
-        )) => exhausted(),
-        record::Error::Refresh(
-            security::refresh::Error::Deadline | security::refresh::Error::KeyExpired,
-        ) => io::Error::new(io::ErrorKind::TimedOut, error),
-        _ => protocol(error),
-    }
-}
-fn native_record_error(error: records::Error) -> io::Error {
-    match error {
-        records::Error::CounterExhausted => exhausted(),
+        ) => exhausted(),
         _ => protocol(error),
     }
 }
@@ -1487,129 +1112,6 @@ impl NativeOrigin {
     }
 }
 
-/// Local native count witness, never proof of a peer's physical completion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeBoundary {
-    origin: NativeOrigin,
-    direction: records::Direction,
-    channels: usize,
-    counts: [u64; swift::MAX_CHANNELS],
-}
-impl NativeBoundary {
-    fn capture(
-        engine: &records::Engine,
-        origin: NativeOrigin,
-        direction: records::Direction,
-    ) -> io::Result<Self> {
-        let channels = match direction {
-            records::Direction::Send => engine.send_config().channels,
-            records::Direction::Receive => engine.receive_config().channels,
-        };
-        if !(1..=swift::MAX_CHANNELS).contains(&channels) {
-            return Err(protocol("native boundary channel width"));
-        }
-        let mut counts = [0; swift::MAX_CHANNELS];
-        for (index, count) in counts.iter_mut().take(channels).enumerate() {
-            let channel = records::ChannelId::new(index)
-                .ok_or_else(|| protocol("native boundary channel"))?;
-            *count = engine
-                .boundary(direction, channel)
-                .ok_or_else(|| protocol("native boundary absent channel"))?
-                .count
-                .0;
-        }
-        Ok(Self {
-            origin,
-            direction,
-            channels,
-            counts,
-        })
-    }
-    fn canonical_for(
-        &self,
-        expected_origin: NativeOrigin,
-        local_direction: records::Direction,
-    ) -> bool {
-        self.origin == expected_origin
-            && self.direction == local_direction
-            && (1..=swift::MAX_CHANNELS).contains(&self.channels)
-            && self
-                .counts
-                .get(self.channels..)
-                .is_some_and(|tail| tail.iter().all(|count| *count == 0))
-    }
-}
-
-/// Physical complete-device writes, separate from admitted/extracted records.
-struct NativeWritten {
-    origin: NativeOrigin,
-    channels: usize,
-    counts: [u64; swift::MAX_CHANNELS],
-}
-struct NativeCompletion {
-    channel: usize,
-    count: u64,
-}
-impl NativeWritten {
-    fn new(origin: NativeOrigin, channels: usize) -> io::Result<Self> {
-        if !(1..=swift::MAX_CHANNELS).contains(&channels) {
-            return Err(protocol("native completion channel width"));
-        }
-        Ok(Self {
-            origin,
-            channels,
-            counts: [0; swift::MAX_CHANNELS],
-        })
-    }
-    fn same_generation(&self, engine: &records::Engine, origin: NativeOrigin) -> bool {
-        self.origin == origin && self.channels == engine.receive_config().channels
-    }
-    fn matches_extracted(&self, engine: &records::Engine, origin: NativeOrigin) -> bool {
-        self.same_generation(engine, origin)
-            && (0..self.channels).all(|index| {
-                records::ChannelId::new(index)
-                    .and_then(|channel| engine.boundary(records::Direction::Receive, channel))
-                    .is_some_and(|boundary| boundary.count.0 == self.counts[index])
-            })
-    }
-    fn boundary(&self) -> NativeBoundary {
-        NativeBoundary {
-            origin: self.origin,
-            direction: records::Direction::Receive,
-            channels: self.channels,
-            counts: self.counts,
-        }
-    }
-    fn preflight(
-        &self,
-        origin: NativeOrigin,
-        identity: records::NativeIdentity,
-    ) -> io::Result<NativeCompletion> {
-        let channel = identity.channel.index();
-        if self.origin != origin
-            || channel >= self.channels
-            || self.counts[channel] != identity.record.0
-        {
-            return Err(protocol("native completion origin or ordered identity"));
-        }
-        let count = self.counts[channel].checked_add(1).ok_or_else(exhausted)?;
-        Ok(NativeCompletion { channel, count })
-    }
-    fn complete(&mut self, completion: NativeCompletion) {
-        // Only preflight constructs this bounded token, and this sole owner
-        // performs no state transition while the synchronous device call runs.
-        self.counts[completion.channel] = completion.count;
-    }
-}
-
-struct Native {
-    origin: NativeOrigin,
-    identity: records::NativeIdentity,
-}
-struct PendingPolicy {
-    id: policy::OutboundId,
-    source: control_owner::Token,
-}
 struct Challenge {
     nonce: u64,
     deadline: u64,
@@ -1625,28 +1127,17 @@ struct Driver {
     outer: u32,
     records: record::Records,
     owner: owner::DataOwner,
-    generic: Option<generic::Runtime>,
     common: Option<owner::StateCell<common::Runtime>>,
-    send: policy::Direction,
-    receive: policy::Direction,
     source_scope: Scope,
     feedback_scope: Scope,
     target: Option<Scope>,
     transaction_origin: Option<Scope>,
-    resolved: Option<policy::Resolved>,
     control: control_owner::Owner,
-    policy_source: Option<PendingPolicy>,
-    policy_cap: Option<u64>,
-    pending_outcome: Option<policy::Outcome>,
     control_work: bool,
-    waiting: Option<Reply>,
     buffers: buffers::Buffers,
     inputs: Option<buffers::Inputs>,
     envelope_rx: u64,
     native: common_native::OutputQueue,
-    written: NativeWritten,
-    retired_send: Option<NativeBoundary>,
-    retired_receive: Option<NativeBoundary>,
     bucket: Bucket,
     reserve: usize,
     ip: usize,
@@ -1665,283 +1156,7 @@ struct Driver {
     terminal: Option<StopReason>,
 }
 
-struct Hooks<'a> {
-    info: &'a member::Info,
-    engine: &'a mut records::Engine,
-    written: &'a mut NativeWritten,
-    retired_send: &'a mut Option<NativeBoundary>,
-    retired_receive: &'a mut Option<NativeBoundary>,
-    send: &'a mut policy::Direction,
-    receive: &'a mut policy::Direction,
-    source: &'a mut Scope,
-    feedback: &'a mut Scope,
-    target: Option<Scope>,
-    next: records::RecordNumber,
-    native_pending: bool,
-    bucket: &'a mut Bucket,
-}
-impl policy::Hooks for Hooks<'_> {
-    type Error = io::Error;
-    fn status(&self) -> policy::Status {
-        policy::Status {
-            send_drained: self.engine.send_drained(),
-            receive_deliverable: self.engine.deliverable() || self.native_pending,
-            receive_drained: self.engine.receive_drained()
-                && !self.native_pending
-                && self.written.matches_extracted(
-                    self.engine,
-                    NativeOrigin::new(self.info, *self.feedback, records::Direction::Receive),
-                ),
-            next_number: self.next,
-        }
-    }
-    fn replace_send(
-        &mut self,
-        now: policy::Time,
-        direction: policy::Direction,
-        feedback_from: records::RecordNumber,
-    ) -> io::Result<()> {
-        let target = self
-            .target
-            .ok_or_else(|| protocol("missing staged source policy scope"))?;
-        if self.retired_send.is_some() {
-            return Err(protocol("previous native send boundary still retained"));
-        }
-        let boundary = NativeBoundary::capture(
-            self.engine,
-            NativeOrigin::new(self.info, *self.source, records::Direction::Send),
-            records::Direction::Send,
-        )?;
-        self.engine
-            .replace_send(direction.records, feedback_from)
-            .map_err(protocol)?;
-        *self.retired_send = Some(boundary);
-        self.bucket.refill(now.0)?;
-        self.bucket.rate = direction.bytes_per_second;
-        *self.send = direction;
-        *self.source = target;
-        Ok(())
-    }
-    fn replace_receive(
-        &mut self,
-        direction: policy::Direction,
-        source_from: records::RecordNumber,
-    ) -> io::Result<()> {
-        let target = self
-            .target
-            .ok_or_else(|| protocol("missing staged feedback policy scope"))?;
-        let origin = NativeOrigin::new(self.info, *self.feedback, records::Direction::Receive);
-        if self.native_pending
-            || !self.engine.receive_drained()
-            || !self.written.matches_extracted(self.engine, origin)
-        {
-            return Err(protocol("native receive completion has not drained"));
-        }
-        if self.retired_receive.is_some() {
-            return Err(protocol("previous native receive boundary still retained"));
-        }
-        let boundary = self.written.boundary();
-        let written = NativeWritten::new(
-            NativeOrigin::new(self.info, target, records::Direction::Receive),
-            direction.records.channels,
-        )?;
-        self.engine
-            .replace_receive(direction.records, source_from)
-            .map_err(protocol)?;
-        *self.retired_receive = Some(boundary);
-        *self.written = written;
-        *self.receive = direction;
-        *self.feedback = target;
-        Ok(())
-    }
-}
-
 impl Driver {
-    fn new(
-        parts: member::Parts,
-        expected: security::ConfigDigest,
-        config: Config,
-        origin: Instant,
-    ) -> io::Result<(tokio::net::UdpSocket, Self)> {
-        if origin >= parts.deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "original setup deadline before runtime readiness",
-            ));
-        }
-        if parts.info.authenticated.configuration != expected.0
-            || parts.info.binding != parts.root.binding()
-            || parts.info.role != parts.root.role()
-            || parts.info.authenticated.session != parts.info.binding.session
-            || parts.socket.local_addr()? != parts.info.local_addr
-            || parts.socket.peer_addr()? != parts.info.peer_addr
-        {
-            return Err(invalid(
-                "actual authenticated runtime session/configuration/role/path",
-            ));
-        }
-        let ipv6 = parts.socket.local_addr()?.is_ipv6();
-        config.validate_cover(parts.cover, ipv6)?;
-        let ip = if ipv6 { 48 } else { 28 };
-        let control_scope = Scope {
-            epoch: config.control_epoch,
-            configuration: expected,
-        };
-        let data_scope = Scope {
-            epoch: config.data_epoch,
-            configuration: expected,
-        };
-        let records = record::Records::new(
-            parts.root,
-            security::LaneId(LANE),
-            config.security,
-            security::Protection::ChaCha20Poly1305,
-            parts.cover,
-            control_scope,
-            data_scope,
-        )
-        .map_err(invalid)?;
-        let mut swift = records::Engine::new(config.send.records).map_err(invalid)?;
-        swift
-            .replace_receive(config.receive.records, records::RecordNumber(0))
-            .map_err(invalid)?;
-        let coordinator = policy::Coordinator::new(
-            if parts.info.role == security::Role::Initiator {
-                policy::Authority::Coordinator
-            } else {
-                policy::Authority::Participant
-            },
-            policy::Committed {
-                epoch: policy::Epoch(0),
-                policy: None,
-            },
-            config.policy,
-            policy::Time(0),
-        )
-        .map_err(invalid)?;
-        let role = if parts.info.role == security::Role::Initiator {
-            mg::Role::Client
-        } else {
-            mg::Role::Server
-        };
-        let control = control_owner::Owner::new(
-            config.control,
-            config.streams,
-            delivery::Binding {
-                session: mg::SessionId(parts.info.binding.session.0),
-                lane: mg::LaneId(LANE),
-                local_role: role,
-                control_epoch: config.control_epoch.0,
-            },
-            envelope_scope(control_scope),
-            envelope_scope(data_scope),
-            Duration::ZERO,
-            config.lifetime.lease,
-        )
-        .map_err(invalid)?;
-        let capacity = records
-            .capacity(config.security.max_body_bytes)
-            .map_err(invalid)?;
-        let reserve = config.control.recovery.max_source_bytes
-            + recovery::DATA_HEADER_BYTES
-            + recovery::ACK_PACKET_BYTES
-            + 2 * (config.control.wire_overhead + config.control_wrapper_bytes());
-        let control_packet = control.max_packet_bytes();
-        let control_message =
-            config
-                .streams
-                .map_or(config.control.recovery.max_source_bytes, |settings| {
-                    settings
-                        .streams
-                        .iter()
-                        .map(|entry| entry.max_message_bytes)
-                        .max()
-                        .unwrap_or(0)
-                });
-        let lease = add(0, config.lifetime.lease)?;
-        origin
-            .checked_add(config.lifetime.lease)
-            .ok_or_else(|| invalid("active lease exceeds runtime clock"))?;
-        let next_report = config
-            .report_interval
-            .map(|interval| add(0, interval))
-            .transpose()?;
-        Ok((
-            parts.socket,
-            Self {
-                config,
-                info: parts.info,
-                cover: parts.cover,
-                origin,
-                bootstrap: parts.bootstrap,
-                joining: parts.joining,
-                outer: parts.next_outer,
-                records,
-                owner: owner::DataOwner::Legacy(owner::Legacy {
-                    engine: swift,
-                    coordinator,
-                }),
-                generic: None,
-                common: None,
-                send: config.send,
-                receive: config.receive,
-                source_scope: data_scope,
-                feedback_scope: data_scope,
-                target: None,
-                transaction_origin: None,
-                resolved: None,
-                control,
-                policy_source: None,
-                policy_cap: None,
-                pending_outcome: None,
-                control_work: false,
-                waiting: None,
-                buffers: buffers::Buffers::new(
-                    parts.cover.limits().max_packet_bytes,
-                    capacity
-                        .seal_workspace_bytes
-                        .max(capacity.open_workspace_bytes),
-                    config.security.max_body_bytes,
-                    control_packet,
-                    control_message,
-                    swift::control::MAX_FRAME,
-                )?,
-                inputs: None,
-                envelope_rx: 1,
-                native: native_storage::Queue::new(
-                    config.native.pending_packets,
-                    config.native.pending_bytes,
-                    config.send.records.max_native,
-                )?
-                .into(),
-                written: NativeWritten::new(
-                    NativeOrigin::new(&parts.info, data_scope, records::Direction::Receive),
-                    config.receive.records.channels,
-                )?,
-                retired_send: None,
-                retired_receive: None,
-                bucket: Bucket::new(config.send.bytes_per_second, config.wire.burst_bytes),
-                reserve,
-                ip,
-                ingress: IngressBudget {
-                    left: config.work.receive_packets,
-                    refill: add(0, config.work.receive_interval)?,
-                },
-                counters: Counters::default(),
-                performance: performance::State::default(),
-                live: Liveness::default(),
-                challenge: None,
-                pong: None,
-                pong_deadline: None,
-                remote_ping: 0,
-                next_nonce: 1,
-                next_ping: add(0, config.lifetime.ping_interval)?,
-                lease,
-                next_report,
-                terminal: None,
-            },
-        ))
-    }
     fn take_inputs(&mut self) -> io::Result<buffers::Inputs> {
         match self.inputs.take() {
             Some(inputs) => Ok(inputs),
@@ -1970,161 +1185,6 @@ impl Driver {
         } else {
             mg::Role::Client
         }
-    }
-    fn snapshot(&self, now: u64, running: bool) -> io::Result<Snapshot> {
-        let legacy = self.owner.legacy()?;
-        let mut counters = self.counters;
-        counters.native_pending_packets = self.native.len();
-        counters.native_pending_bytes = self.native.bytes();
-        counters.native_storage_capacity_bytes = self.native.capacity_bytes();
-        counters.workspace_capacity_bytes = self.buffers.capacity_bytes();
-        Ok(Snapshot {
-            running,
-            elapsed_micros: now,
-            info: self.info,
-            configuration: security::ConfigDigest(self.info.authenticated.configuration),
-            control_streams: self.config.streams.is_some(),
-            policy_deadline_micros: self
-                .policy_cap
-                .or_else(|| legacy.coordinator.deadline().map(|deadline| deadline.0)),
-            policy_receipt_pending: self.policy_source.is_some() || self.control.has_dispatched(),
-            send: self.send,
-            receive: self.receive,
-            committed: legacy.coordinator.committed(),
-            pending: legacy.coordinator.pending(),
-            swift: legacy.engine.stats(),
-            swift_unconfirmed: legacy.engine.unconfirmed(),
-            channels: (0..self
-                .send
-                .records
-                .channels
-                .max(self.receive.records.channels))
-                .filter_map(|index| legacy.engine.channel_stats(index))
-                .collect(),
-            performance: self.performance.snapshot(now, &self.bucket),
-            control: self.control.retained(),
-            counters,
-            liveness: self.live,
-            terminal: self.terminal,
-        })
-    }
-    fn validate_resolution(
-        &self,
-        requested: &swift::control::Policy,
-        resolved: policy::Resolved,
-    ) -> io::Result<()> {
-        resolved.validate().map_err(invalid)?;
-        for direction in [resolved.send, resolved.receive] {
-            if direction.records.layer != self.config.send.records.layer
-                || direction.records.max_native != self.config.send.records.max_native
-                || direction.records.codec.datagram_bytes
-                    < swift::FEEDBACK_HEADER + 2 * swift::MAX_REQUESTS
-                || direction.records.codec.datagram_bytes > self.config.security.max_body_bytes
-            {
-                return Err(invalid(
-                    "policy changes immutable native format or admitted body ceiling",
-                ));
-            }
-            let cost = self
-                .records
-                .capacity(direction.records.codec.datagram_bytes)
-                .map_err(invalid)?
-                .packet_bytes
-                + self.ip;
-            if cost > usize::from(requested.path_mtu)
-                || cost
-                    .checked_add(self.reserve)
-                    .is_none_or(|total| total > self.config.wire.burst_bytes)
-            {
-                return Err(invalid("policy exceeds requested MTU/shared burst"));
-            }
-        }
-        let control = self.config.control.recovery.max_source_bytes
-            + recovery::DATA_HEADER_BYTES
-            + self.config.control.wire_overhead
-            + self.config.control_wrapper_bytes();
-        if control > usize::from(requested.path_mtu) {
-            return Err(invalid(
-                "policy cannot retain stable control packet service",
-            ));
-        }
-        Ok(())
-    }
-    fn stage(&mut self) -> io::Result<()> {
-        if let Some(pending) = self.owner.legacy()?.coordinator.pending() {
-            let scope = Scope {
-                epoch: security::Epoch(
-                    self.config
-                        .data_epoch
-                        .0
-                        .checked_add(pending.epoch.0)
-                        .ok_or_else(exhausted)?,
-                ),
-                configuration: security::ConfigDigest(pending.digest.0),
-            };
-            if self.target == Some(scope) {
-                return Ok(());
-            }
-            if self.target.is_some() {
-                return Err(protocol("another data reader still retained"));
-            }
-            self.records.stage_data(scope).map_err(protocol)?;
-            self.target = Some(scope);
-        }
-        Ok(())
-    }
-    fn settle_scope(&mut self) -> io::Result<()> {
-        if self.owner.legacy()?.coordinator.pending().is_some()
-            || self.owner.legacy()?.coordinator.outbound().is_some()
-            || self.policy_source.is_some()
-            || self.control.has_dispatched()
-        {
-            return Ok(());
-        }
-        if let Some(target) = self.target {
-            if self.source_scope == target && self.feedback_scope == target {
-                let old = self.records.active_data();
-                if self.retired_send.as_ref().is_none_or(|boundary| {
-                    !boundary.canonical_for(
-                        NativeOrigin::new(&self.info, old, records::Direction::Send),
-                        records::Direction::Send,
-                    )
-                }) || self.retired_receive.as_ref().is_none_or(|boundary| {
-                    !boundary.canonical_for(
-                        NativeOrigin::new(&self.info, old, records::Direction::Receive),
-                        records::Direction::Receive,
-                    )
-                }) {
-                    return Err(protocol("settled policy lacks original native boundaries"));
-                }
-                self.control.advance_scope(envelope_scope(target))?;
-                match self.control.retire_draining(envelope_scope(old)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) => return Err(error),
-                }
-                self.records.activate_data(target).map_err(protocol)?;
-                self.records.retire_data(old).map_err(protocol)?;
-                self.retired_send = None;
-                self.retired_receive = None;
-            } else if self.source_scope == self.records.active_data()
-                && self.feedback_scope == self.records.active_data()
-            {
-                if self.retired_send.is_some() || self.retired_receive.is_some() {
-                    return Err(protocol("rejected policy retains native boundary changes"));
-                }
-                self.records.cancel_staged_data(target).map_err(protocol)?;
-            } else {
-                return Err(protocol(
-                    "policy retired before directional ownership settled",
-                ));
-            }
-            self.target = None;
-        }
-        self.transaction_origin = None;
-        self.resolved = None;
-        self.policy_cap = None;
-        Ok(())
     }
     // This guard has no delivery, policy-completion or refill side effects.
     // Event branches must check fresh time before removing any original expiry.
@@ -2186,22 +1246,6 @@ impl Driver {
             ));
         }
         let transaction_cap = match &self.owner {
-            owner::DataOwner::Generic(state) => state
-                .operation_deadline()
-                .into_iter()
-                .chain(
-                    self.generic
-                        .as_ref()
-                        .and_then(|runtime| runtime.outcome)
-                        .map(|outcome| {
-                            let operation = match outcome {
-                                transactions::Outcome::Retired { operation, .. }
-                                | transactions::Outcome::Aborted { operation, .. } => operation,
-                            };
-                            Duration::from_millis(operation.expires().0)
-                        }),
-                )
-                .min(),
             owner::DataOwner::Common(state) => state
                 .operation_deadline()
                 .into_iter()
@@ -2236,7 +1280,6 @@ impl Driver {
                         .map(|pending| duration(pending.deadline)),
                 )
                 .min(),
-            owner::DataOwner::Legacy(_) => None,
         };
         if transaction_cap.is_some_and(|deadline| duration(now) >= deadline) {
             self.terminal = Some(StopReason::PolicyTimeout);
@@ -2245,145 +1288,10 @@ impl Driver {
                 "original generic transaction custody deadline",
             ));
         }
-        if self.policy_cap.is_some_and(|deadline| now >= deadline) {
-            self.terminal = Some(StopReason::PolicyTimeout);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "original streamed policy custody deadline",
-            ));
-        }
-        if let owner::DataOwner::Legacy(legacy) = &self.owner
-            && legacy
-                .coordinator
-                .deadline()
-                .is_some_and(|deadline| now >= deadline.0)
-        {
-            self.terminal = Some(StopReason::PolicyTimeout);
-        }
-        if let owner::DataOwner::Legacy(legacy) = &mut self.owner {
-            legacy
-                .coordinator
-                .check(policy::Time(now))
-                .map_err(protocol)?;
-        }
         Ok(true)
     }
     fn progress(&mut self, now: u64) -> io::Result<()> {
-        if self.common.is_some() {
-            return self.progress_common(now);
-        }
-        if self.generic.is_some() {
-            return self.progress_transaction(now);
-        }
-        if !self.check_expiry(now)? {
-            return Ok(());
-        }
-        if let Some(pending) = &self.policy_source
-            && self.control.confirmed(pending.source, duration(now))?
-        {
-            self.owner
-                .legacy_mut()?
-                .coordinator
-                .complete_outbound(policy::Time(now), pending.id)
-                .map_err(protocol)?;
-            self.control.retire(pending.source, duration(now))?;
-            self.policy_source = None;
-        }
-        let target = self.target;
-        let next = records::RecordNumber(self.records.next_number(Class::User).0);
-        let native_pending = !self.native.is_empty();
-        let legacy = self.owner.legacy_mut()?;
-        let mut hooks = Hooks {
-            info: &self.info,
-            written: &mut self.written,
-            retired_send: &mut self.retired_send,
-            retired_receive: &mut self.retired_receive,
-            engine: &mut legacy.engine,
-            send: &mut self.send,
-            receive: &mut self.receive,
-            source: &mut self.source_scope,
-            feedback: &mut self.feedback_scope,
-            target,
-            next,
-            native_pending,
-            bucket: &mut self.bucket,
-        };
-        legacy
-            .coordinator
-            .progress(policy::Time(now), &mut hooks)
-            .map_err(protocol)?;
-        if let Some(outcome) = legacy.coordinator.take_outcome() {
-            if self.config.streams.is_some() {
-                if self.pending_outcome.replace(outcome).is_some() {
-                    return Err(protocol("another policy outcome still owns custody"));
-                }
-            } else if let Some(reply) = self.waiting.take() {
-                let _ = reply.send(policy_reply(outcome));
-            }
-        }
-        self.settle_scope()?;
-        if self.config.streams.is_some()
-            && self.policy_cap.is_none()
-            && let Some(outcome) = self.pending_outcome.take()
-            && let Some(reply) = self.waiting.take()
-        {
-            let _ = reply.send(policy_reply(outcome));
-        }
-        self.bucket.refill(now)?;
-        if now >= self.ingress.refill {
-            self.ingress.left = self.config.work.receive_packets;
-            self.ingress.refill = add(now, self.config.work.receive_interval)?;
-        }
-        Ok(())
-    }
-    fn request(
-        &mut self,
-        now: u64,
-        requested: swift::control::Policy,
-        reply: Reply,
-        resolve: &Resolver,
-    ) -> io::Result<()> {
-        match self.check_expiry(now) {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = reply.send(Err(SwitchError::Closed));
-                return Ok(());
-            }
-            Err(error) => {
-                let _ = reply.send(Err(SwitchError::Closed));
-                return Err(error);
-            }
-        }
-        if self.waiting.is_some() {
-            let _ = reply.send(Err(SwitchError::Busy));
-            return Ok(());
-        }
-        let resolved = resolve(&requested)
-            .filter(|candidate| self.validate_resolution(&requested, *candidate).is_ok());
-        match self
-            .owner
-            .legacy_mut()?
-            .coordinator
-            .request(policy::Time(now), requested, resolved)
-        {
-            Ok(()) => {
-                self.waiting = Some(reply);
-                self.retain_policy_cap()?;
-                if self.owner.legacy()?.coordinator.pending().is_some() {
-                    self.resolved = resolved;
-                    self.transaction_origin = Some(self.source_scope);
-                    self.stage()?;
-                }
-            }
-            Err(error) => {
-                let _ = reply.send(Err(match error {
-                    policy::RequestError::Busy => SwitchError::Busy,
-                    policy::RequestError::NotCoordinator => SwitchError::NotCoordinator,
-                    policy::RequestError::Invalid => SwitchError::Invalid,
-                }));
-            }
-        }
-        Ok(())
+        self.progress_common(now)
     }
     fn envelope_limits(&self) -> control::Limits {
         control::Limits {
@@ -2415,57 +1323,20 @@ impl Driver {
             auto_retire,
         )
     }
-    fn retain_policy_cap(&mut self) -> io::Result<()> {
-        if self.config.streams.is_some() {
-            let deadline = self
-                .owner
-                .legacy()?
-                .coordinator
-                .deadline()
-                .map(|deadline| deadline.0);
-            self.policy_cap = self.policy_cap.into_iter().chain(deadline).min();
-        }
-        Ok(())
-    }
-    fn submit_control(&mut self, now: u64) -> io::Result<()> {
-        // Retain each policy token until the selected backend proves its exact
-        // custody: legacy source ACK or streamed complete-message confirmation.
-        if let owner::DataOwner::Legacy(legacy) = &self.owner
-            && self.policy_source.is_none()
-            && let Some(outbound) = legacy.coordinator.outbound()
+    fn proxy_liveness_quiesced(&self) -> io::Result<bool> {
+        #[cfg(unix)]
+        if let Some(bridge) = self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.proxy_bridge.as_ref())
         {
-            let origin = self
-                .transaction_origin
-                .ok_or_else(|| protocol("policy output without originating data scope"))?;
-            self.buffers.frame.clear();
-            outbound.message.encode(&mut self.buffers.frame);
-            let mut bytes = [0; swift::control::MAX_FRAME];
-            let length = self.buffers.frame.len();
-            bytes[..length].copy_from_slice(&self.buffers.frame);
-            if let Some(source) = self.submit(
-                now,
-                origin,
-                control::Body::ProfileControl {
-                    tag: control::ProfileTag::SwiftPolicyV1,
-                    bytes: &bytes[..length],
-                },
-                self.policy_cap
-                    .or(self
-                        .owner
-                        .legacy()?
-                        .coordinator
-                        .deadline()
-                        .map(|deadline| deadline.0))
-                    .unwrap_or(self.lease),
-                false,
-            )? {
-                self.policy_source = Some(PendingPolicy {
-                    id: outbound.id,
-                    source,
-                });
-                self.retain_policy_cap()?;
-            }
+            return bridge.liveness_quiesced();
         }
+        Ok(false)
+    }
+
+    fn submit_control(&mut self, now: u64) -> io::Result<()> {
+        self.submit_common_native_receipts(now)?;
         if let Some(nonce) = self.pong
             && self
                 .submit(
@@ -2482,7 +1353,7 @@ impl Driver {
             self.pong = None;
             self.pong_deadline = None;
         }
-        if self.challenge.is_none() && now >= self.next_ping {
+        if self.challenge.is_none() && now >= self.next_ping && !self.proxy_liveness_quiesced()? {
             let nonce = self.next_nonce;
             self.next_nonce = self.next_nonce.checked_add(1).ok_or_else(exhausted)?;
             let deadline = add(now, self.config.lifetime.pong_timeout)?;
@@ -2516,68 +1387,7 @@ impl Driver {
         }
         Ok(())
     }
-    fn profile(
-        &mut self,
-        now: u64,
-        scope: Scope,
-        message: swift::control::Message,
-        resolve: &Resolver,
-    ) -> io::Result<()> {
-        if !self.scope_registered(scope)
-            || self
-                .transaction_origin
-                .is_some_and(|origin| origin != scope)
-        {
-            return Err(protocol("profile command has another data-policy origin"));
-        }
-        if self.config.streams.is_some() && self.policy_cap.is_none() {
-            self.policy_cap = Some(
-                now.checked_add(self.config.policy.transaction_micros)
-                    .ok_or_else(exhausted)?
-                    .min(self.lease),
-            );
-        }
-        let was_pending = self.owner.legacy()?.coordinator.pending().is_some();
-        let candidate = if let swift::control::Message::Propose { policy, .. } = message {
-            resolve(&policy).filter(|value| self.validate_resolution(&policy, *value).is_ok())
-        } else {
-            None
-        };
-        let legacy = self.owner.legacy_mut()?;
-        let mut hooks = Hooks {
-            info: &self.info,
-            written: &mut self.written,
-            retired_send: &mut self.retired_send,
-            retired_receive: &mut self.retired_receive,
-            next: records::RecordNumber(self.records.next_number(Class::User).0),
-            engine: &mut legacy.engine,
-            send: &mut self.send,
-            receive: &mut self.receive,
-            source: &mut self.source_scope,
-            feedback: &mut self.feedback_scope,
-            target: self.target,
-            native_pending: !self.native.is_empty(),
-            bucket: &mut self.bucket,
-        };
-        legacy
-            .coordinator
-            .receive(policy::Time(now), message, |_| candidate, &mut hooks)
-            .map_err(protocol)?;
-        self.retain_policy_cap()?;
-        if self.transaction_origin.is_none() {
-            self.transaction_origin = Some(scope);
-        }
-        if !was_pending && self.owner.legacy()?.coordinator.pending().is_some() {
-            self.resolved = candidate;
-            self.stage()?;
-        }
-        Ok(())
-    }
-    #[cfg(test)]
-    fn service_control(&mut self, now: u64, resolve: &Resolver) -> io::Result<()> {
-        self.service_selected_control(now, Some(resolve))
-    }
-    fn service_selected_control(&mut self, now: u64, resolve: Option<&Resolver>) -> io::Result<()> {
+    fn service_selected_control(&mut self, now: u64) -> io::Result<()> {
         if self.has_transactions() {
             self.progress(now)?;
         }
@@ -2588,22 +1398,20 @@ impl Driver {
                 .ready_for_dispatch(self.target.map(envelope_scope))?
         };
         if self.config.streams.is_some() && (self.control_work || ready) {
-            self.delivered_selected_control(now, resolve)?;
+            self.delivered_selected_control(now)?;
         }
         Ok(())
     }
-    fn delivered_selected_control(
-        &mut self,
-        now: u64,
-        resolve: Option<&Resolver>,
-    ) -> io::Result<()> {
+    fn delivered_selected_control(&mut self, now: u64) -> io::Result<()> {
         self.control_work = false;
+        self.configure_common_native_receipts()?;
         // ARQ receive retention bounds this whole loop. All delivered commands are
         // validated/applied before any poll is allowed to encode their receipts.
         for _ in 0..self.config.control.recovery.receive_records {
             if self.config.streams.is_some() {
                 self.progress(now)?;
             }
+            self.configure_common_native_receipts()?;
             let deferred = self.target.map(envelope_scope);
             let Some(incoming) = self.control.next_with_deferred_scope(
                 duration(now),
@@ -2642,10 +1450,14 @@ impl Driver {
             enum Command {
                 Ping(u64),
                 Pong(u64),
-                Profile(swift::control::Message),
+                Native(mg::LaneId, u16, u64),
                 Reuse(l2tunnel::connection_records::retirement::command::Command),
             }
             let command = match envelope.body {
+                control::Body::NativeReceipt {
+                    lane,
+                    receipt: control::NativeReceipt::Record { channel, record },
+                } => Command::Native(lane, channel, record),
                 control::Body::Ping { nonce } if scope == self.records.control_scope() => {
                     Command::Ping(nonce)
                 }
@@ -2656,20 +1468,6 @@ impl Driver {
                     tag: control::ProfileTag::SlotReuseV1,
                     ..
                 } => Command::Reuse(self.admit_connection_reuse(now, envelope)?),
-                control::Body::ProfileControl {
-                    tag: control::ProfileTag::SwiftPolicyV1,
-                    bytes,
-                } => {
-                    let Some((message, used)) =
-                        swift::control::Message::decode(bytes).map_err(protocol)?
-                    else {
-                        return Err(protocol("incomplete authenticated Swift command"));
-                    };
-                    if used != bytes.len() {
-                        return Err(protocol("trailing authenticated Swift command"));
-                    }
-                    Command::Profile(message)
-                }
                 _ => {
                     return Err(protocol(
                         "unsupported or mis-scoped authenticated control body",
@@ -2703,18 +1501,12 @@ impl Driver {
                         self.next_ping = add(now, self.config.lifetime.ping_interval)?;
                     }
                 }
+                Command::Native(lane, channel, record) => {
+                    self.receive_common_native_delivery(now, scope, lane, channel, record)?
+                }
                 Command::Reuse(command) => self.receive_connection_reuse(now, command)?,
-                Command::Profile(message) => self.profile(
-                    now,
-                    scope,
-                    message,
-                    resolve.ok_or_else(|| protocol("legacy profile command on generic carrier"))?,
-                )?,
             }
             self.control.accepted(incoming, duration(now))?;
-            if !self.has_transactions() {
-                self.retain_policy_cap()?;
-            }
         }
         self.control_work = self.config.streams.is_some();
         Ok(())
@@ -2737,24 +1529,8 @@ impl Driver {
         }
     }
     #[cfg(test)]
-    fn receive(
-        &mut self,
-        packet: &[u8],
-        now: u64,
-        instant: Instant,
-        resolve: &Resolver,
-    ) -> io::Result<()> {
-        self.receive_selected(packet, now, instant, Some(resolve))
-    }
-    #[cfg(test)]
-    fn receive_selected(
-        &mut self,
-        packet: &[u8],
-        now: u64,
-        instant: Instant,
-        resolve: Option<&Resolver>,
-    ) -> io::Result<()> {
-        self.receive_selected_at(packet, now, now, instant, resolve)
+    fn receive_selected(&mut self, packet: &[u8], now: u64, instant: Instant) -> io::Result<()> {
+        self.receive_selected_at(packet, now, now, instant)
     }
     #[cfg(test)]
     fn receive_selected_at(
@@ -2763,15 +1539,14 @@ impl Driver {
         received: u64,
         now: u64,
         instant: Instant,
-        resolve: Option<&Resolver>,
     ) -> io::Result<()> {
         let original = self
             .origin
             .checked_add(duration(received))
             .ok_or_else(exhausted)?;
-        // Legacy deterministic fixtures inject coarse time independently from
+        // Deterministic fixtures inject coarse time independently from
         // the runtime Instant. Real arrivals use the checked wrapper below.
-        self.receive_selected_inner(packet, received, now, original, instant, resolve)
+        self.receive_selected_inner(packet, received, now, original, instant)
     }
     fn receive_selected_with_arrival(
         &mut self,
@@ -2780,12 +1555,11 @@ impl Driver {
         now: u64,
         original: Instant,
         instant: Instant,
-        resolve: Option<&Resolver>,
     ) -> io::Result<()> {
         if received > now || original > instant || clock(self.origin, original)? != received {
             return Err(invalid("authenticated input arrived after observation"));
         }
-        self.receive_selected_inner(packet, received, now, original, instant, resolve)
+        self.receive_selected_inner(packet, received, now, original, instant)
     }
     fn receive_selected_inner(
         &mut self,
@@ -2794,7 +1568,6 @@ impl Driver {
         now: u64,
         original: Instant,
         instant: Instant,
-        resolve: Option<&Resolver>,
     ) -> io::Result<()> {
         self.receive_selected_inner_carrier(
             packet,
@@ -2802,7 +1575,6 @@ impl Driver {
             now,
             original,
             instant,
-            resolve,
             None,
             None,
             |_| Ok(()),
@@ -2816,7 +1588,6 @@ impl Driver {
         now: u64,
         original: Instant,
         instant: Instant,
-        resolve: Option<&Resolver>,
         framing: impl Into<carrier::InputFraming>,
     ) -> io::Result<()> {
         if received > now || original > instant || clock(self.origin, original)? != received {
@@ -2828,7 +1599,6 @@ impl Driver {
             now,
             original,
             instant,
-            resolve,
             None,
             Some(framing.into()),
             |_| Ok(()),
@@ -2844,7 +1614,6 @@ impl Driver {
         now: u64,
         original: Instant,
         instant: Instant,
-        resolve: Option<&Resolver>,
         metadata: raw_compact::FinalMetadata,
     ) -> io::Result<()> {
         let mut committed = false;
@@ -2859,7 +1628,6 @@ impl Driver {
                 now,
                 original,
                 instant,
-                resolve,
                 Some(metadata),
                 None,
                 |verdict| {
@@ -2881,7 +1649,6 @@ impl Driver {
         now: u64,
         original: Instant,
         instant: Instant,
-        resolve: Option<&Resolver>,
         carrier: Option<raw_compact::FinalMetadata>,
         framing: Option<carrier::InputFraming>,
         mut commit: impl FnMut(raw_compact::FinalAcceptance<()>) -> io::Result<()>,
@@ -2893,11 +1660,10 @@ impl Driver {
             self.progress(now)?;
         }
         self.counters.received_packets = self.counters.received_packets.saturating_add(1);
-        let carrier_control = self.records.compact_layout()
-            == Some(record::compact::Layout::Carrier)
+        let carrier_control = self.records.compact_layout() == record::compact::Layout::Carrier
             && packet.first() == Some(&1);
         if let Some(metadata) = carrier {
-            if self.records.compact_layout() != Some(record::compact::Layout::Carrier)
+            if self.records.compact_layout() != record::compact::Layout::Carrier
                 || metadata.payload_bytes() != packet.len()
                 || raw_compact::FinalKind::inspect(packet) != Some(metadata.kind())
             {
@@ -2909,10 +1675,7 @@ impl Driver {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(());
         }
-        if self.records.is_compact()
-            && carrier.is_none()
-            && framing != Some(carrier::InputFraming::Final)
-        {
+        if carrier.is_none() && framing != Some(carrier::InputFraming::Final) {
             // The authenticated selection uses appearance only for setup tails;
             // ordinary established compact records have no cover envelope.
             if let Ok(decoded) = self.cover.decode(packet)
@@ -2927,20 +1690,6 @@ impl Driver {
                 self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
                 return Ok(());
             }
-        } else if !self.records.is_compact() {
-            let decoded = match self.cover.decode(packet) {
-                Ok(decoded) => decoded,
-                Err(_) => {
-                    self.counters.rejected_packets =
-                        self.counters.rejected_packets.saturating_add(1);
-                    return Ok(());
-                }
-            };
-            if self.bootstrap.receive(decoded, instant).map_err(protocol)?
-                || self.joining.receive(decoded, instant)?
-            {
-                return Ok(());
-            }
         }
         let opened = if let Some(metadata) = carrier {
             self.records.open_compact_with_carrier(
@@ -2949,27 +1698,13 @@ impl Driver {
                 &mut self.buffers.open,
                 &mut self.buffers.plain,
             )
-        } else if self.records.key_epoch().is_ok() {
-            self.records
-                .open_at(
-                    l2tunnel::handshake::Time(now),
-                    packet,
-                    &mut self.buffers.open,
-                    &mut self.buffers.plain,
-                )
-                .map(|opened| opened.record)
         } else {
             self.records
                 .open(packet, &mut self.buffers.open, &mut self.buffers.plain)
         };
         let opened = match opened {
             Ok(opened) => opened,
-            Err(
-                record::Error::Security(security::Error::Replay)
-                | record::Error::Refresh(security::refresh::Error::Protection(
-                    security::Error::Replay,
-                )),
-            ) => {
+            Err(record::Error::Security(security::Error::Replay)) => {
                 self.counters.replay_rejections = self.counters.replay_rejections.saturating_add(1);
                 return Ok(());
             }
@@ -2980,19 +1715,6 @@ impl Driver {
                     security::Error::Crypto | security::Error::CounterExhausted,
                 ),
             ) => return Err(record_error(error)),
-            Err(
-                error @ record::Error::Refresh(
-                    security::refresh::Error::Protection(
-                        security::Error::Crypto | security::Error::CounterExhausted,
-                    )
-                    | security::refresh::Error::TimeRegression,
-                ),
-            ) => return Err(record_error(error)),
-            Err(
-                error @ record::Error::Refresh(
-                    security::refresh::Error::Deadline | security::refresh::Error::KeyExpired,
-                ),
-            ) => return Err(io::Error::new(io::ErrorKind::TimedOut, error)),
             Err(_) => {
                 self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
                 return Ok(());
@@ -3055,70 +1777,14 @@ impl Driver {
                         duration(now),
                     )
                     .map_err(protocol)?;
-                self.delivered_selected_control(now, resolve)?;
+                self.delivered_selected_control(now)?;
             }
             Class::User => {
-                if self.common.is_some() {
-                    return if self.research_physical_output(opened.scope)? {
-                        self.receive_common_user_observed(opened, received, now, original)
-                    } else {
-                        self.receive_common_user_at(opened, received, now)
-                    };
-                }
-                let lead = self
-                    .buffers
-                    .plain
-                    .get(..opened.bytes)
-                    .and_then(|body| body.first())
-                    .ok_or_else(|| protocol("empty authenticated Swift body"))?;
-                let kind = lead & swift::KIND_MASK;
-                if !matches!(
-                    kind,
-                    swift::KIND_SOURCE | swift::KIND_REPAIR | swift::KIND_FEEDBACK
-                ) {
-                    return Err(protocol("unknown authenticated Swift kind"));
-                }
-                let feedback = kind == swift::KIND_FEEDBACK;
-                let disposition = if self.generic.is_some() {
-                    self.transaction_receive_scope(opened.scope)?
+                return if self.research_physical_output(opened.scope)? {
+                    self.receive_common_user_observed(opened, received, now, original)
                 } else {
-                    None
+                    self.receive_common_user_at(opened, received, now)
                 };
-                if (self.generic.is_some() && disposition.is_none())
-                    || (self.generic.is_none()
-                        && opened.scope
-                            != if feedback {
-                                self.source_scope
-                            } else {
-                                self.feedback_scope
-                            })
-                {
-                    self.counters.rejected_packets =
-                        self.counters.rejected_packets.saturating_add(1);
-                    return Ok(());
-                }
-                if !feedback && !self.native_room() {
-                    self.counters.native_backpressure_drops =
-                        self.counters.native_backpressure_drops.saturating_add(1);
-                    return Ok(());
-                }
-                if !feedback
-                    && opened.scope == self.feedback_scope
-                    && !self.written.same_generation(
-                        self.owner.engine(core::Epoch(opened.scope.epoch.0))?,
-                        NativeOrigin::new(&self.info, opened.scope, records::Direction::Receive),
-                    )
-                {
-                    return Err(protocol("authenticated native receive generation mismatch"));
-                }
-                self.owner
-                    .entry(core::Epoch(opened.scope.epoch.0))?
-                    .accept(
-                        now,
-                        records::RecordNumber(opened.number.0),
-                        &mut self.buffers.plain[..opened.bytes],
-                    )
-                    .map_err(protocol)?;
             }
         }
         Ok(())
@@ -3127,144 +1793,19 @@ impl Driver {
         self.native.can_acquire()
     }
     fn collect_native(&mut self, now: u64) -> io::Result<()> {
-        if self.common.is_some() {
-            return self.collect_common_native(now);
-        }
-        if self.generic.is_some() {
-            self.progress_transaction(now)?;
-        }
-        // Every source/repair admitted to this installed receive engine passed
-        // the exact opened.scope == feedback_scope check. Its scope cannot move
-        // until that engine and the complete native FIFO have physically drained.
-        let origin =
-            NativeOrigin::new(&self.info, self.feedback_scope, records::Direction::Receive);
-        if !self.written.same_generation(
-            self.owner
-                .engine(core::Epoch(self.feedback_scope.epoch.0))?,
-            origin,
-        ) {
-            return Err(protocol("native collection generation mismatch"));
-        }
-        let fence = self.transaction_native_fence()?;
-        for _ in 0..self.config.work.native_write_batch {
-            if !self.native_room() {
-                self.performance.counters.native_output_full_polls = self
-                    .performance
-                    .counters
-                    .native_output_full_polls
-                    .saturating_add(1);
-                break;
-            }
-            // Acquire actual existing output storage before advancing extraction.
-            // The lease returns its buffer on empty/error paths automatically.
-            let lease = self
-                .native
-                .acquire()
-                .ok_or_else(|| protocol("native lease disappeared"))?;
-            let mut entry = self.owner.entry(core::Epoch(self.feedback_scope.epoch.0))?;
-            let Some(packet) = entry.pop_identified().map_err(native_record_error)? else {
-                break;
-            };
-            generic_actions::check_native_fence(fence.as_ref(), origin, packet.identity)?;
-            lease.copy(
-                Native {
-                    origin,
-                    identity: packet.identity,
-                },
-                now,
-                packet.bytes,
-            )?;
-            self.performance.counters.native_pending_packets_high = self
-                .performance
-                .counters
-                .native_pending_packets_high
-                .max(self.native.len() as u64);
-            self.performance.counters.native_pending_bytes_high = self
-                .performance
-                .counters
-                .native_pending_bytes_high
-                .max(self.native.bytes() as u64);
-        }
-        Ok(())
+        self.collect_common_native(now)
     }
-    fn read_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    fn read_native<D: NativeDevice>(
         &mut self,
-        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
+        ready: &mut NativeGuard<'_, D>,
         output: &mut [u8],
-        mut now: impl FnMut() -> io::Result<u64>,
+        now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
-        if self.common.is_some() {
-            return self.read_common_native(ready, output, now);
-        }
-        let before = now()?;
-        if self.generic.is_some() {
-            self.progress_transaction(before)?;
-        }
-        if !self.check_expiry(before)?
-            || !self.can_admit_native()?
-            || !self
-                .owner
-                .engine(core::Epoch(self.source_scope.epoch.0))?
-                .has_room()
-        {
-            return Ok(false);
-        }
-        let received = try_native_read(ready, output);
-        match &received {
-            Ok(Some(_)) => {
-                self.performance.counters.native_read_batch_packets = self
-                    .performance
-                    .counters
-                    .native_read_batch_packets
-                    .saturating_add(1)
-            }
-            Ok(None) => {
-                self.performance.counters.native_read_would_block = self
-                    .performance
-                    .counters
-                    .native_read_would_block
-                    .saturating_add(1)
-            }
-            Err(_) => {}
-        }
-        let now = now()?;
-        if !self.check_expiry(now)? {
-            return Ok(false);
-        }
-        if self.generic.is_some() {
-            self.progress_transaction(now)?;
-            if !self.can_admit_native()? {
-                return Ok(false);
-            }
-        }
-        let Some(length) = received? else {
-            return Ok(false);
-        };
-        if length == 0 || length > self.config.send.records.max_native || length > output.len() {
-            self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
-            return Ok(true);
-        }
-        match self
-            .owner
-            .entry(core::Epoch(self.source_scope.epoch.0))?
-            .offer_identified(now, &output[..length])
-            .map_err(native_record_error)?
-        {
-            records::IdentifiedAdmission::Accepted(_) => {
-                self.counters.native_read = self.counters.native_read.saturating_add(1);
-            }
-            records::IdentifiedAdmission::PacketSize => {
-                self.counters.native_oversize = self.counters.native_oversize.saturating_add(1);
-            }
-            records::IdentifiedAdmission::Full => {
-                return Err(protocol("Swift admission changed without another producer"));
-            }
-        }
-        Ok(true)
+        self.read_common_native(ready, output, now)
     }
-    async fn flush_native_ready<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    async fn flush_native_ready<D: NativeDevice>(
         &mut self,
-        device: &mut AsyncFd<D>,
+        device: &mut NativeReady<D>,
         mut now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<usize> {
         if self.native.is_empty() {
@@ -3316,55 +1857,12 @@ impl Driver {
         })
         .await
     }
-    fn write_native<D: PacketDevice<Error = io::Error> + AsRawFd>(
+    fn write_native<D: NativeDevice>(
         &mut self,
-        ready: &mut tokio::io::unix::AsyncFdReadyMutGuard<'_, D>,
-        mut now: impl FnMut() -> io::Result<u64>,
+        ready: &mut NativeGuard<'_, D>,
+        now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<bool> {
-        if self.common.is_some() {
-            return self.write_common_native(ready, now);
-        }
-        if !self.check_expiry(now()?)? {
-            return Ok(false);
-        }
-        let Some(packet) = self.native.front() else {
-            return Ok(false);
-        };
-        let completion = self
-            .written
-            .preflight(packet.metadata().origin, packet.metadata().identity)?;
-        let packet_bytes = packet.bytes().len();
-        let packet_since = packet.since();
-        if packet_bytes > self.native.bytes() {
-            return Err(protocol("native output byte ownership mismatch"));
-        }
-        let result = try_native_write(ready, packet.bytes());
-        if matches!(&result, Ok(true)) {
-            // Commit irreversible complete-device acceptance before sampling a
-            // fresh clock or returning any later expiry/invariant failure.
-            self.written.complete(completion);
-            self.counters.native_written = self.counters.native_written.saturating_add(1);
-            self.performance.counters.native_write_batch_packets = self
-                .performance
-                .counters
-                .native_write_batch_packets
-                .saturating_add(1);
-            self.native.complete_front()?;
-        }
-        if matches!(&result, Ok(false)) {
-            self.performance.counters.native_write_would_block = self
-                .performance
-                .counters
-                .native_write_would_block
-                .saturating_add(1);
-        }
-        // Preserve the original front age for the completion check even after
-        // a successful write removes the FIFO entry; it cannot erase its expiry.
-        let expiry = now().and_then(|now| self.check_expiry_with_native(now, Some(packet_since)));
-        if !expiry? {
-            return Ok(false);
-        }
-        result
+        self.write_common_native(ready, now)
     }
     fn handed(
         &mut self,
@@ -3402,11 +1900,7 @@ impl Driver {
         }
     }
     fn bootstrap_ip_bytes(&self) -> usize {
-        let Some(runtime) = self
-            .common
-            .as_deref()
-            .filter(|r| r.contract.compact_wire().is_some())
-        else {
+        let Some(runtime) = self.common.as_deref() else {
             return self.ip;
         };
         if let Some(raw) = runtime.contract.raw_outer() {
@@ -3528,80 +2022,7 @@ impl Driver {
                 }
                 break;
             }
-            if self.generic.is_some() {
-                if self.send_transaction_user(socket, now)? {
-                    emitted += 1;
-                    continue;
-                }
-                break;
-            }
-            let maximum = self
-                .send
-                .records
-                .codec
-                .datagram_bytes
-                .max(self.receive.records.codec.datagram_bytes);
-            let required = self
-                .records
-                .capacity(maximum)
-                .map_err(protocol)?
-                .packet_bytes
-                + self.ip;
-            if self.bucket.allowance() < required + self.reserve {
-                let engine = self.owner.engine(core::Epoch(self.source_scope.epoch.0))?;
-                if engine.data_ready(now) || engine.feedback_ready(now) {
-                    self.performance
-                        .blocked(now, self.bucket.ready_at(required + self.reserve)?);
-                }
-                break;
-            }
-            let number = self.records.next_number(Class::User);
-            let mut entry = self.owner.entry(core::Epoch(self.source_scope.epoch.0))?;
-            let Some(emission) = entry
-                .poll_emission(now, records::RecordNumber(number.0), true)
-                .map_err(protocol)?
-            else {
-                self.performance.counters.user_not_ready_polls = self
-                    .performance
-                    .counters
-                    .user_not_ready_polls
-                    .saturating_add(1);
-                break;
-            };
-            let feedback = emission.kind() == records::EmissionKind::Feedback;
-            let body = emission.body();
-            let scope = if feedback {
-                self.feedback_scope
-            } else {
-                self.source_scope
-            };
-            let sealed = self
-                .records
-                .seal_user_in(
-                    scope,
-                    meta(self.outer, cover::Phase::Established),
-                    body,
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-                .map_err(record_error)?;
-            if sealed.number != number {
-                return Err(protocol(
-                    "Swift coefficient seed/security identity mismatch",
-                ));
-            }
-            self.counters.user_number = Some(sealed.number);
-            self.counters.user_generation = Some(sealed.generation);
-            self.handed(
-                socket,
-                sealed.bytes,
-                if feedback {
-                    performance::WireKind::Feedback
-                } else {
-                    performance::WireKind::Data
-                },
-            )?;
-            emitted += 1;
+            return Err(protocol("UDP send requires the current Common owner"));
         }
         if emitted == self.config.work.send_batch {
             self.performance.counters.send_batch_limit_hits = self
@@ -3624,27 +2045,16 @@ impl Driver {
         else {
             return Ok(None);
         };
-        let sealed = if self.records.key_epoch().is_ok() {
-            self.records
-                .seal_at(
-                    l2tunnel::handshake::Time(now),
-                    Class::Control,
-                    meta(self.outer, cover::Phase::Established),
-                    &self.buffers.control_wire[..emission.bytes],
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-                .map(|sealed| sealed.record)
-        } else {
-            self.records.seal(
+        let sealed = self
+            .records
+            .seal(
                 Class::Control,
                 meta(self.outer, cover::Phase::Established),
                 &self.buffers.control_wire[..emission.bytes],
                 &mut self.buffers.seal,
                 &mut self.buffers.wire,
             )
-        }
-        .map_err(record_error)?;
+            .map_err(record_error)?;
         if sealed.bytes + self.ip != emission.wire_bytes {
             return Err(protocol("control service full-wire accounting mismatch"));
         }
@@ -3652,244 +2062,7 @@ impl Driver {
         self.counters.control_generation = Some(sealed.generation);
         Ok(Some(sealed.bytes))
     }
-    fn send_transaction_user(
-        &mut self,
-        socket: &tokio::net::UdpSocket,
-        now: u64,
-    ) -> io::Result<bool> {
-        let epochs = self.transaction_epochs();
-        let generic = self
-            .generic
-            .as_mut()
-            .ok_or_else(|| protocol("generic scheduler without selection"))?;
-        let first = usize::from(generic.cursor);
-        generic.cursor = !generic.cursor;
-        for offset in 0..2 {
-            let Some(epoch) = epochs[(first + offset) % 2] else {
-                continue;
-            };
-            let (scope, allow_data) = {
-                let owner::DataOwner::Generic(state) = &self.owner else {
-                    return Err(protocol("generic scheduler owner mismatch"));
-                };
-                let Some(reader) = state.peer().reader(epoch) else {
-                    continue;
-                };
-                (
-                    Scope {
-                        epoch: security::Epoch(epoch.0),
-                        configuration: security::ConfigDigest(
-                            transaction::configuration_digest(reader.config)
-                                .map_err(protocol)?
-                                .0,
-                        ),
-                    },
-                    reader.disposition != transaction::ReadDisposition::Staged,
-                )
-            };
-            let engine = self.owner.engine(epoch)?;
-            let maximum = engine
-                .send_config()
-                .codec
-                .datagram_bytes
-                .max(engine.receive_config().codec.datagram_bytes);
-            let required = self
-                .records
-                .capacity(maximum)
-                .map_err(protocol)?
-                .packet_bytes
-                + self.ip;
-            if self.bucket.allowance() < required + self.reserve {
-                if engine.feedback_ready(now) || (allow_data && engine.data_ready(now)) {
-                    self.performance
-                        .blocked(now, self.bucket.ready_at(required + self.reserve)?);
-                }
-                continue;
-            }
-            let number = self.records.next_number(Class::User);
-            let mut entry = self.owner.entry(epoch)?;
-            let Some(emission) = entry
-                .poll_emission(now, records::RecordNumber(number.0), allow_data)
-                .map_err(protocol)?
-            else {
-                continue;
-            };
-            let feedback = emission.kind() == records::EmissionKind::Feedback;
-            let body = emission.body();
-            let sealed = self
-                .records
-                .seal_user_in(
-                    scope,
-                    meta(self.outer, cover::Phase::Established),
-                    body,
-                    &mut self.buffers.seal,
-                    &mut self.buffers.wire,
-                )
-                .map_err(record_error)?;
-            if sealed.number != number {
-                return Err(protocol(
-                    "generic Swift coefficient seed/security identity mismatch",
-                ));
-            }
-            self.counters.user_number = Some(sealed.number);
-            self.counters.user_generation = Some(sealed.generation);
-            self.handed(
-                socket,
-                sealed.bytes,
-                if feedback {
-                    performance::WireKind::Feedback
-                } else {
-                    performance::WireKind::Data
-                },
-            )?;
-            return Ok(true);
-        }
-        self.performance.counters.user_not_ready_polls = self
-            .performance
-            .counters
-            .user_not_ready_polls
-            .saturating_add(1);
-        Ok(false)
-    }
     fn wake(&self, now: u64) -> io::Result<Instant> {
-        if self.common.is_some() {
-            return self.wake_common(now);
-        }
-        let mut wake = self.lease;
-        let control_pending = if self.generic.is_some() {
-            self.control.ready_nontransaction()?
-        } else {
-            self.control
-                .ready_for_dispatch(self.target.map(envelope_scope))?
-        };
-        if self.config.streams.is_some() && (self.control_work || control_pending) {
-            wake = wake.min(now);
-        }
-        if let owner::DataOwner::Generic(state) = &self.owner
-            && let Some(at) = state.next_deadline()
-        {
-            wake = wake.min(u64::try_from(at.as_micros()).map_err(invalid)?);
-        }
-        for at in [
-            self.challenge.as_ref().map(|value| value.deadline),
-            match &self.owner {
-                owner::DataOwner::Legacy(legacy) => {
-                    legacy.coordinator.deadline().map(|value| value.0)
-                }
-                owner::DataOwner::Generic(_) | owner::DataOwner::Common(_) => None,
-            },
-            self.policy_cap,
-            Some(u64::try_from(self.control.expiry().as_micros()).map_err(invalid)?),
-            self.control
-                .pending_deadline()
-                .map(|deadline| u64::try_from(deadline.as_micros()).map_err(invalid))
-                .transpose()?,
-            self.native
-                .front()
-                .map(|packet| add(packet.since(), self.config.native.stall_timeout))
-                .transpose()?,
-            self.next_report,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            wake = wake.min(at);
-        }
-        if self.challenge.is_none() {
-            wake = wake.min(self.next_ping);
-        }
-        if self.ingress.left == 0 {
-            wake = wake.min(self.ingress.refill);
-        }
-        let control_ready = self.bucket.ready_at(self.reserve)?;
-        let control_at = u64::try_from(self.control.deadline().as_micros())
-            .map_err(invalid)?
-            .max(control_ready);
-        wake = wake.min(control_at);
-        if self.generic.is_some() {
-            for epoch in self.transaction_epochs().into_iter().flatten() {
-                let engine = self.owner.engine(epoch)?;
-                let body = engine
-                    .send_config()
-                    .codec
-                    .datagram_bytes
-                    .max(engine.receive_config().codec.datagram_bytes);
-                let required = self.records.capacity(body).map_err(protocol)?.packet_bytes
-                    + self.ip
-                    + self.reserve;
-                let ready = self.bucket.ready_at(required)?;
-                let allow_data = match &self.owner {
-                    owner::DataOwner::Generic(state) => {
-                        state.peer().reader(epoch).is_some_and(|reader| {
-                            reader.disposition != transaction::ReadDisposition::Staged
-                        })
-                    }
-                    _ => false,
-                };
-                if allow_data && engine.data_ready(now) {
-                    wake = wake.min(ready);
-                } else if allow_data && let Some(at) = engine.data_deadline() {
-                    wake = wake.min(at.max(ready));
-                }
-                if let Some(at) = engine.feedback_deadline() {
-                    wake = wake.min(at.max(ready));
-                }
-            }
-        } else {
-            let user_max = self
-                .records
-                .capacity(
-                    self.send
-                        .records
-                        .codec
-                        .datagram_bytes
-                        .max(self.receive.records.codec.datagram_bytes),
-                )
-                .map_err(protocol)?
-                .packet_bytes
-                + self.ip
-                + self.reserve;
-            let user_ready = self.bucket.ready_at(user_max)?;
-            // Queued retransmissions and earned repairs are ready work even when
-            // the next idle-probe deadline is later than available wire credit.
-            let engine = self.owner.engine(core::Epoch(self.source_scope.epoch.0))?;
-            if engine.data_ready(now) {
-                wake = wake.min(user_ready);
-            } else if let Some(at) = engine.data_deadline() {
-                wake = wake.min(at.max(user_ready));
-            }
-            if let Some(at) = engine.feedback_deadline() {
-                wake = wake.min(at.max(user_ready));
-            }
-        }
-        let mut instant = self
-            .origin
-            .checked_add(duration(wake))
-            .ok_or_else(|| protocol("runtime wake overflow"))?;
-        for (at, bytes) in [
-            (
-                self.bootstrap.deadline(),
-                self.bootstrap.max_packet_bytes() + self.bootstrap_ip_bytes(),
-            ),
-            (
-                self.joining.deadline(),
-                self.joining.max_packet_bytes() + self.bootstrap_ip_bytes(),
-            ),
-        ] {
-            if let Some(at) = at {
-                let ready = self
-                    .origin
-                    .checked_add(duration(self.bucket.ready_at(bytes)?))
-                    .ok_or_else(|| protocol("tail wire wake overflow"))?;
-                instant = instant.min(at.max(ready));
-            }
-        }
-        // A pure engine may retain a due source while a local quota blocks it.
-        // Bound re-observation and never let a past deadline make select spin.
-        let floor = self
-            .origin
-            .checked_add(duration(now.checked_add(100).ok_or_else(exhausted)?))
-            .ok_or_else(exhausted)?;
-        Ok(instant.max(floor))
+        self.wake_common(now)
     }
 }

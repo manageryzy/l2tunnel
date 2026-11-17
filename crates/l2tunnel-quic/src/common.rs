@@ -108,6 +108,7 @@ pub struct Carrier {
     local: SocketAddr,
     peer: SocketAddr,
     pair_binding: Option<[u8; 32]>,
+    peer_finished: bool,
 }
 
 impl Carrier {
@@ -167,6 +168,28 @@ impl Carrier {
     /// Observe maintained failure without changing any Common security state.
     pub fn check_failure(&self) -> Result<(), Error> {
         self.session.check()
+    }
+    /// Typed normal peer closure observed on this owner, never a retirement proof.
+    /// Reset, local close, nonzero peer errors and idle expiry remain failures.
+    pub fn peer_close_error(&self, error: &Error) -> bool {
+        match error {
+            Error::Transport => {
+                self.peer_finished
+                    || self
+                        .session
+                        .connection
+                        .close_reason()
+                        .as_ref()
+                        .is_some_and(normal_peer_close)
+            }
+            Error::Io(error) => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<quinn::ReadError>())
+                .is_some_and(|error| {
+                    matches!(error, quinn::ReadError::ConnectionLost(reason) if normal_peer_close(reason))
+                }),
+            _ => false,
+        }
     }
 
     /// Enable the disjoint final namespace after the caller authenticated its
@@ -263,6 +286,7 @@ impl Carrier {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Io(error))),
             Poll::Ready(Ok(())) => {
+                self.peer_finished = input.filled().is_empty();
                 self.session.close();
                 Poll::Ready(Err(if input.filled().is_empty() {
                     Error::Transport
@@ -342,11 +366,24 @@ impl Carrier {
     }
 }
 
+fn normal_peer_close(error: &quinn::ConnectionError) -> bool {
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => close.error_code == 0u32.into(),
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            close.error_code == quinn::TransportErrorCode::NO_ERROR
+        }
+        _ => false,
+    }
+}
+
 fn final_prefix(bytes: &[u8]) -> bool {
+    // Strong data occupies 2..=23 and 80..=121 for all 64 reader slots.
+    // Reserved outer/bootstrap prefixes remain disjoint. This is routing only;
+    // the sole Common Records owner still authenticates every admitted record.
     bytes.len() >= 9
         && bytes
             .first()
-            .is_some_and(|first| *first <= 1 || *first >= 128)
+            .is_some_and(|first| matches!(*first, 0..=23 | 80..=121 | 128..=255))
 }
 fn before(deadline: Instant) -> Result<(), Error> {
     if Instant::now() >= deadline {
@@ -402,6 +439,7 @@ fn checked(
         local,
         peer,
         pair_binding: None,
+        peer_finished: false,
     })
 }
 

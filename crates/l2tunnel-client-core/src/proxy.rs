@@ -1,24 +1,12 @@
 //! Explicit fixed-credit TUN proxy factories; original TLS lanes remain owned.
 use super::ConnectionConfig;
-use l2tunnel_auth::{self as auth, ClientTls, MemberAllowlist, MemberKey, ServerTls};
-use l2tunnel_core::Duplex;
-use l2tunnel_device::{PacketDevice, PacketLayer};
+use l2tunnel_device::PacketLayer;
 use l2tunnel_runtime::{Compression, proxy as runtime};
 use serde::{
     Deserialize, Deserializer,
     de::{self, SeqAccess, Visitor},
 };
-use std::{
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, SocketAddr},
-    time::Duration,
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    time::{Instant, timeout_at},
-};
+use std::{fmt, io, net::IpAddr, time::Duration};
 
 /// Maintained behavior by default; the optional TIME-WAIT exception is explicit.
 pub use l2tunnel_tcp_proxy::TimeWaitResetPolicy;
@@ -165,35 +153,6 @@ fn prefix(text: &str) -> io::Result<IpPrefix> {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn expired() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        "proxy original setup deadline elapsed",
-    )
-}
-pub(super) fn deadline(timeout: Duration) -> io::Result<Instant> {
-    Instant::now().checked_add(timeout).ok_or_else(expired)
-}
-pub(super) fn remaining(end: Instant) -> io::Result<Duration> {
-    end.checked_duration_since(Instant::now())
-        .filter(|d| !d.is_zero())
-        .ok_or_else(expired)
-}
-pub(super) async fn within<T>(
-    end: Instant,
-    future: impl Future<Output = io::Result<T>>,
-) -> io::Result<T> {
-    let value = timeout_at(end, future).await.map_err(|_| expired())??;
-    remaining(end)?;
-    Ok(value)
-}
-pub(super) fn auth_error(value: auth::Error) -> io::Error {
-    match value {
-        auth::Error::TimedOut => expired(),
-        other => super::auth_error(other),
-    }
-}
-
 /// Derive and validate the exact fixed runtime policy before socket/device I/O.
 pub fn runtime_config(
     connection: ConnectionConfig,
@@ -217,112 +176,6 @@ pub fn runtime_config(
     value.native.time_wait_reset_policy = settings.time_wait_reset_policy;
     value.validate()?;
     Ok(value)
-}
-
-/// Actual authenticated lanes and their inseparable immutable proxy configuration.
-pub struct Session {
-    link: runtime::Link,
-    config: runtime::Config,
-}
-impl Session {
-    /// Read the exact authenticated policy; it cannot be mutated through this view.
-    pub fn config(&self) -> &runtime::Config {
-        &self.config
-    }
-    /// Keep polling this future and retain Handle through requested finite drain.
-    /// Cancellation is abnormal; success reports the runtime's exact TLS/native proof.
-    pub async fn run<D: PacketDevice<Error = io::Error>>(
-        self,
-        device: D,
-        control: Control,
-    ) -> io::Result<CloseReport> {
-        runtime::run(device, self.link, self.config, control).await
-    }
-    /// Shared-service ownership: failure returns only after actual I/O children join.
-    /// The service retains this future during late cleanup; drop is not a join proof.
-    pub(crate) async fn run_service_owned<D: PacketDevice<Error = io::Error>>(
-        self,
-        device: D,
-        control: Control,
-    ) -> io::Result<CloseReport> {
-        runtime::run_service_owned(device, self.link, self.config, control).await
-    }
-}
-pub(super) fn remote(address: SocketAddr) -> io::Result<()> {
-    if address.port() == 0
-        || address.ip().is_unspecified()
-        || address.ip().is_multicast()
-        || matches!(address.ip(),IpAddr::V4(ip)if ip.is_broadcast())
-    {
-        return Err(invalid("proxy remote must be a nonzero unicast endpoint"));
-    }
-    Ok(())
-}
-/// Authenticate a full/paired proxy session within one original setup deadline.
-pub async fn connect(
-    address: SocketAddr,
-    tls: &ClientTls,
-    name: &str,
-    member: &MemberKey,
-    connection: ConnectionConfig,
-    settings: &Settings,
-) -> io::Result<Session> {
-    let config = runtime_config(connection, settings)?;
-    remote(address)?;
-    let binding = runtime::session_config(&config)?;
-    let end = deadline(connection.handshake_timeout)?;
-    within(end, async {
-        let lane = async || {
-            let stream = TcpStream::connect(address).await?;
-            stream.set_nodelay(true)?;
-            auth::client_connect(stream, tls, name, member, binding, remaining(end)?)
-                .await
-                .map_err(auth_error)
-        };
-        let first = lane().await?;
-        let link = match connection.duplex {
-            Duplex::Full => runtime::Link::full(first, &config)?,
-            Duplex::Half => {
-                let second = lane().await?;
-                remaining(end)?;
-                runtime::client_pair(first, second, &config).await?
-            }
-        };
-        Ok(Session { link, config })
-    })
-    .await
-}
-/// Accept one full/paired member, including first accept, under one setup deadline.
-pub async fn accept(
-    listener: &TcpListener,
-    tls: &ServerTls,
-    allowlist: &MemberAllowlist,
-    connection: ConnectionConfig,
-    settings: &Settings,
-) -> io::Result<Session> {
-    let config = runtime_config(connection, settings)?;
-    let binding = runtime::session_config(&config)?;
-    let end = deadline(connection.handshake_timeout)?;
-    within(end, async {
-        let lane = async || {
-            let (stream, _) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            auth::server_accept(stream, tls, allowlist, binding, remaining(end)?)
-                .await
-                .map_err(auth_error)
-        };
-        let first = lane().await?;
-        let link = match connection.duplex {
-            Duplex::Full => runtime::Link::full(first, &config)?,
-            Duplex::Half => {
-                let second = lane().await?;
-                remaining(end)?;
-                runtime::server_pair(first, second, &config).await?
-            }
-        };
-        Ok(Session { link, config })
-    })
-    .await
 }
 
 #[cfg(test)]

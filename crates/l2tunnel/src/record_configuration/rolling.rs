@@ -22,11 +22,7 @@ pub(super) fn encode<P: RecoveryPolicy>(
     let p = config.packing;
     let s = config.scheduler;
     for value in [
-        match config.native_policy {
-            aligned::NativePolicy::EthernetHeaders => 1,
-            aligned::NativePolicy::RawIp => 2,
-            aligned::NativePolicy::IpHeaders => 3,
-        },
+        u64::from(config.native_policy.wire()),
         integer(b.max_frame_bytes)?,
         integer(b.symbol_bytes)?,
         u64::from(b.elide_payload_length),
@@ -77,12 +73,8 @@ fn decode(
         padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
     }
     let mut reader = Reader::new(input.get(..ACTIVE_BYTES).ok_or(Error::Length)?);
-    let native_policy = match reader.number()? {
-        1 => aligned::NativePolicy::EthernetHeaders,
-        2 => aligned::NativePolicy::RawIp,
-        3 => aligned::NativePolicy::IpHeaders,
-        _ => return Err(Error::Prefix),
-    };
+    let native_policy =
+        aligned::NativePolicy::from_wire(checked(reader.number()?)?).ok_or(Error::Prefix)?;
     let body = aligned_body::Config {
         max_frame_bytes: reader.size()?,
         symbol_bytes: reader.size()?,
@@ -139,8 +131,12 @@ fn decode(
     let feedback_packets = checked(reader.number()?)?;
     let memory_bytes = reader.size()?;
     let source_wire = match reader.number()? {
-        1 => fec::rolling::wire::SourceWire::Padded,
-        2 => fec::rolling::wire::SourceWire::Exact,
+        version if version == u64::from(fec::rolling::wire::VERSION) => {
+            fec::rolling::wire::SourceWire::Padded
+        }
+        version if version == u64::from(fec::rolling::wire::EXACT_SOURCE_VERSION) => {
+            fec::rolling::wire::SourceWire::Exact
+        }
         _ => return Err(Error::Prefix),
     };
     let scheduler = fec::rolling::scheduler::Policy {

@@ -211,7 +211,7 @@ async fn controlled_nonallowlisted_member_is_rejected_by_actual_generic_server()
         let identity = credentials.noise().attempt();
         let admission = credentials.admission();
         let selected = fixture.profile.settings();
-        let config = selected.runtime(Role::Initiator, fixture.profile.peers())?;
+        let config = fixture.profile.establish_config(Role::Initiator)?;
         let encoded = Zeroizing::new(l2tunnel_auth::MemberKey::generate_pkcs8()?);
         let other = identity::IdentityKey::from_pkcs8(&encoded)?;
         assert_ne!(other.public_key(), selected.member);
@@ -361,7 +361,7 @@ async fn generic_authenticated_provider_descriptor_and_budget_failures_never_pub
                     if cause == 0 {
                         return Err(io::Error::new(io::ErrorKind::PermissionDenied, SENTINEL));
                     }
-                    Ok(crate::swift::Native::new(InvalidDescriptor {
+                    Ok(crate::native::Native::new(InvalidDescriptor {
                         drops: drops.clone(),
                         io_calls: io_calls.clone(),
                     }))
@@ -387,7 +387,7 @@ async fn generic_authenticated_provider_descriptor_and_budget_failures_never_pub
             assert!(!format!("{failed:?}").contains(SENTINEL));
             assert!(!format!("{failed:?}").contains("do-not-copy"));
             let response = pair.handles[0]
-                .lifecycle_request(v3(local::Action::Status {}))
+                .lifecycle_request(v4(local::Action::Status {}))
                 .await;
             let json = serde_json::to_string(&response)?;
             assert!(!json.contains(SENTINEL) && !json.contains("do-not-copy"));
@@ -424,7 +424,7 @@ async fn generic_authenticated_provider_descriptor_and_budget_failures_never_pub
                     .fixture
                     .profile
                     .runtime_contract(Role::Initiator)?
-                    .config()
+                    .resources()
                     .streams
                     .ok_or("missing actual bounded streams")?
                     .streams

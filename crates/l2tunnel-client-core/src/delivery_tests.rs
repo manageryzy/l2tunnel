@@ -1,7 +1,7 @@
 //! Additive shared delivery-policy API and real retained TLS handshake tests.
 use super::*;
 use l2tunnel_flow_control::delivery_window::Config;
-use l2tunnel_runtime::managed::DeliveryConfig;
+use l2tunnel_runtime::configuration::DeliveryConfig;
 use tokio::time::{sleep, timeout};
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<T = ()> = std::result::Result<T, Failure>;

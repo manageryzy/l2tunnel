@@ -100,15 +100,19 @@ fn measured_common_binding_refuses_cross_family_and_unselected_retirement() -> R
     // Trusted runtime metadata cannot opt a measured policy into legacy close.
     let settings = profile.settings();
     let actual = profile.runtime_contract(Role::Initiator)?;
-    let nonretained = transport::CommonTransactionContract::new(
+    let nonretained = transport::CommonTransactionContract::new_compact_wire(
         profile.configuration()?,
         Role::Initiator,
-        actual.resources(),
+        [
+            actual.resources(),
+            profile.runtime_contract(Role::Responder)?.resources(),
+        ],
         actual.cover(),
         settings.gate.path.client.is_ipv6(),
         profile.envelope(),
         profile.catalog().clone(),
         profile.parameters(),
+        profile.compact_wire(),
     )?
     .with_proxy_binding(binding)?;
     assert_eq!(

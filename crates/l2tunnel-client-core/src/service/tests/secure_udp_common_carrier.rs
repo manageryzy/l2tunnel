@@ -365,28 +365,27 @@ async fn exercise_carrier_wire(
                 assert_ne!(frame.requested.configuration()?, requested.configuration()?);
                 assert_ne!(frame.requested.envelope(), requested.envelope());
                 let status = frame.status()?;
+                let protection = status
+                    .compact_wire
+                    .as_ref()
+                    .ok_or("current wire status absent")?;
                 assert_eq!(
-                    status.compact_wire.as_ref().map(|value| value.effective),
-                    wire.map(|value| {
-                        crate::secure_udp::common_status::CompactWireSelection::from_selection(
-                            value,
-                        )
-                        .map(Some)
-                    })
-                    .transpose()?
+                    protection.requested,
+                    crate::secure_udp::common_status::CompactWireSelection::from_selection(
+                        requested.compact_wire(),
+                    )?
                 );
-                if wire.is_some() {
-                    assert_eq!(effective.catalog().root(), requested.catalog().root());
-                    assert_eq!(
-                        frame
-                            .requested
-                            .runtime_contract(frame.info.role)?
-                            .resources()
-                            .control
-                            .wire_overhead,
-                        28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
-                    );
-                }
+                assert_eq!(protection.effective, Some(protection.requested));
+                assert_eq!(effective.catalog().root(), requested.catalog().root());
+                assert_eq!(
+                    frame
+                        .requested
+                        .runtime_contract(frame.info.role)?
+                        .resources()
+                        .control
+                        .wire_overhead,
+                    28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
+                );
                 assert!(status.raw_carrier.is_none());
                 assert!(serde_json::to_value(&status)?.get("raw_carrier").is_none());
                 let carrier = status
@@ -568,7 +567,7 @@ async fn common_carrier_prepared_rejects_split_member_and_setup_expires_before_i
     tls.members = MemberAllowlist::new(&[wrong.public_key()])?;
     let refusal = Prepared::secure_udp_common_carrier_server(
         (*profile).clone(),
-        outer,
+        *outer,
         tls,
         inner,
         data.attachment,

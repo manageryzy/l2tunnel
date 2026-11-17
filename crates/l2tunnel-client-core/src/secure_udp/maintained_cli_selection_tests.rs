@@ -49,7 +49,7 @@ fn descriptor(duplex: Duplex, rate: u64) -> io::Result<common::Descriptor> {
     .map_err(io::Error::other)
 }
 fn plan(duplex: Duplex) -> io::Result<Value> {
-    let original = transaction_cli::test_plan_value();
+    let original = common_plan_fixture::template();
     let catalog = [
         descriptor(duplex, 1_250_001)?,
         descriptor(duplex, 1_375_007)?,

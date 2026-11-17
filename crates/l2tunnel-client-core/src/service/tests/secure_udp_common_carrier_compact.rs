@@ -99,9 +99,10 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
             transport,
             ..
         } = data;
-        let prepared::Transport::SecureUdpCommonCarrier { mut outer, .. } = transport else {
+        let prepared::Transport::SecureUdpCommonCarrier { outer, .. } = transport else {
             return Err("actual original-carrier transport absent".into());
         };
+        let mut outer = *outer;
         // Transfer genuine unstarted credentials; only the explicit catalog and
         // its requested setup digest change before the actual factory executes.
         outer.base.digest = l2tunnel_core::ConfigDigest(requested.requested_configuration()?.0);

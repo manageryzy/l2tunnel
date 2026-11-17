@@ -37,9 +37,7 @@ impl Driver {
             wire_bytes: available,
         };
         let before = budget;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("fragment scheduler Bank missing"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         let runtime = self
             .common
             .as_deref_mut()
@@ -190,9 +188,7 @@ impl Driver {
                 .channels(),
         );
         let cap = self.common_original_cap()?;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("fragment receive Bank missing"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         let accepted = state
             .entry(epoch)?
             .accept_fragment_authenticated_ordered_until(

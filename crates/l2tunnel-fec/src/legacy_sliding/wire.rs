@@ -1,10 +1,10 @@
-//! Explicit legacy v1 records; parsing establishes structure, never authority.
+//! Explicit legacy-algorithm records; parsing establishes structure, never authority.
 use super::*;
 
 /// Complete fixed protocol header, excluding terms, bytes and outer framing.
 pub const HEADER_BYTES: usize = 72;
-/// New format version, unrelated to Python's analytical packet accounting.
-pub const VERSION: u8 = 1;
+/// Current effective-extent format, unrelated to Python's analytical accounting.
+pub const VERSION: u8 = 2;
 
 /// One exact authenticated-carrier record borrowed from caller buffers.
 #[derive(Clone, Copy, Debug)]
@@ -83,7 +83,7 @@ pub fn encode_source(
     output[HEADER_BYTES..length].copy_from_slice(original);
     Ok(length)
 }
-/// Encode the exact frozen sparse coefficients and all fixed-width coded bytes.
+/// Encode the exact frozen sparse coefficients and effective coded extent.
 pub fn encode_repair(
     config: Config,
     repair: Repair<'_>,
@@ -193,7 +193,9 @@ pub fn inspect<'a>(
             if bytes[6] > 1
                 || count == 0
                 || count > usize::from(config.long_window)
-                || bytes.len() != HEADER_BYTES + 5 * count + config.recovery.width()?
+                || !(HEADER_BYTES + 5 * count + 3
+                    ..=HEADER_BYTES + 5 * count + config.recovery.width()?)
+                    .contains(&bytes.len())
             {
                 return Err(Error::Length);
             }

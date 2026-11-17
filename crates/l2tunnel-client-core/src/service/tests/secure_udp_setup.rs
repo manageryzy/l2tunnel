@@ -239,7 +239,7 @@ async fn driver_registration_failure_is_not_promoted_to_ready_or_authentication_
             .ok_or("test plan unexpectedly shared")?
             .attachment = Attachment::readable(PacketLayer::Ip, move || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::swift::Native::new(InvalidDescriptor {
+            Ok(crate::native::Native::new(InvalidDescriptor {
                 dropped: drops.clone(),
                 io_calls: io.clone(),
             }))
@@ -514,33 +514,6 @@ async fn setup_history_retirement_and_future_lookup_follow_existing_operation_bo
 }
 
 #[tokio::test]
-async fn legacy_service_operations_do_not_invent_secure_udp_setup_observations() -> Result {
-    let credentials = super::super::credentials()?;
-    let native = Arc::new(super::super::Native::default());
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let legacy = super::super::plan(
-        &credentials,
-        listener.local_addr()?,
-        cfg(Duplex::Full),
-        native.clone(),
-    )?;
-    let (handle, run) = channel();
-    let accepted = handle
-        .connect(legacy, handle.next_key().map_err(submit)?)
-        .map_err(submit)?;
-    assert_eq!(handle.setup_observation(accepted.operation), Ok(None));
-    assert_eq!(native.opened.load(Ordering::SeqCst), 0);
-    drop(run);
-    assert_eq!(
-        handle.wait(accepted.operation).await.map_err(submit)?,
-        Completed::Cancelled
-    );
-    assert_eq!(handle.setup_observation(accepted.operation), Ok(None));
-    assert_eq!(native.opened.load(Ordering::SeqCst), 0);
-    Ok(())
-}
-
-#[tokio::test]
 async fn fresh_reconnect_observation_cannot_adopt_or_refresh_the_previous_ready_operation() -> Result
 {
     for appearance in appearances() {
@@ -575,7 +548,7 @@ async fn fresh_reconnect_observation_cannot_adopt_or_refresh_the_previous_ready_
             .snapshot()
             .runtime
             .as_ref()
-            .and_then(Observation::secure_udp)
+            .and_then(Observation::secure_udp_common)
             .ok_or("missing live secure UDP owner")?
             .status()?
             .session;
@@ -604,7 +577,7 @@ async fn fresh_reconnect_observation_cannot_adopt_or_refresh_the_previous_ready_
             .snapshot()
             .runtime
             .as_ref()
-            .and_then(Observation::secure_udp)
+            .and_then(Observation::secure_udp_common)
             .ok_or("missing replacement owner")?
             .status()?
             .session;

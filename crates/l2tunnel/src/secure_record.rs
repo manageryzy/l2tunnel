@@ -1,4 +1,4 @@
-//! Pure authenticated User/Control records inside an explicitly selected cover.
+//! Pure current User/Control records with one authenticated compact format.
 //!
 //! Routes are untrusted hints until the selected purpose owner authenticates the
 //! exact route. Local staged readers do not negotiate or commit a peer switch.
@@ -6,20 +6,9 @@
 use crate::{cover, security};
 use std::fmt;
 
-#[path = "secure_record_framing.rs"]
-mod framing;
-use framing::{Format, Route};
-
-/// Explicit selected v2 consumption; legacy constructors and bytes are unchanged.
-#[path = "secure_record_refresh.rs"]
-pub mod refresh;
-
 /// Explicit compact packet selection with short data checks and authenticated feedback.
 #[path = "secure_record_compact.rs"]
 pub mod compact;
-
-/// Public route bytes before the complete common packet-security record.
-pub const ROUTE_BYTES: usize = 9;
 
 /// Authenticated record authority, independent of user Ethernet/IP contents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,18 +57,18 @@ pub struct Capacity {
     pub seal_workspace_bytes: usize,
     /// Body plus selected tag required by the security receiver.
     pub open_workspace_bytes: usize,
-    /// Complete established cover packet, excluding IP/UDP headers.
+    /// Complete current record, excluding carrier framing and transport headers.
     pub packet_bytes: usize,
 }
 
-/// Successful complete covered packet emission.
+/// Successful complete current record emission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Sealed {
     /// Unique identity owned by this class's security sender.
     pub number: security::PacketNumber,
     /// Actual sender key generation used for this protected record.
     pub generation: security::KeyGeneration,
-    /// Complete covered packet bytes in caller output.
+    /// Complete current record bytes in caller output.
     pub bytes: usize,
 }
 
@@ -97,10 +86,11 @@ pub struct Opened {
     /// Plaintext bytes at the start of caller output.
     pub bytes: usize,
     /// True for a compact Feedback branch protected by the separate strong owner.
-    /// Legacy User bodies retain their existing algorithm-level classification.
     pub feedback: bool,
     /// False only for explicitly selected compact ChaCha20/CRC32C data.
     pub authenticated: bool,
+    /// At least a 128-bit authentication tag protects this complete record.
+    pub strongly_authenticated: bool,
 }
 
 /// Structural, local-state, capacity or maintained-protection rejection.
@@ -120,12 +110,8 @@ pub enum Error {
     OutputTooSmall,
     /// The bounded selected owner backing could not be reserved.
     Allocation,
-    /// The selected structural cover rejected the packet or capacity.
-    Cover(cover::Error),
     /// The maintained common security owner rejected the operation.
     Security(security::Error),
-    /// Selected refresh ownership/time/protection rejected the operation.
-    Refresh(security::refresh::Error),
 }
 
 impl fmt::Display for Error {
@@ -134,34 +120,10 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-impl From<cover::Error> for Error {
-    fn from(value: cover::Error) -> Self {
-        Self::Cover(value)
-    }
-}
 impl From<security::Error> for Error {
     fn from(value: security::Error) -> Self {
         Self::Security(value)
     }
-}
-impl From<security::refresh::Error> for Error {
-    fn from(value: security::refresh::Error) -> Self {
-        Self::Refresh(value)
-    }
-}
-
-// Retain the existing inline legacy owner layout. Selected v2 is one fallibly
-// reserved private singleton; no per-packet allocation or duplicate owner exists.
-#[allow(clippy::large_enum_variant)]
-enum Owners {
-    Legacy {
-        data_sender: security::Sender,
-        data_receiver: security::Receiver,
-        control_sender: security::Sender,
-        control_receiver: security::Receiver,
-    },
-    Refreshable(Vec<security::refresh::Owners>),
-    Compact(Vec<compact::Owners>),
 }
 
 /// Fixed-domain secure records, without clocks, I/O or per-packet allocations.
@@ -173,76 +135,31 @@ enum Owners {
 pub struct Records {
     cover: cover::Config,
     limits: security::Limits,
-    protection: security::Protection,
     control: Scope,
     data: Scope,
     additional: Option<DataReader>,
-    owners: Owners,
+    // Exactly one fallibly reserved current owner; no per-packet allocation.
+    owners: Vec<compact::Owners>,
 }
 
 impl Records {
-    /// Consume an authenticated root and reserve exactly four distinct owners.
-    /// Maximum configured plaintext must fit the selected complete cover packet.
-    pub fn new(
-        mut root: security::SessionRoot,
-        lane: security::LaneId,
-        limits: security::Limits,
-        protection: security::Protection,
-        cover: cover::Config,
-        control: Scope,
-        data: Scope,
-    ) -> Result<Self, Error> {
-        Format::Initial.capacity(cover, limits, protection, limits.max_body_bytes)?;
-        let data_sender = root.sender(security::Purpose::Data, lane, limits, protection)?;
-        let data_receiver = root.receiver(security::Purpose::Data, lane, limits, protection)?;
-        let control_sender =
-            root.sender(security::Purpose::Management, lane, limits, protection)?;
-        let control_receiver =
-            root.receiver(security::Purpose::Management, lane, limits, protection)?;
-        Ok(Self {
-            cover,
-            limits,
-            protection,
-            control,
-            data,
-            additional: None,
-            owners: Owners::Legacy {
-                data_sender,
-                data_receiver,
-                control_sender,
-                control_receiver,
-            },
-        })
-    }
-
     /// Checked maximum class capacity before reserving a sending packet number.
-    /// Legacy formats are class-independent. Compact callers use `capacity_for`
-    /// for exact wire charging; this method reserves the larger strong check.
+    /// Use `capacity_for` for exact wire charging; this method reserves the
+    /// largest check selected across data, feedback and control.
     pub fn capacity(&self, plaintext_bytes: usize) -> Result<Capacity, Error> {
-        if self.is_compact() {
-            return self.capacity_for(compact::Kind::Control, plaintext_bytes);
-        }
-        self.format()
-            .capacity(self.cover, self.limits, self.protection, plaintext_bytes)
+        compact::capacity(
+            self.cover,
+            self.limits,
+            self.compact_selection().maximum_overhead() - compact::PREFIX_BYTES,
+            plaintext_bytes,
+        )
     }
 
     /// Inspect the next unique class-specific number without reserving it.
     pub fn next_number(&self, class: Class) -> security::PacketNumber {
-        match &self.owners {
-            Owners::Legacy {
-                data_sender,
-                control_sender,
-                ..
-            } => match class {
-                Class::User => data_sender.next_number(),
-                Class::Control => control_sender.next_number(),
-            },
-            // The private constructor retains exactly one immutable cell.
-            Owners::Refreshable(owners) => owners[0].next_number(refresh::class(class)),
-            Owners::Compact(owners) => match class {
-                Class::User => owners[0].data_sender.next_number(),
-                Class::Control => owners[0].control_sender.next_number(),
-            },
+        match class {
+            Class::User => self.owners[0].data_sender.next_number(),
+            Class::Control => self.owners[0].control_sender.next_number(),
         }
     }
 
@@ -275,9 +192,7 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = Some(requested);
-        if let Owners::Compact(owners) = &mut self.owners {
-            owners[0].additional_slot = Some((owners[0].data_slot + 1) & 0x3f);
-        }
+        self.owners[0].additional_slot = Some((self.owners[0].data_slot + 1) & 0x3f);
         Ok(())
     }
 
@@ -292,9 +207,7 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = None;
-        if let Owners::Compact(owners) = &mut self.owners {
-            owners[0].additional_slot = None;
-        }
+        self.owners[0].additional_slot = None;
         Ok(())
     }
 
@@ -312,11 +225,9 @@ impl Records {
         {
             return Err(Error::ScopeState);
         }
-        if let Owners::Compact(owners) = &mut self.owners {
-            let next_slot = owners[0].additional_slot.ok_or(Error::ScopeState)?;
-            owners[0].additional_slot = Some(owners[0].data_slot);
-            owners[0].data_slot = next_slot;
-        }
+        let next_slot = self.owners[0].additional_slot.ok_or(Error::ScopeState)?;
+        self.owners[0].additional_slot = Some(self.owners[0].data_slot);
+        self.owners[0].data_slot = next_slot;
         self.additional = Some(DataReader {
             scope: self.data,
             state: ReaderState::Draining,
@@ -336,13 +247,11 @@ impl Records {
             return Err(Error::ScopeState);
         }
         self.additional = None;
-        if let Owners::Compact(owners) = &mut self.owners {
-            owners[0].additional_slot = None;
-        }
+        self.owners[0].additional_slot = None;
         Ok(())
     }
 
-    /// Protect one User or Control record, then encode its established cover.
+    /// Protect one User or Control record with the selected current format.
     /// All structural/capacity checks precede cryptographic nonce reservation.
     pub fn seal(
         &mut self,
@@ -386,41 +295,20 @@ impl Records {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<Sealed, Error> {
-        if self.is_compact() {
-            return self.seal_compact(
-                match class {
-                    Class::User => compact::Kind::Data,
-                    Class::Control => compact::Kind::Control,
-                },
-                scope,
-                outer,
-                plaintext,
-                workspace,
-                output,
-            );
-        }
-        if matches!(self.owners, Owners::Refreshable(_)) {
-            return Err(security::refresh::Error::Mode.into());
-        }
-        let capacity = self.preflight(outer, plaintext.len(), workspace, output)?;
-        let route = Route::new(class, scope);
-        let packet = &mut workspace[ROUTE_BYTES..capacity.seal_workspace_bytes];
-        let Owners::Legacy {
-            data_sender,
-            control_sender,
-            ..
-        } = &mut self.owners
-        else {
-            return Err(security::refresh::Error::Mode.into());
-        };
-        let sealed = match class {
-            Class::User => data_sender.seal(route.metadata(), plaintext, packet)?,
-            Class::Control => control_sender.seal(route.metadata(), plaintext, packet)?,
-        };
-        self.finish_cover(outer, route.bytes, sealed, workspace, output)
+        self.seal_compact(
+            match class {
+                Class::User => compact::Kind::Data,
+                Class::Control => compact::Kind::Control,
+            },
+            scope,
+            outer,
+            plaintext,
+            workspace,
+            output,
+        )
     }
 
-    /// Authenticate one covered record before exposing its authority/plaintext.
+    /// Verify one current record before exposing its authority/plaintext.
     /// Capacity failures do not consume replay credit; plaintext output changes
     /// only after successful authentication in the separate caller workspace.
     pub fn open(
@@ -429,38 +317,7 @@ impl Records {
         workspace: &mut [u8],
         plaintext: &mut [u8],
     ) -> Result<Opened, Error> {
-        if self.is_compact() {
-            return self.open_compact(packet, workspace, plaintext);
-        }
-        if matches!(self.owners, Owners::Refreshable(_)) {
-            return Err(security::refresh::Error::Mode.into());
-        }
-        let incoming = self.incoming(packet, workspace, plaintext)?;
-        let route = incoming.route;
-        let Owners::Legacy {
-            data_receiver,
-            control_receiver,
-            ..
-        } = &mut self.owners
-        else {
-            return Err(security::refresh::Error::Mode.into());
-        };
-        let opened = match route.class {
-            Class::User => data_receiver.open(route.metadata(), incoming.protected, workspace)?,
-            Class::Control => {
-                control_receiver.open(route.metadata(), incoming.protected, workspace)?
-            }
-        };
-        plaintext[..opened.bytes].copy_from_slice(&workspace[..opened.bytes]);
-        Ok(Opened {
-            class: route.class,
-            scope: route.scope,
-            number: opened.number,
-            generation: opened.generation,
-            bytes: opened.bytes,
-            feedback: false,
-            authenticated: true,
-        })
+        self.open_compact(packet, workspace, plaintext)
     }
 
     fn registered_scope(&self, class: Class, epoch: security::Epoch) -> Result<Scope, Error> {

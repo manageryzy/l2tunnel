@@ -216,15 +216,12 @@ mod tests {
     fn actual_non_host_commands_refuse_selector_before_their_side_effects() {
         for command in [
             "keygen",
-            "openvpn-keygen",
             "status",
             "disconnect",
             "reconnect",
-            "set-swift",
-            "set-compression",
-            "set-active-policy",
             "drain-proxy",
-            "drain-openvpn",
+            "common-catalog",
+            "switch-common-configuration",
         ] {
             let args = [command, OPTION, "current-thread"].map(String::from);
             assert_eq!(

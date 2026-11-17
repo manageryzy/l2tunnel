@@ -365,10 +365,10 @@ async fn measured_common_saturation_does_not_admit_or_consume_pending_generation
         .admission_cursor = lab.a.actor.config.relay.max_flows + 1;
     let before = lab.a.actor.wire.usage().0;
     lab.a.actor.schedule_measured()?;
-    assert_eq!(lab.a.actor.wire.usage().0 - before, 128); //56+24+44+4
+    assert_eq!(lab.a.actor.wire.usage().0 - before, 85); // 56 + 24 + 1 + 4
     let state = lab.a.actor.measured.as_ref().ok_or("Controller")?;
     assert_eq!(state.ledger.counts(), (1, 0));
-    assert_eq!(state.framed_bytes, 128);
+    assert_eq!(state.framed_bytes, 85);
     assert_eq!(state.admitted, [0, 1, 0]);
     Ok(())
 }
@@ -445,9 +445,9 @@ async fn measured_demand_and_echo_costs_and_coalesced_full_flush_release_exact_t
     lab.a.actor.schedule_measured()?;
     let state = lab.a.actor.measured.as_ref().ok_or("Controller")?;
     assert_eq!(state.admitted, [1, 1, 0]);
-    assert_eq!(state.framed_bytes, 176 + 128);
+    assert_eq!(state.framed_bytes, 133 + 85);
     assert_eq!(state.ledger.counts(), (2, 0));
-    assert_eq!(lab.a.actor.wire.usage(), (176 + 128, 2));
+    assert_eq!(lab.a.actor.wire.usage(), (133 + 85, 2));
     for _ in 0..2 {
         lab.a.actor.send_user()?;
         let _bytes = lab.a.users.try_recv()?;
@@ -604,7 +604,6 @@ async fn measured_actual_writer_partial_body_and_pending_flush_retain_token_in_b
             Direction {
                 index: 0,
                 lane: 0,
-                session: [9; 16],
                 bulk: true,
             },
             256,

@@ -13,9 +13,12 @@ pub use measured_profile::{run_measured, validate_measured};
 #[path = "common_raw.rs"]
 mod raw_profile;
 pub use raw_profile::run_on_raw;
+#[path = "common_maintained.rs"]
+mod maintained_profile;
+pub use maintained_profile::{run_measured_on_maintained, run_on_maintained};
 
-/// Validate the finite fixed/full/one-channel composition before native I/O.
-/// Multi-channel and live generation/endpoint changes remain unsupported.
+/// Validate the fixed Full composition before native I/O. The actor retains its
+/// configured user-flow MUX channels; Common supplies one ordered record stream.
 pub fn validate(
     config: &Config,
     contract: &transport::CommonTransactionContract,
@@ -51,16 +54,15 @@ pub fn validate_catalog(
         .checked_add(memory.common_bridge_metadata_bytes)
         .filter(|bytes| *bytes <= 268_435_456)
         .ok_or_else(|| invalid("Common proxy aggregate memory bound"))?;
-    if config.duplex != Duplex::Full || config.mux.channels != 1 || catalog.descriptors().len() != 1
-    {
+    if config.duplex != catalog.initial().duplex() || catalog.descriptors().len() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Common proxy requires full/one-channel policy",
+            "Common proxy requires matching carrier duplex and one immutable record descriptor",
         ));
     }
     let maximum = config
         .max_user()?
-        .checked_add(48)
+        .checked_add(super::record::FRAME_OVERHEAD)
         .ok_or_else(|| invalid("proxy frame maximum"))?;
     let initial = catalog.initial();
     for role in [
@@ -205,18 +207,16 @@ where
         let (reader, writer) = tokio::io::split(stream);
         let link = Link {
             inner: crate::Link {
-                managed_metadata: None,
                 reader: Box::pin(reader),
                 writer: Box::pin(writer),
                 reverse_reader: None,
                 reverse_writer: None,
-                receive_session: logical,
-                send_session: logical,
                 layer: PacketLayer::Ip,
             },
             binding,
             originator: info.role == l2tunnel_security::Role::Initiator,
             logical,
+            common_ordered: true,
         };
         let readiness = measured_profile::Readiness::new(&control, measured_config.is_some())?;
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -264,20 +264,34 @@ where
                 result = &mut actor => {
                     let _ = stop.send(());
                     let common = runtime.await;
+                    let outcome = (|| {
+                        let report = result?;
+                        let stopped = common?;
+                        if stopped.reason == transport::StopReason::ProxyRetired {
+                            require_retired(&bridge)?;
+                        } else if stopped.reason != transport::StopReason::Cancelled {
+                            return Err(io::Error::other(format!("Common proxy ended before local close: {:?}", stopped.reason)));
+                        }
+                        if retained {
+                            Ok(report)
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::Unsupported,
+                                "Common proxy graceful close has no retained reliable retirement owner"))
+                        }
+                    })();
                     bridge.fail();
-                    let report = result?;
-                    let stopped = common?;
-                    if stopped.reason != transport::StopReason::Cancelled {
-                        return Err(io::Error::other(format!("Common proxy ended before local close: {:?}", stopped.reason)));
-                    }
-                    return if retained {
-                        Ok(report)
-                    } else {
-                        Err(io::Error::new(io::ErrorKind::Unsupported,
-                            "Common proxy graceful close has no retained reliable retirement owner"))
-                    };
+                    return outcome;
                 }
                 result = &mut runtime => {
+                    if matches!(&result, Ok(stopped) if stopped.reason == transport::StopReason::ProxyRetired) {
+                        require_retired(&bridge)?;
+                        // All child joins precede wait_retired. Its retained gate is
+                        // already open, so only synchronous final publication remains.
+                        // Never await a stuck actor beyond the original drain cap.
+                        let report = finish_joined_actor(actor.as_mut()).await;
+                        bridge.fail();
+                        return report;
+                    }
                     bridge.fail();
                     let _ = actor.await; // Same owner performs abnormal cleanup and actual joins.
                     return Err(match result {
@@ -311,5 +325,65 @@ where
                 }
             }
         }
+    }
+}
+
+fn require_retired(bridge: &super::common_bridge::Bridge) -> io::Result<()> {
+    if bridge.retired()? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Common proxy retirement result lacks its retained barrier",
+        ))
+    }
+}
+
+async fn finish_joined_actor<T>(
+    mut actor: std::pin::Pin<&mut impl std::future::Future<Output = io::Result<T>>>,
+) -> io::Result<T> {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match actor.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "joined Common proxy actor did not finish at its original cap",
+            )),
+        })
+    })
+    .await
+}
+
+#[cfg(test)]
+mod close_completion_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_actor_completion_is_one_poll_and_preserves_failure() -> io::Result<()> {
+        let pending = std::future::pending::<io::Result<()>>();
+        tokio::pin!(pending);
+        assert_eq!(
+            finish_joined_actor(pending.as_mut())
+                .await
+                .err()
+                .ok_or_else(|| io::Error::other("pending actor unexpectedly completed"))?
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        let failed = std::future::ready(Err::<(), _>(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "original actor publication failure",
+        )));
+        tokio::pin!(failed);
+        let error = finish_joined_actor(failed.as_mut())
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("failed actor unexpectedly completed"))?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "original actor publication failure");
+        let complete = std::future::ready(Ok(7));
+        tokio::pin!(complete);
+        assert_eq!(finish_joined_actor(complete.as_mut()).await?, 7);
+        Ok(())
     }
 }

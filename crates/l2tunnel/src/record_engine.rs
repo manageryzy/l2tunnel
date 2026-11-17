@@ -38,7 +38,9 @@ pub use fragment::{
 mod native;
 pub use carrier::CarrierOutputToken;
 mod native_counts;
+mod native_window;
 pub use native_counts::NativeCounts;
+pub use native_window::NativeDelivery;
 mod compact_wire;
 mod owner;
 mod proxy_records;
@@ -155,6 +157,8 @@ pub enum Capability {
 /// Configuration, caller-contract or authoritative owner failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// Independent native-byte delivery owner rejected a limit, clock or receipt.
+    NativeWindow(crate::flow_control::delivery_window::Error),
     /// Invalid complete configuration or local binding.
     Configuration,
     /// Exact overhead, path-MTU or burst geometry disagrees.
@@ -350,6 +354,7 @@ pub struct Engine {
     failure: Option<Error>,
     usage: Option<storage::Usage>,
     native_counts: native_counts::Counts,
+    native_window: Option<native_window::State>,
 }
 
 impl Engine {
@@ -375,7 +380,11 @@ impl Engine {
         .map_err(Error::Pipeline)?;
         let mut owner = Owner::new(&configuration, context)?;
         owner.enable_carrier_confirmation(&configuration)?;
-        Ok(Self::assemble(
+        let native_window =
+            native_window::Plan::new(&configuration, context.role, parameters.witnesses)?
+                .map(native_window::State::new)
+                .transpose()?;
+        let mut engine = Self::assemble(
             configuration,
             context,
             native_limits,
@@ -384,7 +393,9 @@ impl Engine {
             owner,
             None,
             None,
-        ))
+        );
+        engine.native_window = native_window;
+        Ok(engine)
     }
 
     #[allow(clippy::too_many_arguments)] // Existing actual owners plus the optional real ingress owner.
@@ -431,6 +442,7 @@ impl Engine {
             failure: None,
             usage,
             native_counts: native_counts::Counts::default(),
+            native_window: None,
         }
     }
 
@@ -480,6 +492,7 @@ impl Engine {
             .ok_or(Error::Arithmetic)?;
         let owner = &mut self.owner;
         let counts = &mut self.native_counts;
+        let window = &mut self.native_window;
         let width = self
             .configuration
             .descriptor()
@@ -487,7 +500,7 @@ impl Engine {
             .send()
             .channels();
         match self.pipeline.offer_front(|metadata, bytes| {
-            native_counts::offer(owner, counts, now, metadata, width, bytes)
+            native_counts::offer(owner, counts, window.as_mut(), now, metadata, width, bytes)
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
@@ -533,6 +546,7 @@ impl Engine {
             .ok_or(Error::Arithmetic)?;
         let owner = &mut self.owner;
         let counts = &mut self.native_counts;
+        let window = &mut self.native_window;
         let width = self
             .configuration
             .descriptor()
@@ -540,7 +554,7 @@ impl Engine {
             .send()
             .channels();
         match self.pipeline.offer_front_borrowed(|metadata, bytes| {
-            native_counts::offer(owner, counts, now, metadata, width, bytes)
+            native_counts::offer(owner, counts, window.as_mut(), now, metadata, width, bytes)
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
@@ -651,6 +665,13 @@ impl Engine {
                         return self.fail(Error::Invariant);
                     }
                     self.reliable_pending = Some((emission, prepared));
+                }
+                if let Some(window) = &mut self.native_window {
+                    window.capture(
+                        unit_witnesses
+                            .get(..emission.witnesses)
+                            .ok_or(Error::Invariant)?,
+                    )?;
                 }
                 self.statistics.emitted = next;
                 Ok(Some(emission))
@@ -846,11 +867,45 @@ impl Engine {
             .chain(self.pending.map(|p| p.deadline))
             .chain(self.ingress_expiry())
             .chain(self.fragments.as_ref().and_then(fragment::State::deadline))
+            .chain(
+                self.native_window
+                    .as_ref()
+                    .map(|w| w.deadline(self.last.unwrap_or(Tick(0))))
+                    .transpose()?
+                    .flatten(),
+            )
             .min())
     }
 
-    /// Original retained-state/native expiry, excluding output service opportunities.
-    /// Callers holding the shared carrier slot still service these hard bounds.
+    /// Earliest terminal custody cap, excluding recoverable receive-cache eviction
+    /// and output service wakes. A retained outgoing packet may inherit this cap;
+    /// once selected, its original cap must never be renewed by later observations.
+    pub fn custody_deadline(&self) -> Result<Option<Tick>, Error> {
+        self.healthy()?;
+        Ok(self
+            .owner
+            .custody_deadline()?
+            .into_iter()
+            .chain(self.pending.map(|p| p.deadline))
+            .chain(self.ingress_expiry())
+            .chain(
+                self.fragments
+                    .as_ref()
+                    .and_then(fragment::State::custody_deadline),
+            )
+            .chain(
+                self.native_window
+                    .as_ref()
+                    .map(|w| w.deadline(self.last.unwrap_or(Tick(0))))
+                    .transpose()?
+                    .flatten(),
+            )
+            .min())
+    }
+
+    /// Receive-maintenance expiry and terminal custody caps, excluding output
+    /// service opportunities. Retained output still permits these maintenance wakes.
+    /// Use `custody_deadline` when assigning an outgoing packet's immutable cap.
     pub fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
         self.healthy()?;
         Ok(self
@@ -860,6 +915,13 @@ impl Engine {
             .chain(self.pending.map(|p| p.deadline))
             .chain(self.ingress_expiry())
             .chain(self.fragments.as_ref().and_then(fragment::State::deadline))
+            .chain(
+                self.native_window
+                    .as_ref()
+                    .map(|w| w.deadline(self.last.unwrap_or(Tick(0))))
+                    .transpose()?
+                    .flatten(),
+            )
             .min())
     }
 
@@ -878,6 +940,12 @@ impl Engine {
             && self.ingress_empty()
             && self.pending.is_none()
             && self.owner.drained()?
+            && self
+                .native_window
+                .as_ref()
+                .map(|w| w.drained(self.last.unwrap_or(Tick(0))))
+                .transpose()?
+                .unwrap_or(true)
             && self.fragments.as_ref().is_none_or(fragment::State::drained))
     }
 
@@ -925,6 +993,11 @@ impl Engine {
         }
         if let Some(state) = &mut self.fragments
             && let Err(error) = state.tick(now)
+        {
+            return self.fail(error);
+        }
+        if let Some(window) = &mut self.native_window
+            && let Err(error) = window.tick(now)
         {
             return self.fail(error);
         }
@@ -984,9 +1057,12 @@ fn parameters_selected(
         Role::Client => geometry.forward_overhead_bytes,
         Role::Server => geometry.reverse_overhead_bytes,
     };
-    let feedback_delta = compact_feedback
-        .map(|feedback| feedback.checked_sub(local_overhead).ok_or(Error::Geometry))
-        .transpose()?;
+    let feedback_delta = compact_feedback.map(|feedback| {
+        (
+            feedback >= local_overhead,
+            feedback.abs_diff(local_overhead),
+        )
+    });
     if let Some(policy) = fragments {
         policy.validate(configuration, geometry)?;
     }
@@ -1011,7 +1087,14 @@ fn parameters_selected(
         (Role::Server, geometry.reverse_overhead_bytes),
     ] {
         let compact_feedback = feedback_delta
-            .map(|delta| overhead.checked_add(delta).ok_or(Error::Arithmetic))
+            .map(|(add, delta)| {
+                if add {
+                    overhead.checked_add(delta)
+                } else {
+                    overhead.checked_sub(delta)
+                }
+                .ok_or(Error::Geometry)
+            })
             .transpose()?;
         let view = descriptor.direction(role);
         match view.common().traffic().tcp {
@@ -1025,12 +1108,7 @@ fn parameters_selected(
                 }
             }
         }
-        if !matches!(
-            view.common().native_window(),
-            configuration::NativeWindow::Disabled
-        ) {
-            return Err(Error::Unsupported(Capability::NativeWindow));
-        }
+        native_window::validate(view)?;
         let opposite = descriptor.local(role).receive();
         let (maximum, _, charge) = dimensions(view.profile(), opposite.profile())?;
         let wire = if let Some(feedback) = compact_feedback {

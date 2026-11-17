@@ -41,6 +41,9 @@ fn compact_seal(records: &mut Records, kind: Kind, scope: Scope, body: &[u8]) ->
     let mut wire = vec![0; cap.packet_bytes];
     let sealed = match kind {
         Kind::Data => records.seal_user_in(scope, outer(0), body, &mut scratch, &mut wire)?,
+        Kind::AuthenticatedData => {
+            records.seal_authenticated_data_in(scope, outer(0), body, &mut scratch, &mut wire)?
+        }
         Kind::Feedback => {
             records.seal_feedback_in(scope, outer(0), body, &mut scratch, &mut wire)?
         }
@@ -52,9 +55,41 @@ fn compact_seal(records: &mut Records, kind: Kind, scope: Scope, body: &[u8]) ->
 }
 
 #[test]
-fn compact_both_profiles_covers_directions_and_authority_have_exact_wire_sizes() -> Result<()> {
+fn compact_authenticated_data_has_strong_tag_without_feedback_authority() -> Result<()> {
+    for protection in [Protection::Aes128Ccm4, Protection::ChaCha20Crc32c] {
+        let [mut a, mut b] = compact_peers(cover::Appearance::QuicLike, protection)?;
+        let packet = compact_seal(&mut a, Kind::AuthenticatedData, data(), b"proxy-credit")?;
+        assert_eq!(packet.len(), 21 + b"proxy-credit".len());
+        assert_eq!(packet[0], 0xc0);
+        let mut relabeled = packet.clone();
+        relabeled[0] = 0x40;
+        assert!(open(&mut b, &relabeled).is_err());
+        let (opened, plain) = open(&mut b, &packet)?;
+        assert!(opened.strongly_authenticated && opened.authenticated);
+        assert!(!opened.feedback);
+        assert_eq!(plain, b"proxy-credit");
+        assert!(open(&mut b, &packet).is_err());
+        assert_eq!(a.next_number(Class::User).0, 0);
+        assert_eq!(a.next_feedback_number().0, 1);
+        let feedback = compact_seal(&mut a, Kind::Feedback, data(), b"ack")?;
+        let (opened, _) = open(&mut b, &feedback)?;
+        assert_eq!(opened.number.0, 1);
+        assert!(opened.feedback && opened.strongly_authenticated);
+        let ordinary = compact_seal(&mut a, Kind::Data, data(), b"ordinary")?;
+        assert!(!open(&mut b, &ordinary)?.0.strongly_authenticated);
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_profiles_covers_directions_and_authority_have_exact_wire_sizes() -> Result<()> {
     for appearance in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
-        for protection in [Protection::Aes128Ccm4, Protection::ChaCha20Crc32c] {
+        for protection in [
+            Protection::Aes128Ccm4,
+            Protection::ChaCha20Crc32c,
+            Protection::ChaCha20Poly1305,
+            Protection::HmacSha256,
+        ] {
             let [mut a, mut b] = compact_peers(appearance, protection)?;
             for index in 0..20 {
                 for reverse in [false, true] {
@@ -73,7 +108,12 @@ fn compact_both_profiles_covers_directions_and_authority_have_exact_wire_sizes()
                         let packet = compact_seal(sender, kind, scope, &body)?;
                         assert_eq!(
                             packet.len(),
-                            body.len() + if kind == Kind::Data { 9 } else { 21 }
+                            body.len()
+                                + if kind == Kind::Data {
+                                    selection(protection).data_overhead()
+                                } else {
+                                    21
+                                }
                         );
                         let (opened, plain) = open(receiver, &packet)?;
                         assert_eq!(plain, body);
@@ -83,7 +123,7 @@ fn compact_both_profiles_covers_directions_and_authority_have_exact_wire_sizes()
                         assert_eq!(opened.feedback, kind == Kind::Feedback);
                         assert_eq!(
                             opened.authenticated,
-                            kind != Kind::Data || protection == Protection::Aes128Ccm4
+                            kind != Kind::Data || protection != Protection::ChaCha20Crc32c
                         );
                         assert_eq!(
                             receiver.open(&packet, &mut [0; 1600], &mut [0; 1024]),
@@ -93,7 +133,7 @@ fn compact_both_profiles_covers_directions_and_authority_have_exact_wire_sizes()
                 }
             }
             assert_eq!(a.next_number(Class::User).0, 20);
-            assert_eq!(a.next_feedback_number()?.0, 20);
+            assert_eq!(a.next_feedback_number().0, 20);
         }
     }
     Ok(())
@@ -101,7 +141,12 @@ fn compact_both_profiles_covers_directions_and_authority_have_exact_wire_sizes()
 
 #[test]
 fn compact_short_outputs_and_tampered_routes_do_not_consume_valid_retry() -> Result<()> {
-    for protection in [Protection::Aes128Ccm4, Protection::ChaCha20Crc32c] {
+    for protection in [
+        Protection::Aes128Ccm4,
+        Protection::ChaCha20Crc32c,
+        Protection::ChaCha20Poly1305,
+        Protection::HmacSha256,
+    ] {
         let [mut a, mut b] = compact_peers(cover::Appearance::QuicLike, protection)?;
         let body = b"nonzero compact data";
         let cap = a.capacity_for(Kind::Data, body.len())?;
@@ -122,7 +167,7 @@ fn compact_short_outputs_and_tampered_routes_do_not_consume_valid_retry() -> Res
         );
         assert_eq!(out, vec![0x5a; body.len() - 1]);
         let mut wrong = packet.clone();
-        wrong[0] = 0xc0;
+        wrong[0] = 0x81;
         assert_eq!(
             b.open(&wrong, &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Malformed)
@@ -173,7 +218,7 @@ fn compact_reader_slots_follow_scopes_across_wrap_and_preserve_counter_domains()
         b.retire_data(old)?;
     }
     assert_eq!(a.next_number(Class::User).0, 132);
-    assert_eq!(a.next_feedback_number()?.0, 66);
+    assert_eq!(a.next_feedback_number().0, 66);
     assert!(
         b.open(
             &old_packet.ok_or("missing old packet")?,

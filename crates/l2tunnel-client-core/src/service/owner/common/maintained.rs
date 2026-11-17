@@ -6,6 +6,7 @@ use crate::secure_udp::maintained::{
 use l2tunnel_runtime::secure_udp::{establish as authentication, member};
 use l2tunnel_runtime::{retained_tls, secure_udp::maintained_io};
 use l2tunnel_security::Role;
+use tokio::net::TcpListener;
 
 pub(in crate::service::owner) async fn establish(
     shared: &Arc<Shared>,
@@ -21,7 +22,7 @@ pub(in crate::service::owner) async fn establish(
     } = authenticate(shared, plan, accepted, deadline, requested).await?;
     let info = parts.info;
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_readable().inspect_err(|_| {
+    let device = plan.open_native().inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
     })?;
     check(deadline)?;
@@ -46,13 +47,14 @@ pub(in crate::service::owner) async fn establish(
 
 // Complete and release authentication polling before eager runtime construction.
 // The same opaque Parts cross this boundary; no copied Driver or new I/O task exists.
-struct Authenticated {
-    effective: Arc<crate::secure_udp::common_transaction_profile::Profile>,
-    parts: member::maintained::InitialParts,
-    contract: transport::CommonTransactionContract,
+pub(in crate::service::owner) struct Authenticated {
+    pub(in crate::service::owner) effective:
+        Arc<crate::secure_udp::common_transaction_profile::Profile>,
+    pub(in crate::service::owner) parts: member::maintained::InitialParts,
+    pub(in crate::service::owner) contract: transport::CommonTransactionContract,
 }
 
-fn authenticate<'a>(
+pub(in crate::service::owner) fn authenticate<'a>(
     shared: &'a Arc<Shared>,
     plan: &'a Prepared,
     accepted: Accepted,
@@ -179,7 +181,7 @@ fn authenticate<'a>(
 // its constructor frames outside the selected service future's poll nesting.
 #[inline(never)]
 fn make_runtime_on_maintained(
-    device: crate::swift::Native,
+    device: crate::native::Native,
     parts: member::maintained::InitialParts,
     contract: transport::CommonTransactionContract,
     requests: transport::CommonControlRequests,

@@ -176,31 +176,65 @@ fn private_permissions(owner: u32, mode: u32, effective: u32) -> bool {
     owner == effective && mode & 0o077 == 0
 }
 
-#[cfg(unix)]
 fn read_file(
     path: &std::path::Path,
     maximum: usize,
     private: bool,
 ) -> io::Result<Zeroizing<Vec<u8>>> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || (private
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "credential must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if private
             && !private_permissions(
                 metadata.uid(),
                 metadata.mode(),
                 rustix::process::geteuid().as_raw(),
-            ))
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "credential must be a private owned regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    #[cfg(windows)]
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "credential must be a private owned regular file",
-        ));
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "credential must not be a reparse point",
+            ));
+        }
+        // The Windows access check remains the operating system's file open.
+        // This reader does not claim to inspect or qualify the file's ACL.
     }
     let mut bytes = Zeroizing::new(Vec::new());
     let limit = u64::try_from(maximum)
@@ -214,8 +248,8 @@ fn read_file(
     Ok(bytes)
 }
 
-/// Read an exact private raw32 input with opened-descriptor security checks.
-#[cfg(unix)]
+/// Read an exact private raw32 input from a bounded regular file.
+/// Unix checks owner/mode; Windows relies on OS access checks and rejects reparse points.
 pub fn read_secret(path: &std::path::Path) -> io::Result<Zeroizing<[u8; 32]>> {
     let bytes = read_file(path, 32, true)?;
     let mut secret = Zeroizing::new([0; 32]);
@@ -228,8 +262,8 @@ pub fn read_secret(path: &std::path::Path) -> io::Result<Zeroizing<[u8; 32]>> {
     Ok(secret)
 }
 
-/// Read an exact public raw32 pin/member identity, rejecting final symlinks.
-#[cfg(unix)]
+/// Read an exact public raw32 pin/member identity.
+/// Unix rejects final symlinks; Windows rejects opened reparse points.
 pub fn read_public(path: &std::path::Path) -> io::Result<[u8; 32]> {
     let bytes = read_file(path, 32, false)?;
     bytes
@@ -239,13 +273,11 @@ pub fn read_public(path: &std::path::Path) -> io::Result<[u8; 32]> {
 }
 
 /// Parse the unchanged existing member PKCS#8 format from a bounded private file.
-#[cfg(unix)]
 pub fn read_member(path: &std::path::Path) -> io::Result<identity::IdentityKey> {
     identity::IdentityKey::from_pkcs8(&read_member_der(path)?).map_err(io::Error::other)
 }
 
 /// Read once for the maintained inner and TLS member parsers, with identical limits.
-#[cfg(unix)]
 pub(crate) fn read_member_der(path: &std::path::Path) -> io::Result<Zeroizing<Vec<u8>>> {
     read_file(path, 4096, true)
 }

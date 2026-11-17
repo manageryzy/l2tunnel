@@ -12,7 +12,11 @@ use l2tunnel::{
 use l2tunnel_core::traffic;
 use l2tunnel_management::Role as DataRole;
 
-fn common_direction(channels: u16, native: usize, rate: u64) -> Result<common::CommonDirection> {
+pub(in super::super) fn common_direction(
+    channels: u16,
+    native: usize,
+    rate: u64,
+) -> Result<common::CommonDirection> {
     let queue = l2tunnel_pipeline::QueueLimits {
         bytes: 65_536,
         packets: 8,
@@ -134,32 +138,42 @@ fn common_plans(
         initial: swift,
         ..
     } = transaction_plans(appearance, hosts)?;
-    let mut initiator = old.runtime_contract(Role::Initiator)?.config();
-    let mut responder = old.runtime_contract(Role::Responder)?.config();
+    let mut initiator = old.runtime_contract(Role::Initiator)?.resources();
+    let mut responder = old.runtime_contract(Role::Responder)?.resources();
     // Fixed immutable shared-resource templates; Common C below supplies actual data policy.
     initiator.report_interval = Some(Duration::from_millis(1));
     responder.report_interval = initiator.report_interval;
-    let forward = swift.descriptor().forward();
-    let reverse = swift.descriptor().reverse();
+    let common::Profile::Swift { forward, reverse } = swift.descriptor().profile() else {
+        return Err("fixture initial profile is not Swift".into());
+    };
+    let rates = [
+        swift
+            .descriptor()
+            .direction(DataRole::Client)
+            .common()
+            .bytes_per_second(),
+        swift
+            .descriptor()
+            .direction(DataRole::Server)
+            .common()
+            .bytes_per_second(),
+    ];
     let native = old.connection().max_packet;
     let descriptor = |profile, widths: [u16; 2]| -> Result<common::Descriptor> {
         Ok(common::Descriptor::new(
             1500,
             Duplex::Full,
-            common_direction(widths[0], native, forward.bytes_per_second)?,
-            common_direction(widths[1], native, reverse.bytes_per_second)?,
+            common_direction(widths[0], native, rates[0])?,
+            common_direction(widths[1], native, rates[1])?,
             profile,
         )?)
     };
     let initial = descriptor(
         common::Profile::Swift {
-            forward: forward.records,
-            reverse: reverse.records,
+            forward: *forward,
+            reverse: *reverse,
         },
-        [
-            forward.records.channels as u16,
-            reverse.records.channels as u16,
-        ],
+        [forward.channels as u16, reverse.channels as u16],
     )?;
     let aligned = descriptor(
         common::Profile::Aligned {
@@ -198,22 +212,30 @@ fn common_plans(
     )?;
     let configurations = [
         profile.initial(),
-        common::Configuration::new(profile.envelope(), aligned)?,
-        common::Configuration::new(profile.envelope(), packed)?,
+        common::Configuration::new(
+            profile.envelope(),
+            *profile
+                .catalog()
+                .descriptors()
+                .iter()
+                .find(|descriptor| matches!(descriptor.profile(), common::Profile::Aligned { .. }))
+                .ok_or("missing rebased Aligned descriptor")?,
+        )?,
+        common::Configuration::new(
+            profile.envelope(),
+            *profile
+                .catalog()
+                .descriptors()
+                .iter()
+                .find(|descriptor| matches!(descriptor.profile(), common::Profile::Packed { .. }))
+                .ok_or("missing rebased Packed descriptor")?,
+        )?,
     ];
     let unlisted = common::Descriptor::new(
         1500,
         Duplex::Full,
-        common_direction(
-            forward.records.channels as u16,
-            native,
-            forward.bytes_per_second + 1,
-        )?,
-        common_direction(
-            reverse.records.channels as u16,
-            native,
-            reverse.bytes_per_second,
-        )?,
+        common_direction(forward.channels as u16, native, rates[0] + 1)?,
+        common_direction(reverse.channels as u16, native, rates[1])?,
         *initial.profile(),
     )?;
     let outside = common::Configuration::new(profile.envelope(), unlisted)?;
@@ -395,7 +417,7 @@ async fn exchange_stage(
 #[tokio::test]
 async fn actual_common_service_switches_swift_aligned_packed_swift_on_original_authenticated_udp()
 -> Result {
-    timeout(Duration::from_secs(30), async {
+    timeout(Duration::from_secs(30), Box::pin(async {
     for appearance in support::appearances() {
         let hosts = support::hosts();
         let CommonPlans { plans: [client_plan, server_plan], addresses, profile, configurations, outside } = common_plans(appearance, &hosts)?;
@@ -491,7 +513,7 @@ async fn actual_common_service_switches_swift_aligned_packed_swift_on_original_a
         let _ = client_task.await; let _ = server_task.await;
     }
     Ok::<(), Error>(())
-    }).await?
+    })).await?
 }
 
 #[path = "secure_udp_common_local.rs"]

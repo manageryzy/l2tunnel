@@ -197,3 +197,59 @@ fn complete_compact_tags_preserve_both_directional_policies_strict_padding_and_e
     }
     Ok(())
 }
+
+#[test]
+fn current_native_compression_complete_catalog_binds_each_direction_and_switch_target() -> Result {
+    for packed in [false, true] {
+        let mut forward = policy(false, packed)?;
+        let mut reverse = policy(true, packed)?;
+        for config in [&mut forward, &mut reverse] {
+            config.base.receiver.body.elide_payload_length = false;
+            config.base.receiver.body.predictive = false;
+            config.base.receiver.body.timestamp_pair_dictionary = false;
+        }
+        forward.base.native_policy = aligned::NativePolicy::RawEthernet;
+        reverse.base.native_policy = aligned::NativePolicy::RawIp;
+        let raw = value(forward, reverse, packed)?;
+        forward.base.native_policy = aligned::NativePolicy::Lz4Ethernet;
+        reverse.base.native_policy = aligned::NativePolicy::Lz4Ip;
+        let compressed = value(forward, reverse, packed)?;
+        for selected in [raw, compressed] {
+            assert_eq!(Configuration::decode(&encoded(&selected)?)?, selected);
+            assert_eq!(
+                selected
+                    .descriptor()
+                    .direction(Role::Client)
+                    .native_policy()
+                    .is_some_and(aligned::NativePolicy::uses_lz4),
+                selected == compressed
+            );
+            assert_eq!(
+                selected
+                    .descriptor()
+                    .direction(Role::Server)
+                    .native_policy()
+                    .is_some_and(aligned::NativePolicy::uses_lz4),
+                selected == compressed
+            );
+        }
+        assert_ne!(raw.digest()?, compressed.digest()?);
+        let catalog = Catalog::new(
+            *raw.descriptor(),
+            &[*raw.descriptor(), *compressed.descriptor()],
+        )?;
+        assert_eq!(catalog.descriptors().len(), 2);
+        assert_ne!(
+            catalog.root(),
+            Catalog::new(*raw.descriptor(), &[*raw.descriptor()])?.root()
+        );
+        // The target retains complete original-layer configuration, rather than
+        // toggling mutable compression state inside an existing epoch owner.
+        assert_eq!(catalog.configurations(raw.envelope())?.len(), 2);
+        reverse.base.native_policy = aligned::NativePolicy::RawIp;
+        let asymmetric = value(forward, reverse, packed)?;
+        assert_ne!(asymmetric.digest()?, compressed.digest()?);
+        assert_ne!(asymmetric.digest()?, raw.digest()?);
+    }
+    Ok(())
+}

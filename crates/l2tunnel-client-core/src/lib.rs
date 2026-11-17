@@ -14,38 +14,22 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, timeout_at};
 
-/// Explicit transparent-TUN credit and QoS client profile.
-pub mod active;
-/// Negotiated active policy catalog and managed authentication lifecycle.
-pub mod active_managed;
-/// Explicit aligned record selection over authenticated UDP or genuine QUIC.
-pub mod aligned;
 /// Strict command-line entry adapter; connection functions remain UI independent.
 pub mod cli;
 /// Shared strict native delivery policy for versioned profile configuration.
 pub mod delivery;
 /// Versioned private local API shared by CLI and future GUI.
 pub mod local;
-/// Standalone OpenVPN-like UDP with separately provisioned admission/cookie keys.
-pub mod openvpn;
-/// Explicit timed packed records over authenticated UDP or genuine QUIC.
-pub mod packed;
 /// Explicit fixed-credit TUN proxy with retained original TCP/TLS ownership.
 pub mod proxy;
 /// Explicit measured relay targets over retained native TUN proxy TCP/TLS lanes.
 pub mod proxy_measured;
-/// Explicit genuine QUIC endpoint/profile configuration, independent of TCP.
-pub mod quic;
 /// Explicit original-owner raw packet runtime; native qualification remains separate.
 pub mod raw_packet;
 /// Explicit same-carrier authentication factory; native/service integration is separate.
 pub mod secure_udp;
 /// Retained managed-TCP connect, cancel, abort, reconnect and apply lifecycle.
 pub mod service;
-/// Shared existing-session command dispatch for authorized local frontends.
-pub mod session_control;
-/// Explicit authenticated UDP endpoint/profile configuration.
-pub mod udp;
 
 /// First supported persistent TCP/TLS configuration, bound into authentication.
 #[derive(Clone, Copy, Debug)]
@@ -72,21 +56,21 @@ impl ConnectionConfig {
                 "handshake timeout outside 0..120 seconds",
             ));
         }
-        l2tunnel_runtime::managed::session_config(self.runtime(), &self.mode()?)
+        l2tunnel_runtime::configuration::session_config(self.runtime(), &self.mode()?)
     }
     /// Canonical actually supported initial managed profile.
     pub fn mode(self) -> io::Result<ModeConfig> {
-        l2tunnel_runtime::managed::mode_config(self.runtime(), self.duplex)
+        l2tunnel_runtime::configuration::mode_config(self.runtime(), self.duplex)
     }
     /// Derive an explicitly selected delivery policy binding, shared by GUI and CLI.
     /// Forward/reverse policies use canonical client-to-server/server-to-client order.
     pub fn session_with_delivery(
         self,
-        delivery: l2tunnel_runtime::managed::DeliveryConfig,
+        delivery: l2tunnel_runtime::configuration::DeliveryConfig,
     ) -> io::Result<SessionConfig> {
         // Preserve the exact existing validation, including the whole-attempt limit.
         self.session()?;
-        l2tunnel_runtime::managed::session_config_with_delivery(
+        l2tunnel_runtime::configuration::session_config_with_delivery(
             self.runtime(),
             &self.mode_with_delivery(delivery)?,
             delivery,
@@ -95,9 +79,13 @@ impl ConnectionConfig {
     /// Keep local queue geometry separate from authenticated delivery-window limits.
     pub fn mode_with_delivery(
         self,
-        delivery: l2tunnel_runtime::managed::DeliveryConfig,
+        delivery: l2tunnel_runtime::configuration::DeliveryConfig,
     ) -> io::Result<ModeConfig> {
-        l2tunnel_runtime::managed::mode_config_with_delivery(self.runtime(), self.duplex, delivery)
+        l2tunnel_runtime::configuration::mode_config_with_delivery(
+            self.runtime(),
+            self.duplex,
+            delivery,
+        )
     }
     /// Bounded runtime defaults, independent of the GUI or CLI.
     pub fn runtime(self) -> RuntimeConfig {
@@ -151,13 +139,6 @@ fn base_auth_error(error: auth::Error) -> io::Error {
         other => auth_error(other),
     }
 }
-async fn socket(address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))??;
-    stream.set_nodelay(true)?;
-    Ok(stream)
-}
 async fn base_socket(address: SocketAddr, deadline: HandshakeDeadline) -> io::Result<TcpStream> {
     deadline.remaining()?;
     let stream = TcpStream::connect(address).await?;
@@ -193,7 +174,7 @@ pub async fn connect_with_delivery(
     server_name: &str,
     identity: &MemberKey,
     config: ConnectionConfig,
-    delivery: l2tunnel_runtime::managed::DeliveryConfig,
+    delivery: l2tunnel_runtime::configuration::DeliveryConfig,
 ) -> io::Result<Link> {
     connect_session(
         address,
@@ -271,7 +252,7 @@ pub async fn accept_with_delivery(
     tls: &ServerTls,
     allowlist: &MemberAllowlist,
     config: ConnectionConfig,
-    delivery: l2tunnel_runtime::managed::DeliveryConfig,
+    delivery: l2tunnel_runtime::configuration::DeliveryConfig,
 ) -> io::Result<Link> {
     accept_session(
         listener,
@@ -370,13 +351,11 @@ mod tests {
     }
 }
 
-/// Explicit startup-bound rolling source/frame client and lifecycle observation.
-pub mod rolling;
+/// Native device ownership shared by all selected carrier services.
+pub mod native;
 
 /// Explicit lean paced packed-stream profile over protected UDP.
 #[cfg(unix)]
-pub mod swift;
-
 #[cfg(test)]
 #[path = "base_deadline_tests.rs"]
 mod base_deadline_tests;
@@ -384,7 +363,5 @@ mod base_deadline_tests;
 #[cfg(test)]
 mod delivery_tests;
 
-#[cfg(test)]
-mod base_datagram_delivery_tests;
 #[cfg(test)]
 mod test_ports;

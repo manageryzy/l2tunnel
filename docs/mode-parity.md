@@ -1,43 +1,58 @@
 # Python-to-Rust mode parity
 
-Status: parity inventory, audited against the working Python sources and saved experiment receipts on 2026-11-11 UTC. All 47 complete catalog acceptance gates below remain open. The Rust workspace now contains tested protocol primitives and native Linux compositions, recorded in [implementation status](implementation-status.md); those finite results do not establish an entire Python family's behavioral and byte-level parity. Catalog status remains **planned** until its complete gate passes. An enum, configuration example, or trait is not an implemented transport.
+Status: parity inventory, with all 47 complete catalog acceptance gates still
+open. Protocol tests and finite Linux integration do not establish an entire
+Python family's behavioral or byte parity. Stable IDs in the [mode catalog](../config/mode-catalog.toml)
+identify acceptance work, not final wire identifiers. Source paths below are
+relative to `simulator/`; the simulator remains an algorithm reference and is not
+an obsolete runtime to delete.
 
-The stable identifiers in [the mode catalog](../config/mode-catalog.toml) are a coverage checklist, not the final wire identifiers. Source paths below are relative to `simulator/`. A profile combines carrier, recovery, packetization, delivery, header codec, MUX, and ACK policies; every Cartesian combination is neither meaningful nor supported.
+The owner-authorized [current cutover](modules/compact-wire-cleanup.md) removes
+obsolete production entry points and wire encoders; Git retains their history.
+The owner explicitly approved deletion before every replacement capability is
+ready. **Common active TUN credit and the Windows Common service entry remain
+pending.** Their former entry points are not evidence that the current format
+implements them. Portable helpers and Linux-hosted fixtures do not qualify a
+Windows or Android runtime. No full mode or platform gate closes through deletion.
+The subsequent explicit old-Records removal also retires the fixed and
+refreshable final-wire wrappers. Fresh-DH integration with the sole current
+Compact owner remains a required gap; the lower handshake/security primitives
+and full lifecycle acceptance are retained. This is separate from negotiated
+data-profile epoch switching.
 
-The [compact-wire cleanup](modules/compact-wire-cleanup.md) preserves all
-47 complete definitions and SW-11. A typed variable-length header union and one
-selected final protection replace redundant encoding only after explicit version
-selection and acceptance. The first structural batch preserves legacy bytes;
-passing protocol regressions and remaining runtime failures are recorded in its
-[checkpoint evidence](modules/compact-wire-cleanup.md#first-structural-checkpoint-evidence).
-The ordinary 24-byte/20-byte target remains unqualified across the full catalog;
-authenticated control/retiring ACKs and full raw/native scope remain required.
+Current Common Records use a five-byte kind/reader and packet-number prefix.
+Data protection adds a 16-byte ChaCha20-Poly1305 tag by default (21 bytes total),
+a 32-byte HMAC-SHA256 tag (37 bytes), or an explicitly selected four-byte CCM tag
+or unkeyed CRC32C check (9 bytes). Management and recovery feedback use their
+independent full-tag domain (21 bytes). Proxy records carrying lifecycle or
+credit controls use the strong authenticated-data arm when ordinary data selects
+a short check. These are record costs: algorithm union fields, packing, fragments
+and the selected carrier remain additional. Raw IPv4/TCP adds 40 bytes, giving
+49, 61 or 77 bytes before algorithm fields for the respective data selections;
+its bootstrap geometry is separate. Genuine TLS and QUIC retain their mandatory
+outer protection and transport behavior.
 
-The [selected compact checkpoint](modules/compact-wire-cleanup.md#selected-compact-implementation-checkpoint)
-implements explicit AES-CCM4 and ChaCha20/CRC32C data profiles with independent
-strong feedback/control. The subsequent [runtime algorithm migration](modules/compact-wire-cleanup.md#runtime-algorithm-migration)
-connects existing Aligned/Packed, CompactARQ, independent-connection, Rolling and
-Research owners to the selected original-UDP format and existing epoch switching.
-Data outer framing is 9 bytes and strong feedback/control is 21 bytes, before
-actual algorithm, packing and fragment metadata. The later
-[selected outer-carrier migration](modules/compact-wire-cleanup.md#selected-outer-carrier-migration)
-installs final Records directly on the original OpenVPN UDP owner and once on the
-original raw TCP owner, with finite shared-service evidence. Raw bootstrap proof
-geometry remains separate from actual final 49/61-byte IPv4/TCP data/control
-geometry. Full SW-11/all47, native/platform, geometry, protocol-identification and
-performance gates retain their complete definitions and scoped evidence.
+Rolling, Research and sliding repairs serialize the maximum encoded source
+extent in their complete support. The receiver restores omitted zero columns in
+bounded symbol storage; meaningful trailing zeros and the encoded source length
+remain present. Current repair grammar and configuration versions must agree.
+The [Rolling version regression](../work/compact-cutover-20261117/fec/rolling-version-parser-attempt2.log)
+passes both current source formats and rejects prior version identifiers. The
+actual UDP lost-source fixture and capture also pass, including meaningful
+trailing zeros, held repair custody and actual byte charging. Runtime failures
+from the broad attempt now have passing focused continuations; remaining client
+service checks and aggregate closure are tracked in the cutover ledger.
 
-The additive [maintained-carrier migration](modules/maintained-common-carriers.md)
-connects the selected Common record path to genuine Quinn DATAGRAMs and ordinary
-TCP/TLS Full/Half owners. Initial-only Noise/member acceptance follows actual
-outer authentication on the same original connection(s); final compact Records
-retain maintained TLS/QUIC encryption as an additional outer layer. Final Common
-feedback and management share the selected carrier. Admission allowances and
-TLS-flush/Quinn-acceptance counters are distinct from physical socket/wire facts.
-The eight actual-connection runtime cases and two shared-service cases pass in
-the final-source Linux regression; the linked module records exact commands and
-remaining aggregate failures. Existing legacy defaults/receipts, complete SW-11/
-all47, proxy, native/platform and measured performance requirements remain unchanged.
+See the [current verification and remaining work](modules/compact-wire-cleanup.md#evidence-and-remaining-work)
+for source-bound receipts, failed attempts, captures and required aggregate-check
+status. Ordinary overhead targets are not guarantees for every packet or mode.
+The shared CLI/GUI service keeps requested and observed configuration separate;
+API4 switches complete authenticated Common catalog entries, including native
+compression policy, while API1 retains current proxy controls. Historical
+checkpoint descriptions below do not preserve retired defaults or qualify the
+current revision. All 47 P-* definitions, full SW-11, native/platform, raw-kernel,
+resource, protocol-identification and measured QoS/performance gates remain in
+scope.
 
 The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
 precise Research feedback/physical ordering on original carriers, legacy

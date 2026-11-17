@@ -23,6 +23,10 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+#[path = "retained_failure.rs"]
+pub(crate) mod failure;
+use failure::Failure;
+
 /// Four-byte checked length and one explicit bootstrap/final discriminator.
 pub const FRAMING_BYTES: usize = 5;
 const MAX_RECORD_BYTES: usize = 65535;
@@ -416,7 +420,7 @@ pub struct Adapter {
     output: [Output; 2],
     control_lane: usize,
     receive_lane: usize,
-    failed: Option<io::Error>,
+    failed: Option<Failure>,
 }
 impl Adapter {
     /// Allocate the preflighted new storage after the enclosing retained-budget check.
@@ -538,9 +542,19 @@ impl Adapter {
     /// Observe the first terminal failure without altering its cause or receipts.
     pub fn check_failure(&self) -> io::Result<()> {
         match &self.failed {
-            Some(error) => Err(copy_error(error)),
+            Some(error) => Err(error.error()),
             None => Ok(()),
         }
+    }
+    /// Exact first read-side closure at a record boundary, never retirement proof.
+    pub(crate) fn peer_close_error(&self, error: &io::Error) -> bool {
+        self.failed
+            .as_ref()
+            .is_some_and(|failure| failure.is_peer_close(error))
+    }
+    #[cfg(any(unix, test))]
+    pub(crate) fn retained_output_empty(&self) -> bool {
+        self.output.iter().all(|output| output.pending.is_none())
     }
     /// Reserve exactly one class slot and copy one complete immutable framed record.
     /// Busy admits nothing and never advances the local submission serial.
@@ -662,7 +676,15 @@ impl Adapter {
             }
             match poll_read(&mut self.lanes[index], index, self.plan.limits, cx) {
                 Ok(progress) => progressed |= progress,
-                Err(error) => return Poll::Ready(Err(self.fail(error))),
+                Err(error) => {
+                    let peer_close = error.kind() == io::ErrorKind::UnexpectedEof
+                        && self.lanes.iter().all(|lane| {
+                            lane.input.prefix_used == 0
+                                && lane.input.body_used == 0
+                                && lane.input.ready.is_none()
+                        });
+                    return Poll::Ready(Err(self.fail_with_close(error, peer_close)));
+                }
             }
         }
         if progressed
@@ -712,14 +734,17 @@ impl Adapter {
         Poll::Pending
     }
     fn fail(&mut self, error: io::Error) -> io::Error {
+        self.fail_with_close(error, false)
+    }
+    fn fail_with_close(&mut self, error: io::Error, peer_close: bool) -> io::Error {
         if self.failed.is_none() {
-            self.failed = Some(error);
+            self.failed = Some(Failure::new(error, peer_close));
             // Both original Half connections fail together. Completed output facts
             // remain available through their original tokens after the I/O drops.
             self.lanes.clear();
         }
         match &self.failed {
-            Some(error) => copy_error(error),
+            Some(error) => error.error(),
             None => invalid("retained TLS terminal state missing"),
         }
     }
@@ -899,9 +924,6 @@ fn before(deadline: Instant) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-fn copy_error(error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), error.to_string())
 }
 fn input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)

@@ -2,14 +2,8 @@
 use super::*;
 use crate::service as lifecycle;
 use lifecycle::{Completed, OperationId, Phase, ProxyProfile, Terminal};
-use std::sync::Arc;
 use tokio::time::Instant;
 
-#[allow(clippy::large_enum_variant)] // One bounded setup value, never a queued runtime packet.
-pub(super) enum Policy {
-    Fixed(crate::proxy::Settings),
-    Measured(crate::proxy_measured::Settings),
-}
 #[derive(Clone, Copy)]
 pub(crate) struct Presentation {
     pub duplex: Duplex,
@@ -30,95 +24,6 @@ pub(crate) enum Event {
 }
 fn submit(error: lifecycle::SubmitError) -> io::Error {
     io::Error::other(format!("proxy service: {error:?}"))
-}
-pub(super) async fn execute(
-    command: &str,
-    options: &BTreeMap<String, String>,
-    config: ConnectionConfig,
-    device: DeviceSpec,
-    policy: Policy,
-) -> io::Result<()> {
-    let profile = match &policy {
-        Policy::Fixed(_) => ProxyProfile::FixedCredit,
-        Policy::Measured(_) => ProxyProfile::MeasuredRelay,
-    };
-    let attachment = lifecycle::Attachment::new(config.layer, move || device.clone().open(config));
-    let plan = match command {
-        "connect" => {
-            let remote = required(options, "--remote")?
-                .parse()
-                .map_err(|_| input("remote requires IP:PORT"))?;
-            let credentials = lifecycle::Client {
-                remote,
-                tls: tls_frontend::client(options)?,
-                server_name: required(options, "--server-name")?.into(),
-                member: Arc::new(
-                    MemberKey::from_pkcs8(&bounded_file(required(options, "--identity")?, 4096)?)
-                        .map_err(auth_error)?,
-                ),
-            };
-            match policy {
-                Policy::Fixed(settings) => {
-                    lifecycle::Prepared::proxy_client(config, credentials, settings, attachment)?
-                }
-                Policy::Measured(settings) => lifecycle::Prepared::proxy_measured_client(
-                    config,
-                    credentials,
-                    settings,
-                    attachment,
-                )?,
-            }
-        }
-        "serve" => {
-            let listen = required(options, "--listen")?
-                .parse()
-                .map_err(|_| input("listen requires IP:PORT"))?;
-            let tls = ServerTls::from_der(
-                &[bounded_file(required(options, "--cert")?, 65536)?],
-                &bounded_file(required(options, "--key")?, 65536)?,
-            )
-            .map_err(auth_error)?;
-            let public: [u8; 32] = bounded_file(required(options, "--allow-key")?, 32)?
-                .try_into()
-                .map_err(|_| input("allow-key must contain exactly 32 raw bytes"))?;
-            let members = MemberAllowlist::new(&[MemberPublicKey(public)]).map_err(auth_error)?;
-            let credentials = lifecycle::Server {
-                listen,
-                tls,
-                members,
-            };
-            match policy {
-                Policy::Fixed(settings) => {
-                    lifecycle::Prepared::proxy_server(config, credentials, settings, attachment)?
-                }
-                Policy::Measured(settings) => lifecycle::Prepared::proxy_measured_server(
-                    config,
-                    credentials,
-                    settings,
-                    attachment,
-                )?,
-            }
-        }
-        _ => return Err(input("unsupported proxy command")),
-    };
-    let api = options
-        .get("--control-socket")
-        .map(crate::local::Server::bind)
-        .transpose()?;
-    let (handle, run) = lifecycle::channel();
-    let accepted = handle
-        .connect(plan, handle.next_key().map_err(submit)?)
-        .map_err(submit)?;
-    serve(handle, run, accepted, api, Presentation { duplex: config.duplex, profile, grace: Duration::from_secs(5) }, |event| match event {
-        Event::Ready { generation, duplex, profile } => { let _ = generation; match profile {
-            ProxyProfile::FixedCredit => println!("Authenticated TUN {duplex:?}; fixed-credit proxy over retained TCP/TLS; immutable route policy; forwarding packet device"),
-            ProxyProfile::MeasuredRelay => println!("Authenticated TUN {duplex:?}; measured relay-target proxy over retained TCP/TLS; immutable route policy; forwarding packet device"),
-        } },
-        Event::Terminal { generation, outcome } => { let _ = generation; match serde_json::to_string(&outcome) {
-            Ok(json) => println!("{json}"),
-            Err(error) => eprintln!("proxy terminal serialization: {error}"),
-        } },
-    }).await
 }
 fn ready(snapshot: &lifecycle::Snapshot, generation: OperationId, profile: ProxyProfile) -> bool {
     snapshot.generation == Some(generation)

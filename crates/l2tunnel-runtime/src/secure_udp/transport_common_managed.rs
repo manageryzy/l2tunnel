@@ -13,7 +13,7 @@ pub fn run_common_on_carrier<D>(
     observe: impl FnMut(&CommonSnapshot) + Send,
 ) -> impl Future<Output = io::Result<CommonStopped>> + Send
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     run_prepared_common(
         prepare_carrier_runtime(device, parts, contract),
@@ -30,7 +30,7 @@ fn prepare_carrier_runtime<D>(
     contract: CommonTransactionContract,
 ) -> io::Result<PreparedRuntime<D>>
 where
-    D: PacketDevice<Error = io::Error> + AsRawFd + Send,
+    D: NativeDevice + Send,
 {
     contract.require_native_adapter()?;
     if device.layer() != contract.native_layer() {
@@ -59,23 +59,18 @@ impl Driver {
         mut parts: member::carrier::InitialParts,
         contract: CommonTransactionContract,
     ) -> io::Result<(carrier::IoOwner, owner::StateCell<Self>)> {
-        let selected = contract.compact_wire().is_some();
-        if contract.refresh_selection().is_some()
-            || contract.extra_wire_bytes() != usize::from(!selected)
-        {
+        if contract.extra_wire_bytes() != 0 {
             return Err(invalid(
                 "initial-only carrier requires its exact untimed contract",
             ));
         }
         contract.validate_outer(Some(parts.outer()))?;
-        if selected {
-            if parts.info.authenticated.configuration != contract.expected_configuration().0 {
-                return Err(invalid(
-                    "compact carrier selection differs from actual member proof",
-                ));
-            }
-            parts.datagram.select_final_records(parts.deadline)?;
+        if parts.info.authenticated.configuration != contract.expected_configuration().0 {
+            return Err(invalid(
+                "compact carrier selection differs from actual member proof",
+            ));
         }
+        parts.datagram.select_final_records(parts.deadline)?;
         let origin = parts.clock_origin();
         let geometry = parts.datagram.geometry();
         if parts.datagram.outer_info() != Some(&parts.outer().info())

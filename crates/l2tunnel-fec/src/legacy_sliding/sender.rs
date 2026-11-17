@@ -1214,7 +1214,7 @@ impl Sender {
             slot,
             event: job.due,
             cap: job.expires,
-            length: wire::HEADER_BYTES + 5 * job.terms + self.config.recovery.width()?,
+            length: add(wire::HEADER_BYTES + 5 * job.terms, add(2, maximum)?)?,
             analytical: add(maximum, if job.feedback { 4 * job.terms } else { 0 })?,
         }))
     }

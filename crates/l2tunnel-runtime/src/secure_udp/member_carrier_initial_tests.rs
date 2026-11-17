@@ -99,93 +99,6 @@ fn initial_settings(established: &factory::InitialEstablished) -> Settings {
         receive_packets_per_interval: 8,
     }
 }
-fn install_initial(parts: InitialParts) -> TestResult<(Live, record::Records)> {
-    let origin = parts.clock_origin();
-    assert_eq!(parts.root.binding(), parts.info.binding);
-    assert_eq!(parts.root.role(), parts.info.role);
-    let records = record::Records::new(
-        parts.root,
-        security::LaneId(3),
-        security::Limits {
-            max_body_bytes: 256,
-            packets_per_key: security::MAX_PACKETS_PER_KEY,
-            max_body_bytes_per_key: security::MAX_BODY_BYTES_PER_KEY,
-        },
-        security::Protection::ChaCha20Poly1305,
-        parts.cover,
-        record::Scope {
-            epoch: security::Epoch(4),
-            configuration: security::ConfigDigest([19; 32]),
-        },
-        record::Scope {
-            epoch: security::Epoch(7),
-            configuration: security::ConfigDigest([21; 32]),
-        },
-    )?;
-    assert!(matches!(
-        records.key_epoch(),
-        Err(record::Error::Refresh(security::refresh::Error::Mode))
-    ));
-    Ok((
-        Live {
-            socket: parts.datagram,
-            cover: parts.cover,
-            bootstrap: parts.bootstrap,
-            joining: parts.joining,
-            next_outer: parts.next_outer,
-            deadline: parts.deadline,
-            origin,
-        },
-        records,
-    ))
-}
-async fn initial_record(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    body: &[u8],
-) -> TestResult<Vec<u8>> {
-    let mut scratch = [0; 1024];
-    let mut output = [0; 1024];
-    let sealed = records.seal(
-        class,
-        metadata(live.next_outer, cover::Phase::Established),
-        body,
-        &mut scratch,
-        &mut output,
-    )?;
-    advance(&mut live.next_outer)?;
-    physical(live, class, &output[..sealed.bytes]).await?;
-    Ok(output[..sealed.bytes].to_vec())
-}
-async fn receive_initial(
-    live: &mut Live,
-    records: &mut record::Records,
-    class: record::Class,
-    body: &[u8],
-) -> TestResult {
-    let mut input = [0; 1025];
-    let mut scratch = [0; 1024];
-    let mut plaintext = [0; 512];
-    timeout_at(live.deadline, async {
-        loop {
-            let length =
-                std::future::poll_fn(|cx| live.socket.poll_receive(cx, &mut input)).await?;
-            let now = Instant::now();
-            let decoded = live.cover.decode(&input[..length])?;
-            if live.bootstrap.receive(decoded, now)? || live.joining.receive(decoded, now)? {
-                continue;
-            }
-            let opened = records.open(&input[..length], &mut scratch, &mut plaintext)?;
-            assert_eq!(opened.class, class);
-            assert_eq!(&plaintext[..opened.bytes], body);
-            return Ok::<_, TestError>(());
-        }
-    })
-    .await??;
-    Ok(())
-}
-
 #[tokio::test]
 async fn actual_initial_only_carrier_keeps_original_noise_member_root_and_socket() -> TestResult {
     let credentials = credentials()?;
@@ -263,51 +176,22 @@ async fn actual_initial_only_carrier_keeps_original_noise_member_root_and_socket
     )?;
     assert_eq!(a.info().member, a.outer().info().member);
     assert_eq!(a.info().binding, b.info().binding);
-    let (a, b) = (a.into_parts(), b.into_parts());
+    let (mut a, mut b) = (a.into_parts(), b.into_parts());
     assert_eq!((a.clock_origin(), b.clock_origin()), origins);
     assert_eq!((a.deadline, b.deadline), (cap, cap));
     assert_eq!(a.datagram.addresses(), endpoints);
     assert_eq!(b.datagram.addresses(), (endpoints.1, endpoints.0));
     assert_eq!(a.datagram.geometry().extra_wire_bytes, 1);
-    let (mut a, mut a_records) = install_initial(a)?;
-    let (mut b, mut b_records) = install_initial(b)?;
-    let packet = initial_record(
-        &mut a,
-        &mut a_records,
-        record::Class::User,
-        b"initial-only user",
-    )
-    .await?;
-    receive_initial(
-        &mut b,
-        &mut b_records,
-        record::Class::User,
-        b"initial-only user",
-    )
-    .await?;
-    let mut scratch = [0; 1024];
-    let mut plaintext = [0; 512];
-    assert!(matches!(
-        b_records.open(&packet, &mut scratch, &mut plaintext),
-        Err(record::Error::Security(security::Error::Replay))
-    ));
-    initial_record(
-        &mut b,
-        &mut b_records,
-        record::Class::Control,
-        b"initial-only control",
-    )
-    .await?;
-    receive_initial(
-        &mut a,
-        &mut a_records,
-        record::Class::Control,
-        b"initial-only control",
-    )
-    .await?;
+    assert_eq!(a.root.binding(), a.info.binding);
+    assert_eq!(b.root.binding(), b.info.binding);
+    assert_eq!(a.root.role(), a.info.role);
+    assert_eq!(b.root.role(), b.info.role);
+    // This is the initial handoff; final Records activation owns the later cutover.
+    assert!(!a.datagram.final_records());
+    assert!(!b.datagram.final_records());
     let mut received = [0; 3];
-    let a_tls = a.socket.outer_control().ok_or("missing original TLS")?;
-    let b_tls = b.socket.outer_control().ok_or("missing original TLS")?;
+    let a_tls = a.datagram.outer_control().ok_or("missing original TLS")?;
+    let b_tls = b.datagram.outer_control().ok_or("missing original TLS")?;
     let (write, read) = timeout_at(cap, async {
         tokio::join!(a_tls.write_all(b"tls"), b_tls.read_exact(&mut received))
     })

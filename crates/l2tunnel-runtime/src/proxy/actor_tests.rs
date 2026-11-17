@@ -228,7 +228,6 @@ async fn reader_quiesce_watermark_prevents_freezing_earlier_queued_open() -> io:
         Direction {
             index: 0,
             lane: 0,
-            session: [9; 16],
             bulk: true,
         },
         expected,
@@ -239,31 +238,18 @@ async fn reader_quiesce_watermark_prevents_freezing_earlier_queued_open() -> io:
     ));
     let frames = [
         (
-            super::super::super::wire::Kind::Control,
+            crate::proxy::record::Kind::Control,
             Frame::Start(expected).encode(),
         ),
         (
-            super::super::super::wire::Kind::Control,
+            crate::proxy::record::Kind::Control,
             Frame::Ready(expected).encode(),
         ),
-        (super::super::super::wire::Kind::Data, open),
-        (
-            super::super::super::wire::Kind::Control,
-            Frame::Quiesce.encode(),
-        ),
+        (crate::proxy::record::Kind::Data, open),
+        (crate::proxy::record::Kind::Control, Frame::Quiesce.encode()),
     ];
-    for (n, (kind, body)) in frames.into_iter().enumerate() {
-        let bytes = super::super::super::wire::encode(
-            super::super::super::wire::Header {
-                kind,
-                epoch: l2tunnel_core::Epoch(1),
-                packet_number: n as u64,
-                session: [9; 16],
-                lane: 0,
-            },
-            &body,
-        )
-        .map_err(super::super::super::wire_error)?;
+    for (kind, body) in frames {
+        let bytes = crate::proxy::record::encode(kind, &body)?;
         input.write_u32(bytes.len() as u32).await?;
         input.write_all(&bytes).await?;
     }
@@ -319,7 +305,6 @@ async fn writer_flushes_ready_then_previously_owned_user_before_quiesce() -> io:
         Direction {
             index: 0,
             lane: 0,
-            session: [9; 16],
             bulk: true,
         },
         256,
@@ -332,11 +317,9 @@ async fn writer_flushes_ready_then_previously_owned_user_before_quiesce() -> io:
         let length = wire_reader.read_u32().await? as usize;
         let mut bytes = vec![0; length];
         wire_reader.read_exact(&mut bytes).await?;
-        let (header, body) = super::super::super::wire::decode(&bytes, 1600)
-            .map_err(super::super::super::wire_error)?;
-        assert_eq!(header.packet_number, number);
+        let (kind, body) = crate::proxy::record::decode(&bytes, 1600)?;
         if number == 2 {
-            assert_eq!(header.kind, super::super::super::wire::Kind::Data);
+            assert_eq!(kind, crate::proxy::record::Kind::Data);
             assert_eq!(body, [17; 24]);
         } else {
             assert_eq!(
@@ -388,13 +371,7 @@ fn peer_barrier_can_arrive_before_actor_users_but_not_ack_before_native_write() 
     packet[39] = 2;
     let binding = a.binding(&packet)?;
     let channel = a.wire.channel(binding.key, Duration::ZERO)?;
-    let body = a
-        .config
-        .runtime
-        .codec()?
-        .encode_vec(&packet)
-        .map_err(error)?;
-    let user = wire::user(channel, 0, &body)?;
+    let user = wire::user(channel, 0, &packet)?;
     let fence = Fence {
         records: 1,
         transparent: Credit {

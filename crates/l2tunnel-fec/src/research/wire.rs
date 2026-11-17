@@ -1,13 +1,13 @@
 //! Draft explicit research records. Parsing establishes structure, never authority.
 use super::*;
 
-/// Explicit context-free selected union; legacy formats remain unchanged.
+/// Explicit context-free union; the authenticated configuration binds its grammar.
 pub mod compact;
 
 /// Fixed complete header including the twelve-byte exact algorithm descriptor.
 pub const HEADER_BYTES: usize = 80;
-/// Version of this additive format, distinct from rolling record versions.
-pub const VERSION: u8 = 1;
+/// Current format with effective repair extents, distinct from rolling versions.
+pub const VERSION: u8 = 2;
 
 /// Borrowed validated record; no payload allocation or sender ledger is used.
 #[derive(Clone, Copy, Debug)]

@@ -53,7 +53,7 @@ impl Config {
 /// An immutable expanded equation plus the sender's actual frozen receipt prefix.
 #[derive(Clone, Copy, Debug)]
 pub struct Repair<'a> {
-    /// Real coded length/padding and payload bytes under a canonical support.
+    /// Real coded length and effective payload prefix under a canonical support.
     pub equation: rolling::Repair<'a>,
     /// Cumulative prefix known to the sender when this equation was scheduled.
     pub confirmed: u32,
@@ -63,9 +63,10 @@ impl Repair<'_> {
     pub fn validate(self, config: Config) -> Result<(), Error> {
         config.validate()?;
         let serial = u32::try_from(self.equation.id.0).map_err(|_| Error::Identity)?;
-        if serial == 0 || self.equation.bytes.len() != config.recovery.width()? {
+        if serial == 0 {
             return Err(Error::Length);
         }
+        self.equation.validate_extent(config.recovery.width()?)?;
         let expected_end = (u64::from(serial) * 125).div_ceil(26);
         if expected_end != u64::from(self.equation.support.end)
             || config

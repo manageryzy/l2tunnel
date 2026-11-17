@@ -2,36 +2,13 @@
 
 use super::support::*;
 use super::*;
-use l2tunnel::swift_configuration::EnvelopeDigest;
+use l2tunnel::record_configuration::EnvelopeDigest;
 
-fn assert_completed_forwarding(
-    handle: &Handle,
-    response: &local::Response,
-    current: Configuration,
-    epoch: u64,
-) -> Result {
-    assert_eq!(response.version, local::TRANSACTION_VERSION);
-    let state = response
-        .state
-        .as_ref()
-        .ok_or("missing completed transaction state")?;
-    assert_eq!(state.phase, "forwarding");
-    assert_eq!(state.epoch, epoch);
-    let returned = state
-        .transaction
-        .as_ref()
-        .ok_or("missing completed transaction status")?;
-    assert_eq!(returned.epoch, Some(state.epoch));
-    assert_current(returned, current, epoch)?;
+fn assert_completed_forwarding(handle: &Handle, current: Configuration, epoch: u64) -> Result {
     let settled = handle.snapshot();
     assert_eq!(settled.phase, Phase::Connected);
     assert!(settled.operation.is_none());
-    let actual = status(handle)?;
-    assert_eq!(returned.current, actual.current);
-    assert_eq!(returned.epoch, actual.epoch);
-    assert_eq!(returned.phase, actual.phase);
-    assert_eq!(returned.operation, actual.operation);
-    Ok(())
+    assert_current(&status(handle)?, current, epoch)
 }
 
 #[tokio::test(start_paused = true)]
@@ -39,7 +16,7 @@ async fn generic_connect_key_identity_history_and_future_bounds_use_real_prepare
     for appearance in appearances() {
         let hosts = hosts();
         let fixture = transaction_plans(appearance, &hosts)?;
-        let equivalent = Prepared::secure_udp_transaction_server(
+        let equivalent = Prepared::secure_udp_common_server(
             fixture.profile.clone(),
             credentials::Server::new(
                 credentials::NoiseIdentity::new(
@@ -119,18 +96,16 @@ async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual
         let target = pair.fixture.target;
         let before = status(&pair.handles[0])?;
         let key = pair.handles[0].next_key().map_err(submit)?;
-        let foreign = Configuration::new(EnvelopeDigest::new([0xfd; 32]), target.descriptor())?;
+        let foreign = Configuration::new(EnvelopeDigest::new([0xfd; 32]), *target.descriptor())?;
         for outside in [pair.fixture.outside, foreign] {
             let history_before = history(&pair.handles[0]);
             assert_eq!(
-                pair.handles[0].apply_transaction(outside, key),
+                pair.handles[0].apply_common(outside, key),
                 Err(SubmitError::InvalidConfiguration)
             );
             assert_eq!(history(&pair.handles[0]), history_before);
         }
-        let accepted = pair.handles[0]
-            .apply_transaction(target, key)
-            .map_err(submit)?;
+        let accepted = pair.handles[0].apply_common(target, key).map_err(submit)?;
         let mut waiter = Box::pin(pair.handles[0].wait(accepted.operation));
         std::future::poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
@@ -142,31 +117,29 @@ async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual
             pair.handles[0].cancel(accepted.operation),
             Err(SubmitError::Unsupported)
         );
-        assert_eq!(pair.handles[0].apply_transaction(target, key), Ok(accepted));
+        assert_eq!(pair.handles[0].apply_common(target, key), Ok(accepted));
         assert_eq!(
-            pair.handles[0].apply_transaction(initial, key),
+            pair.handles[0].apply_common(initial, key),
             Err(SubmitError::Conflict)
         );
         let next = pair.handles[0].next_key().map_err(submit)?;
         assert_eq!(
-            pair.handles[0].apply_transaction(target, next),
+            pair.handles[0].apply_common(target, next),
             Err(SubmitError::Busy)
         );
         assert_eq!(pair.handles[0].next_key().map_err(submit)?, next);
         let result = pair.result(0, accepted.operation).await?;
-        let Completed::Applied(response) = &result else {
-            return Err("real apply did not complete".into());
-        };
-        assert_eq!(response.code, "ok");
-        let switched = transaction_response(response)?;
-        assert_current(
-            switched,
-            target,
-            before.epoch.ok_or("missing initial epoch")? + 1,
-        )?;
+        assert_eq!(
+            result,
+            Completed::Common {
+                configuration: target,
+                outcome: Ok(l2tunnel_core::Epoch(
+                    before.epoch.ok_or("missing initial epoch")? + 1
+                )),
+            }
+        );
         assert_completed_forwarding(
             &pair.handles[0],
-            response,
             target,
             before.epoch.ok_or("missing initial epoch")? + 1,
         )?;
@@ -175,7 +148,7 @@ async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual
                 && status(&pair.handles[1])?.phase == Some(transaction_status::Phase::Idle))
         })
         .await?;
-        assert_eq!(pair.handles[0].apply_transaction(target, key), Ok(accepted));
+        assert_eq!(pair.handles[0].apply_common(target, key), Ok(accepted));
         assert_eq!(
             pair.handles[0]
                 .wait(accepted.operation)
@@ -194,7 +167,7 @@ async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual
         }
         for side in 0..2 {
             pair.accepted[side] = pair.handles[side]
-                .submit_local_lifecycle(local::TRANSACTION_VERSION, true)
+                .submit_local_lifecycle(local::COMMON_VERSION, true)
                 .map_err(|_| "actual retained-plan reconnect was refused")?;
         }
         pair.ready().await?;
@@ -207,7 +180,7 @@ async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual
             before.epoch.ok_or("missing initial epoch")?,
         )?;
         let history_before = history(&pair.handles[0]);
-        assert_eq!(pair.handles[0].apply_transaction(target, key), Ok(accepted));
+        assert_eq!(pair.handles[0].apply_common(target, key), Ok(accepted));
         assert_eq!(
             pair.handles[0]
                 .wait(accepted.operation)
@@ -263,7 +236,7 @@ async fn generic_actual_inflight_owner_loss_and_original_cap_expiry_are_unknown(
             pair.ready().await?;
             let before = status(&pair.handles[0])?;
             let accepted = pair.handles[0]
-                .apply_transaction(
+                .apply_common(
                     pair.fixture.target,
                     pair.handles[0].next_key().map_err(submit)?,
                 )
@@ -328,7 +301,7 @@ async fn generic_actual_inflight_owner_loss_and_original_cap_expiry_are_unknown(
                     .snapshot()
                     .runtime
                     .and_then(|value| match value {
-                        Observation::SecureUdpTransaction(frame) => Some(frame),
+                        Observation::SecureUdpCommon(frame) => Some(frame),
                         _ => None,
                     })
                     .ok_or("missing actual final frame")?;
@@ -367,30 +340,26 @@ async fn generic_actual_follower_request_completes_not_coordinator_rejection() -
         let before = [status(&pair.handles[0])?, status(&pair.handles[1])?];
         let key = pair.handles[1].next_key().map_err(submit)?;
         let accepted = pair.handles[1]
-            .apply_transaction(pair.fixture.target, key)
+            .apply_common(pair.fixture.target, key)
             .map_err(submit)?;
         let result = pair.result(1, accepted.operation).await?;
-        let Completed::Rejected(response) = &result else {
-            return Err("follower request was not a definitive rejection".into());
-        };
-        assert_eq!(response.version, local::TRANSACTION_VERSION);
-        assert!(!response.ok);
-        assert_eq!(response.code, "not_coordinator");
-        let returned = response
-            .state
-            .as_ref()
-            .and_then(|state| state.transaction.as_ref())
-            .ok_or("missing actual follower status")?;
+        assert_eq!(
+            result,
+            Completed::Common {
+                configuration: pair.fixture.target,
+                outcome: Err(transport::SwitchError::NotCoordinator),
+            }
+        );
+        let returned = status(&pair.handles[1])?;
         assert_eq!(returned.current, before[1].current);
         assert_eq!(returned.epoch, before[1].epoch);
         assert_completed_forwarding(
             &pair.handles[1],
-            response,
             pair.fixture.initial,
             before[1].epoch.ok_or("missing initial follower epoch")?,
         )?;
         assert_eq!(
-            pair.handles[1].apply_transaction(pair.fixture.target, key),
+            pair.handles[1].apply_common(pair.fixture.target, key),
             Ok(accepted)
         );
         assert_eq!(

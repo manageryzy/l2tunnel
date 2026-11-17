@@ -39,7 +39,7 @@ pub struct Profile {
     // Keep an absent optional policy from enlarging every carrier setup future.
     proxy_measured: Option<Box<l2tunnel_runtime::proxy::measured::Config>>,
     connection_reuse: bool,
-    compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
+    compact_wire: l2tunnel::secure_record::compact::Selection,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +69,7 @@ impl Profile {
     }
     /// Explicit compact v3 on the original UDP socket, selected before Noise/member
     /// authentication. The actual runtime validates the complete supported catalog.
-    /// No legacy default or copied public observation installs this selection.
+    /// The explicit protection policy replaces the default full authentication tag.
     #[allow(clippy::too_many_arguments)]
     pub fn new_compact(
         connection: ConnectionConfig,
@@ -95,8 +95,8 @@ impl Profile {
             Some(selection),
         )
     }
-    /// Exact establishment-bound compact request, absent for legacy constructors.
-    pub const fn compact_wire(&self) -> Option<l2tunnel::secure_record::compact::Selection> {
+    /// Exact establishment-bound final record protection used by every Common profile.
+    pub const fn compact_wire(&self) -> l2tunnel::secure_record::compact::Selection {
         self.compact_wire
     }
     /// Explicit fixed TCP proxy on the initial Common record profile. The complete
@@ -164,7 +164,7 @@ impl Profile {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_proxy_selected(
         connection: ConnectionConfig,
-        mut settings: Settings,
+        settings: Settings,
         peers: establish::Peers,
         initiator: transport::Config,
         responder: transport::Config,
@@ -175,9 +175,64 @@ impl Profile {
         measured: Option<l2tunnel_runtime::proxy::measured::Config>,
         wire: Option<l2tunnel::secure_record::compact::Selection>,
     ) -> io::Result<Self> {
+        Self::new_proxy_selected_on(
+            connection, settings, peers, initiator, responder, catalog, parameters, proxy,
+            retained, measured, wire, None, None,
+        )
+    }
+    /// Complete fixed or measured proxy policy on actual retained TLS/QUIC lanes.
+    /// The proxy, carrier and record catalog all enter the pre-authentication digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proxy_maintained(
+        connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+        retained: bool,
+        measured: Option<l2tunnel_runtime::proxy::measured::Config>,
+        wire: Option<l2tunnel::secure_record::compact::Selection>,
+        maintained: super::maintained::Settings,
+    ) -> io::Result<Self> {
+        Self::new_proxy_selected_on(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            proxy,
+            retained,
+            measured,
+            wire,
+            None,
+            Some(maintained),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_proxy_selected_on(
+        connection: ConnectionConfig,
+        mut settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        proxy: l2tunnel_runtime::proxy::Config,
+        retained: bool,
+        measured: Option<l2tunnel_runtime::proxy::measured::Config>,
+        wire: Option<l2tunnel::secure_record::compact::Selection>,
+        raw: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        maintained: Option<super::maintained::Settings>,
+    ) -> io::Result<Self> {
         let binding = l2tunnel_runtime::proxy::session_config(&proxy)?;
-        if proxy.duplex != Duplex::Full
-            || proxy.mux.channels != 1
+        #[cfg(unix)]
+        l2tunnel_runtime::proxy::common::validate_catalog(&proxy, &catalog)?;
+        if proxy.duplex != connection.duplex
             || proxy.runtime.layer != PacketLayer::Ip
             || connection.layer != PacketLayer::Ip
             || proxy.runtime.max_packet != connection.max_packet
@@ -185,7 +240,7 @@ impl Profile {
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Common proxy requires explicit fixed full-duplex one-channel TUN and one immutable descriptor",
+                "Common proxy requires matching carrier duplex, TUN and one immutable descriptor",
             ));
         }
         if let Some(measured) = &measured {
@@ -215,7 +270,7 @@ impl Profile {
         application.update(&settings.application.0);
         application.update(&binding.digest.0);
         settings.application = ConfigDigest(super::finish(application));
-        let mut result = Self::new_selected(
+        let mut result = Self::new_selected_for(
             connection,
             settings,
             peers,
@@ -223,14 +278,17 @@ impl Profile {
             responder,
             catalog,
             parameters,
-            None,
+            raw,
             Some(proxy),
             wire,
+            maintained,
         )?;
         result.proxy_retirement = retained;
         result.proxy_measured = measured.map(Box::new);
-        for role in [security::Role::Initiator, security::Role::Responder] {
-            result.runtime_contract(role)?;
+        if result.maintained.is_none() && result.raw.is_none() {
+            for role in [security::Role::Initiator, security::Role::Responder] {
+                result.runtime_contract(role)?;
+            }
         }
         Ok(result)
     }
@@ -330,6 +388,56 @@ impl Profile {
         compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
         maintained: Option<super::maintained::Settings>,
     ) -> io::Result<Self> {
+        let selected_proxy = proxy.is_some();
+        let (compact_wire, [initiator, responder], catalog) = match compact_wire {
+            Some(selection) => (selection, [initiator, responder], catalog),
+            None => {
+                let selection = compact::authenticated_selection(initiator, responder)?;
+                let physical = if let Some(carrier) = maintained {
+                    carrier.geometry.charged_overhead_bytes
+                } else if let Some(policy) = raw_policy {
+                    policy
+                        .record_geometry()
+                        .map_err(io::Error::other)?
+                        .ip_tcp_bytes
+                } else if settings.gate.path.client.is_ipv6() {
+                    48
+                } else {
+                    28
+                };
+                let (resources, catalog) = compact::rebase_parameters(
+                    [initiator, responder],
+                    catalog,
+                    physical,
+                    selection,
+                )?;
+                (selection, resources, catalog)
+            }
+        };
+        let ([initiator, responder], catalog) = if selected_proxy {
+            let physical = if let Some(carrier) = maintained {
+                carrier.geometry.charged_overhead_bytes
+            } else if let Some(policy) = raw_policy {
+                policy
+                    .record_geometry()
+                    .map_err(io::Error::other)?
+                    .ip_tcp_bytes
+            } else if settings.gate.path.client.is_ipv6() {
+                48
+            } else {
+                28
+            };
+            compact::rebase_parameters_with_data_overhead(
+                [initiator, responder],
+                catalog,
+                physical,
+                compact_wire
+                    .data_overhead()
+                    .max(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD),
+            )?
+        } else {
+            ([initiator, responder], catalog)
+        };
         let base = connection.session()?;
         if initiator.rolling_fragments != responder.rolling_fragments {
             return Err(invalid(
@@ -351,12 +459,11 @@ impl Profile {
             ));
         }
         if (raw_policy.is_none() && maintained.is_none() && connection.duplex != Duplex::Full)
-            || connection.compression != Compression::None
             || catalog.initial().duplex() != connection.duplex
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "common runtime requires full duplex and no outer compression",
+                "Common carrier and initial descriptor duplex differ",
             ));
         }
         for descriptor in catalog.descriptors() {
@@ -373,6 +480,17 @@ impl Profile {
             }
         }
         let initial = catalog.initial();
+        for role in [Role::Client, Role::Server] {
+            let uses_lz4 = initial
+                .direction(role)
+                .native_policy()
+                .is_some_and(l2tunnel::aligned::NativePolicy::uses_lz4);
+            if uses_lz4 != (connection.compression == Compression::Lz4IfSmaller) {
+                return Err(invalid(
+                    "requested compression differs from the initial Common record policy",
+                ));
+            }
+        }
         let native = [Role::Client, Role::Server]
             .into_iter()
             .map(|role| initial.direction(role).max_native())
@@ -530,26 +648,7 @@ impl Profile {
             ));
         }
         let role = outer_role(outer)?;
-        let mut resources = [self.initiator, self.responder];
-        for value in &mut resources {
-            if self.compact_wire.is_some() {
-                continue;
-            }
-            if let Some(policy) = value.rolling_fragments.as_mut() {
-                policy.forward.framing.outer_overhead_bytes =
-                    extra_byte(policy.forward.framing.outer_overhead_bytes)?;
-                policy.reverse.framing.outer_overhead_bytes =
-                    extra_byte(policy.reverse.framing.outer_overhead_bytes)?;
-            }
-            value.control.wire_overhead = extra_byte(value.control.wire_overhead)?;
-            let streams = value
-                .streams
-                .as_mut()
-                .ok_or_else(|| invalid("common carrier requires explicit streams"))?;
-            for stream in &mut streams.streams {
-                stream.delivery.wire_overhead = extra_byte(stream.delivery.wire_overhead)?;
-            }
-        }
+        let resources = [self.initiator, self.responder];
         let requested_configuration = self.configuration()?;
         let mut binding = CarrierBinding {
             outer,
@@ -559,11 +658,6 @@ impl Profile {
             configuration: requested_configuration,
         };
         let mut result = self.clone();
-        result.catalog = if self.compact_wire.is_some() {
-            self.catalog.clone()
-        } else {
-            carrier_catalog(&self.catalog)?
-        };
         result.requested_catalog = Some(self.catalog.clone());
         let contract = result.carrier_contract(binding, role)?;
         binding.configuration = contract.expected_configuration();
@@ -614,7 +708,7 @@ impl Profile {
         if self.maintained.is_some() {
             return self.establish_maintained(config, role);
         }
-        if self.compact_wire.is_some() && self.raw.is_none() && self.carrier.is_none() {
+        if self.raw.is_none() && self.carrier.is_none() {
             config.binding.configuration = self.compact_contract(role)?.expected_configuration().0;
         }
         if self.raw.is_some() {
@@ -669,12 +763,9 @@ impl Profile {
         if let Some(binding) = self.carrier {
             return Ok(binding.configuration);
         }
-        if self.compact_wire.is_some() {
-            return Ok(self
-                .compact_contract(security::Role::Initiator)?
-                .expected_configuration());
-        }
-        self.settings.configuration(self.peers)
+        Ok(self
+            .compact_contract(security::Role::Initiator)?
+            .expected_configuration())
     }
     /// Transfer the exact selected role resources/catalog and setup identity.
     pub fn runtime_contract(
@@ -695,32 +786,13 @@ impl Profile {
             }
             return self.carrier_contract(binding, role);
         }
-        if self.compact_wire.is_some() {
-            return self.compact_contract(role);
-        }
-        let contract = transport::CommonTransactionContract::new(
-            self.configuration()?,
-            role,
-            if role == security::Role::Initiator {
-                self.initiator
-            } else {
-                self.responder
-            },
-            self.settings.cover.config(role)?,
-            self.settings.gate.path.client.is_ipv6(),
-            self.envelope,
-            self.catalog.clone(),
-            self.parameters,
-        )?;
-        self.complete_proxy_contract(contract)
+        self.compact_contract(role)
     }
     fn compact_contract(
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        let selection = self
-            .compact_wire
-            .ok_or_else(|| invalid("compact selection absent"))?;
+        let selection = self.compact_wire;
         if self.raw.is_some() || self.carrier.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -748,27 +820,38 @@ impl Profile {
     ) -> io::Result<transport::CommonTransactionContract> {
         match &self.proxy {
             Some(proxy) => {
-                let digest = match &self.proxy_measured {
-                    Some(measured) => {
-                        l2tunnel_runtime::proxy::measured::session_config(measured)?.digest
-                    }
-                    None => l2tunnel_runtime::proxy::session_config(proxy)?.digest,
-                };
-                let mut contract = if self.raw.is_some() {
-                    contract.with_proxy_raw_binding(digest)?
-                } else {
-                    contract.with_proxy_binding(digest)?
-                };
-                if self.proxy_retirement {
-                    contract = contract.with_proxy_retirement()?;
+                #[cfg(not(unix))]
+                {
+                    let _ = proxy;
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Common proxy record adapter is unavailable on this platform",
+                    ))
                 }
-                match &self.proxy_measured {
-                    Some(measured) => {
-                        l2tunnel_runtime::proxy::common::validate_measured(measured, &contract)?
+                #[cfg(unix)]
+                {
+                    let digest = match &self.proxy_measured {
+                        Some(measured) => {
+                            l2tunnel_runtime::proxy::measured::session_config(measured)?.digest
+                        }
+                        None => l2tunnel_runtime::proxy::session_config(proxy)?.digest,
+                    };
+                    let mut contract = if self.raw.is_some() {
+                        contract.with_proxy_raw_binding(digest)?
+                    } else {
+                        contract.with_proxy_binding(digest)?
+                    };
+                    if self.proxy_retirement {
+                        contract = contract.with_proxy_retirement()?;
                     }
-                    None => l2tunnel_runtime::proxy::common::validate(proxy, &contract)?,
+                    match &self.proxy_measured {
+                        Some(measured) => {
+                            l2tunnel_runtime::proxy::common::validate_measured(measured, &contract)?
+                        }
+                        None => l2tunnel_runtime::proxy::common::validate(proxy, &contract)?,
+                    }
+                    Ok(contract)
                 }
-                Ok(contract)
             }
             None => {
                 if self.connection_reuse {
@@ -785,21 +868,7 @@ impl Profile {
         binding: CarrierBinding,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        if let Some(selection) = self.compact_wire {
-            return transport::CommonTransactionContract::new_on_carrier_paired_compact(
-                binding.requested_configuration,
-                role,
-                binding.resources,
-                self.settings.cover.config(role)?,
-                self.settings.gate.path.client.is_ipv6(),
-                binding.requested_envelope,
-                self.catalog.clone(),
-                self.parameters,
-                binding.outer,
-                selection,
-            );
-        }
-        transport::CommonTransactionContract::new_on_carrier_paired(
+        transport::CommonTransactionContract::new_on_carrier_paired_compact(
             binding.requested_configuration,
             role,
             binding.resources,
@@ -809,6 +878,7 @@ impl Profile {
             self.catalog.clone(),
             self.parameters,
             binding.outer,
+            self.compact_wire,
         )
     }
 }
@@ -816,79 +886,6 @@ fn extra_byte(value: usize) -> io::Result<usize> {
     value
         .checked_add(1)
         .ok_or_else(|| invalid("common carrier opcode accounting overflow"))
-}
-fn carrier_catalog(catalog: &Catalog) -> io::Result<Catalog> {
-    let mut descriptors = Vec::new();
-    descriptors
-        .try_reserve_exact(catalog.descriptors().len())
-        .map_err(io::Error::other)?;
-    for descriptor in catalog.descriptors() {
-        descriptors.push(carrier_descriptor(*descriptor)?);
-    }
-    Catalog::new(carrier_descriptor(catalog.initial())?, &descriptors).map_err(io::Error::other)
-}
-fn carrier_descriptor(descriptor: common::Descriptor) -> io::Result<common::Descriptor> {
-    let mut profile = *descriptor.profile();
-    match &mut profile {
-        common::Profile::Research { config, .. } => {
-            config.geometry.forward_overhead_bytes =
-                extra_byte(config.geometry.forward_overhead_bytes)?;
-            config.geometry.reverse_overhead_bytes =
-                extra_byte(config.geometry.reverse_overhead_bytes)?;
-        }
-        common::Profile::Swift { .. } => {}
-        common::Profile::Aligned { forward, reverse } => {
-            for value in [forward, reverse] {
-                value.recovery.outer_overhead_bytes =
-                    extra_byte(value.recovery.outer_overhead_bytes)?;
-            }
-        }
-        common::Profile::Packed { forward, reverse } => {
-            for value in [forward, reverse] {
-                value.base.recovery.outer_overhead_bytes =
-                    extra_byte(value.base.recovery.outer_overhead_bytes)?;
-            }
-        }
-        common::Profile::AlignedCompact { forward, reverse } => {
-            for value in [forward, reverse] {
-                value.recovery = compact_extra_byte(value.recovery)?;
-            }
-        }
-        common::Profile::PerConnectionCompact { forward, reverse } => {
-            for value in [forward, reverse] {
-                value.compact.recovery = compact_extra_byte(value.compact.recovery)?;
-            }
-        }
-        common::Profile::PackedCompact { forward, reverse } => {
-            for value in [forward, reverse] {
-                value.base.recovery = compact_extra_byte(value.base.recovery)?;
-            }
-        }
-        common::Profile::Rolling { config, .. } | common::Profile::RollingCopies { config, .. } => {
-            config.geometry.forward_overhead_bytes =
-                extra_byte(config.geometry.forward_overhead_bytes)?;
-            config.geometry.reverse_overhead_bytes =
-                extra_byte(config.geometry.reverse_overhead_bytes)?;
-        }
-    }
-    common::Descriptor::new(
-        descriptor.path_mtu(),
-        descriptor.duplex(),
-        *descriptor.direction(Role::Client).common(),
-        *descriptor.direction(Role::Server).common(),
-        profile,
-    )
-    .map_err(io::Error::other)
-}
-// Retain the exact complete adaptive policy; only actual carrier framing changes.
-fn compact_extra_byte(
-    value: l2tunnel::reliable::CompactReliableConfig,
-) -> io::Result<l2tunnel::reliable::CompactReliableConfig> {
-    l2tunnel::reliable::CompactReliableConfig::new(
-        value.arq(),
-        extra_byte(value.outer_overhead_bytes())?,
-    )
-    .map_err(io::Error::other)
 }
 fn outer_role(outer: establish::carrier::AuthenticatedOuter) -> io::Result<security::Role> {
     match outer.info().peer_member {
@@ -901,6 +898,6 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "common_transaction_profile_tests.rs"]
 mod tests;

@@ -262,11 +262,13 @@ impl Sender {
     }
     /// Stage one already-MUX-admitted frame. Failure consumes no context or ID.
     pub fn stage(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), Error> {
-        self.stage_selected(channel, frame, false).map(|_| ())
+        self.stage_selected(channel, frame, aligned_body::Encoding::Headers)
+            .map(|_| ())
     }
     /// Stage an explicitly selected raw packet without consuming a header context.
     pub fn stage_raw(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), Error> {
-        self.stage_selected(channel, frame, true).map(|_| ())
+        self.stage_selected(channel, frame, aligned_body::Encoding::Raw)
+            .map(|_| ())
     }
     /// Stage and return the actual native-body identity, excluding any context.
     pub fn stage_identified(
@@ -274,7 +276,7 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
     ) -> Result<RecordIdentity, Error> {
-        self.stage_selected(channel, frame, false)
+        self.stage_selected(channel, frame, aligned_body::Encoding::Headers)
     }
     /// Stage raw native bytes and return their original channel body identity.
     pub fn stage_raw_identified(
@@ -282,13 +284,21 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
     ) -> Result<RecordIdentity, Error> {
-        self.stage_selected(channel, frame, true)
+        self.stage_selected(channel, frame, aligned_body::Encoding::Raw)
+    }
+    /// Stage stateless LZ4-or-raw bytes under the actual channel identity.
+    pub fn stage_lz4_identified(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<RecordIdentity, Error> {
+        self.stage_selected(channel, frame, aligned_body::Encoding::Lz4)
     }
     fn stage_selected(
         &mut self,
         channel: ChannelId,
         frame: &[u8],
-        raw: bool,
+        encoding: aligned_body::Encoding,
     ) -> Result<RecordIdentity, Error> {
         if self.pending.is_some() {
             return Err(Error::Busy);
@@ -299,10 +309,10 @@ impl Sender {
             .ok_or(Error::Configuration)?;
         let record = state.next.ok_or(Error::Exhausted)?;
         self.staged.copy_context_from(&state.encoder);
-        let encoded = if raw {
-            self.staged.encode_raw(frame, &mut self.bodies)?
-        } else {
-            self.staged.encode(frame, &mut self.bodies)?
+        let encoded = match encoding {
+            aligned_body::Encoding::Headers => self.staged.encode(frame, &mut self.bodies)?,
+            aligned_body::Encoding::Raw => self.staged.encode_raw(frame, &mut self.bodies)?,
+            aligned_body::Encoding::Lz4 => self.staged.encode_lz4(frame, &mut self.bodies)?,
         };
         let last = if encoded.context_len != 0 {
             record.0.checked_add(1).ok_or(Error::Exhausted)?

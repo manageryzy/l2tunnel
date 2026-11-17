@@ -345,3 +345,6 @@ fn packed_requested_copies_remain_canonical_but_refuse_before_storage_admission(
     }
     Ok(())
 }
+
+#[path = "native_compression_tests.rs"]
+mod native_compression;

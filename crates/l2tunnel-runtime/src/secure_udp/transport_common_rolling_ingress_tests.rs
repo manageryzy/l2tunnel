@@ -55,7 +55,6 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                     &input[..length],
                     now,
                     endpoint.driver.origin + duration(now),
-                    None,
                 )?;
             }
             let epoch = endpoint.driver.common_state()?.epoch();
@@ -79,7 +78,6 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 &wires[0],
                 now,
                 endpoint.driver.origin + duration(now),
-                None,
             )?;
             assert_eq!(
                 endpoint.driver.counters.replay_rejections,
@@ -108,7 +106,7 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 endpoint.driver.progress_common(now)?;
                 endpoint.driver.collect_native(now)?;
                 endpoint.driver.service_common_rolling(now)?;
-                endpoint.driver.service_selected_control(now, None)?;
+                endpoint.driver.service_selected_control(now)?;
                 endpoint.driver.submit_control(now)?;
                 endpoint.driver.collect_native(now)?;
                 if !endpoint.driver.native.is_empty() {

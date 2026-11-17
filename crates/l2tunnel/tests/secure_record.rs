@@ -4,6 +4,7 @@ use l2tunnel::{
     cover,
     secure_record::{
         Capacity, Class, DataReader, Error, Opened, ReaderState, Records, Scope, Sealed,
+        compact::{Kind, Selection},
     },
     security,
 };
@@ -79,29 +80,52 @@ fn covers(appearance: cover::Appearance) -> Result<(cover::Config, cover::Config
     ))
 }
 
+fn current_selection(protection: security::Protection) -> Selection {
+    Selection {
+        protection: match protection {
+            security::Protection::ChaCha20Poly1305 => {
+                security::compact::Protection::ChaCha20Poly1305
+            }
+            security::Protection::HmacSha256 => security::compact::Protection::HmacSha256,
+        },
+        limits: security::compact::Selection {
+            max_forward_packets: 4096,
+            max_failed_checks: 128,
+        },
+    }
+}
+
+fn kind(class: Class) -> Kind {
+    match class {
+        Class::User => Kind::Data,
+        Class::Control => Kind::Control,
+    }
+}
+
 fn peers(
     appearance: cover::Appearance,
     protection: security::Protection,
 ) -> Result<(Records, Records)> {
     let (a_cover, b_cover) = covers(appearance)?;
+    let selection = current_selection(protection);
     Ok((
-        Records::new(
+        Records::new_compact(
             root(security::Role::Initiator)?,
             security::LaneId(7),
             limits(),
-            protection,
             a_cover,
             control(),
             data(),
+            selection,
         )?,
-        Records::new(
+        Records::new_compact(
             root(security::Role::Responder)?,
             security::LaneId(7),
             limits(),
-            protection,
             b_cover,
             control(),
             data(),
+            selection,
         )?,
     ))
 }
@@ -115,7 +139,7 @@ fn outer(number: u32) -> cover::PacketMeta {
 }
 
 fn seal(records: &mut Records, class: Class, body: &[u8]) -> Result<(Sealed, Vec<u8>)> {
-    let capacity = records.capacity(body.len())?;
+    let capacity = records.capacity_for(kind(class), body.len())?;
     let mut workspace = vec![0; capacity.seal_workspace_bytes];
     let mut packet = vec![0; capacity.packet_bytes];
     let sealed = records.seal(class, outer(0x1234_5678), body, &mut workspace, &mut packet)?;
@@ -130,49 +154,13 @@ fn open(records: &mut Records, packet: &[u8]) -> Result<(Opened, Vec<u8>)> {
     Ok((opened, plaintext[..opened.bytes].to_vec()))
 }
 
-fn repack(
-    sender: cover::Config,
-    receiver: cover::Config,
-    packet: &[u8],
-    change: impl FnOnce(&mut Vec<u8>),
-) -> Result<Vec<u8>> {
-    let mut protected = receiver.decode(packet)?.protected.to_vec();
-    change(&mut protected);
-    let mut output = [0; 1536];
-    let length = sender.encode(outer(1), &protected, &mut output)?;
-    Ok(output[..length].to_vec())
-}
-
-fn seal_registered_scope(
-    sender: &mut security::Sender,
-    cover: cover::Config,
-    scope: Scope,
-    body: &[u8],
-    legacy_route: bool,
-) -> Result<Vec<u8>> {
-    let mut route = vec![1];
-    route.extend_from_slice(&scope.epoch.0.to_be_bytes());
-    if legacy_route {
-        route.extend_from_slice(&scope.configuration.0);
-    }
-    let mut workspace = [0; 1536];
-    let sealed = sender.seal(
-        security::Metadata {
-            epoch: scope.epoch,
-            configuration: scope.configuration,
-            extra: &route,
-        },
-        body,
-        &mut workspace[route.len()..],
-    )?;
-    workspace[..route.len()].copy_from_slice(&route);
-    let mut output = [0; 1536];
-    let length = cover.encode(
-        outer(0),
-        &workspace[..route.len() + sealed.bytes],
-        &mut output,
-    )?;
-    Ok(output[..length].to_vec())
+fn seal_scope(records: &mut Records, scope: Scope, body: &[u8]) -> Result<Vec<u8>> {
+    let capacity = records.capacity_for(Kind::Data, body.len())?;
+    let mut workspace = vec![0; capacity.seal_workspace_bytes];
+    let mut packet = vec![0; capacity.packet_bytes];
+    let sealed = records.seal_user_in(scope, outer(0), body, &mut workspace, &mut packet)?;
+    assert_eq!(sealed.bytes, packet.len());
+    Ok(packet)
 }
 
 fn selections() -> impl Iterator<Item = (cover::Appearance, security::Protection)> {
@@ -189,7 +177,8 @@ fn selections() -> impl Iterator<Item = (cover::Appearance, security::Protection
 }
 
 #[test]
-fn both_covers_protections_classes_and_directions_preserve_exact_records() -> Result<()> {
+fn both_initial_appearances_protections_classes_and_directions_preserve_exact_records() -> Result<()>
+{
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
         let bodies = [vec![], vec![0], vec![0xff, 0, 1, 0, 0], vec![0; 1024]];
@@ -201,19 +190,18 @@ fn both_covers_protections_classes_and_directions_preserve_exact_records() -> Re
             };
             for class in [Class::User, Class::Control] {
                 for (number, body) in bodies.iter().enumerate() {
-                    let capacity = sender.capacity(body.len())?;
-                    let overhead = protection.overhead_bytes();
-                    let outer_bytes = match appearance {
-                        cover::Appearance::QuicLike => cover::QUIC_ESTABLISHED_OVERHEAD,
-                        cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+                    let capacity = sender.capacity_for(kind(class), body.len())?;
+                    let tag = match class {
+                        Class::User => protection.tag_bytes(),
+                        Class::Control => 16,
                     };
                     assert_eq!(
                         capacity,
                         Capacity {
                             plaintext_bytes: body.len(),
-                            seal_workspace_bytes: 9 + overhead + body.len(),
-                            open_workspace_bytes: protection.tag_bytes() + body.len(),
-                            packet_bytes: outer_bytes + 9 + overhead + body.len(),
+                            seal_workspace_bytes: 5 + tag + body.len(),
+                            open_workspace_bytes: tag + body.len(),
+                            packet_bytes: 5 + tag + body.len(),
                         }
                     );
                     let (sealed, packet) = seal(sender, class, body)?;
@@ -243,15 +231,9 @@ fn both_covers_protections_classes_and_directions_preserve_exact_records() -> Re
 fn exact_route_is_public_but_management_looking_user_bytes_keep_user_authority() -> Result<()> {
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
-        let (_, b_cover) = covers(appearance)?;
         let ethernet = b"\xff\xff\xff\xff\xff\xff\x02\0\0\0\0\x01\x88\xb5L2MC\0\0";
         let (_, packet) = seal(&mut a, Class::User, ethernet)?;
-        let protected = b_cover.decode(&packet)?.protected;
-        assert_eq!(protected[0], 1);
-        assert_eq!(&protected[1..9], &data().epoch.0.to_be_bytes());
-        assert_eq!(protected[9], security::VERSION);
-        assert_eq!(protected[10], protection as u8);
-        assert_eq!(&protected[11..19], &[0; 8]);
+        assert_eq!(&packet[..5], &[0; 5]);
         let (opened, bytes) = open(&mut b, &packet)?;
         assert_eq!(opened.class, Class::User);
         assert_eq!(bytes, ethernet);
@@ -263,11 +245,10 @@ fn exact_route_is_public_but_management_looking_user_bytes_keep_user_authority()
 fn every_protected_byte_tamper_fails_without_plaintext_or_replay_adoption() -> Result<()> {
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
-        let (a_cover, b_cover) = covers(appearance)?;
         let (_, packet) = seal(&mut a, Class::User, b"exact protected body\0\0")?;
-        let protected_length = b_cover.decode(&packet)?.protected.len();
-        for index in 0..protected_length {
-            let forged = repack(a_cover, b_cover, &packet, |body| body[index] ^= 1)?;
+        for index in 0..packet.len() {
+            let mut forged = packet.clone();
+            forged[index] ^= 1;
             let mut workspace = [0x6b; 1600];
             let mut plaintext = [0xa5; 1024];
             assert!(
@@ -291,12 +272,9 @@ fn every_protected_byte_tamper_fails_without_plaintext_or_replay_adoption() -> R
 fn relabeling_a_user_record_as_a_valid_control_route_cannot_grant_authority() -> Result<()> {
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
-        let (a_cover, b_cover) = covers(appearance)?;
         let (_, user) = seal(&mut a, Class::User, b"L2MC fake control")?;
-        let forged = repack(a_cover, b_cover, &user, |body| {
-            body[0] = 2;
-            body[1..9].copy_from_slice(&control().epoch.0.to_be_bytes());
-        })?;
+        let mut forged = user.clone();
+        forged[0] = 0x80;
         assert_eq!(
             b.open(&forged, &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Security(security::Error::Authentication))
@@ -380,13 +358,11 @@ fn control_and_shared_data_replay_survive_staging_activation_and_retirement() ->
 fn changing_a_late_route_to_another_registered_scope_does_not_consume_it() -> Result<()> {
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
-        let (a_cover, b_cover) = covers(appearance)?;
         let (_, old) = seal(&mut a, Class::User, b"old scope")?;
         let next = scope(11, 0xd1);
         b.stage_data(next)?;
-        let forged = repack(a_cover, b_cover, &old, |body| {
-            body[1..9].copy_from_slice(&next.epoch.0.to_be_bytes());
-        })?;
+        let mut forged = old.clone();
+        forged[0] = 1;
         assert_eq!(
             b.open(&forged, &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Security(security::Error::Authentication))
@@ -400,31 +376,19 @@ fn changing_a_late_route_to_another_registered_scope_does_not_consume_it() -> Re
 fn canceled_epoch_can_change_digest_without_accepting_old_ciphertext_or_resetting_replay()
 -> Result<()> {
     for (appearance, protection) in selections() {
-        let (a_cover, b_cover) = covers(appearance)?;
-        let mut sender = root(security::Role::Initiator)?.sender(
-            security::Purpose::Data,
-            security::LaneId(7),
-            limits(),
-            protection,
-        )?;
-        let mut receiver = Records::new(
-            root(security::Role::Responder)?,
-            security::LaneId(7),
-            limits(),
-            protection,
-            b_cover,
-            control(),
-            data(),
-        )?;
+        let (mut sender, mut receiver) = peers(appearance, protection)?;
         let canceled = scope(11, 0xa1);
         let replacement = scope(11, 0xb1);
-        let accepted = seal_registered_scope(&mut sender, a_cover, data(), b"active scope", false)?;
+        let accepted = seal_scope(&mut sender, data(), b"active scope")?;
         open(&mut receiver, &accepted)?;
-        receiver.stage_data(canceled)?;
-        let old =
-            seal_registered_scope(&mut sender, a_cover, canceled, b"canceled attempt", false)?;
-        receiver.cancel_staged_data(canceled)?;
-        receiver.stage_data(replacement)?;
+        for endpoint in [&mut sender, &mut receiver] {
+            endpoint.stage_data(canceled)?;
+        }
+        let old = seal_scope(&mut sender, canceled, b"canceled attempt")?;
+        for endpoint in [&mut sender, &mut receiver] {
+            endpoint.cancel_staged_data(canceled)?;
+            endpoint.stage_data(replacement)?;
+        }
         let mut plaintext = [0xa5; 1024];
         assert_eq!(
             receiver.open(&old, &mut [0; 1600], &mut plaintext),
@@ -435,8 +399,7 @@ fn canceled_epoch_can_change_digest_without_accepting_old_ciphertext_or_resettin
             receiver.open(&accepted, &mut [0; 1600], &mut plaintext),
             Err(Error::Security(security::Error::Replay))
         );
-        let new =
-            seal_registered_scope(&mut sender, a_cover, replacement, b"replacement\0\0", false)?;
+        let new = seal_scope(&mut sender, replacement, b"replacement\0\0")?;
         let (opened, bytes) = open(&mut receiver, &new)?;
         assert_eq!(opened.scope, replacement);
         assert_eq!(opened.number, security::PacketNumber(2));
@@ -445,41 +408,8 @@ fn canceled_epoch_can_change_digest_without_accepting_old_ciphertext_or_resettin
             receiver.open(&new, &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Security(security::Error::Replay))
         );
-        assert_eq!(sender.next_number(), security::PacketNumber(3));
+        assert_eq!(sender.next_number(Class::User), security::PacketNumber(3));
         assert_eq!(receiver.next_number(Class::User), security::PacketNumber(0));
-    }
-    Ok(())
-}
-
-#[test]
-fn prior_41_byte_route_is_not_autodetected_or_accepted() -> Result<()> {
-    for (appearance, protection) in selections() {
-        let (a_cover, b_cover) = covers(appearance)?;
-        let mut sender = root(security::Role::Initiator)?.sender(
-            security::Purpose::Data,
-            security::LaneId(7),
-            limits(),
-            protection,
-        )?;
-        let mut receiver = Records::new(
-            root(security::Role::Responder)?,
-            security::LaneId(7),
-            limits(),
-            protection,
-            b_cover,
-            control(),
-            data(),
-        )?;
-        let legacy = seal_registered_scope(&mut sender, a_cover, data(), b"legacy draft", true)?;
-        assert!(
-            receiver
-                .open(&legacy, &mut [0; 1600], &mut [0; 1024])
-                .is_err()
-        );
-        let compact = seal_registered_scope(&mut sender, a_cover, data(), b"compact draft", false)?;
-        let (opened, bytes) = open(&mut receiver, &compact)?;
-        assert_eq!(opened.number, security::PacketNumber(1));
-        assert_eq!(bytes, b"compact draft");
     }
     Ok(())
 }
@@ -524,7 +454,7 @@ fn seal_preflight_errors_preserve_both_buffers_and_unique_numbers() -> Result<()
     for (appearance, protection) in selections() {
         let (mut a, _) = peers(appearance, protection)?;
         for class in [Class::User, Class::Control] {
-            let capacity = a.capacity(100)?;
+            let capacity = a.capacity_for(kind(class), 100)?;
             for failure in 0..4 {
                 let mut workspace = [0x6b; 1600];
                 let mut packet = [0xa5; 1600];
@@ -600,7 +530,6 @@ fn receive_capacity_errors_do_not_expose_plaintext_or_consume_replay_credit() ->
 fn truncation_trailing_bytes_unknown_classes_and_scopes_are_bounded() -> Result<()> {
     for (appearance, protection) in selections() {
         let (mut a, mut b) = peers(appearance, protection)?;
-        let (a_cover, b_cover) = covers(appearance)?;
         let (_, packet) = seal(&mut a, Class::User, b"truncation\0\0")?;
         for end in 0..packet.len() {
             assert!(
@@ -612,56 +541,25 @@ fn truncation_trailing_bytes_unknown_classes_and_scopes_are_bounded() -> Result<
         let mut appended = packet.clone();
         appended.push(0);
         assert!(b.open(&appended, &mut [0; 1600], &mut [0; 1024]).is_err());
-        for class in [0, 3, 255] {
-            let forged = repack(a_cover, b_cover, &packet, |body| body[0] = class)?;
+        for class in [129, 130, 191] {
+            let mut forged = packet.clone();
+            forged[0] = class;
             assert_eq!(
                 b.open(&forged, &mut [0; 1600], &mut [0; 1024]),
                 Err(Error::Malformed)
             );
         }
-        let unknown_epoch = repack(a_cover, b_cover, &packet, |body| body[1] ^= 1)?;
+        let mut unknown_scope = packet.clone();
+        unknown_scope[0] = 1;
         assert_eq!(
-            b.open(&unknown_epoch, &mut [0; 1600], &mut [0; 1024]),
+            b.open(&unknown_scope, &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Scope)
         );
-        let no_security = repack(a_cover, b_cover, &packet, |body| body.truncate(9))?;
         assert_eq!(
-            b.open(&no_security, &mut [0; 1600], &mut [0; 1024]),
+            b.open(&packet[..5], &mut [0; 1600], &mut [0; 1024]),
             Err(Error::Malformed)
         );
         assert_eq!(open(&mut b, &packet)?.1, b"truncation\0\0");
-    }
-    Ok(())
-}
-
-#[test]
-fn outer_numbers_are_not_authenticated_packet_identities_or_handshake_authority() -> Result<()> {
-    for (appearance, protection) in selections() {
-        let (mut a, mut b) = peers(appearance, protection)?;
-        let (a_cover, b_cover) = covers(appearance)?;
-        let (_, packet) = seal(&mut a, Class::User, &[1, 0])?;
-        let protected = b_cover.decode(&packet)?.protected;
-        let mut changed_outer = [0; 1536];
-        let length = a_cover.encode(outer(u32::MAX), protected, &mut changed_outer)?;
-        let (opened, body) = open(&mut b, &changed_outer[..length])?;
-        assert_eq!(opened.number, security::PacketNumber(0));
-        assert_eq!(body, &[1, 0]);
-        assert_eq!(
-            b.open(&packet, &mut [0; 1600], &mut [0; 1024]),
-            Err(Error::Security(security::Error::Replay))
-        );
-        let length = a_cover.encode(
-            cover::PacketMeta {
-                phase: cover::Phase::Handshake,
-                ..outer(0)
-            },
-            protected,
-            &mut changed_outer,
-        )?;
-        assert_eq!(
-            b.open(&changed_outer[..length], &mut [0; 1600], &mut [0; 1024]),
-            Err(Error::Phase)
-        );
     }
     Ok(())
 }
@@ -699,14 +597,14 @@ fn different_lanes_and_protection_selections_cannot_open_the_record() -> Result<
         let (mut a, _) = peers(appearance, protection)?;
         let (_, b_cover) = covers(appearance)?;
         let (_, packet) = seal(&mut a, Class::User, &[0; 100])?;
-        let mut wrong_lane = Records::new(
+        let mut wrong_lane = Records::new_compact(
             root(security::Role::Responder)?,
             security::LaneId(8),
             limits(),
-            protection,
             b_cover,
             control(),
             data(),
+            current_selection(protection),
         )?;
         assert_eq!(
             wrong_lane.open(&packet, &mut [0; 1600], &mut [0; 1024]),
@@ -716,63 +614,63 @@ fn different_lanes_and_protection_selections_cannot_open_the_record() -> Result<
             security::Protection::ChaCha20Poly1305 => security::Protection::HmacSha256,
             security::Protection::HmacSha256 => security::Protection::ChaCha20Poly1305,
         };
-        let mut wrong_protection = Records::new(
+        let mut wrong_protection = Records::new_compact(
             root(security::Role::Responder)?,
             security::LaneId(7),
             limits(),
-            other_protection,
             b_cover,
             control(),
             data(),
+            current_selection(other_protection),
         )?;
-        assert_eq!(
-            wrong_protection.open(&packet, &mut [0; 1600], &mut [0; 1024]),
-            Err(Error::Security(security::Error::ContextMismatch))
+        assert!(
+            wrong_protection
+                .open(&packet, &mut [0; 1600], &mut [0; 1024])
+                .is_err()
         );
     }
     Ok(())
 }
 
 #[test]
-fn construction_rejects_incompatible_security_and_cover_bounds() -> Result<()> {
+fn construction_rejects_incompatible_security_and_packet_bounds() -> Result<()> {
     for (appearance, protection) in selections() {
         let (a_cover, _) = covers(appearance)?;
-        let maximum = a_cover.limits().max_protected_bytes
-            - l2tunnel::secure_record::ROUTE_BYTES
-            - protection.overhead_bytes();
+        let selection = current_selection(protection);
+        let maximum = a_cover.limits().max_packet_bytes - selection.maximum_overhead();
         assert_eq!(
             maximum,
             match protection {
-                security::Protection::ChaCha20Poly1305 => 1415,
-                security::Protection::HmacSha256 => 1399,
+                security::Protection::ChaCha20Poly1305 => 1515,
+                security::Protection::HmacSha256 => 1499,
             }
         );
-        let valid = Records::new(
+        let valid = Records::new_compact(
             root(security::Role::Initiator)?,
             security::LaneId(7),
             security::Limits {
                 max_body_bytes: maximum,
                 ..limits()
             },
-            protection,
             a_cover,
             control(),
             data(),
+            selection,
         )?;
-        assert_eq!(valid.capacity(maximum)?.seal_workspace_bytes, 1450);
+        assert_eq!(valid.capacity(maximum)?.seal_workspace_bytes, 1536);
         for max_body_bytes in [0, usize::MAX, maximum + 1] {
             assert!(
-                Records::new(
+                Records::new_compact(
                     root(security::Role::Initiator)?,
                     security::LaneId(7),
                     security::Limits {
                         max_body_bytes,
                         ..limits()
                     },
-                    protection,
                     a_cover,
                     control(),
-                    data()
+                    data(),
+                    selection,
                 )
                 .is_err()
             );
@@ -837,7 +735,7 @@ fn explicit_directional_scopes_share_user_numbers_replay_and_generations() -> Re
             let mut old_packet = None;
             let mut new_packet = None;
             for index in 0..20_u64 {
-                // Old-policy sources coexist with new receiver-policy feedback.
+                // Both registered data scopes share one sender and replay history.
                 let selected = if index % 2 == 0 { data() } else { next };
                 let body = [index as u8, 0x81, 0xff, 0, 0];
                 let capacity = left.capacity(body.len())?;

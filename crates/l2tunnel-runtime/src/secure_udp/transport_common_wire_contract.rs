@@ -1,4 +1,4 @@
-//! Establishment-bound compact UDP selection; legacy contracts keep their bytes.
+//! Establishment-bound current compact UDP and carrier selection.
 use super::*;
 
 impl CommonTransactionContract {
@@ -31,7 +31,7 @@ impl CommonTransactionContract {
             .max()
             .ok_or_else(|| invalid("compact native geometry"))?;
         let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(b"l2tunnel/common-compact-wire/v1\0");
+        hash.update(b"l2tunnel/common-compact-wire/v2\0");
         hash.update(&base_policy.0);
         hash.update(envelope.as_bytes());
         hash.update(catalog.root().as_bytes());
@@ -48,9 +48,8 @@ impl CommonTransactionContract {
         hash.update(&[match selection.protection {
             security::compact::Protection::Aes128Ccm4 => 1,
             security::compact::Protection::ChaCha20Crc32c => 2,
-            security::compact::Protection::ChaCha20Poly1305 => {
-                return Err(invalid("compact data check"));
-            }
+            security::compact::Protection::ChaCha20Poly1305 => 3,
+            security::compact::Protection::HmacSha256 => 4,
         }]);
         hash.update(&selection.limits.max_forward_packets.to_be_bytes());
         hash.update(&selection.limits.max_failed_checks.to_be_bytes());
@@ -89,13 +88,12 @@ impl CommonTransactionContract {
                 envelope,
                 catalog.clone(),
                 settings,
-                None,
                 0,
                 None,
                 physical,
                 None,
                 core::Duplex::Full,
-                Some(selection),
+                selection,
             )
         };
         // Validate the actual opposite endpoint inventory without assigning it
@@ -128,13 +126,13 @@ impl CommonTransactionContract {
             security::Role::Initiator => 0,
             security::Role::Responder => 1,
         }];
-        managed::validate_carrier(outer, role, local, ipv6, catalog.initial())?;
+        carrier::validate_carrier(outer, role, local, ipv6, catalog.initial())?;
         for local in resources {
             if local.path_mtu != outer.requested().path_mtu
                 || local
                     .security
                     .max_body_bytes
-                    .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+                    .checked_add(selection.maximum_overhead())
                     .is_none_or(|maximum| maximum > outer.requested().max_record_bytes)
                 || cover.limits().max_packet_bytes > outer.requested().max_record_bytes
             {
@@ -170,18 +168,14 @@ impl CommonTransactionContract {
         self.outer.is_some() || self.maintained.is_some()
     }
 
-    /// Exact explicit final-wire selection; absence retains legacy framing.
-    pub fn compact_wire(&self) -> Option<record::compact::Selection> {
+    /// Exact authenticated final-wire selection installed by every current contract.
+    pub fn compact_wire(&self) -> record::compact::Selection {
         self.compact_wire
     }
 
     pub(crate) fn feedback_overhead_bytes(&self) -> io::Result<usize> {
-        if self.compact_wire.is_some() {
-            self.physical_overhead_bytes()?
-                .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
-                .ok_or_else(exhausted)
-        } else {
-            Ok(self.geometry.forward_overhead_bytes)
-        }
+        self.physical_overhead_bytes()?
+            .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
+            .ok_or_else(exhausted)
     }
 }

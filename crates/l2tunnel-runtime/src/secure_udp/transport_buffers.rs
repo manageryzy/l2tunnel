@@ -32,6 +32,7 @@ pub(super) struct Buffers {
     pub(super) frame: Vec<u8>,
 }
 impl Buffers {
+    #[cfg(test)]
     pub(super) fn new(
         wire: usize,
         secure_packet: usize,

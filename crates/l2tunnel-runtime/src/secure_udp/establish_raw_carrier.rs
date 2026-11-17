@@ -12,10 +12,10 @@ use l2tunnel_raw_io::{
 /// Pure maintained bootstrap/cover/MTU preflight; this returns no proof or owner.
 pub fn validate_requested(config: Config, peers: Peers, policy: PacketPolicy) -> Result<(), Error> {
     let geometry = policy.record_geometry().map_err(raw_error)?;
+    validate_cover_geometry(config.cover, policy)?;
     if config.gate.path.client.is_ipv6()
         || config.gate.path.server.is_ipv6()
         || config.gate.path_mtu != geometry.path_mtu
-        || config.cover.limits().max_packet_bytes > geometry.max_record_bytes
     {
         return Err(Error::Configuration("requested raw bootstrap geometry"));
     }
@@ -377,6 +377,7 @@ fn validate_config(proof: AuthenticatedRaw, config: Config, role: hs::Role) -> R
     validate_shape(proof, config, role)
 }
 fn validate_shape(proof: AuthenticatedRaw, config: Config, role: hs::Role) -> Result<(), Error> {
+    validate_cover_geometry(config.cover, proof.policy)?;
     let (client, server) =
         proof.endpoints[0].ok_or(Error::Configuration("actual raw first tuple absent"))?;
     if proof.role != role
@@ -384,10 +385,32 @@ fn validate_shape(proof: AuthenticatedRaw, config: Config, role: hs::Role) -> Re
         || config.gate.path.client != client
         || config.gate.path.server != server
         || config.gate.path_mtu != proof.geometry.path_mtu
-        || config.cover.limits().max_packet_bytes > proof.geometry.max_record_bytes
     {
         return Err(Error::Configuration(
             "inner setup differs from actual raw proof/geometry",
+        ));
+    }
+    Ok(())
+}
+
+pub(in crate::secure_udp) fn validate_cover_geometry(
+    cover: cover::Config,
+    policy: PacketPolicy,
+) -> Result<(), Error> {
+    let bootstrap = policy.record_geometry().map_err(raw_error)?;
+    let final_records = policy.final_record_geometry().map_err(raw_error)?;
+    let limits = cover.limits();
+    let bootstrap_bytes = limits
+        .max_protected_bytes
+        .checked_add(cover.overhead(cover::Phase::Handshake, limits.max_protected_bytes)?)
+        .ok_or(Error::Configuration("raw bootstrap covered size overflow"))?;
+    // A shared backing buffer also carries final Records, which omit the raw
+    // bootstrap wrapper. The actual covered bootstrap maximum remains separate.
+    if limits.max_packet_bytes > final_records.max_record_bytes
+        || bootstrap_bytes > bootstrap.max_record_bytes
+    {
+        return Err(Error::Configuration(
+            "requested raw bootstrap/final geometry",
         ));
     }
     Ok(())

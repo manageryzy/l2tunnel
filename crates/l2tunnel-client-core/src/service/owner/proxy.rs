@@ -1,175 +1,11 @@
 #[cfg(unix)]
+pub(super) mod maintained;
+#[cfg(unix)]
 pub(super) mod raw;
 use super::super::proxy_backend::Backend;
 use super::*;
 use l2tunnel_runtime::proxy as runtime;
 use std::sync::Arc;
-
-/// Authenticate through the existing factories without starting child I/O.
-/// The service retains Active before its first poll so readiness cancellation
-/// cannot drop a spawned JoinSet and misreport it as completed release.
-pub(super) async fn fixed(
-    shared: &Shared,
-    plan: &Prepared,
-    accepted: Accepted,
-    deadline: Instant,
-    settings: Arc<crate::proxy::Settings>,
-) -> io::Result<Active> {
-    let session = match &plan.data.endpoint {
-        Endpoint::Client(client) => {
-            crate::proxy::connect(
-                client.remote,
-                &client.tls,
-                &client.server_name,
-                &client.member,
-                plan.data.connection,
-                &settings,
-            )
-            .await?
-        }
-        Endpoint::Server(server) => {
-            let listener = listen(shared, server, accepted, deadline).await?;
-            crate::proxy::accept(
-                &listener,
-                &server.tls,
-                &server.members,
-                plan.data.connection,
-                &settings,
-            )
-            .await?
-        }
-        #[cfg(unix)]
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "prepared proxy endpoint mismatch",
-            ));
-        }
-    };
-    check(deadline)?;
-    let requested = runtime::session_config(&crate::proxy::runtime_config(
-        plan.data.connection,
-        &settings,
-    )?)?
-    .digest;
-    let effective = runtime::session_config(session.config())?.digest;
-    if requested != effective {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "proxy authenticated policy mismatch",
-        ));
-    }
-    let device = plan.open()?;
-    check(deadline)?;
-    let (handle, control) = crate::proxy::control_channel();
-    let backend = Arc::new(Backend::fixed(
-        handle,
-        requested,
-        effective,
-        session.config(),
-    ));
-    let observed = backend.clone();
-    let runtime = Box::pin(async move {
-        let result = session.run_service_owned(device, control).await;
-        observed.finished(&result);
-        result.map(|_| ())
-    });
-    Ok(Active {
-        runtime,
-        backend: ObservedBackend::Proxy(backend),
-        generation: accepted.operation,
-    })
-}
-
-pub(super) async fn measured(
-    shared: &Shared,
-    plan: &Prepared,
-    accepted: Accepted,
-    deadline: Instant,
-    settings: Arc<crate::proxy_measured::Settings>,
-) -> io::Result<Active> {
-    let session = match &plan.data.endpoint {
-        Endpoint::Client(client) => {
-            crate::proxy_measured::connect(
-                client.remote,
-                &client.tls,
-                &client.server_name,
-                &client.member,
-                plan.data.connection,
-                &settings,
-            )
-            .await?
-        }
-        Endpoint::Server(server) => {
-            let listener = listen(shared, server, accepted, deadline).await?;
-            crate::proxy_measured::accept(
-                &listener,
-                &server.tls,
-                &server.members,
-                plan.data.connection,
-                &settings,
-            )
-            .await?
-        }
-        #[cfg(unix)]
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "prepared measured proxy endpoint mismatch",
-            ));
-        }
-    };
-    check(deadline)?;
-    let requested = runtime::measured::session_config(&crate::proxy_measured::runtime_config(
-        plan.data.connection,
-        &settings,
-    )?)?
-    .digest;
-    let effective = runtime::measured::session_config(session.config())?.digest;
-    if requested != effective {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "measured proxy authenticated policy mismatch",
-        ));
-    }
-    let device = plan.open()?;
-    check(deadline)?;
-    let (handle, control) = crate::proxy_measured::control_channel();
-    let backend = Arc::new(Backend::measured(
-        handle,
-        requested,
-        effective,
-        &session.config().fixed,
-    ));
-    let observed = backend.clone();
-    let runtime = Box::pin(async move {
-        let result = session.run_service_owned(device, control).await;
-        observed.finished(&result);
-        result.map(|_| ())
-    });
-    Ok(Active {
-        runtime,
-        backend: ObservedBackend::Proxy(backend),
-        generation: accepted.operation,
-    })
-}
-
-async fn listen(
-    shared: &Shared,
-    server: &prepared::Server,
-    accepted: Accepted,
-    deadline: Instant,
-) -> io::Result<TcpListener> {
-    check(deadline)?;
-    let listener = TcpListener::bind(server.listen).await?;
-    check(deadline)?;
-    shared.lock().snapshot.listening = Some(Listening {
-        operation: accepted.operation,
-        address: listener.local_addr()?,
-    });
-    shared.changed();
-    Ok(listener)
-}
 
 pub(super) async fn ready(
     shared: &Shared,
@@ -366,12 +202,14 @@ pub(super) async fn common(
         effective_carrier: info.authenticated.carrier,
         requested_cover: profile.settings().cover.appearance,
         effective_cover: None,
-        compact_wire: profile
-            .compact_wire()
-            .map(|requested| {
-                crate::secure_udp::common_status::CompactWireStatus::observe(requested, None)
-            })
-            .transpose()?,
+        compact_wire: Some(
+            crate::secure_udp::common_status::CompactWireStatus::observe(
+                profile.compact_wire(),
+                None,
+            )?,
+        ),
+        maintained_request: None,
+        maintained: None,
         local_addr: info.local_addr,
         peer_addr: info.peer_addr,
         installed: false,
@@ -467,7 +305,7 @@ fn authenticate_common<'a>(
             accepted,
             deadline,
             profile.settings(),
-            profile.compact_wire().map(|_| profile),
+            Some(profile),
         )
         .await?;
         let info = session.info();

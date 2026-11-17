@@ -28,17 +28,6 @@ impl Driver {
                 ),
         )
     }
-    pub(super) fn research_carrier_selected(&self) -> bool {
-        self.common.as_deref().is_some_and(|runtime| {
-            (runtime.contract.on_outer_carrier() || runtime.contract.raw_outer().is_some())
-                && runtime
-                    .contract
-                    .catalog()
-                    .descriptors()
-                    .iter()
-                    .any(|d| matches!(d.profile(), configuration::Profile::Research { .. }))
-        })
-    }
     pub(super) fn retain_research_feedback(
         &mut self,
         opened: record::Opened,
@@ -91,9 +80,7 @@ impl Driver {
         }
         let deadline = deadline.min(self.common_original_cap()?);
         let order = self.causal_time(original)?;
-        let owner::DataOwner::Common(state) = &mut self.owner else {
-            return Err(protocol("Research feedback Bank missing"));
-        };
+        let owner::DataOwner::Common(state) = &mut self.owner;
         if state
             .entry(core::Epoch(opened.scope.epoch.0))?
             .retain_research_feedback_authenticated_until(

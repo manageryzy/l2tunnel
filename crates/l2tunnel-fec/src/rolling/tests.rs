@@ -485,7 +485,7 @@ fn shape_support_scope_and_future_horizon_are_checked_before_work() -> TestResul
         Err(Error::Identity)
     );
     assert_eq!(
-        decoder.begin_repair(repair(config(), 3, 2, false, &E3_R2[..9])?, Tick(0)),
+        decoder.begin_repair(repair(config(), 3, 2, false, &E3_R2[..2])?, Tick(0)),
         Err(Error::Length)
     );
     let mut bad = repair(config(), 3, 2, false, &E3_R2)?;
@@ -601,22 +601,22 @@ fn sender_matches_independent_python_equation_and_retains_confirmed_columns() ->
     assert_eq!(pending.support.start, 1);
     assert_eq!(pending.support.end, 5);
     // Tail id 1 has the regular-id-1 seed but global support.
-    let expected = [0, 154, 159, 79, 250, 0, 0, 0, 0, 0];
+    let expected = [0, 154, 159, 79, 250, 0];
     assert_eq!(pending.bytes, expected);
-    let mut short = [0xa5; 9];
+    let mut short = [0xa5; 5];
     assert_eq!(
         encoder.take_repair(&mut short, Tick(0)),
         Err(Error::OutputTooSmall)
     );
-    assert_eq!(short, [0xa5; 9]);
+    assert_eq!(short, [0xa5; 5]);
     assert_eq!(encoder.pending_repair().ok_or(Error::Busy)?.bytes, expected);
     let mut output = [0xa5; 12];
     assert_eq!(
         encoder.take_repair(&mut output, Tick(0))?,
-        (RepairId(1), config().support(5, RepairId(1), true)?, 10)
+        (RepairId(1), config().support(5, RepairId(1), true)?, 6)
     );
-    assert_eq!(&output[..10], expected);
-    assert_eq!(&output[10..], &[0xa5; 2]);
+    assert_eq!(&output[..6], expected);
+    assert_eq!(&output[6..], &[0xa5; 6]);
     assert!(encoder.pending_repair().is_none());
     assert_eq!(encoder.begin_repair(false, Tick(0))?, RepairId(2));
     Ok(())

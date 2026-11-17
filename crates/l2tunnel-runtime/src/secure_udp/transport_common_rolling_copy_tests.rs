@@ -49,7 +49,6 @@ async fn receive_copy(endpoint: &mut Endpoint, now: u64, expected: &[u8]) -> Res
         &input[..bytes],
         now,
         endpoint.driver.origin + duration(now),
-        None,
     )?;
     assert_eq!(
         endpoint.driver.counters.received_packets,
@@ -101,17 +100,28 @@ fn actual_udp_rolling_three_copies_survive_first_loss_early_feedback_and_mode_sw
                         runtime.wire[..pending.sealed.bytes].to_vec(),
                     )
                 };
-                let c::Profile::RollingCopies { config, .. } = *values[3].descriptor().profile()
+                let c::Profile::RollingCopies { config, stream, .. } =
+                    *values[3].descriptor().profile()
                 else {
                     return Err("selected copy profile absent".into());
                 };
-                let rolling::wire::View::Source {
+                let context = held.context();
+                let source_scope = rolling::Scope {
+                    session: context.session.to_be_bytes(),
+                    epoch: context.epoch,
+                    stream,
+                    direction: match context.role {
+                        mg::Role::Client => 0,
+                        mg::Role::Server => 1,
+                    },
+                };
+                let rolling::wire::compact::View::Data(rolling::wire::View::Source {
                     id,
                     original: packed,
                     ..
-                } = rolling::wire::inspect_with(
+                }) = rolling::wire::compact::inspect(
                     config.forward.scheduler.recovery,
-                    config.forward.scheduler.source_wire,
+                    source_scope,
                     &first_plain,
                 )?
                 else {
@@ -237,13 +247,21 @@ fn actual_udp_rolling_three_copies_survive_first_loss_early_feedback_and_mode_sw
                                     })
                                     .ok_or("actual feedback geometry")?;
                                 assert_eq!(
-                                    endpoint.driver.records.capacity(body_length)?.packet_bytes,
+                                    endpoint.driver.records.capacity_for(
+                                        record::compact::Kind::Feedback,
+                                        body_length,
+                                    )?.packet_bytes,
                                     wire_length
                                 );
-                                let feedback = rolling::scheduler::decode_feedback(
-                                    config.forward.scheduler.recovery,
-                                    &endpoint.driver.buffers.frame[..body_length],
-                                )?;
+                                let rolling::wire::compact::View::Feedback(feedback) =
+                                    rolling::wire::compact::inspect(
+                                        config.forward.scheduler.recovery,
+                                        source_scope,
+                                        &endpoint.driver.buffers.frame[..body_length],
+                                    )?
+                                else {
+                                    return Err("actual compact feedback union absent".into());
+                                };
                                 assert_eq!(feedback.prefix, 1);
                                 assert_eq!(feedback.observed_end, 1);
                                 let mut wire = [0; 1501];
@@ -258,7 +276,6 @@ fn actual_udp_rolling_three_copies_survive_first_loss_early_feedback_and_mode_sw
                                     &wire[..bytes],
                                     now,
                                     sender.driver.origin + duration(now),
-                                    None,
                                 )?;
                                 assert_eq!(
                                     sender.driver.counters.received_packets,

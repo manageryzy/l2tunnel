@@ -24,7 +24,7 @@ impl Policy {
     pub fn config(
         &self,
         max_packet: usize,
-    ) -> io::Result<l2tunnel_runtime::managed::DeliveryConfig> {
+    ) -> io::Result<l2tunnel_runtime::configuration::DeliveryConfig> {
         let direction = |target_bandwidth_bps| l2tunnel_flow_control::delivery_window::Config {
             target_bandwidth_bps,
             bootstrap_rtt_micros: self.bootstrap_rtt_micros,
@@ -39,7 +39,7 @@ impl Policy {
             sample_ttl_micros: self.sample_ttl_micros,
             flush_timeout_micros: self.flush_timeout_micros,
         };
-        let result = l2tunnel_runtime::managed::DeliveryConfig {
+        let result = l2tunnel_runtime::configuration::DeliveryConfig {
             forward: direction(self.forward_bandwidth_bps),
             reverse: direction(self.reverse_bandwidth_bps),
         };

@@ -1,22 +1,13 @@
-//! Narrow Windows foreground frontend; protocol/configuration ownership stays shared.
-use l2tunnel_auth::{ClientSni, ClientTls, MemberKey};
-use l2tunnel_client_core::{Compression, ConnectionConfig, service};
+//! Side-effect-free Windows configuration validation; Common service binding is pending.
+use l2tunnel_auth::ClientSni;
+use l2tunnel_client_core::{Compression, ConnectionConfig};
 use l2tunnel_core::Duplex;
 use l2tunnel_device::PacketLayer;
 use l2tunnel_platform_windows::Config;
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{self, Read},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-use zeroize::Zeroizing;
+use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf, time::Duration};
 
-/// Supported foreground invocation and explicit capability limits.
-pub const HELP: &str = "l2tunnel-windows connect --carrier tcp-tls --layer tun --remote IP:PORT --ca DER --server-name DNS --identity PKCS8 --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--mtu 1280..65519] [--duplex half|full] [--compression off|lz4] [--sni DNS] [--handshake-seconds 1..120] [--control stdin]\nExplicit foreground Wintun L3 / retained TCP/TLS frame slice. Default half duplex, MTU 1500, compression off, no SNI. Ctrl+C cancels setup or aborts forwarding and releases owned handles. Optional --control stdin accepts exact status, disconnect and reconnect LF/CRLF lines, at most 32 bytes before LF; EOF or invalid input stops the foreground owner. The input-only thread may remain blocked on stdin until process exit and holds no tunnel owners. Requires a trusted, operator-pinned official Wintun DLL and permission to create an adapter. Only its unique adapter/address/MTU are owned; no default routes or DNS are changed. Windows service, named-pipe API, TAP L2, credential vault and other carriers are pending. Native Windows qualification is separate. Other commands: plan, --help, --version.";
+/// Accepted configuration syntax and explicit execution capability limits.
+pub const HELP: &str = "l2tunnel-windows connect --carrier tcp-tls --layer tun --remote IP:PORT --ca DER --server-name DNS --identity PKCS8 --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--mtu 1280..65519] [--duplex half|full] [--compression off|lz4] [--sni DNS] [--handshake-seconds 1..120] [--control stdin]\nConfiguration validation only: connect returns Unsupported before opening credentials, sockets or Wintun. The obsolete managed TCP/TLS foreground path has been removed; binding the Windows application to the current Common client/service API remains pending. Wintun device/configuration components and bounded input/diagnostic helpers are retained separately. No effective carrier or native tunnel execution is claimed. Other commands: plan, --help, --version.";
 
 /// One parsed command; parsing opens no sockets, credentials or devices.
 pub enum Command {
@@ -26,23 +17,28 @@ pub enum Command {
     Version,
     /// Display implementation capabilities without side effects.
     Plan,
-    /// Explicit foreground connection request.
+    /// Requested connection inputs; execution currently returns Unsupported.
     Connect(Box<Plan>),
 }
 
-/// Validated frontend configuration, with private credential references.
+/// Validated requested inputs; credential paths are references and are never opened here.
 pub struct Plan {
-    /// Existing shared managed transport configuration.
+    /// Requested shared transport settings, without an effective runtime binding.
     pub connection: ConnectionConfig,
     /// Validated platform-specific device inputs.
     pub device: Config,
-    /// Explicit process stdin control; disabled unless --control stdin is selected.
+    /// Requested stdin control; no service command execution is currently installed.
     pub control_stdin: bool,
-    remote: SocketAddr,
-    ca: PathBuf,
-    identity: PathBuf,
-    server_name: String,
-    sni: ClientSni,
+    /// Requested outer peer address.
+    pub remote: SocketAddr,
+    /// Requested trust-root file; validation does not open it.
+    pub ca: PathBuf,
+    /// Requested member identity file; validation does not open it.
+    pub identity: PathBuf,
+    /// Requested TLS identity verification name, separate from SNI.
+    pub server_name: String,
+    /// Requested TLS SNI policy, without changing the identity trust anchor.
+    pub sni: ClientSni,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -104,7 +100,7 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
     if get("--carrier")? != "tcp-tls" || get("--layer")? != "tun" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "this foreground slice requires explicit tcp-tls and tun; no fallback",
+            "the retained configuration validator accepts explicit tcp-tls and tun only; Common execution is pending",
         ));
     }
     let control_stdin = match values.get("--control").copied() {
@@ -216,43 +212,16 @@ fn sha256(value: &str) -> io::Result<[u8; 32]> {
     Ok(output)
 }
 
-fn bounded_file(path: &Path, maximum: usize) -> io::Result<Zeroizing<Vec<u8>>> {
-    let file = File::open(path)
-        .map_err(|error| io::Error::new(error.kind(), "credential file could not be opened"))?;
-    if !file.metadata()?.is_file() {
-        return Err(invalid("credential input must be a regular file"));
-    }
-    let mut contents = Zeroizing::new(Vec::new());
-    file.take(maximum as u64 + 1)
-        .read_to_end(&mut contents)
-        .map_err(|error| io::Error::new(error.kind(), "credential file could not be read"))?;
-    if contents.is_empty() || contents.len() > maximum {
-        return Err(invalid("credential input exceeds bounds"));
-    }
-    Ok(contents)
-}
-
 impl Plan {
-    /// Read bounded explicitly provisioned credentials and build the shared plan.
-    /// The caller owns credential-file ACL provisioning; this is not a vault.
-    pub fn prepare(self, attachment: service::Attachment) -> io::Result<service::Prepared> {
-        let roots = bounded_file(&self.ca, 65_536)?;
-        let tls = ClientTls::from_der_roots_with_sni(&[roots.to_vec()], self.sni)
-            .map_err(|_| invalid("invalid TLS trust roots or naming policy"))?;
-        let private = bounded_file(&self.identity, 4096)?;
-        let member =
-            MemberKey::from_pkcs8(&private).map_err(|_| invalid("invalid member identity"))?;
-        service::Prepared::client(
-            self.connection,
-            service::Client {
-                remote: self.remote,
-                tls,
-                server_name: self.server_name,
-                member: Arc::new(member),
-            },
-            attachment,
-            service::Options::default(),
-        )
+    /// Refuse execution before any credential, socket, stdin or native-device I/O.
+    ///
+    /// The former managed-frame service was removed. A parsed plan does not
+    /// supply a current Common catalog or an authenticated runtime owner.
+    pub fn check_runtime_support(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows Common client/service binding is not implemented; the obsolete managed TCP/TLS foreground path has been removed",
+        ))
     }
 }
 
@@ -342,14 +311,17 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn credentials_never_open_attachment_on_parse_failure() -> io::Result<()> {
+    fn validated_request_refuses_execution_before_credential_or_device_io() -> io::Result<()> {
         let Command::Connect(plan) = parse(&args())? else {
             return Err(invalid("plan"));
         };
-        let attachment = service::Attachment::new(PacketLayer::Ip, || {
-            Err(io::Error::other("must not be opened"))
-        });
-        assert!(plan.prepare(attachment).is_err());
+        // The fixture uses nonexistent credential and DLL paths. Refusal is a
+        // capability result, not a file-open or platform-constructor failure.
+        let error = plan.check_runtime_support().err().ok_or_else(|| {
+            io::Error::other("pending Common service unexpectedly accepted execution")
+        })?;
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Common client/service"));
         Ok(())
     }
 }

@@ -167,6 +167,7 @@ fn research_loss_fixture(selected: bool) {
         let mut repairs = 0;
         let mut source_bytes = 0;
         let mut repair_bytes = 0;
+        let mut expected_repair_bytes = 0;
         for id in 0..1600u32 {
             let now = Tick(100 + u64::from(id) * 10);
             while feedback.front().is_some_and(|(due, _)| *due <= now) {
@@ -189,6 +190,15 @@ fn research_loss_fixture(selected: bool) {
                 } else {
                     output.encoded_len()
                 };
+                if let Output::Repair(repair) = output {
+                    let extent = 2
+                        + (repair.equation.support.start..repair.equation.support.end)
+                            .map(|id| payload(id).len())
+                            .max()
+                            .unwrap();
+                    assert_eq!(repair.equation.bytes.len(), extent);
+                    expected_repair_bytes += wire::HEADER_BYTES + extent;
+                }
                 let mut bytes = vec![0; length];
                 if selected {
                     assert_eq!(
@@ -258,7 +268,8 @@ fn research_loss_fixture(selected: bool) {
                     .sum::<usize>()
             );
         } else {
-            assert_eq!(repair_bytes, repairs as usize * (wire::HEADER_BYTES + 25));
+            assert_eq!(repair_bytes, expected_repair_bytes);
+            assert!(repair_bytes < repairs as usize * (wire::HEADER_BYTES + 25));
             assert_eq!(
                 source_bytes,
                 (0..1600)
@@ -406,4 +417,19 @@ fn research_exact_storage_bounds_and_configuration_refusal() {
     let mut invalid = c;
     invalid.recovery.window -= 1;
     assert_eq!(invalid.validate(), Err(Error::Configuration));
+}
+
+#[test]
+fn previous_full_width_research_wire_version_is_refused() {
+    let c = config(Profile::Accumulator {
+        lanes: 7,
+        window: 128,
+    });
+    let mut bytes = [0; 100];
+    let length = wire::encode_source(c, scope(), SourceId(0), &[1, 0], &mut bytes).unwrap();
+    bytes[4] = 1;
+    assert!(matches!(
+        wire::inspect(c, &bytes[..length]),
+        Err(Error::Format)
+    ));
 }

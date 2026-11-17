@@ -7,8 +7,10 @@
 use crate::tcp_header::{self, HeaderDecoder, HeaderEncoder, HeaderProfile};
 use std::fmt;
 mod header;
+mod stateless;
 pub(crate) use header::DecoderState;
 use header::EncoderHeader;
+pub use stateless::{LZ4_TAG, lz4_available};
 
 const ECHO_DELTAS: [u32; 16] = [
     0, 1, 17, 18, 19, 20, 36, 37, 38, 55, 56, 74, 75, 92, 93, 111,
@@ -47,6 +49,17 @@ impl Config {
         Ok(self.validate()?.symbol_bytes - 3)
     }
 }
+/// Explicit native encoding selected by the enclosing authenticated policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Encoding {
+    /// Existing protocol-compatible header/context encoding.
+    Headers,
+    /// Exact raw packet with no compression or context.
+    Raw,
+    /// Stateless LZ4 only when its complete body is smaller than raw.
+    Lz4,
+}
+
 /// Exact complete record kind, independent of the selected encoding flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BodyKind {
@@ -54,6 +67,8 @@ pub enum BodyKind {
     Timestamp,
     /// Complete unmodified frame (kind 2).
     Raw,
+    /// Independent LZ4 block with explicit encoded and original lengths (kind 10).
+    Lz4,
     /// Explicit payload length and delta mask (kind 3).
     Delta,
     /// Implicit payload length and explicit delta mask (kind 6).
@@ -110,6 +125,10 @@ pub enum Decoded {
 pub enum Error {
     /// Invalid frame/symbol/threshold bounds or dictionary without prediction.
     Configuration,
+    /// The maintained LZ4 provider is disabled in this build.
+    CompressionUnavailable,
+    /// Compressed input or its exact original-length claim is malformed.
+    Compression,
     /// Underlying header parser or native frame bound failed.
     Header(tcp_header::Error),
     /// Encoded body exceeds the format or implicit-symbol bound.
@@ -128,6 +147,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration => f.write_str("invalid aligned body configuration"),
+            Self::CompressionUnavailable => f.write_str("aligned LZ4 support is unavailable"),
+            Self::Compression => f.write_str("invalid aligned LZ4 body"),
             Self::Header(error) => write!(f, "aligned header: {error}"),
             Self::RecordTooLarge => f.write_str("aligned record exceeds its bound"),
             Self::Padding => f.write_str("invalid aligned body padding"),
@@ -161,13 +182,18 @@ impl Encoder {
     }
 }
 impl Encoder {
+    fn scratch_bytes(config: Config) -> Result<usize, Error> {
+        let config = config.validate()?;
+        let bytes = config.max_frame_bytes + 29;
+        #[cfg(feature = "lz4")]
+        let bytes = bytes.max(5 + lz4_flex::block::get_maximum_output_size(config.max_frame_bytes));
+        Ok(bytes)
+    }
     pub(crate) fn reserved_bytes(config: Config) -> Result<usize, crate::aligned_storage::Error> {
-        crate::aligned_storage::array_bytes::<u8>(
-            config
-                .max_frame_bytes
-                .checked_add(29)
-                .ok_or(crate::aligned_storage::Error::Layout)?,
-        )
+        let bytes = Self::scratch_bytes(config).map_err(|error| {
+            crate::aligned_storage::Error::Sender(crate::aligned_sender::Error::Body(error))
+        })?;
+        crate::aligned_storage::array_bytes::<u8>(bytes)
     }
     pub(crate) fn new_in_mode(
         config: Config,
@@ -179,14 +205,14 @@ impl Encoder {
         let header = EncoderHeader::new(config.max_frame_bytes, ip)
             .map_err(Error::Header)
             .map_err(map)?;
-        let scratch = allocation.bytes(header.max_encoded_len())?;
+        let scratch = allocation.bytes(Self::scratch_bytes(config).map_err(map)?)?;
         Ok(Self {
             config,
             header,
             scratch,
         })
     }
-    /// Validate bounds and allocate at most maximum native bytes plus 29 scratch bytes.
+    /// Validate bounds and reserve the larger header or maintained-LZ4 scratch bound.
     pub fn new(config: Config) -> Result<Self, Error> {
         Self::new_mode(config, false)
     }
@@ -197,7 +223,7 @@ impl Encoder {
     fn new_mode(config: Config, ip: bool) -> Result<Self, Error> {
         let config = config.validate()?;
         let header = EncoderHeader::new(config.max_frame_bytes, ip)?;
-        let scratch = vec![0; header.max_encoded_len()];
+        let scratch = vec![0; Self::scratch_bytes(config)?];
         Ok(Self {
             config,
             header,
@@ -210,7 +236,7 @@ impl Encoder {
     }
     /// Sufficient allocation for context plus body, never including symbol padding.
     pub fn max_encoded_len(&self) -> usize {
-        self.scratch.len()
+        self.header.max_encoded_len()
     }
     /// Whether an eligible header context is available.
     pub fn has_context(&self) -> bool {
@@ -440,6 +466,9 @@ impl Decoder {
             return Err(Error::RecordTooLarge);
         }
         let tag = *input.first().ok_or(tcp_header::Error::Truncated)?;
+        if tag == LZ4_TAG {
+            return self.decode_lz4(input, padding, output);
+        }
         let implicit = tag == 6 || tag & 7 == 7 || tag & 7 == 5;
         let mut staged = self.header.clone();
         let (decoded, inserted) = if implicit {
@@ -536,6 +565,7 @@ fn kind(tag: u8) -> Result<BodyKind, Error> {
     match tag {
         1 => Ok(BodyKind::Timestamp),
         2 => Ok(BodyKind::Raw),
+        LZ4_TAG => Ok(BodyKind::Lz4),
         3 | 9 => Ok(BodyKind::Delta),
         6 => Ok(BodyKind::Elided),
         _ if tag & 7 == 7 => Ok(BodyKind::Predictive),

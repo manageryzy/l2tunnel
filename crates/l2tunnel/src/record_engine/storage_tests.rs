@@ -184,17 +184,45 @@ fn complete_actual_plans_observe_nested_capacity_once_and_refuse_owned_output() 
                 flush_timeout_micros: 20_000,
             }),
         )?;
-        assert!(matches!(
-            storage::Plan::for_engine(
-                configuration,
-                context(Role::Client),
-                geometry(),
-                native_limits()
-            ),
-            Err(storage::Error::Engine(Error::Unsupported(
-                Capability::NativeWindow
-            )))
-        ));
+        let selected = storage::Plan::for_engine(
+            configuration,
+            context(Role::Client),
+            geometry(),
+            native_limits(),
+        );
+        if family == Family::Swift {
+            assert!(matches!(
+                selected,
+                Err(storage::Error::Engine(Error::Unsupported(
+                    Capability::NativeWindow
+                )))
+            ));
+        } else {
+            let plan = selected?;
+            assert!(matches!(
+                Engine::new_reserved(plan, storage::Limits { capacity_bytes: plan.capacity_bytes() - 1 }),
+                Err(storage::Error::Limit { required, limit })
+                    if required == plan.capacity_bytes() && limit + 1 == required
+            ));
+            let engine = Engine::new_reserved(
+                plan,
+                storage::Limits {
+                    capacity_bytes: plan.capacity_bytes(),
+                },
+            )?;
+            let usage = engine.storage_usage().ok_or("native window storage")?;
+            assert!(usage.native_window_bytes > 0);
+            assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+            assert_eq!(
+                usage.capacity_bytes,
+                usage.fixed_bytes
+                    + usage.pipeline_bytes
+                    + usage.record_bytes
+                    + usage.ingress_bytes
+                    + usage.fragment_bytes
+                    + usage.native_window_bytes
+            );
+        }
     }
     Ok(())
 }

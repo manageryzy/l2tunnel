@@ -7,14 +7,14 @@ use std::{io, thread};
 use tokio::sync::oneshot;
 
 /// Sole owner of a blocking setup worker and any result not yet claimed.
-pub(crate) struct Setup<T> {
+pub struct Setup<T> {
     worker: Option<thread::JoinHandle<io::Result<T>>>,
     ready: Option<oneshot::Receiver<()>>,
 }
 
 impl<T: Send + 'static> Setup<T> {
     /// Start one owned OS setup call; thread-creation failure returns directly.
-    pub(crate) fn spawn(work: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<Self> {
+    pub fn spawn(work: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<Self> {
         let (ready, notification) = oneshot::channel();
         let worker = thread::Builder::new()
             .name("l2tunnel-wintun-setup".into())
@@ -33,7 +33,7 @@ impl<T: Send + 'static> Setup<T> {
 
     /// Await call completion without claiming its result. This future is cancel-safe.
     /// Readiness is neither driver success nor a successful native tunnel receipt.
-    pub(crate) async fn wait(&mut self) -> io::Result<()> {
+    pub async fn wait(&mut self) -> io::Result<()> {
         let Some(ready) = &mut self.ready else {
             return Ok(());
         };
@@ -44,7 +44,7 @@ impl<T: Send + 'static> Setup<T> {
 
     /// Join the exact worker and claim its actual result once; a panicked worker
     /// becomes a bounded error without resuming or copying its panic payload.
-    pub(crate) async fn finish(&mut self) -> io::Result<T> {
+    pub async fn finish(&mut self) -> io::Result<T> {
         // A lost notification can mean worker panic. Always join it rather than
         // returning early and implying that an unobserved worker has released.
         let _ = self.wait().await;

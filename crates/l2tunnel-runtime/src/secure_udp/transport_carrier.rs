@@ -248,6 +248,13 @@ impl<R: RawBacking> IoOwner<R> {
     pub(super) fn is_maintained(&self) -> bool {
         matches!(self, Self::Maintained(_))
     }
+    #[cfg(unix)]
+    pub(super) fn retained_peer_close(&self, error: &io::Error) -> bool {
+        match self {
+            Self::Maintained(values) => values[0].retained_peer_close(error),
+            _ => false,
+        }
+    }
     pub(super) fn is_carrier(&self) -> bool {
         !matches!(self, Self::Udp(_))
     }
@@ -856,7 +863,18 @@ impl Driver {
         control?;
         user?;
         ordering?;
-        socket.check_physical_failure()?;
+        if let Err(error) = socket.check_physical_failure() {
+            // The caller still owns the original I/O error. Re-observing that
+            // same typed peer close does not invalidate already settled facts;
+            // all actual receipt, queue, clock and cap failures remain errors.
+            #[cfg(unix)]
+            let repeated_close = terminal && socket.retained_peer_close(&error);
+            #[cfg(not(unix))]
+            let repeated_close = false;
+            if !repeated_close {
+                return Err(error);
+            }
+        }
         let observed = sample();
         clock(self.origin, observed)?;
         if socket.deadline().is_some_and(|cap| observed >= cap) {

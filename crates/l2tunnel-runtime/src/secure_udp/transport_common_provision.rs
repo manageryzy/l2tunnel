@@ -1,12 +1,11 @@
 //! Exact selected Control plans for the shared Common constructor.
 use super::*;
-use mg::messages::{self, storage};
+use mg::messages::storage;
 
 // These are constructor-only immutable plans, never duplicate message owners.
-#[allow(clippy::large_enum_variant)]
-pub(super) enum ControlPlan {
-    Legacy(control_owner::Settings, [storage::Plan; 3]),
-    Managed(control_owner::SettingsV2, [storage::Plan; 4]),
+pub(super) struct ControlPlan {
+    settings: control_owner::Settings,
+    plans: [storage::Plan; 3],
 }
 impl ControlPlan {
     pub(super) fn new(
@@ -14,64 +13,41 @@ impl ControlPlan {
         binding: delivery::Binding,
     ) -> io::Result<Self> {
         let config = contract.resources();
-        match contract.managed_streams() {
-            Some(selected) => Ok(Self::Managed(
-                selected,
-                selected.message_storage_plans(binding, Duration::ZERO, config.lifetime.lease)?,
-            )),
-            None => {
-                let selected = config
-                    .streams
-                    .ok_or_else(|| invalid("common streams absent"))?;
-                Ok(Self::Legacy(
-                    selected,
-                    selected.message_storage_plans(
-                        binding,
-                        Duration::ZERO,
-                        config.lifetime.lease,
-                    )?,
-                ))
-            }
-        }
+        let settings = config
+            .streams
+            .ok_or_else(|| invalid("common streams absent"))?;
+        Ok(Self {
+            settings,
+            plans: settings.message_storage_plans(
+                binding,
+                Duration::ZERO,
+                config.lifetime.lease,
+            )?,
+        })
     }
     pub(super) fn capacity_bytes(&self) -> io::Result<usize> {
-        let plans: &[storage::Plan] = match self {
-            Self::Legacy(_, plans) => plans,
-            Self::Managed(_, plans) => plans,
-        };
-        plans.iter().try_fold(0usize, |total, plan| {
+        self.plans.iter().try_fold(0usize, |total, plan| {
             total
                 .checked_add(plan.capacity_bytes())
                 .ok_or_else(exhausted)
         })
     }
     pub(super) fn maximum_message_bytes(&self) -> io::Result<usize> {
-        let settings: &[messages::Settings] = match self {
-            Self::Legacy(value, _) => &value.streams,
-            Self::Managed(value, _) => &value.streams,
-        };
-        settings
+        self.settings
+            .streams
             .iter()
             .map(|value| value.max_message_bytes)
             .max()
             .ok_or_else(exhausted)
     }
     pub(super) fn maximum_packet_bytes(&self, base: delivery::Settings) -> io::Result<usize> {
-        match self {
-            Self::Legacy(value, _) => value.max_packet_bytes(base),
-            Self::Managed(value, _) => value.max_packet_bytes(base),
-        }
+        self.settings.max_packet_bytes(base)
     }
     pub(super) fn wrapper(
         &self,
         base: delivery::Settings,
     ) -> io::Result<control_owner::wrapper_storage::Plan> {
-        match self {
-            Self::Legacy(selected, _) => control_owner::wrapper_storage::Plan::new(*selected, base),
-            Self::Managed(selected, _) => {
-                control_owner::wrapper_storage::Plan::new_v2(*selected, base)
-            }
-        }
+        control_owner::wrapper_storage::Plan::new(self.settings, base)
     }
     pub(super) fn construct(
         self,
@@ -84,55 +60,26 @@ impl ControlPlan {
         let limit = control_owner::wrapper_storage::Limits {
             capacity_bytes: wrapper.capacity_bytes(),
         };
-        let control = match self {
-            Self::Legacy(selected, plans) => {
-                let owner = control_owner::Owner::new_leased_reserved_messages_with_wrapper_plan(
-                    config.control,
-                    selected,
-                    binding,
-                    envelope_scope(control_scope),
-                    envelope_scope(data_scope),
-                    Duration::ZERO,
-                    config.lifetime.lease,
-                    plans.map(|plan| storage::Limits {
-                        capacity_bytes: plan.capacity_bytes(),
-                    }),
-                    wrapper,
-                    limit,
-                )?;
-                verify(
-                    owner
-                        .message_storage_usage()
-                        .ok_or_else(|| protocol("common Control reservation absent"))?,
-                    plans,
-                )?;
-                owner
-            }
-            Self::Managed(selected, plans) => {
-                let owner =
-                    control_owner::Owner::new_leased_reserved_messages_v2_with_wrapper_plan(
-                        config.control,
-                        selected,
-                        binding,
-                        envelope_scope(control_scope),
-                        envelope_scope(data_scope),
-                        Duration::ZERO,
-                        config.lifetime.lease,
-                        plans.map(|plan| storage::Limits {
-                            capacity_bytes: plan.capacity_bytes(),
-                        }),
-                        wrapper,
-                        limit,
-                    )?;
-                verify(
-                    owner
-                        .message_storage_usage_v2()
-                        .ok_or_else(|| protocol("managed common Control reservation absent"))?,
-                    plans,
-                )?;
-                owner
-            }
-        };
+        let control = control_owner::Owner::new_leased_reserved_messages_with_wrapper_plan(
+            config.control,
+            self.settings,
+            binding,
+            envelope_scope(control_scope),
+            envelope_scope(data_scope),
+            Duration::ZERO,
+            config.lifetime.lease,
+            self.plans.map(|plan| storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            }),
+            wrapper,
+            limit,
+        )?;
+        verify(
+            control
+                .message_storage_usage()
+                .ok_or_else(|| protocol("common Control reservation absent"))?,
+            self.plans,
+        )?;
         Ok(control)
     }
 }

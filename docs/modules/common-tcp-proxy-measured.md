@@ -1,5 +1,11 @@
 # Explicit measured TCP proxy through Common records
 
+Current compact migration and validation are recorded in the
+[cutover ledger](compact-wire-cleanup.md). Standalone measured TLS service
+entries have been removed. The current selected Common composition retains
+measured control, physical completion and original handoff deadlines; earlier
+checkpoint evidence below does not qualify every current carrier composition.
+
 Status: implemented finite composition with current root integration evidence
 (PCOM-02a) in [Batch15](../../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
 External results below remain separately source-bound. Full
@@ -42,8 +48,10 @@ The production path is:
    `record_bank::Entry::enqueue_proxy_borrowed`, the reserved Pipeline,
    Aligned/direct ARQ, existing Common protection and the original UDP socket.
 5. The reverse path uses the same authenticated Common receiver and record port.
-   The existing proxy reader validates session, sequence and envelope; the actor
-   dispatches measurement records only after actual lifetime-flow and channel
+   Common owns authenticated session, direction, epoch and replay validation;
+   the proxy reader validates its bounded Data/Control union, startup binding and
+   application envelope without repeating per-record session or sequence fields.
+   The actor dispatches measurement records only after actual lifetime-flow and channel
    checks to `Controller::receive_authenticated`. Native payload bytes cannot
    acquire measurement or Common management authority.
 

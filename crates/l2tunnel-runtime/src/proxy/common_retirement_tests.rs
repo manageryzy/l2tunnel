@@ -181,11 +181,26 @@ async fn final_source_and_first_feedback_loss_recover_before_original_retirement
     let mut b = endpoint(EndpointRole::Responder, 91, cap).await?;
     // A's first final source is lost after a real physical receipt. B's is real.
     assert!(!a.owner.source_retired(a.source)?);
+    assert_eq!(
+        a.bridge.proved_peer_close_cap(
+            Some(a.source),
+            a.owner.source_retired(a.source)?,
+            a.owner.drained(),
+        )?,
+        None,
+        "carrier close before final-source receipt cannot certify retirement",
+    );
     receive_eof(&mut a, &b.first, 0, false).await?;
     let (ack_b, ack_token) = emit(&mut a.owner, 1, true)?;
     a.owner.confirm_output(ms(1), ack_token)?;
     b.owner.receive(&ack_b, ms(1))?;
     assert!(b.owner.source_retired(b.source)?);
+    assert_eq!(
+        b.bridge
+            .proved_peer_close_cap(Some(b.source), true, b.owner.drained())?,
+        None,
+        "peer EOF and actual actor joins remain mandatory after source retirement",
+    );
     let (retry, retry_token) = emit(&mut a.owner, 10, false)?;
     assert_eq!(retry, a.first);
     a.owner.confirm_output(ms(10), retry_token)?;
@@ -207,9 +222,9 @@ async fn final_source_and_first_feedback_loss_recover_before_original_retirement
     assert!(a.owner.drained() && b.owner.drained());
     tokio::time::advance(ms(31)).await;
     a.bridge
-        .advance_retirement(Some(a.source), true, a.owner.drained())?;
+        .advance_retirement(Some(a.source), true, a.owner.drained(), true)?;
     b.bridge
-        .advance_retirement(Some(b.source), true, b.owner.drained())?;
+        .advance_retirement(Some(b.source), true, b.owner.drained(), true)?;
     let a_wait = a.bridge.wait_retired();
     let b_wait = b.bridge.wait_retired();
     tokio::pin!(a_wait, b_wait);
@@ -217,14 +232,34 @@ async fn final_source_and_first_feedback_loss_recover_before_original_retirement
     // service test separately drives actual actor quiesce/fences/native/joins.
     assert!(poll_once(a_wait.as_mut()).is_pending());
     assert!(poll_once(b_wait.as_mut()).is_pending());
+    assert!(!a.bridge.liveness_quiesced()?);
+    a.bridge
+        .advance_retirement(Some(a.source), true, true, false)?;
+    assert!(a.bridge.liveness_quiesced()?);
+    a.bridge
+        .advance_retirement(Some(a.source), true, false, false)?;
+    assert!(a.bridge.liveness_quiesced()?);
+    assert_eq!(
+        a.bridge
+            .proved_peer_close_cap(Some(a.source), true, a.owner.drained())?,
+        Some(cap),
+    );
+    assert_eq!(a.bridge.retirement_deadline()?, Some(cap));
+    assert_eq!(
+        a.bridge
+            .proved_peer_close_cap(Some(a.source), true, false)?,
+        None,
+        "whole-send custody cannot be inferred from the peer ACK",
+    );
     tokio::time::advance(ms(68)).await;
-    a.bridge.advance_retirement(Some(a.source), true, true)?;
+    a.bridge
+        .advance_retirement(Some(a.source), true, true, true)?;
     assert!(poll_once(a_wait.as_mut()).is_pending());
     tokio::time::advance(ms(1)).await;
     a.bridge
-        .advance_retirement(Some(a.source), true, a.owner.drained())?;
+        .advance_retirement(Some(a.source), true, a.owner.drained(), true)?;
     b.bridge
-        .advance_retirement(Some(b.source), true, b.owner.drained())?;
+        .advance_retirement(Some(b.source), true, b.owner.drained(), true)?;
     assert!(matches!(poll_once(a_wait.as_mut()), Poll::Ready(Ok(()))));
     assert!(matches!(poll_once(b_wait.as_mut()), Poll::Ready(Ok(()))));
     assert_eq!(Instant::now(), cap);
@@ -263,20 +298,32 @@ async fn acknowledged_but_physically_retained_final_retry_fails_without_false_pe
         Some(a.source),
         a.owner.source_retired(a.source)?,
         a.owner.drained(),
+        true,
     )?;
     b.bridge.advance_retirement(
         Some(b.source),
         b.owner.source_retired(b.source)?,
         b.owner.drained(),
+        true,
     )?;
     assert!(poll_once(a_wait.as_mut()).is_pending());
+    assert_eq!(
+        a.bridge.proved_peer_close_cap(
+            Some(a.source),
+            a.owner.source_retired(a.source)?,
+            a.owner.drained(),
+        )?,
+        None,
+        "a maintained peer close cannot release a held physical retry",
+    );
     tokio::time::advance(ms(1)).await;
     assert_eq!(
         a.bridge
             .advance_retirement(
                 Some(a.source),
                 a.owner.source_retired(a.source)?,
-                a.owner.drained()
+                a.owner.drained(),
+                true
             )
             .err()
             .ok_or("retirement must fail at original cap")?
@@ -287,6 +334,7 @@ async fn acknowledged_but_physically_retained_final_retry_fails_without_false_pe
         Some(b.source),
         b.owner.source_retired(b.source)?,
         b.owner.drained(),
+        true,
     )?;
     assert!(
         matches!(poll_once(a_wait.as_mut()), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut)
@@ -296,17 +344,64 @@ async fn acknowledged_but_physically_retained_final_retry_fails_without_false_pe
         "do not invent the peer's unobserved result"
     );
     assert_eq!(a.owner.pending_data_output(), Some(retry_token));
+    assert!(
+        a.bridge
+            .proved_peer_close_cap(Some(a.source), true, true)
+            .is_err()
+    );
     // The late physical fact is consumed by the actual owner, but can never
     // resurrect the failed bridge or renew its original retirement cap.
     a.owner.confirm_output_at(ms(101), ms(10), retry_token)?;
     assert!(a.owner.source_retired(a.source)?);
     assert_eq!(
         a.bridge
-            .advance_retirement(Some(a.source), true, true)
+            .advance_retirement(Some(a.source), true, true, true)
             .err()
             .ok_or("retirement must fail at original cap")?
             .kind(),
         io::ErrorKind::TimedOut
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_data_barrier_keeps_control_debt_at_original_cap() -> TestResult {
+    let cap = Instant::now() + ms(100);
+    let mut a = endpoint(EndpointRole::Initiator, 37, cap).await?;
+    let mut b = endpoint(EndpointRole::Responder, 91, cap).await?;
+    receive_eof(&mut a, &b.first, 0, false).await?;
+    receive_eof(&mut b, &a.first, 0, false).await?;
+    let (ack_a, token) = emit(&mut b.owner, 1, true)?;
+    b.owner.confirm_output(ms(1), token)?;
+    a.owner.receive(&ack_a, ms(1))?;
+    let (ack_b, token) = emit(&mut a.owner, 1, true)?;
+    a.owner.confirm_output(ms(1), token)?;
+    b.owner.receive(&ack_b, ms(1))?;
+    assert!(a.owner.source_retired(a.source)? && a.owner.drained());
+    a.bridge
+        .advance_retirement(Some(a.source), true, true, false)?;
+    assert!(!a.bridge.liveness_quiesced()?);
+    let wait = a.bridge.wait_retired();
+    tokio::pin!(wait);
+    assert!(poll_once(wait.as_mut()).is_pending());
+    a.bridge
+        .advance_retirement(Some(a.source), true, true, false)?;
+    assert!(a.bridge.liveness_quiesced()?);
+    assert!(!a.bridge.retired()?);
+    // This component supplies the independent control predicate. Real service
+    // tests obtain it from the original message/recovery/challenge owners.
+    tokio::time::advance(ms(100)).await;
+    let failure = a
+        .bridge
+        .advance_retirement(Some(a.source), true, true, false)
+        .err()
+        .ok_or("unsettled control debt must fail at the unchanged cap")?;
+    assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
+    assert!(matches!(poll_once(wait.as_mut()), Poll::Ready(Err(_))));
+    assert!(
+        a.bridge
+            .advance_retirement(Some(a.source), true, true, true)
+            .is_err()
     );
     Ok(())
 }

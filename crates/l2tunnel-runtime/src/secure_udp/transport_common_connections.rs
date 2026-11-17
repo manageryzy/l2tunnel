@@ -161,53 +161,6 @@ pub(super) fn maximum_body(
         .map_err(invalid)
 }
 
-pub(super) fn classify_incarnation(
-    body: &[u8],
-    send: connections::Direction,
-    receive: connections::Direction,
-    role: security::Role,
-    incarnation: u64,
-) -> io::Result<engine::EmissionKind> {
-    let (header, inner) = connections::route::decode(body).map_err(protocol)?;
-    if header.owner.index() >= receive.owners || header.incarnation != incarnation {
-        return Err(protocol(
-            "connection input route differs from actual cohort",
-        ));
-    }
-    match header.class {
-        connections::route::Class::UnreliableNative => {
-            let policy = receive
-                .unreliable
-                .ok_or_else(|| protocol("unselected raw ACK route"))?;
-            if inner.len() > policy.max_bytes {
-                return Err(protocol("raw ACK exceeds actual bound"));
-            }
-            Ok(engine::EmissionKind::UnreliableNative)
-        }
-        connections::route::Class::Source | connections::route::Class::Feedback => {
-            let kind = common_io::classify_compact(
-                inner,
-                send.compact.recovery,
-                receive.compact.recovery,
-                role,
-            )?;
-            let expected = match header.class {
-                connections::route::Class::Source => {
-                    engine::EmissionKind::Source(engine::SourceForm::DirectArq)
-                }
-                connections::route::Class::Feedback => engine::EmissionKind::Feedback,
-                connections::route::Class::UnreliableNative => {
-                    return Err(protocol("connection class invariant"));
-                }
-            };
-            if kind != expected {
-                return Err(protocol("connection route/inner kind differs"));
-            }
-            Ok(kind)
-        }
-    }
-}
-
 impl Driver {
     pub(super) fn common_original_cap(&self) -> io::Result<u64> {
         let mut cap = self.lease;
@@ -391,9 +344,7 @@ impl Driver {
             );
             input.retried = input.retried.saturating_add(1);
             runtime.observation_dirty = true;
-            let owner::DataOwner::Common(state) = &mut self.owner else {
-                return Err(protocol("raw ACK Bank missing"));
-            };
+            let owner::DataOwner::Common(state) = &mut self.owner;
             match state.entry(epoch)?.accept_authenticated_until(
                 engine::Tick(pending.received),
                 engine::Tick(now),

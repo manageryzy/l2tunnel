@@ -853,22 +853,12 @@ async fn route_denied_and_reverse_originated_tcp_remain_transparent() -> TestRes
 
 async fn manual_frame(
     peer: &mut Link,
-    sequence: u64,
-    kind: super::super::wire::Kind,
+    _sequence: u64,
+    kind: super::record::Kind,
     body: &[u8],
 ) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let bytes = super::super::wire::encode(
-        super::super::wire::Header {
-            kind,
-            epoch: l2tunnel_core::Epoch(1),
-            packet_number: sequence,
-            session: peer.inner.send_session,
-            lane: 0,
-        },
-        body,
-    )
-    .map_err(super::super::wire_error)?;
+    let bytes = super::record::encode(kind, body)?;
     peer.inner.writer.write_u32(bytes.len() as u32).await?;
     peer.inner.writer.write_all(&bytes).await?;
     peer.inner.writer.flush().await
@@ -884,20 +874,20 @@ async fn manual_start(peer: &mut Link, cfg: &Config, bad_role: bool) -> io::Resu
     manual_frame(
         peer,
         0,
-        super::super::wire::Kind::Control,
+        super::record::Kind::Control,
         &wire::ControlFrame::Start(start).encode(),
     )
     .await?;
     manual_frame(
         peer,
         1,
-        super::super::wire::Kind::Control,
+        super::record::Kind::Control,
         &wire::ControlFrame::Ready(start).encode(),
     )
     .await
 }
 #[tokio::test]
-async fn authenticated_bad_role_scope_replay_and_unearned_credit_fail_closed() -> TestResult {
+async fn authenticated_bad_role_duplicate_start_and_unearned_credit_fail_closed() -> TestResult {
     for case in 0..5 {
         let cfg = config(Duplex::Full)?;
         let (local, mut peer) = links(&cfg).await?;
@@ -907,11 +897,9 @@ async fn authenticated_bad_role_scope_replay_and_unearned_credit_fail_closed() -
         manual_start(&mut peer, &cfg, case == 0).await?;
         if case != 0 {
             wait_forwarding(&handle).await?;
-            let kind = super::super::wire::Kind::Control;
+            let kind = super::record::Kind::Control;
             match case {
-                1 => {
-                    manual_frame(&mut peer, 7, kind, &wire::ControlFrame::Ping(1).encode()).await?
-                }
+                1 => manual_start(&mut peer, &cfg, false).await?,
                 2 => {
                     manual_frame(
                         &mut peer,
@@ -932,7 +920,7 @@ async fn authenticated_bad_role_scope_replay_and_unearned_credit_fail_closed() -
                 }
                 _ => {
                     let body = wire::user(cfg.mux.channels, 0, b"bad")?;
-                    manual_frame(&mut peer, 2, super::super::wire::Kind::Data, &body).await?;
+                    manual_frame(&mut peer, 2, super::record::Kind::Data, &body).await?;
                 }
             }
         }
@@ -1000,7 +988,7 @@ fn common_user_arbiter_has_channel_fifo_and_shared_saturation() -> TestResult {
         .push(b, 16, vec![2; 48], Owner::Transparent(24), Duration::ZERO)
         .map_err(|e| e.error)?;
     let before = arbiter.usage();
-    assert_eq!(before, (192, 2));
+    assert_eq!(before, (106, 2)); // Two 48-byte bodies, each with a 5-byte boundary.
     let rejected = arbiter
         .push(b, 16, vec![3; 48], Owner::Transparent(24), Duration::ZERO)
         .err()

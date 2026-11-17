@@ -217,6 +217,121 @@ fn selected_compact_wire_rolling_actual_loss_feedback_and_native_completion() ->
     rolling_loss_fixture(true)
 }
 
+#[test]
+fn effective_repair_extent_real_records_recovers_loss_and_charges_exact_short_bytes() -> TestResult
+{
+    let config = config(true, rolling::wire::SourceWire::Exact);
+    let mut a = endpoint(config, Role::Client)?;
+    let mut b = endpoint(config, Role::Server)?;
+    a.enable_compact_wire(53)?;
+    b.enable_compact_wire(85)?;
+    let originals = [packet(true, 0x39, 64), packet(true, 0x73, 100)];
+    let mut identities = Vec::new();
+    let mut number = 1;
+    let mut source_extents = Vec::new();
+    for (index, original) in originals.iter().enumerate() {
+        let now = Tick(index as u64);
+        identities.push(
+            a.enqueue_admitted_identified(now, 0, original)?
+                .ok_or("actual native admission")?,
+        );
+        a.flush(now)?;
+        a.step(now, work())?;
+        let (prepared, datagram) =
+            emit(&mut a, now, &mut number, true)?.ok_or("actual compact source")?;
+        let recovery::View::Source {
+            original: source, ..
+        } = a.inspect_data(&datagram.bytes, true)?
+        else {
+            return Err("source became repair".into());
+        };
+        source_extents.push(source.len());
+        assert_eq!(prepared.bytes, 2 + source.len());
+        // Lose the first whole source; only the received second source and
+        // actual encoded repair may contribute to reconstruction.
+        if index != 0 {
+            b.accept_authenticated(now, datagram.kind, &datagram.bytes)?;
+        }
+    }
+    assert_eq!(source_extents, [74, 110]);
+    let mut repaired = false;
+    let mut delivered = 0;
+    let mut reverse = 1;
+    for tick in 2..1000 {
+        let now = Tick(tick);
+        a.step(now, work())?;
+        b.step(now, work())?;
+        let mut output = [0xa5; rolling::wire::MAX_RECORD_BYTES];
+        let mut witnesses = [witness(); 4];
+        let mut budget = OutboundBudget {
+            packets: 1,
+            wire_bytes: 10_000,
+        };
+        if let Some(prepared) =
+            a.prepare_output(now, number, true, &mut output, &mut budget, &mut witnesses)?
+        {
+            assert_eq!(prepared.kind, record_engine::EmissionKind::Repair);
+            assert_eq!(prepared.bytes, 1 + 1 + 1 + 2 + 110);
+            assert_eq!(prepared.wire_bytes, 115 + 41);
+            assert_eq!(budget.packets, 0);
+            assert_eq!(budget.wire_bytes, 10_000 - prepared.wire_bytes);
+            assert!(prepared.bytes < config.forward.scheduler.recovery.width()?);
+            let retained = output;
+            let deadline = a.deadline();
+            let handed = a.statistics().handed;
+            // A blocked carrier keeps this exact ciphertext input and custody
+            // token; another prepare cannot rewrite it or spend a second debit.
+            let mut retry = [0x5a; rolling::wire::MAX_RECORD_BYTES];
+            let mut retry_budget = OutboundBudget {
+                packets: 7,
+                wire_bytes: 19_000,
+            };
+            assert_eq!(
+                a.prepare_output(
+                    now,
+                    number + 1,
+                    true,
+                    &mut retry,
+                    &mut retry_budget,
+                    &mut witnesses
+                )?,
+                Some(prepared)
+            );
+            assert!(retry.iter().all(|byte| *byte == 0x5a));
+            assert_eq!(output, retained);
+            assert_eq!(retry_budget.packets, 7);
+            assert_eq!(retry_budget.wire_bytes, 19_000);
+            assert_eq!(a.deadline(), deadline);
+            assert_eq!(a.statistics().handed, handed);
+            assert_eq!(a.pending_output(), Some(prepared));
+            a.confirm_output(now, prepared)?;
+            assert_eq!(a.statistics().handed, handed + 1);
+            number += 1;
+            b.accept_authenticated(now, prepared.kind, &output[..prepared.bytes])?;
+            repaired = true;
+        }
+        let mut native = [0; 1024];
+        if let NativePreparation::Ready(prepared) =
+            b.prepare_native(now, 32, Tick(10_000), &mut native)?
+        {
+            assert!(delivered < originals.len());
+            assert_eq!(prepared.identity(), identities[delivered]);
+            assert_eq!(&native[..prepared.bytes()], originals[delivered]);
+            b.commit_native(now, prepared.token())?;
+            delivered += 1;
+        }
+        if let Some((_, feedback)) = emit(&mut b, now, &mut reverse, false)? {
+            a.accept_authenticated(now, feedback.kind, &feedback.bytes)?;
+        }
+        if delivered == originals.len() && a.drained() && b.drained() {
+            break;
+        }
+    }
+    assert!(repaired && delivered == originals.len());
+    assert!(a.drained() && b.drained());
+    Ok(())
+}
+
 fn rolling_loss_fixture(selected: bool) -> TestResult {
     for wire in [
         rolling::wire::SourceWire::Padded,
@@ -355,7 +470,7 @@ fn exact_output_budget_retry_retains_real_owner_and_full_security_number() -> Te
         )?
         .ok_or("exact retry")?;
     assert_eq!(prepared.security_number, u64::MAX - 17);
-    assert_eq!(output[4], 2);
+    assert_eq!(output[4], 4, "current exact-source repair grammar");
     assert_eq!(&output[66..70], b"L2PK");
     assert_eq!(
         prepared.bytes,

@@ -62,6 +62,8 @@ pub enum Error {
     TooLarge,
     /// A caller buffer cannot hold the complete result or receive workspace.
     OutputTooSmall,
+    /// The selected owner's bounded backing storage could not be reserved.
+    Allocation,
     /// The format, exact length or compatibility body is invalid.
     Malformed,
     /// Version or protection does not match the authenticated selection.

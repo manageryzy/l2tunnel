@@ -1,14 +1,10 @@
 //! Explicit measured TUN proxy policy and original authenticated lane ownership.
 use crate::{ConnectionConfig, proxy};
-use l2tunnel_auth::{self as auth, ClientTls, MemberAllowlist, MemberKey, ServerTls};
-use l2tunnel_core::Duplex;
-use l2tunnel_device::PacketDevice;
 use l2tunnel_flow_control::Credit;
 use l2tunnel_runtime::proxy::measured as runtime;
 use l2tunnel_tcp_proxy::{Window, adaptive, measurement};
 use serde::Deserialize;
-use std::{io, net::SocketAddr};
-use tokio::net::{TcpListener, TcpStream};
+use std::io;
 
 /// Actual shared close proof and finite drain waiter.
 pub use proxy::{CloseReport, DrainWaiter};
@@ -220,101 +216,5 @@ pub fn runtime_config(
     value.validate()?;
     Ok(value)
 }
-/// Immutable configuration inseparable from the actual authenticated lane owners.
-pub struct Session {
-    link: runtime::Link,
-    config: runtime::Config,
-}
-impl Session {
-    /// Exact measured configuration bound in both peers' member authentication.
-    pub fn config(&self) -> &runtime::Config {
-        &self.config
-    }
-    /// Run the real measured actor; success requires actual native/TLS close proof.
-    /// Dropping this future is abnormal and never creates a terminal-success report.
-    pub async fn run<D: PacketDevice<Error = io::Error>>(
-        self,
-        device: D,
-        control: Control,
-    ) -> io::Result<CloseReport> {
-        runtime::run(device, self.link, self.config, control).await
-    }
-    /// Shared-service ownership: failure returns only after actual I/O children join.
-    /// The service retains this future during late cleanup; drop is not a join proof.
-    pub(crate) async fn run_service_owned<D: PacketDevice<Error = io::Error>>(
-        self,
-        device: D,
-        control: Control,
-    ) -> io::Result<CloseReport> {
-        runtime::run_service_owned(device, self.link, self.config, control).await
-    }
-}
-/// Authenticate and retain one or two measured lanes under one setup deadline.
-pub async fn connect(
-    address: SocketAddr,
-    tls: &ClientTls,
-    name: &str,
-    member: &MemberKey,
-    connection: ConnectionConfig,
-    settings: &Settings,
-) -> io::Result<Session> {
-    let config = runtime_config(connection, settings)?;
-    proxy::remote(address)?;
-    let binding = runtime::session_config(&config)?;
-    let end = proxy::deadline(connection.handshake_timeout)?;
-    proxy::within(end, async {
-        let lane = async || {
-            let stream = TcpStream::connect(address).await?;
-            stream.set_nodelay(true)?;
-            auth::client_connect(stream, tls, name, member, binding, proxy::remaining(end)?)
-                .await
-                .map_err(proxy::auth_error)
-        };
-        let first = lane().await?;
-        let link = match connection.duplex {
-            Duplex::Full => runtime::Link::full(first, &config)?,
-            Duplex::Half => {
-                let second = lane().await?;
-                proxy::remaining(end)?;
-                runtime::client_pair(first, second, &config).await?
-            }
-        };
-        Ok(Session { link, config })
-    })
-    .await
-}
-/// Accept first TCP connection through final paired proof under the original deadline.
-pub async fn accept(
-    listener: &TcpListener,
-    tls: &ServerTls,
-    allowlist: &MemberAllowlist,
-    connection: ConnectionConfig,
-    settings: &Settings,
-) -> io::Result<Session> {
-    let config = runtime_config(connection, settings)?;
-    let binding = runtime::session_config(&config)?;
-    let end = proxy::deadline(connection.handshake_timeout)?;
-    proxy::within(end, async {
-        let lane = async || {
-            let (stream, _) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            auth::server_accept(stream, tls, allowlist, binding, proxy::remaining(end)?)
-                .await
-                .map_err(proxy::auth_error)
-        };
-        let first = lane().await?;
-        let link = match connection.duplex {
-            Duplex::Full => runtime::Link::full(first, &config)?,
-            Duplex::Half => {
-                let second = lane().await?;
-                proxy::remaining(end)?;
-                runtime::server_pair(first, second, &config).await?
-            }
-        };
-        Ok(Session { link, config })
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests;

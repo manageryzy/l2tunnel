@@ -1,5 +1,5 @@
 //! Actual reserved Common ingress, original protected UDP and Unix packet-device bytes.
-//! Session keys are the existing fixture's imported keys, not a fresh-handshake proof.
+//! The shared fixture authenticates the complete current catalog before data service.
 use super::*;
 use l2tunnel_pipeline::ack_coalescing as ack;
 
@@ -87,15 +87,16 @@ fn selected_contracts(kind: cover::Appearance) -> Result<[CommonTransactionContr
     let make = |value: &CommonTransactionContract| -> Result<CommonTransactionContract> {
         let mut resources = value.resources();
         resources.ack_coalescing = Some(policy());
-        Ok(CommonTransactionContract::new(
+        Ok(CommonTransactionContract::new_compact_wire(
             value.expected_configuration(),
             value.role(),
-            resources,
+            [resources; 2],
             value.cover(),
             value.ipv6(),
             value.envelope(),
             catalog.clone(),
             value.settings(),
+            value.compact_wire(),
         )?)
     };
     Ok([make(&old[0])?, make(&old[1])?])

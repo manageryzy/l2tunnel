@@ -30,6 +30,10 @@ pub struct ProxyCommonFrame {
     pub effective_cover: Option<l2tunnel_cover::Appearance>,
     /// Explicit request and actual installed final-wire observations, absent for legacy.
     pub compact_wire: Option<crate::secure_udp::common_status::CompactWireStatus>,
+    /// Requested maintained carrier policy, separate from authenticated lane facts.
+    pub maintained_request: Option<l2tunnel_runtime::secure_udp::maintained::Request>,
+    /// Original actual owner reported by the live Common Driver.
+    pub maintained: Option<l2tunnel_runtime::secure_udp::maintained::Authenticated>,
     /// Original authenticated connected socket endpoints.
     pub local_addr: std::net::SocketAddr,
     /// Original fixed peer endpoint.
@@ -138,6 +142,13 @@ impl ProxyFrame {
             requested_cover: cover(frame.requested_cover),
             effective_cover: frame.effective_cover.map(cover),
             compact_wire: frame.compact_wire,
+            maintained_carrier: frame.maintained_request.and_then(|request| {
+                crate::secure_udp::common_status::MaintainedCarrier::from_observation(
+                    request,
+                    frame.maintained,
+                )
+                .ok()
+            }),
             local_addr: frame.local_addr,
             peer_addr: frame.peer_addr,
             installed: frame.installed,
@@ -242,10 +253,13 @@ impl Backend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            frame.installed |= snapshot.running;
+            frame.installed |= snapshot.running
+                && snapshot.configuration == frame.effective_configuration
+                && snapshot.info.authenticated.carrier == frame.effective_carrier;
             frame.running = snapshot.running;
             frame.epoch = Some(snapshot.epoch);
             frame.liveness = snapshot.liveness;
+            frame.maintained = snapshot.maintained;
             frame.socket_accepted_packets = snapshot.counters.socket_accepted_packets;
             frame.socket_accepted_ip_bytes = snapshot.counters.socket_accepted_ip_bytes;
             if let Some(wire) = &mut frame.compact_wire {
@@ -264,6 +278,9 @@ impl Backend {
                         limit: value.limit,
                     });
                 wire.feedback_packet_number = snapshot.compact_feedback_number.map(|value| value.0);
+                wire.authenticated_proxy_records = Some(snapshot.authenticated_proxy_records);
+                wire.effective_data_overhead_bytes =
+                    Some(snapshot.effective_data_overhead_bytes as u64);
             }
             if snapshot.running {
                 frame.effective_cover = Some(frame.requested_cover);
@@ -311,6 +328,8 @@ impl Backend {
                         value.as_ref().map(|s| &s.measurement),
                         frame.requested_cover,
                         frame.effective_cover,
+                        frame.maintained_request,
+                        frame.maintained.is_some(),
                     ),
                     None => crate::proxy_measured::LocalSnapshot::observed(
                         self.duplex,
@@ -449,6 +468,10 @@ impl Backend {
         Ok("accepted")
     }
     pub(super) fn finished(&self, result: &io::Result<runtime::CloseReport>) {
+        #[cfg(test)]
+        if let Err(error) = result {
+            eprintln!("actual proxy driver failed: {error:?}");
+        }
         #[cfg(unix)]
         if let Some(frame) = &mut *self
             .common
@@ -496,15 +519,6 @@ impl Handle {
                     .and_then(|frame| frame.runtime.as_ref())
                     .map_or_else(|| "Starting".into(), |status| format!("{:?}", status.phase)),
                 compression: local::Compression::Off,
-                active: None,
-                openvpn_drain: None,
-                raw_packet: None,
-                rolling: None,
-                #[cfg(unix)]
-                swift: None,
-                #[cfg(unix)]
-                secure_udp: None,
-                transaction: None,
                 common: None,
                 proxy: proxy.map(ProxyFrame::status),
             }),

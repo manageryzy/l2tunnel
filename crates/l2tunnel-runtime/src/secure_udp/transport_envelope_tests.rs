@@ -89,8 +89,7 @@ fn immutable_envelope_permits_each_complete_mutable_direction_field() -> Result 
             };
             let envelope = original.immutable_contract_digest()?;
             let canonical = original.canonical_digest()?;
-            let actual_cover = appearance(kind, true)?;
-            original.validate_cover(actual_cover, false)?;
+            original.validate()?;
             for outgoing in [false, true] {
                 for &(label, change) in MUTABLE_DIRECTION {
                     let mut value = original;
@@ -99,7 +98,7 @@ fn immutable_envelope_permits_each_complete_mutable_direction_field() -> Result 
                     } else {
                         &mut value.receive
                     });
-                    value.validate_cover(actual_cover, false)?;
+                    value.validate()?;
                     assert_eq!(
                         value.immutable_contract_digest()?,
                         envelope,
@@ -133,7 +132,7 @@ fn active_and_derived_mtu_and_asymmetric_policy_normalize_together() -> Result {
                     entry.path_mtu = changed.path_mtu;
                 }
             }
-            changed.validate_cover(appearance(kind, true)?, false)?;
+            changed.validate()?;
             assert_eq!(
                 changed.immutable_contract_digest()?,
                 original.immutable_contract_digest()?
@@ -147,7 +146,7 @@ fn active_and_derived_mtu_and_asymmetric_policy_normalize_together() -> Result {
             changed.receive.bytes_per_second = 750_013;
             changed.receive.records.codec.datagram_bytes = 768;
             changed.send.records.codec.datagram_bytes = 640;
-            changed.validate_cover(appearance(kind, true)?, false)?;
+            changed.validate()?;
             assert_ne!(changed.send, changed.receive);
             assert_eq!(
                 changed.immutable_contract_digest()?,

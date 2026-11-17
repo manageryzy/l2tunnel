@@ -100,7 +100,7 @@ fn poll_control(
 pub(super) fn final_prefix(packet: &[u8]) -> bool {
     packet
         .first()
-        .is_some_and(|byte| *byte <= 1 || *byte >= 128)
+        .is_some_and(|byte| matches!(*byte, 0..=23 | 80..=121 | 128..=255))
 }
 
 #[cfg(test)]

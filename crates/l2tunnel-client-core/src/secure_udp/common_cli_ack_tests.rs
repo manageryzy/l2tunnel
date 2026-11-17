@@ -24,7 +24,7 @@ fn profile(value: &Value) -> io::Result<secure_udp::common_transaction_profile::
         maximum_mtu: 2000,
         profile: hs::Profile::Ik,
     };
-    let (overhead, body) = common.geometry()?;
+    let (overhead, body) = common.final_geometry()?;
     let settings = common.raw(
         1500,
         connection.handshake_timeout,

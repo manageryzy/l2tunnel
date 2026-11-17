@@ -3,7 +3,7 @@ use super::*;
 fn options_for(command: &str, carrier: &str) -> BTreeMap<String, String> {
     let mut options: BTreeMap<_, _> = [
         ("--carrier", carrier),
-        ("--record-profile", "swift"),
+        ("--record-profile", "common"),
         ("--duplex", "full"),
         ("--compression", "off"),
         ("--layer", "tun"),
@@ -28,8 +28,7 @@ fn options_for(command: &str, carrier: &str) -> BTreeMap<String, String> {
         ("--noise-private-key-file", "absent-private"),
         ("--noise-peer-key-file", "absent-pin"),
         ("--session-admission-key-file", "absent-admission"),
-        ("--swift-forward-kbit", "10000"),
-        ("--swift-reverse-kbit", "5000"),
+        ("--max-packet", "1500"),
     ]
     .into_iter()
     .map(|(key, value)| (key.into(), value.into()))
@@ -45,90 +44,94 @@ fn options_for(command: &str, carrier: &str) -> BTreeMap<String, String> {
 
 #[test]
 fn explicit_carrier_selection_is_pure_and_global_views_match() -> io::Result<()> {
+    let file = transaction_integration_tests::PlanFile::new(
+        &transaction_integration_tests::common_value()?,
+    )?;
     let peers = establish::Peers {
         initiator: hs::LocalSecret::new(zeroize::Zeroizing::new([11; 32])).public_key(),
         responder: hs::LocalSecret::new(zeroize::Zeroizing::new([22; 32])).public_key(),
     };
     for carrier in ["quic-like", "media-like"] {
-        let client = options_for("connect", carrier);
-        let server = options_for("serve", carrier);
-        let client_config = configuration(&client)?;
-        let server_config = configuration(&server)?;
-        let client = selection("connect", &client, client_config)?
-            .ok_or_else(|| input("missing selection"))?;
-        let server = selection("serve", &server, server_config)?
-            .ok_or_else(|| input("missing selection"))?;
-        let Built::Legacy(a) = client.build(
-            client_config,
-            peers,
-            l2tunnel_identity::MemberPublicKey([7; 32]),
-        )?
-        else {
-            return Err(input("legacy selector changed backend"));
-        };
-        let Built::Legacy(b) = server.build(
-            server_config,
-            peers,
-            l2tunnel_identity::MemberPublicKey([7; 32]),
-        )?
-        else {
-            return Err(input("legacy selector changed backend"));
-        };
-        assert_eq!(a.configuration(peers)?, b.configuration(peers)?);
-        assert_eq!(a.settings().cover, b.settings().cover);
-        assert_eq!(a.runtime(security::Role::Initiator).path_mtu, 1500);
-        let header = if carrier == "quic-like" { 13 } else { 14 };
-        assert_eq!(
-            a.runtime(security::Role::Initiator).security.max_body_bytes + 9 + 26 + header + 28,
-            9000
-        );
-        assert_eq!(
-            a.settings().cover.max_packet_bytes + 28,
-            if carrier == "quic-like" { 9017 } else { 9000 }
-        );
+        let mut profiles = Vec::new();
+        for role in ["connect", "serve"] {
+            let mut options = options_for(role, carrier);
+            options.insert(
+                "--common-transaction-plan".into(),
+                file.0.to_string_lossy().into_owned(),
+            );
+            let config = configuration(&options)?;
+            let selected =
+                selection(role, &options, config)?.ok_or_else(|| input("missing selection"))?;
+            let Built::Records(profile) =
+                selected.build(config, peers, l2tunnel_identity::MemberPublicKey([7; 32]))?
+            else {
+                return Err(input("native profile became proxy"));
+            };
+            assert_eq!(
+                profile
+                    .runtime_contract(security::Role::Initiator)?
+                    .geometry()
+                    .forward_overhead_bytes,
+                49
+            );
+            assert_eq!(
+                profile
+                    .requested_resources(security::Role::Initiator)
+                    .security
+                    .max_body_bytes,
+                9000 - 28 - 21
+            );
+            profiles.push(profile);
+        }
+        assert_eq!(profiles[0].configuration()?, profiles[1].configuration()?);
+        assert_eq!(profiles[0].settings().cover, profiles[1].settings().cover);
     }
     Ok(())
 }
-
 #[test]
 fn short_setup_deadline_bounds_derived_cookie_and_retry_without_extending_it() -> io::Result<()> {
-    let options = options_for("connect", "quic-like");
     let peers = establish::Peers {
         initiator: hs::LocalSecret::new(zeroize::Zeroizing::new([11; 32])).public_key(),
         responder: hs::LocalSecret::new(zeroize::Zeroizing::new([22; 32])).public_key(),
     };
+    let common = Common {
+        appearance: l2tunnel_cover::Appearance::QuicLike,
+        role: security::Role::Initiator,
+        local: "127.0.0.1:42101".parse().map_err(io::Error::other)?,
+        peer: "127.0.0.1:42102".parse().map_err(io::Error::other)?,
+        maximum_mtu: 9000,
+        profile: hs::Profile::Ik,
+    };
     for deadline in [Duration::from_millis(300), Duration::from_millis(50)] {
-        let mut connection = configuration(&options)?;
-        connection.handshake_timeout = deadline;
-        let Built::Legacy(profile) = selection("connect", &options, connection)?
-            .ok_or_else(|| input("missing explicit carrier"))?
-            .build(
-                connection,
-                peers,
-                l2tunnel_identity::MemberPublicKey([7; 32]),
-            )?
-        else {
-            return Err(input("legacy selector changed backend"));
-        };
-        let gate = profile.settings().gate;
-        assert_eq!(profile.connection().handshake_timeout, deadline);
+        let settings = common.raw(
+            1500,
+            deadline,
+            peers,
+            l2tunnel_identity::MemberPublicKey([7; 32]),
+        )?;
+        let gate = settings.gate;
         assert_eq!(gate.handshake_timeout, deadline);
         assert_eq!(gate.cookie_ttl, deadline);
         assert_eq!(gate.maximum_rto, deadline);
         assert_eq!(gate.initial_rto, Duration::from_millis(100).min(deadline));
-        profile.configuration(peers)?;
     }
     Ok(())
 }
 
 #[test]
 fn invalid_or_legacy_combinations_fail_before_any_credential_file_read() -> io::Result<()> {
-    let valid = options_for("connect", "quic-like");
-    let mutations: [(&str, &str); 12] = [
+    let file = transaction_integration_tests::PlanFile::new(
+        &transaction_integration_tests::common_value()?,
+    )?;
+    let mut valid = options_for("connect", "quic-like");
+    valid.insert(
+        "--common-transaction-plan".into(),
+        file.0.to_string_lossy().into_owned(),
+    );
+    let mutations: [(&str, &str); 11] = [
         ("--carrier", "udp"),
         ("--record-profile", "system"),
         ("--duplex", "half"),
-        ("--compression", "lz4"),
         ("--udp-peer", "127.0.0.1:0"),
         ("--noise-profile", "ikpsk2"),
         ("--noise-psk-file", "absent-psk"),
@@ -147,6 +150,14 @@ fn invalid_or_legacy_combinations_fail_before_any_credential_file_read() -> io::
             "accepted {key}={value}"
         );
     }
+    let mut compressed = valid.clone();
+    compressed.insert("--compression".into(), "lz4".into());
+    let compressed_config = configuration(&compressed)?;
+    assert_eq!(
+        compressed_config.compression,
+        crate::Compression::Lz4IfSmaller
+    );
+    assert!(selection("connect", &compressed, compressed_config)?.is_some());
     let mut options = valid.clone();
     options.insert("--noise-profile".into(), "ikpsk2".into());
     options.insert("--noise-psk-file".into(), "absent-psk".into());

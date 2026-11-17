@@ -247,6 +247,15 @@ impl Config {
         }
     }
 
+    /// Inspect an existing local output with the same strict grammar and bounds.
+    /// Directional identifiers are checked as emitted by this configuration;
+    /// this does not grant authentication, replay or transmission authority.
+    pub fn decode_outgoing(mut self, packet: &[u8]) -> Result<Decoded<'_>, Error> {
+        core::mem::swap(&mut self.ids.local, &mut self.ids.peer);
+        core::mem::swap(&mut self.media.local_ssrc, &mut self.media.peer_ssrc);
+        self.decode(packet)
+    }
+
     fn validate_body(self, length: usize) -> Result<(), Error> {
         if length == 0 {
             Err(Error::EmptyPayload)

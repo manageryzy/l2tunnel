@@ -3,30 +3,18 @@
 //! Authentication readiness is distinct from native runtime readiness. The caller
 //! transfers every returned tail to the one selected-carrier data/control reader.
 
+#[cfg(all(test, unix))]
+pub(crate) mod common_fixture;
 /// Portable complete Common configuration values and explicit APIv4 observations.
 pub mod common_status;
 /// Explicit complete common record catalog and actual authentication handoff.
-#[cfg(unix)]
 pub mod common_transaction_profile;
 /// Explicit runtime credential owners and bounded manual key-file readers.
 pub mod credentials;
 /// Explicit maintained TCP/TLS and genuine QUIC Common transport policies.
-#[cfg(unix)]
 pub mod maintained;
 /// Bounded performance telemetry shared by CLI and embedding frontends.
-#[cfg(unix)]
 pub mod performance;
-/// Immutable shared native-runtime profile and authenticated policy resolution.
-#[cfg(unix)]
-pub mod profile;
-/// Non-secret versioned observations for the selected shared UDP profile.
-#[cfg(unix)]
-pub mod status;
-/// Explicit complete canonical transaction plan; actual driver readiness is separate.
-#[cfg(unix)]
-pub mod transaction_profile;
-/// Portable complete canonical values and truthful explicit version3 observations.
-pub mod transaction_status;
 
 use l2tunnel_core::ConfigDigest;
 use l2tunnel_cover as cover;

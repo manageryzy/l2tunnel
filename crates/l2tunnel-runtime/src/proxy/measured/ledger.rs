@@ -418,6 +418,37 @@ impl Ledger {
             })
             .try_fold(0, |a, b| Ok(a.max(b?)))
     }
+    #[cfg(debug_assertions)]
+    pub(in crate::proxy) fn trace_failure(&self, now: Micros) {
+        eprintln!(
+            "MEASURED_LEDGER_FAILURE now={} sent={} flushed={} physical_observed={} physical_generation={} counts={:?}",
+            now.0,
+            self.sent,
+            self.flushed,
+            self.physical_observed,
+            self.physical_generation,
+            self.counts(),
+        );
+        for flight in self.flights.iter().flatten() {
+            eprintln!(
+                "MEASURED_FLIGHT ordinal={} handed={} age={:?}",
+                flight.ordinal,
+                flight.at.0,
+                now.0.checked_sub(flight.at.0),
+            );
+        }
+        for entry in self.entries.iter().flatten().take(8) {
+            eprintln!(
+                "MEASURED_ENTRY flow={} channel={} admitted={} age={:?} ordinal={:?} physical={:?}",
+                entry.flow,
+                entry.channel,
+                entry.admitted.0,
+                now.0.checked_sub(entry.admitted.0),
+                entry.ordinal,
+                entry.physical,
+            );
+        }
+    }
     #[cfg(test)]
     pub(in crate::proxy) fn retained_physical(&self, id: Id) -> io::Result<Option<PhysicalWrite>> {
         Ok(self.entry(id)?.physical)

@@ -8,6 +8,8 @@ use l2tunnel::{
 
 #[path = "transport_common_clock_tests.rs"]
 mod clock;
+#[path = "transport_common_repair_extent_tests.rs"]
+mod repair_extent;
 
 fn work() -> rolling::WorkBudget {
     rolling::WorkBudget {

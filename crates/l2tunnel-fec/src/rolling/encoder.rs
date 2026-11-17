@@ -9,6 +9,7 @@ struct Job {
     cleared: usize,
     source: u32,
     column: usize,
+    extent: usize,
     factor: Option<u8>,
     ready: bool,
 }
@@ -348,6 +349,7 @@ impl Encoder {
             cleared: 0,
             source: support.start,
             column: 0,
+            extent: 2,
             factor: None,
             ready: false,
         });
@@ -396,6 +398,17 @@ impl Encoder {
                             None => field::compact_coefficient(job.support.seed, job.source),
                         }
                     };
+                    // Include every selected original, even a zero coefficient
+                    // in a contiguous policy. Explicit rows contain only nonzero
+                    // terms, so their intervening gap IDs are outside support.
+                    if self.explicit.is_none() || value != 0 {
+                        let start = index * self.width;
+                        let original = usize::from(u16::from_be_bytes([
+                            self.vectors[start],
+                            self.vectors[start + 1],
+                        ]));
+                        job.extent = job.extent.max(2 + original);
+                    }
                     job.factor = Some(value);
                     value
                 }
@@ -426,7 +439,7 @@ impl Encoder {
             scope: self.scope,
             id: job.id,
             support: job.support,
-            bytes: &self.output,
+            bytes: &self.output[..job.extent],
         })
     }
     /// Copy and consume the exact pending equation after external output reservation.
@@ -442,11 +455,11 @@ impl Encoder {
             .as_ref()
             .filter(|job| job.ready)
             .ok_or(Error::Busy)?;
-        if output.len() < self.width {
+        if output.len() < job.extent {
             return Err(Error::OutputTooSmall);
         }
-        let value = (job.id, job.support, self.width);
-        output[..self.width].copy_from_slice(&self.output);
+        let value = (job.id, job.support, job.extent);
+        output[..job.extent].copy_from_slice(&self.output[..job.extent]);
         self.next_repair += 1;
         self.job = None;
         Ok(value)

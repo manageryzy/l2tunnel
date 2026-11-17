@@ -35,8 +35,11 @@ pub const DESCRIPTOR_BYTES: usize = HEADER_BYTES + 2 * DIRECTION_BYTES;
 pub const CONFIGURATION_BYTES: usize = DESCRIPTOR_BYTES + 32;
 /// Exact supported set bound, independent of runtime message/resource capacity.
 pub const MAX_CATALOG_ENTRIES: usize = 64;
-const CONFIG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-config/v2\0";
-const CATALOG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-catalog/v2\0";
+// Revision three commits effective repair extents. The fixed configuration
+// grammar is still CompleteV2; peers using full-width repair semantics must not
+// authenticate or switch into this catalog under the previous digest domain.
+const CONFIG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-config/v3\0";
+const CATALOG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-catalog/v3\0";
 const SWIFT_BYTES: usize = 120;
 const ALIGNED_BYTES: usize = 332;
 
@@ -356,11 +359,10 @@ impl DirectionProfile<'_> {
     }
 }
 fn native_layer(policy: aligned::NativePolicy) -> traffic::NetworkLayer {
-    match policy {
-        aligned::NativePolicy::EthernetHeaders => traffic::NetworkLayer::Tap,
-        aligned::NativePolicy::RawIp | aligned::NativePolicy::IpHeaders => {
-            traffic::NetworkLayer::Tun
-        }
+    if policy.is_ip() {
+        traffic::NetworkLayer::Tun
+    } else {
+        traffic::NetworkLayer::Tap
     }
 }
 /// Common policy and exact family reference for one globally identified sender.
@@ -370,6 +372,19 @@ pub struct DirectionView<'a> {
     profile: DirectionProfile<'a>,
 }
 impl<'a> DirectionView<'a> {
+    /// Native body policy of the actual record owner; Swift has its own body format.
+    pub fn native_policy(self) -> Option<aligned::NativePolicy> {
+        Some(match self.profile {
+            DirectionProfile::Swift(_) => return None,
+            DirectionProfile::PerConnectionCompact(config) => config.compact.native_policy,
+            DirectionProfile::Aligned(config) => config.native_policy,
+            DirectionProfile::AlignedCompact(config) => config.native_policy,
+            DirectionProfile::Packed(config) => config.base.native_policy,
+            DirectionProfile::PackedCompact(config) => config.base.native_policy,
+            DirectionProfile::Rolling { config, .. } => config.native_policy,
+            DirectionProfile::Research { config, .. } => config.native_policy,
+        })
+    }
     /// Complete common value; actual capability checks must consume every field.
     pub const fn common(self) -> &'a CommonDirection {
         self.common
@@ -1347,11 +1362,7 @@ fn encode_aligned(config: aligned::Config, output: &mut [u8]) -> Result<(), Erro
     let receiver = config.receiver;
     let body = receiver.body;
     let mut writer = Writer::new(output);
-    writer.byte(match config.native_policy {
-        aligned::NativePolicy::EthernetHeaders => 1,
-        aligned::NativePolicy::RawIp => 2,
-        aligned::NativePolicy::IpHeaders => 3,
-    })?;
+    writer.byte(config.native_policy.wire())?;
     for value in [
         body.max_frame_bytes,
         body.symbol_bytes,
@@ -1422,12 +1433,7 @@ fn encode_aligned(config: aligned::Config, output: &mut [u8]) -> Result<(), Erro
     writer.finish()
 }
 fn read_aligned(reader: &mut Reader<'_>) -> Result<aligned::Config, Error> {
-    let native_policy = match reader.byte()? {
-        1 => aligned::NativePolicy::EthernetHeaders,
-        2 => aligned::NativePolicy::RawIp,
-        3 => aligned::NativePolicy::IpHeaders,
-        _ => return Err(Error::Prefix),
-    };
+    let native_policy = aligned::NativePolicy::from_wire(reader.byte()?).ok_or(Error::Prefix)?;
     let max_frame_bytes = reader.size()?;
     let symbol_bytes = reader.size()?;
     let independent_short_frame_bytes = reader.size()?;

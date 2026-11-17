@@ -150,7 +150,6 @@ async fn start(start: Start) -> Result<WriterHarness> {
         Direction {
             index: 0,
             lane: 0,
-            session: [9; 16],
             bulk: true,
         },
         256,
@@ -381,6 +380,97 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
             .physical_callbacks,
         callbacks
     );
+    task.abort();
+    let _ = task.await;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn measured_common_whole_write_wakes_callback_before_original_handoff_cap() -> Result {
+    let mut lab = Lab::active().await?;
+    let origin = lab.a.actor.start;
+    let config = lab
+        .a
+        .actor
+        .measured
+        .as_ref()
+        .ok_or("actual measured fixture")?
+        .config
+        .clone();
+    let mut state = profile::State::new_at(config.clone(), &lab.a.actor.table, micros(origin)?)?;
+    state.enable_physical_receipts()?;
+    let binding = *lab
+        .a
+        .actor
+        .bindings
+        .get(&1)
+        .ok_or("actual lifetime binding")?;
+    let mut arbiter = Arbiter::new(&config.fixed, false)?;
+    let WriterHarness {
+        mut port,
+        bridge,
+        tx,
+        mut progress,
+        task,
+        controls: _controls,
+        events: _events,
+    } = start(Start {
+        digest: profile::session_config(&config)?.digest.0,
+        ..lab.a.actor.writers[0].start
+    })
+    .await?;
+    progress.borrow_and_update();
+    let at = micros(origin)?;
+    let (id, token, bytes) = admit(
+        &mut state,
+        &lab.a.actor.table,
+        &mut arbiter,
+        binding,
+        at,
+        true,
+    )?;
+    assert_eq!(handoff(&mut state, &tx, Some(id), bytes, at).await?, 1);
+    assert!(received(&mut port).await?.len() >= 5);
+    let identity = RecordIdentity {
+        channel: ChannelId(0),
+        record: RecordId(2),
+    };
+    bridge.admitted(identity)?;
+    lab.a.actor.measured = Some(state);
+    lab.a.actor.retirement = Some(bridge.clone());
+    lab.a.actor.writers[0].progress = progress;
+    let original =
+        origin + Duration::from_micros(at.0 + config.measured.ownership.handoff_timeout_micros);
+    tokio::time::advance(original - Duration::from_millis(3) - Instant::now()).await;
+    let accepted = Instant::now();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let observed = Instant::now();
+    bridge.complete(identity, accepted, observed)?;
+    // No periodic turn is due before expiry. Only the actual writer's watch
+    // publication can release this wait early enough for a fresh callback.
+    let mut tick =
+        tokio::time::interval_at(original + Duration::from_millis(1), Duration::from_secs(1));
+    lab.a.actor.wait_service(&mut tick, Some(original)).await;
+    assert!(Instant::now() < original);
+    lab.a.actor.measured_callbacks()?;
+    let state = lab
+        .a
+        .actor
+        .measured
+        .as_ref()
+        .ok_or("actual measured owner")?;
+    assert_eq!(state.ledger.counts(), (0, 0));
+    let snapshot = state.snapshot(&lab.a.actor.table, micros(origin)?)?;
+    let callback = snapshot.physical_callbacks[0]
+        .as_ref()
+        .ok_or("exact callback")?;
+    assert_eq!(callback.token, token);
+    assert_eq!(callback.ordinal, 1);
+    assert_eq!(callback.common_record, identity);
+    assert_eq!(callback.accepted_at, accepted);
+    assert_eq!(callback.physical_observed_at, observed);
+    assert!(callback.callback_observed_at >= observed);
+    assert!(callback.callback_observed_at < original);
     task.abort();
     let _ = task.await;
     Ok(())

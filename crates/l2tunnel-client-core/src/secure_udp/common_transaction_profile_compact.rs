@@ -15,7 +15,7 @@ impl Profile {
         selection.validate().map_err(io::Error::other)?;
         if self.raw.is_some_and(|raw| raw.outer.is_some())
             || self.carrier.is_some()
-            || self.compact_wire.is_some()
+            || self.maintained.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -33,31 +33,12 @@ impl Profile {
         } else {
             28
         };
-        let data = physical + l2tunnel::secure_record::compact::DATA_OVERHEAD;
-        let control = physical + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD;
-        let mut resources = [self.initiator, self.responder];
-        for resource in &mut resources {
-            resource.control.wire_overhead = control;
-            if let Some(fragments) = resource.rolling_fragments.as_mut() {
-                fragments.forward.framing.outer_overhead_bytes = data;
-                fragments.reverse.framing.outer_overhead_bytes = data;
-            }
-            if let Some(streams) = resource.streams.as_mut() {
-                for stream in &mut streams.streams {
-                    stream.delivery.wire_overhead =
-                        control + l2tunnel_management::control_streams::HEADER_BYTES;
-                }
-            }
-        }
-        let mut descriptors = Vec::new();
-        descriptors
-            .try_reserve_exact(self.catalog.descriptors().len())
-            .map_err(io::Error::other)?;
-        for descriptor in self.catalog.descriptors() {
-            descriptors.push(rebase(*descriptor, data)?);
-        }
-        let catalog = Catalog::new(rebase(self.catalog.initial(), data)?, &descriptors)
-            .map_err(io::Error::other)?;
+        let (resources, catalog) = rebase_parameters(
+            [self.initiator, self.responder],
+            self.catalog,
+            physical,
+            selection,
+        )?;
         let mut settings = self.settings;
         settings.application = self.application;
         let mut result = Self::new_selected(
@@ -84,6 +65,78 @@ impl Profile {
         }
         Ok(result)
     }
+}
+/// Preserve the full-tag authentication of Common configurations that predate
+/// explicit short-check selection. The packet gap follows the existing key-use
+/// limits; the finite failed-check bound is authenticated with the complete plan.
+pub(super) fn authenticated_selection(
+    initiator: transport::Config,
+    responder: transport::Config,
+) -> io::Result<l2tunnel::secure_record::compact::Selection> {
+    let selection = l2tunnel::secure_record::compact::Selection {
+        protection: security::compact::Protection::ChaCha20Poly1305,
+        limits: security::compact::Selection {
+            max_forward_packets: u32::try_from(
+                initiator
+                    .security
+                    .packets_per_key
+                    .min(responder.security.packets_per_key)
+                    .min(i32::MAX as u64),
+            )
+            .map_err(io::Error::other)?,
+            max_failed_checks: u32::MAX,
+        },
+    };
+    selection.validate().map_err(io::Error::other)?;
+    Ok(selection)
+}
+
+pub(super) fn rebase_parameters(
+    resources: [transport::Config; 2],
+    catalog: Catalog,
+    physical: usize,
+    selection: l2tunnel::secure_record::compact::Selection,
+) -> io::Result<([transport::Config; 2], Catalog)> {
+    rebase_parameters_with_data_overhead(resources, catalog, physical, selection.data_overhead())
+}
+
+pub(super) fn rebase_parameters_with_data_overhead(
+    mut resources: [transport::Config; 2],
+    catalog: Catalog,
+    physical: usize,
+    data_overhead: usize,
+) -> io::Result<([transport::Config; 2], Catalog)> {
+    let data = physical
+        .checked_add(data_overhead)
+        .ok_or_else(|| invalid("final data accounting overflow"))?;
+    let control = physical
+        .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+        .ok_or_else(|| invalid("final control accounting overflow"))?;
+    let stream_overhead = control
+        .checked_add(l2tunnel_management::control_streams::HEADER_BYTES)
+        .ok_or_else(|| invalid("final control stream accounting overflow"))?;
+    for resource in &mut resources {
+        resource.control.wire_overhead = control;
+        if let Some(fragments) = resource.rolling_fragments.as_mut() {
+            fragments.forward.framing.outer_overhead_bytes = data;
+            fragments.reverse.framing.outer_overhead_bytes = data;
+        }
+        if let Some(streams) = resource.streams.as_mut() {
+            for stream in &mut streams.streams {
+                stream.delivery.wire_overhead = stream_overhead;
+            }
+        }
+    }
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(catalog.descriptors().len())
+        .map_err(io::Error::other)?;
+    for descriptor in catalog.descriptors() {
+        descriptors.push(rebase(*descriptor, data)?);
+    }
+    let catalog =
+        Catalog::new(rebase(catalog.initial(), data)?, &descriptors).map_err(io::Error::other)?;
+    Ok((resources, catalog))
 }
 fn reliable(
     config: l2tunnel::reliable::CompactReliableConfig,

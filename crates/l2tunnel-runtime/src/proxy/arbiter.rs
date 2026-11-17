@@ -51,7 +51,7 @@ impl Arbiter {
         let maximum = if native {
             config.runtime.max_packet
         } else {
-            config.max_user()? + 48
+            config.max_user()? + super::record::FRAME_OVERHEAD
         };
         let qos = Scheduler::new(
             SchedulerConfig {
@@ -86,7 +86,11 @@ impl Arbiter {
             meta: BTreeMap::new(),
             channels: vec![VecDeque::new(); policy.channels as usize],
             next: 0,
-            wire_charge: if native { 0 } else { 48 },
+            wire_charge: if native {
+                0
+            } else {
+                super::record::FRAME_OVERHEAD
+            },
         })
     }
     pub fn channel(&self, key: FlowKey, now: Duration) -> io::Result<u16> {

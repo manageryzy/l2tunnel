@@ -179,7 +179,7 @@ fn run_drop_failure(
             let setup = entry.and_then(|entry| entry.setup.as_ref().map(|record| record.observation));
             let completed = entry.and_then(|entry| entry.result.as_ref());
             let runtime = match state.backend.as_ref() {
-                Some(ObservedBackend::SecureUdpTransaction(backend)) => {
+                Some(ObservedBackend::SecureUdpCommon(backend)) => {
                     let counters = backend
                         .counters
                         .lock()
@@ -191,7 +191,7 @@ fn run_drop_failure(
                             snapshot.elapsed_micros,
                             snapshot.epoch.0,
                             snapshot.phase,
-                            snapshot.swift,
+                            snapshot.engine,
                             snapshot.control,
                             snapshot.counters,
                             snapshot.liveness,
@@ -322,7 +322,7 @@ async fn generic_expired_queued_reconnect_preserves_old_owner_then_replaces_in_o
             .fixture
             .profile
             .runtime_contract(Role::Initiator)?
-            .config();
+            .resources();
         assert!(runtime.lifetime.lease > pair.fixture.profile.connection().handshake_timeout);
         assert!(
             runtime.lifetime.pong_timeout > pair.fixture.profile.connection().handshake_timeout
