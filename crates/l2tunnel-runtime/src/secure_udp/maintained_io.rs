@@ -115,6 +115,13 @@ impl PendingSend {
     pub fn record_bytes(&self) -> usize {
         self.bytes
     }
+    fn metric_identity(&self) -> quic_metrics::tickets::Identity {
+        quic_metrics::tickets::Identity {
+            owner: self.owner,
+            serial: self.serial,
+            class: self.class,
+        }
+    }
 }
 enum Backend {
     Tls(Vec<tls::Adapter>),
@@ -421,6 +428,57 @@ impl Carrier {
             .max(self.geometry().max_bootstrap_bytes);
         quic_metrics::input(&mut self.buffer_metrics, None, bytes, capacity);
     }
+    pub(in crate::secure_udp) fn bind_ticket_metrics(
+        &mut self,
+        ticket: &PendingSend,
+        user: Option<super::raw_carrier_io::UserIdentity>,
+    ) -> Option<quic_metrics::tickets::Identity> {
+        if !self
+            .buffer_metrics
+            .as_ref()
+            .is_some_and(Observer::has_quic_tickets)
+        {
+            return None;
+        }
+        let id = ticket.metric_identity();
+        quic_metrics::ticket_event(
+            &mut self.buffer_metrics,
+            user.map(|value| value.deadline),
+            |state, _, deadline| {
+                let user =
+                    user.zip(deadline)
+                        .map(|(value, deadline_us)| quic_metrics::tickets::User {
+                            epoch: value.scope.epoch.0,
+                            configuration: value.scope.configuration.0,
+                            number: value.number.0,
+                            bytes: value.bytes,
+                            deadline_us,
+                        });
+                state.bind(id, user);
+            },
+        );
+        Some(id)
+    }
+    pub(in crate::secure_udp) fn observe_ticket_result(
+        &mut self,
+        id: Option<quic_metrics::tickets::Identity>,
+    ) {
+        if let Some(id) = id {
+            quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+                state.observed(id, now)
+            });
+        }
+    }
+    pub(in crate::secure_udp) fn observe_ticket_take(
+        &mut self,
+        id: Option<quic_metrics::tickets::Identity>,
+    ) {
+        if let Some(id) = id {
+            quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+                state.take(id, now)
+            });
+        }
+    }
     /// Actual verified proof; copying it never constructs an owner.
     pub fn authenticated(&self) -> Authenticated {
         self.proof
@@ -654,6 +712,11 @@ impl Carrier {
                 (Pending::Quic(token), lane, effective)
             }
         };
+        let identity = quic_metrics::tickets::Identity {
+            owner: self.owner,
+            serial,
+            class,
+        };
         self.next = serial.checked_add(1);
         self.output[class.index()] = Some(Output {
             serial,
@@ -662,6 +725,15 @@ impl Carrier {
             pending,
             result: None,
         });
+        quic_metrics::ticket_event(
+            &mut self.buffer_metrics,
+            Some(effective),
+            |state, now, cap| {
+                if let Some(cap) = cap {
+                    state.create(identity, lane, bytes.len(), cap, now);
+                }
+            },
+        );
         if class == Class::Control {
             self.control_lane = (control_lane + 1) % self.lane_count();
         }
@@ -696,6 +768,14 @@ impl Carrier {
             if output.result.is_some() {
                 continue;
             }
+            let identity = quic_metrics::tickets::Identity {
+                owner: self.owner,
+                serial: output.serial,
+                class,
+            };
+            quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+                state.first_poll(identity, now);
+            });
             let ready = match (&mut self.backend, &mut output.pending) {
                 (Backend::Tls(adapter), Pending::Tls(token)) => {
                     match adapter[0].poll_send(cx, token) {
@@ -765,7 +845,22 @@ impl Carrier {
                 _ => Some(Err(SendFailure::Ticket)),
             };
             if let Some(result) = ready {
+                let accepted = match &result {
+                    Ok(receipt)
+                    | Err(SendFailure::Expired {
+                        accepted: Some(receipt),
+                    }) => Some(receipt.accepted_at),
+                    _ => None,
+                };
+                let result_failed = result.is_err();
                 output.result = Some(result);
+                quic_metrics::ticket_event(
+                    &mut self.buffer_metrics,
+                    accepted,
+                    |state, now, accepted| {
+                        state.result(identity, accepted, result_failed, now);
+                    },
+                );
                 progress = true;
             }
         }
@@ -848,12 +943,19 @@ impl Carrier {
                 false,
             );
             self.observe_buffers();
+            quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+                state.direct_take(token.metric_identity(), now);
+            });
             return Poll::Ready(result);
         }
         if let Err(error) = self.check_failure() {
             quic_metrics::finish(&mut self.buffer_metrics);
             self.output[index] = None;
             token.consumed = true;
+            quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+                state.result(token.metric_identity(), None, true, now);
+                state.direct_take(token.metric_identity(), now);
+            });
             return Poll::Ready(Err(SendFailure::Io(error)));
         }
         Poll::Pending
@@ -1086,9 +1188,18 @@ fn map_quic_send(
     }
 }
 
-#[cfg(test)]
 impl Drop for Carrier {
     fn drop(&mut self) {
+        quic_metrics::ticket_event(&mut self.buffer_metrics, None, |state, now, _| {
+            state.finish(now)
+        });
+        #[cfg(test)]
+        self.trace_drop();
+    }
+}
+#[cfg(test)]
+impl Carrier {
+    fn trace_drop(&self) {
         if std::env::var_os("L2TUNNEL_MAINTAINED_TRACE").is_none() {
             return;
         }
@@ -1152,6 +1263,33 @@ pub(crate) fn test_framing_carrier(
         Carrier::finish(Backend::Tls(vec![adapter]), proof, 0, 0)?,
         peer,
     ))
+}
+
+#[cfg(test)]
+pub(crate) async fn test_quic_pair()
+-> Result<(Carrier, Carrier), Box<dyn std::error::Error + Send + Sync>> {
+    let (a, b, request, base) = tests::full().await?;
+    Ok((
+        Carrier::quic(vec![a], request, base, 1_000_000)?,
+        Carrier::quic(vec![b], request, base, 1_000_000)?,
+    ))
+}
+#[cfg(test)]
+impl Carrier {
+    pub(crate) fn test_ticket_metrics(&mut self, path: std::path::PathBuf) -> io::Result<()> {
+        self.buffer_metrics = Some(Observer::for_quic_test(Instant::now(), path)?);
+        Ok(())
+    }
+    pub(crate) fn test_ticket_report(&mut self) -> io::Result<serde_json::Value> {
+        let state = self
+            .buffer_metrics
+            .as_mut()
+            .and_then(Observer::quic_tickets)
+            .ok_or_else(|| io::Error::other("ticket metrics disabled"))?;
+        let mut bytes = Vec::new();
+        state.write(&mut bytes)?;
+        serde_json::from_slice(&bytes).map_err(io::Error::other)
+    }
 }
 
 #[cfg(test)]
@@ -1244,7 +1382,8 @@ mod tests {
         }
     }
 
-    async fn full() -> Result<(quic::Carrier, quic::Carrier, Request, SessionConfig), Failure> {
+    pub(super) async fn full()
+    -> Result<(quic::Carrier, quic::Carrier, Request, SessionConfig), Failure> {
         let mut profile = Profile::new(*b"maintained-test1");
         profile.datagram_format = DatagramFormat::CommonCompact;
         profile.max_datagram_bytes = 1072;

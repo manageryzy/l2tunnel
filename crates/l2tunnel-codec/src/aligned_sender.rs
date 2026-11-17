@@ -406,6 +406,19 @@ impl Sender {
             observation,
         ))
     }
+    /// Read the authoritative retained unit without building bytes or advancing state.
+    pub fn staged_identity(&self) -> Option<crate::diagnostics::StageIdentity> {
+        let pending = self.pending?;
+        // stage_selected validated this successor before publishing Pending.
+        let native_record = pending.record.0.checked_add(u64::from(pending.context))?;
+        Some(crate::diagnostics::StageIdentity {
+            channel: pending.channel.0,
+            record: pending.record.0,
+            native_record,
+            offset: pending.offset,
+            context: pending.context,
+        })
+    }
     /// Write immutable pending bytes using the recovery owner's source-ID snapshot.
     /// Failure or success here never consumes a pending symbol.
     pub fn write_pending(&mut self, source: SourceId, output: &mut [u8]) -> Result<usize, Error> {

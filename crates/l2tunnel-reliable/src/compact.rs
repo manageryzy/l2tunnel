@@ -218,6 +218,23 @@ impl Reliable {
         received: Duration,
         observed: Duration,
     ) -> Result<(), Error> {
+        let before = (!self.diagnostics.is_empty()).then(|| self.arq.retained());
+        let result = self.receive_at_inner(packet, received, observed);
+        self.observe_retirement(
+            before,
+            observed,
+            None,
+            diagnostics::staged::RetirementKind::Input,
+            result.is_ok(),
+        );
+        result
+    }
+    fn receive_at_inner(
+        &mut self,
+        packet: &[u8],
+        received: Duration,
+        observed: Duration,
+    ) -> Result<(), Error> {
         if self.compact_wire.is_some() {
             return self.receive_selected(packet, received, observed);
         }

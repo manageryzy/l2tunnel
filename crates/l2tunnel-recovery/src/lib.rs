@@ -7,7 +7,7 @@ mod arq;
 pub mod storage;
 pub use arq::{
     ACK_PACKET_BYTES, ARQ_BODY_DATA_MAX_HEADER_BYTES, ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES,
-    ArqConfig, BufferSide, COMPACT_BODY_DATA_MAX_HEADER_BYTES,
+    AdmissionFlight, AdmissionSnapshot, ArqConfig, BufferSide, COMPACT_BODY_DATA_MAX_HEADER_BYTES,
     COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES, COMPACT_DATA_HEADER_BYTES,
     COMPACT_FEEDBACK_HEADER_BYTES, CarrierOnly, CompactArqConfig, CompactBounds, CompactFeedback,
     CompactPacketKind, CompactPacketView, CompactPeerFeedbackSnapshot, CompactPollError,

@@ -103,6 +103,58 @@ class ReliableProviderTests(unittest.TestCase):
                 self.assertNotIn('### Block FEC retained output:', text)
                 self.assertEqual(owner['provider_metadata']['protocol_buffers'], provider)
 
+    def test_sparse_sequence_gate_keeps_maximum_source_and_original_flow_identity(self):
+        value = fixture()
+        value['staged_source'] = staged_fixture()
+        self.assertEqual(self.check(value)['status'], 'validated_known_fields_partial')
+        lines = []
+        reliable.render(lines, {'protocol_buffers': self.provider(value)}, report.table, report.cell)
+        rendered = '\n'.join(lines)
+        self.assertIn('earlier held sources', rendered)
+        self.assertIn('sequence_full', rendered)
+        self.assertIn('1/2', rendered)
+        self.assertEqual(value['staged_source']['maximum_completed']['pending']['native']['flow'], 100)
+
+    def test_staged_unknown_identity_and_false_predicates_are_not_valid_zero(self):
+        mutations = (
+            lambda v: v.update(schema=2),
+            lambda v: v.update(invalid=True),
+            lambda v: v['maximum_completed']['pending'].update(unit=None),
+            lambda v: v['maximum_completed']['pending']['last_gate'].update(records_full=True),
+            lambda v: v['maximum_completed']['pending']['last_gate'].update(sequence_full=False),
+            lambda v: v['maximum_completed']['pending']['last_gate'].update(next_source=3),
+            lambda v: v['maximum_completed']['pending']['unit'].update(native_record=14),
+            lambda v: v.update(terminal_at_us=100),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                value = fixture(); value['staged_source'] = staged_fixture()
+                mutate(value['staged_source'])
+                self.assertTrue(self.check(value)['status'].startswith('invalid'))
+        value = fixture(); value['staged_source'] = staged_fixture()
+        for key in ('last_resolved', 'maximum_completed'):
+            value['staged_source'][key]['pending'].update(unit=None, native=None)
+        self.assertEqual(self.check(value)['status'], 'validated_known_fields_partial')
+
+
+def staged_fixture():
+    gate = {'next_source': 2, 'span_base': 0, 'records': 1, 'records_capacity': 2,
+            'bytes': 4, 'bytes_capacity': 512, 'proposed_bytes': 3, 'resulting_bytes': 7,
+            'records_full': False, 'bytes_full': False, 'sequence_full': True,
+            'oldest': {'source': 0, 'attempts': 1, 'transmission': 1,
+                       'acknowledged': False, 'retry_at_us': 1000}}
+    pending = {'source': 2, 'bytes': 3, 'since_us': 10, 'last_refusal_us': 11,
+               'retirement_before': 0,
+               'unit': {'channel': 7, 'record': 12, 'native_record': 13, 'offset': 16, 'context': True},
+               'native': {'flow': 100, 'received_us': 0, 'queued_us': 1, 'deadline_us': 500},
+               'first_gate': copy.deepcopy(gate), 'last_gate': copy.deepcopy(gate)}
+    resolved = {'pending': pending, 'at_us': 30, 'censored': False,
+                'latest_retirement': {'serial': 1, 'observed_us': 29, 'accepted_us': None,
+                                      'kind': 'input', 'records': 1, 'bytes': 4, 'operation_succeeded': True}}
+    return {'schema': 1, 'invalid': False, 'terminal_at_us': None, 'pending': None,
+            'last_resolved': copy.deepcopy(resolved), 'maximum_completed': copy.deepcopy(resolved),
+            'maximum_censored': None, 'last_retirement': copy.deepcopy(resolved['latest_retirement'])}
+
 
 if __name__ == '__main__':
     unittest.main()

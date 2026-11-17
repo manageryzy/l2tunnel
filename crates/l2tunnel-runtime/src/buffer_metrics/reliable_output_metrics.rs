@@ -2,6 +2,8 @@
 use l2tunnel_reliable::diagnostics::{Operation, Snapshot, Totals};
 use std::io::{self, Write};
 use std::time::Duration;
+#[path = "reliable_staged_metrics.rs"]
+mod staged;
 fn optional(out: &mut impl Write, value: Option<Duration>) -> io::Result<()> {
     match value {
         Some(value) => write!(out, "{}", value.as_micros()),
@@ -110,5 +112,7 @@ pub(super) fn write(out: &mut impl Write, value: &Snapshot) -> io::Result<()> {
             value.capacity_refusals[index]
         )?;
     }
-    write!(out, "]}}")
+    write!(out, "],\"staged_source\":")?;
+    staged::write(out, &value.staged)?;
+    write!(out, "}}")
 }

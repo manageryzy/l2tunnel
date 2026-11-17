@@ -612,9 +612,10 @@ async fn dropped_common_future_samples_live_protocol_and_management_before_owner
         };
         let _never = execution
             .timing
-            .measure_future(
-                crate::initialization_timing::Stage::CommonNativeWrite,
+            .measure_selection(
+                origin + duration(now + 10_000),
                 std::future::pending::<io::Result<()>>(),
+                |_| crate::initialization_timing::SelectionWinner::IoError,
             )
             .await;
         drop(execution);
@@ -642,14 +643,20 @@ async fn dropped_common_future_samples_live_protocol_and_management_before_owner
         .as_array()
         .ok_or("execution stages")?
         .iter()
-        .find(|stage| stage["stage"] == "CommonNativeWrite")
-        .ok_or("entered native write")?;
+        .find(|stage| stage["stage"] == "CommonSelectPending")
+        .ok_or("entered selected suspension")?;
     assert_eq!(stage["samples"], 1);
     assert_eq!(stage["censored"], 1);
     assert_eq!(stage["failed"], 0);
     assert_eq!(stage["sum_us"], 50_000);
     assert_eq!(stage["maximum_start_us"], now);
     assert_eq!(stage["maximum_end_us"], stopped);
+    let selection = &execution["timing"]["selection"];
+    assert_eq!(selection["completed"], 0);
+    assert!(selection["maximum_lateness"].is_null());
+    assert!(selection["pending_planned_wake_us"].is_null());
+    assert_eq!(selection["interrupted"]["planned_wake_us"], now + 10_000);
+    assert_eq!(selection["interrupted"]["observed_at_us"], stopped);
     assert!(
         execution["timing"]["diagnostic_heap_bytes"]
             .as_u64()
@@ -838,3 +845,134 @@ async fn actual_common_swift_buffers_preserve_channels_and_terminal_sampling() -
 
 #[path = "transport_common_swift_acceptance_tests.rs"]
 mod swift_acceptance;
+
+#[tokio::test]
+async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io_priority() -> Result
+{
+    use crate::initialization_timing::{Owner, Timing};
+    let kind = cover::Appearance::QuicLike;
+    let (contracts, _) = super::compact::selected_compact(kind)?;
+    let fixture = Fixture::from_contracts_with_tail(kind, contracts, false).await?;
+    let [mut a, b] = fixture.endpoints;
+    let current = a.driver.common_state()?.current();
+    let mut socket: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+    b.socket.send(b"readiness fixture").await?;
+    let carrier::IoOwner::Udp(udp) = &socket else {
+        return Err("UDP fixture".into());
+    };
+    tokio::time::timeout(Duration::from_secs(1), udp.readable()).await??;
+    a.host.send(b"native readiness fixture")?;
+    drop(tokio::time::timeout(Duration::from_secs(1), a.device.readable_mut()).await??);
+    let origin = Instant::now();
+    let mut timing = Timing::try_new(Owner::CommonExecution, origin)?;
+    let (handle, requests) = common_channel();
+    let mut requests = Requests::Common(Some(requests));
+    let (reply, _receive) = oneshot::channel();
+    handle
+        .0
+        .try_send(common::Command::Switch(*current, reply))
+        .map_err(|_| "fixture request admission")?;
+    let shutdown = std::future::ready(());
+    tokio::pin!(shutdown);
+    let selected = timing
+        .measure_selection(
+            origin,
+            next_selected(
+                &mut socket,
+                &mut a.device,
+                shutdown.as_mut(),
+                &mut requests,
+                Interest::READABLE,
+                true,
+                true,
+                origin,
+                true,
+            ),
+            Selected::winner,
+        )
+        .await;
+    assert!(matches!(selected, Selected::Shutdown));
+    drop(selected);
+    let shutdown = std::future::pending::<()>();
+    tokio::pin!(shutdown);
+    let selected = timing
+        .measure_selection(
+            origin,
+            next_selected(
+                &mut socket,
+                &mut a.device,
+                shutdown.as_mut(),
+                &mut requests,
+                Interest::READABLE,
+                true,
+                true,
+                origin,
+                true,
+            ),
+            Selected::winner,
+        )
+        .await;
+    assert!(matches!(
+        selected,
+        Selected::Request(Some(Request::Common(common::Command::Switch(..))))
+    ));
+    drop(selected);
+    for native_first in [true, false] {
+        let selected = timing
+            .measure_selection(
+                origin,
+                next_selected(
+                    &mut socket,
+                    &mut a.device,
+                    shutdown.as_mut(),
+                    &mut requests,
+                    Interest::READABLE,
+                    true,
+                    true,
+                    origin,
+                    native_first,
+                ),
+                Selected::winner,
+            )
+            .await;
+        if native_first {
+            assert!(matches!(selected, Selected::Io(Ok(IoEvent::Native(_)))));
+        } else {
+            assert!(matches!(selected, Selected::Io(Ok(IoEvent::Udp))));
+        }
+        drop(selected);
+    }
+    let selected = timing
+        .measure_selection(
+            origin,
+            next_selected(
+                &mut socket,
+                &mut a.device,
+                shutdown.as_mut(),
+                &mut requests,
+                Interest::READABLE,
+                false,
+                false,
+                origin,
+                false,
+            ),
+            Selected::winner,
+        )
+        .await;
+    assert!(matches!(selected, Selected::Io(Ok(IoEvent::Timer))));
+    drop(selected);
+    let mut bytes = Vec::new();
+    timing.write_snapshot_at(Instant::now(), &mut bytes)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(json["selection"]["completed"], 5);
+    for winner in ["Shutdown", "Request", "Native", "Carrier", "Timer"] {
+        let row = json["selection"]["winners"]
+            .as_array()
+            .ok_or("winner array")?
+            .iter()
+            .find(|row| row["winner"] == winner)
+            .ok_or("actual winner")?;
+        assert_eq!(row["count"], 1);
+    }
+    Ok(())
+}

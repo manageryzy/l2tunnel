@@ -182,6 +182,13 @@ pub(super) enum SenderOwner {
     Packed(Vec<packed_sender::Sender>),
 }
 impl SenderOwner {
+    pub(super) fn staged_identity(&self) -> Option<l2tunnel_codec::diagnostics::StageIdentity> {
+        match self {
+            Self::Aligned(sender) => sender[0].staged_identity(),
+            // A packed source may contain multiple native units; no one-unit attribution.
+            Self::Packed(_) => None,
+        }
+    }
     pub(super) fn buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::SendBuffers {
         use l2tunnel_codec::diagnostics::SendBuffers;
         match self {

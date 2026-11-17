@@ -595,5 +595,134 @@ class ExecutionProviderTests(unittest.TestCase):
         self.assertTrue(report.normalize(value, 'wrong-owner.bmetrics', 'digest')['issues'])
 
 
+class SelectionExecutionProviderTests(unittest.TestCase):
+    observation = ExecutionProviderTests.observation
+    normalized = ExecutionProviderTests.normalized
+    def observed_selection(self, cancelled=False):
+        from tools.buffer_metrics_execution import STAGES_V2, WINNERS
+        value = self.observation(cancelled)
+        timing = value['timing']
+        timing['schema'] = 2
+        existing = {row['stage']: row for row in timing['stages']}
+        timing['stages'] = [existing.get(name, dict(stage=name, samples=0, sum_us=0,
+                            max_us=0, failed=0, censored=0, maximum_start_us=None,
+                            maximum_end_us=None)) for name in STAGES_V2]
+        timing['selection'] = dict(completed=1,
+            winners=[dict(winner=name, count=int(name == 'Timer')) for name in WINNERS],
+            maximum_lateness=dict(planned_wake_us=60, poll_entered_at_us=81, observed_at_us=88,
+                                  lateness_us=20, winner='Timer'),
+            interrupted=dict(planned_wake_us=150, observed_at_us=100) if cancelled else None,
+            pending_planned_wake_us=None)
+        return value
+
+    def test_historical_and_actual_selected_observations_keep_wait_union_separate(self):
+        historical = self.normalized(self.observation())
+        self.assertEqual(historical['execution_provider_validation']['selection']['status'],
+                         'unavailable_historical_schema')
+        for cancelled in (False, True):
+            owner = self.normalized(self.observed_selection(cancelled))
+            self.assertFalse(owner['issues'])
+            self.assertEqual(owner['blocked_union'], historical['blocked_union'])
+            selection = owner['execution_provider_validation']['selection']
+            self.assertEqual(selection['status'], 'validated_observed_selection')
+            self.assertEqual(selection['maximum_lateness']['lateness_us'], 20)
+        value = self.observed_selection(); selection = value['timing']['selection']
+        selection['completed'] = 0; selection['maximum_lateness'] = None
+        for row in selection['winners']: row['count'] = 0
+        owner = self.normalized(value)
+        self.assertFalse(owner['issues'])
+        self.assertIsNone(owner['execution_provider_validation']['selection']['maximum_lateness'])
+
+    def test_invalid_selected_identity_clock_and_schema_never_become_valid_zero(self):
+        for mutation in ('missing', 'duplicate', 'unknown', 'count', 'maximum', 'time',
+                         'late', 'winner', 'pending', 'interrupted', 'stages', 'historical'):
+            with self.subTest(mutation=mutation):
+                value = self.observed_selection(); timing = value['timing']; selection = timing['selection']
+                if mutation == 'missing': del timing['selection']
+                elif mutation == 'duplicate': selection['winners'][1] = dict(selection['winners'][0])
+                elif mutation == 'unknown': selection['winners'][0]['winner'] = 'Invented'
+                elif mutation == 'count': selection['completed'] = 2
+                elif mutation == 'maximum': selection['maximum_lateness'] = None
+                elif mutation == 'time': selection['maximum_lateness']['observed_at_us'] = 101
+                elif mutation == 'late': selection['maximum_lateness']['lateness_us'] = 22
+                elif mutation == 'winner': selection['maximum_lateness']['winner'] = 'IoError'
+                elif mutation == 'pending': selection['pending_planned_wake_us'] = 200
+                elif mutation == 'interrupted': selection['interrupted'] = dict(planned_wake_us=99, observed_at_us=100)
+                elif mutation == 'stages': timing['stages'].pop()
+                else: timing['schema'] = 1
+                owner = self.normalized(value)
+                self.assertTrue(owner['issues'])
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+
+
+class QuicTicketProviderTests(unittest.TestCase):
+    @staticmethod
+    def observation():
+        key = {'owner': 3, 'serial': 7, 'class': 'Control'}
+        record = {'identity': key, 'lane': 1, 'bytes': 9, 'deadline_us': 50,
+                  'created_us': 1, 'first_poll_us': 3, 'accepted_us': 6,
+                  'result_us': 7, 'observed_us': 11, 'taken_us': 15,
+                  'stopped_us': 15, 'consumer': 'Common', 'user': None, 'failed': False}
+        stages = ('creation_to_first_poll', 'first_poll_to_returned_queue_acceptance',
+                  'queue_acceptance_to_result_latch', 'result_latch_to_upper_observation',
+                  'upper_observation_to_take')
+        return {'schema': 1, 'cutoff': 'carrier_drop', 'invalid': False,
+                'first_us': 1, 'stopped_us': 20, 'live_capacity': 2, 'pending': [],
+                'rows': [{'lane': 1, 'class': 'Control', 'consumer': 'Common',
+                          'created': 1, 'completed': 1, 'failed': 0, 'censored': 0,
+                          'last': record, 'stages': [
+                              {'stage': name, 'completed': 1, 'completed_us': elapsed,
+                               'failed': 0, 'failed_us': 0, 'censored': 0, 'censored_us': 0,
+                               'maximum_us': elapsed, 'maximum_identity': key}
+                              for name, elapsed in zip(stages, (2, 3, 1, 4, 4))]}]}
+
+    def normalized(self, observation, owner='maintained_quic'):
+        value = fixture(); value['owner'] = owner
+        value['quic'] = {'tickets': observation}
+        return report.normalize(value, 'tickets.bmetrics', 'digest')
+
+    def test_actual_ticket_population_is_not_joined_to_generic_blocked_union(self):
+        owner = self.normalized(self.observation())
+        self.assertEqual(owner['quic_ticket_provider_validation']['status'],
+                         'validated_ticket_latencies')
+        baseline = report.normalize(fixture(), 'baseline.bmetrics', 'digest')
+        self.assertEqual(owner['blocked_union'], baseline['blocked_union'])
+        self.assertEqual(owner['owner_union_percent_of_observed_span'],
+                         baseline['owner_union_percent_of_observed_span'])
+
+    def test_unknown_identity_phase_cutoff_and_outcomes_are_invalid(self):
+        for mutation in ('schema', 'class', 'cutoff', 'maximum', 'identity', 'phase', 'count', 'stop'):
+            with self.subTest(mutation=mutation):
+                value = self.observation(); row = value['rows'][0]
+                if mutation == 'schema': value['schema'] = 2
+                elif mutation == 'class': row['class'] = 'Unknown'
+                elif mutation == 'cutoff': value['cutoff'] = 'physical_send'
+                elif mutation == 'maximum': row['stages'][0]['maximum_us'] = None
+                elif mutation == 'identity': row['last']['identity']['owner'] = 0
+                elif mutation == 'phase': row['last']['accepted_us'] = 12
+                elif mutation == 'count': row['completed'] = 2
+                else: value['stopped_us'] = 5
+                owner = self.normalized(value)
+                self.assertTrue(owner['issues'])
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+        self.assertTrue(self.normalized(self.observation(), 'common')['issues'])
+
+    def test_missing_provider_and_unobserved_phase_do_not_become_zero_samples(self):
+        owner = report.normalize(fixture(), 'missing.bmetrics', 'digest')
+        self.assertEqual(owner['quic_ticket_provider_validation']['status'], 'unavailable')
+        value = self.observation(); row = value['rows'][0]
+        row.update(completed=0, censored=1)
+        row['last'].update(first_poll_us=None, accepted_us=None, result_us=None,
+                           observed_us=None, taken_us=None)
+        for span in row['stages']:
+            span.update(completed=0, completed_us=0, maximum_us=None, maximum_identity=None)
+        row['stages'][0].update(censored=1, censored_us=14, maximum_us=14,
+                                maximum_identity=row['last']['identity'])
+        owner = self.normalized(value)
+        self.assertEqual(owner['quic_ticket_provider_validation']['status'],
+                         'validated_ticket_latencies')
+        self.assertIsNone(owner['quic_ticket_provider_validation']['rows'][0]['stages'][1]['maximum_us'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1385,3 +1385,95 @@ acceptance-to-upper-take attribution remain required to distinguish these
 dependencies. Occupancy and temporal proximity alone do not establish causality.
 BP-01 through BP-24, all current-build matrix directions and full original-native
 overhead remain open.
+
+### Exact staged identity and selected-wake observations
+
+Batch19 implementation passes the coordinated local checks below; native
+validation remains pending. The existing staged-source wait remains the only duration aggregate.
+Optional prepaid Reliable metadata retains the pending, last, maximum completed
+and maximum censored source identities, with actual first/latest count, byte and
+sequence-span admission predicates. Oldest retained flight state distinguishes
+an acknowledged physical retry from an actually retired source. A bounded last
+retirement fact comes from a real retention decrease during input or physical
+confirmation; it is context, not proof that it alone enabled admission.
+
+Shared Aligned unit identity is attached to the actual earlier native record.
+Flow and arrival/admission/deadline provenance is attached only after successful
+Pipeline-to-codec admission, so a later refused FIFO head cannot overwrite it.
+Packed multi-unit, independent Compact and per-connection native attribution
+remain unavailable in this slice. Actual optional Snapshot sizes remain charged
+by existing resource plans; no event queue, payload copy or per-packet allocation
+is introduced. This does not close BP-01, BP-04, BP-07 or BP-13.
+
+The Common execution observer now separates wake planning, actual selection
+poll calls and Pending-return-to-next-poll-entry wall spans. The existing biased
+shutdown/request/I/O order, native/carrier alternation, guards and timer instant
+remain unchanged. Maximum resume lateness uses winning poll entry minus the
+original planned wake; it excludes work inside that poll. Cancellation retains
+the original planned wake and freezes unresolved Pending time without inventing
+a winner. Pending includes intentional I/O/timer suspension and scheduling;
+it is not itself buffer backpressure or evidence of a kernel defect. The CLI's
+single real service snapshot is now inside its existing projection span.
+Execution schema2 has twenty stages and bounded selection facts; historical
+schema1 keeps seventeen stages and explicitly unavailable selection facts.
+
+### Exact maintained QUIC ticket custody
+
+Batch19 implementation passes the coordinated local checks below; native
+validation remains pending. Two fixed live cells and eight fixed lane/class/consumer summaries
+observe successful lower submission, first actual lower poll, returned queue
+acceptance, lower result storage, Common wrapper observation and actual upper
+take. Exact owner/serial/class identity and the original Common User epoch,
+configuration, packet number, byte count and deadline survive the move-only
+lower token. Direct bootstrap consumers remain a separate population.
+
+Late queue acceptance is retained even when the operation returns an expiry
+error. Missing acceptance remains unavailable. The provider censors unresolved
+phases at Carrier Drop before field cleanup, independently of the generic
+collector's earlier error stop; neither its cutoff nor durations extend the
+generic blocked union. Completed phase samples do not imply successful whole
+operations or physical IP transmission. Provider queue occupancy is still
+unavailable. Optional storage remains prepaid and charged by actual size; a
+non-QUIC or absent provider returns before clock conversion or ticket identity
+retention. Existing terminal exporter I/O remains synchronous. BP-21 and BP-22
+retain their full remaining scope.
+
+### Same-budget Rolling encoder batching
+
+Batch19 replaces repeated encoder dispatch for contiguous zero/GF bytes within
+one source with bounded slices. Each slice consumes exactly the original byte
+and metadata visits, including the already-paid outer visit. It cannot cross a
+source or spend beyond the original copy/field/metadata allowance. Cached
+coefficients, per-call cursor, immutable output, memory reservation, expiry and
+failure ordering remain unchanged. Passing focused coverage checks exact
+partial-work cursors/charges, zero allowances, an independently generated Python
+equation and the original expiry. Native validation remains pending; this
+source-level reduction does not yet establish a throughput gain.
+
+
+### Coordinated local buffer batch19 validation
+
+The required `python3 tools/check.py` sequence completes across preserved
+[initial](../../work/aligned-extents-20261117/required-buffer-checks19-attempt1/validation.json),
+[workspace](../../work/aligned-extents-20261117/required-buffer-checks19-continuation3/validation.json)
+and [final continuation](../../work/aligned-extents-20261117/required-buffer-checks19-continuation6/validation.json)
+receipts. Failed new fixture/type and test-layout attempts remain recorded.
+Unchanged passing stages are reused: the last continuation reruns the sole
+failed facade case, then every previously unrun required stage. That fixture
+now uses a valid four-record window and the subsequent actual output poll:
+filling a window alone is not a failed admission or a wait episode.
+
+Strict workspace Clippy, all workspace tests, no-default-feature codec tests,
+strict rustdoc, real external Common CLI probes, tooling and 1,658 simulator
+cases pass their local scopes. Actual maintained QUIC ticket custody/cancellation,
+Common selection priority and expiry, staged native provenance/held retries,
+and same-budget encoder cursors have passing focused regressions. This is
+local protocol and process evidence, not privileged network performance.
+
+A subsequent [76-case affected continuation](../../work/aligned-extents-20261117/required-buffer-checks19-continuation7/validation.json)
+removes a duplicate send-slot traversal from the optional admission snapshot:
+non-Compact span base reuses the already captured oldest retained flight while
+Compact keeps its explicit base. Only that private implementation body changes;
+formatting, affected strict Clippy, recovery tests and staged diagnostic callers
+pass. No benchmark policy, work allowance, deadline or memory quota changes.
+Full buffer coverage and the full current-build native matrix remain open.

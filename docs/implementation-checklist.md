@@ -178,6 +178,13 @@ staged-source admission waiting; Cauchy and QUIC exhaust their original workload
 bounds. Exact identity/frontier and selected-wake/QUIC ticket observations remain
 the next implementation work. No passing throughput or full BP row is inferred.
 
+The [batch19 staged-source and selected-wake implementation](modules/buffer-observability.md#exact-staged-identity-and-selected-wake-observations)
+and [QUIC ticket custody](modules/buffer-observability.md#exact-maintained-quic-ticket-custody),
+plus [same-budget Rolling encoder batching](modules/buffer-observability.md#same-budget-rolling-encoder-batching),
+pass [coordinated local validation](modules/buffer-observability.md#coordinated-local-buffer-batch19-validation);
+native validation remains pending. Identity attachments do not create another
+wait union, and selected Pending time is not buffer backpressure. All original algorithm, resource and coverage gates remain.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

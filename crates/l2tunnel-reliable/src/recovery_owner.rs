@@ -137,6 +137,12 @@ impl Owner {
     pub fn statistics(&self) -> ArqStatistics {
         dispatch!(self, owner => owner.statistics())
     }
+    pub fn admission_snapshot(&self, bytes: usize) -> Option<l2tunnel_recovery::AdmissionSnapshot> {
+        match self {
+            Self::Legacy(owner) => owner.admission_snapshot(bytes).ok(),
+            Self::Compact(_) => None,
+        }
+    }
     pub fn retained(&self) -> Retained {
         dispatch!(self, owner => owner.retained())
     }

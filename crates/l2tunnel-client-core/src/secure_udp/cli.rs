@@ -1381,7 +1381,7 @@ pub(super) async fn execute(
                     let generation = live;
                     live = None;
                     let terminal = terminal.map_err(submit)?;
-                    emit_transaction(life.snapshot().runtime.as_ref(), generation, TransactionEvent::Terminal(terminal), &mut output);
+                    emit_transaction(|| life.snapshot(), generation, TransactionEvent::Terminal(terminal), &mut output);
                     if let Terminal::Failed(failure) = terminal && !local_control {
                         output.flush_turn();
                         return Err(io::Error::new(failure.kind, "secure UDP runtime failed"));
@@ -1395,11 +1395,10 @@ pub(super) async fn execute(
                             connected = true;
                             if let Some(previous) = live.take() {
                                 let terminal = life.wait_stopped(previous).await.map_err(submit)?;
-                                emit_transaction(life.snapshot().runtime.as_ref(), Some(previous), TransactionEvent::Terminal(terminal), &mut output);
+                                emit_transaction(|| life.snapshot(), Some(previous), TransactionEvent::Terminal(terminal), &mut output);
                             }
                             live = Some(generation);
-                            let snapshot = life.snapshot();
-                            emit_transaction(snapshot.runtime.as_ref(), Some(generation), TransactionEvent::Ready, &mut output);
+                            emit_transaction(|| life.snapshot(), Some(generation), TransactionEvent::Ready, &mut output);
                         }
                         Completed::Failed(failure) => {
                             match life.setup_observation(operation) {
@@ -1420,7 +1419,7 @@ pub(super) async fn execute(
                                 // Completion may win select before wait_stopped. Observe
                                 // the real release before forgetting its generation.
                                 let terminal = life.wait_stopped(generation).await.map_err(submit)?;
-                                emit_transaction(life.snapshot().runtime.as_ref(), Some(generation), TransactionEvent::Terminal(terminal), &mut output);
+                                emit_transaction(|| life.snapshot(), Some(generation), TransactionEvent::Terminal(terminal), &mut output);
                             }
                             live = None;
                         }
@@ -1428,7 +1427,7 @@ pub(super) async fn execute(
                     }
                 }
                 _ = report_tick.tick(), if report_interval.is_some() => {
-                    if live.is_some() { emit_transaction(life.snapshot().runtime.as_ref(), live, TransactionEvent::Status, &mut output); }
+                    if live.is_some() { emit_transaction(|| life.snapshot(), live, TransactionEvent::Status, &mut output); }
                 }
                 _ = output_tick.tick(), if output.has_pending() || diagnostic.has_pending() => {},
             }
@@ -1467,14 +1466,18 @@ pub(super) async fn execute(
 
 #[cfg(target_os = "linux")]
 fn emit_transaction(
-    observation: Option<&crate::service::Observation>,
+    snapshot: impl FnOnce() -> crate::service::Snapshot,
     generation: Option<crate::service::OperationId>,
     event: TransactionEvent,
     output: &mut output::Sink,
 ) {
     let projection_started = output.timing.start();
+    let snapshot = snapshot();
     let value = match (
-        observation.and_then(crate::service::Observation::secure_udp_common),
+        snapshot
+            .runtime
+            .as_ref()
+            .and_then(crate::service::Observation::secure_udp_common),
         generation,
     ) {
         (Some(frame), Some(generation)) => {
@@ -2028,6 +2031,35 @@ mod output {
             os::fd::AsRawFd,
             sync::atomic::{AtomicUsize, Ordering},
         };
+        #[tokio::test(flavor = "current_thread")]
+        async fn projection_includes_actual_service_snapshot_callback_and_failure() -> io::Result<()>
+        {
+            let (handle, _run) = crate::service::channel();
+            let mut sink = Sink::with_worker(io::sink())?;
+            sink.timing = Timing::try_new(Owner::CliOutput, Instant::now())?;
+            let invoked = std::cell::Cell::new(0);
+            super::super::emit_transaction(
+                || {
+                    invoked.set(invoked.get() + 1);
+                    // Actual callback work must remain inside the projection span.
+                    std::thread::sleep(Duration::from_millis(1));
+                    handle.snapshot()
+                },
+                None,
+                super::super::TransactionEvent::Status,
+                &mut sink,
+            );
+            assert_eq!(invoked.get(), 1);
+            assert_eq!(sink.health.projection_errors, 1);
+            let span = sink
+                .timing
+                .snapshot(Stage::CliProjection)
+                .ok_or_else(|| io::Error::other("enabled projection"))?;
+            assert_eq!((span.samples, span.failed), (1, 1));
+            assert!(span.sum_us >= 1_000);
+            Ok(())
+        }
+
         #[tokio::test(flavor = "current_thread")]
         async fn terminal_snapshot_cannot_combine_pre_failure_health_with_post_failure_empty_queue()
         -> io::Result<()> {

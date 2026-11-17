@@ -705,13 +705,37 @@ fn selected_compact_aligned_preview_preserves_gap_and_deduplicates_native_delive
 fn staged_source_wait_tracks_actual_capacity_refusal_then_same_source_admission() -> TestResult {
     let mut config = config(128);
     config.recovery.repair_symbols = 0;
-    let mut sender = Endpoint::new(config, context(EndpointRole::Initiator))?;
+    let plan = storage::Plan::for_duplex(config, config)?.with_reliable_output_diagnostics()?;
+    let mut sender = Endpoint::new_reserved_with_plan(
+        plan,
+        context(EndpointRole::Initiator),
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    let usage = sender.storage_usage();
     let mut peer = Reliable::new(config.recovery, context(EndpointRole::Responder))?;
     for source in 0..8 {
         assert_eq!(sender.recovery.submit(b"retained", ms(0))?, source);
     }
     let frames = native_frames()?;
-    sender.enqueue_admitted(ChannelId(0), &frames[0], ms(0))?;
+    let native_id = sender.enqueue_identified(ChannelId(0), &frames[0], ms(0))?;
+    let details = sender
+        .recovery_output_wait(ms(0))
+        .ok_or("details enabled")?
+        .staged
+        .pending
+        .ok_or("actual stage")?;
+    let unit = details.unit.ok_or("actual codec unit")?;
+    assert_eq!(
+        (unit.channel, unit.native_record),
+        (u16::from(native_id.channel.0), native_id.record.0)
+    );
+    assert_eq!(unit.native_record, unit.record + u64::from(unit.context));
+    assert!(
+        details.native.is_none(),
+        "no Pipeline owner existed in this fixture"
+    );
     let waiting = sender.staged_admission_snapshot(ms(0));
     let pending = waiting.pending.ok_or("actual blocked stage")?;
     assert_eq!(pending.source, 8);
@@ -742,5 +766,16 @@ fn staged_source_wait_tracks_actual_capacity_refusal_then_same_source_admission(
     );
     assert!(!completed.identity_mismatch);
     assert!(!completed.clock_regression);
+    let maximum = sender
+        .recovery_output_wait(ms(10))
+        .ok_or("details")?
+        .staged
+        .maximum_completed
+        .ok_or("maximum identity")?;
+    assert_eq!(
+        (maximum.pending.source, maximum.pending.unit),
+        (8, Some(unit))
+    );
+    assert_eq!(sender.storage_usage(), usage);
     Ok(())
 }

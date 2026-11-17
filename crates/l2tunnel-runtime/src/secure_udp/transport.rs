@@ -243,164 +243,398 @@ where
     })?;
     let mut observed_transaction = driver.transaction_observation()?;
     let mut native_first = true;
-    let result:io::Result<StopReason>=async {
+    let result: io::Result<StopReason> = async {
         loop {
             execution.turn();
-            if execution.measure_future(TimingStage::CommonReceiptProgress,
-                begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
-                    driver.complete_carrier_io(socket, &mut sample)
-                })
-            ).await? {
+            if execution
+                .measure_future(
+                    TimingStage::CommonReceiptProgress,
+                    begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
+                        driver.complete_carrier_io(socket, &mut sample)
+                    }),
+                )
+                .await?
+            {
                 break Ok(StopReason::Cancelled);
             }
             socket.begin_turn();
             if socket.is_carrier() {
-                execution.measure_future(TimingStage::CommonReceiptProgress, async {
-                    socket.observe_completions().await;
-                    driver.complete_carrier_io(&mut socket,&mut sample)
-                }).await?;
+                execution
+                    .measure_future(TimingStage::CommonReceiptProgress, async {
+                        socket.observe_completions().await;
+                        driver.complete_carrier_io(&mut socket, &mut sample)
+                    })
+                    .await?;
             }
-            if driver.has_transactions(){
-                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(clock(origin,sample())?))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                execution.measure_result(TimingStage::CommonAdmission, || driver.admit_common(||clock(origin,sample()).map(duration)))?;
+            if driver.has_transactions() {
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || {
+                    driver.check_expiry(clock(origin, sample())?)
+                })? {
+                    break Ok(driver
+                        .terminal
+                        .ok_or_else(|| protocol("terminal expiry missing"))?);
+                }
+                execution.measure_result(TimingStage::CommonAdmission, || {
+                    driver.admit_common(|| clock(origin, sample()).map(duration))
+                })?;
             }
-            let mut instant=sample();let mut now=clock(origin,instant)?;
-            driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
+            let mut instant = sample();
+            let mut now = clock(origin, instant)?;
+            driver.performance.counters.loop_turns =
+                driver.performance.counters.loop_turns.saturating_add(1);
             execution.measure_result(TimingStage::CommonBufferSampling, || {
                 driver.sample_common_buffers(now);
                 driver.sample_raw_buffers(&mut socket, instant, false);
                 Ok::<(), io::Error>(())
             })?;
-            if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(now))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+            if !execution.measure_result(TimingStage::CommonDeadlineService, || {
+                driver.check_expiry(now)
+            })? {
+                break Ok(driver
+                    .terminal
+                    .ok_or_else(|| protocol("terminal expiry missing"))?);
+            }
             execution.measure_result(TimingStage::CommonProtocolProgress, || {
                 driver.service_common_ingress(now, &mut inputs.native)?;
                 driver.collect_native(now)?;
                 driver.progress(now)?;
                 driver.service_common_rolling(now)
             })?;
-            let completed=driver.report_transaction_completion(
-                ||clock(origin,sample()),
-                |driver,at|execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,at,true)),
+            let completed = driver.report_transaction_completion(
+                || clock(origin, sample()),
+                |driver, at| {
+                    execution
+                        .measure_result(TimingStage::CommonSnapshot, || observe(driver, at, true))
+                },
             )?;
-            let actual=driver.transaction_observation()?;
-            let mut semantic_observed=false;
-            if driver.terminal.is_none() && !completed && (actual!=observed_transaction || driver.observation_dirty()) {
-                let reported=clock(origin,sample())?;
-                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(reported))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,reported,true))?;
-                semantic_observed=true;
+            let actual = driver.transaction_observation()?;
+            let mut semantic_observed = false;
+            if driver.terminal.is_none()
+                && !completed
+                && (actual != observed_transaction || driver.observation_dirty())
+            {
+                let reported = clock(origin, sample())?;
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || {
+                    driver.check_expiry(reported)
+                })? {
+                    break Ok(driver
+                        .terminal
+                        .ok_or_else(|| protocol("terminal expiry missing"))?);
+                }
+                execution.measure_result(TimingStage::CommonSnapshot, || {
+                    observe(driver, reported, true)
+                })?;
+                semantic_observed = true;
             }
-            observed_transaction=actual;
+            observed_transaction = actual;
             driver.clear_observation_dirty();
-            if let Some(reason)=driver.terminal {break Ok(reason);}
+            if let Some(reason) = driver.terminal {
+                break Ok(reason);
+            }
             if driver.has_transactions() && (completed || semantic_observed) {
-                instant=sample();now=clock(origin,instant)?;
-                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(now))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+                instant = sample();
+                now = clock(origin, instant)?;
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || {
+                    driver.check_expiry(now)
+                })? {
+                    break Ok(driver
+                        .terminal
+                        .ok_or_else(|| protocol("terminal expiry missing"))?);
+                }
             }
             execution.measure_result(TimingStage::CommonManagement, || {
                 driver.service_selected_control(now)?;
                 driver.submit_control(now)
             })?;
-            execution.measure_result(TimingStage::CommonSend, || driver.send_selected_io_sampled(&mut socket,now,instant,&mut sample))?;
-            let native_before=driver.performance.counters.native_write_batch_packets;
-            let native_spent=execution.measure_future(TimingStage::CommonNativeWrite,
-                driver.flush_native_ready(&mut device,||clock(origin,sample()))).await?;
-            let native_write_remaining=driver.config.work.native_write_batch.saturating_sub(native_spent);
-            if let Some(reason)=driver.terminal {break Ok(reason);}
-            if driver.next_report.is_some_and(|at|now>=at) {
-                let reported=clock(origin,sample())?;
-                execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,reported,true))?;
-                driver.next_report=driver.config.report_interval.map(|interval|add(reported,interval)).transpose()?;
+            execution.measure_result(TimingStage::CommonSend, || {
+                driver.send_selected_io_sampled(&mut socket, now, instant, &mut sample)
+            })?;
+            let native_before = driver.performance.counters.native_write_batch_packets;
+            let native_spent = execution
+                .measure_future(
+                    TimingStage::CommonNativeWrite,
+                    driver.flush_native_ready(&mut device, || clock(origin, sample())),
+                )
+                .await?;
+            let native_write_remaining = driver
+                .config
+                .work
+                .native_write_batch
+                .saturating_sub(native_spent);
+            if let Some(reason) = driver.terminal {
+                break Ok(reason);
             }
-            let read_native=driver.can_admit_native()?;
-            let write_native=!driver.native.is_empty();
-            let interest=if read_native && write_native {Interest::READABLE.add(Interest::WRITABLE)}else if write_native {Interest::WRITABLE}else{Interest::READABLE};
-            let mut wake=driver.wake_selected_io(&socket,now)?;
-            if native_spent>0 || (driver.native_deliverable()? && driver.native_room()) {wake=wake.min(sample());}
-            tokio::select! {
-                biased;
-                ()=&mut shutdown=>break Ok(StopReason::Cancelled),
-                request=next_selected_request(&mut requests),if requests.enabled()=>{
-                    driver.performance.counters.request_events=driver.performance.counters.request_events.saturating_add(1);
-                    match request {
-                        Some(Request::Common(common::Command::Switch(configuration,reply)))=>driver.request_common(clock(origin,sample())?,configuration,reply)?,
-                        Some(Request::Common(common::Command::Reuse(request,reply)))=>driver.request_connection_reuse(clock(origin,sample())?,request,reply)?,
-                        None=>requests.close(),
+            if driver.next_report.is_some_and(|at| now >= at) {
+                let reported = clock(origin, sample())?;
+                execution.measure_result(TimingStage::CommonSnapshot, || {
+                    observe(driver, reported, true)
+                })?;
+                driver.next_report = driver
+                    .config
+                    .report_interval
+                    .map(|interval| add(reported, interval))
+                    .transpose()?;
+            }
+            let (read_native, write_native, interest, wake) =
+                execution.measure_result(TimingStage::CommonWakePlanning, || {
+                    let read_native = driver.can_admit_native()?;
+                    let write_native = !driver.native.is_empty();
+                    let interest = if read_native && write_native {
+                        Interest::READABLE.add(Interest::WRITABLE)
+                    } else if write_native {
+                        Interest::WRITABLE
+                    } else {
+                        Interest::READABLE
+                    };
+                    let mut wake = driver.wake_selected_io(&socket, now)?;
+                    if native_spent > 0 || (driver.native_deliverable()? && driver.native_room()) {
+                        wake = wake.min(sample());
                     }
-                },
-                event=next_io(&mut socket,&mut device,interest,read_native || write_native,driver.ingress.left>0,wake,native_first)=>match event? {
-                IoEvent::Udp=>{
-                    native_first=true;
-                    if socket.is_maintained() {driver.performance.counters.maintained_ready_events=driver.performance.counters.maintained_ready_events.saturating_add(1);}
-                    else if !socket.is_raw() {driver.performance.counters.udp_ready_events=driver.performance.counters.udp_ready_events.saturating_add(1);}
-                    let maximum=if socket.receive_ready() {driver.config.work.receive_packets.min(driver.ingress.left)}else{0};
-                    let mut batch=0u64;
-                    for _ in 0..maximum {
-                        if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(clock(origin,sample())?))? {break;}
-                        driver.ingress.left-=1;
-                        match execution.measure_future(TimingStage::CommonCarrierReceive, socket.try_receive_at_ready(&mut inputs.datagram)).await {
-                            Ok((length,received,framing))=>{
-                                batch+=1;
-                                if socket.is_maintained() {
-                                    driver.performance.counters.maintained_batch_records=driver.performance.counters.maintained_batch_records.saturating_add(1);
-                                    if batch==u64::from(maximum) {driver.performance.counters.maintained_batch_limit_hits=driver.performance.counters.maintained_batch_limit_hits.saturating_add(1);}
-                                } else if !socket.is_raw() {
-                                    driver.performance.counters.udp_batch_packets=driver.performance.counters.udp_batch_packets.saturating_add(1);
-                                    if batch==u64::from(maximum) {driver.performance.counters.udp_batch_limit_hits=driver.performance.counters.udp_batch_limit_hits.saturating_add(1);}
+                    Ok::<_, io::Error>((read_native, write_native, interest, wake))
+                })?;
+            let selected = execution
+                .measure_selection(
+                    wake,
+                    next_selected(
+                        &mut socket,
+                        &mut device,
+                        shutdown.as_mut(),
+                        &mut requests,
+                        interest,
+                        read_native || write_native,
+                        driver.ingress.left > 0,
+                        wake,
+                        native_first,
+                    ),
+                    Selected::winner,
+                )
+                .await;
+            match selected {
+                Selected::Shutdown => break Ok(StopReason::Cancelled),
+                Selected::Request(request) => {
+                    driver.performance.counters.request_events =
+                        driver.performance.counters.request_events.saturating_add(1);
+                    match request {
+                        Some(Request::Common(common::Command::Switch(configuration, reply))) => {
+                            driver.request_common(clock(origin, sample())?, configuration, reply)?
+                        }
+                        Some(Request::Common(common::Command::Reuse(request, reply))) => driver
+                            .request_connection_reuse(clock(origin, sample())?, request, reply)?,
+                        None => requests.close(),
+                    }
+                }
+                Selected::Io(event) => match event? {
+                    IoEvent::Udp => {
+                        native_first = true;
+                        if socket.is_maintained() {
+                            driver.performance.counters.maintained_ready_events = driver
+                                .performance
+                                .counters
+                                .maintained_ready_events
+                                .saturating_add(1);
+                        } else if !socket.is_raw() {
+                            driver.performance.counters.udp_ready_events = driver
+                                .performance
+                                .counters
+                                .udp_ready_events
+                                .saturating_add(1);
+                        }
+                        let maximum = if socket.receive_ready() {
+                            driver.config.work.receive_packets.min(driver.ingress.left)
+                        } else {
+                            0
+                        };
+                        let mut batch = 0u64;
+                        for _ in 0..maximum {
+                            if !execution
+                                .measure_result(TimingStage::CommonDeadlineService, || {
+                                    driver.check_expiry(clock(origin, sample())?)
+                                })?
+                            {
+                                break;
+                            }
+                            driver.ingress.left -= 1;
+                            match execution
+                                .measure_future(
+                                    TimingStage::CommonCarrierReceive,
+                                    socket.try_receive_at_ready(&mut inputs.datagram),
+                                )
+                                .await
+                            {
+                                Ok((length, received, framing)) => {
+                                    batch += 1;
+                                    if socket.is_maintained() {
+                                        driver.performance.counters.maintained_batch_records =
+                                            driver
+                                                .performance
+                                                .counters
+                                                .maintained_batch_records
+                                                .saturating_add(1);
+                                        if batch == u64::from(maximum) {
+                                            driver
+                                                .performance
+                                                .counters
+                                                .maintained_batch_limit_hits = driver
+                                                .performance
+                                                .counters
+                                                .maintained_batch_limit_hits
+                                                .saturating_add(1);
+                                        }
+                                    } else if !socket.is_raw() {
+                                        driver.performance.counters.udp_batch_packets = driver
+                                            .performance
+                                            .counters
+                                            .udp_batch_packets
+                                            .saturating_add(1);
+                                        if batch == u64::from(maximum) {
+                                            driver.performance.counters.udp_batch_limit_hits =
+                                                driver
+                                                    .performance
+                                                    .counters
+                                                    .udp_batch_limit_hits
+                                                    .saturating_add(1);
+                                        }
+                                    }
+                                    let metadata = socket.final_input_metadata();
+                                    let at = sample();
+                                    let time = clock(origin, at)?;
+                                    if !execution.measure_result(
+                                        TimingStage::CommonDeadlineService,
+                                        || driver.check_expiry(time),
+                                    )? {
+                                        if let Some(metadata) = metadata {
+                                            socket.commit_final_input(metadata, None)?;
+                                        }
+                                        break;
+                                    }
+                                    if length > driver.cover.limits().max_packet_bytes {
+                                        driver.counters.received_packets =
+                                            driver.counters.received_packets.saturating_add(1);
+                                        driver.counters.rejected_packets =
+                                            driver.counters.rejected_packets.saturating_add(1);
+                                        if let Some(metadata) = metadata {
+                                            socket.commit_final_input(metadata, None)?;
+                                        }
+                                    } else {
+                                        let received_time = received
+                                            .map(|original| clock(origin, original))
+                                            .transpose()?
+                                            .unwrap_or(time);
+                                        execution.measure_result(
+                                            TimingStage::CommonReceive,
+                                            || {
+                                                if let Some(metadata) = metadata {
+                                                    driver.receive_selected_raw(
+                                                        &mut socket,
+                                                        &inputs.datagram[..length],
+                                                        received_time,
+                                                        time,
+                                                        received.unwrap_or(at),
+                                                        at,
+                                                        metadata,
+                                                    )
+                                                } else if let Some(framing) = framing {
+                                                    driver.receive_selected_on_carrier(
+                                                        &inputs.datagram[..length],
+                                                        received_time,
+                                                        time,
+                                                        received.unwrap_or(at),
+                                                        at,
+                                                        framing,
+                                                    )
+                                                } else {
+                                                    driver.receive_selected_with_arrival(
+                                                        &inputs.datagram[..length],
+                                                        received_time,
+                                                        time,
+                                                        received.unwrap_or(at),
+                                                        at,
+                                                    )
+                                                }
+                                            },
+                                        )?;
+                                    }
                                 }
-                                let metadata=socket.final_input_metadata();
-                                let at=sample();let time=clock(origin,at)?;
-                                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(time))? {
-                                    if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(error) if establish::path_loss(&error) => {
+                                    driver.counters.socket_receive_errors =
+                                        driver.counters.socket_receive_errors.saturating_add(1);
                                     break;
                                 }
-                                if length>driver.cover.limits().max_packet_bytes {
-                                    driver.counters.received_packets=driver.counters.received_packets.saturating_add(1);
-                                    driver.counters.rejected_packets=driver.counters.rejected_packets.saturating_add(1);
-                                    if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
-                                }else{
-                                    let received_time=received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time);
-                                    execution.measure_result(TimingStage::CommonReceive, || {
-                                        if let Some(metadata)=metadata {
-                                            driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,metadata)
-                                        }else if let Some(framing)=framing {
-                                            driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,framing)
-                                        }else{
-                                            driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at)
-                                        }
-                                    })?;
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                    IoEvent::Native(mut ready) => {
+                        native_first = false;
+                        driver.performance.counters.native_ready_events = driver
+                            .performance
+                            .counters
+                            .native_ready_events
+                            .saturating_add(1);
+                        if ready.ready().is_writable() && write_native && native_write_remaining > 0
+                        {
+                            let written =
+                                execution.measure_result(TimingStage::CommonNativeWrite, || {
+                                    driver.write_native_batch(
+                                        &mut ready,
+                                        native_write_remaining,
+                                        || clock(origin, sample()),
+                                    )
+                                });
+                            if driver
+                                .performance
+                                .counters
+                                .native_write_batch_packets
+                                .saturating_sub(native_before)
+                                == driver.config.work.native_write_batch as u64
+                            {
+                                driver.performance.counters.native_write_batch_limit_hits = driver
+                                    .performance
+                                    .counters
+                                    .native_write_batch_limit_hits
+                                    .saturating_add(1);
+                            }
+                            written?;
+                        }
+                        if ready.ready().is_readable() && read_native {
+                            let mut batch = 0u64;
+                            for _ in 0..driver.config.work.native_read_batch {
+                                let before = driver.performance.counters.native_read_batch_packets;
+                                let step =
+                                    execution.measure_result(TimingStage::CommonNativeRead, || {
+                                        driver.read_native(&mut ready, &mut inputs.native, || {
+                                            clock(origin, sample())
+                                        })
+                                    });
+                                batch += driver
+                                    .performance
+                                    .counters
+                                    .native_read_batch_packets
+                                    .saturating_sub(before);
+                                if batch == driver.config.work.native_read_batch as u64 {
+                                    driver.performance.counters.native_read_batch_limit_hits =
+                                        driver
+                                            .performance
+                                            .counters
+                                            .native_read_batch_limit_hits
+                                            .saturating_add(1);
                                 }
-                            },
-                            Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
-                            Err(error) if establish::path_loss(&error)=>{driver.counters.socket_receive_errors=driver.counters.socket_receive_errors.saturating_add(1);break;},
-                            Err(error)=>return Err(error),
+                                if !step? {
+                                    break;
+                                }
+                            }
                         }
                     }
-                },
-                IoEvent::Native(mut ready)=>{
-                    native_first=false;
-                    driver.performance.counters.native_ready_events=driver.performance.counters.native_ready_events.saturating_add(1);
-                    if ready.ready().is_writable() && write_native && native_write_remaining>0 {
-                        let written=execution.measure_result(TimingStage::CommonNativeWrite, || driver.write_native_batch(&mut ready,native_write_remaining,||clock(origin,sample())));
-                        if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
-                        written?;
+                    IoEvent::Timer => {
+                        driver.performance.counters.timer_events =
+                            driver.performance.counters.timer_events.saturating_add(1);
                     }
-                    if ready.ready().is_readable() && read_native {
-                        let mut batch=0u64;
-                        for _ in 0..driver.config.work.native_read_batch {
-                            let before=driver.performance.counters.native_read_batch_packets;
-                            let step=execution.measure_result(TimingStage::CommonNativeRead, || driver.read_native(&mut ready,&mut inputs.native,||clock(origin,sample())));
-                            batch+=driver.performance.counters.native_read_batch_packets.saturating_sub(before);
-                            if batch==driver.config.work.native_read_batch as u64 {driver.performance.counters.native_read_batch_limit_hits=driver.performance.counters.native_read_batch_limit_hits.saturating_add(1);}
-                            if !step? {break;}
-                        }
-                    }
-                },
-                IoEvent::Timer=>{driver.performance.counters.timer_events=driver.performance.counters.timer_events.saturating_add(1);},
                 },
             }
         }
-    }.await;
+    }
+    .await;
     let metric_stop = sample();
     // Freeze before terminal settlement. Existing buffer export owns the prepaid
     // diagnostic from here. The stack guard handles cancellation before this
@@ -547,6 +781,54 @@ where
     }
     observe(driver, now, false)?;
     result.map(|reason| LoopCompletion { reason, at: now })
+}
+
+// One already bounded canonical request or native readiness guard, with no
+// new queue, allocation or independent I/O owner.
+#[allow(clippy::large_enum_variant)]
+enum Selected<'a, D: NativeDevice> {
+    Shutdown,
+    Request(Option<Request>),
+    Io(io::Result<IoEvent<'a, D>>),
+}
+impl<D: NativeDevice> Selected<'_, D> {
+    fn winner(&self) -> crate::initialization_timing::SelectionWinner {
+        use crate::initialization_timing::SelectionWinner as Winner;
+        match self {
+            Self::Shutdown => Winner::Shutdown,
+            Self::Request(_) => Winner::Request,
+            Self::Io(Ok(IoEvent::Udp)) => Winner::Carrier,
+            Self::Io(Ok(IoEvent::Native(_))) => Winner::Native,
+            Self::Io(Ok(IoEvent::Timer)) => Winner::Timer,
+            Self::Io(Err(_)) => Winner::IoError,
+        }
+    }
+}
+// Preserve the original outer bias and nested I/O alternation. The observer
+// wraps only selection; selected event handlers keep their original ordering.
+#[allow(clippy::too_many_arguments)] // Preserve the original explicit owners and selection inputs.
+async fn next_selected<
+    'a,
+    D: NativeDevice,
+    R: raw_carrier::RawBacking,
+    S: Future<Output = ()> + ?Sized,
+>(
+    socket: &mut carrier::IoOwner<R>,
+    device: &'a mut NativeReady<D>,
+    shutdown: std::pin::Pin<&mut S>,
+    requests: &mut Requests,
+    interest: Interest,
+    native: bool,
+    udp: bool,
+    wake: Instant,
+    native_first: bool,
+) -> Selected<'a, D> {
+    tokio::select! {
+        biased;
+        () = shutdown => Selected::Shutdown,
+        request = next_selected_request(requests), if requests.enabled() => Selected::Request(request),
+        event = next_io(socket,device,interest,native,udp,wake,native_first) => Selected::Io(event),
+    }
 }
 
 enum IoEvent<'a, D: NativeDevice> {

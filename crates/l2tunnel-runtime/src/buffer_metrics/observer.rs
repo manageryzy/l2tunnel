@@ -296,6 +296,23 @@ impl Observer {
             value.sample_transport(lane, now, sample);
         }
     }
+    pub(crate) fn has_quic_tickets(&self) -> bool {
+        !self.quic.is_empty()
+    }
+    // This provider owns an explicit Carrier-drop cutoff, independent of the
+    // collector's earlier error stop. Its latencies never join that union.
+    pub(crate) fn quic_tickets(
+        &mut self,
+    ) -> Option<&mut crate::secure_udp::maintained_io::quic_metrics::tickets::Snapshot> {
+        self.quic.first_mut().map(|value| &mut value.tickets)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_quic_test(origin: Instant, path: PathBuf) -> io::Result<Self> {
+        let mut value = Self::for_test(origin, path)?;
+        value.label = "maintained_quic";
+        value.quic = Self::quic_storage("maintained_quic")?;
+        Ok(value)
+    }
     pub(crate) fn sample_quic(
         &mut self,
         lane: usize,

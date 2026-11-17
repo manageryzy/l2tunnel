@@ -11,6 +11,7 @@ struct Pending {
     ticket: Option<wire::PendingSend>,
     result: Option<Result<wire::Receipt, wire::SendFailure>>,
     deadline: Instant,
+    metric_ticket: Option<wire::quic_metrics::tickets::Identity>,
 }
 struct User {
     identity: UserIdentity,
@@ -190,11 +191,13 @@ impl MaintainedIo {
             Class::User,
             bytes,
             Framing::Final,
+            Some(identity),
         )?;
         if hold {
             return Ok(SendProgress::Pending);
         }
         if let Some(result) = user.pending.result.take() {
+            self.carrier.observe_ticket_take(user.pending.metric_ticket);
             self.user = None;
             complete(result)
         } else {
@@ -230,6 +233,7 @@ impl MaintainedIo {
             Class::Control,
             bytes,
             framing,
+            None,
         )?;
         self.control = Some(Control {
             bytes: bytes.len(),
@@ -247,6 +251,8 @@ impl MaintainedIo {
             return Ok(None);
         };
         let cost = control.cost;
+        self.carrier
+            .observe_ticket_take(control.pending.metric_ticket);
         self.control = None;
         complete(result).map(|progress| Some((progress, cost)))
     }
@@ -258,6 +264,7 @@ impl MaintainedIo {
             return Ok(None);
         };
         let identity = user.identity;
+        self.carrier.observe_ticket_take(user.pending.metric_ticket);
         self.user = None;
         complete(result).map(|progress| Some((identity, progress)))
     }
@@ -315,6 +322,7 @@ impl MaintainedIo {
                 Class::Control,
                 &self.control_bytes[..control.bytes],
                 control.framing,
+                None,
             ) {
                 control.pending.result = Some(Err(wire::SendFailure::Io(error)));
             }
@@ -360,6 +368,7 @@ fn pending(deadline: Instant) -> Pending {
         ticket: None,
         result: None,
         deadline,
+        metric_ticket: None,
     }
 }
 fn begin(
@@ -368,10 +377,14 @@ fn begin(
     class: Class,
     bytes: &[u8],
     framing: Framing,
+    user: Option<UserIdentity>,
 ) -> io::Result<()> {
     if pending.ticket.is_none() && pending.result.is_none() {
         match carrier.try_send(class, bytes, pending.deadline, framing) {
-            Ok(ticket) => pending.ticket = Some(ticket),
+            Ok(ticket) => {
+                pending.metric_ticket = carrier.bind_ticket_metrics(&ticket, user);
+                pending.ticket = Some(ticket);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
@@ -386,6 +399,7 @@ fn poll(carrier: &mut Carrier, pending: &mut Pending, cx: &mut Context<'_>) -> b
         && let Poll::Ready(result) = carrier.poll_send(cx, ticket)
     {
         pending.result = Some(result);
+        carrier.observe_ticket_result(pending.metric_ticket);
         pending.ticket = None;
         return true;
     }
@@ -425,3 +439,7 @@ fn buffer(size: usize) -> io::Result<Vec<u8>> {
     out.resize(size, 0);
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "transport_maintained_ticket_tests.rs"]
+mod ticket_tests;

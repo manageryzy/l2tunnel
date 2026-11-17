@@ -8,10 +8,13 @@ use std::io::{self, Write};
 #[path = "maintained_quic_transport_metrics.rs"]
 mod transport;
 pub(crate) use transport::Sample as TransportSample;
+#[path = "maintained_quic_ticket_metrics.rs"]
+pub(crate) mod tickets;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Snapshot {
     lanes: [Option<Provider>; 2],
+    pub(crate) tickets: tickets::Snapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +105,9 @@ impl Snapshot {
             }
             write!(out, "}}")?;
         }
-        write!(out, "]}}")
+        write!(out, "],\"tickets\":")?;
+        self.tickets.write(out)?;
+        write!(out, "}}")
     }
 }
 
@@ -246,4 +251,26 @@ pub(super) fn input(
             }),
         },
     );
+}
+
+/// Separate ticket lifetime can outlast the generic collector's first-error stop.
+pub(super) fn ticket_event(
+    metrics: &mut Option<Observer>,
+    timestamp: Option<tokio::time::Instant>,
+    event: impl FnOnce(&mut tickets::Snapshot, u64, Option<u64>),
+) {
+    let Some(metrics) = metrics
+        .as_mut()
+        .filter(|metrics| metrics.has_quic_tickets())
+    else {
+        return;
+    };
+    let now = metrics.now();
+    let converted = timestamp.and_then(|at| metrics.elapsed_at(at));
+    if let Some(state) = metrics.quic_tickets() {
+        if timestamp.is_some() && converted.is_none() {
+            state.invalid_clock();
+        }
+        event(state, now, converted);
+    }
 }

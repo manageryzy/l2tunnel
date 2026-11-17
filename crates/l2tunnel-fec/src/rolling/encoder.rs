@@ -383,11 +383,19 @@ impl Encoder {
         };
         while !job.ready && spend(&mut budget.metadata) {
             if job.cleared < self.width {
-                if !spend(&mut budget.copies) {
+                if budget.copies == 0 {
                     break;
                 }
-                self.output[job.cleared] = 0;
-                job.cleared += 1;
+                // The outer visit already paid for one byte. Batch only the
+                // same visits that the scalar loop could finish this call.
+                let count = (self.width - job.cleared)
+                    .min(budget.copies)
+                    .min(budget.metadata + 1);
+                let end = job.cleared + count;
+                self.output[job.cleared..end].fill(0);
+                budget.copies -= count;
+                budget.metadata -= count - 1;
+                job.cleared = end;
                 continue;
             }
             if job.source == job.support.end {
@@ -436,12 +444,25 @@ impl Encoder {
                 job.factor = None;
                 continue;
             }
-            if !spend(&mut budget.field) {
+            if budget.field == 0 {
                 break;
             }
-            self.output[job.column] ^=
-                field::multiply(factor, self.vectors[index * self.width + job.column]);
-            job.column += 1;
+            // Stay inside this validated source and retain the original field
+            // and metadata charge, including a later unsuccessful visit.
+            let count = (self.width - job.column)
+                .min(budget.field)
+                .min(budget.metadata + 1);
+            let end = job.column + count;
+            let start = index * self.width;
+            for (output, source) in self.output[job.column..end]
+                .iter_mut()
+                .zip(&self.vectors[start + job.column..start + end])
+            {
+                *output ^= field::multiply(factor, *source);
+            }
+            budget.field -= count;
+            budget.metadata -= count - 1;
+            job.column = end;
             if job.column == self.width {
                 job.column = 0;
                 job.source += 1;
@@ -553,5 +574,7 @@ impl Encoder {
     }
 }
 
+#[cfg(test)]
+mod batch_work_tests;
 #[cfg(test)]
 mod equation_tests;

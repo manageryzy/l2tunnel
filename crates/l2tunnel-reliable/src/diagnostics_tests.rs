@@ -211,3 +211,198 @@ fn block_decoder_capacity_is_an_actual_count_not_a_wait_or_allocated_capacity() 
     assert_eq!(receiver.statistics().skipped_fec_packets, 1);
     Ok(())
 }
+
+fn direct_observed(role: EndpointRole) -> Result<Reliable, Box<dyn std::error::Error>> {
+    let mut policy = config();
+    policy.repair_symbols = 0;
+    policy.arq.send_records = 2;
+    policy.fec.block.max_sources = 2;
+    observed(policy, role)
+}
+fn actual_source(owner: &mut Reliable, tick: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = vec![0; owner.max_packet_bytes()];
+    let n = owner
+        .poll_data(time(tick), &mut bytes, &mut budget())?
+        .ok_or("actual source")?;
+    let token = owner.pending_data_output().ok_or("actual source custody")?;
+    owner.confirm_output(time(tick), token)?;
+    bytes.truncate(n);
+    Ok(bytes)
+}
+fn actual_feedback(owner: &mut Reliable, tick: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = vec![0; owner.max_packet_bytes()];
+    let n = owner
+        .poll_feedback(time(tick), &mut bytes, &mut budget())?
+        .ok_or("actual feedback")?;
+    let token = owner
+        .pending_feedback_output()
+        .ok_or("actual feedback custody")?;
+    owner.confirm_output(time(tick), token)?;
+    bytes.truncate(n);
+    Ok(bytes)
+}
+#[test]
+fn staged_source_identity_survives_sparse_span_shorter_episode_and_terminal_censor() -> TestResult {
+    let mut sender = direct_observed(EndpointRole::Initiator)?;
+    let mut peer = direct_observed(EndpointRole::Responder)?;
+    let usage = sender.storage_usage();
+    sender.submit(b"zero", time(0))?;
+    sender.submit(b"one", time(0))?;
+    let zero = actual_source(&mut sender, 0)?;
+    peer.receive(&actual_source(&mut sender, 0)?, time(0))?;
+    sender.receive(&actual_feedback(&mut peer, 1)?, time(1))?;
+    assert_eq!(
+        sender.submit(b"two", time(2)),
+        Err(Error::Arq(RecoveryError::SequenceWindow))
+    );
+    let unit = diagnostics::staged::Unit {
+        channel: 7,
+        record: 12,
+        native_record: 13,
+        offset: 16,
+        context: true,
+    };
+    sender.observe_staged_unit(2, 3, unit);
+    sender.observe_native_provenance(
+        7,
+        13,
+        diagnostics::staged::Native {
+            flow: 100,
+            received: time(0),
+            queued: time(1),
+            deadline: Some(time(50)),
+        },
+    );
+    let pending = sender
+        .output_wait_snapshot(time(2))
+        .ok_or("observer")?
+        .staged
+        .pending
+        .ok_or("pending")?;
+    assert_eq!(
+        (pending.first.records, pending.first.records_capacity),
+        (1, 2)
+    );
+    assert!(
+        !pending.first.records_full && !pending.first.bytes_full && pending.first.sequence_full
+    );
+    assert_eq!(pending.first.oldest.ok_or("held hole")?.source.0, 0);
+    assert_eq!(pending.native.ok_or("original native")?.flow, 100);
+    peer.receive(&zero, time(3))?;
+    sender.receive(&actual_feedback(&mut peer, 4)?, time(12))?;
+    assert_eq!(sender.submit(b"two", time(12))?, 2);
+    sender.submit(b"three", time(12))?;
+    assert!(matches!(
+        sender.submit(b"four", time(13)),
+        Err(Error::Arq(RecoveryError::Capacity(_)))
+    ));
+    peer.receive(&actual_source(&mut sender, 13)?, time(13))?;
+    peer.receive(&actual_source(&mut sender, 13)?, time(13))?;
+    sender.receive(&actual_feedback(&mut peer, 14)?, time(14))?;
+    sender.submit(b"four", time(14))?;
+    sender.submit(b"five", time(14))?;
+    assert!(matches!(
+        sender.submit(b"six", time(15)),
+        Err(Error::Arq(RecoveryError::Capacity(_)))
+    ));
+    let live = sender
+        .output_wait_snapshot(time(16))
+        .ok_or("live observer")?;
+    let winner = live.staged.maximum_completed.ok_or("maximum")?;
+    assert_eq!(
+        (
+            winner.pending.source,
+            winner.pending.unit,
+            winner.pending.native
+        ),
+        (2, Some(unit), pending.native)
+    );
+    assert_eq!(winner.at - winner.pending.since, time(10));
+    assert_eq!(
+        winner.retirement.ok_or("real input retirement")?.kind,
+        diagnostics::staged::RetirementKind::Input
+    );
+    assert_eq!(
+        live.staged
+            .last_resolved
+            .ok_or("shorter completed")?
+            .pending
+            .source,
+        4
+    );
+    assert_eq!(live.staged.pending.ok_or("terminal retained")?.source, 6);
+    let terminal = live.censor(time(16));
+    assert_eq!(terminal.staged.maximum_completed, Some(winner));
+    let censored = terminal
+        .staged
+        .maximum_censored
+        .ok_or("censored identity")?;
+    assert_eq!(
+        (
+            censored.pending.source,
+            censored.at - censored.pending.since
+        ),
+        (6, time(1))
+    );
+    assert!(censored.censored && terminal.staged.pending.is_none());
+    assert_eq!(terminal, terminal.censor(time(17)));
+    assert!(!terminal.staged.invalid);
+    assert_eq!(sender.storage_usage(), usage);
+    assert_eq!(
+        sender.storage().arq.send_records,
+        2,
+        "observing/censoring did not release protocol custody"
+    );
+    Ok(())
+}
+#[test]
+fn staged_retirement_is_not_inferred_from_ack_while_actual_retry_is_held() -> TestResult {
+    let mut sender = direct_observed(EndpointRole::Initiator)?;
+    let mut peer = direct_observed(EndpointRole::Responder)?;
+    sender.submit(b"old copy", time(0))?;
+    peer.receive(&actual_source(&mut sender, 0)?, time(0))?;
+    let feedback = actual_feedback(&mut peer, 1)?;
+    let mut output = vec![0; sender.max_packet_bytes()];
+    sender
+        .poll_data(time(100), &mut output, &mut budget())?
+        .ok_or("retry")?;
+    let token = sender.pending_data_output().ok_or("held retry")?;
+    sender.receive(&feedback, time(101))?;
+    assert_eq!(sender.storage().arq.send_records, 1);
+    assert!(
+        sender
+            .output_wait_snapshot(time(101))
+            .ok_or("observer")?
+            .staged
+            .last_retirement
+            .is_none()
+    );
+    sender.confirm_output_at(time(102), time(101), token)?;
+    let event = sender
+        .output_wait_snapshot(time(102))
+        .ok_or("observer")?
+        .staged
+        .last_retirement
+        .ok_or("actual release")?;
+    assert_eq!(
+        (event.kind, event.records, event.bytes),
+        (diagnostics::staged::RetirementKind::Physical, 1, 8)
+    );
+    assert_eq!(
+        (event.accepted, event.observed, event.operation_succeeded),
+        (Some(time(101)), time(102), true)
+    );
+    assert_eq!(
+        sender.confirm_output(time(103), token),
+        Err(Error::OutputToken)
+    );
+    assert_eq!(
+        sender
+            .output_wait_snapshot(time(103))
+            .ok_or("observer")?
+            .staged
+            .last_retirement,
+        Some(event)
+    );
+    Ok(())
+}

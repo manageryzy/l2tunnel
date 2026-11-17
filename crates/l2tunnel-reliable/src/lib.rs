@@ -4,9 +4,9 @@
 //! belong to the caller. Every emitted copy consumes an explicit wire allowance.
 use l2tunnel_fec as fec;
 use l2tunnel_recovery::{
-    ACK_PACKET_BYTES, ArqConfig, DATA_HEADER_BYTES, EndpointRole, PacketView, PhysicalTransmission,
-    RecoveryContext, RecoveryEngine, RecoveryError, Retained, SelectiveRepeat,
-    Statistics as ArqStatistics, inspect_packet,
+    ACK_PACKET_BYTES, ArqConfig, BufferSide, DATA_HEADER_BYTES, EndpointRole, PacketView,
+    PhysicalTransmission, RecoveryContext, RecoveryEngine, RecoveryError, Retained,
+    SelectiveRepeat, Statistics as ArqStatistics, inspect_packet,
 };
 mod backing;
 mod compact;
@@ -756,6 +756,23 @@ impl Reliable {
         accepted: Duration,
         output: PreparedOutput,
     ) -> Result<(), Error> {
+        let before = (!self.diagnostics.is_empty()).then(|| self.arq.retained());
+        let result = self.confirm_output_inner(observed, accepted, output);
+        self.observe_retirement(
+            before,
+            observed,
+            Some(accepted),
+            diagnostics::staged::RetirementKind::Physical,
+            result.is_ok(),
+        );
+        result
+    }
+    fn confirm_output_inner(
+        &mut self,
+        observed: Duration,
+        accepted: Duration,
+        output: PreparedOutput,
+    ) -> Result<(), Error> {
         if self.pending_output == Some(output) {
             self.pending_output = None;
         } else if self.independent_feedback == Some(output) {
@@ -808,7 +825,19 @@ impl Reliable {
         if !self.arq.is_compact() && self.next_generation.is_none() {
             return Err(Error::Exhausted);
         }
-        let source = self.arq.submit(source, now)?;
+        let result = self.arq.submit(source, now);
+        if !self.diagnostics.is_empty() {
+            match result {
+                Ok(id) => self.diagnostics[0].source_admitted(id, source.len(), now),
+                Err(RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow) => {
+                    if let Some(gate) = self.arq.admission_snapshot(source.len()) {
+                        self.diagnostics[0].source_refused(now, gate);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        let source = result?;
         self.now = now;
         Ok(source)
     }
@@ -1398,6 +1427,44 @@ impl Reliable {
     /// Sticky protocol/retry failure, requiring session reconciliation/replacement.
     pub fn failure(&self) -> Option<Error> {
         self.failure.or_else(|| self.arq.failure().map(Error::Arq))
+    }
+    /// Attach actual generated codec-unit identity to the same retained source refusal.
+    /// No payload, protocol state or allocation is retained when diagnostics are disabled.
+    pub fn observe_staged_unit(
+        &mut self,
+        source: u64,
+        bytes: usize,
+        unit: diagnostics::staged::Unit,
+    ) {
+        if let Some(state) = self.diagnostics.first_mut() {
+            state.staged.unit(source, bytes, unit);
+        }
+    }
+    /// Attach provenance only after the caller's actual successful native admission.
+    pub fn observe_native_provenance(
+        &mut self,
+        channel: u16,
+        record: u64,
+        native: diagnostics::staged::Native,
+    ) {
+        if let Some(state) = self.diagnostics.first_mut() {
+            state.staged.native(channel, record, native);
+        }
+    }
+    fn observe_retirement(
+        &mut self,
+        before: Option<Retained>,
+        now: Duration,
+        accepted: Option<Duration>,
+        kind: diagnostics::staged::RetirementKind,
+        succeeded: bool,
+    ) {
+        if let Some(before) = before {
+            let after = self.arq.retained();
+            if let Some(state) = self.diagnostics.first_mut() {
+                state.source_retired(before, after, now, accepted, kind, succeeded);
+            }
+        }
     }
     /// Read-only exact output-budget observations; None means diagnostics were not selected.
     pub fn output_wait_snapshot(&self, now: Duration) -> Option<diagnostics::Snapshot> {

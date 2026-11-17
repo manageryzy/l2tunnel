@@ -112,6 +112,10 @@ def validate(value, epoch, path, issues, gaps, expected_direction=None):
         row = obj(row)
         need(row.get('reason') == name, 'unknown/duplicate/out-of-order capacity reason')
         number(row, 'refusals')
+    if 'staged_source' in value:
+        validate_staged(value['staged_source'], observed, terminal, path + '.staged_source', issues, gaps)
+    else:
+        gaps.append(path + ': exact staged source maximum/native identity unavailable in this receipt')
     gaps.append(path + ': head interval includes scheduling until emission; reason intervals overlap; '
                 'capacity gates are count-only; restored-source/builder/dependency/physical waits unavailable')
 
@@ -141,6 +145,7 @@ def render(lines, metadata, table, cell):
                       'Actual head refusal to emission, including scheduling delay; emission is not '
                       'physical acceptance. Reasons overlap and are not added. Capacity counts do '
                       'not establish wait duration. Full configuration identity is retained in JSON.'])
+        render_staged(lines, value.get('staged_source'), table, cell)
         if not value['sealed_output_present']:
             lines.append('No sealed FEC output queue is present; output wait duration is unavailable.')
             table(lines, ['Capacity gate', 'Actual count-only refusals'],
@@ -161,3 +166,146 @@ def render(lines, metadata, table, cell):
               [[row['reason'], row['refusals']] for row in value['capacity_refusals'] if row['refusals']])
         lines.append('Restored-source waits, deliberate builder hold, missing equations and physical '
                      'receipt latency are unavailable in this provider.')
+
+
+def validate_staged(value, observed, terminal, path, issues, gaps):
+    """Validate bounded identity attachments without treating them as another wait union."""
+    def need(ok, text):
+        if not ok:
+            raise ValueError(path + ': ' + text)
+
+    def obj(value):
+        need(isinstance(value, dict), 'expected object')
+        return value
+
+    def num(value, key, nullable=False):
+        need(key in value, 'missing ' + key)
+        v = value[key]
+        need((v is None and nullable) or (type(v) is int and 0 <= v <= U64_MAX), 'invalid ' + key)
+        return v
+
+    def flag(value, key):
+        need(type(value.get(key)) is bool, 'invalid ' + key)
+        return value[key]
+
+    def retirement(value):
+        if value is None:
+            return
+        value = obj(value)
+        need(num(value, 'serial') > 0 and num(value, 'observed_us') <= observed, 'invalid retirement')
+        accepted = num(value, 'accepted_us', True)
+        need(value.get('kind') in ('input', 'physical'), 'unknown retirement kind')
+        need((accepted is None) == (value['kind'] == 'input'), 'wrong acceptance boundary')
+        if flag(value, 'operation_succeeded') and accepted is not None:
+            need(accepted <= value['observed_us'], 'invalid successful physical time')
+        need(num(value, 'records') > 0, 'no actual source retention released')
+        num(value, 'bytes')
+
+    def gate(value, source, length):
+        value = obj(value)
+        need(num(value, 'next_source') == source and num(value, 'proposed_bytes') == length,
+             'gate belongs to another source')
+        records, record_cap = num(value, 'records'), num(value, 'records_capacity')
+        used, cap = num(value, 'bytes'), num(value, 'bytes_capacity')
+        need(record_cap > 0 and cap > 0 and records <= record_cap and used <= cap, 'invalid capacity')
+        resulting = num(value, 'resulting_bytes')
+        need(resulting == used + length, 'wrong proposed byte total')
+        base = num(value, 'span_base', True)
+        need(base is None or base <= source, 'invalid source span')
+        need(flag(value, 'records_full') == (records >= record_cap), 'wrong count predicate')
+        need(flag(value, 'bytes_full') == (resulting > cap), 'wrong byte predicate')
+        need(flag(value, 'sequence_full') == (base is not None and source - base >= record_cap),
+             'wrong sequence predicate')
+        need(any(value[k] for k in ('records_full', 'bytes_full', 'sequence_full')), 'no actual gate refusal')
+        need('oldest' in value, 'missing oldest availability')
+        oldest = value['oldest']
+        need((oldest is None) == (records == 0), 'wrong oldest availability')
+        if oldest is not None:
+            oldest = obj(oldest)
+            need(num(oldest, 'source') == base, 'oldest/span mismatch')
+            num(oldest, 'attempts'); num(oldest, 'transmission'); num(oldest, 'retry_at_us', True)
+            flag(oldest, 'acknowledged')
+
+    def pending(value):
+        value = obj(value)
+        source, length = num(value, 'source'), num(value, 'bytes')
+        need(length <= 65535, 'invalid source length')
+        start, last = num(value, 'since_us'), num(value, 'last_refusal_us')
+        need(start <= last <= observed, 'invalid refusal clock')
+        num(value, 'retirement_before')
+        for name in ('first_gate', 'last_gate'):
+            gate(value.get(name), source, length)
+        need('unit' in value and 'native' in value, 'missing identity availability')
+        unit, native = value['unit'], value['native']
+        if unit is not None:
+            unit = obj(unit)
+            need(num(unit, 'channel') < 256, 'invalid Aligned channel')
+            record, native_record = num(unit, 'record'), num(unit, 'native_record')
+            need(native_record == record + int(flag(unit, 'context')), 'wrong context/native identity')
+            num(unit, 'offset')
+        if native is not None:
+            native = obj(native)
+            need(unit is not None, 'native provenance without actual unit')
+            num(native, 'flow'); num(native, 'deadline_us', True)
+            need(num(native, 'received_us') <= num(native, 'queued_us') <= start,
+                 'native provenance predates/does not match original staging')
+        return start, last
+
+    value = obj(value)
+    need(value.get('schema') == 1, 'unknown schema')
+    if flag(value, 'invalid'):
+        issues.append(path + ': producer invalid identity/time/counter flag')
+    need(num(value, 'terminal_at_us', True) == terminal, 'terminal boundary mismatch')
+    for key in ('pending', 'last_resolved', 'maximum_completed', 'maximum_censored', 'last_retirement'):
+        need(key in value, 'missing ' + key)
+    if value['pending'] is not None:
+        need(terminal is None, 'open source after terminal')
+        pending(value['pending'])
+    retirement(value['last_retirement'])
+    durations = {}
+    for key in ('last_resolved', 'maximum_completed', 'maximum_censored'):
+        resolved = value[key]
+        if resolved is None:
+            continue
+        resolved = obj(resolved)
+        start, last = pending(resolved.get('pending'))
+        at, censored = num(resolved, 'at_us'), flag(resolved, 'censored')
+        need(last <= at <= observed, 'invalid resolution time')
+        need(not censored or (terminal == at), 'censor without exact terminal')
+        need(key != 'maximum_completed' or not censored, 'wrong completed population')
+        need(key != 'maximum_censored' or censored, 'wrong censored population')
+        need('latest_retirement' in resolved, 'missing retirement availability')
+        event = resolved['latest_retirement']
+        retirement(event)
+        if event is not None:
+            need(event['serial'] > resolved['pending']['retirement_before'] and event['observed_us'] <= at,
+                 'retirement outside same wait')
+        durations[key] = (at - start, censored)
+    if 'last_resolved' in durations:
+        elapsed, censored = durations['last_resolved']
+        winner = 'maximum_censored' if censored else 'maximum_completed'
+        need(winner in durations and durations[winner][0] >= elapsed, 'maximum lost its identity')
+    gaps.append(path + ': maxima attach to existing staged wait timing; no second union; native identity is '
+                'earlier admitted original, not the later refused FIFO head; latest retirement is not sole-cause proof')
+
+
+def render_staged(lines, value, table, cell):
+    if not isinstance(value, dict):
+        return
+    lines.extend(['', 'Exact staged-source identities (same existing staged wait episodes). '
+                  'These are earlier held sources; later refused FIFO heads remain separate. '
+                  'An actual retention release does not alone prove it enabled this source.'])
+    rows = []
+    for key in ('maximum_completed', 'maximum_censored', 'last_resolved'):
+        row = value.get(key)
+        if row is None:
+            continue
+        item = row['pending']; unit = item['unit']; native = item['native']; gate = item['last_gate']
+        rows.append([key, item['source'], row['at_us'] - item['since_us'],
+                     unit['channel'] if unit is not None else 'unavailable',
+                     unit['native_record'] if unit is not None else 'unavailable',
+                     native['flow'] if native is not None else 'unavailable',
+                     str(gate['records']) + '/' + str(gate['records_capacity']), gate['span_base'],
+                     ', '.join(k for k in ('records_full', 'bytes_full', 'sequence_full') if gate[k])])
+    table(lines, ['Population', 'Source', 'Episode us', 'Channel', 'Native record', 'Original flow',
+                  'Records/cap', 'Span base', 'Actual latest predicates'], rows)

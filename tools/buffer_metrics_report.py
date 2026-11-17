@@ -616,6 +616,12 @@ def normalize(value, source, digest):
         from buffer_metrics_execution import validate as validate_execution
     execution = validate_execution(value.get('common_execution'), value.get('owner'))
     issues.extend(execution['issues'])
+    try:
+        from .buffer_metrics_quic_tickets import validate as validate_quic_tickets
+    except ImportError:
+        from buffer_metrics_quic_tickets import validate as validate_quic_tickets
+    quic_tickets = validate_quic_tickets(value.get('quic'), value.get('owner'))
+    issues.extend(quic_tickets['issues'])
     management = management_provider(value.get('management_streams'), finished)
     issues.extend(management['issues'])
     ratio = None
@@ -635,6 +641,7 @@ def normalize(value, source, digest):
         'pipeline_provider_validation': pipeline,
         'management_provider_validation': management,
         'execution_provider_validation': execution,
+        'quic_ticket_provider_validation': quic_tickets,
         'provider_metadata': {key: item for key, item in value.items() if key not in CORE_FIELDS},
         'provider_metadata_definition': 'Preserved source fields; no queue usage derived from provider space or limits.',
     }
@@ -717,6 +724,26 @@ def markdown(report):
             table(lines, ['Stage', 'Samples', 'Wall sum us', 'Wall maximum us', 'Failed', 'Censored'],
                   [[row['stage'], row['samples'], row['sum_us'], row['max_us'], row['failed'], row['censored']]
                    for row in execution['stages'] if row['samples']])
+        selection = execution['selection']
+        lines.append('Selection observation: ' + cell(selection['status']) + '.')
+        if (execution['status'] == 'validated_wall_spans' and
+                selection['status'] == 'validated_observed_selection'):
+            maximum = selection['maximum_lateness']
+            if maximum is None:
+                lines.append('Resume lateness: unavailable (no completed selection).')
+            else:
+                table(lines, ['Maximum resume lateness us', 'Planned wake us', 'Winning poll entry us', 'Observed return us', 'Winner'],
+                      [[maximum['lateness_us'], maximum['planned_wake_us'], maximum['poll_entered_at_us'],
+                        maximum['observed_at_us'], maximum['winner']]])
+            interrupted = selection['interrupted']
+            if interrupted is not None:
+                table(lines, ['Interrupted planned wake us', 'Cancellation cutoff us'],
+                      [[interrupted['planned_wake_us'], interrupted['observed_at_us']]])
+        try:
+            from .buffer_metrics_quic_tickets import render as render_quic_tickets
+        except ImportError:
+            from buffer_metrics_quic_tickets import render as render_quic_tickets
+        render_quic_tickets(lines, owner['quic_ticket_provider_validation'], table, cell)
         protocol = owner['protocol_provider_validation']
         lines.extend(['', 'Protocol provider: ' + cell(protocol['status']) + '. ' +
                       protocol['definition']])

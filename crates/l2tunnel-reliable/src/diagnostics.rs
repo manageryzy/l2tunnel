@@ -2,6 +2,8 @@
 //! Packing delay, missing equations and physical custody are not inferred waits.
 use super::{EndpointRole, RecoveryContext};
 use std::time::Duration;
+#[path = "staged_diagnostics.rs"]
+pub mod staged;
 
 /// Operational block staging bounds; byte reservations are not queue capacities.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -109,6 +111,8 @@ pub struct Snapshot {
     /// Actual input refusals only: decoder symbol slots, generation slots, logical
     /// reservation, restored packet slots, restored byte budget. These are not waits.
     pub capacity_refusals: [u64; 5],
+    /// Opt-in same-source identity and actual gate/retirement observations.
+    pub staged: staged::Snapshot,
     /// Diagnostic time regressed; no protocol clock is changed.
     pub clock_regression: bool,
     /// Actual head identity differed before corresponding progress.
@@ -133,9 +137,41 @@ impl Snapshot {
             pending: None,
             last_resolved: None,
             capacity_refusals: [0; 5],
+            staged: staged::Snapshot::default(),
             clock_regression: false,
             identity_mismatch: false,
             overflow: false,
+        }
+    }
+    pub(crate) fn source_refused(
+        &mut self,
+        now: Duration,
+        gate: l2tunnel_recovery::AdmissionSnapshot,
+    ) {
+        if self.observe(now) {
+            self.staged.refused(now, gate);
+        }
+    }
+    pub(crate) fn source_admitted(&mut self, source: u64, bytes: usize, now: Duration) {
+        if self.observe(now) {
+            self.staged.admitted(source, bytes, now);
+        }
+    }
+    pub(crate) fn source_retired(
+        &mut self,
+        before: l2tunnel_recovery::Retained,
+        after: l2tunnel_recovery::Retained,
+        now: Duration,
+        accepted: Option<Duration>,
+        kind: staged::RetirementKind,
+        succeeded: bool,
+    ) {
+        if after.send_records < before.send_records || after.send_bytes < before.send_bytes {
+            // Keep the actual irreversible release even if the original operation
+            // reports a clock error. Only diagnostic validity changes here.
+            self.observe(now);
+            self.staged
+                .retired(before, after, now, accepted, kind, succeeded);
         }
     }
     fn observe(&mut self, now: Duration) -> bool {
@@ -158,6 +194,7 @@ impl Snapshot {
     /// A cached snapshot must retain its own older observation boundary instead.
     pub fn censor(mut self, now: Duration) -> Self {
         if self.observe(now) {
+            self.staged.censor(now);
             self.close(now, true);
             self.terminal_at = Some(now);
         }

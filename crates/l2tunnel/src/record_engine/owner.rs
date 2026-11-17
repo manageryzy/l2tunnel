@@ -216,6 +216,21 @@ impl Owner {
             Self::Connections(owner) => owner.offer_diagnosed(now, metadata, bytes, on_block),
             _ => {
                 let result = self.offer(now, metadata.binding.channel, bytes)?;
+                if let (Self::Aligned(endpoint), Some(observed)) = (&mut *self, &result)
+                    && let ProfileIdentity::Aligned(identity) = observed.identity
+                {
+                    // Only the successfully admitted original owns this provenance.
+                    // A later refused FIFO head must never replace the staged packet.
+                    endpoint.observe_native_provenance(
+                        identity,
+                        l2tunnel_reliable::diagnostics::staged::Native {
+                            flow: metadata.binding.id.0,
+                            received: metadata.timing.received,
+                            queued: metadata.timing.admitted,
+                            deadline: metadata.timing.original_deadline,
+                        },
+                    );
+                }
                 if result.is_none() {
                     on_block(if matches!(self, Self::Swift(_)) {
                         super::AdmissionBlock::SwiftPackingQueue

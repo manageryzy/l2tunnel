@@ -1180,6 +1180,20 @@ impl Endpoint {
         self.recovery.output_wait_snapshot(now)
     }
 
+    /// Attach actual successful caller admission provenance to the retained native record.
+    /// This is optional observation only, never flow/record authentication authority.
+    pub fn observe_native_provenance(
+        &mut self,
+        identity: receiver::RecordIdentity,
+        native: l2tunnel_reliable::diagnostics::staged::Native,
+    ) {
+        self.recovery.observe_native_provenance(
+            u16::from(identity.channel.0),
+            identity.record.0,
+            native,
+        );
+    }
+
     /// Read the actual codec stage and receiver; recovery buffers remain separate.
     pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
         l2tunnel_codec::diagnostics::DuplexBuffers {
@@ -1245,6 +1259,19 @@ impl Endpoint {
                         staged_wait::Reason::SendCapacity
                     };
                     self.staged_wait.refused(id, length, self.now, reason);
+                    if let Some(unit) = self.sender.staged_identity() {
+                        self.recovery.observe_staged_unit(
+                            id,
+                            length,
+                            l2tunnel_reliable::diagnostics::staged::Unit {
+                                channel: u16::from(unit.channel),
+                                record: unit.record,
+                                native_record: unit.native_record,
+                                offset: unit.offset,
+                                context: unit.context,
+                            },
+                        );
+                    }
                     break;
                 }
                 Err(error) => return self.fail(Error::Recovery(error)),

@@ -222,6 +222,49 @@ pub struct Retained {
     pub receive_bytes: usize,
 }
 
+/// Actual oldest retained source at a local admission check; no payload is exposed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionFlight {
+    /// Full recovery source identity.
+    pub source: SourceId,
+    /// Already prepared attempts, including any unconfirmed current attempt.
+    pub attempts: u32,
+    /// Actual still-held physical serial; zero means no held transmission.
+    pub transmission: u64,
+    /// A validated earlier-copy ACK is retained while physical custody remains.
+    pub acknowledged: bool,
+    /// Original current retry deadline; None is not an immediate retry claim.
+    pub retry_at: Option<Duration>,
+}
+/// Read-only scalar predicates reused by the actual source admission gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionSnapshot {
+    /// Exact next source that the owner would allocate.
+    pub next_source: SourceId,
+    /// Actual source-span frontier, not the number of retained entries.
+    pub span_base: Option<SourceId>,
+    /// Current oldest retained flight, absent when no source remains.
+    pub oldest: Option<AdmissionFlight>,
+    /// Actual retained source count.
+    pub records: usize,
+    /// Configured count and sequence-span bound.
+    pub records_capacity: usize,
+    /// Actual retained source payload bytes.
+    pub bytes: usize,
+    /// Configured retained payload bound.
+    pub bytes_capacity: usize,
+    /// Exact proposed source payload bytes.
+    pub proposed_bytes: usize,
+    /// Checked retained plus proposed bytes.
+    pub resulting_bytes: usize,
+    /// Actual count predicate at this observation.
+    pub records_full: bool,
+    /// Actual byte predicate at this observation.
+    pub bytes_full: bool,
+    /// Actual next-source span predicate at this observation.
+    pub sequence_full: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
     Selective,
@@ -424,6 +467,11 @@ impl SelectiveRepeat {
     /// Actual persistent heap capacity, or None for legacy dynamic backing.
     pub fn storage_usage(&self) -> Option<crate::storage::Usage> {
         self.0.storage_usage
+    }
+
+    /// Observe the same scalar source gate without time, allocation or mutation.
+    pub fn admission_snapshot(&self, bytes: usize) -> Result<AdmissionSnapshot, RecoveryError> {
+        self.0.admission_snapshot(bytes)
     }
 
     /// Whether an allocated source was removed by a validated peer receipt.
@@ -901,25 +949,66 @@ impl Engine {
         Ok(())
     }
 
+    fn admission_bytes(&self, proposed: usize) -> Result<usize, RecoveryError> {
+        self.send_bytes
+            .checked_add(proposed)
+            .ok_or(RecoveryError::CounterExhausted)
+    }
+    fn admission_base(&self) -> Option<SourceId> {
+        self.compact
+            .as_ref()
+            .map(|state| SourceId(state.base))
+            .or_else(|| self.sent.first_key_value().map(|(source, _)| *source))
+    }
+    fn admission_span_full(&self, base: Option<SourceId>) -> bool {
+        base.is_some_and(|first| self.next_source - first.0 >= self.config.send_records as u64)
+    }
+    fn admission_snapshot(
+        &self,
+        proposed_bytes: usize,
+    ) -> Result<AdmissionSnapshot, RecoveryError> {
+        let resulting_bytes = self.admission_bytes(proposed_bytes)?;
+        let oldest = self
+            .sent
+            .first_key_value()
+            .map(|(source, flight)| AdmissionFlight {
+                source: *source,
+                attempts: flight.attempts,
+                transmission: flight.transmission,
+                acknowledged: flight.acknowledged,
+                retry_at: flight.retry_at,
+            });
+        let span_base = self
+            .compact
+            .as_ref()
+            .map(|state| SourceId(state.base))
+            .or_else(|| oldest.map(|flight| flight.source));
+        Ok(AdmissionSnapshot {
+            next_source: SourceId(self.next_source),
+            span_base,
+            oldest,
+            records: self.sent.len(),
+            records_capacity: self.config.send_records,
+            bytes: self.send_bytes,
+            bytes_capacity: self.config.send_bytes,
+            proposed_bytes,
+            resulting_bytes,
+            records_full: self.sent.len() >= self.config.send_records,
+            bytes_full: resulting_bytes > self.config.send_bytes,
+            sequence_full: self.admission_span_full(span_base),
+        })
+    }
+
     fn submit(&mut self, source: &[u8], now: Duration) -> Result<u64, RecoveryError> {
         self.check_time(now)?;
         if source.len() > self.config.max_source_bytes {
             return Err(RecoveryError::SourceTooLarge);
         }
-        let bytes = self
-            .send_bytes
-            .checked_add(source.len())
-            .ok_or(RecoveryError::CounterExhausted)?;
+        let bytes = self.admission_bytes(source.len())?;
         if self.sent.len() >= self.config.send_records || bytes > self.config.send_bytes {
             return Err(RecoveryError::Capacity(BufferSide::Send));
         }
-        if let Some(first) = self
-            .compact
-            .as_ref()
-            .map(|state| state.base)
-            .or_else(|| self.sent.first_key_value().map(|(source, _)| source.0))
-            && self.next_source - first >= self.config.send_records as u64
-        {
+        if self.admission_span_full(self.admission_base()) {
             return Err(RecoveryError::SequenceWindow);
         }
         let next = self

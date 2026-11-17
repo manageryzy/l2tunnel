@@ -11,6 +11,9 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod selection;
+pub(crate) use selection::SelectionWinner;
+
 /// Diagnostic owner; no peer/session identity or request contents are logged.
 #[derive(Clone, Copy, Debug)]
 pub enum Owner {
@@ -84,7 +87,13 @@ pub enum Stage {
     CommonNativeRead,
     /// Actual bounded diagnostic buffer sample collection.
     CommonBufferSampling,
-    /// Current Common status to bounded JSON value projection.
+    /// Actual wake/interest planning, without waiting or changing its result.
+    CommonWakePlanning,
+    /// Actual poll calls of the original nested selection; includes preemption.
+    CommonSelectPoll,
+    /// Pending return to next poll entry; includes intentional suspension.
+    CommonSelectPending,
+    /// Current Common snapshot acquisition and bounded JSON value projection.
     CliProjection,
     /// Current JSON value serialization, excluding its queue residence.
     CliEncoding,
@@ -94,7 +103,7 @@ pub enum Stage {
     CliFileWrite,
 }
 
-const STAGES: [Stage; 29] = [
+const STAGES: [Stage; 32] = [
     Stage::ContractAndRecords,
     Stage::ControlAndExternalPlanning,
     Stage::EngineAndBankPlanning,
@@ -120,6 +129,9 @@ const STAGES: [Stage; 29] = [
     Stage::CommonNativeWrite,
     Stage::CommonNativeRead,
     Stage::CommonBufferSampling,
+    Stage::CommonWakePlanning,
+    Stage::CommonSelectPoll,
+    Stage::CommonSelectPending,
     Stage::CliProjection,
     Stage::CliEncoding,
     Stage::CliFlush,
@@ -173,6 +185,7 @@ struct State {
     origin: Instant,
     active: Option<(Stage, Instant)>,
     previous_turn: Option<Instant>,
+    selection: selection::Selections,
     report_on_drop: bool,
     stages: [Aggregate; STAGES.len()],
     accepted: u64,
@@ -465,6 +478,7 @@ fn allocate_state(id: u64, owner: Owner, origin: Instant) -> Vec<State> {
         origin,
         active: None,
         previous_turn: None,
+        selection: selection::Selections::default(),
         report_on_drop: !matches!(owner, Owner::CliOutput | Owner::CommonExecution),
         stages: [Aggregate::default(); STAGES.len()],
         accepted: 0,
@@ -560,6 +574,7 @@ impl State {
     /// overlaps its read/handler/reply stages and must not be added to their sum.
     pub fn end_request_at(&mut self, now: Instant, outcome: Outcome) {
         self.end_at(now, outcome);
+        self.invalid |= self.selection.censor(self.origin, now);
         let Some(start) = self.request.take() else {
             return;
         };
@@ -621,12 +636,13 @@ impl State {
             .and_then(|value| u64::try_from(value.as_micros()).ok());
         write!(
             out,
-            "{{\"event\":\"{}\",\"schema\":1,\"owner\":\"{:?}\",\"id\":{},\"pid\":{},\"checkpoint\":\"{}\",\"definition\":\"owner-local wall durations; includes descheduling; overlapping stages and turn spacing are not CPU or blocked time\",\"elapsed_us\":{},\"invalid\":{},\"accepted\":{},\"replied\":{},\"inline_bytes\":{},\"diagnostic_heap_bytes\":{},\"stages\":[",
+            "{{\"event\":\"{}\",\"schema\":{},\"owner\":\"{:?}\",\"id\":{},\"pid\":{},\"checkpoint\":\"{}\",\"definition\":\"owner-local wall durations; includes descheduling; overlapping stages and turn spacing are not CPU or blocked time\",\"elapsed_us\":{},\"invalid\":{},\"accepted\":{},\"replied\":{},\"inline_bytes\":{},\"diagnostic_heap_bytes\":{},\"stages\":[",
             if execution_owner(self.owner) {
                 "execution_timing"
             } else {
                 "initialization_timing"
             },
+            if execution_owner(self.owner) { 2 } else { 1 },
             self.owner,
             self.id,
             std::process::id(),
@@ -659,10 +675,15 @@ impl State {
             optional_us(out, value.maximum_end_us)?;
             write!(out, "}}")?;
         }
+        write!(out, "]")?;
+        if execution_owner(self.owner) {
+            write!(out, ",\"selection\":")?;
+            self.selection.write(self.origin, out)?;
+        }
         let value = self.request_duration;
         writeln!(
             out,
-            "],\"accepted_to_completion\":{{\"samples\":{},\"sum_us\":{},\"max_us\":{},\"failed\":{},\"censored\":{}}}}}",
+            ",\"accepted_to_completion\":{{\"samples\":{},\"sum_us\":{},\"max_us\":{},\"failed\":{},\"censored\":{}}}}}",
             value.samples, value.sum_us, value.max_us, value.failed, value.censored
         )
     }
@@ -755,6 +776,7 @@ mod tests {
             origin,
             active: None,
             previous_turn: None,
+            selection: selection::Selections::default(),
             report_on_drop: false,
             stages: [Aggregate::default(); STAGES.len()],
             accepted: 0,
@@ -787,6 +809,7 @@ mod tests {
             origin,
             active: None,
             previous_turn: None,
+            selection: selection::Selections::default(),
             report_on_drop: false,
             stages: [Aggregate::default(); STAGES.len()],
             accepted: 0,

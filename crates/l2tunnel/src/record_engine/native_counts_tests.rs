@@ -257,3 +257,118 @@ fn early_short_roundtrip(raw: bool, role: Role) -> TestResult {
     assert_eq!(receiver.storage_usage(), receiver_usage);
     Ok(())
 }
+
+#[test]
+fn actual_staged_original_provenance_is_not_replaced_by_later_refused_fifo_head() -> TestResult {
+    let original_config = fixture(Family::Aligned, true)?;
+    let descriptor = original_config.descriptor();
+    let configuration::Profile::Aligned {
+        mut forward,
+        reverse,
+    } = *descriptor.profile()
+    else {
+        return Err("actual Aligned fixture".into());
+    };
+    // Retain an actual unit after the earlier original fills the ARQ window.
+    forward.recovery.arq.send_records = 4;
+    forward.recovery.arq.receive_records = 4;
+    let config = configuration::Configuration::new(
+        original_config.envelope(),
+        configuration::Descriptor::new(
+            descriptor.path_mtu(),
+            descriptor.duplex(),
+            *descriptor.direction(Role::Client).common(),
+            *descriptor.direction(Role::Server).common(),
+            configuration::Profile::Aligned { forward, reverse },
+        )?,
+    )?;
+    let plan = storage::Plan::for_engine(
+        config,
+        context(Role::Client),
+        geometry(),
+        NativeLimits {
+            stall_micros: 50_000,
+        },
+    )?
+    .with_reliable_output_diagnostics()?;
+    let mut engine = Engine::new_reserved(
+        plan,
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    let usage = engine.storage_usage();
+    let original = packet(true, 1001, 1024, 7);
+    let queued = engine.enqueue_borrowed(Tick(0), &original)?;
+    let admitted = engine
+        .admit_borrowed_diagnosed(Tick(0), |_| {})?
+        .ok_or("actual native admission")?;
+    assert_eq!(admitted.metadata, queued);
+    let ProfileIdentity::Aligned(native_id) = admitted.permit.identity else {
+        return Err("Aligned identity".into());
+    };
+    // Admission pumps at most the configured window. A subsequent real output
+    // poll attempts the next source and observes the still-full retained window.
+    let mut output = vec![0; engine.send_max];
+    let mut witnesses = vec![
+        receiver::UnitWitness {
+            identity: native_id,
+            index: 0,
+            count: 1,
+        };
+        engine.witnesses
+    ];
+    let mut budget = OutboundBudget {
+        packets: 0,
+        wire_bytes: 0,
+    };
+    assert!(
+        engine
+            .poll(Tick(0), 0, true, &mut output, &mut budget, &mut witnesses)?
+            .is_none()
+    );
+    let before = engine
+        .reliable_output_wait(Duration::ZERO)
+        .ok_or("opted diagnostics")?
+        .staged
+        .pending
+        .ok_or("actual retained unit")?;
+    assert_eq!(
+        before.native.ok_or("actual original Flow")?.flow,
+        queued.binding.id.0
+    );
+    assert_eq!(
+        before.unit.ok_or("canonical unit")?.native_record,
+        native_id.record.0
+    );
+    assert_eq!(
+        before.unit.ok_or("canonical unit")?.channel,
+        u16::from(native_id.channel.0)
+    );
+    let later = engine.enqueue_borrowed(Tick(1), &packet(true, 1002, 100, 9))?;
+    assert_ne!(later.binding.id, queued.binding.id);
+    let mut refusal = None;
+    assert!(
+        engine
+            .admit_borrowed_diagnosed(Tick(1), |value| refusal = Some(value))?
+            .is_none()
+    );
+    let refusal = refusal.ok_or("actual later head refusal")?;
+    assert_eq!(
+        (refusal.flow, refusal.reason),
+        (later.binding.id, AdmissionBlock::CodecStage)
+    );
+    let after = engine
+        .reliable_output_wait(Duration::from_micros(1))
+        .ok_or("observer")?
+        .staged
+        .pending
+        .ok_or("same earlier unit")?;
+    assert_eq!(
+        (after.source, after.unit, after.native, after.since),
+        (before.source, before.unit, before.native, before.since)
+    );
+    assert_ne!(after.native.ok_or("earlier original")?.flow, refusal.flow.0);
+    assert_eq!(engine.storage_usage(), usage);
+    Ok(())
+}

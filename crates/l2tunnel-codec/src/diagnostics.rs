@@ -119,3 +119,18 @@ pub enum ReceiveBlock {
     /// Complete bytes cannot yet be interpreted in their ordered context.
     MissingContext,
 }
+
+/// Exact current unit in the single native stage, without preparing or consuming it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageIdentity {
+    /// Actual ordered codec channel.
+    pub channel: u8,
+    /// Full context/body record currently supplying the next unit.
+    pub record: u64,
+    /// Final body record returned at original successful native admission.
+    pub native_record: u64,
+    /// Cursor into the current body/context, before the next unit is committed.
+    pub offset: usize,
+    /// This unit belongs to the context preceding the final native body.
+    pub context: bool,
+}

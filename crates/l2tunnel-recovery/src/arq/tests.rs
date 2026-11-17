@@ -334,12 +334,30 @@ fn selective_ack_holes_do_not_expand_the_send_span() -> Result<(), RecoveryError
     assert_eq!(u64::from_be_bytes(field(&selective, 40)?), 2);
     sender.receive(&selective, ms(1))?;
     assert_eq!(sender.retained().send_records, 1);
+    let gate = sender.admission_snapshot(3)?;
+    assert_eq!((gate.records, gate.records_capacity), (1, 2));
+    assert!(!gate.records_full && !gate.bytes_full && gate.sequence_full);
+    assert_eq!(
+        (gate.next_source, gate.span_base),
+        (SourceId(2), Some(SourceId(0)))
+    );
+    let oldest = gate.oldest.ok_or(RecoveryError::MalformedPacket)?;
+    assert_eq!(
+        (oldest.source, oldest.attempts, oldest.acknowledged),
+        (SourceId(0), 1, false)
+    );
     assert_eq!(
         sender.submit(b"two", ms(1)),
         Err(RecoveryError::SequenceWindow)
     );
     receiver.receive(&zero, ms(1))?;
     sender.receive(&emit(&mut receiver, ms(2))?, ms(2))?;
+    let released = sender.admission_snapshot(3)?;
+    assert_eq!(
+        (released.records, released.span_base, released.oldest),
+        (0, None, None)
+    );
+    assert!(!released.records_full && !released.bytes_full && !released.sequence_full);
     assert_eq!(sender.submit(b"two", ms(2))?, 2);
     Ok(())
 }
