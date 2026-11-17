@@ -199,9 +199,8 @@ impl RecordPlan {
                     .map(Owner::Swift)
                     .map_err(Error::Swift)
             }
-            Self::Aligned(plan) => aligned::Endpoint::new_duplex_reserved(
-                plan.send_config(),
-                plan.receive_config(),
+            Self::Aligned(plan) => aligned::Endpoint::new_reserved_with_plan(
+                plan,
                 recovery,
                 aligned::storage::Limits {
                     capacity_bytes: plan.capacity_bytes(),
@@ -209,9 +208,8 @@ impl RecordPlan {
             )
             .map(Owner::Aligned)
             .map_err(Error::Aligned),
-            Self::Packed(plan) => aligned::packed::Endpoint::new_duplex_reserved(
-                plan.send_packed().ok_or(Error::Invariant)?,
-                plan.receive_packed().ok_or(Error::Invariant)?,
+            Self::Packed(plan) => aligned::packed::Endpoint::new_reserved_with_plan(
+                plan,
                 recovery,
                 aligned::storage::Limits {
                     capacity_bytes: plan.capacity_bytes(),
@@ -518,6 +516,33 @@ impl Plan {
             RecordPlan::Research(plan) => {
                 RecordPlan::Research(plan.with_wait_diagnostics().map_err(Error::Rolling)?)
             }
+            other => other,
+        };
+        let extra = self
+            .record
+            .heap_bytes()
+            .checked_sub(before)
+            .ok_or(Error::Layout)?;
+        self.heap_bytes = self.heap_bytes.checked_add(extra).ok_or(Error::Layout)?;
+        self.capacity_bytes = self
+            .capacity_bytes
+            .checked_add(extra)
+            .ok_or(Error::Layout)?;
+        Ok(self)
+    }
+    /// Pre-admit exact Block/Direct ARQ output observations. Compact ARQ and
+    /// unrelated families construct no block pools or diagnostic sidecar here.
+    pub fn with_reliable_output_diagnostics(mut self) -> Result<Self, Error> {
+        let before = self.record.heap_bytes();
+        self.record = match self.record {
+            RecordPlan::Aligned(plan) => RecordPlan::Aligned(
+                plan.with_reliable_output_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
+            RecordPlan::Packed(plan) => RecordPlan::Packed(
+                plan.with_reliable_output_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
             other => other,
         };
         let extra = self

@@ -395,6 +395,9 @@ mod tests {
             dropped_bytes: u64::MAX,
             written_bytes: u64::MAX,
             queue_bytes_high: u64::MAX,
+            shutdown_timeouts: u64::MAX,
+            unresolved_lines: u64::MAX,
+            unresolved_bytes: u64::MAX,
         })?;
         assert!(serde_json::to_vec(&value)?.len() < 4096);
         Ok(())

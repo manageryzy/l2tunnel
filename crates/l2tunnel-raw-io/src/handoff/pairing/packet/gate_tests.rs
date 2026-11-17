@@ -471,3 +471,87 @@ fn upper_feedback_has_bounded_headroom_without_spending_internal_control_reserve
     assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
     Ok(())
 }
+
+#[test]
+fn early_hello_proof_diagnostic_retains_exact_window_refusal_without_adoption() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    state.fence = None;
+    state.active = false;
+    state.hello_allowed = true;
+    state.expected_pair = [7; 32];
+    state.expected_armed = [8; 32];
+    let body = hello().encode()?;
+    let protected = seal(&mut sealer, wire::Kind::Hello, 0, &body)?;
+    state.ingest_phase(&outer(&protected, 2000, 1000, 32768)?)?;
+    assert!(state.early.is_some());
+    state.fence = fixture()?.0.fence;
+    state.fence.as_mut().ok_or("fence")?.peer_horizon = 32763;
+    let before = state.fence.as_ref().ok_or("fence")?.retired;
+    assert!(matches!(state.release_early(), Err(Error::Proof)));
+    let Some(SetupProofFailure::EarlyHelloRelease(value)) = state.proof_failure else {
+        return Err("missing early release proof diagnostic".into());
+    };
+    assert!(value.sequence_matches && value.acknowledgment_matches);
+    assert!(value.within_local_horizon && value.within_sequence_space);
+    assert!(!value.window_matches && !value.right_edge_matches);
+    assert_eq!(
+        (value.expected_window, value.observed_window),
+        (32763, 32768)
+    );
+    assert_eq!(
+        (value.expected_right_edge, value.observed_right_edge),
+        (32763, 32768)
+    );
+    assert_eq!(value.end, protected.len() as u64);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, before);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.peer_horizon, 32763);
+    assert!(state.incoming.is_empty());
+    assert!(
+        state.fault.is_none(),
+        "diagnostic must not invent a gate fault"
+    );
+    // The original release consumed the early cell on failure. Observing that
+    // absence does not replace the first retained failure with a success.
+    state.release_early()?;
+    assert_eq!(
+        state.proof_failure,
+        Some(SetupProofFailure::EarlyHelloRelease(value))
+    );
+    Ok(())
+}
+
+#[test]
+fn complementary_diagnostic_keeps_identity_sequence_and_scale_refusals_separate() -> R {
+    let peer = hello().lanes[0].ok_or("peer")?;
+    let mut local = peer;
+    local.role = 1;
+    local.written = peer.read;
+    local.read = peer.written;
+    local.una = peer.receive;
+    local.next = peer.receive;
+    local.receive = peer.next;
+    local.ack = peer.next;
+    local.available = u32::MAX - local.next;
+    local.complementary(peer)?;
+    for variant in 0..4 {
+        let mut other = peer;
+        match variant {
+            0 => other.session[0] ^= 1,
+            1 => other.receive += 1,
+            2 => other.peer_scale = 1,
+            _ => other.peer_window -= 1,
+        }
+        assert!(matches!(local.complementary(other), Err(Error::Proof)));
+        let SetupProofFailure::Hello(value) =
+            SetupProofFailure::hello(SetupProofBoundary::PeerHello, local, other)
+        else {
+            return Err("wrong proof diagnostic".into());
+        };
+        assert_eq!(value.identity_matches, variant != 0);
+        assert_eq!(value.sequence_matches, variant != 1);
+        assert_eq!(value.scales_match, variant != 2);
+        assert_eq!(value.peer_peer_window_matches, variant != 3);
+        assert!(value.stream_bytes_match && value.options_match && value.local_peer_window_matches);
+    }
+    Ok(())
+}

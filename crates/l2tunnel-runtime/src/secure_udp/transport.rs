@@ -160,7 +160,13 @@ async fn run_driver_clock<D, R: raw_carrier::RawBacking>(
 where
     D: NativeDevice + Send,
 {
+    use crate::initialization_timing::{Owner as TimingOwner, Stage as TimingStage, Timing};
     let origin = driver.origin;
+    let (mut execution, execution_initialization_failed) =
+        match Timing::try_from_environment(TimingOwner::CommonExecution, origin) {
+            Ok(timing) => (timing, false),
+            Err(_) => (Timing::disabled(), true),
+        };
     let mut device =
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
@@ -183,44 +189,56 @@ where
         ));
     }
     tokio::pin!(shutdown);
-    observe(driver, clock(origin, ready)?, true)?;
+    execution.measure_result(TimingStage::CommonSnapshot, || {
+        observe(driver, clock(origin, ready)?, true)
+    })?;
     let mut observed_transaction = driver.transaction_observation()?;
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
-            if begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
-                driver.complete_carrier_io(socket, &mut sample)
-            }).await? {
+            execution.turn();
+            if execution.measure_future(TimingStage::CommonReceiptProgress,
+                begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
+                    driver.complete_carrier_io(socket, &mut sample)
+                })
+            ).await? {
                 break Ok(StopReason::Cancelled);
             }
             socket.begin_turn();
             if socket.is_carrier() {
-                socket.observe_completions().await;
-                driver.complete_carrier_io(&mut socket,&mut sample)?;
+                execution.measure_future(TimingStage::CommonReceiptProgress, async {
+                    socket.observe_completions().await;
+                    driver.complete_carrier_io(&mut socket,&mut sample)
+                }).await?;
             }
             if driver.has_transactions(){
-                if !driver.check_expiry(clock(origin,sample())?)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                driver.admit_common(||clock(origin,sample()).map(duration))?;
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(clock(origin,sample())?))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+                execution.measure_result(TimingStage::CommonAdmission, || driver.admit_common(||clock(origin,sample()).map(duration)))?;
             }
             let mut instant=sample();let mut now=clock(origin,instant)?;
             driver.performance.counters.loop_turns=driver.performance.counters.loop_turns.saturating_add(1);
-            driver.sample_common_buffers(now);
-            driver.sample_raw_buffers(&mut socket, instant, false);
-            if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-            driver.service_common_ingress(now, &mut inputs.native)?;
-            driver.collect_native(now)?;
-            driver.progress(now)?;
-            driver.service_common_rolling(now)?;
+            execution.measure_result(TimingStage::CommonBufferSampling, || {
+                driver.sample_common_buffers(now);
+                driver.sample_raw_buffers(&mut socket, instant, false);
+                Ok::<(), io::Error>(())
+            })?;
+            if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(now))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+            execution.measure_result(TimingStage::CommonProtocolProgress, || {
+                driver.service_common_ingress(now, &mut inputs.native)?;
+                driver.collect_native(now)?;
+                driver.progress(now)?;
+                driver.service_common_rolling(now)
+            })?;
             let completed=driver.report_transaction_completion(
                 ||clock(origin,sample()),
-                |driver,at|observe(driver,at,true),
+                |driver,at|execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,at,true)),
             )?;
             let actual=driver.transaction_observation()?;
             let mut semantic_observed=false;
             if driver.terminal.is_none() && !completed && (actual!=observed_transaction || driver.observation_dirty()) {
                 let reported=clock(origin,sample())?;
-                if !driver.check_expiry(reported)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
-                observe(driver,reported,true)?;
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(reported))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+                execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,reported,true))?;
                 semantic_observed=true;
             }
             observed_transaction=actual;
@@ -228,18 +246,21 @@ where
             if let Some(reason)=driver.terminal {break Ok(reason);}
             if driver.has_transactions() && (completed || semantic_observed) {
                 instant=sample();now=clock(origin,instant)?;
-                if !driver.check_expiry(now)? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
+                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(now))? {break Ok(driver.terminal.ok_or_else(||protocol("terminal expiry missing"))?);}
             }
-            driver.service_selected_control(now)?;
-            driver.submit_control(now)?;
-            driver.send_selected_io_sampled(&mut socket,now,instant,&mut sample)?;
+            execution.measure_result(TimingStage::CommonManagement, || {
+                driver.service_selected_control(now)?;
+                driver.submit_control(now)
+            })?;
+            execution.measure_result(TimingStage::CommonSend, || driver.send_selected_io_sampled(&mut socket,now,instant,&mut sample))?;
             let native_before=driver.performance.counters.native_write_batch_packets;
-            let native_spent=driver.flush_native_ready(&mut device,||clock(origin,sample())).await?;
+            let native_spent=execution.measure_future(TimingStage::CommonNativeWrite,
+                driver.flush_native_ready(&mut device,||clock(origin,sample()))).await?;
             let native_write_remaining=driver.config.work.native_write_batch.saturating_sub(native_spent);
             if let Some(reason)=driver.terminal {break Ok(reason);}
             if driver.next_report.is_some_and(|at|now>=at) {
                 let reported=clock(origin,sample())?;
-                observe(driver,reported,true)?;
+                execution.measure_result(TimingStage::CommonSnapshot, || observe(driver,reported,true))?;
                 driver.next_report=driver.config.report_interval.map(|interval|add(reported,interval)).transpose()?;
             }
             let read_native=driver.can_admit_native()?;
@@ -266,9 +287,9 @@ where
                     let maximum=if socket.receive_ready() {driver.config.work.receive_packets.min(driver.ingress.left)}else{0};
                     let mut batch=0u64;
                     for _ in 0..maximum {
-                        if !driver.check_expiry(clock(origin,sample())?)? {break;}
+                        if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(clock(origin,sample())?))? {break;}
                         driver.ingress.left-=1;
-                        match socket.try_receive_at_ready(&mut inputs.datagram).await {
+                        match execution.measure_future(TimingStage::CommonCarrierReceive, socket.try_receive_at_ready(&mut inputs.datagram)).await {
                             Ok((length,received,framing))=>{
                                 batch+=1;
                                 if socket.is_maintained() {
@@ -280,7 +301,7 @@ where
                                 }
                                 let metadata=socket.final_input_metadata();
                                 let at=sample();let time=clock(origin,at)?;
-                                if !driver.check_expiry(time)? {
+                                if !execution.measure_result(TimingStage::CommonDeadlineService, || driver.check_expiry(time))? {
                                     if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
                                     break;
                                 }
@@ -290,13 +311,15 @@ where
                                     if let Some(metadata)=metadata {socket.commit_final_input(metadata,None)?;}
                                 }else{
                                     let received_time=received.map(|original|clock(origin,original)).transpose()?.unwrap_or(time);
-                                    if let Some(metadata)=metadata {
-                                        driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,metadata)?;
-                                    }else if let Some(framing)=framing {
-                                        driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,framing)?;
-                                    }else{
-                                        driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at)?;
-                                    }
+                                    execution.measure_result(TimingStage::CommonReceive, || {
+                                        if let Some(metadata)=metadata {
+                                            driver.receive_selected_raw(&mut socket,&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,metadata)
+                                        }else if let Some(framing)=framing {
+                                            driver.receive_selected_on_carrier(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at,framing)
+                                        }else{
+                                            driver.receive_selected_with_arrival(&inputs.datagram[..length],received_time,time,received.unwrap_or(at),at)
+                                        }
+                                    })?;
                                 }
                             },
                             Err(error) if error.kind()==io::ErrorKind::WouldBlock=>break,
@@ -309,7 +332,7 @@ where
                     native_first=false;
                     driver.performance.counters.native_ready_events=driver.performance.counters.native_ready_events.saturating_add(1);
                     if ready.ready().is_writable() && write_native && native_write_remaining>0 {
-                        let written=driver.write_native_batch(&mut ready,native_write_remaining,||clock(origin,sample()));
+                        let written=execution.measure_result(TimingStage::CommonNativeWrite, || driver.write_native_batch(&mut ready,native_write_remaining,||clock(origin,sample())));
                         if driver.performance.counters.native_write_batch_packets.saturating_sub(native_before)==driver.config.work.native_write_batch as u64 {driver.performance.counters.native_write_batch_limit_hits=driver.performance.counters.native_write_batch_limit_hits.saturating_add(1);}
                         written?;
                     }
@@ -317,7 +340,7 @@ where
                         let mut batch=0u64;
                         for _ in 0..driver.config.work.native_read_batch {
                             let before=driver.performance.counters.native_read_batch_packets;
-                            let step=driver.read_native(&mut ready,&mut inputs.native,||clock(origin,sample()));
+                            let step=execution.measure_result(TimingStage::CommonNativeRead, || driver.read_native(&mut ready,&mut inputs.native,||clock(origin,sample())));
                             batch+=driver.performance.counters.native_read_batch_packets.saturating_sub(before);
                             if batch==driver.config.work.native_read_batch as u64 {driver.performance.counters.native_read_batch_limit_hits=driver.performance.counters.native_read_batch_limit_hits.saturating_add(1);}
                             if !step? {break;}
@@ -330,6 +353,18 @@ where
         }
     }.await;
     let metric_stop = sample();
+    // Freeze before terminal settlement. Existing buffer export owns the prepaid
+    // diagnostic from here; cancellation before this handoff remains unavailable.
+    if let Some(metrics) = driver
+        .common
+        .as_deref_mut()
+        .and_then(|runtime| runtime.buffer_metrics.as_mut())
+    {
+        metrics.retain_execution(
+            execution.freeze_at(metric_stop),
+            execution_initialization_failed,
+        );
+    }
     driver.sample_raw_buffers(&mut socket, metric_stop, true);
     if let Ok(now) = clock(origin, metric_stop) {
         driver.finish_buffer_metrics(now);

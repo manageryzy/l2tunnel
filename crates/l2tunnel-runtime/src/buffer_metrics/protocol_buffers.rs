@@ -6,9 +6,12 @@ use l2tunnel_management::Role;
 use std::io::{self, Write};
 use std::time::Duration;
 
+#[path = "reliable_output_metrics.rs"]
+mod reliable_output_metrics;
 #[path = "rolling_wait_metrics.rs"]
 mod rolling_wait_metrics;
 use l2tunnel::rolling_records::waits::{Snapshot as RollingWait, Terminal as RollingTerminal};
+use l2tunnel_reliable::diagnostics::Snapshot as ReliableOutput;
 
 const SAMPLE_INTERVAL_US: u64 = 100_000;
 const MAX_OWNERS: usize = 256;
@@ -51,7 +54,7 @@ struct Gauge {
     capacity: Option<u64>,
 }
 
-const NAMES: [&str; 28] = [
+const NAMES: [&str; 38] = [
     "codec_stage_items",
     "codec_stage_bytes",
     "codec_stage_remaining_bytes",
@@ -79,7 +82,17 @@ const NAMES: [&str; 28] = [
     "reliable_restored_packets",
     "reliable_restored_bytes",
     "arq_transmission_history_entries",
-    "reliable_fec_reserved_bytes",
+    "reliable_fec_logical_reservation_bytes",
+    "reliable_fec_live_generations",
+    "reliable_fec_basis_rows",
+    "reliable_fec_history_symbols",
+    "reliable_fec_completed_generations",
+    "reliable_fec_allocated_backing_bytes",
+    "reliable_physical_main_packets",
+    "reliable_physical_feedback_packets",
+    "reliable_physical_main_bytes",
+    "reliable_physical_feedback_bytes",
+    "reliable_outbound_packet_bytes_maximum",
 ];
 
 // Reuse the existing row storage; Swift channel pools have different meanings.
@@ -273,25 +286,70 @@ impl Row {
             Some(storage.arq.receive_bytes),
             receive.map(|v| v.receive_bytes),
         );
-        // These existing observations expose actual use. Operational staging
-        // capacities are unavailable here; allocated bytes are not substituted.
-        for (index, used) in [
-            storage.building_packets,
-            storage.building_bytes,
-            storage.outbound_packets,
-            storage.outbound_bytes,
-            storage.restored_packets,
-            storage.restored_bytes,
+        // Do not scan a potentially large ARQ history or infer use from its bound.
+        self.gauge(26, None, send.and_then(|v| v.history));
+        // Keep the established Compact R0/per-connection observations. Only
+        // actual Block/Direct policies supply these additional operational caps.
+        for (index, (used, capacity)) in [
+            (
+                storage.building_packets,
+                storage.block.map(|v| v.building_packets_capacity),
+            ),
+            (storage.building_bytes, None),
+            (
+                storage.outbound_packets,
+                storage.block.map(|v| v.outbound_packets_capacity),
+            ),
+            (storage.outbound_bytes, None),
+            (
+                storage.restored_packets,
+                storage.block.map(|v| v.restored_packets_capacity),
+            ),
+            (
+                storage.restored_bytes,
+                storage.block.map(|v| v.restored_bytes_capacity),
+            ),
         ]
         .into_iter()
         .enumerate()
         {
-            self.gauge(20 + index, Some(used), None);
+            self.gauge(20 + index, Some(used), capacity);
         }
-        // Do not scan a potentially large history or infer use from its bound.
-        self.gauge(26, None, send.and_then(|v| v.history));
-        // Reservation is capacity-only static storage, not meaningful queue use.
-        self.gauge(27, None, Some(storage.fec_reserved_bytes));
+        if let Some(block) = storage.block {
+            if let Some(fec) = block.decoder {
+                self.gauge(
+                    27,
+                    Some(fec.logical_reservation_bytes),
+                    Some(fec.logical_reservation_capacity),
+                );
+                self.gauge(28, Some(fec.generations), Some(fec.generations_capacity));
+                self.gauge(29, Some(fec.basis_rows), Some(fec.basis_rows_capacity));
+                self.gauge(
+                    30,
+                    Some(fec.history_symbols),
+                    Some(fec.history_symbols_capacity),
+                );
+                self.gauge(
+                    31,
+                    Some(fec.completed_generations),
+                    Some(fec.generations_capacity),
+                );
+                self.gauge(32, None, fec.allocated_capacity_bytes);
+            }
+            for lane in 0..2 {
+                self.gauge(
+                    33 + lane,
+                    Some(block.physical_packets[lane]),
+                    Some(block.physical_packets_capacity),
+                );
+                self.gauge(
+                    35 + lane,
+                    Some(block.physical_bytes[lane]),
+                    Some(block.outbound_packet_bytes_maximum),
+                );
+            }
+            self.gauge(37, None, Some(block.outbound_packet_bytes_maximum));
+        }
     }
 }
 
@@ -303,6 +361,7 @@ struct Epoch {
     samples: u64,
     rows: Vec<Option<Row>>,
     rolling: Vec<RollingWait>,
+    reliable: Vec<ReliableOutput>,
 }
 impl Epoch {
     fn new(owners: usize) -> io::Result<Self> {
@@ -317,6 +376,7 @@ impl Epoch {
             samples: 0,
             rows,
             rolling: Vec::new(),
+            reliable: Vec::new(),
         })
     }
 }
@@ -374,6 +434,25 @@ impl ProtocolBuffers {
         }
         Ok(())
     }
+    pub(crate) fn configure_reliable_output(&mut self) -> io::Result<()> {
+        for epoch in &mut self.epochs {
+            if epoch.reliable.capacity() != 0 {
+                return Err(io::Error::other(
+                    "reliable output observer already configured",
+                ));
+            }
+            epoch
+                .reliable
+                .try_reserve_exact(1)
+                .map_err(io::Error::other)?;
+            if epoch.reliable.capacity() != 1 {
+                return Err(io::Error::other(
+                    "reliable output observer capacity differs",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.epochs.capacity() * std::mem::size_of::<Epoch>()
             + self
@@ -382,6 +461,7 @@ impl ProtocolBuffers {
                 .map(|v| {
                     v.rows.capacity() * std::mem::size_of::<Option<Row>>()
                         + v.rolling.capacity() * std::mem::size_of::<RollingWait>()
+                        + v.reliable.capacity() * std::mem::size_of::<ReliableOutput>()
                 })
                 .sum::<usize>()
     }
@@ -448,6 +528,7 @@ impl ProtocolBuffers {
                 epoch.samples = 0;
                 epoch.rows.fill(None);
                 epoch.rolling.clear();
+                epoch.reliable.clear();
             }
             epoch.live = true;
             epoch.last = now;
@@ -495,6 +576,9 @@ impl ProtocolBuffers {
             } else {
                 increment(&mut self.identity_errors, &mut self.overflow);
             }
+        }
+        if let Some(snapshot) = engine.reliable_output_wait(Duration::from_micros(now)) {
+            self.sample_reliable_output(identity, snapshot);
         }
         let local = engine.configuration().descriptor().local(self.role);
         // Called only after the periodic/terminal sampling gate. Swift's exact
@@ -629,10 +713,45 @@ impl ProtocolBuffers {
             }
         }
     }
+    fn sample_reliable_output(&mut self, identity: Identity, snapshot: ReliableOutput) {
+        if let Some(epoch) = self
+            .epochs
+            .iter_mut()
+            .find(|v| v.live && v.identity == Some(identity))
+            && epoch.reliable.capacity() == 1
+            && snapshot.epoch == identity.epoch
+        {
+            if let Some(slot) = epoch.reliable.first_mut() {
+                *slot = snapshot;
+            } else {
+                epoch.reliable.push(snapshot);
+            }
+        } else {
+            increment(&mut self.identity_errors, &mut self.overflow);
+        }
+    }
+    pub(crate) fn finish_reliable_output(&mut self, now: u64) {
+        let at = Duration::from_micros(now);
+        for epoch in &mut self.epochs {
+            if !epoch.live {
+                continue;
+            }
+            if let Some(snapshot) = epoch.reliable.first_mut() {
+                if snapshot.terminal_at.is_some() {
+                    continue;
+                }
+                if epoch.last == now && snapshot.observed_at == at {
+                    *snapshot = snapshot.censor(at);
+                } else {
+                    increment(&mut self.staged_terminal_unavailable, &mut self.overflow);
+                }
+            }
+        }
+    }
     pub(crate) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         write!(
             out,
-            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; Swift shared packing overlaps per-channel packing and is not additive; Swift source positions include gaps; equation payload bytes exclude coefficient metadata; repairs_due is work debt without allocated payload; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention and Swift shared packing/per-channel source/retry/equation/stream snapshots; Swift feedback/history/control and all Swift dependency waits, other recovery internals, history use, per-channel non-Swift receiver gauges and waits outside explicitly emitted interval sections remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
+            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; Swift shared packing overlaps per-channel packing and is not additive; Swift source positions include gaps; equation payload bytes exclude coefficient metadata; repairs_due is work debt without allocated payload; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention and Swift shared packing/per-channel source/retry/equation/stream snapshots; Swift feedback/history/control and all Swift dependency waits, restored-source handoff waits, builder packing hold, FEC missing-equation dependencies, other recovery internals, history use, per-channel non-Swift receiver gauges and waits outside explicitly emitted interval sections remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
             self.role,
             self.omitted_epochs,
             self.omitted_owners,
@@ -744,6 +863,11 @@ impl ProtocolBuffers {
             write!(out, "],\"rolling_waits\":")?;
             match epoch.rolling.first() {
                 Some(snapshot) => rolling_wait_metrics::write(out, snapshot)?,
+                None => write!(out, "null")?,
+            }
+            write!(out, ",\"reliable_output\":")?;
+            match epoch.reliable.first() {
+                Some(snapshot) => reliable_output_metrics::write(out, snapshot)?,
                 None => write!(out, "null")?,
             }
             write!(out, "}}")?;
@@ -1140,6 +1264,141 @@ mod tests {
             value.row(a, owner, 100_002).is_none(),
             "retired epoch cannot update"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reliable_provider_uses_actual_sealed_head_and_fresh_terminal_identity() -> Result {
+        use l2tunnel_recovery::{ArqConfig, EndpointRole, RecoveryContext};
+        use l2tunnel_reliable::{OutboundBudget, Reliable, ReliableConfig, storage};
+        let ms = Duration::from_millis;
+        let config = ReliableConfig {
+            arq: ArqConfig {
+                max_source_bytes: 64,
+                send_bytes: 512,
+                receive_bytes: 512,
+                send_records: 8,
+                receive_records: 8,
+                initial_rto: ms(100),
+                maximum_rto: ms(800),
+                ack_delay: ms(1),
+                max_retries: 8,
+            },
+            fec: l2tunnel_fec::DecoderConfig {
+                block: l2tunnel_fec::BlockConfig {
+                    max_sources: 3,
+                    max_source_bytes: 108,
+                    max_packet_bytes: 169,
+                    max_work_per_symbol: 4096,
+                },
+                max_generations: 4,
+                max_symbols_per_generation: 6,
+                max_reserved_bytes: 50_000,
+                max_lifetime_ticks: 50,
+                generation_window: 32,
+            },
+            repair_symbols: 2,
+            flush_after: ms(5),
+            max_restored_packets: 16,
+            max_restored_bytes: 4096,
+            outer_overhead_bytes: 28,
+        };
+        let plan = storage::Plan::for_duplex(config, config)?.with_output_diagnostics()?;
+        let mut endpoint = Reliable::new_reserved_with_plan(
+            plan,
+            RecoveryContext {
+                session: 0x1234,
+                epoch: 7,
+                role: EndpointRole::Initiator,
+            },
+            storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            },
+        )?;
+        endpoint.enable_compact_wire_with_overheads(37, 49)?;
+        endpoint.submit(b"actual retained FEC source", Duration::ZERO)?;
+        let mut packet = vec![0; endpoint.max_packet_bytes()];
+        endpoint.poll_data(
+            Duration::ZERO,
+            &mut packet,
+            &mut OutboundBudget {
+                packets: 8,
+                wire_bytes: 4096,
+            },
+        )?;
+        assert_eq!(
+            endpoint.poll_data(ms(5), &mut packet, &mut OutboundBudget::default())?,
+            None
+        );
+        let mut provider = ProtocolBuffers::new(1, Role::Client)?;
+        let base_heap = provider.heap_bytes();
+        provider.configure_reliable_output()?;
+        let heap = provider.heap_bytes();
+        assert_eq!(heap - base_heap, 2 * std::mem::size_of::<ReliableOutput>());
+        let epoch = identity(7, 6);
+        assert!(provider.begin(5_000, [Some(epoch), None]));
+        provider.sample_reliable_output(
+            epoch,
+            endpoint.output_wait_snapshot(ms(5)).ok_or("actual wait")?,
+        );
+        provider
+            .row(epoch, Owner::Endpoint, 5_000)
+            .ok_or("row")?
+            .recovery(endpoint.storage(), None, None);
+        // A later cached terminal cannot invent another millisecond of waiting.
+        provider.finish_reliable_output(6_000);
+        assert_eq!(provider.staged_terminal_unavailable, 1);
+        assert!(provider.begin(6_000, [Some(epoch), None]));
+        provider.sample_reliable_output(
+            epoch,
+            endpoint.output_wait_snapshot(ms(6)).ok_or("fresh wait")?,
+        );
+        provider.finish_reliable_output(6_000);
+        let mut output = Vec::new();
+        provider.write(&mut output)?;
+        let json: serde_json::Value = serde_json::from_slice(&output)?;
+        let wait = &json["epochs"][0]["reliable_output"];
+        assert_eq!(wait["epoch"], 7);
+        assert_eq!(wait["union"]["censored_episodes"], 1);
+        assert_eq!(wait["union"]["censored_us"], 1_000);
+        assert_eq!(wait["last_resolved"]["operation"]["generation"], 0);
+        assert!(wait["pending"].is_null());
+        assert_eq!(provider.heap_bytes(), heap);
+        assert!(
+            endpoint
+                .output_wait_snapshot(ms(6))
+                .ok_or("live protocol owner")?
+                .pending
+                .is_some()
+        );
+        // Compact R0 has no Block policy; retain baseline used gauges and unknown FEC.
+        let row = provider.row(epoch, Owner::Endpoint, 6_000).ok_or("row")?;
+        let mut compact = Row::new(
+            Owner::Connection {
+                owner: 0,
+                incarnation: 1,
+            },
+            6_000,
+        );
+        compact.recovery(
+            l2tunnel_reliable::Storage {
+                building_packets: 2,
+                outbound_packets: 3,
+                restored_packets: 4,
+                ..l2tunnel_reliable::Storage::default()
+            },
+            None,
+            None,
+        );
+        assert_eq!(compact.gauges[20].used, Some(2));
+        assert_eq!(compact.gauges[22].used, Some(3));
+        assert_eq!(compact.gauges[24].used, Some(4));
+        assert_eq!(compact.gauges[20].capacity, None);
+        assert_eq!(compact.gauges[27].samples, 0);
+        assert_eq!(row.gauges[27].used, Some(0));
+        assert_eq!(row.gauges[27].capacity, Some(50_000));
+        assert_eq!(row.gauges[32].used, None);
+        assert!(row.gauges[32].capacity.is_some());
         Ok(())
     }
 }

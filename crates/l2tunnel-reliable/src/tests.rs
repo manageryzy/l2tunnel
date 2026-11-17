@@ -788,3 +788,6 @@ fn generation_exhaustion_is_explicit_and_never_reuses_a_context_identity() -> Te
     assert_eq!(sender.inspect_output(&retry)?, RecordKind::Source);
     Ok(())
 }
+
+#[path = "diagnostics_tests.rs"]
+mod block_diagnostics;

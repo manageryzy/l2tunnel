@@ -180,6 +180,14 @@ def protocol_provider(value):
                     from buffer_metrics_rolling import validate as validate_rolling
                 validate_rolling(epoch['rolling_waits'], epoch['epoch'],
                                  path + '.rolling_waits', issues, gaps)
+            if 'reliable_output' in epoch:
+                try:
+                    from .buffer_metrics_reliable import validate as validate_reliable
+                except ImportError:
+                    from buffer_metrics_reliable import validate as validate_reliable
+                validate_reliable(epoch['reliable_output'], epoch['epoch'],
+                                  path + '.reliable_output', issues, gaps,
+                                  {'Client': 0, 'Server': 1}.get(value.get('local_role')))
             seen = set()
             for oi, owner in enumerate(owners):
                 prefix = path + '.owners[' + str(oi) + ']'
@@ -703,6 +711,12 @@ def markdown(report):
         except ImportError:
             from buffer_metrics_pipeline import render as render_pipeline
         render_pipeline(lines, owner['pipeline_provider_validation'], table, cell)
+        try:
+            from .buffer_metrics_reliable import render as render_reliable
+        except ImportError:
+            from buffer_metrics_reliable import render as render_reliable
+        if protocol['status'] == 'validated_known_fields_partial':
+            render_reliable(lines, owner['provider_metadata'], table, cell)
         management = owner['management_provider_validation']
         lines.extend(['', 'Management provider: ' + cell(management['status']) + '. ' +
                       management['definition']])

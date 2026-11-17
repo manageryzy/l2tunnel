@@ -1487,3 +1487,119 @@ mod transition_reservation {
         Ok(())
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn actual_pair_hello_loss_reports_stale_window_proof_without_weakening_authentication() -> R {
+    let (c, s, member, allow) = support::fixture()?;
+    let (a_input, b_input, _) = support::inputs(false);
+    let af = Arc::new(Fault::default());
+    let bf = Arc::new(Fault::default());
+    af.drops.lock().map_err(|_| "fault lock")?.push(1);
+    bf.drops.lock().map_err(|_| "fault lock")?.extend([1, 2]);
+    let mut a = begin_packet_client(
+        wrap(a_input, af.clone()),
+        &c,
+        "tunnel.test",
+        &member,
+        config(),
+    )?;
+    let mut b = begin_packet_server(wrap(b_input, bf.clone()), &s, &allow, config())?;
+    let deadlines = [a.deadline, b.deadline];
+    // Stop the actual original owners immediately after TCP/TLS handoff and
+    // before either first Hello. No fabricated authentication or carrier is used.
+    poll_fn(|cx| {
+        for setup in [&mut a, &mut b] {
+            if setup.stage < 5
+                && let Poll::Ready(result) = Pin::new(setup).poll(cx)
+            {
+                return Poll::Ready(Err(match result {
+                    Ok(_) => "unexpected ready carrier before Hello".into(),
+                    Err(error) => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+                }));
+            }
+        }
+        if a.stage == 5 && b.stage == 5 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await?;
+    let carrier = a.carrier.as_mut().ok_or("client carrier")?;
+    let lane = carrier.lanes[0].as_mut().ok_or("client lane")?;
+    let shift = if lane.proof.peer_scale == 255 {
+        0
+    } else {
+        lane.proof.peer_scale
+    };
+    let actual_peer_window = lane.proof.peer_window;
+    // Fault injection models a frozen peer observation preceding a legal TCP
+    // window update. This fixture proves branch attribution after real encrypted
+    // Hello loss/retry; it does not claim to reproduce smoltcp's window timing.
+    lane.proof.peer_window = actual_peer_window
+        .checked_sub(1u32 << shift)
+        .ok_or("window")?;
+    {
+        let mut state = lock(&lane.io.state)?;
+        state.local_proof = Some(lane.proof);
+        state.fence.as_mut().ok_or("fence")?.peer_horizon =
+            super::horizon_bytes(carrier.policy, u64::from(lane.proof.peer_window), shift)?;
+    }
+    let mut hello = wire::Hello::parse(&carrier.local_hello)?;
+    hello.lanes[0] = Some(lane.proof);
+    carrier.local_hello = hello.encode()?;
+    let stale_peer_window = lane.proof.peer_window;
+    poll_fn(|cx| {
+        if let Poll::Ready(result) = Pin::new(&mut a).poll(cx) {
+            return Poll::Ready(Err(match result {
+                Ok(_) => "unexpected client ready before proof refusal".into(),
+                Err(error) => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+            }));
+        }
+        if let Poll::Ready(result) = Pin::new(&mut b).poll(cx) {
+            // The authenticated gate retains the exact proof refusal below.
+            // Its PacketIo boundary wraps that refusal in io::Error::other;
+            // Detached::progress preserves this original outer I/O category.
+            assert!(
+                matches!(
+                    &result,
+                    Err(Error::Io {
+                        kind: io::ErrorKind::Other,
+                        raw_os_error: None,
+                    })
+                ),
+                "unexpected encrypted Hello retry result: ready={}, error={:?}, snapshot={:?}",
+                result.is_ok(),
+                result.as_ref().err(),
+                b.diagnostic_snapshot(),
+            );
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await?;
+    assert!(
+        af.phases.load(Ordering::SeqCst) >= 2,
+        "actual Hello retry required"
+    );
+    let snapshot = b.diagnostic_snapshot();
+    assert_eq!(snapshot.deadline, deadlines[1]);
+    assert_eq!(snapshot.stage, SetupStage::PacketConfirmation);
+    assert_eq!(snapshot.outcome, SetupOutcome::Failed);
+    let gate = snapshot.lanes[0].ok_or("lane")?.gate.ok_or("gate")?;
+    let Some(SetupProofFailure::Hello(value)) = gate.proof_failure else {
+        return Err("missing complementary proof diagnostic".into());
+    };
+    assert_eq!(value.boundary, SetupProofBoundary::AuthenticatedHello);
+    assert!(value.identity_matches && value.stream_bytes_match && value.sequence_matches);
+    assert!(value.local_peer_window_matches && value.options_match && value.scales_match);
+    assert!(!value.peer_peer_window_matches);
+    assert_eq!(value.local_scaled_window, actual_peer_window);
+    assert_eq!(value.peer_peer_window, stale_peer_window);
+    assert!(gate.faulted);
+    assert!(b.carrier.is_none());
+    assert_eq!(a.deadline, deadlines[0]);
+    assert_eq!(b.terminal_setup.len(), 1);
+    assert_eq!(b.diagnostic_snapshot(), snapshot);
+    Ok(())
+}

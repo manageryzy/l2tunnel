@@ -52,6 +52,7 @@ pub struct Plan {
     send: ReliableConfig,
     receive: ReliableConfig,
     bytes: usize,
+    pub(crate) diagnostics: bool,
     pub(crate) arq: l2tunnel_recovery::storage::DuplexPlan,
     pub(crate) encoder: Option<l2tunnel_fec::storage::EncoderPlan>,
     pub(crate) decoder: Option<l2tunnel_fec::storage::DecoderPlan>,
@@ -111,7 +112,17 @@ impl Plan {
             arq,
             encoder,
             decoder,
+            diagnostics: false,
         })
+    }
+    /// Reserve one optional scalar observation sidecar before owner construction.
+    /// This changes no protocol allowance; the existing complete byte limit still applies.
+    pub fn with_output_diagnostics(mut self) -> Result<Self, Error> {
+        if !self.diagnostics {
+            self.bytes = add(self.bytes, array_bytes::<crate::diagnostics::Snapshot>(1)?)?;
+            self.diagnostics = true;
+        }
+        Ok(self)
     }
     /// Complete original send policy.
     pub fn send_config(&self) -> ReliableConfig {

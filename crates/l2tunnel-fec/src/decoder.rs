@@ -57,6 +57,41 @@ impl DecoderConfig {
     }
 }
 
+/// Exact existing capacity gate that refused one canonically validated symbol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecoderCapacity {
+    /// Accepted symbol identities in this live generation are full.
+    SymbolSlots,
+    /// Live incomplete/undelivered generation slots are full.
+    GenerationSlots,
+    /// The new generation would exceed the logical reservation budget.
+    LogicalReservation,
+}
+/// Read-only aggregate gauges; no retained row is decoded or copied.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecoderBuffers {
+    /// Actual live generation count.
+    pub generations: usize,
+    /// Negotiated live-generation bound.
+    pub generations_capacity: usize,
+    /// Current conservative logical reservation for live generations.
+    pub logical_reservation_bytes: usize,
+    /// Negotiated logical reservation cap; distinct from allocated backing.
+    pub logical_reservation_capacity: usize,
+    /// Existing explicit backing capacity; absent for unreserved construction.
+    pub allocated_capacity_bytes: Option<usize>,
+    /// Sum of actual independent rows across live generations.
+    pub basis_rows: usize,
+    /// Maximum retained independent rows across all configured slots.
+    pub basis_rows_capacity: usize,
+    /// Actual distinct received symbols, including dependent equations.
+    pub history_symbols: usize,
+    /// Maximum distinct-symbol slots across all configured generations.
+    pub history_symbols_capacity: usize,
+    /// Full-rank generations still awaiting explicit decoded retirement.
+    pub completed_generations: usize,
+}
+
 /// Accepted equation's effect; completion is retained until take_decoded succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceptStatus {
@@ -281,7 +316,7 @@ impl Decoder {
     ) -> Result<AcceptStatus, Error> {
         self.check_time(now_ticks)?;
         let view = inspect(authenticated_packet, self.context, self.config.block)?;
-        self.accept_validated_view(view, now_ticks)
+        self.accept_validated_view(view, now_ticks, &mut |_| {})
     }
 
     /// Accept a typed symbol after the caller validates the selected outer context,
@@ -291,15 +326,27 @@ impl Decoder {
         view: crate::SymbolView<'_>,
         now_ticks: u64,
     ) -> Result<AcceptStatus, Error> {
+        self.accept_view_observed(view, now_ticks, |_| {})
+    }
+
+    /// The same atomic acceptance transaction, with a scalar callback only at an
+    /// actual capacity refusal. The callback cannot change admission or its error.
+    pub fn accept_view_observed(
+        &mut self,
+        view: crate::SymbolView<'_>,
+        now_ticks: u64,
+        mut refused: impl FnMut(DecoderCapacity),
+    ) -> Result<AcceptStatus, Error> {
         self.check_time(now_ticks)?;
         view.validate(self.config.block)?;
-        self.accept_validated_view(view, now_ticks)
+        self.accept_validated_view(view, now_ticks, &mut refused)
     }
 
     fn accept_validated_view(
         &mut self,
         view: crate::SymbolView<'_>,
         now_ticks: u64,
+        refused: &mut impl FnMut(DecoderCapacity),
     ) -> Result<AcceptStatus, Error> {
         self.check_generation(view.generation)?;
         let mut new_generation = None;
@@ -322,11 +369,13 @@ impl Decoder {
                 return Err(Error::CompletePending);
             }
             if generation.received.len() >= self.config.max_symbols_per_generation {
+                refused(DecoderCapacity::SymbolSlots);
                 return Err(Error::Capacity);
             }
             generation
         } else {
             if self.generations.len() >= self.config.max_generations {
+                refused(DecoderCapacity::GenerationSlots);
                 return Err(Error::Capacity);
             }
             let reservation = self
@@ -338,6 +387,7 @@ impl Decoder {
                 .ok_or(Error::Arithmetic)?
                 > self.config.max_reserved_bytes
             {
+                refused(DecoderCapacity::LogicalReservation);
                 return Err(Error::Capacity);
             }
             let deadline = now_ticks
@@ -534,6 +584,28 @@ impl Decoder {
         self.last_now = now_ticks;
         self.prune_terminal();
         Ok(count)
+    }
+
+    /// Actual metadata-only buffer observation. This neither expires nor retrieves state.
+    pub fn buffer_snapshot(&self) -> DecoderBuffers {
+        let mut result = DecoderBuffers {
+            generations: self.generations.len(),
+            generations_capacity: self.config.max_generations,
+            logical_reservation_bytes: self.reserved,
+            logical_reservation_capacity: self.config.max_reserved_bytes,
+            allocated_capacity_bytes: self.usage.map(|v| v.capacity_bytes),
+            basis_rows_capacity: self.config.max_generations * self.config.block.max_sources,
+            history_symbols_capacity: self.config.max_generations
+                * self.config.max_symbols_per_generation,
+            ..DecoderBuffers::default()
+        };
+        // All products/sums are bounded by the validated hard dimensional maxima.
+        for (_, generation) in self.generations.iter() {
+            result.basis_rows += generation.rank;
+            result.history_symbols += generation.received.len();
+            result.completed_generations += usize::from(generation.rank == generation.count);
+        }
+        result
     }
 
     /// Current rank/count for a live generation, including undelivered completion.

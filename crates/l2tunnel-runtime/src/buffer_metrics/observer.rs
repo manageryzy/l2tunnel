@@ -40,6 +40,7 @@ pub(crate) struct Observer {
     origin: Instant,
     finished: Option<u64>,
     source_terminal: Option<SourceTerminal>,
+    execution: Option<(crate::initialization_timing::FrozenTiming, bool)>,
     // Reserve one slot only when diagnostics are enabled. Keeping this large
     // snapshot inline also enlarges disabled adapters and nested setup futures.
     protocol: Vec<super::protocol_buffers::ProtocolBuffers>,
@@ -104,6 +105,7 @@ impl Observer {
             origin,
             finished: None,
             source_terminal: None,
+            execution: None,
             protocol: Vec::new(),
             pipeline_admission: Vec::new(),
             management: Vec::new(),
@@ -156,6 +158,7 @@ impl Observer {
             origin,
             finished: None,
             source_terminal: None,
+            execution: None,
             protocol: Vec::new(),
             pipeline_admission: Vec::new(),
             management: Vec::new(),
@@ -304,9 +307,23 @@ impl Observer {
             retained.sample(lane, snapshot);
         }
     }
+    pub(crate) fn retain_execution(
+        &mut self,
+        timing: crate::initialization_timing::FrozenTiming,
+        initialization_failed: bool,
+    ) {
+        if !self.is_finished() && self.execution.is_none() {
+            self.execution = Some((timing, initialization_failed));
+        }
+    }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.collector
             .heap_bytes()
+            .saturating_add(
+                self.execution
+                    .as_ref()
+                    .map_or(0, |(timing, _)| timing.heap_bytes()),
+            )
             .saturating_add(
                 self.proxy.capacity() * std::mem::size_of::<crate::proxy::timing::Snapshot>(),
             )
@@ -498,6 +515,31 @@ impl Observer {
         } else {
             write!(writer, "null")?;
         }
+        write!(writer, ",\"common_execution\":")?;
+        match &self.execution {
+            Some((timing, false)) if timing.enabled() => {
+                write!(
+                    writer,
+                    "{{\"availability\":\"observed\",\"boundary\":\"loop_stop_before_settlement\",\"timing\":"
+                )?;
+                timing.write(writer)?;
+                write!(writer, "}}")?;
+            }
+            Some((_, failed)) => write!(
+                writer,
+                "{{\"availability\":\"unavailable\",\"reason\":\"{}\"}}",
+                if *failed {
+                    "diagnostic_initialization_failed"
+                } else {
+                    "disabled"
+                }
+            )?,
+            None if self.label == "common" => write!(
+                writer,
+                "{{\"availability\":\"unavailable\",\"reason\":\"loop_stop_not_observed\"}}"
+            )?,
+            None => write!(writer, "null")?,
+        }
         write!(writer, ",\"source_terminal_sample\":")?;
         if let Some(value) = self.source_terminal {
             write!(
@@ -621,6 +663,73 @@ fn gauge(writer: &mut impl Write, value: Gauge) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn moved_execution_censors_cancelled_work_at_original_stop_and_survives_render_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::initialization_timing::{Owner, Stage, Timing};
+        use std::time::Duration;
+        struct Reject;
+        impl Write for Reject {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture output"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let origin = Instant::now();
+        let mut timing = Timing::try_new(Owner::CommonExecution, origin)?;
+        {
+            let pending = timing.measure_future(
+                Stage::CommonNativeWrite,
+                std::future::pending::<io::Result<()>>(),
+            );
+            tokio::pin!(pending);
+            tokio::select! {
+                biased;
+                _ = &mut pending => return Err("pending operation completed".into()),
+                () = std::future::ready(()) => {},
+            }
+            tokio::time::advance(Duration::from_micros(11)).await;
+        }
+        let stop = Instant::now();
+        let frozen = timing.freeze_at(stop);
+        let retained = frozen.heap_bytes();
+        assert!(retained > 0);
+        assert!(
+            matches!(frozen.write(&mut Reject), Err(error) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-common-execution-transfer-{}.bmetrics",
+            std::process::id()
+        ));
+        let mut observer = Observer::for_test(origin, path.clone())?;
+        let before = observer.heap_bytes();
+        observer.retain_execution(frozen, false);
+        assert_eq!(observer.heap_bytes() - before, retained);
+        observer.finish_at(11);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(observer);
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        std::fs::remove_file(path)?;
+        let report = &value["common_execution"];
+        assert_eq!(report["availability"], "observed");
+        assert_eq!(report["boundary"], "loop_stop_before_settlement");
+        assert_eq!(report["timing"]["checkpoint"], "loop_stop");
+        assert_eq!(report["timing"]["elapsed_us"], 11);
+        let stage = report["timing"]["stages"]
+            .as_array()
+            .ok_or("stages")?
+            .iter()
+            .find(|stage| stage["stage"] == "CommonNativeWrite")
+            .ok_or("native write")?;
+        assert_eq!(stage["samples"], 1);
+        assert_eq!(stage["censored"], 1);
+        assert_eq!(stage["sum_us"], 11);
+        assert_eq!(stage["maximum_end_us"], 11);
+        Ok(())
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn original_udp_readback_export_is_once_only_and_reports_unavailability()
@@ -748,6 +857,7 @@ mod tests {
             std::process::id()
         ));
         let mut observer = Observer::for_test(Instant::now(), path.clone())?;
+        observer.label = "common";
         observer.configure_protocol_buffers(1, l2tunnel_management::Role::Client)?;
         observer.configure_management_buffers()?;
         let key = Key {
@@ -764,6 +874,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         std::fs::remove_file(path)?;
         assert_eq!(value["finished_at_us"], 50_000);
+        assert_eq!(value["common_execution"]["availability"], "unavailable");
+        assert_eq!(
+            value["common_execution"]["reason"],
+            "loop_stop_not_observed"
+        );
         assert_eq!(
             value["source_terminal_sample"]["boundary"],
             "observer_drop_without_source"

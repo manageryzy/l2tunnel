@@ -655,3 +655,6 @@ fn invalid_configs_sources_coefficients_and_repair_exhaustion_are_explicit() -> 
     assert_eq!(encoder.repair(&[1, 1, 1]), Err(Error::SymbolExhausted));
     Ok(())
 }
+
+#[path = "decoder_diagnostics_tests.rs"]
+mod decoder_diagnostics;

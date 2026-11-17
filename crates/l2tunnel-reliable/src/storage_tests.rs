@@ -484,3 +484,47 @@ fn reserved_output_refusal_partial_flush_retry_and_expiry_preserve_original_boun
     assert!(receiver.storage_usage().is_some());
     Ok(())
 }
+
+#[test]
+fn operational_block_capacities_match_lazy_and_reserved_in_both_directions() -> TestResult {
+    for (send_repairs, receive_repairs) in [(0, 0), (0, 1), (1, 0), (1, 2)] {
+        let send = policy(32, 2, send_repairs, 17);
+        let receive = policy(96, 3, receive_repairs, 73);
+        let mut lazy = make(send, receive, EndpointRole::Initiator, false)?;
+        let mut reserved = make(send, receive, EndpointRole::Initiator, true)?;
+        assert!(lazy.storage_usage().is_none());
+        assert!(reserved.storage_usage().is_some());
+        let expected_sources = if send_repairs == 0 { 0 } else { 2 };
+        for at in [0, 5] {
+            if at == 0 {
+                assert_eq!(lazy.storage(), reserved.storage());
+                lazy.submit(b"partial block", ms(at))?;
+                reserved.submit(b"partial block", ms(at))?;
+            }
+            assert_eq!(
+                packets(&mut lazy, ms(at), false)?,
+                packets(&mut reserved, ms(at), false)?
+            );
+            assert_eq!(lazy.storage(), reserved.storage());
+            for value in [lazy.storage(), reserved.storage()] {
+                let block = value.block.ok_or("actual Direct/Block policy")?;
+                assert_eq!(block.building_packets_capacity, expected_sources);
+                assert_eq!(
+                    block.outbound_packets_capacity,
+                    expected_sources + send_repairs
+                );
+                assert_eq!(block.decoder_present, receive_repairs != 0);
+                assert_eq!(
+                    block.restored_packets_capacity,
+                    receive.max_restored_packets
+                );
+                assert_eq!(block.restored_bytes_capacity, receive.max_restored_bytes);
+                assert!(
+                    block.decoder.is_none(),
+                    "disabled detailed observation stays unavailable"
+                );
+            }
+        }
+    }
+    Ok(())
+}

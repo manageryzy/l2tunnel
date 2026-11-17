@@ -1352,18 +1352,21 @@ pub(super) async fn execute(
     let local_control = api.is_some();
     let (handle, run) = service::channel();
     let submit = |error| io::Error::other(format!("service request: {error:?}"));
+    // Prepare persistent output owners before any protocol operation starts.
+    // Regular descriptions retain their original shared offset and flags.
+    let mut output = output::Sink::stdout();
+    let mut diagnostic = output::Sink::stderr();
     let accepted = handle
         .connect(plan, handle.next_key().map_err(submit)?)
         .map_err(submit)?;
     let life = handle.clone();
-    let lifecycle = async move {
+    let lifecycle = async {
         let mut cursor = accepted.operation.value().saturating_sub(1);
         let mut live = None;
         let mut connected = false;
         let mut report_tick =
             tokio::time::interval(report_interval.unwrap_or(Duration::from_secs(1)));
         report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut output = output::Sink::stdout();
         let mut output_tick = tokio::time::interval(Duration::from_millis(5));
         output_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1399,7 +1402,6 @@ pub(super) async fn execute(
                             emit_transaction(snapshot.runtime.as_ref(), Some(generation), TransactionEvent::Ready, &mut output);
                         }
                         Completed::Failed(failure) => {
-                            let mut diagnostic = output::Sink::stderr();
                             match life.setup_observation(operation) {
                                 Ok(Some(observation)) => setup_output::failed(observation, &mut diagnostic),
                                 _ => diagnostic.projection_error(),
@@ -1428,9 +1430,15 @@ pub(super) async fn execute(
                 _ = report_tick.tick(), if report_interval.is_some() => {
                     if live.is_some() { emit_transaction(life.snapshot().runtime.as_ref(), live, TransactionEvent::Status, &mut output); }
                 }
-                _ = output_tick.tick(), if output.has_pending() => {},
+                _ = output_tick.tick(), if output.has_pending() || diagnostic.has_pending() => {},
             }
             output.flush_turn();
+            if output.take_failure() {
+                diagnostic.emit(serde_json::json!({
+                    "event": "cli_output_failure", "output_health": output.health
+                }));
+            }
+            diagnostic.flush_turn();
         }
     };
     let local = async {
@@ -1445,7 +1453,16 @@ pub(super) async fn execute(
             None => std::future::pending::<io::Result<()>>().await,
         }
     };
-    tokio::select! { result = run => result, result = lifecycle => result, result = local => result }
+    let result = tokio::select! { result = run => result, result = lifecycle => result, result = local => result };
+    // This is local diagnostic cleanup after the protocol outcome. Its one
+    // absolute cap never renews or extends any protocol deadline. Eight existing
+    // 64KiB grants at the 5ms cadence give a 40ms implementation cleanup bound.
+    let now = tokio::time::Instant::now();
+    let deadline = now.checked_add(output::DRAIN_CAP).unwrap_or(now);
+    let stdout = output.finish_until(deadline).await;
+    diagnostic.emit(serde_json::json!({"event":"cli_output_finish", "stdout":stdout}));
+    let _stderr = diagnostic.finish_until(deadline).await;
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -1455,6 +1472,7 @@ fn emit_transaction(
     event: TransactionEvent,
     output: &mut output::Sink,
 ) {
+    let projection_started = output.timing.start();
     let value = match (
         observation.and_then(crate::service::Observation::secure_udp_common),
         generation,
@@ -1464,6 +1482,15 @@ fn emit_transaction(
         }
         _ => Err(input("missing matching Common observation")),
     };
+    output.timing.record_since(
+        l2tunnel_runtime::initialization_timing::Stage::CliProjection,
+        projection_started,
+        if value.is_ok() {
+            l2tunnel_runtime::initialization_timing::Outcome::Complete
+        } else {
+            l2tunnel_runtime::initialization_timing::Outcome::Failed
+        },
+    );
     match value {
         Ok(value) => output.emit(value),
         Err(_) => output.projection_error(),
@@ -1478,7 +1505,17 @@ enum TransactionEvent {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "output_writer.rs"]
+mod output_writer;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "output_sink_tests.rs"]
+mod output_sink_tests;
+
+#[cfg(target_os = "linux")]
 mod output {
+    use super::output_writer as writer;
+    use l2tunnel_runtime::initialization_timing::{Outcome, Owner, Stage, Timing};
     use std::{
         collections::VecDeque,
         fs::{File, OpenOptions},
@@ -1486,12 +1523,15 @@ mod output {
         os::fd::{AsFd, AsRawFd, BorrowedFd},
         os::unix::fs::OpenOptionsExt,
         path::Path,
+        time::Duration,
     };
+    pub(super) const DRAIN_CAP: Duration = Duration::from_millis(40);
+    use tokio::time::Instant;
     pub(super) const MAX_LINE: usize = 128 * 1024;
     pub(super) const MAX_LINES: usize = 4;
-    const MAX_BYTES: usize = MAX_LINE * MAX_LINES;
+    pub(super) const MAX_BYTES: usize = MAX_LINE * MAX_LINES;
     pub(super) const WRITE_BYTES: usize = 64 * 1024;
-    const WRITE_CALLS: usize = 4;
+    pub(super) const WRITE_CALLS: usize = 4;
     /// Local logger health; observations never become protocol inputs.
     #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
     pub(super) struct Health {
@@ -1504,39 +1544,76 @@ mod output {
         pub dropped_bytes: u64,
         pub written_bytes: u64,
         pub queue_bytes_high: u64,
+        pub unresolved_lines: u64,
+        pub unresolved_bytes: u64,
+        pub shutdown_timeouts: u64,
+    }
+    /// Completion means observed write acceptance, never durable storage.
+    #[derive(Clone, Copy, Debug, serde::Serialize)]
+    pub(super) struct Finish {
+        pub completed: bool,
+        pub failed: bool,
+        pub timed_out: bool,
+        pub unresolved_lines: u64,
+        pub unresolved_bytes: u64,
     }
     pub(super) struct Sink {
         file: Option<File>,
+        worker: Option<writer::Handle>,
+        observed: writer::Snapshot,
+        closed: bool,
+        failure_reported: bool,
+        finished: Option<Finish>,
         pending: VecDeque<Vec<u8>>,
         offset: usize,
         bytes: usize,
         pub(super) health: Health,
+        // Off-inline and optional; this owner never writes diagnostics on Drop.
+        pub(super) timing: Timing,
     }
     impl Sink {
         pub(super) fn stdout() -> Self {
-            Self::from_stdio(std::io::stdout().as_fd()).unwrap_or_else(|_| Self {
-                file: None,
-                pending: VecDeque::new(),
-                offset: 0,
-                bytes: 0,
-                health: Health {
-                    disabled: true,
-                    write_errors: 1,
-                    ..Health::default()
-                },
+            Self::from_stdio(std::io::stdout().as_fd()).unwrap_or_else(|_| {
+                Self {
+                    file: None,
+                    worker: None,
+                    observed: writer::Snapshot::default(),
+                    closed: false,
+                    failure_reported: false,
+                    finished: None,
+                    pending: VecDeque::new(),
+                    offset: 0,
+                    bytes: 0,
+                    timing: Timing::disabled(),
+                    health: Health {
+                        disabled: true,
+                        write_errors: 1,
+                        ..Health::default()
+                    },
+                }
+                .observe_timing()
             })
         }
         pub(super) fn stderr() -> Self {
-            Self::from_stdio(std::io::stderr().as_fd()).unwrap_or_else(|_| Self {
-                file: None,
-                pending: VecDeque::new(),
-                offset: 0,
-                bytes: 0,
-                health: Health {
-                    disabled: true,
-                    write_errors: 1,
-                    ..Health::default()
-                },
+            Self::from_stdio(std::io::stderr().as_fd()).unwrap_or_else(|_| {
+                Self {
+                    file: None,
+                    worker: None,
+                    observed: writer::Snapshot::default(),
+                    closed: false,
+                    failure_reported: false,
+                    finished: None,
+                    pending: VecDeque::new(),
+                    offset: 0,
+                    bytes: 0,
+                    timing: Timing::disabled(),
+                    health: Health {
+                        disabled: true,
+                        write_errors: 1,
+                        ..Health::default()
+                    },
+                }
+                .observe_timing()
             })
         }
         fn from_stdio(original: BorrowedFd<'_>) -> io::Result<Self> {
@@ -1545,9 +1622,9 @@ mod output {
                 // Stdout and stderr may alias this same open-file description.
                 // Preserve their shared offset: a separate APPEND description
                 // would leave stderr's old offset able to overwrite telemetry.
-                // Regular-file writes have byte/call bounds, not a nonblocking
-                // disk-latency guarantee; never alter the inherited flags.
-                return Ok(Self::with_file(duplicate));
+                // Only the persistent worker may perform regular-file writes.
+                // Never alter inherited flags or replace the shared description.
+                return Self::with_worker(duplicate);
             }
             // Pipes/terminals need their own nonblocking description; changing
             // the duplicate's status flags would also change inherited stdio.
@@ -1559,11 +1636,41 @@ mod output {
         fn with_file(file: File) -> Self {
             Self {
                 file: Some(file),
+                worker: None,
+                observed: writer::Snapshot::default(),
+                closed: false,
+                failure_reported: false,
+                finished: None,
                 pending: VecDeque::with_capacity(MAX_LINES),
                 offset: 0,
                 bytes: 0,
                 health: Health::default(),
+                timing: Timing::disabled(),
             }
+            .observe_timing()
+        }
+        pub(super) fn with_worker<W: Write + Send + 'static>(file: W) -> io::Result<Self> {
+            Ok(Self {
+                file: None,
+                worker: Some(writer::Handle::new(file)?),
+                timing: Timing::disabled(),
+                observed: writer::Snapshot::default(),
+                closed: false,
+                failure_reported: false,
+                finished: None,
+                pending: VecDeque::new(),
+                offset: 0,
+                bytes: 0,
+                health: Health::default(),
+            }
+            .observe_timing())
+        }
+        fn observe_timing(mut self) -> Self {
+            match Timing::try_from_environment(Owner::CliOutput, Instant::now()) {
+                Ok(timing) => self.timing = timing,
+                Err(_) => self.projection_error(),
+            }
+            self
         }
         pub(super) fn reopen(path: &Path) -> io::Result<Self> {
             // Opening procfs creates a distinct open-file description. Never set
@@ -1577,17 +1684,38 @@ mod output {
             Ok(Self::with_file(file))
         }
         pub(super) fn has_pending(&self) -> bool {
-            !self.pending.is_empty()
+            self.worker.as_ref().map_or_else(
+                || !self.pending.is_empty(),
+                |worker| worker.snapshot().pending_lines != 0,
+            )
         }
         pub(super) fn projection_error(&mut self) {
             self.health.projection_errors = self.health.projection_errors.saturating_add(1);
         }
         pub(super) fn emit(&mut self, mut value: serde_json::Value) {
-            if self.file.is_none() {
+            self.refresh();
+            if self.closed || self.health.disabled || self.file.is_none() && self.worker.is_none() {
                 self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
                 return;
             }
             if let Some(object) = value.as_object_mut() {
+                if let Some(now) = self.timing.start() {
+                    let mut diagnostic = Limited(Vec::new());
+                    match self
+                        .timing
+                        .write_snapshot_at(now, &mut diagnostic)
+                        .and_then(|_| {
+                            serde_json::from_slice(&diagnostic.0).map_err(io::Error::other)
+                        }) {
+                        Ok(snapshot) => {
+                            object.insert("execution_wall".into(), snapshot);
+                        }
+                        Err(_) => {
+                            self.health.projection_errors =
+                                self.health.projection_errors.saturating_add(1);
+                        }
+                    }
+                }
                 match serde_json::to_value(self.health) {
                     Ok(health) => {
                         object.insert("log_health".into(), health);
@@ -1599,12 +1727,30 @@ mod output {
                 }
             }
             let mut encoded = Limited(Vec::new());
-            if serde_json::to_writer(&mut encoded, &value).is_err() {
+            if self
+                .timing
+                .measure_result(Stage::CliEncoding, || {
+                    serde_json::to_writer(&mut encoded, &value)
+                })
+                .is_err()
+            {
                 self.projection_error();
                 self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
                 return;
             }
             encoded.0.push(b'\n');
+            if let Some(worker) = &mut self.worker {
+                match worker.enqueue(encoded.0) {
+                    writer::Admission::Accepted => {}
+                    writer::Admission::Full(line) | writer::Admission::Closed(line) => {
+                        self.health.dropped_lines = self.health.dropped_lines.saturating_add(1);
+                        self.health.dropped_bytes =
+                            self.health.dropped_bytes.saturating_add(line.len() as u64);
+                    }
+                }
+                self.refresh();
+                return;
+            }
             if self.pending.len() == MAX_LINES
                 || self.bytes.saturating_add(encoded.0.len()) > MAX_BYTES
             {
@@ -1620,6 +1766,18 @@ mod output {
             self.pending.push_back(encoded.0);
         }
         pub(super) fn flush_turn(&mut self) {
+            let started = self.timing.start();
+            self.flush_turn_inner();
+            // A flush returning normally is not proof every queued line drained.
+            self.timing
+                .record_since(Stage::CliFlush, started, Outcome::Complete);
+        }
+        fn flush_turn_inner(&mut self) {
+            self.refresh();
+            if let Some(worker) = &self.worker {
+                worker.grant();
+                return;
+            }
             let mut budget = WRITE_BYTES;
             for _ in 0..WRITE_CALLS {
                 let (Some(file), Some(line)) = (&mut self.file, self.pending.front()) else {
@@ -1629,7 +1787,10 @@ mod output {
                     break;
                 }
                 let end = line.len().min(self.offset.saturating_add(budget));
-                match file.write(&line[self.offset..end]) {
+                match self
+                    .timing
+                    .measure_result(Stage::CliFileWrite, || file.write(&line[self.offset..end]))
+                {
                     Ok(0) => {
                         self.fail(io::ErrorKind::WriteZero);
                         break;
@@ -1657,6 +1818,150 @@ mod output {
                 }
             }
         }
+        fn refresh(&mut self) {
+            let Some(worker) = &self.worker else {
+                return;
+            };
+            let current = worker.snapshot();
+            self.merge_worker_snapshot(current);
+        }
+        fn merge_worker_snapshot(&mut self, current: writer::Snapshot) {
+            macro_rules! merge {
+                ($field:ident) => {
+                    self.health.$field = self
+                        .health
+                        .$field
+                        .saturating_add(current.$field.saturating_sub(self.observed.$field));
+                };
+            }
+            merge!(written_bytes);
+            merge!(write_errors);
+            merge!(broken_pipe);
+            merge!(would_block);
+            merge!(dropped_lines);
+            merge!(dropped_bytes);
+            self.health.queue_bytes_high =
+                self.health.queue_bytes_high.max(current.queue_bytes_high);
+            self.health.disabled |= current.disabled;
+            self.observed = current;
+        }
+        pub(super) fn take_failure(&mut self) -> bool {
+            self.refresh();
+            if self.health.disabled && !self.failure_reported {
+                self.failure_reported = true;
+                true
+            } else {
+                false
+            }
+        }
+        fn report(&mut self, timed_out: bool) -> Finish {
+            if let Some(report) = self.finished {
+                return report;
+            }
+            let observed = self.worker.as_ref().map(|worker| worker.snapshot());
+            self.report_observed(timed_out, observed)
+        }
+        fn report_observed(
+            &mut self,
+            timed_out: bool,
+            observed: Option<writer::Snapshot>,
+        ) -> Finish {
+            if let Some(report) = self.finished {
+                return report;
+            }
+            // Failure and pending custody must come from the same observation.
+            // A second worker read could otherwise see an empty failed queue
+            // while retaining the first read's successful health state.
+            let (lines, bytes) = if let Some(snapshot) = observed {
+                self.merge_worker_snapshot(snapshot);
+                (snapshot.pending_lines, snapshot.pending_bytes)
+            } else {
+                (self.pending.len(), self.bytes)
+            };
+            self.health.unresolved_lines = lines as u64;
+            self.health.unresolved_bytes = bytes as u64;
+            let report = Finish {
+                completed: lines == 0 && !self.health.disabled,
+                failed: self.health.disabled,
+                timed_out,
+                unresolved_lines: lines as u64,
+                unresolved_bytes: bytes as u64,
+            };
+            self.finished = Some(report);
+            report
+        }
+        fn stop(&mut self, timed_out: bool) -> Finish {
+            self.closed = true;
+            // Snapshot first: after stop a returning worker may conclusively
+            // discard queued tails; at this boundary they were still unresolved.
+            let report = self.report(timed_out);
+            if timed_out {
+                self.health.shutdown_timeouts = self.health.shutdown_timeouts.saturating_add(1);
+            }
+            if let Some(worker) = &self.worker {
+                worker.stop();
+            }
+            report
+        }
+        pub(super) async fn finish_until(&mut self, deadline: Instant) -> Finish {
+            if let Some(report) = self.finished {
+                return report;
+            }
+            if !self.closed {
+                self.emit_terminal_timing();
+            }
+            self.closed = true;
+            let mut guard = Finishing {
+                sink: self,
+                complete: false,
+            };
+            if Instant::now() < deadline
+                && let Some(worker) = &guard.sink.worker
+            {
+                worker.close();
+            }
+            loop {
+                guard.sink.refresh();
+                if guard.sink.health.disabled {
+                    let report = guard.sink.stop(false);
+                    guard.complete = true;
+                    return report;
+                }
+                if !guard.sink.has_pending() {
+                    let report = guard.sink.report(false);
+                    guard.complete = true;
+                    return report;
+                }
+                if Instant::now() >= deadline {
+                    let report = guard.sink.stop(true);
+                    guard.complete = true;
+                    return report;
+                }
+                guard.sink.flush_turn();
+                if !guard.sink.has_pending() {
+                    let report = guard.sink.report(false);
+                    guard.complete = true;
+                    return report;
+                }
+                let now = Instant::now();
+                let next = now
+                    .checked_add(Duration::from_millis(5))
+                    .unwrap_or(deadline)
+                    .min(deadline);
+                tokio::time::sleep_until(next).await;
+            }
+        }
+        fn emit_terminal_timing(&mut self) {
+            let mut encoded = Limited(Vec::new());
+            match self.timing.write_terminal_at(Instant::now(), &mut encoded) {
+                Ok(true) => match serde_json::from_slice(&encoded.0) {
+                    Ok(value) => self.emit(value),
+                    Err(_) => self.projection_error(),
+                },
+                Ok(false) => {}
+                Err(_) => self.projection_error(),
+            }
+        }
         fn fail(&mut self, kind: io::ErrorKind) {
             self.health.disabled = true;
             self.health.write_errors = self.health.write_errors.saturating_add(1);
@@ -1673,6 +1978,30 @@ mod output {
             self.offset = 0;
             self.file = None;
         }
+    }
+    impl Drop for Sink {
+        fn drop(&mut self) {
+            if !self.closed {
+                let _unresolved = self.stop(false);
+            }
+        }
+    }
+    struct Finishing<'a> {
+        sink: &'a mut Sink,
+        complete: bool,
+    }
+    impl Drop for Finishing<'_> {
+        fn drop(&mut self) {
+            if !self.complete {
+                // Cancellation never starts async cleanup or waits on the writer.
+                let _unresolved = self.sink.stop(false);
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn test_health(sink: &mut Sink) -> Health {
+        sink.refresh();
+        sink.health
     }
     struct Limited(Vec<u8>);
     impl Write for Limited {
@@ -1699,6 +2028,85 @@ mod output {
             os::fd::AsRawFd,
             sync::atomic::{AtomicUsize, Ordering},
         };
+        #[tokio::test(flavor = "current_thread")]
+        async fn terminal_snapshot_cannot_combine_pre_failure_health_with_post_failure_empty_queue()
+        -> io::Result<()> {
+            struct FailingWriter {
+                started: Option<tokio::sync::oneshot::Sender<()>>,
+                release: std::sync::mpsc::Receiver<()>,
+            }
+            impl Write for FailingWriter {
+                fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                    if let Some(started) = self.started.take() {
+                        let _sent = started.send(());
+                    }
+                    self.release.recv().map_err(io::Error::other)?;
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture failure"))
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            let (release, wait) = std::sync::mpsc::sync_channel(1);
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let mut sink = Sink::with_worker(FailingWriter {
+                started: Some(started),
+                release: wait,
+            })?;
+            sink.emit(serde_json::json!({"event":"pending failure"}));
+            sink.flush_turn();
+            tokio::time::timeout(Duration::from_secs(1), entered)
+                .await
+                .map_err(|_| io::Error::other("worker write not entered"))?
+                .map_err(io::Error::other)?;
+            let before = sink
+                .worker
+                .as_ref()
+                .ok_or_else(|| io::Error::other("worker"))?
+                .snapshot();
+            assert!(!before.disabled && before.pending_lines == 1);
+            release.try_send(()).map_err(io::Error::other)?;
+            let failed = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let value = sink
+                        .worker
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("worker"))?
+                        .snapshot();
+                    if value.disabled && value.pending_lines == 0 {
+                        break Ok::<_, io::Error>(value);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::other("worker failure not observed"))??;
+            assert_eq!(failed.written_bytes, 0);
+            assert_eq!(
+                (
+                    failed.write_errors,
+                    failed.broken_pipe,
+                    failed.dropped_lines
+                ),
+                (1, 1, 1)
+            );
+            // Actual failure occurred between capture and terminal projection.
+            // Freeze that capture, never combine it with the now-empty queue.
+            let report = sink.report_observed(false, Some(before));
+            assert!(!report.completed && !report.failed);
+            assert_eq!(report.unresolved_lines, 1);
+            assert_eq!(report.unresolved_bytes, before.pending_bytes as u64);
+            let repeated = sink.report(false);
+            assert!(!repeated.completed && !repeated.failed);
+            assert_eq!(repeated.unresolved_lines, 1);
+            // The independent failure observation still carries its own exact
+            // empty/failed boundary; no successful progress can be inferred.
+            sink.merge_worker_snapshot(failed);
+            assert!(sink.health.disabled);
+            assert_eq!(sink.health.write_errors, 1);
+            assert_eq!(sink.health.unresolved_lines, 1);
+            Ok(())
+        }
         fn pipe() -> io::Result<(std::io::PipeReader, std::io::PipeWriter, Sink)> {
             let (reader, writer) = std::io::pipe()?;
             let before = rustix::fs::fcntl_getfl(&writer)?;
@@ -1854,7 +2262,66 @@ mod output {
             Ok(())
         }
         #[test]
-        fn stdio_regular_file_and_aliased_stderr_preserve_each_others_lines() -> io::Result<()> {
+        fn execution_timing_counts_actual_successful_direct_file_write() -> io::Result<()> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "l2tunnel-log-timing-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            std::fs::remove_file(&path)?;
+            let mut sink = Sink::with_file(file.try_clone()?);
+            sink.timing = Timing::try_new(Owner::CliOutput, Instant::now())?;
+            sink.emit(serde_json::json!({"event":"timed-success"}));
+            sink.flush_turn();
+            assert!(!sink.has_pending());
+            assert!(sink.health.written_bytes > 0);
+            assert_eq!(sink.health.would_block, 0);
+            let writes = sink
+                .timing
+                .snapshot(Stage::CliFileWrite)
+                .ok_or_else(|| io::Error::other("explicit observation"))?;
+            assert_eq!(writes.samples, 1);
+            assert_eq!(writes.failed, 0);
+            assert!(writes.maximum_start_us.is_some() && writes.maximum_end_us.is_some());
+            assert_eq!(
+                sink.timing
+                    .snapshot(Stage::CliEncoding)
+                    .ok_or_else(|| io::Error::other("encoding"))?
+                    .samples,
+                1
+            );
+            assert_eq!(
+                sink.timing
+                    .snapshot(Stage::CliFlush)
+                    .ok_or_else(|| io::Error::other("flush"))?
+                    .samples,
+                1
+            );
+            file.rewind()?;
+            let mut bytes = String::new();
+            file.read_to_string(&mut bytes)?;
+            let value: serde_json::Value = serde_json::from_str(bytes.trim())?;
+            assert_eq!(value["event"], "timed-success");
+            assert_eq!(value["execution_wall"]["event"], "execution_timing");
+            // The published snapshot preceded this write; it is not a later final observation.
+            let written_before = value["execution_wall"]["stages"]
+                .as_array()
+                .ok_or_else(|| io::Error::other("stages"))?
+                .iter()
+                .find(|stage| stage["stage"] == "CliFileWrite")
+                .ok_or_else(|| io::Error::other("write stage"))?;
+            assert_eq!(written_before["samples"], 0);
+            Ok(())
+        }
+        #[tokio::test]
+        async fn stdio_regular_file_and_aliased_stderr_preserve_each_others_lines() -> io::Result<()>
+        {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
                 "l2tunnel-shared-log-{}-{}",
@@ -1874,6 +2341,14 @@ mod output {
             let mut sink = Sink::from_stdio(original.as_fd())?;
             sink.emit(serde_json::json!({"event":"first telemetry"}));
             sink.flush_turn();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while sink.has_pending() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::other("regular writer acceptance"))?;
+            sink.refresh();
             assert_eq!(
                 original.stream_position()?,
                 b"original prefix\n".len() as u64 + sink.health.written_bytes
@@ -1881,6 +2356,14 @@ mod output {
             stderr.write_all(b"final error\n")?;
             sink.emit(serde_json::json!({"event":"second telemetry"}));
             sink.flush_turn();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while sink.has_pending() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::other("regular writer acceptance"))?;
+            sink.refresh();
             assert_eq!(rustix::fs::fcntl_getfl(&original)?, flags);
             assert_eq!(rustix::fs::fcntl_getfl(&stderr)?, flags);
             assert!(!sink.has_pending());

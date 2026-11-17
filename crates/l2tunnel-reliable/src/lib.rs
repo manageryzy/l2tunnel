@@ -18,6 +18,7 @@ pub use compact::{
     inspect_compact_structural,
 };
 pub use wire_extent::RecoveryExtent;
+pub mod diagnostics;
 mod legacy_layout;
 pub mod storage;
 use std::fmt;
@@ -293,8 +294,11 @@ pub struct Storage {
     pub restored_packets: usize,
     /// Complete ARQ bytes in restored staging.
     pub restored_bytes: usize,
-    /// Existing FEC decoder reservation, including its bounded scratch allowance.
+    /// Current live-generation logical reservation; neither configured capacity nor allocated backing.
     pub fec_reserved_bytes: usize,
+    /// Actual Block/Direct ARQ staging bounds and decoder gauges. Compact ARQ
+    /// constructs none of these block pools, so its value is absent.
+    pub block: Option<diagnostics::Buffers>,
 }
 
 #[derive(Clone, Copy)]
@@ -352,6 +356,8 @@ pub struct Reliable {
     pending_output: Option<PreparedOutput>,
     independent_feedback: Option<PreparedOutput>,
     compact_wire: Option<CompactOverheads>,
+    // Opt-in fixed sidecar, reserved in the original construction plan.
+    diagnostics: Vec<diagnostics::Snapshot>,
 }
 
 impl ReliableConfig {
@@ -507,6 +513,7 @@ impl Reliable {
             pending_output: None,
             independent_feedback: None,
             compact_wire: None,
+            diagnostics: Vec::new(),
         })
     }
 
@@ -517,7 +524,18 @@ impl Reliable {
         context: RecoveryContext,
         limits: storage::Limits,
     ) -> Result<Self, storage::Error> {
-        let plan = storage::Plan::for_duplex(config, receive_config)?;
+        Self::new_reserved_with_plan(
+            storage::Plan::for_duplex(config, receive_config)?,
+            context,
+            limits,
+        )
+    }
+    /// Construct the exact validated plan, including optional pre-admitted diagnostics.
+    pub fn new_reserved_with_plan(
+        plan: storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
         if plan.capacity_bytes() > limits.capacity_bytes {
             return Err(storage::Error::Limit {
                 required: plan.capacity_bytes(),
@@ -525,7 +543,13 @@ impl Reliable {
             });
         }
         let mut allocation = storage::Allocation::new(limits.capacity_bytes);
-        Self::reserved_with(config, receive_config, context, plan, &mut allocation)
+        Self::reserved_with(
+            plan.send_config(),
+            plan.receive_config(),
+            context,
+            plan,
+            &mut allocation,
+        )
     }
     pub(crate) fn reserved_with(
         config: ReliableConfig,
@@ -612,6 +636,10 @@ impl Reliable {
         let expired = backing::expired(generations, a)?;
         let mut scratch = a.vec(arq.send_max_packet_bytes())?;
         scratch.resize(arq.send_max_packet_bytes(), 0);
+        let mut diagnostics = a.vec::<diagnostics::Snapshot>(usize::from(plan.diagnostics))?;
+        if plan.diagnostics {
+            diagnostics.push(diagnostics::Snapshot::new(context, encoder.is_some()));
+        }
         let wrapper = a.usage();
         let bytes = storage::add(
             wrapper.capacity_bytes,
@@ -674,6 +702,7 @@ impl Reliable {
             pending_output: None,
             independent_feedback: None,
             compact_wire: None,
+            diagnostics,
         })
     }
     /// Select physical-attempt timing before any local/peer traffic is used.
@@ -798,7 +827,7 @@ impl Reliable {
         match kind {
             1 => {
                 self.source_id(inner).or_else(|error| self.fail(error))?;
-                self.ensure_restored(1, inner.len())?;
+                self.ensure_restored(1, inner.len(), now)?;
                 self.advance(now)?;
                 self.enqueue(inner, false)?;
                 self.pump()?;
@@ -1370,6 +1399,56 @@ impl Reliable {
     pub fn failure(&self) -> Option<Error> {
         self.failure.or_else(|| self.arq.failure().map(Error::Arq))
     }
+    /// Read-only exact output-budget observations; None means diagnostics were not selected.
+    pub fn output_wait_snapshot(&self, now: Duration) -> Option<diagnostics::Snapshot> {
+        self.diagnostics.first().copied().map(|v| v.observed(now))
+    }
+    fn block_buffers(&self) -> Option<diagnostics::Buffers> {
+        let compact::Policies::Legacy { send, receive } = self.policies else {
+            return None;
+        };
+        // The allocating owner creates its encoder only inside seal(). Both
+        // owners retain the same configured queues before/after that temporary
+        // encoder exists; backing allocation is not an operational capacity.
+        let building = if send.repair_symbols == 0 {
+            0
+        } else {
+            send.fec.block.max_sources
+        };
+        Some(diagnostics::Buffers {
+            building_packets_capacity: building,
+            building_deadline: self.building_deadline,
+            outbound_packets_capacity: building + send.repair_symbols,
+            outbound_packet_bytes_maximum: self.maximum_packet,
+            restored_packets_capacity: receive.max_restored_packets,
+            restored_bytes_capacity: receive.max_restored_bytes,
+            physical_packets: [
+                usize::from(self.pending_output.is_some()),
+                usize::from(self.independent_feedback.is_some()),
+            ],
+            physical_bytes: [
+                self.pending_output.map_or(0, |v| v.bytes),
+                self.independent_feedback.map_or(0, |v| v.bytes),
+            ],
+            physical_packets_capacity: usize::from(self.physical_instance.is_some()),
+            decoder_present: self.decoder.is_some(),
+            decoder: if self.diagnostics.is_empty() {
+                None
+            } else {
+                self.decoder.as_ref().map(fec::Decoder::buffer_snapshot)
+            },
+        })
+    }
+    fn output_operation(&self) -> Option<diagnostics::Operation> {
+        let front = self.outgoing.front()?;
+        let view = self.inspect_output_record(&front.bytes).ok()?.fec?;
+        Some(diagnostics::Operation {
+            generation: view.generation.0,
+            symbol: view.symbol.0,
+            bytes: front.bytes.len(),
+        })
+    }
+
     /// Current bounded owned storage, without counting external caller packets.
     pub fn storage(&self) -> Storage {
         Storage {
@@ -1384,6 +1463,7 @@ impl Reliable {
                 .decoder
                 .as_ref()
                 .map_or(0, fec::Decoder::reserved_bytes),
+            block: self.block_buffers(),
         }
     }
 
@@ -1414,14 +1494,24 @@ impl Reliable {
             .source_count
             .checked_mul(view.coded_bytes - 2)
             .ok_or(Error::Exhausted)?;
-        self.ensure_restored(view.source_count, maximum)?;
+        self.ensure_restored(view.source_count, maximum, now)?;
         self.advance(now)?;
         let ticks = milliseconds(now)?;
+        let mut diagnostics = self.diagnostics.first_mut();
         let accepted = self
             .decoder
             .as_mut()
             .ok_or(Error::Malformed)?
-            .accept_view(view, ticks);
+            .accept_view_observed(view, ticks, |reason| {
+                if let Some(state) = diagnostics.as_deref_mut() {
+                    let index = match reason {
+                        fec::DecoderCapacity::SymbolSlots => 0,
+                        fec::DecoderCapacity::GenerationSlots => 1,
+                        fec::DecoderCapacity::LogicalReservation => 2,
+                    };
+                    state.capacity_refused(index, now);
+                }
+            });
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
                 let checked = (|| -> Result<(), Error> {
@@ -1630,14 +1720,47 @@ impl Reliable {
         let Some(front) = self.outgoing.front() else {
             return Ok(None);
         };
-        if !self.allowed(front.bytes.len(), budget)? {
-            return Ok(None);
-        }
+        let allowed = self.allowed(front.bytes.len(), budget)?;
         let length = front.bytes.len();
         let emission = front.emission;
+        // Canonical inspection runs only for an opted-in actual refusal or its
+        // matching completion. It neither polls nor copies retained payloads.
+        let inspect = self
+            .diagnostics
+            .first()
+            .is_some_and(|v| !allowed || v.pending.is_some());
+        let operation = if inspect {
+            self.output_operation()
+        } else {
+            None
+        };
+        if !allowed {
+            let charge = length.checked_add(self.outer_overhead());
+            if let Some(state) = self.diagnostics.first_mut() {
+                if let (Some(operation), Some(charge)) = (operation, charge) {
+                    state.refused(
+                        operation,
+                        self.now,
+                        [budget.packets == 0, budget.wire_bytes < charge],
+                    );
+                } else {
+                    state.identity_mismatch = true;
+                }
+            }
+            return Ok(None);
+        }
+        // Reborrow after read-only identity inspection; the exact head is unchanged.
+        let front = self.outgoing.front().ok_or(Error::Exhausted)?;
         output[..length].copy_from_slice(&front.bytes);
         self.outgoing.discard_front()?;
         self.charge(length, emission, budget)?;
+        if inspect && let Some(state) = self.diagnostics.first_mut() {
+            if let Some(operation) = operation {
+                state.progress(operation, self.now);
+            } else {
+                state.identity_mismatch = true;
+            }
+        }
         Ok(Some(length))
     }
     fn emit_scratch(
@@ -1725,19 +1848,35 @@ impl Reliable {
                     .ok_or(Error::Exhausted)?)
     }
 
-    fn ensure_restored(&self, packets: usize, bytes: usize) -> Result<(), Error> {
-        if self
+    fn ensure_restored(
+        &mut self,
+        packets: usize,
+        bytes: usize,
+        now: Duration,
+    ) -> Result<(), Error> {
+        // Preserve the existing short-circuit gate and error precedence.
+        let reason = if self
             .restored
             .len()
             .checked_add(packets)
             .ok_or(Error::Exhausted)?
             > self.legacy_receive()?.max_restored_packets
-            || self
-                .restored_bytes
-                .checked_add(bytes)
-                .ok_or(Error::Exhausted)?
-                > self.legacy_receive()?.max_restored_bytes
         {
+            Some(3)
+        } else if self
+            .restored_bytes
+            .checked_add(bytes)
+            .ok_or(Error::Exhausted)?
+            > self.legacy_receive()?.max_restored_bytes
+        {
+            Some(4)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if let Some(state) = self.diagnostics.first_mut() {
+                state.capacity_refused(reason, now);
+            }
             return Err(Error::RestoredCapacity);
         }
         Ok(())

@@ -731,6 +731,7 @@ impl Driver {
         let initial_plan = if rolling_wait_diagnostics {
             initial_plan
                 .with_rolling_wait_diagnostics()
+                .and_then(|plan| plan.with_reliable_output_diagnostics())
                 .map_err(invalid)?
         } else {
             initial_plan
@@ -803,6 +804,18 @@ impl Driver {
                     .protocol_buffers()
                     .ok_or_else(|| invalid("rolling buffer observer"))?
                     .configure_rolling_waits()?;
+            }
+            if contract.catalog().descriptors().iter().any(|descriptor| {
+                matches!(
+                    descriptor.profile(),
+                    l2tunnel::record_configuration::Profile::Aligned { .. }
+                        | l2tunnel::record_configuration::Profile::Packed { .. }
+                )
+            }) {
+                metrics
+                    .protocol_buffers()
+                    .ok_or_else(|| invalid("reliable buffer observer"))?
+                    .configure_reliable_output()?;
             }
             metrics.configure_management_buffers()?;
         }

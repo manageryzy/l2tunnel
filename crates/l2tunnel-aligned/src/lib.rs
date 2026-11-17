@@ -321,6 +321,17 @@ impl Endpoint {
         let plan = storage::Plan::for_duplex(send, receive)?;
         Self::new_reserved_profile(plan, context, limits)
     }
+    /// Construct the exact ordinary Aligned plan, retaining optional nested observations.
+    pub fn new_reserved_with_plan(
+        plan: storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        if plan.send_packed().is_some() || plan.receive_packed().is_some() {
+            return Err(storage::Error::Endpoint(Error::Configuration));
+        }
+        Self::new_reserved_profile(plan, context, limits)
+    }
     /// Actual complete retained heap; an allocating endpoint returns None.
     pub fn storage_usage(&self) -> Option<storage::Usage> {
         self.usage
@@ -412,9 +423,8 @@ impl Endpoint {
         });
         construction.packed_symbols = allocation.bytes(symbols)?;
         construction.recovery = Some(
-            Reliable::new_duplex_reserved(
-                config.recovery,
-                receive_config.recovery,
+            Reliable::new_reserved_with_plan(
+                plan.reliable_plan(),
                 context,
                 l2tunnel_reliable::storage::Limits {
                     capacity_bytes: plan.reliable_plan().capacity_bytes(),
@@ -1160,6 +1170,14 @@ impl Endpoint {
     /// Returns recovery retention without scanning codec receiver state.
     pub fn recovery_storage(&self) -> l2tunnel_reliable::Storage {
         self.recovery.storage()
+    }
+
+    /// Exact opted-in Reliable output-budget observations, without polling recovery.
+    pub fn recovery_output_wait(
+        &self,
+        now: Duration,
+    ) -> Option<l2tunnel_reliable::diagnostics::Snapshot> {
+        self.recovery.output_wait_snapshot(now)
     }
 
     /// Read the actual codec stage and receiver; recovery buffers remain separate.

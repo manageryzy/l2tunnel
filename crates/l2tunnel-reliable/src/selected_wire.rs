@@ -245,7 +245,7 @@ impl Reliable {
         }
         match view.kind {
             RecordKind::Source => {
-                self.ensure_restored(1, body.len())?;
+                self.ensure_restored(1, body.len(), observed)?;
                 self.advance(observed)?;
                 self.enqueue(body, false)?;
                 self.pump()

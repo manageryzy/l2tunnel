@@ -331,6 +331,17 @@ impl Endpoint {
         let plan = storage::Plan::for_packed_duplex(send, receive)?;
         super::Endpoint::new_reserved_profile(plan, context, limits).map(Self)
     }
+    /// Construct the exact Packed plan, retaining optional nested Reliable observations.
+    pub fn new_reserved_with_plan(
+        plan: storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        if plan.send_packed().is_none() || plan.receive_packed().is_none() {
+            return Err(storage::Error::Endpoint(Error::Configuration));
+        }
+        super::Endpoint::new_reserved_profile(plan, context, limits).map(Self)
+    }
     /// Reserve one actual symmetric Compact R0 packed owner; physical custody is enabled.
     pub fn new_compact_reserved(
         config: CompactConfig,
@@ -632,6 +643,14 @@ impl Endpoint {
     /// Returns recovery retention without scanning codec receiver state.
     pub fn recovery_storage(&self) -> l2tunnel_reliable::Storage {
         self.0.recovery_storage()
+    }
+
+    /// Exact opted-in nested Reliable output-budget observations.
+    pub fn recovery_output_wait(
+        &self,
+        now: Duration,
+    ) -> Option<l2tunnel_reliable::diagnostics::Snapshot> {
+        self.0.recovery_output_wait(now)
     }
 
     /// Actual nested codec retention; this does not poll recovery or consume output.

@@ -1282,11 +1282,21 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                     return Err(Error::Proof);
                 }
                 for j in 0..self.count() {
-                    self.lanes[j]
-                        .as_ref()
-                        .ok_or(Error::Proof)?
-                        .proof
-                        .complementary(hello.lanes[j].ok_or(Error::Proof)?)?;
+                    let lane = self.lanes[j].as_ref().ok_or(Error::Proof)?;
+                    let peer = hello.lanes[j].ok_or(Error::Proof)?;
+                    if let Err(error) = lane.proof.complementary(peer) {
+                        // A diagnostic lock failure must not replace the original proof error.
+                        if let Ok(mut state) = lane.io.state.try_lock()
+                            && state.proof_failure.is_none()
+                        {
+                            state.proof_failure = Some(SetupProofFailure::hello(
+                                SetupProofBoundary::PeerHello,
+                                lane.proof,
+                                peer,
+                            ));
+                        }
+                        return Err(error);
+                    }
                 }
                 if self.peer_hello.is_some_and(|old| old != bytes) {
                     return Err(Error::Proof);

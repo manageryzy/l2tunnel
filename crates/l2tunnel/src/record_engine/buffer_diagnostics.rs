@@ -216,3 +216,18 @@ impl Engine {
         }
     }
 }
+
+impl Engine {
+    /// Actual shared Block/Direct ARQ sidecar. Other profiles remain explicitly absent;
+    /// per-connection Compact ARQ has no builder or sealed FEC output queue.
+    pub fn reliable_output_wait(
+        &self,
+        now: std::time::Duration,
+    ) -> Option<l2tunnel_reliable::diagnostics::Snapshot> {
+        match &self.owner {
+            Owner::Aligned(owner) => owner.recovery_output_wait(now),
+            Owner::Packed(owner) => owner.recovery_output_wait(now),
+            _ => None,
+        }
+    }
+}

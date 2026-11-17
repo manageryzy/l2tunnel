@@ -69,6 +69,8 @@ pub struct SetupGateSnapshot {
     pub rejected_packets: u64,
     /// Retained incoming gate cells.
     pub queued_packets: usize,
+    /// First identified proof refusal, with no key, session or transcript values.
+    pub proof_failure: Option<SetupProofFailure>,
 }
 
 /// Actual detached-lane transition flags, absent before I/O transfer.
@@ -202,6 +204,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
                         sent_bytes: state.sent_bytes,
                         rejected_packets: state.rejected_packets,
                         queued_packets: state.incoming.len(),
+                        proof_failure: state.proof_failure,
                     })
                 });
                 Some(SetupLaneSnapshot {

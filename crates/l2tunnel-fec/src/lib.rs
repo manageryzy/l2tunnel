@@ -14,7 +14,8 @@ mod symbol_output;
 mod wire;
 
 pub use decoder::{
-    AcceptStatus, DecodedBlock, DecodedSources, Decoder, DecoderConfig, ExpiredGeneration, Progress,
+    AcceptStatus, DecodedBlock, DecodedSources, Decoder, DecoderBuffers, DecoderCapacity,
+    DecoderConfig, ExpiredGeneration, Progress,
 };
 pub use field::{cauchy_coefficients, compact_coefficients};
 pub use wire::{HEADER_BYTES, SymbolKind, SymbolView, inspect};

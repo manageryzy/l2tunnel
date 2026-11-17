@@ -43,15 +43,15 @@ validation pass. "Implemented" below describes source, not a passing check.
 
 | ID | Owner / retained storage | Current source and remaining coverage |
 |---|---|---|
-| BP-01 | Pipeline/MUX packet/byte/flow/DRR bounds | Actual Engine admission refusal callback and aggregate counts are wired. Exact selected FIFO-head refusal-to-admission intervals, keyed by epoch/configuration/FlowId/channel, pass coordinated local validation with bounded omission and first-observed cause segments. Native qualification, per-flow occupancy, ingress capacity, flow-table and DRR/policy attribution remain pending. |
+| BP-01 | Pipeline/MUX packet/byte/flow/DRR bounds | Actual Engine admission refusal callback and aggregate counts are wired. Exact selected FIFO-head refusal-to-admission intervals, keyed by epoch/configuration/FlowId/channel, pass coordinated local validation with bounded omission and first-observed cause segments. Native16 exports pass parser validation for actual Swift and Rolling refusals. Per-flow occupancy, ingress capacity, flow-table and DRR/policy attribution remain pending. |
 | BP-02 | ACK ingress candidates/slab | Common held-input capacity wait implemented; internal deliberate coalescing hold and per-flow replacement age export pending. |
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
 | BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
-| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Existing storage observations; dedicated builder, recovery/output and whole-write intervals pending. |
+| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below; native qualification pending. Restored-source and whole-write durations remain open. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
-| BP-09 | Block FEC generations/equations/restored output | Rank/storage limits and bounded scratch remain; dedicated gauges/refusals/export pending. |
+| BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below; native qualification pending. Missing-equation and restored-source wait duration remain open. |
 | BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and three exact retained-operation intervals are implemented: source admission, decoded handoff and ready-feedback budget. Optional bounded storage and runtime export are charged before I/O. Coordinated local validation passes below; native qualification, work slices, feedback construction, ingress and missing-source dependencies remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
@@ -1026,3 +1026,155 @@ failure. The first preflight compared different hash inventories and ran no
 tests; its tool-failure receipt is retained. Runtime source and release16 binary
 are unchanged, so required batch16 Rust checks are reused. Native qualification
 of concurrent local release remains pending.
+
+
+### Native16 observed admission waits and unresolved failures
+
+The [four-case source-bound report](../../work/aligned-extents-20261117/native16-analysis1/report.md)
+uses runtime commit `1cd5e4a`, harness `f6ae9ba`, and one release16 binary.
+All four original-policy lanes run concurrently; none yields qualified throughput.
+Swift raw fails at PacketConfirmation Proof before its first confirmation copy.
+Rolling UDP expires at the original Ingress custody boundary; the earlier decoder
+job deadline is a candidate, not the winning checked failure. Swift TLS reverse
+and QUIC forward exhaust the original stage/case bound. Concurrent requested local
+disconnect succeeds for TLS and QUIC; this is not bilateral protocol-drain proof.
+
+All ten buffer exports parse without validation issues. QUIC bulk Common waits
+56.150440 seconds for carrier receipts over a 62.337622-second observation;
+maintained QUIC User admission waits 55.933472 seconds. TLS bulk Common waits
+49.334208 seconds over 62.149241 seconds; its retained User flush waits 49.265735
+seconds, while management writer dependency totals 43.131199 seconds. Censored
+final intervals remain separate in the underlying exports. These same-owner and
+cross-owner durations overlap and must not be added or interpreted as proof of
+kernel queue saturation.
+
+The Pipeline provider exports sixteen exact flow-head identities on each bulk
+Swift endpoint and the Rolling sender. Actual packing/codec-stage refusals and
+same-head admission are observed, with no omitted rows, identity/clock errors or
+unavailable terminal sample. This qualifies these finite export paths only;
+remaining BP-01 and all-buffer coverage are unchanged. Full original-native
+mean/p99, real TLS/QUIC physical overhead and the complete current-build matrix
+remain open. The mixed-version continuation retains latest requested failures
+and selects 15 passed, 181 failed, 34 bound-exhausted and 10 not-run phases.
+
+
+### Execution-stage and output-write wall timing
+
+Coordinated local validation passes below; native qualification is pending.
+The bounded runtime timing accumulator now
+observes actual Common admission, protocol work, control service, send/receive,
+native I/O, expiry checks, sampling and publication. Consecutive turn-start spacing
+also includes intentional idle waiting and scheduler delays. Stage totals and
+maxima are wall durations, not CPU time or backpressure. Each maximum retains its
+own start/end within one owner clock; maxima from different owners are not one
+joined event. Original protocol tick samples and error precedence are unchanged.
+
+Execution timing opts in with `L2TUNNEL_EXECUTION_TIMING=1` or the existing
+buffer/wire metric prefix. Disabled work paths do not read another clock or
+allocate an aggregate. Enabled state is fallibly allocated off the async future
+and remains subject to the existing bounded owner catalog. No per-packet log or
+unbounded event history is added. Missing diagnostics remain unavailable.
+
+CLI projection, JSON serialization, bounded flush and actual file writes are
+separate populations; successful writes are measured too. Their nested times
+must not be added. CLI snapshots use existing bounded output custody and can be
+omitted on saturation, failure or cancellation. The no-I/O construction/rendering
+seams let foreground output retain allocation failure through its health fields
+without synchronous error logging. Common execution has no automatic stderr
+report: its prepaid state moves at the exact original loop-stop instant into the
+existing buffer observer. Frozen output excludes later settlement, rendering and
+persistence. Cancellation before that handoff is explicitly unavailable. Common
+execution export requires the buffer/wire prefix; the execution flag alone does
+not create a sink. Existing observer file persistence and unrelated direct stderr
+diagnostics remain synchronous and outside these stage samples.
+
+
+### Bounded regular-file output isolation
+
+Coordinated local validation passes below; native qualification is pending. Regular stdout
+and stderr each retain one dedicated writer thread across explicit reconnects.
+The existing four-line/512-KiB custody includes the worker's partial line; the
+channel is not extra payload capacity. Actual accepted prefixes release byte
+custody, and each coalesced grant permits at most four writes and 64 KiB. The
+foreground never performs the regular-file write or joins a worker. Duplicating
+the inherited file description preserves its flags and shared offset.
+
+One forty-millisecond absolute diagnostic cleanup bound is an implementation
+choice, separate from protocol deadlines. Expiry/cancellation preserves unresolved
+custody and never invents completion. Failure and abnormal unwind remain visible
+through bounded health snapshots; final publication can be unavailable. The
+writer records actual write wall time on its own thread. Shared offsets do not
+make independent emitters' partial lines atomic, and unrelated direct diagnostic
+emitters retain their existing behavior. This removes a source-proven blocking
+coupling; it does not establish that logging caused a previous native hiatus.
+
+
+### Reliable and Block FEC actual buffer observations
+
+Batch17 passes coordinated local validation below. Optional diagnostic state is
+prepaid through Reliable, Aligned/Packed and Engine plans, with one bounded
+provider snapshot per existing epoch slot. Disabled state does not allocate or
+scan decoder generations. Existing Compact R0 storage observations remain.
+Builder count/deadline, sealed output, restored admission, live generation/rank/
+history and physical-slot gauges separate occupancy from actual refusal. Live
+logical reservation is used storage against its configured admission limit;
+preallocated backing is a different capacity, with unknown actual used bytes.
+
+An actual sealed output-head packet/byte-budget refusal starts an interval keyed
+by its immutable generation, symbol and extent. Repeated refusal does not renew
+it; only emission of that same head completes it. Packet and byte reasons overlap,
+and the separate head union must not be added to either reason or other owners.
+Emission is not physical carrier acceptance. Fresh terminal sampling censors
+unresolved heads; cached retired state retains its earlier boundary. Direct ARQ
+explicitly has no sealed FEC output queue. Actual decoder and restored capacity
+failures are count-only, not inferred durations. Partial-block hold, missing
+equations, restored-source waits and repair-work timing remain unmeasured here.
+BP-06 and BP-09 remain open. Protocol bytes, limits, deadline sampling and error
+precedence are unchanged.
+
+### Raw confirmation proof diagnostic boundary
+
+Batch17 adds bounded first-failure scalars and booleans at the original raw
+confirmation predicates, with coordinated local validation below. Early protected-Hello
+release and authenticated complementary-window proof failures are distinguished.
+Local raw/scaled advertised windows and observed peer windows are available;
+keys, session values, transcripts and full sequence numbers are not exported.
+The original authentication, predicate order, errors and all retry/window/deadline
+bounds remain unchanged. Contention on the diagnostic lock cannot replace Proof.
+
+Native16's saved capture shows the final TLS segment initially advertising 32763
+and its retries 32768, with window scale five. This supports a frozen-window
+mismatch candidate, but the exact failed predicate is not yet proven by that
+receipt. The new injected-stale-window fixtures exercise actual authenticated
+Hello/retry processing, not a natural smoltcp race reproduction. A conservative
+window reconciliation would also have to account for already allocated extents
+and both authenticated handoff states; no such protocol change is included.
+
+
+### Coordinated local buffer batch17 validation
+
+The [required attempt](../../work/aligned-extents-20261117/required-buffer-checks17-attempt1/validation.json)
+passes 114 Python cases and preflight, then stops at compile errors. The first
+continuation preserves later Clippy fixture failures. After these corrections,
+the [workspace continuation](../../work/aligned-extents-20261117/required-buffer-checks17-continuation2/validation.json)
+passes strict Clippy and 2,193 Rust cases, including passing cases in failed
+targets. Three fixtures fail: two expose incorrectly reported operational bounds
+for lazy encoders, and one expects the inner Proof instead of its existing
+PacketIo error wrapper. All output writer, cancellation/failure, execution freeze,
+Block FEC refusal and actual-provider fixtures pass in that run.
+
+The [scoped continuation](../../work/aligned-extents-20261117/required-buffer-checks17-continuation3/validation.json)
+corrects the bound observation using the validated send policy and retains the
+original semantic-equivalence assertions. One added actual-owner fixture covers
+no-FEC, send-only, receive-only and asymmetric coding. Raw expects the exact
+existing I/O wrapper while retaining all authenticated proof, retry, original-cap
+and terminal-release assertions. All 48 Reliable cases, affected raw/provider
+cases, formatting, strict Clippy, no-default codec, strict rustdoc, external CLI,
+remaining tools and 1,658 simulator cases pass. Unchanged earlier passing checks
+are reused; this is scoped required coverage, not a pristine single invocation.
+All recorded checks are source-stable. A wrapper import failure before execution
+is retained separately and is not a protocol or test result.
+
+This qualifies local Linux behavior and bounded diagnostic paths only. Native
+throughput improvement, complete current-build carrier coverage, all BP rows and
+full original-native encapsulation overhead remain open.

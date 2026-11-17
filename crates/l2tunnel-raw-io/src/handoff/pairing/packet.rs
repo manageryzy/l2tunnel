@@ -15,12 +15,14 @@ mod diagnostics;
 mod send_timing;
 pub use send_timing::{SendTimingSnapshot, SendTimingTotal};
 mod gate;
+mod setup_proof;
 mod transaction;
 pub use diagnostics::{
     BufferSnapshot, CandidateBufferSnapshot, CandidateCounters, FinalPrepareBlocked,
     FinalPrepareOutcome, LaneBufferSnapshot, PacketCount, PrepareSnapshot, SendIoSnapshot,
 };
 use gate::{GateIo, GateState, SharedBudget};
+pub use setup_proof::{SetupEarlyProof, SetupHelloProof, SetupProofBoundary, SetupProofFailure};
 pub use transaction::{
     PacketCarrier, PacketSetup, SetupGateSnapshot, SetupLaneSnapshot, SetupOutcome, SetupPairStage,
     SetupSnapshot, SetupStage, SetupTransitionSnapshot, begin_packet_client, begin_packet_server,

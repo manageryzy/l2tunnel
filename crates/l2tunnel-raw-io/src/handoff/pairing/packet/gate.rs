@@ -109,6 +109,7 @@ pub(super) struct GateState {
     pub last_old: Option<Instant>,
     pub deadline: Instant,
     pub fault: Option<Error>,
+    pub proof_failure: Option<SetupProofFailure>,
     pub received_packets: u64,
     pub received_bytes: u64,
     pub sent_bytes: u64,
@@ -183,6 +184,7 @@ impl GateState {
             last_old: None,
             deadline,
             fault: None,
+            proof_failure: None,
             received_packets: 0,
             received_bytes: 0,
             sent_bytes: 0,
@@ -269,6 +271,7 @@ impl GateState {
         let count = if self.half { 2 } else { 1 };
         let lane = self.lane;
         let mut protocol_fault = false;
+        let mut proof_failure = None;
         let ranges = &self.ranges;
         let mut range_proposal = None;
         let result = self.opener.as_mut().ok_or(Error::Proof)?.open_checked(
@@ -333,6 +336,17 @@ impl GateState {
                             || local_proof
                                 .ok_or(Error::Proof)?
                                 .complementary(hello.lanes[lane].ok_or(Error::Proof)?)
+                                .inspect_err(|_| {
+                                    if let (Some(local), Some(peer)) =
+                                        (local_proof, hello.lanes[lane])
+                                    {
+                                        proof_failure = Some(SetupProofFailure::hello(
+                                            SetupProofBoundary::AuthenticatedHello,
+                                            local,
+                                            peer,
+                                        ));
+                                    }
+                                })
                                 .is_err()
                             || expected_peer.is_some_and(|expected| body != expected)
                         {
@@ -391,6 +405,9 @@ impl GateState {
         );
         match result {
             Err(_) if protocol_fault => {
+                if self.proof_failure.is_none() {
+                    self.proof_failure = proof_failure;
+                }
                 self.fault = Some(Error::Proof);
                 return Err(Error::Proof);
             }
@@ -545,6 +562,25 @@ impl GateState {
             || end > f.local_horizon
             || end >= u64::from(u32::MAX - f.peer)
         {
+            if self.proof_failure.is_none() {
+                self.proof_failure = Some(SetupProofFailure::EarlyHelloRelease(SetupEarlyProof {
+                    sequence_matches: u32::try_from(h.offset)
+                        .ok()
+                        .and_then(|offset| f.peer.checked_add(offset))
+                        == Some(early.sequence),
+                    acknowledgment_matches: early.ack == f.local,
+                    window_matches: u64::from(early.window) == f.peer_horizon >> f.peer_scale,
+                    right_edge_matches: h.right_edge == f.peer_horizon,
+                    within_local_horizon: end <= f.local_horizon,
+                    within_sequence_space: end < u64::from(u32::MAX - f.peer),
+                    expected_window: f.peer_horizon >> f.peer_scale,
+                    observed_window: early.window,
+                    expected_right_edge: f.peer_horizon,
+                    observed_right_edge: h.right_edge,
+                    end,
+                    local_horizon: f.local_horizon,
+                }));
+            }
             return Err(Error::Proof);
         }
         f.retired = f.retired.max(end);

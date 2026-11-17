@@ -139,6 +139,16 @@ The [concurrent local-shutdown harness](modules/buffer-observability.md#concurre
 passes 32 affected Python tests and retains original bounds and every endpoint
 failure. It removes serial request ordering, without claiming bilateral drain.
 No parent gate closes, and historical failed receipts remain preserved.
+The [native16 receipt](modules/buffer-observability.md#native16-observed-admission-waits-and-unresolved-failures)
+validates actual Pipeline wait exports and concurrent TLS/QUIC local disconnect,
+but all four selected data cases remain failed, bound-exhausted or not run.
+No native throughput, full BP row or same-build matrix gate closes.
+The [batch17 observations](modules/buffer-observability.md#execution-stage-and-output-write-wall-timing)
+add execution wall timing, bounded regular-file output isolation, actual Reliable/
+Block FEC gauges and sealed-head waits, and first-failure raw proof diagnostics.
+These pass [coordinated local validation](modules/buffer-observability.md#coordinated-local-buffer-batch17-validation);
+native qualification, full buffer coverage, original native overhead and the
+requested current-build matrix remain open.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

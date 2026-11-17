@@ -139,6 +139,19 @@ impl Plan {
             reliable,
         })
     }
+    /// Pre-admit the actual nested Reliable output observations into this owner plan.
+    pub fn with_reliable_output_diagnostics(mut self) -> Result<Self, Error> {
+        let before = self.reliable.capacity_bytes();
+        self.reliable = self
+            .reliable
+            .with_output_diagnostics()
+            .map_err(Error::Reliable)?;
+        self.bytes = self
+            .bytes
+            .checked_add(self.reliable.capacity_bytes() - before)
+            .ok_or(Error::Layout)?;
+        Ok(self)
+    }
     /// Complete original send direction policy.
     pub fn send_config(&self) -> Config {
         self.send
