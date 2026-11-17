@@ -1,0 +1,121 @@
+# Current Common native matrix runner
+
+`common_native_matrix.py` consumes the version1 manifest emitted by the maintained
+`common_benchmark_plan` example. A ready exporter row means the selected protocol
+planners accepted it. A generated constructor refusal is `plan_refused`, not a
+claim that the algorithm is unsupported. The runner still performs actual daemon CLI inspection,
+mutual authentication, native TCP transfer, observation and cleanup. It never
+substitutes another algorithm for a refused plan row.
+
+The default invocation is a dry run:
+
+```sh
+python3 tools/common_native_matrix.py --manifest /absolute/plans/manifest.json \
+  --binary /absolute/l2tunnel --output /absolute/new-results
+```
+
+An explicitly authorized Linux namespace experiment adds `--apply`. Optional
+repeated `--case ROW_ID` arguments select exact rows. `--phase forward`,
+`--phase reverse` or `--phase simultaneous` selects an independent direction run;
+omitting this option retains all three phases on one tunnel. A new direction run
+is separate evidence, not a retry of a failed earlier direction. The output directory must
+not already exist. The default root-owned exclusive lock serializes default runs.
+An explicit `--parallel-lane udp|raw|tls|quic` permits independent carrier lanes;
+each lane requires only its carrier rows and the distinct `--lab-id cm-CARRIER`.
+Lane locks serialize that lane. Its processes inherit a fixed eight-CPU set
+(UDP0..7, raw8..15, TLS16..23, QUIC24..31); unavailable CPU sets fail closed.
+Receipts record the selected lane and affinity. These runs still share host
+memory, storage and kernel resources, and are concurrent-host observations, not
+isolated capacity maxima. Do not launch a default run concurrently with a lane
+using the same lab prefix; namespace journal identity checks remain mandatory.
+All route, interface, offload, firewall and qdisc changes stay inside the
+new journal-owned namespaces. Cleanup verifies namespace inode identity and that
+no processes remain before deletion. No host route or qdisc is changed.
+
+Each Full-duplex TUN case uses the actual current Common daemon entry, its complete
+catalog, member credentials, Noise credentials, and any required raw/maintained
+carrier policy. TLS server identity is pinned to a fresh owned certificate. The
+manifest's fixed endpoint pair is `192.0.2.2:24440` and `192.0.2.6:24441`; native
+addresses are `198.18.0.1` and `198.18.0.2`. Raw TCP suppresses only unmarked RSTs
+for that exact tuple in each owned namespace, using the same mark passed to the
+actual CLI. This experiment does not qualify broader firewall/NAT behavior.
+
+The path has100Mbit/s forward and10Mbit/s reverse HTB ceilings, one35ms netem delay
+and independent15% random loss in each direction. Effective qdisc/class state,
+rate/delay/loss readback and counters are retained. Offloads are disabled on the
+owned WAN/router/native interfaces and read back; inability to do so is an
+unsupported observation, never silently accepted packet accounting.
+
+Each TCP connection exchanges a bounded four-byte flow ID and acknowledgment
+before `Connected`; the receiver orders sockets by that identity. These setup
+bytes are excluded from payload hashes, byte totals and the timed window. This
+avoids attributing one flow to another when accept order differs under loss.
+
+Three phases run serially on the same authenticated tunnel: forward, reverse and
+simultaneous. Each phase opens16 ordinary kernel TCP connections, uses a shared
+monotonic2-second warmup and10-second sample window, and has an original60-second
+cap including connection and tail drain. Each direction/flow has a32MiB byte cap.
+The data pattern is deterministic pseudorandom64KiB; payload compression is off
+in the supplied baseline. Failed phases do not trigger reconnect, retries,
+algorithm replacement or timeout changes. Remaining phases are explicitly
+`not_run`; later independent cases may continue after successful cleanup.
+
+## Metric definitions
+
+- **Application goodput** is unique bytes returned by the receiving application
+  during the common10-second sample, converted to Mbit/s. All sent/received stream
+  totals, hashes and EOFs must match after bounded tail drain. Warmup and tail bytes
+  are retained separately. TCP samples expose endpoint kernel cwnd, retransmits,
+  RTT and socket windows; these are not tunnel or proxy credit.
+- **Captured IP bytes** sum IPv4 `total_length` at one observation surface. Each
+  endpoint captures both directions on WAN and native TUN. Local WAN egress is
+  observed before its qdisc loss; remote ingress is after path loss. Keep surfaces
+  separate: summing both endpoint captures double-counts delivered packets.
+- **Packet-size mean/p50/p99** describe captured IP packet lengths, not per-native
+  packet encapsulation overhead. They include the observed mix of data, ACKs,
+  feedback and control; the capture does not decrypt TLS or QUIC or infer payload
+  identity. Packet-size summaries include the whole phase and the sample window,
+  mapped by a saved wall/monotonic clock anchor. Clock-anchor uncertainty remains
+  visible.
+- **Runtime record metrics** are opt-in actual accepted-record histograms emitted
+  at Runtime Drop using `L2TUNNEL_WIRE_METRICS`. They are cumulative across this
+  case's phases and distinct from physical captured transport bytes. Inner record
+  overhead is actual final-record length minus actual algorithm-body length;
+  neither a fixed21-byte tag cost nor a configured carrier allowance is total
+  packet overhead. Unavailable padding/retry/native correlation remains null in
+  the runtime report. Its observer heap is reported separately.
+- **CPU** stores host `/proc/stat`, load and per-owned-process user/kernel ticks
+  and RSS. Host-wide kernel time includes unrelated jobs. Probe CPU, daemon CPU
+  and capture CPU remain separate observations; this harness cannot attribute all
+  host utilization to the tunnel.
+
+Captures have finite512MiB and2million-packet ceilings per surface. Snaplen2048
+must preserve complete packets. Captures use preopened output descriptors and tcpdump immediate mode.
+Missing/truncated captures, kernel capture drops,
+exhausted bounds and missing/invalid metrics reports prevent a passing row.
+Histogram counts, totals, quantiles, carrier boundaries and invalid/overflow
+counters are checked; failed probes retain partial sample-window byte counts
+with an explicit completion flag. If byte/hash/identity qualification fails,
+observed receiver counts and completed-window rates remain available but are
+labeled invalid or incomplete, never promoted to a passing throughput result. The original overall cleanup cap is shared
+by disconnect, child termination and namespace removal. IPC disconnect
+precedes bounded metrics publication and supervisor termination. Receipts include
+binary/input/helper hashes; the separate build receipt binds the executable to
+its source revision. Credentials remain in an owned private temporary directory
+and are removed after the run.
+
+No result from this Linux lab establishes all47 Python parity gates, Windows or
+Android operation, public ISP QoS classification, or production performance. This
+runner's unprivileged parser/socketpair tests are separate from real namespace
+execution, which requires its own preserved receipts.
+
+## Saved-result reporting
+
+`common_matrix_report.py --manifest MANIFEST --results RESULTS --output NEW_DIR`
+reads receipts without starting a workload. Repeat `--results` to include earlier
+attempts and explicitly independent direction sessions. Every manifest row and
+attempt remains visible. The selected result for each explicitly requested phase
+is its latest started attempt, never the fastest or most successful result.
+Independent sessions retain their own binary/input/receipt provenance. Cumulative
+runtime histograms remain per session and direction; they are not merged or
+attributed to a phase. Unmeasured total encapsulation overhead remains null.

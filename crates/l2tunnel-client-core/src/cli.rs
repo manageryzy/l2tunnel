@@ -308,6 +308,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--swift-transaction-plan",
             "--common-transaction-plan",
             "--raw-policy",
+            "--maintained-policy",
             "--noise-profile",
             "--noise-private-key-file",
             "--noise-peer-key-file",

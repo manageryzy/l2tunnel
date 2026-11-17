@@ -766,6 +766,15 @@ impl Driver {
                     .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
                 bridge.bind_final_source(unit.identity, source)?;
             }
+            runtime.wire_sample =
+                runtime
+                    .wire_metrics
+                    .as_ref()
+                    .map(|_| common::wire_metrics::Sample {
+                        algorithm_bytes: emission.bytes,
+                        kind: emission.kind,
+                        fragmented: fragment.is_some(),
+                    });
             runtime.unsealed = Some(common::PendingPlain {
                 proxy_record,
                 scope,
@@ -975,6 +984,12 @@ impl Driver {
             .sealed
             .take()
             .ok_or_else(|| protocol("whole carrier write lost pending ciphertext"))?;
+        if let Some(runtime) = self.common.as_deref_mut()
+            && let Some(sample) = runtime.wire_sample.take()
+            && let Some(metrics) = runtime.wire_metrics.as_mut()
+        {
+            metrics.accepted(sample, receipt.record_bytes, receipt.boundary);
+        }
         if pending.scope != identity.scope
             || pending.sealed.number != identity.number
             || pending.sealed.bytes != identity.bytes
@@ -1135,6 +1150,11 @@ impl Driver {
                     .sealed
                     .take()
                     .ok_or_else(|| protocol("whole write lost Common custody"))?;
+                if let Some(sample) = runtime.wire_sample.take()
+                    && let Some(metrics) = runtime.wire_metrics.as_mut()
+                {
+                    metrics.accepted(sample, bytes, super::super::SendBoundary::SocketAccepted);
+                }
                 let sampled = sample();
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
                 let confirmation = self.confirm_common_output(

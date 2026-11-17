@@ -12,6 +12,8 @@ mod provision;
 #[cfg(unix)]
 #[path = "transport_common_proxy.rs"]
 mod proxy_records;
+#[path = "transport_wire_metrics.rs"]
+pub(super) mod wire_metrics;
 pub use managed::run_common_on_carrier;
 #[cfg(unix)]
 pub(crate) use proxy_records::{
@@ -267,6 +269,8 @@ pub(super) struct PendingIngress {
     pub(super) deadline: u64,
 }
 pub(super) struct Runtime {
+    pub(super) wire_metrics: Option<wire_metrics::Observer>,
+    pub(super) wire_sample: Option<wire_metrics::Sample>,
     #[cfg(unix)]
     pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
     pub(super) reuse_owner: Option<owner::StateCell<super::common_reuse::Installed>>,
@@ -705,6 +709,10 @@ impl Driver {
             ));
         }
         // Allocate only after the complete external subtotal passed its admission.
+        // Explicit diagnostics have their own bounded, reported heap; they never
+        // borrow protocol storage or enlarge the authenticated protocol quota.
+        let wire_metrics =
+            wire_metrics::Observer::from_environment(input.cover.limits().max_packet_bytes)?;
         let reuse_owner = if contract.connection_reuse() {
             Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
         } else {
@@ -774,6 +782,8 @@ impl Driver {
                 .map(|interval| add(0, interval))
                 .transpose()?;
             let common = owner::StateCell::new(Runtime {
+                wire_metrics,
+                wire_sample: None,
                 #[cfg(unix)]
                 proxy_bridge: None,
                 reuse_owner,

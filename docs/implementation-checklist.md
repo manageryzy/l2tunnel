@@ -5,6 +5,11 @@ Current Aligned exact-source extent correction and scoped evidence are tracked i
 This removes serialized Aligned tail padding; it does not close the full CWC
 acceptance gates, the remaining proxy framing work or the native performance matrix.
 
+The current [native matrix and observer](modules/compact-wire-cleanup.md#native-matrix-and-accepted-record-observer-2026-11-17)
+records eighty initial algorithm/carrier cases and separately fills independent
+directions. Runtime failures and unmeasured full encapsulation quantiles remain
+open; accepted-record histograms and a successful plan are not full qualification.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

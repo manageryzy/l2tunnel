@@ -359,6 +359,60 @@ way (nominal RTT 70 ms). No Aligned 80 Mbit/s pass is established by those
 receipts. The requested current algorithm/carrier/direction matrix is a separate
 measurement deliverable; configured carrier allowances are not captured bytes.
 
+## Native matrix and accepted-record observer (2026-11-17)
+
+The current `common_benchmark_plan` example exports twenty explicit implemented
+algorithm configurations across UDP, kernel raw TCP, retained real TLS and real
+QUIC: eighty canonical plans. Every planner accepts its row; this is not runtime
+qualification. The owned Linux Full-duplex TUN workload uses sixteen kernel TCP
+flows,100/10 Mbit/s,35 ms each way,15% loss each way,2 s warmup and10 s measurement.
+Header coding is on, payload compression off, and data protection is full-tag
+ChaCha20-Poly1305. Ordinary Aligned/Packed ARQ retains its existing shared64-source
+limit; this is not the8192-source Compact or per-connection simulator profile.
+
+The first complete carrier pass is retained in
+`work/aligned-extents-20261117/matrix-{udp,raw,tls,quic}-attempt1/` with canonical
+inputs, copied binary hashes, actual qdisc/offload readback, four capture surfaces,
+probe byte/hash receipts and process user/kernel counters. A failed phase leaves
+later phases `not_run`; independent direction sessions fill those cells without
+retrying the failed phase. Explicit carrier lanes have disjoint namespace names
+and eight-CPU affinity sets, but share host memory, storage and kernel resources.
+These are finite concurrent-host observations, not production capacity maxima.
+See [the runner contract](../../tools/common_native_matrix.md).
+
+An opt-in bounded runtime observer records algorithm bytes, final Records bytes
+and their exact difference only at socket acceptance, TLS stream flush or Quinn
+DATAGRAM acceptance. Its fixed histograms and separately reported diagnostic heap
+are not protocol admission credit. No packet contents or keys are logged. These
+observations currently establish Records overhead, not total encapsulation:
+codec/source attribution, retry allocation and TLS/QUIC physical header quantiles
+remain unmeasured. Captured IP packet-size p99 must not be renamed overhead p99.
+`common_matrix_report.py` preserves every attempt, selects the latest explicitly
+requested phase, keeps independent-session provenance and separates validated
+rates from failed partial observations. The terminal diagnostic preserves the
+original error before the public portable status category loses detail.
+
+The first pass has one complete three-phase case, Swift ARQ over UDP. Its forward,
+reverse and simultaneous goodputs are59.8985472,7.871328 and10.303968/7.7404288 Mbit/s.
+Swift FEC UDP forward passes at68.6328832 Mbit/s before reverse liveness failure;
+Packed Cauchy UDP forward passes at0.5896256 before reverse drain exhaustion;
+per-connection recovered-ACK UDP forward passes at4.5455616 before reverse failure.
+The ordinary Aligned cases continue delivering native packets but do not finish
+tail drain within their original60 s phase cap. The other carriers expose raw
+expiry, whole-message control expiry, authenticated liveness expiry, retained TLS
+record expiry and algorithm retry/age failures. These observations do not close
+CWC-01/06/16/18 or establish80 Mbit/s acceptance. The report records exact errors
+separately from source-based root-cause hypotheses.
+
+The required local gate was run with the existing simulator environment. Its
+initial Clippy type error was corrected; subsequent strict workspace Clippy,
+formatting, rustdoc, no-default-codec and external CLI probe stages pass. All
+remaining Python tool suites and1658 simulator tests pass. The complete Rust
+workspace run retains seven failures: two measured maintained proxy handoff
+expiries, one integration port collision, three QUIC switching transport errors
+and one raw control expiry. No Aligned exact-extent assertion fails, but there is
+no aggregate green gate. Original failed attempts remain evidence.
+
 ## Accepted direction and open engineering choices
 
 The ordinary-data target is at most 24 bytes, with 20 bytes or less an optimization

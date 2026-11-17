@@ -382,6 +382,19 @@ where
         }
         other => other,
     };
+    if std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some()
+        && let Err(error) = &result
+    {
+        use std::io::Write;
+        // One terminal diagnostic preserves the original cause before the public
+        // status reduces it to a portable category. No packet or key is logged.
+        let _ = writeln!(
+            io::stderr().lock(),
+            "Common runtime failure: role={:?} kind={:?} cause={error:?}",
+            driver.role(),
+            error.kind(),
+        );
+    }
     let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {
         Ok(reason) => *reason,
