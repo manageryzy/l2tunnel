@@ -67,6 +67,25 @@ continuous three-phase pass. The stable `swift-arq` ID disables proportional
 repairs only; Swift's existing tail-probe repair equations remain enabled and
 are counted as repair traffic.
 
+Live phase cleanup stops all capture processes, checks their terminal counters,
+and takes the original post-phase qdisc/kernel snapshots. Full pcap parsing and
+hashing for every phase run only after requested local disconnects and owned
+process/namespace cleanup. Each stopped capture retains its own address pair
+and sample wall-clock window. This removes offline file analysis from the
+absolute session lease; it does not shorten TCP tail/EOF validation or extend
+any session, phase, case, capture, or cleanup bound. Live startup, capture stops,
+status/kernel snapshots and cumulative TCP tails can still exhaust the lease.
+
+Known capture drops immediately stop later live phases. A malformed pcap or a
+packet-count mismatch discovered during deferred analysis invalidates its
+phase and the case; later phases that already ran retain their own evidence.
+There is no automatic replay or reconnect. Observed throughput remains
+`pending_capture_validation` until that phase's full capture checks pass.
+`data_status` and `shutdown` report separate results. A case cannot pass if either
+endpoint's API4 requested local disconnect fails, even when all three data
+phases pass. A successful local disconnect response is not a bilateral protocol
+drain proof. Primary workload/setup failures are preserved through cleanup.
+
 ## Metric definitions
 
 - **Application goodput** is unique bytes returned by the receiving application

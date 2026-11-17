@@ -458,6 +458,113 @@ def compare_probes(a, b, phase):
     return result
 
 
+def qualify_phase(result):
+    pending = result.get('capture_analysis') == 'pending'
+    for observed in result.get('throughput_observed', {}).values():
+        observed['qualification'] = ('pending_capture_validation' if pending and result['status'] == 'passed'
+                                     else 'valid' if result['status'] == 'passed' else 'invalid_or_incomplete')
+        observed['reason'] = ('capture files have not been analyzed' if pending and result['status'] == 'passed'
+                              else None if result['status'] == 'passed' else result.get('error', result['status']))
+
+
+def stop_captures(case, result, captures, sample_wall, deadline):
+    # Release all live capture owners before parsing even their short exit logs.
+    # Full pcap analysis and hashes wait until the session has been disconnected.
+    for surface, (child, addresses) in captures.items():
+        entry = {'pcap': str(child['capture'].relative_to(case.output)), 'log': child['log'].name,
+                 'addresses': addresses, 'sample_wall_ns': sample_wall, 'analysis': 'pending'}
+        result['captures'][surface] = entry
+        try:
+            entry['returncode'] = case.stop(child, signal.SIGINT, deadline=deadline)
+            entry['stop'] = child['stops'][-1]
+            require(entry['returncode'] == 0, 'tcpdump did not exit cleanly')
+        except Exception as error:
+            entry.update(status='tool_failure', error=str(error))
+    for surface, (child, _) in captures.items():
+        entry = result['captures'][surface]
+        try:
+            # A known capture drop still stops later live phases immediately.
+            entry['counters'] = observe.capture_counters(child['log'])
+        except Exception as error:
+            entry.setdefault('status', 'tool_failure')
+            entry.setdefault('error', str(error))
+        if entry.get('status') == 'tool_failure' and result['status'] == 'passed':
+            result.update(status='tool_failure', error='capture observation incomplete')
+    result['capture_analysis'] = 'pending' if captures else 'not_started'
+
+
+def analyze_captures(case):
+    """Validate stopped files after live cleanup, retaining each phase's window."""
+    for result in case.value['phases']:
+        if result.get('capture_analysis') != 'pending':
+            continue
+        for entry in result['captures'].values():
+            try:
+                case.check()
+                path = input_path(case.output, entry['pcap'])
+                # Preserve hashes for malformed captures too; no packet data is logged.
+                entry['sha256'] = file_hash(path)
+                entry['summary'] = observe.capture_summary(path, entry['addresses'], entry['sample_wall_ns'])
+                require('counters' in entry, 'validated capture terminal counters absent')
+                require(entry['counters']['captured'] == entry['summary']['captured_packets'],
+                        'pcap packet count differs from tcpdump')
+                if entry.get('status') != 'tool_failure':
+                    entry['analysis'] = 'passed'
+            except Exception as error:
+                entry.setdefault('status', 'tool_failure')
+                entry.setdefault('error', str(error))
+                entry['analysis_error'] = str(error)
+            if entry.get('status') == 'tool_failure':
+                entry['analysis'] = 'failed'
+                if result['status'] == 'passed':
+                    result.update(status='tool_failure', error='capture observation incomplete')
+        result['capture_analysis'] = ('failed' if any(entry['analysis'] != 'passed'
+                                                     for entry in result['captures'].values()) else 'passed')
+        qualify_phase(result)
+    case.value['data_status'] = next((result['status'] for result in case.value['phases']
+                                    if result['status'] != 'passed'), 'passed')
+    if case.value['status'] == 'passed' and case.value['data_status'] != 'passed':
+        case.value.update(status=case.value['data_status'], error='capture observation incomplete')
+
+
+def disconnect_sessions(case, binary, secrets, deadline):
+    """Keep requested local release separate from data and peer-drain qualification."""
+    shutdown = {'status': 'running', 'started_wall_ns': time.time_ns(), 'endpoints': {},
+                'definition': 'API4 requested local disconnect response; not a bilateral protocol drain proof'}
+    case.value['shutdown'] = shutdown
+    started = {child['label'] for child in case.children if child['label'].startswith('daemon-')}
+    for side in ('a', 'b'):
+        endpoint = shutdown['endpoints'][side] = {'status': 'not_started'}
+        if not (secrets / f'control-{side}.sock').exists():
+            if 'daemon-' + side in started:
+                endpoint.update(status='failed', error='started daemon control socket unavailable')
+            continue
+        endpoint['started_wall_ns'] = time.time_ns()
+        try:
+            raw = bounded.command(case.prefix('endpoint_' + side, [binary, 'disconnect',
+                '--control-socket', secrets / f'control-{side}.sock', '--api-version', '4']), deadline, 3)
+            values = [bounded.strict_json(line) for line in raw.splitlines() if line.startswith('{')]
+            reply = values[-1] if values else {'error': 'no JSON disconnect reply'}
+            case.value['cleanup']['disconnect'][side] = reply
+            state = reply.get('state') or {}
+            common = state.get('common') or {}
+            endpoint.update(status='passed' if reply.get('version') == 4 and reply.get('ok') is True
+                            and state.get('phase') == 'disconnected' else 'failed',
+                            code=reply.get('code'), phase=state.get('phase'),
+                            terminal=common.get('terminal'), service_terminal=common.get('service_terminal'))
+        except Exception as error:
+            # Retain the original error/DTO in cleanup; the summary stays bounded.
+            case.value['cleanup']['disconnect'][side] = {'error': str(error)}
+            endpoint.update(status='failed', error_type=type(error).__name__)
+        endpoint['finished_wall_ns'] = time.time_ns()
+    outcomes = [value['status'] for value in shutdown['endpoints'].values()]
+    shutdown['status'] = ('passed' if all(value == 'passed' for value in outcomes)
+                          else 'not_started' if all(value == 'not_started' for value in outcomes) else 'failed')
+    shutdown['finished_wall_ns'] = time.time_ns()
+    if shutdown['status'] != 'passed' and case.value['status'] == 'passed':
+        case.value.update(status='failed', error='requested local disconnect did not succeed for both endpoints')
+
+
 def phase(case, name, binary, secrets, daemons):
     output = case.output / name
     output.mkdir()
@@ -552,30 +659,14 @@ def phase(case, name, binary, secrets, daemons):
 
                 except Exception as error:
                     result['probe_results'][side] = {'status': 'tool_failure', 'error': str(error)}
-        for surface, (child, addresses) in captures.items():
-            entry = {'pcap': str(child['capture'].relative_to(case.output)), 'log': child['log'].name}
-            result['captures'][surface] = entry
-            try:
-                entry['returncode'] = case.stop(child, signal.SIGINT, deadline=cleanup_deadline)
-                entry['stop'] = child['stops'][-1]
-                require(entry['returncode'] == 0, 'tcpdump did not exit cleanly')
-                entry['counters'] = observe.capture_counters(child['log'])
-                entry['summary'] = observe.capture_summary(child['capture'], addresses, sample_wall)
-                require(entry['counters']['captured'] == entry['summary']['captured_packets'], 'pcap packet count differs from tcpdump')
-                entry['sha256'] = file_hash(child['capture'])
-            except Exception as error:
-                entry.update(status='tool_failure', error=str(error))
-                if result['status'] == 'passed':
-                    result.update(status='tool_failure', error='capture observation incomplete')
+        stop_captures(case, result, captures, sample_wall, cleanup_deadline)
         try:
             result['qdisc_after'] = qdisc(case)
         except Exception as error:
             result['qdisc_error'] = str(error)
             if result['status'] == 'passed':
                 result.update(status='tool_failure', error='qdisc observation incomplete')
-        for observed in result.get('throughput_observed', {}).values():
-            observed['qualification'] = 'valid' if result['status'] == 'passed' else 'invalid_or_incomplete'
-            observed['reason'] = None if result['status'] == 'passed' else result.get('error', result['status'])
+        qualify_phase(result)
         case.save()
     return result['status'] == 'passed'
 
@@ -641,15 +732,7 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
         # Disconnect drops the actual Runtime; dropping the CLI supervisor alone
         # cannot establish graceful report publication or peer drain.
         cleanup_deadline = time.monotonic() + BOUNDS['cleanup_seconds']
-        for side in ('a', 'b'):
-            if (secrets / f'control-{side}.sock').exists():
-                try:
-                    raw = bounded.command(case.prefix('endpoint_' + side, [binary, 'disconnect',
-                        '--control-socket', secrets / f'control-{side}.sock', '--api-version', '4']), cleanup_deadline, 3)
-                    values = [bounded.strict_json(line) for line in raw.splitlines() if line.startswith('{')]
-                    case.value['cleanup']['disconnect'][side] = values[-1] if values else {'error': 'no JSON disconnect reply'}
-                except Exception as error:
-                    case.value['cleanup']['disconnect'][side] = {'error': str(error)}
+        disconnect_sessions(case, binary, secrets, cleanup_deadline)
         if (output / 'metrics').is_dir():
             publication_deadline = min(cleanup_deadline, time.monotonic() + 2)
             while len(list((output / 'metrics').glob('wire.*.json'))) < 2 and time.monotonic() < publication_deadline:
@@ -693,6 +776,10 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
         for name in args.phases:
             if name not in present:
                 case.value['phases'].append({'phase': name, 'status': 'not_run', 'reason': 'setup or prior phase failed; no retry'})
+        # No owned process or namespace is held for offline packet parsing/hash I/O.
+        # A malformed file discovered here may invalidate an earlier phase, but
+        # never restarts it or suppresses independently completed later evidence.
+        analyze_captures(case)
         case.value['completed_wall_ns'] = time.time_ns()
         case.save()
     return case.value

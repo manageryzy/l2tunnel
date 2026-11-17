@@ -120,6 +120,9 @@ export and exact Rolling/Research source, decoded-handoff and feedback-budget
 waits, plus exact raw token custody latency across physical completion and upper
 take. The [scoped required continuation](modules/buffer-observability.md#coordinated-local-buffer-batch15-validation)
 passes after two fixture-only corrections; native qualification is pending.
+The [capture cleanup correction](modules/buffer-observability.md#release-before-offline-capture-analysis)
+defers offline parsing until after disconnect without changing original caps;
+30 affected harness/report tests pass, with native confirmation pending.
 No parent gate closes, and historical failed receipts remain preserved.
 
 This remains the persistent progress ledger. Unchecked work is required;

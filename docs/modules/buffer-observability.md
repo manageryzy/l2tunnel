@@ -876,3 +876,27 @@ histogram to quantify causality. The source also exposes Swift starting retry
 timing before carrier acceptance; correcting that behavior is pending. It does
 not justify bypassing congestion control, enlarging caps or treating a Python
 fixed-rate link as an equivalent genuine-QUIC experiment.
+
+### Release before offline capture analysis
+
+The [native14 raw lease audit](../../work/aligned-extents-20261117/raw-lease-analysis16/report.md)
+shows fresh verified control immediately before the deliberately absolute
+120-second session cap. Final live-observation commands completed after the
+latest possible lease expiry, so the later disconnect failed. This evidence
+does not establish liveness starvation or justify renewing the lease.
+
+The harness now stops captures and retains terminal counters/window identities
+between phases, but defers full pcap analysis/hash until after requested disconnect
+and owned-process/namespace cleanup. Immediate capture drops still prevent later
+phases; deferred malformed-file validation invalidates the corresponding phase
+without discarding independently completed later evidence. A separate shutdown
+outcome can fail the case while preserving qualified data-phase results. It
+measures API4 requested local release, not bilateral protocol drain. Original
+lease, workload/EOF/tail, capture bounds and validation remain unchanged.
+
+All 30 affected harness/report tests pass in the
+[Python-only continuation](../../work/aligned-extents-20261117/matrix-live-cleanup-check16-attempt1/validation.json).
+Rust/protocol sources are byte-identical to the passing batch15 continuation,
+so those checks and its release binary are reused. Native confirmation of the
+new live-cleanup ordering is pending. Long live workloads may still reach their
+original absolute cap; this change does not remove that outcome.

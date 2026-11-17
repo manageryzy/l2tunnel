@@ -2,6 +2,7 @@
 """Unprivileged contract checks for the Common native matrix harness."""
 import argparse
 from contextlib import redirect_stdout
+from contextlib import ExitStack
 import io
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -49,6 +51,156 @@ def pcap(packets):
 
 
 class MatrixTests(unittest.TestCase):
+    def deferred_case(self, root, failure=None):
+        """Exercise the actual case coordinator with owned-I/O test doubles."""
+        output, secrets, state = root / 'output', root / 'secrets', root / 'state'
+        for directory in (output, secrets, state):
+            directory.mkdir()
+        for side in ('a', 'b'):
+            (secrets / f'control-{side}.sock').touch()
+        events = []
+        value = row()
+        args = SimpleNamespace(lab_id='test-matrix', output=output, phases=list(matrix.PHASES))
+
+        def spawn(case, role, label, argv, capture=None, metrics=None):
+            pid = 101 if label == 'daemon-a' else 102
+            log = case.output / (label + '.log')
+            log.write_text('')
+            child = {'label': label, 'process': SimpleNamespace(pid=pid), 'log': log, 'capture': capture}
+            case.children.append(child)
+            (metrics.parent / f'wire.{pid}.json').write_text('{}')
+            return child
+
+        def stop(case, child, requested=signal.SIGTERM, deadline=None):
+            events.append(('stop', child['label']))
+            self.assertIsNotNone(deadline)
+            child.setdefault('stops', []).append({'returncode': 0})
+            return 0
+
+        def live_phase(case, name, *_):
+            events.append(('phase', name))
+            directory = case.output / name
+            directory.mkdir()
+            result = {'phase': name, 'status': 'passed', 'captures': {},
+                      'throughput_observed': {'a_to_b': {'observed_goodput_mbit_s': 1.0}}}
+            if failure == 'probe' and name == 'reverse':
+                result.update(status='bound_exhausted', error='original TCP workload deadline exhausted')
+            case.value['phases'].append(result)
+            captures = {}
+            second = 2 + 3 * matrix.PHASES.index(name)
+            for side in ('a', 'b'):
+                for kind, addresses in [('wan', list(matrix.WAN.values())), ('native', list(matrix.NATIVE.values()))]:
+                    label = name + '-' + side + '-' + kind
+                    path = directory / (side + '-' + kind + '.pcap')
+                    raw = pcap([(second, ipv4(*addresses, 40))])
+                    if failure == 'truncated' and name == 'forward' and side == 'a' and kind == 'wan':
+                        raw = raw[:-1]
+                    path.write_bytes(raw)
+                    log = case.output / (label + '.log')
+                    dropped = int(failure == 'drop' and name == 'forward' and side == 'a' and kind == 'wan')
+                    log.write_text(f'1 packets captured\n1 packets received by filter\n{dropped} packets dropped by kernel\n')
+                    child = {'label': label, 'capture': path, 'log': log}
+                    captures[side + '_' + kind] = (child, addresses)
+            matrix.stop_captures(case, result, captures,
+                                 ((second - 1) * 1_000_000_000, (second + 1) * 1_000_000_000), case.deadline)
+            matrix.qualify_phase(result)
+            if result['status'] == 'passed':
+                self.assertEqual(result['throughput_observed']['a_to_b']['qualification'], 'pending_capture_validation')
+                self.assertTrue(all('summary' not in entry and 'sha256' not in entry for entry in result['captures'].values()))
+            return result['status'] == 'passed'
+
+        def disconnect(argv, deadline, maximum):
+            side = 'a' if any('control-a.sock' in str(value) for value in argv) else 'b'
+            events.append(('disconnect', side))
+            self.assertEqual(maximum, 3)
+            if failure == 'disconnect' and side == 'b':
+                raise RuntimeError('original owner LeaseExpired')
+            return json.dumps({'version': 4, 'ok': True, 'code': 'ok', 'state': {'phase': 'disconnected'}})
+
+        original_summary = observe.capture_summary
+
+        def summarize(*values):
+            self.assertIn(('disconnect', 'a'), events)
+            self.assertIn(('disconnect', 'b'), events)
+            self.assertIn(('cleanup', 'namespaces'), events)
+            events.append(('analyze', values[0].parent.name))
+            return original_summary(*values)
+
+        with ExitStack() as stack:
+            for target, name, replacement in [
+                (matrix, 'topology', lambda *_: None),
+                (matrix, 'readiness', lambda *_: None),
+                (matrix, 'phase', live_phase),
+                (matrix.Case, 'command', lambda *_a, **_k: ''),
+                (matrix.Case, 'spawn', spawn),
+                (matrix.Case, 'stop', stop),
+                (matrix.bounded, 'command', disconnect),
+                (matrix.bounded, 'bounded_lab', lambda *_: events.append(('cleanup', 'namespaces'))),
+                (matrix.observe, 'validate_wire_metrics', lambda *_: {}),
+                (matrix.observe, 'capture_summary', summarize),
+            ]:
+                stack.enter_context(patch.object(target, name, replacement))
+            result = matrix.run_case(value, 0, args, Path('/unused-binary'), root, secrets, state)
+        return result, events
+
+    def test_all_live_phases_and_requested_disconnect_precede_offline_capture_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, events = self.deferred_case(Path(directory))
+        self.assertEqual(result['status'], 'passed')
+        self.assertEqual(result['data_status'], 'passed')
+        self.assertEqual(result['shutdown']['status'], 'passed')
+        self.assertEqual([value for kind, value in events if kind == 'phase'], list(matrix.PHASES))
+        self.assertLess(events.index(('phase', 'simultaneous')), events.index(('disconnect', 'a')))
+        self.assertLess(events.index(('disconnect', 'b')), events.index(('analyze', 'forward')))
+        for result in result['phases']:
+            self.assertEqual(result['capture_analysis'], 'passed')
+            self.assertEqual(result['throughput_observed']['a_to_b']['qualification'], 'valid')
+            for entry in result['captures'].values():
+                self.assertEqual(entry['summary']['captured_packets'], 1)
+                self.assertEqual(entry['summary']['sample_window']['a_to_b']['packets'], 1)
+                self.assertEqual(len(entry['sha256']), 64)
+
+    def test_failed_probe_still_disconnects_and_preserves_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, events = self.deferred_case(Path(directory), 'probe')
+        self.assertEqual(result['status'], 'bound_exhausted')
+        self.assertEqual(result['shutdown']['status'], 'passed')
+        self.assertEqual([value for kind, value in events if kind == 'phase'], ['forward', 'reverse'])
+        self.assertEqual(result['phases'][1]['error'], 'original TCP workload deadline exhausted')
+        self.assertEqual(result['phases'][1]['throughput_observed']['a_to_b']['qualification'], 'invalid_or_incomplete')
+        self.assertEqual(result['phases'][2]['status'], 'not_run')
+
+    def test_known_capture_drop_stops_later_phases_and_is_never_qualified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, events = self.deferred_case(Path(directory), 'drop')
+        self.assertEqual([value for kind, value in events if kind == 'phase'], ['forward'])
+        self.assertEqual(result['status'], 'tool_failure')
+        entry = result['phases'][0]['captures']['a_wan']
+        self.assertIn('drops', entry['error'])
+        self.assertEqual(entry['analysis'], 'failed')
+        self.assertEqual(result['shutdown']['status'], 'passed')
+
+    def test_offline_malformed_capture_invalidates_only_its_completed_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, events = self.deferred_case(Path(directory), 'truncated')
+        self.assertEqual([value for kind, value in events if kind == 'phase'], list(matrix.PHASES))
+        self.assertEqual(result['status'], 'tool_failure')
+        self.assertEqual(result['phases'][0]['capture_analysis'], 'failed')
+        self.assertIn('truncated', result['phases'][0]['captures']['a_wan']['error'])
+        self.assertEqual([phase['status'] for phase in result['phases'][1:]], ['passed', 'passed'])
+
+    def test_failed_requested_disconnect_does_not_hide_valid_data_or_skip_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, events = self.deferred_case(Path(directory), 'disconnect')
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['data_status'], 'passed')
+        self.assertEqual(result['shutdown']['status'], 'failed')
+        self.assertEqual(result['shutdown']['endpoints']['a']['status'], 'passed')
+        self.assertEqual(result['shutdown']['endpoints']['b']['status'], 'failed')
+        self.assertIn('LeaseExpired', result['cleanup']['disconnect']['b']['error'])
+        self.assertIn(('cleanup', 'namespaces'), events)
+        self.assertTrue(all(value['capture_analysis'] == 'passed' for value in result['phases']))
+
     def test_command_timeout_preserves_actual_child_exit_and_original_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             case = matrix.Case(row(), None, Path(directory))
