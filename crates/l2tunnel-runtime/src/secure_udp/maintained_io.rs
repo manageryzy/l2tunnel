@@ -911,6 +911,48 @@ impl Drop for Carrier {
 }
 
 #[cfg(test)]
+pub(crate) fn test_framing_carrier(
+    capacity: usize,
+) -> io::Result<(Carrier, tokio::io::DuplexStream)> {
+    // Private synthetic framing custody only. Public factories still require
+    // actual member-authenticated original TLS/QUIC owners.
+    let (adapter, peer) = tls::test_framing_adapter(capacity)?;
+    let info = adapter.info();
+    let base = info.first.session.config;
+    let request = Request {
+        kind: Kind::TlsStream,
+        duplex: Duplex::Full,
+        geometry: Geometry {
+            path_mtu: 1500,
+            max_record_bytes: 1024,
+            max_bootstrap_bytes: 1024,
+            charged_overhead_bytes: 69,
+            bootstrap_overhead_bytes: 69,
+            framing_bytes: 5,
+        },
+        policy: adapter.policy_digest()?,
+    };
+    let proof = Authenticated::checked(
+        request,
+        base,
+        [
+            Some(Lane {
+                info: info.first.session,
+                local: info.first.local_addr,
+                peer: info.first.peer_addr,
+            }),
+            None,
+        ],
+        [Some(base), None],
+        adapter.setup_deadline(),
+    )?;
+    Ok((
+        Carrier::finish(Backend::Tls(vec![adapter]), proof, 0, 0)?,
+        peer,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use l2tunnel_auth::{MemberAllowlist, MemberKey};
@@ -1078,39 +1120,7 @@ mod tests {
     async fn synthetic_tls_setup_helper_wakes_at_original_partial_input_deadline()
     -> Result<(), Failure> {
         use tokio::io::AsyncWriteExt;
-        // Only this private test constructs synthetic framing custody. Public
-        // factories continue requiring actual member-authenticated TLS owners.
-        let (adapter, mut peer) = tls::test_framing_adapter(16)?;
-        let info = adapter.info();
-        let base = info.first.session.config;
-        let request = Request {
-            kind: Kind::TlsStream,
-            duplex: Duplex::Full,
-            geometry: Geometry {
-                path_mtu: 1500,
-                max_record_bytes: 1024,
-                max_bootstrap_bytes: 1024,
-                charged_overhead_bytes: 69,
-                bootstrap_overhead_bytes: 69,
-                framing_bytes: 5,
-            },
-            policy: adapter.policy_digest()?,
-        };
-        let proof = Authenticated::checked(
-            request,
-            base,
-            [
-                Some(Lane {
-                    info: info.first.session,
-                    local: info.first.local_addr,
-                    peer: info.first.peer_addr,
-                }),
-                None,
-            ],
-            [Some(base), None],
-            adapter.setup_deadline(),
-        )?;
-        let mut carrier = Carrier::finish(Backend::Tls(vec![adapter]), proof, 0, 0)?;
+        let (mut carrier, mut peer) = test_framing_carrier(16)?;
         let start = Instant::now();
         peer.write_all(&[0]).await?;
         let error = carrier

@@ -579,6 +579,26 @@ impl<R: RawBacking> IoOwner<R> {
         };
         Ok((bytes, None, framing))
     }
+    /// Promote at most one ready maintained input during the caller's bounded
+    /// receive batch. Pending remains WouldBlock: this never waits for new input
+    /// or consumes the separately retained send-completion receipts.
+    pub(super) async fn try_receive_at_ready(
+        &mut self,
+        output: &mut [u8],
+    ) -> io::Result<(usize, Option<Instant>, Option<InputFraming>)> {
+        if let Self::Maintained(values) = self
+            && !values[0].receive_ready()
+        {
+            std::future::poll_fn(|cx| {
+                Poll::Ready(match values[0].poll_ready(cx, true) {
+                    Poll::Ready(Err(error)) => Err(error),
+                    Poll::Ready(Ok(())) | Poll::Pending => Ok(()),
+                })
+            })
+            .await?;
+        }
+        self.try_receive_at(output)
+    }
     pub(super) fn try_receive(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Udp(socket) => socket.try_recv(output),

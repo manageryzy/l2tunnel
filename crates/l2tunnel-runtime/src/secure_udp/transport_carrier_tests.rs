@@ -51,6 +51,63 @@ async fn sockets() -> io::Result<(UdpSocket, UdpSocket)> {
     b.connect(a.local_addr()?).await?;
     Ok((a, b))
 }
+
+#[tokio::test(start_paused = true)]
+async fn maintained_receive_batch_promotes_ready_frames_without_renewing_arrival() -> TestResult {
+    use tokio::io::AsyncWriteExt;
+
+    // Synthetic byte-stream framing isolates batching. Actual authenticated
+    // TLS/QUIC service fixtures separately exercise the complete public path.
+    let (mut carrier, mut peer) = crate::secure_udp::maintained_io::test_framing_carrier(128)?;
+    carrier.select_final_records(carrier.setup_deadline())?;
+    let mut socket: IoOwner = IoOwner::Maintained(MaintainedIo::new(carrier)?);
+    let start = Instant::now();
+    for index in 0..3u8 {
+        let mut frame = [0; 14];
+        frame[..4].copy_from_slice(&10u32.to_be_bytes());
+        frame[4] = 1;
+        frame[5] = 0x80;
+        frame[13] = index;
+        peer.write_all(&frame).await?;
+    }
+    socket.ready(true).await?;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    let mut output = [0; 1024];
+    // Consume exactly this caller's existing two-record budget. The third
+    // ready frame must remain with its actual owner for the next batch.
+    for index in 0..2u8 {
+        let (bytes, received, framing) = socket.try_receive_at_ready(&mut output).await?;
+        assert_eq!(bytes, 9);
+        assert_eq!(framing, Some(InputFraming::Final));
+        assert_eq!(output[8], index);
+        let received = received.ok_or("maintained original arrival timestamp missing")?;
+        assert!(received <= Instant::now());
+        if index == 0 {
+            assert_eq!(
+                received, start,
+                "cached arrival cannot become dispatch time"
+            );
+        }
+    }
+    let (bytes, received, framing) = socket.try_receive_at_ready(&mut output).await?;
+    assert_eq!(bytes, 9);
+    assert_eq!(framing, Some(InputFraming::Final));
+    assert_eq!(output[8], 2);
+    assert!(received.is_some_and(|at| at <= Instant::now()));
+    let before_empty = Instant::now();
+    assert_eq!(
+        socket
+            .try_receive_at_ready(&mut output)
+            .await
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(Instant::now(), before_empty, "empty input must never wait");
+    assert!(!socket.receive_ready());
+    Ok(())
+}
+
 #[tokio::test]
 async fn actual_outer_io_keeps_separate_tickets_and_only_reports_whole_original_socket_writes()
 -> TestResult {

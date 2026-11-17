@@ -263,7 +263,7 @@ where
                     for _ in 0..maximum {
                         if !driver.check_expiry(clock(origin,sample())?)? {break;}
                         driver.ingress.left-=1;
-                        match socket.try_receive_at(&mut inputs.datagram) {
+                        match socket.try_receive_at_ready(&mut inputs.datagram).await {
                             Ok((length,received,framing))=>{
                                 batch+=1;
                                 if socket.is_maintained() {

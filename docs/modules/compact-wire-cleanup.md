@@ -219,6 +219,106 @@ Common active TUN credit and the Windows Common service remain explicit gaps.
 Deleting their old entry points does not reduce SEC, SW-11, platform or any of the
 47 Python-mode acceptance definitions.
 
+## Current overhead audit and maintained receive correction (2026-11-17)
+
+Fresh receipts are under `work/overhead-failures-20261117/`. Captures use the
+source at `4ef12d8`, before the receive-only correction below. Three actual
+fixtures passed in separate owned loopback namespaces: retained TLS, genuine
+QUIC and UDP lost-source repair. Capture drops were zero. Native endpoints in
+these fixtures are Unix devices, not kernel TAP/TUN. Captures do not decrypt the
+inner records; algorithm interpretation is joined to the exact endpoint fixture.
+
+Record protection is only one term. The following IPv4 costs exclude algorithm
+fields, packing, padding, repair copies, feedback and connection setup. They
+include the 21-byte strong record protection; ordinary 9-byte protection saves
+12 bytes, while HMAC adds 16. Proxy control-bearing data and feedback cannot use
+the ordinary short-check deduction.
+
+| Current final carrier | Carrier plus strong record overhead | Evidence and conditions |
+| --- | ---: | --- |
+| QUIC-like or media-like UDP; OpenVPN-established final UDP | 49 bytes | 20 IP + 8 UDP + 21 record; final data has no repeated mimic envelope or OpenVPN opcode |
+| Raw TCP after TLS bootstrap | 61 bytes | 20 IP + 20 raw TCP + 21 record; source/injected-I/O evidence, no fresh kernel raw capture |
+| Retained real TLS | 100 bytes | 20 IP + observed 32 TCP + 5 framing + 22 TLS 1.3 + 21 record, conditional on one record per TLS record and TCP segment |
+| Genuine QUIC DATAGRAM | 78-81 bytes | Conditional single short-header packet/DATAGRAM, observed 8-byte CID, 1-4 packet-number bytes, 16-byte QUIC tag and 2-byte DATAGRAM length |
+
+TLS/QUIC segmentation, coalescing, padding and outer ACK traffic prevent a
+universal fixed packet cost. The QUIC range is derived from the pinned encoder
+and visible CID, not decrypted packet-number/frame measurements. The TLS capture
+contains 224 pure TCP ACK packets and observes 32-byte TCP headers on ordinary
+packets. Configured TLS 69/70-byte and QUIC 156-byte admission allowances are not
+measurements. IPv6 adds 20 bytes to the UDP examples. Full/Half has the same
+per-packet grammar; Half additionally establishes and manages another connection.
+
+For RawIp/literal native packets, the existing native CLI fixtures explicitly use
+Swift source capacity 1016, Aligned symbols 256 and Packed symbols 320. There is
+no single product-wide default symbol. Early IDs occupy one varint byte and
+source copies are one. These are current encoder derivations, not fresh captures
+of each algorithm:
+
+| Algorithm | 100-byte native: algorithm / strong record / IPv4 UDP total | 1400-byte native: strong records / IPv4 UDP total |
+| --- | ---: | ---: |
+| Swift | 108 / 129 / 157 bytes | 1455 / 1511 bytes, two packets |
+| Aligned direct ARQ | 259 / 280 / 308 bytes | 1680 / 1848 bytes, six packets |
+| Packed direct ARQ | 112 / 133 / 161 bytes | 1578 / 1718 bytes, five packets |
+
+Aligned still serializes the entire symbol; the 100-byte example has 150 zero
+bytes. Packed serializes the effective unit extent. Two 100-byte native packets
+coalesced into one Swift source total 232 strong-record bytes; Packed totals 246.
+Separate source records cost 258 and 266 respectively. Ordinary ARQ does not
+concatenate independent retransmissions into a new record; multiple native
+packets already in one source retransmit together.
+
+The fresh UDP loss capture observes the 100-byte fixture's source as 133 UDP
+payload / 161 IPv4 bytes and each repair as 136 / 164 bytes. The repair's 115
+algorithm bytes include its effective equation extent, not a configured
+maximum-width slab. This does not remove Aligned source padding. Block FEC still
+extends shorter sources to the generation's actual maximum source width.
+
+Other branch costs remain explicit. With `v(x)` denoting canonical varint width
+and `P` the actual recovery body, direct ARQ adds `1+v(source)`, Compact ARQ adds
+`1+v(source)+v(serial)`, Rolling repair adds `1+v(repair)+v(end)` to its effective
+equation width, and Research adds `v(confirmed)` further. Block FEC adds
+`1+v(generation)+v(symbol)+v(source_count)+v(width)+source_count` to the actual
+generation width. Per-connection Compact adds a 10-byte route. Optional outer LX
+fragmentation adds 40 bytes per fragment, before each fragment's record/carrier
+cost. Feedback adds its own algorithm fields and a separate strong record;
+retransmission, repair and configured copies incur the complete emitted cost.
+
+Proxy Data retains 56 relay bytes, 24 flow-envelope bytes and the 5-byte local
+length/union, all passed into Common: 81 bytes before codec/recovery. The failing
+maintained proxy fixtures explicitly select 1024-byte Aligned symbols. A
+100-byte application chunk therefore has 837 zero bytes and becomes a 1048-byte
+strong record before carrier overhead. A 1400-byte chunk becomes two records
+totalling 2096 bytes. These application-byte examples must not be compared as
+native IP packet sizes. Proxy currently requires Aligned/direct ARQ; Packed's
+smaller cost is not its implemented behavior.
+
+Failure tracing reproduced all three maintained proxy failures. The bounded
+receive loop repeatedly called a cache-only receive method: after one record,
+later iterations returned WouldBlock even when the maintained owner could yield
+more input. The correction promotes at most one ready maintained record per
+existing batch iteration, using the real task waker without waiting on Pending.
+It preserves receive/ingress quotas, original arrival timestamps, send receipts,
+deadlines and Half routing; it adds no queue or timeout extension.
+
+The corrected deterministic three-frame/two-record-budget regression and original
+partial-input deadline test pass. Fixed QUIC Half proxy passes with tracing and
+again without tracing. Measured QUIC Half and TLS Full still fail without tracing
+at their original handoff cap. In the diagnostic QUIC run, admission-to-selection
+already exceeded 50 ms. In TLS, acceptance was at 47.9 ms, receipt observation at
+49.7 ms and actor callback at 50.7 ms against the original 50 ms cap. Those timing
+samples include diagnostic overhead; they locate stages, not production latency
+guarantees. Queue/admission/selection and callback scheduling remain unresolved.
+Temporary per-packet diagnostics were removed after preserving the traces.
+
+The first new regression attempt exposed an incorrect synthetic TLS frame length;
+its corrected length includes the discriminator. All attempts and source/binary
+hashes are retained. The required system-Python `tools/check.py` attempt stops at
+missing `aioquic`; it is not an aggregate pass. Formatting, strict all-target
+workspace Clippy and the checklist validator pass separately. Existing simulator
+evidence is unchanged. This focused correction does not close CWC-01/17/18, the broader
+cutover, native platform gates or the previously intermittent raw/switch cases.
+
 ## Accepted direction and open engineering choices
 
 The ordinary-data target is at most 24 bytes, with 20 bytes or less an optimization
