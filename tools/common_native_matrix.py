@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from threading import Thread
 import time
 
 try:
@@ -530,22 +531,26 @@ def analyze_captures(case):
 def disconnect_sessions(case, binary, secrets, deadline):
     """Keep requested local release separate from data and peer-drain qualification."""
     shutdown = {'status': 'running', 'started_wall_ns': time.time_ns(), 'endpoints': {},
-                'definition': 'API4 requested local disconnect response; not a bilateral protocol drain proof'}
+                'definition': 'API4 requested local disconnect response; not a bilateral protocol drain proof',
+                'submission': 'concurrent local requests; peer-close races remain failures'}
     case.value['shutdown'] = shutdown
     started = {child['label'] for child in case.children if child['label'].startswith('daemon-')}
+    requests = {}
     for side in ('a', 'b'):
         endpoint = shutdown['endpoints'][side] = {'status': 'not_started'}
         if not (secrets / f'control-{side}.sock').exists():
             if 'daemon-' + side in started:
                 endpoint.update(status='failed', error='started daemon control socket unavailable')
             continue
-        endpoint['started_wall_ns'] = time.time_ns()
+        requests[side] = case.prefix('endpoint_' + side, [binary, 'disconnect',
+            '--control-socket', secrets / f'control-{side}.sock', '--api-version', '4'])
+
+    def request(argv):
+        endpoint = {'started_wall_ns': time.time_ns()}
         try:
-            raw = bounded.command(case.prefix('endpoint_' + side, [binary, 'disconnect',
-                '--control-socket', secrets / f'control-{side}.sock', '--api-version', '4']), deadline, 3)
+            raw = bounded.command(argv, deadline, 3)
             values = [bounded.strict_json(line) for line in raw.splitlines() if line.startswith('{')]
             reply = values[-1] if values else {'error': 'no JSON disconnect reply'}
-            case.value['cleanup']['disconnect'][side] = reply
             state = reply.get('state') or {}
             common = state.get('common') or {}
             endpoint.update(status='passed' if reply.get('version') == 4 and reply.get('ok') is True
@@ -553,10 +558,38 @@ def disconnect_sessions(case, binary, secrets, deadline):
                             code=reply.get('code'), phase=state.get('phase'),
                             terminal=common.get('terminal'), service_terminal=common.get('service_terminal'))
         except Exception as error:
-            # Retain the original error/DTO in cleanup; the summary stays bounded.
-            case.value['cleanup']['disconnect'][side] = {'error': str(error)}
+            # Keep the actual refusal/DTO, including an already-failed peer.
+            reply = {'error': str(error)}
             endpoint.update(status='failed', error_type=type(error).__name__)
         endpoint['finished_wall_ns'] = time.time_ns()
+        return endpoint, reply
+
+    if requests:
+        # Submit both local requests before awaiting either completion. This
+        # removes serial cleanup bias; it is not a simultaneous-acceptance or
+        # bilateral-drain guarantee. Original per-command/shared caps still apply.
+        results, workers = {}, []
+
+        def collect(side, argv):
+            # Each worker writes its own result only. The case receipt remains
+            # coordinator-owned and is updated after all bounded workers join.
+            results[side] = request(argv)
+
+        for side, argv in requests.items():
+            try:
+                worker = Thread(target=collect, args=(side, argv))
+                worker.start()
+                workers.append(worker)
+            except Exception as error:
+                at = time.time_ns()
+                results[side] = ({'status': 'failed', 'error_type': type(error).__name__,
+                                  'started_wall_ns': at, 'finished_wall_ns': at},
+                                 {'error': str(error)})
+        for worker in workers:
+            worker.join()
+        for side, (endpoint, reply) in results.items():
+            shutdown['endpoints'][side] = endpoint
+            case.value['cleanup']['disconnect'][side] = reply
     outcomes = [value['status'] for value in shutdown['endpoints'].values()]
     shutdown['status'] = ('passed' if all(value == 'passed' for value in outcomes)
                           else 'not_started' if all(value == 'not_started' for value in outcomes) else 'failed')

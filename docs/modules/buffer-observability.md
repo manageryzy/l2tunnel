@@ -1007,3 +1007,22 @@ terminal censoring. Raw reverse separately loses 1,258 packets in the server
 WAN capture and remains unqualified. Neither raw endpoint reaches the original
 120-second lease. Peer service pauses and QUIC requested-local-abort ordering
 need further attribution; transport close alone is not bilateral drain.
+
+### Concurrent requested local shutdown
+
+The native15 QUIC receipt shows the harness finishing endpoint A's local abort
+before it submits B's request. B can already have observed the resulting peer
+close and entered Failed; the later local request then correctly rejects that
+state. The harness now submits both existing local disconnect commands before
+waiting for either result. Each original per-command and absolute cleanup bound
+is unchanged. Startup errors and peer-close races still fail the corresponding
+endpoint and case; there is no retry, ignored error or normal-close-to-drain
+conversion. Full Common peer shutdown/drain semantics remain separate.
+
+All 32 affected matrix/report tests pass in the
+[Python-only receipt](../../work/aligned-extents-20261117/matrix-parallel-disconnect-check16-attempt2/validation.json),
+including an actual two-worker barrier and preservation of a concurrent peer
+failure. The first preflight compared different hash inventories and ran no
+tests; its tool-failure receipt is retained. Runtime source and release16 binary
+are unchanged, so required batch16 Rust checks are reused. Native qualification
+of concurrent local release remains pending.

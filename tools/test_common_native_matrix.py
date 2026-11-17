@@ -201,6 +201,70 @@ class MatrixTests(unittest.TestCase):
         self.assertIn(('cleanup', 'namespaces'), events)
         self.assertTrue(all(value['capture_analysis'] == 'passed' for value in result['phases']))
 
+    def test_disconnect_submits_both_local_requests_before_waiting_for_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = Path(directory)
+            for side in ('a', 'b'):
+                (secrets / f'control-{side}.sock').touch()
+            case = SimpleNamespace(children=[{'label': 'daemon-a'}, {'label': 'daemon-b'}],
+                value={'status': 'passed', 'data_status': 'passed', 'cleanup': {'disconnect': {}}},
+                prefix=lambda _role, argv: argv)
+            deadline = time.monotonic() + 30
+            entered = threading.Barrier(2)
+            calls = []
+
+            def request(argv, actual_deadline, cap):
+                side = 'a' if 'control-a.sock' in str(argv) else 'b'
+                calls.append((side, actual_deadline, cap))
+                # Neither command can finish until the other actually started.
+                # The timeout bounds a broken test, not a runtime policy change.
+                entered.wait(timeout=2)
+                return json.dumps({'version': 4, 'ok': True, 'code': 'ok',
+                    'state': {'phase': 'disconnected', 'common': {'service_terminal': 'Aborted'}}})
+
+            with patch.object(matrix.bounded, 'command', request):
+                matrix.disconnect_sessions(case, Path('/unused'), secrets, deadline)
+        self.assertEqual(sorted(calls), [('a', deadline, 3), ('b', deadline, 3)])
+        self.assertEqual(case.value['shutdown']['status'], 'passed')
+        self.assertEqual(case.value['status'], 'passed')
+        self.assertEqual(case.value['data_status'], 'passed')
+        self.assertEqual(set(case.value['cleanup']['disconnect']), {'a', 'b'})
+
+    def test_concurrent_disconnect_keeps_peer_failure_and_success_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = Path(directory)
+            for side in ('a', 'b'):
+                (secrets / f'control-{side}.sock').touch()
+            case = SimpleNamespace(children=[{'label': 'daemon-a'}, {'label': 'daemon-b'}],
+                value={'status': 'passed', 'data_status': 'passed', 'cleanup': {'disconnect': {}}},
+                prefix=lambda _role, argv: argv)
+            deadline = time.monotonic() + 30
+            entered = threading.Barrier(2)
+            calls = []
+            failure = {'version': 4, 'ok': False, 'code': 'state',
+                'state': {'phase': 'failed', 'common': {'terminal': 'Io(Other)',
+                    'service_terminal': 'Failed(Failure { kind: Other })'}}}
+
+            def request(argv, actual_deadline, cap):
+                side = 'a' if 'control-a.sock' in str(argv) else 'b'
+                calls.append((side, actual_deadline, cap))
+                entered.wait(timeout=2)
+                if side == 'b':
+                    raise RuntimeError('command failed (1): ' + json.dumps(failure))
+                return json.dumps({'version': 4, 'ok': True, 'code': 'ok',
+                                   'state': {'phase': 'disconnected'}})
+
+            with patch.object(matrix.bounded, 'command', request):
+                matrix.disconnect_sessions(case, Path('/unused'), secrets, deadline)
+        self.assertEqual(sorted(calls), [('a', deadline, 3), ('b', deadline, 3)])
+        self.assertEqual(case.value['shutdown']['endpoints']['a']['status'], 'passed')
+        self.assertEqual(case.value['shutdown']['endpoints']['b']['status'], 'failed')
+        self.assertEqual(case.value['shutdown']['status'], 'failed')
+        self.assertEqual(case.value['status'], 'failed')
+        self.assertEqual(case.value['data_status'], 'passed')
+        self.assertIn(json.dumps(failure), case.value['cleanup']['disconnect']['b']['error'])
+        self.assertTrue(case.value['cleanup']['disconnect']['a']['ok'])
+
     def test_command_timeout_preserves_actual_child_exit_and_original_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             case = matrix.Case(row(), None, Path(directory))

@@ -84,7 +84,14 @@ There is no automatic replay or reconnect. Observed throughput remains
 `data_status` and `shutdown` report separate results. A case cannot pass if either
 endpoint's API4 requested local disconnect fails, even when all three data
 phases pass. A successful local disconnect response is not a bilateral protocol
-drain proof. Primary workload/setup failures are preserved through cleanup.
+drain proof. Both existing local disconnect commands are submitted concurrently
+before waiting for either completion, using at most two workers and the unchanged
+three-second command cap within the original shared cleanup deadline. This avoids
+waiting for the first endpoint to close before even asking the second endpoint.
+It does not guarantee simultaneous service acceptance: an actual peer-close or
+already-failed state can still win and remains a failed shutdown. No retry or
+terminal-error rewriting is performed. Primary workload/setup failures are
+preserved through cleanup.
 
 ## Metric definitions
 

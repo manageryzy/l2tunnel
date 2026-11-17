@@ -135,6 +135,9 @@ implements Swift actual carrier-acceptance timing and bounded Rolling copy-phase
 dispatch with unchanged work charges and deadlines. Their [scoped required checks](modules/buffer-observability.md#coordinated-local-buffer-batch16-validation)
 pass after correcting one obsolete Swift no-witness fixture. Native qualification,
 native failure corrections and full original mode gates remain open.
+The [concurrent local-shutdown harness](modules/buffer-observability.md#concurrent-requested-local-shutdown)
+passes 32 affected Python tests and retains original bounds and every endpoint
+failure. It removes serial request ordering, without claiming bilateral drain.
 No parent gate closes, and historical failed receipts remain preserved.
 
 This remains the persistent progress ledger. Unchecked work is required;
