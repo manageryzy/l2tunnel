@@ -89,6 +89,84 @@ fn exact_plans_preflight_invalid_and_one_short_before_construction() -> TestResu
 }
 
 #[test]
+fn compact_systematic_extent_restores_only_algebraic_zeros_with_atomic_rejection() -> TestResult {
+    let originals = [
+        vec![9, 0, 0],
+        vec![21, 22, 23, 24, 25, 26, 0, 0],
+        vec![4, 0],
+    ];
+    let sources: Vec<&[u8]> = originals.iter().map(Vec::as_slice).collect();
+    let mut encoder = BlockEncoder::new(context(), GenerationId(7), block(), &sources)?;
+    let mut decoder = reserved(config())?;
+    let backing = decoder.backing_fingerprint();
+    let usage = decoder.storage_usage();
+    let before = snapshot(&decoder, GenerationId(7));
+    encoder.systematic_with(SourceId(0), |full| {
+        let extent = full.original_source()?.len() + 2;
+        assert!(extent < full.coded_bytes);
+        full.validate(block())?;
+        assert!(full.validate_compact_extent(block()).is_err());
+        let short = SymbolView {
+            payload: &full.payload[..extent],
+            ..full
+        };
+        assert!(short.validate(block()).is_err());
+        for end in 0..extent {
+            let truncated = SymbolView {
+                payload: &short.payload[..end],
+                ..short
+            };
+            assert!(
+                decoder
+                    .accept_compact_view_observed(truncated, 50, |_| {})
+                    .is_err()
+            );
+            assert_eq!(snapshot(&decoder, GenerationId(7)), before);
+        }
+        assert!(
+            decoder
+                .accept_compact_view_observed(full, 50, |_| {})
+                .is_err()
+        );
+        assert_eq!(snapshot(&decoder, GenerationId(7)), before);
+        // Rejected future-time views did not advance the actual decoder clock.
+        assert!(matches!(
+            decoder.accept_compact_view_observed(short, 0, |_| {})?,
+            AcceptStatus::Innovative(_)
+        ));
+        assert!(matches!(
+            decoder.accept_compact_view_observed(short, 1, |_| {})?,
+            AcceptStatus::Duplicate(_)
+        ));
+        Ok(())
+    })?;
+    // Neither remaining systematic is delivered: actual Cauchy equations recover
+    // both different lengths, including meaningful terminal zero bytes.
+    for index in 0..2 {
+        encoder.cauchy_repair_with(index, |repair| {
+            assert_eq!(repair.payload.len(), repair.coded_bytes);
+            let before = snapshot(&decoder, GenerationId(7));
+            let truncated = SymbolView {
+                payload: &repair.payload[..repair.payload.len() - 1],
+                ..repair
+            };
+            assert!(
+                decoder
+                    .accept_compact_view_observed(truncated, 50, |_| {})
+                    .is_err()
+            );
+            assert_eq!(snapshot(&decoder, GenerationId(7)), before);
+            decoder.accept_compact_view_observed(repair, 2, |_| {})?;
+            Ok(())
+        })?;
+    }
+    assert_eq!(decoder.take_decoded(GenerationId(7))?.sources, originals);
+    assert_eq!(decoder.storage_usage(), usage);
+    assert_eq!(decoder.backing_fingerprint(), backing);
+    Ok(())
+}
+
+#[test]
 fn reusable_encoder_matches_fixed_python_bytes_and_preserves_ids_on_refusal() -> TestResult {
     let plan = storage::EncoderPlan::for_encoder(block())?;
     let mut e = BlockEncoder::new_reserved(

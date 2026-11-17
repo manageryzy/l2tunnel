@@ -520,7 +520,8 @@ impl Observer {
             Some((timing, false)) if timing.enabled() => {
                 write!(
                     writer,
-                    "{{\"availability\":\"observed\",\"boundary\":\"loop_stop_before_settlement\",\"timing\":"
+                    "{{\"availability\":\"observed\",\"boundary\":\"{}\",\"timing\":",
+                    timing.boundary()
                 )?;
                 timing.write(writer)?;
                 write!(writer, "}}")?;
@@ -693,7 +694,10 @@ mod tests {
             tokio::time::advance(Duration::from_micros(11)).await;
         }
         let stop = Instant::now();
-        let frozen = timing.freeze_at(stop);
+        let frozen = timing.freeze_at(
+            stop,
+            crate::initialization_timing::ExecutionBoundary::LoopStop,
+        );
         let retained = frozen.heap_bytes();
         assert!(retained > 0);
         assert!(

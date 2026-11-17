@@ -107,7 +107,7 @@ fn selected_fec_recovers_real_loss_without_legacy_context_in_coded_sources() -> 
         submit_all(&mut a, &input)?;
         let mut output = vec![0; a.max_packet_bytes()];
         let mut packets = Vec::new();
-        let mut observed_fill = false;
+        let mut observed_short_systematic = false;
         while let Some(n) = a.poll_data(time(0), &mut output, &mut allowance())? {
             let bytes = output[..n].to_vec();
             let view = a.inspect_output_record(&bytes)?;
@@ -129,7 +129,16 @@ fn selected_fec_recovers_real_loss_without_legacy_context_in_coded_sources() -> 
             if let Some((source, payload)) = view.source {
                 assert_eq!(payload, input[source.0 as usize]);
                 assert_eq!(extent.payload_bytes, payload.len());
-                observed_fill |= extent.systematic_coded_fill_bytes != 0;
+                assert_eq!(extent.systematic_coded_fill_bytes, 0);
+                let symbol = view.fec.ok_or("systematic symbol")?;
+                let original = symbol.original_source()?;
+                assert_eq!(symbol.payload.len(), original.len() + 2);
+                if symbol.payload.len() < symbol.coded_bytes {
+                    observed_short_systematic = true;
+                    let mut padded_alias = bytes.clone();
+                    padded_alias.resize(bytes.len() + symbol.coded_bytes - symbol.payload.len(), 0);
+                    assert!(a.inspect_output_extent(&padded_alias).is_err());
+                }
             }
             for end in 0..bytes.len() {
                 assert!(a.inspect_output_extent(&bytes[..end]).is_err());
@@ -145,7 +154,7 @@ fn selected_fec_recovers_real_loss_without_legacy_context_in_coded_sources() -> 
             packets.push(bytes);
         }
         assert_eq!(packets.len(), 5);
-        assert!(observed_fill);
+        assert!(observed_short_systematic);
         for packet in packets.iter().skip(2) {
             b.receive(packet, time(0))?;
         }

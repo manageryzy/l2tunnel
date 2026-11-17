@@ -144,6 +144,42 @@ pub struct WireBudget {
 #[path = "transport_tests.rs"]
 mod tests;
 
+// The guard owns no new allocation: it only retains the existing Timing while
+// borrowing the actual Driver. A cancelled future transfers diagnostics before
+// Driver::drop performs its unchanged final source sampling and persistence.
+struct DriverExecution<'a> {
+    driver: &'a mut Driver,
+    timing: crate::initialization_timing::Timing,
+    initialization_failed: bool,
+    transferred: bool,
+}
+impl Drop for DriverExecution<'_> {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        self.transferred = true;
+        if let Some(metrics) = self
+            .driver
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.buffer_metrics.as_mut())
+        {
+            let timing = std::mem::replace(
+                &mut self.timing,
+                crate::initialization_timing::Timing::disabled(),
+            );
+            metrics.retain_execution(
+                timing.freeze_at(
+                    Instant::now(),
+                    crate::initialization_timing::ExecutionBoundary::DriverFutureDrop,
+                ),
+                self.initialization_failed,
+            );
+        }
+    }
+}
+
 // The one existing loop borrows its actual Driver. Common constructs its cell
 // before polling, so construction frames do not nest inside readiness polling.
 #[allow(clippy::too_many_arguments)] // The original loop's owners and deadline remain explicit.
@@ -162,11 +198,24 @@ where
 {
     use crate::initialization_timing::{Owner as TimingOwner, Stage as TimingStage, Timing};
     let origin = driver.origin;
-    let (mut execution, execution_initialization_failed) =
+    let (timing, initialization_failed) =
         match Timing::try_from_environment(TimingOwner::CommonExecution, origin) {
             Ok(timing) => (timing, false),
             Err(_) => (Timing::disabled(), true),
         };
+    let mut execution_owner = DriverExecution {
+        driver,
+        timing,
+        initialization_failed,
+        transferred: false,
+    };
+    let DriverExecution {
+        driver,
+        timing: execution,
+        initialization_failed,
+        transferred,
+    } = &mut execution_owner;
+    let driver = &mut **driver;
     let mut device =
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
@@ -354,15 +403,20 @@ where
     }.await;
     let metric_stop = sample();
     // Freeze before terminal settlement. Existing buffer export owns the prepaid
-    // diagnostic from here; cancellation before this handoff remains unavailable.
+    // diagnostic from here. The stack guard handles cancellation before this
+    // normal boundary without extending it through later Driver destruction.
+    *transferred = true;
     if let Some(metrics) = driver
         .common
         .as_deref_mut()
         .and_then(|runtime| runtime.buffer_metrics.as_mut())
     {
         metrics.retain_execution(
-            execution.freeze_at(metric_stop),
-            execution_initialization_failed,
+            std::mem::replace(execution, Timing::disabled()).freeze_at(
+                metric_stop,
+                crate::initialization_timing::ExecutionBoundary::LoopStop,
+            ),
+            *initialization_failed,
         );
     }
     driver.sample_raw_buffers(&mut socket, metric_stop, true);

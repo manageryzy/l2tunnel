@@ -596,10 +596,28 @@ async fn dropped_common_future_samples_live_protocol_and_management_before_owner
             .is_some()
     );
     let origin = a.driver.origin;
-    // This polled future owns the actual authenticated Driver, just as the
-    // service's inline session future does. Cancellation skips its continuation.
+    let timing = crate::initialization_timing::Timing::try_new(
+        crate::initialization_timing::Owner::CommonExecution,
+        origin,
+    )?;
+    // This polled future owns the actual authenticated Driver and the same
+    // production stack guard. Cancellation skips the operation continuation;
+    // the guard freezes its entered interval before Driver source sampling.
     let mut running = Box::pin(async move {
-        std::future::pending::<()>().await;
+        let mut execution = DriverExecution {
+            driver: &mut a.driver,
+            timing,
+            initialization_failed: false,
+            transferred: false,
+        };
+        let _never = execution
+            .timing
+            .measure_future(
+                crate::initialization_timing::Stage::CommonNativeWrite,
+                std::future::pending::<io::Result<()>>(),
+            )
+            .await;
+        drop(execution);
         drop(a);
     });
     std::future::poll_fn(|cx| {
@@ -614,6 +632,29 @@ async fn dropped_common_future_samples_live_protocol_and_management_before_owner
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     std::fs::remove_file(path)?;
     assert_eq!(json["finished_at_us"], stopped);
+    let execution = &json["common_execution"];
+    assert_eq!(execution["availability"], "observed");
+    assert_eq!(execution["boundary"], "driver_future_drop");
+    assert_eq!(execution["timing"]["checkpoint"], "driver_future_drop");
+    assert_eq!(execution["timing"]["elapsed_us"], stopped);
+    assert_eq!(execution["timing"]["invalid"], false);
+    let stage = execution["timing"]["stages"]
+        .as_array()
+        .ok_or("execution stages")?
+        .iter()
+        .find(|stage| stage["stage"] == "CommonNativeWrite")
+        .ok_or("entered native write")?;
+    assert_eq!(stage["samples"], 1);
+    assert_eq!(stage["censored"], 1);
+    assert_eq!(stage["failed"], 0);
+    assert_eq!(stage["sum_us"], 50_000);
+    assert_eq!(stage["maximum_start_us"], now);
+    assert_eq!(stage["maximum_end_us"], stopped);
+    assert!(
+        execution["timing"]["diagnostic_heap_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
     assert_eq!(json["source_terminal_sample"]["boundary"], "driver_drop");
     assert_eq!(json["source_terminal_sample"]["attempted_at_us"], stopped);
     assert_eq!(

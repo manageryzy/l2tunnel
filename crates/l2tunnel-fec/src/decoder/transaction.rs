@@ -53,8 +53,12 @@ impl Work {
         index: usize,
         coefficients: &[u8],
         payload: &[u8],
+        width: usize,
         pivot: Option<usize>,
     ) -> Result<(), Error> {
+        if payload.len() > width {
+            return Err(Error::Malformed);
+        }
         if index >= self.rows.len() {
             if self.reserved {
                 return Err(Error::Capacity);
@@ -67,7 +71,7 @@ impl Work {
         let target = self.rows.get_mut(index).ok_or(Error::Arithmetic)?;
         if self.reserved
             && (target.row.coefficients.capacity() < coefficients.len()
-                || target.row.payload.capacity() < payload.len())
+                || target.row.payload.capacity() < width)
         {
             return Err(Error::Capacity);
         }
@@ -75,6 +79,9 @@ impl Work {
         target.row.coefficients.extend_from_slice(coefficients);
         target.row.payload.clear();
         target.row.payload.extend_from_slice(payload);
+        // Only a separately validated compact systematic can be shorter. Work
+        // rows already reserve the full algebraic width; no new storage owner.
+        target.row.payload.resize(width, 0);
         target.pivot = pivot;
         Ok(())
     }
@@ -84,8 +91,8 @@ impl Work {
         view: SymbolView<'_>,
     ) -> Result<Prepared, Error> {
         self.used = 2;
-        self.copy(0, view.coefficients, view.payload, None)?;
-        self.copy(1, view.coefficients, view.payload, None)?;
+        self.copy(0, view.coefficients, view.payload, view.coded_bytes, None)?;
+        self.copy(1, view.coefficients, view.payload, view.coded_bytes, None)?;
         for pivot in 0..view.source_count {
             if let Some(existing) = generation.basis.get(pivot) {
                 let factor = self.rows[1].row.coefficients[pivot];
@@ -117,6 +124,7 @@ impl Work {
                         target,
                         &existing.coefficients,
                         &existing.payload,
+                        existing.payload.len(),
                         Some(index),
                     )?;
                     self.used += 1;

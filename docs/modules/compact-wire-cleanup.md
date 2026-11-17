@@ -319,6 +319,39 @@ workspace Clippy and the checklist validator pass separately. Existing simulator
 evidence is unchanged. This focused correction does not close CWC-01/17/18, the broader
 cutover, native platform gates or the previously intermittent raw/switch cases.
 
+## Exact Block FEC systematic extents (2026-11-17)
+
+The source-bound native17 Cauchy UDP case passes its finite forward data and
+requested disconnect, but sends 1,864,271 bytes of systematic coded fill on the
+client side. The prior exact Aligned codec correction did not remove this second
+layer: Block FEC equalized systematic vectors to the generation's longest actual
+ARQ source before serializing them. The precise observation and its limits are
+saved in `work/aligned-extents-20261117/native17-udp-review1/`.
+
+The current selected systematic grammar now retains the declared coded width
+while serializing exactly the original two-byte length prefix and ARQ source.
+The canonical parser rejects truncated original bytes and old padded systematic
+aliases. Repair equations still carry the complete generation width, which is
+based on the actual longest source rather than a configured maximum. Meaningful
+source trailing zeros remain part of the declared original extent; repair tails
+are never trimmed by inspecting their byte values.
+
+The FEC decoder restores only the omitted algebraic zeros inside its existing
+reserved transaction rows. Its allocation plan, generation/window bounds,
+deadlines and atomic rejection remain unchanged. The regular complete-symbol
+API remains strict; only the explicitly selected compact API accepts short
+systematic vectors. Exact emitted lengths flow through retained output witnesses,
+byte budgets, final Records and carrier acceptance. Configuration and catalog
+hash domains advance to v5; CompleteV2 field bytes and the final Records prefix
+are unchanged. An older padded-systematic peer cannot share the new authenticated
+catalog domain.
+
+Focused source-loss, trailing-zero, malformed extent, duplicate, allocation,
+physical-charge and actual Common UDP fixture checks pass the
+[required batch18 continuation](buffer-observability.md#coordinated-local-buffer-batch18-validation).
+No new native speed or complete CWC/BP qualification is claimed. Historical packets, receipts and simulator formats are
+unchanged. CWC-03 and the full overhead/matrix gates remain open.
+
 ## Exact Aligned source extents (2026-11-17)
 
 The preceding overhead table describes the pre-correction source. Current

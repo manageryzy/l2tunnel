@@ -273,14 +273,7 @@ impl Reliable {
 }
 
 pub(super) fn original_source(view: fec::SymbolView<'_>) -> Result<&[u8], Error> {
-    let prefix: [u8; 2] = view
-        .payload
-        .get(..2)
-        .ok_or(Error::Malformed)?
-        .try_into()
-        .map_err(|_| Error::Malformed)?;
-    let length = usize::from(u16::from_be_bytes(prefix));
-    view.payload.get(2..2 + length).ok_or(Error::Malformed)
+    view.original_source().map_err(Error::Fec)
 }
 fn inspect_symbol(
     kind: u8,
@@ -309,13 +302,26 @@ fn inspect_symbol(
         coefficients,
         payload,
     };
-    view.validate(config)?;
+    view.validate_compact_extent(config)?;
     Ok(view)
 }
 pub(super) fn encode_symbol(
     view: fec::SymbolView<'_>,
     output: &mut [u8],
 ) -> Result<usize, fec::Error> {
+    let payload = if view.kind == fec::SymbolKind::Systematic {
+        let original = view.original_source()?;
+        let end = original
+            .len()
+            .checked_add(2)
+            .ok_or(fec::Error::Arithmetic)?;
+        if view.payload.len() > view.coded_bytes {
+            return Err(fec::Error::InvalidSource);
+        }
+        view.payload.get(..end).ok_or(fec::Error::InvalidSource)?
+    } else {
+        view.payload
+    };
     let values = [
         view.generation.0,
         u64::from(view.symbol.0),
@@ -325,7 +331,7 @@ pub(super) fn encode_symbol(
     let required = 1
         + values.into_iter().map(varint_len).sum::<usize>()
         + view.coefficients.len()
-        + view.payload.len();
+        + payload.len();
     if output.len() < required {
         return Err(fec::Error::OutputTooSmall { required });
     }
@@ -340,7 +346,7 @@ pub(super) fn encode_symbol(
     }
     let end = position + view.coefficients.len();
     output[position..end].copy_from_slice(view.coefficients);
-    output[end..required].copy_from_slice(view.payload);
+    output[end..required].copy_from_slice(payload);
     Ok(required)
 }
 fn varint_len(value: u64) -> usize {

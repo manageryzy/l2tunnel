@@ -1,21 +1,56 @@
 //! Safe finite-field error-correction arithmetic, not cryptography.
 use crate::{Error, MAX_SOURCES};
 
-/// Multiply bytes in GF(256), polynomial 0x11d, in eight polynomial steps.
-pub fn multiply(mut left: u8, mut right: u8) -> u8 {
-    let mut product = 0;
-    for _ in 0..8 {
-        if right & 1 != 0 {
-            product ^= left;
+// One process-static 768-byte lookup, evaluated at compile time. This changes
+// only the implementation of a charged GF operation: no caller budget, phase,
+// pause cursor, allocation plan or packet format depends on these table reads.
+// This is error-correction arithmetic, not a constant-time cryptographic API.
+struct FieldTables {
+    logarithm: [u8; 256],
+    exponential: [u8; 512],
+}
+
+impl FieldTables {
+    const fn new() -> Self {
+        let mut tables = Self {
+            logarithm: [0; 256],
+            exponential: [0; 512],
+        };
+        let mut value = 1_u16;
+        let mut exponent = 0;
+        // Two generates all 255 nonzero elements for polynomial 0x11d.
+        while exponent < 255 {
+            tables.exponential[exponent] = value as u8;
+            tables.logarithm[value as usize] = exponent as u8;
+            value <<= 1;
+            if value & 0x100 != 0 {
+                value ^= 0x11d;
+            }
+            exponent += 1;
         }
-        let high = left & 0x80 != 0;
-        left <<= 1;
-        if high {
-            left ^= 0x1d;
+        // Repetition avoids a runtime modulo for log(a) + log(b), at most 508.
+        while exponent < tables.exponential.len() {
+            tables.exponential[exponent] = tables.exponential[exponent - 255];
+            exponent += 1;
         }
-        right >>= 1;
+        tables
     }
-    product
+}
+
+static FIELD_TABLES: FieldTables = FieldTables::new();
+
+/// Multiply bytes in GF(256), polynomial 0x11d, using a fixed static lookup.
+///
+/// The table contains no protocol state or cryptographic key material. This is
+/// the same one GF byte operation charged by existing FEC work budgets.
+#[inline]
+pub fn multiply(left: u8, right: u8) -> u8 {
+    if left == 0 || right == 0 {
+        return 0;
+    }
+    let exponent = usize::from(FIELD_TABLES.logarithm[usize::from(left)])
+        + usize::from(FIELD_TABLES.logarithm[usize::from(right)]);
+    FIELD_TABLES.exponential[exponent]
 }
 
 /// Multiplicative inverse, or None for the field's zero element.
@@ -92,4 +127,69 @@ pub(crate) fn cauchy_column(sources: u16, repair_index: u16) -> Result<u16, Erro
         return Err(Error::InvalidCoefficients);
     }
     Ok(column)
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    // Independent of logarithms and the generator recurrence: multiply the
+    // binary polynomials first, then reduce high terms by the modulus.
+    fn reference_product(left: u8, right: u8) -> u8 {
+        let mut polynomial = 0_u16;
+        for bit in 0..8 {
+            if right & (1 << bit) != 0 {
+                polynomial ^= u16::from(left) << bit;
+            }
+        }
+        for bit in (8..=14).rev() {
+            if polynomial & (1 << bit) != 0 {
+                polynomial ^= 0x11d << (bit - 8);
+            }
+        }
+        polynomial as u8
+    }
+
+    #[test]
+    fn static_products_match_all_independent_polynomial_reductions() {
+        for left in 0_u8..=u8::MAX {
+            for right in 0_u8..=u8::MAX {
+                assert_eq!(
+                    multiply(left, right),
+                    reference_product(left, right),
+                    "GF product {left} * {right}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_table_cycle_indexes_and_storage_are_bounded() {
+        assert_eq!(std::mem::size_of::<FieldTables>(), 768);
+        let mut seen = [false; 256];
+        for exponent in 0..255 {
+            let value = FIELD_TABLES.exponential[exponent];
+            assert_ne!(value, 0);
+            assert!(!seen[usize::from(value)]);
+            seen[usize::from(value)] = true;
+            assert_eq!(
+                usize::from(FIELD_TABLES.logarithm[usize::from(value)]),
+                exponent
+            );
+        }
+        assert!(seen[1..].iter().all(|value| *value));
+        for exponent in 255..512 {
+            assert_eq!(
+                FIELD_TABLES.exponential[exponent],
+                FIELD_TABLES.exponential[exponent % 255],
+            );
+        }
+        for left in 1_u8..=u8::MAX {
+            for right in 1_u8..=u8::MAX {
+                let exponent = usize::from(FIELD_TABLES.logarithm[usize::from(left)])
+                    + usize::from(FIELD_TABLES.logarithm[usize::from(right)]);
+                assert!(exponent <= 508);
+            }
+        }
+    }
 }

@@ -1230,3 +1230,91 @@ and 9 not-run phases from 62 attempt directories over 80 combinations. This is
 not a complete current-build matrix. Full BP-01..BP-24, original-native overhead
 mean/p99, complete carrier/algorithm qualification and functional failures remain
 open. No parent acceptance definition is reduced by these partial results.
+
+### Cancellation timing and bounded execution validation
+
+Implemented with coordinated local batch18 validation below. A stack-only guard retains
+existing prepaid Common execution timing and transfers it to the existing
+Observer on future destruction before Driver source sampling. Normal loop stop
+retains its original cutoff and disarms the cancellation transfer. The exported
+boundary distinguishes `driver_future_drop` from `loop_stop_before_settlement`;
+interrupted entered stages remain censored. No extra diagnostic heap, output I/O,
+queue or protocol action is introduced by this transfer. The actual authenticated
+Driver cancellation fixture now checks timing and fresh source sampling together.
+
+The offline reporter now validates the execution extension's bounded stage list,
+owner/schema, boundary/checkpoint, outcome counts and maximum interval. Endpoint
+microsecond truncation may differ by one from separately truncated elapsed time.
+Unavailable/invalid timing remains visible; execution spans are rendered separately
+and never added to blocked unions or interpreted as CPU time. Complete BP coverage
+and native qualification of cancellation transfer remain open.
+
+### Finite-field operation implementation
+
+Implemented with coordinated local batch18 validation below. GF(256)
+multiplication uses a compile-time 768-byte log/exp table for the same 0x11d field.
+This adds process-static read-only storage, no per-session heap or initialization,
+and changes no GF/copy/metadata work charge, pause cursor, deadline, protocol byte
+or caller. The existing independent Python products/inverses and added exhaustive
+polynomial-reduction oracle cover all 65536 input pairs. This is error-correction
+arithmetic, not a cryptographic primitive or constant-time API.
+
+The [finite primitive microbenchmark](../../work/aligned-extents-20261117/field-microbench18/receipt.json)
+measures about 78 ms versus 14.4--14.9 ms for 8388608 operations with equal checksums,
+three alternating-order rounds and no workload I/O. It does not establish native
+throughput improvement. Two additional original-binary Rolling diagnostic attempts
+exhaust startup API bounds before data; the first captures mainly kernel
+`clear_page_rep` during construction, and the after-readiness profiler in the
+second never starts. Those failed receipts remain separate from native17 and
+cannot establish a data-path GF hotspot.
+
+### Empty receiver-pool initialization
+
+Implemented with coordinated local batch18 validation below. The
+[source-bound startup audit](../../work/aligned-extents-20261117/allocation-review18/notes.md)
+finds 8.096/8.141-second Bank construction in native17 Rolling, versus about
+11.5--12.9 seconds in the two later failed startup attempts. The sampled kernel
+page-clearing evidence does not join every sample to an individual allocation.
+
+The actual reserved Aligned receiver initialized each free record/proof payload
+with zeros and immediately cleared its live length. It now uses the existing
+fallible reserve-only vector constructor for these empty pools. For the observed
+Rolling plan this removes 265,970,832 discarded constructor byte writes per
+endpoint; all 55,392 reservations, capacities, allocation order, accounting,
+transaction versions and limits remain unchanged. This is a source-level write
+count, not measured RSS, physical commitment or a native speedup.
+
+Actual acquisition initializes record and fragment-bitmap extents before reading;
+proof and journal copies initialize their entire live extent. An actual-owner
+regression poisons idle/recycled storage, admits reordered fragments, verifies
+missing ranges, rolls back malformed input and delivers meaningful trailing zeros
+with unchanged pointers and usage. No spare capacity is read and no unsafe code
+is introduced. Full preallocation/resource and platform acceptance remain open.
+
+### Coordinated local buffer batch18 validation
+
+The [required attempt](../../work/aligned-extents-20261117/required-buffer-checks18-attempt1/validation.json)
+passes 118 Python checks and preflight, then exposes one new FEC fixture passing
+owned vectors to a borrowed-slice constructor. The fixture correction changes no
+production behavior. The [scoped continuation](../../work/aligned-extents-20261117/required-buffer-checks18-continuation1/validation.json)
+reuses those unchanged checks and passes formatting, strict workspace Clippy,
+2,326 Rust cases including doctests/no-default codec, strict rustdoc, external
+Common CLI, 356 remaining Python checks and 1,658 simulator cases. Source remains
+unchanged during each receipt; the only intervening edit is that test fixture.
+This is a passing required continuation, not a pristine first invocation.
+
+Actual-owner tests cover cancellation timing with fresh Driver source sampling,
+dirty recycled receiver backing and unchanged accounting, real lost-source
+recovery with exact systematic extents, physical byte charging and rejection of
+old v4 authenticated transaction digests. Independent exhaustive field oracles
+pass. No protocol deadline, retry, queue, window, authentication or configured
+work allowance is increased. Native18 verification and full BP/matrix/native
+overhead gates remain open; simulator passes do not qualify kernel throughput.
+
+A [read-only native17 supplement](../../work/aligned-extents-20261117/bp-next-triage18/report.md)
+extracts an existing actual staged-source provider previously omitted from the
+concise report. The Cauchy sender has 103 completed refusal-to-admission waits,
+45.455953 seconds total and a 6.649802-second maximum. Sequence-window and
+send-capacity reason intervals overlap. The maximum identity is unavailable in
+that version; temporal proximity to a Pipeline maximum does not identify the
+same packet. Exact cross-layer provenance remains required.

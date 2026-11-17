@@ -1498,20 +1498,22 @@ impl Reliable {
         self.advance(now)?;
         let ticks = milliseconds(now)?;
         let mut diagnostics = self.diagnostics.first_mut();
-        let accepted = self
-            .decoder
-            .as_mut()
-            .ok_or(Error::Malformed)?
-            .accept_view_observed(view, ticks, |reason| {
-                if let Some(state) = diagnostics.as_deref_mut() {
-                    let index = match reason {
-                        fec::DecoderCapacity::SymbolSlots => 0,
-                        fec::DecoderCapacity::GenerationSlots => 1,
-                        fec::DecoderCapacity::LogicalReservation => 2,
-                    };
-                    state.capacity_refused(index, now);
-                }
-            });
+        let refused = |reason| {
+            if let Some(state) = diagnostics.as_deref_mut() {
+                let index = match reason {
+                    fec::DecoderCapacity::SymbolSlots => 0,
+                    fec::DecoderCapacity::GenerationSlots => 1,
+                    fec::DecoderCapacity::LogicalReservation => 2,
+                };
+                state.capacity_refused(index, now);
+            }
+        };
+        let decoder = self.decoder.as_mut().ok_or(Error::Malformed)?;
+        let accepted = if compact {
+            decoder.accept_compact_view_observed(view, ticks, refused)
+        } else {
+            decoder.accept_view_observed(view, ticks, refused)
+        };
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
                 let checked = (|| -> Result<(), Error> {

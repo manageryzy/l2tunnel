@@ -501,3 +501,89 @@ fn original_receiver_maxima_are_not_pruned_to_fit_reserved_capacity() -> Result 
     );
     Ok(())
 }
+
+#[test]
+fn empty_reserved_payloads_initialize_dirty_recycled_storage_before_fragment_reads() -> Result {
+    let l = limits();
+    let mut receiver = reserved(l)?;
+    let plan = heap::ReceiverPlan::for_limits(l)?;
+    let usage = receiver.storage_usage().ok_or("reserved usage missing")?;
+    assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+    let pointers = payloads(&receiver)?;
+    for cycle in 0..2u64 {
+        // Safe initialized poison models arbitrary previous contents, including
+        // buffers returned by the preceding actual delivery. No allocator or
+        // spare-capacity reads are needed to prove initialization on acquire.
+        let pool = receiver.reserved.as_mut().ok_or("reserved pool missing")?;
+        for record in &mut pool.records {
+            assert!(record.bytes.is_empty());
+            assert!(record.pieces.is_empty());
+            assert_eq!(record.bytes.capacity(), 65_535);
+            assert_eq!(record.pieces.capacity(), l.max_fragments_per_record);
+            record.bytes.resize(record.bytes.capacity(), 0xa5);
+            record.bytes.clear();
+            record.pieces.resize(record.pieces.capacity(), 0xa5);
+            record.pieces.clear();
+        }
+        for proof in &mut pool.proofs {
+            assert!(proof.is_empty());
+            assert_eq!(proof.capacity(), l.body.symbol_bytes);
+            proof.resize(proof.capacity(), 0xa5);
+            proof.clear();
+        }
+        let mut body = vec![7 + cycle as u8; 103];
+        body[0] = 2;
+        body[1..3].copy_from_slice(&100u16.to_be_bytes());
+        body[95..].fill(0);
+        let first = fragment(cycle, body.len(), 0, &body);
+        let last = fragment(cycle, body.len(), 56, &body);
+        let now = Tick(cycle * 3 + 1);
+        let last_identity = unit(cycle * 2 + 1, cycle, &last).identity;
+        assert_eq!(
+            receiver.admit_authenticated(last_identity, &last, now)?,
+            Admission::Accepted
+        );
+        let slot = receiver
+            .find(ChannelId(0), RecordId(cycle))
+            .ok_or("partial")?;
+        let partial = receiver.records[slot].as_ref().ok_or("partial record")?;
+        assert_eq!(&partial.bytes[..56], &[0; 56]);
+        assert_eq!(&partial.bytes[56..], &body[56..]);
+        assert_eq!(partial.pieces, [0, 1]);
+        let proof_slot = ((cycle * 2 + 1) % l.source_window as u64) as usize;
+        assert_eq!(
+            receiver.proofs[proof_slot].as_ref().ok_or("proof")?.bytes,
+            last
+        );
+        assert_eq!(receiver.prepare(ChannelId(0), now, 1)?, Prepared::Idle);
+        let saved = receiver.status();
+        let mut malformed = first.clone();
+        malformed[9..11].copy_from_slice(&99u16.to_be_bytes());
+        assert_eq!(
+            receiver.admit_batch_authenticated_into(
+                &[unit(cycle * 2, cycle, &malformed)],
+                Tick(now.0 + 1),
+                &mut [Admission::Duplicate],
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(receiver.status(), saved);
+        assert_eq!(payloads(&receiver)?, pointers);
+        receiver.admit_authenticated(
+            unit(cycle * 2, cycle, &first).identity,
+            &first,
+            Tick(now.0 + 1),
+        )?;
+        assert_eq!(
+            receiver.prepare(ChannelId(0), Tick(now.0 + 1), 1)?,
+            Prepared::Ready
+        );
+        assert_eq!(receiver.pending().ok_or("native")?.bytes, &body[3..]);
+        receiver.commit_delivery(Tick(now.0 + 2))?;
+        assert_eq!(receiver.status().retained_records, 0);
+        assert_eq!(receiver.status().retained_sources, 0);
+        assert_eq!(receiver.storage_usage(), Some(usage));
+        assert_eq!(payloads(&receiver)?, pointers);
+    }
+    Ok(())
+}

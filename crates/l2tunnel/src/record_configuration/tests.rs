@@ -274,6 +274,70 @@ fn literal_complete_bytes_and_independent_sha256_cover_all_actual_families() -> 
 }
 
 #[test]
+fn current_transaction_refuses_previous_systematic_extent_domain() -> Result {
+    use l2tunnel_core::Epoch;
+    use l2tunnel_management::{EndpointId, Frame, Ingress, LaneId, SessionId};
+    use transaction::{Fence, Identity, Peer, Settings, Tick};
+
+    let initial = fixture("aligned")?;
+    let mut next = initial;
+    next.descriptor.forward.bytes_per_second += 1;
+    let supported = [initial, next];
+    let make = |role| {
+        Peer::new_directional(
+            Identity {
+                session: SessionId([7; 16]),
+                role,
+                local: EndpointId(if role == Role::Client { 1 } else { 2 }),
+                remote: EndpointId(if role == Role::Client { 2 } else { 1 }),
+                lane: LaneId(3),
+            },
+            Epoch(1),
+            initial,
+            &supported,
+            Settings::default(),
+            Tick(0),
+        )
+    };
+    let mut client = make(Role::Client)?;
+    client.propose(next, Tick(0))?;
+    let fence = Fence::new(&vec![0; usize::from(initial.sender_channels(Role::Client))])?;
+    let prepare = client.staged(fence, Tick(1))?.outbound.ok_or("prepare")?;
+    let limits = transaction::configuration_limits::<Configuration>()?;
+    let mut previous = Frame::decode(&prepare, limits)?;
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(b"l2tunnel/record-transaction-config/v4\0");
+    context.update(&encoded(&next)?);
+    previous
+        .header
+        .ticket
+        .digest
+        .0
+        .copy_from_slice(context.finish().as_ref());
+    assert_ne!(previous.header.ticket.digest, next.digest()?);
+    let mut old_prepare = vec![0; prepare.len()];
+    assert_eq!(previous.encode(&mut old_prepare, limits)?, prepare.len());
+    let ingress = Ingress::AuthenticatedManagement {
+        session: SessionId([7; 16]),
+        lane: LaneId(3),
+        sender: Role::Client,
+    };
+    // The same canonical policy bytes are valid; the old authenticated ticket
+    // digest cannot authorize the new systematic extent grammar.
+    assert!(matches!(
+        make(Role::Server)?.receive(ingress, &old_prepare, Tick(2)),
+        Err(transaction::Error::Unexpected)
+    ));
+    assert!(matches!(
+        make(Role::Server)?
+            .receive(ingress, &prepare, Tick(2))?
+            .event,
+        Some(transaction::Event::Stage { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn every_wire_byte_is_preserved_or_refused_instead_of_silently_defaulted() -> Result {
     for name in ["swift", "aligned", "packed"] {
         let original = fixture(name)?;

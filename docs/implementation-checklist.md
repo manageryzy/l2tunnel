@@ -1,5 +1,9 @@
 # Implementation checklist and evidence ledger
 
+The selected [Block FEC systematic extent correction](modules/compact-wire-cleanup.md#exact-block-fec-systematic-extents-2026-11-17)
+removes separately observed coded fill and passes the required batch18 continuation;
+native qualification is pending. It does not close CWC-03 or any full-matrix gate.
+
 Current Aligned exact-source extent correction and scoped evidence are tracked in
 [the cutover ledger](modules/compact-wire-cleanup.md#exact-aligned-source-extents-2026-11-17).
 This removes serialized Aligned tail padding; it does not close the full CWC
@@ -156,6 +160,12 @@ buffer exports. TLS workload/close and Rolling original-expiry failures remain.
 It also confirms residual serialized Block FEC systematic padding and missing
 execution-timing handoff on successful future cancellation. Both require
 correction; full BP, original-native overhead and same-build matrix gates stay open.
+
+The follow-up cancellation guard, bounded execution-report validation, static
+GF multiplication and reserve-only empty receiver pools pass the
+[required batch18 continuation](modules/buffer-observability.md#coordinated-local-buffer-batch18-validation). Their [source and measurement boundaries](modules/buffer-observability.md#cancellation-timing-and-bounded-execution-validation)
+retain original caps and distinguish primitive microbenchmarks, constructor
+write counts and actual native performance. No complete gate closes.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

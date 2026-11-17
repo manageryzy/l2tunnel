@@ -358,7 +358,7 @@ impl Timing {
 
     /// Move the prepaid owner into terminal export custody without output I/O.
     /// The injected stop excludes settlement, rendering and persistence time.
-    pub(crate) fn freeze_at(mut self, now: Instant) -> FrozenTiming {
+    pub(crate) fn freeze_at(mut self, now: Instant, boundary: ExecutionBoundary) -> FrozenTiming {
         if let Some(state) = self.state.first_mut() {
             state.report_on_drop = false;
             state.end_request_at(now, Outcome::Censored);
@@ -366,6 +366,7 @@ impl Timing {
         FrozenTiming {
             timing: self,
             at: now,
+            boundary,
         }
     }
 
@@ -405,13 +406,38 @@ impl Timing {
     }
 }
 
+/// The actual runtime boundary that relinquished the execution observation.
+#[derive(Clone, Copy)]
+pub(crate) enum ExecutionBoundary {
+    LoopStop,
+    DriverFutureDrop,
+}
+impl ExecutionBoundary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoopStop => "loop_stop_before_settlement",
+            Self::DriverFutureDrop => "driver_future_drop",
+        }
+    }
+    fn checkpoint(self) -> &'static str {
+        match self {
+            Self::LoopStop => "loop_stop",
+            Self::DriverFutureDrop => "driver_future_drop",
+        }
+    }
+}
+
 /// A moved diagnostic owner with an immutable measurement cutoff. No new
 /// allocation, packet state or protocol authority is introduced by this owner.
 pub(crate) struct FrozenTiming {
     timing: Timing,
     at: Instant,
+    boundary: ExecutionBoundary,
 }
 impl FrozenTiming {
+    pub(crate) fn boundary(&self) -> &'static str {
+        self.boundary.label()
+    }
     pub(crate) fn enabled(&self) -> bool {
         !self.timing.state.is_empty()
     }
@@ -420,7 +446,7 @@ impl FrozenTiming {
     }
     pub(crate) fn write(&self, output: &mut impl Write) -> io::Result<()> {
         if let Some(state) = self.timing.state.first() {
-            state.write_report_ref_at("loop_stop", self.at, output)
+            state.write_report_ref_at(self.boundary.checkpoint(), self.at, output)
         } else {
             write!(output, "null")
         }

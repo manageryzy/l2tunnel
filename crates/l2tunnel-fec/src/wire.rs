@@ -29,7 +29,8 @@ pub struct SymbolView<'a> {
     pub coded_bytes: usize,
     /// Exactly source_count coefficient bytes.
     pub coefficients: &'a [u8],
-    /// Exactly coded_bytes payload bytes.
+    /// Exactly coded_bytes payload bytes for the regular symbol API. The explicit
+    /// compact-extent API permits a systematic's exact length-prefixed source.
     pub payload: &'a [u8],
 }
 
@@ -176,12 +177,42 @@ fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
         .map_err(|_| Error::Malformed)
 }
 
-impl SymbolView<'_> {
+impl<'a> SymbolView<'a> {
+    /// Borrow the exact original systematic bytes through the same canonical
+    /// length/tail validator used by decoding. Repair equations have no source.
+    pub fn original_source(self) -> Result<&'a [u8], Error> {
+        if self.kind != SymbolKind::Systematic {
+            return Err(Error::Malformed);
+        }
+        let length = crate::original_length(self.payload)?;
+        let end = length.checked_add(2).ok_or(Error::Arithmetic)?;
+        self.payload.get(2..end).ok_or(Error::InvalidSource)
+    }
+
     /// Validate typed input independently of its enclosing authenticated wire context.
     pub fn validate(self, config: BlockConfig) -> Result<(), Error> {
+        self.validate_extent(config, false)
+    }
+
+    /// Validate an explicitly selected exact-systematic wire extent. Systematic
+    /// bytes end at their original-length prefix; only their absent algebraic
+    /// tail is zero. Repairs still carry every byte of the declared coded width.
+    /// This never accepts truncated source content or a padded systematic alias.
+    pub fn validate_compact_extent(self, config: BlockConfig) -> Result<(), Error> {
+        self.validate_extent(config, true)
+    }
+
+    fn validate_extent(self, config: BlockConfig, compact: bool) -> Result<(), Error> {
         config.validate()?;
         config.dimensions(self.source_count, self.coded_bytes)?;
-        if self.coefficients.len() != self.source_count || self.payload.len() != self.coded_bytes {
+        let exact_systematic = compact && self.kind == SymbolKind::Systematic;
+        if self.coefficients.len() != self.source_count
+            || if exact_systematic {
+                self.payload.len() > self.coded_bytes
+            } else {
+                self.payload.len() != self.coded_bytes
+            }
+        {
             return Err(Error::Malformed);
         }
         if self
@@ -200,7 +231,12 @@ impl SymbolView<'_> {
                 {
                     return Err(Error::InvalidCoefficients);
                 }
-                crate::original_length(self.payload)?;
+                let length = crate::original_length(self.payload)?;
+                if exact_systematic
+                    && length.checked_add(2).ok_or(Error::Arithmetic)? != self.payload.len()
+                {
+                    return Err(Error::InvalidSource);
+                }
             }
             SymbolKind::Repair if u64::from(self.symbol.0) < self.source_count as u64 => {
                 return Err(Error::Malformed);

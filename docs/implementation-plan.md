@@ -30,6 +30,13 @@ and the selected carrier remain additional. Raw IPv4/TCP adds 40 bytes, giving
 its bootstrap geometry is separate. Genuine TLS and QUIC retain their mandatory
 outer protection and transport behavior.
 
+Selected Block FEC systematic records also transmit only their exact original
+length-prefixed source extent. Existing reserved decoder rows restore the omitted
+algebraic zero tail; repair equations retain their complete actual generation
+width. Common configuration/catalog domains are v5 with unchanged policy bytes.
+The [batch18 local evidence](modules/buffer-observability.md#coordinated-local-buffer-batch18-validation)
+passes; native qualification and full acceptance gates remain open.
+
 Rolling, Research and sliding repairs serialize the maximum encoded source
 extent in their complete support. The receiver restores omitted zero columns in
 bounded symbol storage; meaningful trailing zeros and the encoded source length

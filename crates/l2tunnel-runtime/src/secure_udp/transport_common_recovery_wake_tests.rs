@@ -2,6 +2,22 @@
 use super::*;
 use l2tunnel::record_engine as engine;
 
+fn longer_native_frame() -> Vec<u8> {
+    let mut packet = frame(40_101, 92);
+    packet.resize(100, 0);
+    packet[16..18].copy_from_slice(&86_u16.to_be_bytes());
+    packet[38..40].copy_from_slice(&66_u16.to_be_bytes());
+    packet[24..26].fill(0);
+    let mut sum = packet[14..34].chunks_exact(2).fold(0u32, |sum, pair| {
+        sum + u32::from(u16::from_be_bytes([pair[0], pair[1]]))
+    });
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    packet[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    packet
+}
+
 #[test]
 fn held_aligned_ciphertext_survives_unrelated_receive_fec_eviction() -> Result {
     tokio::runtime::Builder::new_current_thread()
@@ -22,8 +38,9 @@ fn held_aligned_ciphertext_survives_unrelated_receive_fec_eviction() -> Result {
             // Two real source records make a repair insufficient to decode.
             // Discard every source; authenticate only the actual repair at A.
             fixture.admit(1, &frame(40_100, 91)).await?;
-            fixture.admit(1, &frame(40_101, 92)).await?;
+            fixture.admit(1, &longer_native_frame()).await?;
             let mut repair = None;
+            let mut systematic_bytes = Vec::new();
             for _ in 0..32 {
                 fixture.now += 1000;
                 let driver = &mut fixture.endpoints[1].driver;
@@ -38,12 +55,23 @@ fn held_aligned_ciphertext_survives_unrelated_receive_fec_eviction() -> Result {
                 let Some(pending) = pending else {
                     continue;
                 };
-                let kind = pending
+                let emission = pending
                     .carrier
                     .as_ref()
                     .ok_or("actual Aligned carrier witness missing")?
-                    .emission()
-                    .kind;
+                    .emission();
+                let kind = emission.kind;
+                let extent = driver
+                    .common_state()?
+                    .engine(core::Epoch(pending.scope.epoch.0))?
+                    .inspect_output_extent(&driver.buffers.frame[..emission.bytes], kind, false)?;
+                let recovery = extent.recovery.ok_or("actual recovery extent missing")?;
+                assert_eq!(recovery.systematic_coded_fill_bytes, 0);
+                assert_eq!(pending.cost, pending.sealed.bytes + 28);
+                assert_eq!(emission.wire_bytes, pending.cost);
+                if recovery.kind == l2tunnel_reliable::RecordKind::Systematic {
+                    systematic_bytes.push(recovery.bytes);
+                }
                 let mut packet = Vec::new();
                 assert!(driver.flush_common_wire_with(fixture.now, |bytes| {
                     packet.extend_from_slice(bytes);
@@ -54,6 +82,11 @@ fn held_aligned_ciphertext_survives_unrelated_receive_fec_eviction() -> Result {
                     break;
                 }
             }
+            assert_eq!(systematic_bytes.len(), 2);
+            assert_ne!(
+                systematic_bytes[0], systematic_bytes[1],
+                "actual protected systematic records retain their unequal source extents"
+            );
             let repair = repair.ok_or("two-source repair was not emitted")?;
             let driver = &mut fixture.endpoints[0].driver;
             driver.receive_selected(&repair, fixture.now, driver.origin + duration(fixture.now))?;

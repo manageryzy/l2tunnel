@@ -164,8 +164,18 @@ fn selected_compact_wire_elides_identity_envelope_and_restores_lost_fec_source()
     }
     let packets = emissions(&mut left, 0)?;
     assert_eq!(packets.len(), 5);
+    let mut short_systematic = false;
     for packet in &packets[..3] {
         let record = left.recovery.inspect_output_record(packet)?;
+        let symbol = record.fec.ok_or("actual systematic coding vector")?;
+        assert_eq!(symbol.payload.len(), symbol.original_source()?.len() + 2);
+        short_systematic |= symbol.payload.len() < symbol.coded_bytes;
+        assert_eq!(
+            left.inspect_output_extent(packet)?
+                .recovery
+                .systematic_coded_fill_bytes,
+            0
+        );
         let (source, payload) = record.source.ok_or("systematic source")?;
         assert!(
             payload.len() < 129,
@@ -194,6 +204,10 @@ fn selected_compact_wire_elides_identity_envelope_and_restores_lost_fec_source()
         }; 1];
         assert_eq!(left.outgoing_units(packet, &mut witnesses)?, 1);
     }
+    assert!(
+        short_systematic,
+        "unequal actual units elide only algebraic tails"
+    );
     for index in [2, 1, 3] {
         right.receive_authenticated(&packets[index], ms(1))?;
     }

@@ -342,6 +342,21 @@ impl Decoder {
         self.accept_validated_view(view, now_ticks, &mut refused)
     }
 
+    /// Accept the explicitly selected compact systematic extent. The existing
+    /// reserved transaction rows restore only the validated algebraic zero tail;
+    /// repair rows remain full width. All rejection and deadline ordering is the
+    /// same as the regular typed API, which still requires full-width symbols.
+    pub fn accept_compact_view_observed(
+        &mut self,
+        view: crate::SymbolView<'_>,
+        now_ticks: u64,
+        mut refused: impl FnMut(DecoderCapacity),
+    ) -> Result<AcceptStatus, Error> {
+        self.check_time(now_ticks)?;
+        view.validate_compact_extent(self.config.block)?;
+        self.accept_validated_view(view, now_ticks, &mut refused)
+    }
+
     fn accept_validated_view(
         &mut self,
         view: crate::SymbolView<'_>,
@@ -358,7 +373,14 @@ impl Decoder {
                 return Err(Error::Conflict);
             }
             if let Some(previous) = generation.received.get(&view.symbol) {
-                if previous.coefficients != view.coefficients || previous.payload != view.payload {
+                if previous.coefficients != view.coefficients
+                    || previous.payload.len() != view.coded_bytes
+                    || previous.payload.get(..view.payload.len()) != Some(view.payload)
+                    || previous
+                        .payload
+                        .get(view.payload.len()..)
+                        .is_none_or(|tail| tail.iter().any(|byte| *byte != 0))
+                {
                     return Err(Error::Conflict);
                 }
                 let progress = generation.progress(view.generation);

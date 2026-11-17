@@ -610,6 +610,12 @@ def normalize(value, source, digest):
         from buffer_metrics_pipeline import validate as validate_pipeline
     pipeline = validate_pipeline(value.get('pipeline_admission'))
     issues.extend(pipeline['issues'])
+    try:
+        from .buffer_metrics_execution import validate as validate_execution
+    except ImportError:
+        from buffer_metrics_execution import validate as validate_execution
+    execution = validate_execution(value.get('common_execution'), value.get('owner'))
+    issues.extend(execution['issues'])
     management = management_provider(value.get('management_streams'), finished)
     issues.extend(management['issues'])
     ratio = None
@@ -628,6 +634,7 @@ def normalize(value, source, digest):
         'protocol_provider_validation': protocol,
         'pipeline_provider_validation': pipeline,
         'management_provider_validation': management,
+        'execution_provider_validation': execution,
         'provider_metadata': {key: item for key, item in value.items() if key not in CORE_FIELDS},
         'provider_metadata_definition': 'Preserved source fields; no queue usage derived from provider space or limits.',
     }
@@ -702,6 +709,14 @@ def markdown(report):
                 union['open_us'] if union['open_us'] is not None else 'none open',
                 f'{percentage:.6f}%' if percentage is not None else
                 'unavailable: ' + owner['percentage_unavailable_reason']]])
+        execution = owner['execution_provider_validation']
+        lines.extend(['', 'Execution provider: ' + cell(execution['status']) + '. ' +
+                      execution['definition']])
+        if execution['status'] == 'validated_wall_spans':
+            lines.append('Boundary: ' + cell(execution['boundary']) + '.')
+            table(lines, ['Stage', 'Samples', 'Wall sum us', 'Wall maximum us', 'Failed', 'Censored'],
+                  [[row['stage'], row['samples'], row['sum_us'], row['max_us'], row['failed'], row['censored']]
+                   for row in execution['stages'] if row['samples']])
         protocol = owner['protocol_provider_validation']
         lines.extend(['', 'Protocol provider: ' + cell(protocol['status']) + '. ' +
                       protocol['definition']])

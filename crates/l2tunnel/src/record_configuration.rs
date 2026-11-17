@@ -35,11 +35,11 @@ pub const DESCRIPTOR_BYTES: usize = HEADER_BYTES + 2 * DIRECTION_BYTES;
 pub const CONFIGURATION_BYTES: usize = DESCRIPTOR_BYTES + 32;
 /// Exact supported set bound, independent of runtime message/resource capacity.
 pub const MAX_CATALOG_ENTRIES: usize = 64;
-// Revision four commits exact Aligned source extents in addition to effective
-// repair extents. CompleteV2 policy fields remain unchanged; padded-source peers
-// must not authenticate or switch into this catalog under the previous domain.
-const CONFIG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-config/v4\0";
-const CATALOG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-catalog/v4\0";
+// Revision five additionally commits exact Block FEC systematic extents. The
+// CompleteV2 policy fields and repair algebra remain unchanged; padded-systematic
+// peers must not authenticate or switch into this catalog under the prior domain.
+const CONFIG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-config/v5\0";
+const CATALOG_DOMAIN: &[u8] = b"l2tunnel/record-transaction-catalog/v5\0";
 const SWIFT_BYTES: usize = 120;
 const ALIGNED_BYTES: usize = 332;
 

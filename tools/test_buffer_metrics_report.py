@@ -520,5 +520,80 @@ class ManagementProviderTests(unittest.TestCase):
         self.assertTrue(owner['management_provider_validation']['issues'])
 
 
+class ExecutionProviderTests(unittest.TestCase):
+    def observation(self, cancelled=False):
+        from tools.buffer_metrics_execution import STAGES
+        stages = [{'stage': name, 'samples': 0, 'sum_us': 0, 'max_us': 0,
+                   'failed': 0, 'censored': 0, 'maximum_start_us': None,
+                   'maximum_end_us': None} for name in STAGES]
+        stages[0].update(samples=2, sum_us=40, max_us=30,
+                         maximum_start_us=50, maximum_end_us=81)
+        stages[1].update(samples=1, sum_us=25, max_us=25, censored=1,
+                         maximum_start_us=75, maximum_end_us=100)
+        return {'availability': 'observed',
+                'boundary': 'driver_future_drop' if cancelled else 'loop_stop_before_settlement',
+                'timing': {'schema': 1, 'event': 'execution_timing', 'owner': 'CommonExecution',
+                           'checkpoint': 'driver_future_drop' if cancelled else 'loop_stop',
+                           'elapsed_us': 100, 'invalid': False, 'id': 1, 'pid': 3,
+                           'inline_bytes': 24, 'diagnostic_heap_bytes': 2048,
+                           'stages': stages}}
+
+    def normalized(self, observation):
+        value = fixture()
+        value['common_execution'] = observation
+        return report.normalize(value, 'execution.bmetrics', 'digest')
+
+    def test_actual_boundaries_censor_and_rounding_never_change_blocked_union(self):
+        original = report.normalize(fixture(), 'base.bmetrics', 'digest')
+        for cancelled in (False, True):
+            owner = self.normalized(self.observation(cancelled))
+            self.assertFalse(owner['issues'])
+            self.assertEqual(owner['execution_provider_validation']['status'], 'validated_wall_spans')
+            self.assertEqual(owner['blocked_union'], original['blocked_union'])
+            self.assertEqual(owner['owner_union_percent_of_observed_span'], original['owner_union_percent_of_observed_span'])
+
+    def test_unavailable_is_not_zero_or_successful_wall_observation(self):
+        owner = self.normalized({'availability': 'unavailable', 'reason': 'loop_stop_not_observed'})
+        self.assertFalse(owner['issues'])
+        self.assertEqual(owner['execution_provider_validation']['status'], 'unavailable')
+        self.assertEqual(owner['execution_provider_validation']['stages'], [])
+        owner = self.normalized({'availability': 'unavailable', 'reason': 'loop_stop_not_observed',
+                                 'timing': self.observation()['timing']})
+        self.assertTrue(owner['issues'])
+
+    def test_invalid_shapes_and_impossible_maxima_disable_inferred_percentage(self):
+        for mutation in ('owner', 'boundary', 'checkpoint', 'duplicate', 'unknown', 'oversized',
+                         'schema_bool', 'invalid', 'negative', 'outcome', 'sum', 'end',
+                         'missing_endpoint', 'duration', 'no_samples', 'sum_ceiling', 'zero_maximum'):
+            with self.subTest(mutation=mutation):
+                value = self.observation(); timing = value['timing']; stage = timing['stages'][0]
+                if mutation == 'owner': timing['owner'] = 'CliWriter'
+                elif mutation == 'boundary': value['boundary'] = 'invented'
+                elif mutation == 'checkpoint': timing['checkpoint'] = 'driver_future_drop'
+                elif mutation == 'duplicate': timing['stages'][1] = dict(stage)
+                elif mutation == 'unknown': stage['stage'] = 'Unknown'
+                elif mutation == 'oversized': timing['stages'].append(dict(stage))
+                elif mutation == 'schema_bool': timing['schema'] = True
+                elif mutation == 'invalid': timing['invalid'] = True
+                elif mutation == 'negative': stage['samples'] = -1
+                elif mutation == 'outcome': stage['failed'] = 3
+                elif mutation == 'sum': stage['sum_us'] = 29
+                elif mutation == 'end': stage['maximum_end_us'] = 101
+                elif mutation == 'missing_endpoint': del stage['maximum_end_us']
+                elif mutation == 'duration': stage['maximum_start_us'] = 49
+                elif mutation == 'sum_ceiling': stage['sum_us'] = 61
+                elif mutation == 'zero_maximum':
+                    stage.update(samples=1, sum_us=0, max_us=0, maximum_start_us=None, maximum_end_us=None)
+                else: stage['samples'] = 0
+                owner = self.normalized(value)
+                self.assertTrue(owner['issues'])
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+
+    def test_common_extension_on_different_owner_is_invalid(self):
+        value = fixture(); value['owner'] = 'maintained_quic'
+        value['common_execution'] = self.observation()
+        self.assertTrue(report.normalize(value, 'wrong-owner.bmetrics', 'digest')['issues'])
+
+
 if __name__ == '__main__':
     unittest.main()

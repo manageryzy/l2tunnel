@@ -180,17 +180,18 @@ impl Receiver {
         let native = a.bytes(l.body.max_frame_bytes)?;
         let mut free_records = a.vec(3 * r)?;
         for _ in 0..3 * r {
-            let mut bytes = a.bytes(65_535)?;
-            bytes.clear();
-            let mut pieces = a.bytes(l.max_fragments_per_record)?;
-            pieces.clear();
-            free_records.push(RecordBuffer { bytes, pieces });
+            // Pool capacity is prepaid, but no payload is live yet. Acquisition
+            // initializes the exact record/piece extent before any read.
+            free_records.push(RecordBuffer {
+                bytes: a.vec(65_535)?,
+                pieces: a.vec(l.max_fragments_per_record)?,
+            });
         }
         let mut free_proofs = a.vec(3 * s)?;
         for _ in 0..3 * s {
-            let mut bytes = a.bytes(l.body.symbol_bytes)?;
-            bytes.clear();
-            free_proofs.push(bytes);
+            // proof_buffer and transaction copies initialize the whole live
+            // extent with extend_from_slice; unused capacity is never read.
+            free_proofs.push(a.vec(l.body.symbol_bytes)?);
         }
         let journals = [Journal::new(r, s, c, a)?, Journal::new(r, s, c, a)?];
         Ok(Self {
