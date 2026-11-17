@@ -653,7 +653,7 @@ impl Driver {
                     .entry(epoch)?
                     .admit_borrowed_diagnosed(engine::Tick(now), |refusal| {
                         if let Some(runtime) = self.common.as_deref_mut() {
-                            buffer_metrics::admission_refused(runtime, now, refusal);
+                            buffer_metrics::admission_refused(runtime, now, scope, refusal);
                         }
                     })
                     .map_err(protocol)?
@@ -661,6 +661,7 @@ impl Driver {
                     break;
                 };
                 if let Some(runtime) = self.common.as_deref_mut() {
+                    buffer_metrics::admission_succeeded(runtime, now, scope, admitted.metadata);
                     let proxy = runtime.contract.proxy_binding().is_some();
                     if let Some(metrics) = runtime.wire_metrics.as_mut() {
                         metrics.admitted_native(admitted.permit.encoding, proxy);

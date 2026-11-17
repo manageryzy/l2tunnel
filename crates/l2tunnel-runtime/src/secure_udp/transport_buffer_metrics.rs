@@ -145,6 +145,9 @@ impl Driver {
                 protocol.sample_engine(identity, now, engine);
             }
         }
+        if let Some(pipeline) = metrics.pipeline_admission() {
+            pipeline.reconcile(now, identities);
+        }
         true
     }
 
@@ -258,6 +261,9 @@ impl Driver {
                 // terminal source observation succeeded. Never extend it.
                 metrics.source_terminal_unavailable();
             }
+            if let Some(pipeline) = metrics.pipeline_admission() {
+                pipeline.finish(now, protocol_sampled);
+            }
             metrics.finish_at(now);
         }
     }
@@ -266,6 +272,7 @@ impl Driver {
 pub(super) fn admission_refused(
     runtime: &mut common::Runtime,
     now: u64,
+    scope: Scope,
     refusal: l2tunnel::record_engine::AdmissionRefusal,
 ) {
     use l2tunnel::record_engine::AdmissionBlock;
@@ -278,6 +285,16 @@ pub(super) fn admission_refused(
         AdmissionBlock::ConnectionRetirement => Reason::Dependency,
     };
     if let Some(metrics) = runtime.buffer_metrics.as_mut() {
+        if let Some(pipeline) = metrics.pipeline_admission() {
+            pipeline.refused(
+                crate::buffer_metrics::protocol_buffers::Identity {
+                    epoch: scope.epoch.0,
+                    configuration: scope.configuration.0,
+                },
+                now,
+                refusal,
+            );
+        }
         // This counter aggregates actual channel refusals. Timing it would merge
         // independent owners and falsely clear one channel when another advances.
         let _ = metrics.collector().refused(
@@ -288,6 +305,28 @@ pub(super) fn admission_refused(
             },
             reason,
             now,
+        );
+    }
+}
+
+pub(super) fn admission_succeeded(
+    runtime: &mut common::Runtime,
+    now: u64,
+    scope: Scope,
+    metadata: l2tunnel::pipeline::PacketMetadata,
+) {
+    if let Some(pipeline) = runtime
+        .buffer_metrics
+        .as_mut()
+        .and_then(|metrics| metrics.pipeline_admission())
+    {
+        pipeline.admitted(
+            crate::buffer_metrics::protocol_buffers::Identity {
+                epoch: scope.epoch.0,
+                configuration: scope.configuration.0,
+            },
+            now,
+            metadata,
         );
     }
 }

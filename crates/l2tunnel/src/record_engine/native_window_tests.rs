@@ -93,7 +93,7 @@ fn actual_compact_native_window_waits_for_device_receipt_not_recovery_ack() -> R
             let first = packet(false, 1001, 300, 5);
             let second = packet(false, 1002, 100, 7);
             a.enqueue_borrowed(Tick(0), &first)?;
-            a.enqueue_borrowed(Tick(0), &second)?;
+            let second_metadata = a.enqueue_borrowed(Tick(0), &second)?;
             assert!(a.admit_borrowed(Tick(0))?.is_some());
             let mut refusal = None;
             assert!(
@@ -106,6 +106,9 @@ fn actual_compact_native_window_waits_for_device_receipt_not_recovery_ack() -> R
                 super::super::AdmissionBlock::NativeDeliveryWindow
             );
             assert_eq!(refusal.bytes, second.len());
+            assert_eq!(refusal.flow, second_metadata.binding.id);
+            assert_eq!(refusal.channel, second_metadata.binding.channel);
+            assert_eq!(refusal.timing, second_metadata.timing);
             let mut forward = Link::new(&c, role)?;
             let mut reverse = Link::new(&c, peer)?;
             let mut clock = 1;

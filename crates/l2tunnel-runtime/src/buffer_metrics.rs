@@ -15,6 +15,7 @@
 use std::collections::TryReserveError;
 
 mod observer;
+mod pipeline_admission;
 pub(crate) mod protocol_buffers;
 mod udp_socket;
 pub(crate) use observer::{Observer, SourceBoundary};

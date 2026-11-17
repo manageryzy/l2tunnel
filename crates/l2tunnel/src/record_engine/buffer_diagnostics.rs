@@ -19,6 +19,10 @@ pub enum AdmissionBlock {
 /// One actual refusal, not a prediction derived from a nonempty snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionRefusal {
+    /// Nonreusable local Pipeline flow identity; scoped by the issuing Engine.
+    pub flow: pipeline::FlowId,
+    /// Original retained FIFO-head times, not a globally unique packet identity.
+    pub timing: pipeline::PacketTiming,
     /// Actual Pipeline-selected channel or connection-owner index.
     pub channel: u16,
     /// Unchanged original packet length retained by Pipeline.

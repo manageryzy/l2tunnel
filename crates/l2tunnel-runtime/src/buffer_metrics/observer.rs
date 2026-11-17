@@ -43,6 +43,7 @@ pub(crate) struct Observer {
     // Reserve one slot only when diagnostics are enabled. Keeping this large
     // snapshot inline also enlarges disabled adapters and nested setup futures.
     protocol: Vec<super::protocol_buffers::ProtocolBuffers>,
+    pipeline_admission: Vec<super::pipeline_admission::PipelineAdmission>,
     management: Vec<crate::secure_udp::control::buffers::Report>,
     udp_socket: Vec<super::udp_socket::Snapshot>,
     udp_socket_allocation_failed: bool,
@@ -104,6 +105,7 @@ impl Observer {
             finished: None,
             source_terminal: None,
             protocol: Vec::new(),
+            pipeline_admission: Vec::new(),
             management: Vec::new(),
             udp_socket: Vec::new(),
             udp_socket_allocation_failed: false,
@@ -155,6 +157,7 @@ impl Observer {
             finished: None,
             source_terminal: None,
             protocol: Vec::new(),
+            pipeline_admission: Vec::new(),
             management: Vec::new(),
             udp_socket: Vec::new(),
             udp_socket_allocation_failed: false,
@@ -195,6 +198,28 @@ impl Observer {
             None
         } else {
             self.management.first_mut()
+        }
+    }
+    pub(crate) fn configure_pipeline_admission(&mut self, maximum_flows: usize) -> io::Result<()> {
+        if !self.pipeline_admission.is_empty() || self.is_finished() {
+            return Err(io::Error::other(
+                "pipeline admission observer already configured",
+            ));
+        }
+        let state = super::pipeline_admission::PipelineAdmission::new(maximum_flows)?;
+        self.pipeline_admission
+            .try_reserve_exact(1)
+            .map_err(io::Error::other)?;
+        self.pipeline_admission.push(state);
+        Ok(())
+    }
+    pub(crate) fn pipeline_admission(
+        &mut self,
+    ) -> Option<&mut super::pipeline_admission::PipelineAdmission> {
+        if self.is_finished() {
+            None
+        } else {
+            self.pipeline_admission.first_mut()
         }
     }
     pub(crate) fn configure_protocol_buffers(
@@ -292,6 +317,15 @@ impl Observer {
             )
             .saturating_add(self.path.capacity())
             .saturating_add(
+                self.pipeline_admission.capacity()
+                    * std::mem::size_of::<super::pipeline_admission::PipelineAdmission>(),
+            )
+            .saturating_add(
+                self.pipeline_admission
+                    .first()
+                    .map_or(0, super::pipeline_admission::PipelineAdmission::heap_bytes),
+            )
+            .saturating_add(
                 self.management.capacity()
                     * std::mem::size_of::<crate::secure_udp::control::buffers::Report>(),
             )
@@ -342,6 +376,11 @@ impl Observer {
     }
     pub(crate) fn finish_at(&mut self, now: u64) {
         if self.finished.is_none() && self.collector.finish(now).is_ok() {
+            // Without an explicit fresh source stop, do not extrapolate a last
+            // FIFO-head observation through an observer-only Drop.
+            if let Some(state) = self.pipeline_admission.first_mut() {
+                state.finish(now, false);
+            }
             self.finished = Some(now);
         }
     }
@@ -481,6 +520,12 @@ impl Observer {
         } else {
             write!(writer, "null")?;
         }
+        write!(writer, ",\"pipeline_admission\":")?;
+        if let Some(snapshot) = self.pipeline_admission.first() {
+            snapshot.write(writer)?;
+        } else {
+            write!(writer, "null")?;
+        }
         write!(writer, ",\"management_streams\":")?;
         if let Some(snapshot) = self.management.first() {
             snapshot.write(writer)?;
@@ -515,7 +560,9 @@ impl Observer {
 impl Drop for Observer {
     fn drop(&mut self) {
         if self.source_terminal.is_none()
-            && (!self.protocol.is_empty() || !self.management.is_empty())
+            && (!self.protocol.is_empty()
+                || !self.management.is_empty()
+                || !self.pipeline_admission.is_empty())
         {
             // An observer alone cannot prove that a prior source snapshot is
             // still current. Preserve it unchanged and report the missing owner.

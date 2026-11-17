@@ -356,7 +356,7 @@ pub struct Engine {
     next_channel: u16,
     limits: NativeLimits,
     pending: Option<PreparedNative>,
-    reliable_pending: Option<(Emission, l2tunnel_reliable::PreparedOutput)>,
+    inline_pending: Option<(Emission, carrier::InlinePrepared)>,
     fragments: Option<fragment::State>,
     statistics: Statistics,
     last: Option<Tick>,
@@ -444,7 +444,7 @@ impl Engine {
             next_channel: 0,
             limits,
             pending: None,
-            reliable_pending: None,
+            inline_pending: None,
             fragments: None,
             statistics: Statistics::default(),
             last: None,
@@ -697,20 +697,52 @@ impl Engine {
         ) {
             Ok(Some(emission)) => {
                 let pending = match &self.owner {
-                    Owner::Aligned(endpoint) => Some(endpoint.pending_output()),
-                    Owner::Packed(endpoint) => Some(endpoint.pending_output()),
+                    Owner::Swift(owner) => Some(
+                        owner
+                            .engine()
+                            .pending_output()
+                            .map(carrier::InlinePrepared::Swift),
+                    ),
+                    Owner::Aligned(endpoint) => Some(
+                        endpoint
+                            .pending_output()
+                            .map(carrier::InlinePrepared::Reliable),
+                    ),
+                    Owner::Packed(endpoint) => Some(
+                        endpoint
+                            .pending_output()
+                            .map(carrier::InlinePrepared::Reliable),
+                    ),
                     _ => None,
                 };
                 if let Some(pending) = pending {
                     let Some(prepared) = pending else {
                         return self.fail(Error::Invariant);
                     };
-                    if prepared.bytes != emission.bytes
-                        || prepared.wire_bytes != emission.wire_bytes
-                    {
+                    let matches = match prepared {
+                        carrier::InlinePrepared::Swift(p) => {
+                            p.bytes() == emission.bytes
+                                && p.number().0 == emission.security_number
+                                && match p.kind() {
+                                    swift::records::EmissionKind::Source => {
+                                        emission.kind == EmissionKind::Source(SourceForm::Swift)
+                                    }
+                                    swift::records::EmissionKind::Repair => {
+                                        emission.kind == EmissionKind::Repair
+                                    }
+                                    swift::records::EmissionKind::Feedback => {
+                                        emission.kind == EmissionKind::Feedback
+                                    }
+                                }
+                        }
+                        carrier::InlinePrepared::Reliable(p) => {
+                            p.bytes == emission.bytes && p.wire_bytes == emission.wire_bytes
+                        }
+                    };
+                    if !matches {
                         return self.fail(Error::Invariant);
                     }
-                    self.reliable_pending = Some((emission, prepared));
+                    self.inline_pending = Some((emission, prepared));
                 }
                 if let Some(window) = &mut self.native_window {
                     window.capture(

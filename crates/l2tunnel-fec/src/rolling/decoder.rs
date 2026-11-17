@@ -62,6 +62,7 @@ impl Input {
     }
 }
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
 enum Phase {
     CopyRow {
         row: usize,
@@ -241,6 +242,19 @@ pub struct Decoder {
     expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::DecoderState>,
 }
+// step() already charged the first metadata visit. Each copied/cleared byte
+// still consumes one copy and one metadata unit; batching removes dispatch only.
+// The end-of-phase transition remains a separate, unchanged metadata visit.
+fn copy_chunk(remaining: usize, budget: &WorkBudget) -> Result<usize, Error> {
+    Ok(remaining.min(budget.copies).min(add(budget.metadata, 1)?))
+}
+fn charge_copy_chunk(count: usize, budget: &mut WorkBudget) {
+    // The caller has a nonempty phase and nonzero copy budget. copy_chunk also
+    // bounds count by the remaining metadata plus the visit already charged.
+    budget.copies -= count;
+    budget.metadata -= count - 1;
+}
+
 enum Action {
     Continue,
     Paused,
@@ -870,19 +884,35 @@ impl Decoder {
                 to,
                 index,
             } => {
-                if index == w + width {
+                let stride = add(w, width)?;
+                if index == stride {
                     job.phase = job.resume.take().ok_or(Error::Identity)?;
                 } else {
-                    if !spend(&mut budget.copies) {
+                    if budget.copies == 0 {
                         return Ok(Action::Paused);
                     }
-                    let at = self.row_start(row) + index;
-                    self.data[to][at] = self.data[from][at];
+                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let count = copy_chunk(remaining, budget)?;
+                    let start = add(mul(row, stride)?, index)?;
+                    let end = add(start, count)?;
+                    // Cell::prepare chooses the other version of this same row.
+                    // Borrow the two actual banks separately; no temporary row,
+                    // overlapping copy or committed-bank mutation is permitted.
+                    let [first, second] = &mut self.data;
+                    let (source, destination) = match (from, to) {
+                        (0, 1) => (first, second),
+                        (1, 0) => (second, first),
+                        _ => return Err(Error::Identity),
+                    };
+                    let source = source.get(start..end).ok_or(Error::Identity)?;
+                    let destination = destination.get_mut(start..end).ok_or(Error::Identity)?;
+                    destination.copy_from_slice(source);
+                    charge_copy_chunk(count, budget);
                     job.phase = Phase::CopyRow {
                         row,
                         from,
                         to,
-                        index: index + 1,
+                        index: add(index, count)?,
                     };
                 }
             }
@@ -890,22 +920,38 @@ impl Decoder {
                 if i == self.candidate.len() {
                     job.phase = Phase::Load(0);
                 } else {
-                    if !spend(&mut budget.copies) {
+                    if budget.copies == 0 {
                         return Ok(Action::Paused);
                     }
-                    self.candidate[i] = 0;
-                    job.phase = Phase::Clear(i + 1);
+                    let remaining = self.candidate.len().checked_sub(i).ok_or(Error::Identity)?;
+                    let count = copy_chunk(remaining, budget)?;
+                    let end = add(i, count)?;
+                    self.candidate
+                        .get_mut(i..end)
+                        .ok_or(Error::Identity)?
+                        .fill(0);
+                    charge_copy_chunk(count, budget);
+                    job.phase = Phase::Clear(end);
                 }
             }
             Phase::Load(i) => {
                 if i == width {
                     job.phase = Phase::Support(job.input.start());
                 } else {
-                    if !spend(&mut budget.copies) {
+                    if budget.copies == 0 {
                         return Ok(Action::Paused);
                     }
-                    self.candidate[w + i] = self.input[i];
-                    job.phase = Phase::Load(i + 1);
+                    let remaining = width.checked_sub(i).ok_or(Error::Identity)?;
+                    let count = copy_chunk(remaining, budget)?;
+                    let end = add(i, count)?;
+                    let source = self.input.get(i..end).ok_or(Error::Identity)?;
+                    let destination = self
+                        .candidate
+                        .get_mut(add(w, i)?..add(w, end)?)
+                        .ok_or(Error::Identity)?;
+                    destination.copy_from_slice(source);
+                    charge_copy_chunk(count, budget);
+                    job.phase = Phase::Load(end);
                 }
             }
             Phase::Support(id) => {
@@ -1664,3 +1710,6 @@ mod feedback_tests;
 
 #[cfg(test)]
 mod equation_tests;
+
+#[cfg(test)]
+mod copy_batch_tests;

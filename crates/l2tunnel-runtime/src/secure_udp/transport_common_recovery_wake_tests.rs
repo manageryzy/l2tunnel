@@ -156,7 +156,7 @@ fn held_aligned_ciphertext_survives_unrelated_receive_fec_eviction() -> Result {
 }
 
 #[test]
-fn held_swift_ciphertext_wakes_at_retry_instead_of_expired_sender_opportunity() -> Result {
+fn held_swift_ciphertext_wakes_at_retry_without_arming_sender_attempt() -> Result {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -166,8 +166,8 @@ fn held_swift_ciphertext_wakes_at_retry_instead_of_expired_sender_opportunity() 
             let explicit_timing =
                 |contract: CommonTransactionContract| -> Result<CommonTransactionContract> {
                     let mut resources = contract.resources();
-                    // Explicit fixture geometry places the real Swift tail opportunity
-                    // before the recovery cadence, independently of product defaults.
+                    // Keep the existing explicit recovery cadence, independently of
+                    // product defaults; an unaccepted Swift attempt stays pending.
                     resources.work.receive_interval = Duration::from_millis(100);
                     resources.lifetime.ping_interval = Duration::from_secs(10);
                     Ok(CommonTransactionContract::new_compact_wire(
@@ -212,9 +212,14 @@ fn held_swift_ciphertext_wakes_at_retry_instead_of_expired_sender_opportunity() 
                 .sealed
                 .as_ref()
                 .ok_or("actual sealed Swift output missing")?;
-            assert!(
-                pending.carrier.is_none(),
-                "Swift does not fabricate a Reliable token"
+            assert_eq!(
+                pending
+                    .carrier
+                    .as_ref()
+                    .ok_or("actual Swift witness")?
+                    .emission()
+                    .kind,
+                engine::EmissionKind::Source(engine::SourceForm::Swift)
             );
             let identity = (
                 pending.scope,
@@ -227,28 +232,21 @@ fn held_swift_ciphertext_wakes_at_retry_instead_of_expired_sender_opportunity() 
                 .path
                 .retry_at_micros
                 .ok_or("actual retry cadence missing")?;
-            let soft = driver
-                .common_state()?
-                .engine(epoch)?
-                .deadline()?
-                .ok_or("actual emitted Swift source has no sender opportunity")?
-                .0;
-            let after_soft = soft.checked_add(1).ok_or("fixture clock overflow")?;
-            assert!(soft > fixture.now);
-            assert!(after_soft < retry);
+            let after_prepare = fixture.now.checked_add(1).ok_or("fixture clock overflow")?;
+            assert!(after_prepare < retry);
             assert!(retry < driver.lease && retry < driver.next_ping);
-            driver.progress_common(after_soft)?;
+            driver.progress_common(after_prepare)?;
             // The direct User-send seam bypasses send_sampled's preceding
             // Control poll. Complete the real empty owners' bounded initial
             // rotations rather than excluding their legitimate immediate work.
-            assert!(driver.control.deadline() <= duration(after_soft));
-            assert_eq!(driver.prepare_control(after_soft)?, None);
+            assert!(driver.control.deadline() <= duration(after_prepare));
+            assert_eq!(driver.prepare_control(after_prepare)?, None);
             assert!(driver.control.deadline() > duration(retry));
-            let wake = driver.wake_common(after_soft)?;
+            let wake = driver.wake_common(after_prepare)?;
             assert_eq!(wake, driver.origin + duration(retry));
-            assert!(wake > driver.origin + duration(after_soft));
+            assert!(wake > driver.origin + duration(after_prepare));
             let mut premature_socket_call = false;
-            assert!(!driver.flush_common_wire_with(after_soft, |_| {
+            assert!(!driver.flush_common_wire_with(after_prepare, |_| {
                 premature_socket_call = true;
                 Err(io::ErrorKind::WouldBlock.into())
             })?);

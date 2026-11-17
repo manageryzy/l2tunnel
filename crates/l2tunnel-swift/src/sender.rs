@@ -6,15 +6,31 @@ use super::{
 use std::collections::VecDeque;
 
 /// Kind selected at the actual sender emission branch.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DataKind {
     Source,
     Repair,
 }
 
+/// Exact branch retained until the enclosing record receives carrier custody.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparedData {
+    Source { sequence: u64, first: bool },
+    Repair { tail_interval: Option<u64> },
+}
+impl PreparedData {
+    pub(crate) const fn kind(self) -> DataKind {
+        match self {
+            Self::Source { .. } => DataKind::Source,
+            Self::Repair { .. } => DataKind::Repair,
+        }
+    }
+}
+
 struct Source {
     payload: Vec<u8>,
     first_sent: u64,
+    accepted: bool,
     last_sent: u64,
     retransmitted: bool,
     queued: bool,
@@ -57,6 +73,7 @@ pub struct Sender {
     sampled_end: u64,
     /// Next idle probe time while unconfirmed sources remain.
     probe_at: Option<u64>,
+    last_probe_feedback: Option<u64>,
     probe_interval: u64,
     probe_burst: u32,
     peer_missing: u32,
@@ -137,6 +154,7 @@ impl Sender {
             smoothed_rtt: 0,
             sampled_end: 0,
             probe_at: None,
+            last_probe_feedback: None,
             probe_interval: config.tail_micros,
             probe_burst: 0,
             peer_missing: 0,
@@ -321,6 +339,7 @@ impl Sender {
                 || (!self.queue.is_empty()
                     && now >= self.queue_since.saturating_add(self.config.flush_micros)))
     }
+    /// Synchronous handoff at `now`; asynchronous callers use record preparation.
     /// Write the next datagram body into `output` (cleared first). `seed` must
     /// be unique per datagram and is supplied again to the peer's receiver; the
     /// carrier's packet number serves. Returns `false` when nothing is due.
@@ -338,6 +357,19 @@ impl Sender {
         seed: u64,
         output: &mut Vec<u8>,
     ) -> Result<Option<DataKind>, Error> {
+        let prepared = self.prepare_kind(now, seed, output)?;
+        if let Some(prepared) = prepared {
+            self.confirm_prepared(now, prepared);
+        }
+        Ok(prepared.map(PreparedData::kind))
+    }
+
+    pub(crate) fn prepare_kind(
+        &mut self,
+        now: u64,
+        seed: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<Option<PreparedData>, Error> {
         self.check_storage()?;
         if self.reserved && output.capacity() < self.config.datagram_bytes {
             return Err(Error::Storage);
@@ -358,14 +390,16 @@ impl Sender {
                 .ok_or(Error::Exhausted)?;
             let _ = self.retransmit.pop_front();
             let source = self.source(sequence).ok_or(Error::Storage)?;
-            source.queued = false;
-            source.last_sent = now;
-            source.retransmitted = true;
+            // Keep the requested attempt guarded until actual carrier custody.
+            source.queued = true;
             output.push(KIND_SOURCE);
             output.extend_from_slice(&(sequence as u32).to_be_bytes());
             output.extend_from_slice(&source.payload);
             self.stats.retransmits = retransmits;
-            return Ok(Some(DataKind::Source));
+            return Ok(Some(PreparedData::Source {
+                sequence,
+                first: false,
+            }));
         }
         if self.repairs_due > 0 {
             let repairs = if self.sources.is_empty() {
@@ -376,7 +410,9 @@ impl Sender {
             self.repairs_due -= 1;
             if self.repair(seed, output) {
                 self.stats.repairs = repairs;
-                return Ok(Some(DataKind::Repair));
+                return Ok(Some(PreparedData::Repair {
+                    tail_interval: None,
+                }));
             }
         }
         if self.can_send_source(now) {
@@ -423,18 +459,21 @@ impl Sender {
             output.extend_from_slice(&payload);
             self.sources.push_back(Source {
                 payload,
-                first_sent: now,
-                last_sent: now,
+                first_sent: 0,
+                accepted: false,
+                last_sent: 0,
                 retransmitted: false,
-                queued: false,
+                queued: true,
             });
             self.stats.sources = sources;
             self.stats.packed_bytes = packed_bytes;
             self.repairs_due = repairs_due;
             self.credit = credit % self.config.repair_denominator;
-            self.rearm_probe(now);
             self.probe_burst = 0;
-            return Ok(Some(DataKind::Source));
+            return Ok(Some(PreparedData::Source {
+                sequence,
+                first: true,
+            }));
         }
         if self.sources.is_empty() {
             self.probe_at = None;
@@ -449,6 +488,7 @@ impl Sender {
         } else {
             self.stats.tail_repairs
         };
+        let mut tail_interval = None;
         if self.probe_burst == 0 && self.probe_at.is_some_and(|at| now >= at) {
             // With proportional repairs, enough independent equations for
             // everything the peer still reports missing inside the window.
@@ -459,20 +499,50 @@ impl Sender {
             } else {
                 self.peer_missing.clamp(1, self.config.window as u32)
             };
-            self.probe_interval = self
-                .probe_interval
-                .saturating_mul(2)
-                .clamp(self.rto(), self.config.max_rto_micros);
-            self.probe_at = Some(now.saturating_add(self.probe_interval));
+            tail_interval = Some(
+                self.probe_interval
+                    .saturating_mul(2)
+                    .clamp(self.rto(), self.config.max_rto_micros),
+            );
         }
         if self.probe_burst > 0 {
             self.probe_burst -= 1;
             if self.repair(seed, output) {
                 self.stats.tail_repairs = tail_repairs;
-                return Ok(Some(DataKind::Repair));
+                return Ok(Some(PreparedData::Repair { tail_interval }));
             }
         }
         Ok(None)
+    }
+    /// Consume actual acceptance without resurrecting sources already ACKed by
+    /// an older copy. Newer feedback, including equal-tick observations, wins.
+    pub(crate) fn confirm_prepared(&mut self, accepted: u64, prepared: PreparedData) {
+        let mut first_retained = false;
+        if let PreparedData::Source { sequence, first } = prepared
+            && let Some(source) = self.source(sequence)
+        {
+            if first {
+                source.first_sent = accepted;
+                source.accepted = true;
+                first_retained = true;
+            } else {
+                source.retransmitted = true;
+            }
+            source.last_sent = accepted;
+            source.queued = false;
+        }
+        if self.sources.is_empty() || self.last_probe_feedback.is_some_and(|at| at >= accepted) {
+            return;
+        }
+        if first_retained {
+            self.rearm_probe(accepted);
+        } else if let PreparedData::Repair {
+            tail_interval: Some(interval),
+        } = prepared
+        {
+            self.probe_interval = interval;
+            self.probe_at = Some(accepted.saturating_add(interval));
+        }
     }
     /// One equation over the newest unconfirmed sources, at most one window.
     fn repair(&mut self, seed: u64, output: &mut Vec<u8>) -> bool {
@@ -556,6 +626,7 @@ impl Sender {
             .and_then(|index| self.sources.get(index));
         let sampled = if fresh
             && let Some(source) = sample_source
+            && source.accepted
             && !source.retransmitted
         {
             let sample = now.saturating_sub(source.first_sent).max(1);
@@ -614,6 +685,7 @@ impl Sender {
         if base > self.acked || fresh {
             // The peer is hearing us: no probe is needed until it goes quiet
             // again, and the next one starts from the short interval.
+            self.last_probe_feedback = Some(now);
             self.rearm_probe(now);
         }
         let spare_limit = if self.reserved {

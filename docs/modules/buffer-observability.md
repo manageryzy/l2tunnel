@@ -43,7 +43,7 @@ validation pass. "Implemented" below describes source, not a passing check.
 
 | ID | Owner / retained storage | Current source and remaining coverage |
 |---|---|---|
-| BP-01 | Pipeline/MUX packet/byte/flow/DRR bounds | Actual Engine admission refusal callback implemented; aggregate refusal counts wired. Per-flow occupancy, reason-specific interval and DRR/policy attribution pending. |
+| BP-01 | Pipeline/MUX packet/byte/flow/DRR bounds | Actual Engine admission refusal callback and aggregate counts are wired. Exact selected FIFO-head refusal-to-admission intervals, keyed by epoch/configuration/FlowId/channel, pass coordinated local validation with bounded omission and first-observed cause segments. Native qualification, per-flow occupancy, ingress capacity, flow-table and DRR/policy attribution remain pending. |
 | BP-02 | ACK ingress candidates/slab | Common held-input capacity wait implemented; internal deliberate coalescing hold and per-flow replacement age export pending. |
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
@@ -897,6 +897,113 @@ lease, workload/EOF/tail, capture bounds and validation remain unchanged.
 All 30 affected harness/report tests pass in the
 [Python-only continuation](../../work/aligned-extents-20261117/matrix-live-cleanup-check16-attempt1/validation.json).
 Rust/protocol sources are byte-identical to the passing batch15 continuation,
-so those checks and its release binary are reused. Native confirmation of the
-new live-cleanup ordering is pending. Long live workloads may still reach their
-original absolute cap; this change does not remove that outcome.
+so those checks and its release binary are reused. Native15 below exercises the
+new live-cleanup ordering. Long live workloads may still reach their original
+absolute cap; this change does not remove that outcome.
+
+### Native15 dependencies and failure attribution
+
+The [source-bound six-case analysis](../../work/aligned-extents-20261117/native15-analysis1/report.md)
+uses runtime commit `79d7bc8`, harness commit `bbb0db7` and release SHA256
+`84ce4638e4e8e0d92bd0d2baa7776f672d096f239ba433acca09098aa2689476`.
+The original 100/10 Mbit/s, 70 ms RTT, independent 15% loss per direction,
+16-flow and ten-second receiver sample definitions remain unchanged. All owned
+namespaces are removed. Results are finite Linux integration evidence:
+
+| Selected case | Qualified data result | Remaining failure |
+|---|---|---|
+| Aligned Compact UDP simultaneous | 9.0517376 / 7.0928832 Mbit/s | None in this selected case; capture qualification and requested disconnect pass |
+| Aligned Compact raw all directions | Forward 16.6485248 Mbit/s | Reverse ARQ source 77598 retry exhaustion; simultaneous not run; shutdown fails |
+| Rolling UDP forward | Unqualified | Receiver DecoderJob expiry, then client EncoderDebt expiry |
+| Rolling raw forward | Not run | Bootstrap handoff Proof failure |
+| Swift ARQ real TLS reverse | Unqualified | Original stage/case bound exhausted; requested shutdown passes |
+| Swift ARQ real QUIC forward | 0.2826496 Mbit/s | Server peer-close failure makes the overall case fail |
+
+All sixteen buffer exports parse without validation issues. QUIC bulk Common
+receipt waiting occupies 49.152431 of 56.211528 observed seconds (87.442%). TLS
+bulk Common receipt waiting occupies 53.640638 of 63.047531 seconds (85.080%);
+the retained-TLS owner union is 53.551252 of 63.831593 seconds (83.895%). Its
+User FlushPending contributes 53.549397 seconds, and management writer ownership
+waiting contributes 46.142097 seconds. These intervals overlap and must not be
+summed; they do not independently prove kernel queue saturation. Swift now
+exports distinct sampled gauges for all sixteen channels per Common endpoint;
+independent per-channel wait duration is still unavailable.
+
+Rolling's receiver first fails DecoderJob at Tick 11426261 against its original
+11426143 deadline, RepairId 425, support 0..784. The client independently fails
+EncoderDebt at Tick 14702337 against deadline 14701894, sources 391..1015.
+Those are different peer clocks, not a shared causal timeline. Source admission
+on the client has 207 completed waits totaling 5.958300 seconds and one terminal
+censored wait of 3.605311 seconds; passive stored symbols are not counted as
+waiting. Decoder service and retained debt need correction without extending
+their original caps. Raw token custody, Swift channel gauges and TLS writer
+dependencies now have actual native exports, but their broader BP rows remain open.
+
+The companion layer table records 21-byte Records protection and exact 28-byte
+UDP or 40-byte raw outer extents. It preserves separate recovery populations
+and same-emission joins instead of adding quantiles. Full original-native
+overhead and real TLS/QUIC physical-layer distributions remain unavailable.
+The mixed-version continuation selects 17 passed, 181 failed, 33 bound-exhausted
+and 9 not-run phases; it is not a complete current-build matrix.
+
+### Selected Pipeline FIFO-head intervals
+
+The optional provider reserves at most 256 diagnostic flow rows before I/O,
+separately charged from protocol capacity. Full epoch/configuration/FlowId/channel
+identity and actual retained-head metadata join a real downstream refusal to the
+same Pipeline FIFO head's successful pop. Repeated refusal retains the original
+start; DRR ineligibility, occupancy and deliberate packing delay do not create
+waits. Consecutive identical packet metadata remains separate through the actual
+pop boundary. Per-flow first-observed cause segments partition that head's total,
+while different flows and generic owner waits must not be summed.
+
+Live rows are never evicted. Diagnostic saturation counts omitted refusals;
+fresh terminal sampling censors unresolved heads, while observer-only fallback
+stops at the last actual event and marks terminal coverage unavailable. This is
+implemented and locally validated below, not complete BP-01 coverage or a native
+throughput result.
+
+### Pending acceptance and bounded decoder dispatch correction
+
+Swift now prepares one immutable output witness and consumes the existing
+Common carrier completion before setting source/retry send times. An ACK for an
+older copy can retire debt while the pending witness remains valid; completing
+it must not recreate that debt. Frozen feedback commits only its prepared
+receive state and preserves later input. Existing synchronous pure helpers
+perform an explicit same-tick prepare/confirm; Common uses deferred confirmation.
+The existing bounded body and pending slot are reused. This implements the
+[SWR-19 correction](swift-record-engine.md#deferred-carrier-acceptance-checkpoint), with local validation below and
+native qualification pending; it neither changes real QUIC congestion control nor
+establishes complete Python parity.
+
+Rolling decoder CopyRow, Clear and Load now process bounded contiguous chunks
+instead of re-entering the state-machine match once per byte. Each chunk retains
+exactly one copy and one metadata charge per byte, including the original
+separate phase transition and pause costs. Checked disjoint bank slices preserve
+transaction storage. GF operations, scheduling, caps, deadlines and all wire
+bytes remain unchanged. Bytewise-reference, rollback, recovery and original-cap
+fixtures pass locally below; native performance evidence is pending.
+
+### Coordinated local buffer batch16 validation
+
+The [required source-stable attempt](../../work/aligned-extents-20261117/required-buffer-checks16-attempt1/validation.json)
+passes formatting, strict workspace Clippy, early Python tooling and 2,173 Rust
+cases including the passing cases in the failed target. All new Swift pure/Bank/
+protected-UDP, Pipeline-owner and Rolling bytewise-equivalence/rollback/expiry
+fixtures pass. One prior Common blocked-output fixture still asserts Swift has
+no carrier witness; that obsolete assertion is the sole failure.
+
+The [source-stable continuation](../../work/aligned-extents-20261117/required-buffer-checks16-continuation1/validation.json)
+changes only that fixture to compare the actual Bank witness while retaining
+byte/nonce/single-debit and independent Control assertions. The affected case,
+formatting/strict Clippy, codec no-default branch, strict rustdoc, CLI checks,
+external Common CLI, remaining tooling and all 1,658 simulator cases pass.
+Unchanged passing workspace tests are reused. This is scoped required coverage,
+not a pristine full-suite invocation, native speedup or closure of full BP gates.
+
+The [native15 raw/QUIC follow-up](../../work/aligned-extents-20261117/native15-raw-quic-analysis1/report.md)
+also confirms every recorded raw custody token completed without mismatch or
+terminal censoring. Raw reverse separately loses 1,258 packets in the server
+WAN capture and remains unqualified. Neither raw endpoint reaches the original
+120-second lease. Peer service pauses and QUIC requested-local-abort ordering
+need further attribution; transport close alone is not bilateral drain.

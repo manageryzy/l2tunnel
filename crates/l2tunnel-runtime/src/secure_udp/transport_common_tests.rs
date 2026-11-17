@@ -634,6 +634,13 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                 let wire_packets = endpoint.driver.counters.wire_packets;
                 let blocked = |_: &[u8]| Err(io::Error::from(io::ErrorKind::WouldBlock));
                 assert!(!endpoint.driver.send_common_user_with(now, blocked)?);
+                let epoch = endpoint.driver.common_state()?.epoch();
+                let carrier = endpoint
+                    .driver
+                    .common_state_mut()?
+                    .entry(epoch)?
+                    .pending_carrier_output()
+                    .ok_or("actual Swift carrier witness missing")?;
                 let runtime = endpoint
                     .driver
                     .common
@@ -643,14 +650,14 @@ fn common_sealed_user_wouldblock_retains_exact_bytes_number_scope_and_single_deb
                     .sealed
                     .as_ref()
                     .ok_or("real Common seal not retained")?;
-                assert!(retained.carrier.is_none());
+                assert_eq!(retained.carrier.as_ref(), Some(&carrier));
                 let pending = common::PendingWire {
                     feedback: false,
                     scope: retained.scope,
                     sealed: retained.sealed,
                     cost: retained.cost,
                     deadline: retained.deadline,
-                    carrier: None,
+                    carrier: Some(carrier),
                     fragment: None,
                     proxy_record: None,
                 };

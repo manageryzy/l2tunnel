@@ -775,6 +775,22 @@ impl Driver {
                 .max()
                 .unwrap_or(1);
             metrics.configure_protocol_buffers(maximum_owners, role)?;
+            let maximum_flows = contract
+                .catalog()
+                .descriptors()
+                .iter()
+                .map(|descriptor| {
+                    descriptor
+                        .local(role)
+                        .send()
+                        .common()
+                        .pipeline()
+                        .flows
+                        .capacity
+                })
+                .max()
+                .unwrap_or(1);
+            metrics.configure_pipeline_admission(maximum_flows)?;
             if contract.catalog().descriptors().iter().any(|descriptor| {
                 matches!(
                     descriptor.profile(),

@@ -188,6 +188,7 @@ pub struct Receiver {
     /// Ordered recovered bytes not yet cut into native packets.
     stream: VecDeque<u8>,
     dirty: bool,
+    prepared_feedback: Option<PreparedFeedback>,
     /// Highest sequence known when feedback was last produced.
     reported_end: u64,
     /// Unprompted repeats of the latest feedback still owed, so one lost
@@ -196,6 +197,13 @@ pub struct Receiver {
     last_feedback: u64,
     spare: Vec<Vec<u8>>,
     stats: ReceiverStats,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedFeedback {
+    end: u64,
+    dirty: bool,
+    changed: bool,
 }
 
 impl Receiver {
@@ -215,6 +223,7 @@ impl Receiver {
             reserved: false,
             stream: VecDeque::new(),
             dirty: false,
+            prepared_feedback: None,
             reported_end: 0,
             repeats: 0,
             last_feedback: 0,
@@ -279,6 +288,7 @@ impl Receiver {
             reserved: true,
             stream: allocation.deque(shape.stream)?,
             dirty: false,
+            prepared_feedback: None,
             reported_end: 0,
             repeats: 0,
             last_feedback: 0,
@@ -411,6 +421,9 @@ impl Receiver {
     /// is the same per-datagram number the sender used.
     pub fn on_datagram(&mut self, seed: u64, body: &[u8]) -> Result<(), Error> {
         self.dirty = true;
+        if let Some(prepared) = &mut self.prepared_feedback {
+            prepared.changed = true;
+        }
         match body.first() {
             Some(&KIND_SOURCE) => {
                 let wire =
@@ -851,6 +864,28 @@ impl Receiver {
         }
         self.feedback_shape().write(output);
         true
+    }
+    /// Freeze metadata matching bytes already rendered by preview_feedback.
+    pub(crate) fn prepare_feedback(&mut self) {
+        self.prepared_feedback = Some(PreparedFeedback {
+            end: self.end,
+            dirty: self.dirty,
+            changed: false,
+        });
+    }
+    /// Commit the frozen report, preserving any later authenticated receive event.
+    pub(crate) fn confirm_feedback(&mut self, accepted: u64) {
+        if let Some(prepared) = self.prepared_feedback.take() {
+            self.reported_end = prepared.end;
+            self.repeats = if prepared.dirty {
+                FEEDBACK_REPEATS
+            } else {
+                self.repeats.saturating_sub(1)
+            };
+            self.dirty = prepared.changed;
+            self.last_feedback = self.last_feedback.max(accepted);
+            self.stats.feedback += 1;
+        }
     }
     /// Commit only after the sole packer accepted the complete rendered block.
     pub(crate) fn commit_feedback(&mut self, now: u64) {

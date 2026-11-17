@@ -436,3 +436,94 @@ fn actual_aligned_and_packed_carrier_tokens_hold_source_and_arm_retry_at_accepta
     }
     Ok(())
 }
+
+#[test]
+fn actual_swift_carrier_token_keeps_original_epoch_and_once_only_budget() -> tests::TestResult {
+    let plan = tests::plan(tests::Family::Swift, Role::Client, 7)?;
+    let mut bank = tests::bank(plan, 0)?;
+    let mut foreign = tests::bank(plan, 0)?;
+    let generation = bank.initial();
+    let other = foreign.initial();
+    let usage = bank.usage();
+    let mut output = [0; 1500];
+    let mut witnesses = [];
+    for (owner, id) in [(&mut bank, generation), (&mut foreign, other)] {
+        let mut entry = owner.entry(id)?;
+        entry.enqueue_borrowed(engine::Tick(0), &tests::packet(8))?;
+        entry
+            .admit_borrowed(engine::Tick(0))?
+            .ok_or("Swift native admission")?;
+        let mut budget = OutboundBudget {
+            packets: 1,
+            wire_bytes: 1500,
+        };
+        let emission = entry
+            .poll(
+                engine::Tick(1000),
+                7,
+                true,
+                &mut output,
+                &mut budget,
+                &mut witnesses,
+            )?
+            .ok_or("Swift prepared source")?;
+        assert_eq!(
+            emission.kind,
+            engine::EmissionKind::Source(engine::SourceForm::Swift)
+        );
+        assert_eq!(budget.packets, 0);
+        assert_eq!(
+            entry
+                .pending_carrier_output()
+                .ok_or("Swift token")?
+                .emission(),
+            emission
+        );
+    }
+    let other_token = foreign
+        .entry(other)?
+        .pending_carrier_output()
+        .ok_or("foreign Swift token")?;
+    assert_eq!(
+        bank.entry(generation)?
+            .confirm_carrier_output(engine::Tick(u64::MAX), other_token),
+        Err(Error::Stale)
+    );
+    let mut entry = bank.entry(generation)?;
+    let token = entry
+        .pending_carrier_output()
+        .ok_or("original Swift token")?;
+    let duplicate = entry.pending_carrier_output().ok_or("repeat witness")?;
+    let mut budget = OutboundBudget {
+        packets: 0,
+        wire_bytes: 0,
+    };
+    let mut untouched = [0x5c; 1500];
+    assert_eq!(
+        entry.poll(
+            engine::Tick(30_000),
+            999,
+            false,
+            &mut untouched,
+            &mut budget,
+            &mut witnesses
+        )?,
+        Some(token.emission())
+    );
+    assert_eq!(untouched, [0x5c; 1500]);
+    assert_eq!(
+        budget,
+        OutboundBudget {
+            packets: 0,
+            wire_bytes: 0
+        }
+    );
+    entry.confirm_carrier_output_at(engine::Tick(30_000), engine::Tick(20_000), token)?;
+    assert!(entry.pending_carrier_output().is_none());
+    assert_eq!(
+        entry.confirm_carrier_output(engine::Tick(30_000), duplicate),
+        Err(Error::Engine(engine::Error::Token))
+    );
+    assert_eq!(bank.usage(), usage);
+    Ok(())
+}

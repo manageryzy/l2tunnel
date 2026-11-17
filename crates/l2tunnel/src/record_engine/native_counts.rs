@@ -150,6 +150,8 @@ pub(super) fn offer_diagnosed(
         && !window.preview(now, bytes.len())?
     {
         on_block(AdmissionRefusal {
+            flow: metadata.binding.id,
+            timing: metadata.timing,
             channel: metadata.binding.channel,
             bytes: bytes.len(),
             reason: AdmissionBlock::NativeDeliveryWindow,
@@ -165,6 +167,8 @@ pub(super) fn offer_diagnosed(
     };
     let admitted = owner.offer_queued_diagnosed(now, metadata, bytes, &mut |reason| {
         on_block(AdmissionRefusal {
+            flow: metadata.binding.id,
+            timing: metadata.timing,
             channel,
             bytes: bytes.len(),
             reason,

@@ -551,6 +551,33 @@ impl Entry<'_> {
             .poll_emission_bounded(now, number, allow_data, body_limit)
     }
 
+    /// Prepare immutable output under exact credit; actual acceptance is separate.
+    pub fn prepare_emission_with_limits(
+        &mut self,
+        now: u64,
+        number: records::RecordNumber,
+        allow_data: bool,
+        data_body_limit: usize,
+        feedback_body_limit: usize,
+    ) -> Result<Option<records::Emission<'_>>, records::Error> {
+        self.engine.prepare_emission_with_limits(
+            now,
+            number,
+            allow_data,
+            data_body_limit,
+            feedback_body_limit,
+        )
+    }
+    /// Consume the same output after caller-observed complete carrier acceptance.
+    pub fn confirm_output_at(
+        &mut self,
+        observed: u64,
+        accepted: u64,
+        witness: records::PreparedOutput,
+    ) -> Result<(), records::Error> {
+        self.engine.confirm_output_at(observed, accepted, witness)
+    }
+
     /// Exact per-kind outer credit through the same selected record owner.
     pub fn poll_emission_with_limits(
         &mut self,

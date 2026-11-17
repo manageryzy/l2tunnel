@@ -72,6 +72,8 @@ fn drained_old_swift_duplicate_gets_exact_small_feedback_without_data_or_native_
         .ok_or("actual source")?;
     assert_eq!(source.kind, EmissionKind::Source(SourceForm::Swift));
     let original = output[..source.bytes].to_vec();
+    let token = sender.pending_carrier_output().ok_or("source handoff")?;
+    sender.confirm_carrier_output(Tick(1000), token)?;
     receiver.accept_authenticated(
         Tick(1000),
         first_number,
@@ -109,6 +111,10 @@ fn drained_old_swift_duplicate_gets_exact_small_feedback_without_data_or_native_
         )?
         .ok_or("actual confirmation")?;
     assert_eq!(feedback.kind, EmissionKind::Feedback);
+    let token = receiver
+        .pending_carrier_output()
+        .ok_or("feedback handoff")?;
+    receiver.confirm_carrier_output(Tick(2000), token)?;
     sender.accept_authenticated(
         Tick(2000),
         first_number + 1,
@@ -180,6 +186,10 @@ fn drained_old_swift_duplicate_gets_exact_small_feedback_without_data_or_native_
     assert_eq!(feedback.wire_bytes, full);
     assert_eq!(feedback.security_number, first_number + 3);
     assert_eq!(exact, OutboundBudget::default());
+    let token = receiver
+        .pending_carrier_output()
+        .ok_or("duplicate feedback handoff")?;
+    receiver.confirm_carrier_output(at, token)?;
     sender.accept_authenticated(
         at,
         first_number + 3,

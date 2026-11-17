@@ -596,6 +596,12 @@ def normalize(value, source, digest):
                                 row['class'], row['reason']))
     protocol = protocol_provider(value.get('protocol_buffers'))
     issues.extend(protocol['issues'])
+    try:
+        from .buffer_metrics_pipeline import validate as validate_pipeline
+    except ImportError:
+        from buffer_metrics_pipeline import validate as validate_pipeline
+    pipeline = validate_pipeline(value.get('pipeline_admission'))
+    issues.extend(pipeline['issues'])
     management = management_provider(value.get('management_streams'), finished)
     issues.extend(management['issues'])
     ratio = None
@@ -612,6 +618,7 @@ def normalize(value, source, digest):
         ('invalid_observations' if issues else 'unknown_or_zero_observed_span'),
         'wait_ranking': waits, 'count_only_refusals': counts, 'occupancy': occupancy,
         'protocol_provider_validation': protocol,
+        'pipeline_provider_validation': pipeline,
         'management_provider_validation': management,
         'provider_metadata': {key: item for key, item in value.items() if key not in CORE_FIELDS},
         'provider_metadata_definition': 'Preserved source fields; no queue usage derived from provider space or limits.',
@@ -691,6 +698,11 @@ def markdown(report):
         lines.extend(['', 'Protocol provider: ' + cell(protocol['status']) + '. ' +
                       protocol['definition']])
         lines.extend('- ' + cell(gap) for gap in protocol['coverage_gaps'])
+        try:
+            from .buffer_metrics_pipeline import render as render_pipeline
+        except ImportError:
+            from buffer_metrics_pipeline import render as render_pipeline
+        render_pipeline(lines, owner['pipeline_provider_validation'], table, cell)
         management = owner['management_provider_validation']
         lines.extend(['', 'Management provider: ' + cell(management['status']) + '. ' +
                       management['definition']])

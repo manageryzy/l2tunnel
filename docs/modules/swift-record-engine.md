@@ -8,10 +8,54 @@ record composition. It does not implement a new connection mode, handshake,
 carrier, control protocol or default. The existing [Swift ledger](swift.md),
 [common session contract](secure-session.md) and full SW-11 remain authoritative.
 
+## Deferred carrier acceptance checkpoint
+
+Status: **implemented, protocol/runtime-fixture-tested and locally checked**.
+The Common Swift adapter now prepares one immutable record and retains a local
+witness until the existing selected-carrier owner confirms actual acceptance.
+The authenticated record number remains the repair seed. Repeated preparation
+returns the same bytes and consumes neither another packet number nor another
+wire-budget debit. Source, requested retry, proportional GF repair, tail repair
+and short-source output use the same path. The public `poll*` helpers explicitly
+represent synchronous handoff at the injected call time; Common uses
+`prepare_emission_with_limits` and `confirm_output_at`.
+
+First-send RTT and repeated-retry guards start at actual carrier acceptance.
+Tail backoff also anchors to acceptance; newer authenticated feedback retains
+its original probe state when acceptance is observed late. An older copy's ACK
+may retire source debt while an attempt is pending, but cannot consume its
+witness, reopen the output slot or authorize an epoch drain. Whole-record
+feedback freezes its exact reported endpoint and preserves authenticated data
+arriving before local receipt observation. A late successful receipt consumes
+that acceptance once before the existing original deadline error is returned.
+No wire grammar, repair coefficients, retransmission limit, deadline, queue
+capacity or carrier congestion-control policy changes.
+
+All extra state is bounded inline metadata included by existing `size_of`
+resource plans; payloads retain their existing storage. Passing regressions cover
+actual source/retry timing, unchanged GF repair bytes and lost short-source
+recovery, feedback interleaving, old-copy ACKs, original generation/budget
+ownership and protected UDP receipt observation. The [required attempt](../../work/aligned-extents-20261117/required-buffer-checks16-attempt1/validation.json)
+passes these new tests but finds one older fixture assuming Swift has no carrier
+witness. Its [scoped continuation](../../work/aligned-extents-20261117/required-buffer-checks16-continuation1/validation.json)
+corrects only that fixture to require the actual retained witness, then passes
+the affected case and every remaining required stage. Unchanged passing tests
+are reused; this is not a pristine all-green full invocation.
+This checkpoint does not establish native throughput improvement, Python mode
+parity, genuine QUIC integration qualification or completion of SW-11.
+
+- [ ] [SWR-19] Anchor Common Swift source/retry/tail and frozen-feedback timing to
+  actual selected-carrier acceptance, retaining immutable witnesses through
+  delayed observation and old-copy ACKs. Preserve original limits, wire bytes,
+  GF repairs, full SW-11 and all P-* requirements. Implementation, focused
+  regressions and scoped required checks pass as recorded above. Source-bound
+  native carrier qualification remains pending; no native speedup is claimed.
+
 ## Boundary and compatibility
 
-The existing pure `Sender`/`Receiver`, GF arithmetic, connection classifier and
-exact header compression remain unchanged. `l2tunnel_swift::records` composes
+The pure `Sender`/`Receiver` retain their wire algorithms, GF arithmetic,
+connection classifier and exact header compression. The deferred-acceptance
+checkpoint above extends only their local output-custody lifecycle. `l2tunnel_swift::records` composes
 them into the same ordered channels currently owned by the legacy runtime. It
 owns the common packing-byte budget, per-channel header contexts, urgent
 retransmission preference, round-robin new-data scheduling, channel-tagged data,
@@ -53,7 +97,8 @@ RecordNumber(pub u64)
 Admission::{Accepted, Full, PacketSize}
 Stats { sender: swift::SenderStats, receiver: swift::ReceiverStats,
         native_read: u64, native_dropped: u64, header_bytes_saved: u64 }
-Error::{Configuration, CounterExhausted, Codec(swift::Error), NotDrained, Admission}
+Error::{Configuration, OutputToken, OutputTime, CounterExhausted,
+        Codec(swift::Error), NotDrained, Admission}
 
 Engine::new(config: Config) -> Result<Engine, Error>
 Engine::{send_config, receive_config}(&self) -> Config

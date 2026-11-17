@@ -325,7 +325,7 @@ impl Owner {
                 }
                 let mut entry = owned.entry();
                 let Some(emission) = entry
-                    .poll_emission_with_limits(
+                    .prepare_emission_with_limits(
                         now.0,
                         records::RecordNumber(number),
                         allow_data,
@@ -350,8 +350,8 @@ impl Owner {
                     records::EmissionKind::Repair => EmissionKind::Repair,
                     records::EmissionKind::Feedback => EmissionKind::Feedback,
                 };
-                // The actual complete body fit was checked before feedback or
-                // sender state committed, using the one shared wire allowance.
+                // Exact preparation reserves the one shared wire allowance;
+                // only the matching carrier receipt commits send-related timers.
                 let wire_bytes = bytes
                     .checked_add(selected_overhead)
                     .ok_or(Error::Arithmetic)?;

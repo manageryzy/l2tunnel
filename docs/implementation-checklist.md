@@ -122,7 +122,19 @@ take. The [scoped required continuation](modules/buffer-observability.md#coordin
 passes after two fixture-only corrections; native qualification is pending.
 The [capture cleanup correction](modules/buffer-observability.md#release-before-offline-capture-analysis)
 defers offline parsing until after disconnect without changing original caps;
-30 affected harness/report tests pass, with native confirmation pending.
+30 affected harness/report tests pass. The [native15 continuation](modules/buffer-observability.md#native15-dependencies-and-failure-attribution)
+qualifies UDP simultaneous and raw/QUIC forward data, while retaining raw reverse
+retry exhaustion, Rolling decoder/debt and raw bootstrap failures, TLS original
+bound exhaustion and QUIC peer-close failure. Sixteen native buffer exports pass
+parsing; complete BP coverage and the full current-build matrix remain open.
+The [selected Pipeline FIFO-head provider](modules/buffer-observability.md#selected-pipeline-fifo-head-intervals)
+adds actual per-flow refusal-to-pop intervals with explicit omitted/terminal
+coverage; coordinated local validation passes below, with native qualification pending.
+The [same batch](modules/buffer-observability.md#pending-acceptance-and-bounded-decoder-dispatch-correction)
+implements Swift actual carrier-acceptance timing and bounded Rolling copy-phase
+dispatch with unchanged work charges and deadlines. Their [scoped required checks](modules/buffer-observability.md#coordinated-local-buffer-batch16-validation)
+pass after correcting one obsolete Swift no-witness fixture. Native qualification,
+native failure corrections and full original mode gates remain open.
 No parent gate closes, and historical failed receipts remain preserved.
 
 This remains the persistent progress ledger. Unchecked work is required;

@@ -1,13 +1,22 @@
-//! Explicit post-carrier custody for actual Rolling and Reliable output.
+//! Explicit post-carrier custody for every actual record family.
 use super::*;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Prepared {
+    Swift(swift::records::PreparedOutput),
     Connections(connections::OutputWitness),
     Rolling(rolling_records::PreparedOutput),
     Research(rolling_records::PreparedOutput),
     Aligned(l2tunnel_reliable::PreparedOutput),
     Packed(l2tunnel_reliable::PreparedOutput),
+}
+
+/// One existing inline slot shared by owner families whose wire debit belongs
+/// to Engine. Payloads remain in their original already-reserved storage.
+#[derive(Clone, Copy)]
+pub(super) enum InlinePrepared {
+    Swift(swift::records::PreparedOutput),
+    Reliable(l2tunnel_reliable::PreparedOutput),
 }
 
 /// Move-only local pending witness, never proof of peer authentication or I/O.
@@ -70,18 +79,27 @@ impl Engine {
                 )
             }
             Owner::Aligned(_) => {
-                let (emission, p) = self.reliable_pending?;
+                let (emission, InlinePrepared::Reliable(p)) = self.inline_pending? else {
+                    return None;
+                };
                 (emission, Prepared::Aligned(p))
             }
             Owner::Packed(_) => {
-                let (emission, p) = self.reliable_pending?;
+                let (emission, InlinePrepared::Reliable(p)) = self.inline_pending? else {
+                    return None;
+                };
                 (emission, Prepared::Packed(p))
             }
             Owner::Connections(owner) => {
                 let (emission, witness) = owner.pending_output().ok()??;
                 (emission, Prepared::Connections(witness))
             }
-            Owner::Swift(_) => return None,
+            Owner::Swift(_) => {
+                let (emission, InlinePrepared::Swift(p)) = self.inline_pending? else {
+                    return None;
+                };
+                (emission, Prepared::Swift(p))
+            }
         };
         Some(CarrierOutputToken {
             context: self.context,
@@ -172,6 +190,16 @@ impl Engine {
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
         let result = match (&mut self.owner, token.prepared) {
+            (Owner::Swift(owner), Prepared::Swift(p)) => {
+                let result = owner
+                    .entry()
+                    .confirm_output_at(now.0, accepted.0, p)
+                    .map_err(Error::Swift);
+                if result.is_ok() {
+                    self.inline_pending = None;
+                }
+                result
+            }
             (Owner::Connections(owner), Prepared::Connections(witness)) => {
                 owner.confirm_output_at(now, accepted, witness)
             }
@@ -182,13 +210,13 @@ impl Engine {
                 .confirm_output_at(now, accepted, p)
                 .map_err(Error::Rolling),
             (Owner::Aligned(endpoint), Prepared::Aligned(p)) => {
-                self.reliable_pending = None;
+                self.inline_pending = None;
                 endpoint
                     .confirm_output_at(duration(now), duration(accepted), p)
                     .map_err(Error::Aligned)
             }
             (Owner::Packed(endpoint), Prepared::Packed(p)) => {
-                self.reliable_pending = None;
+                self.inline_pending = None;
                 endpoint
                     .confirm_output_at(duration(now), duration(accepted), p)
                     .map_err(Error::Aligned)

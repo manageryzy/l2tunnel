@@ -1,5 +1,6 @@
 use super::*;
 
+mod acceptance;
 mod adapter;
 mod native_encoding;
 mod native_identity;

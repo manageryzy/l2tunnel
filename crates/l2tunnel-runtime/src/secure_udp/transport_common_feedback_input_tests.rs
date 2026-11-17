@@ -718,8 +718,8 @@ async fn actual_common_swift_buffers_preserve_channels_and_terminal_sampling() -
         send_attempts, 1,
         "actual Swift ciphertext reached the carrier"
     );
-    // Swift retains its source directly; its whole ciphertext belongs to the
-    // runtime slot rather than a Reliable/Rolling CarrierOutputToken.
+    // Swift keeps its original source and exact prepared-output witness while
+    // the runtime retains the authenticated ciphertext until carrier acceptance.
     let pending = a
         .driver
         .common
@@ -794,3 +794,6 @@ async fn actual_common_swift_buffers_preserve_channels_and_terminal_sampling() -
     );
     Ok(())
 }
+
+#[path = "transport_common_swift_acceptance_tests.rs"]
+mod swift_acceptance;
