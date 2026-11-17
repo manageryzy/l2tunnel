@@ -740,8 +740,25 @@ impl Driver {
         let wire_metrics =
             wire_metrics::Observer::from_environment(input.cover.limits().max_packet_bytes)?;
         let compact_arq_trace = compact_arq_trace::Observer::from_environment()?;
-        let buffer_metrics =
+        let mut buffer_metrics =
             crate::buffer_metrics::Observer::from_environment_at("common", origin)?;
+        if let Some(metrics) = &mut buffer_metrics {
+            let maximum_owners = contract
+                .catalog()
+                .descriptors()
+                .iter()
+                .map(|descriptor| match descriptor.profile() {
+                    l2tunnel::record_configuration::Profile::PerConnectionCompact {
+                        forward,
+                        reverse,
+                    } => usize::from(forward.owners).max(usize::from(reverse.owners)),
+                    // Shared codec channels do not create independent recovery owners.
+                    _ => 1,
+                })
+                .max()
+                .unwrap_or(1);
+            metrics.configure_protocol_buffers(maximum_owners, role)?;
+        }
         let reuse_owner = if contract.connection_reuse() {
             Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
         } else {

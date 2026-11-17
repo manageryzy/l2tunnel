@@ -109,3 +109,92 @@ impl Engine {
         }
     }
 }
+
+/// Actual shared or independent reliable recovery retention, without polling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryBufferSnapshot {
+    /// One shared Aligned or Packed recovery owner.
+    Endpoint(l2tunnel_reliable::Storage),
+    /// One independently recovering connection and its full incarnation.
+    Connection {
+        /// Actual route owner, not a shared MUX channel.
+        owner: crate::connection_records::OwnerId,
+        /// Full current incarnation of this actual recovery owner.
+        incarnation: u64,
+        /// Actual retained recovery payloads and staging.
+        storage: l2tunnel_reliable::Storage,
+    },
+}
+
+impl Engine {
+    /// Visit actual Reliable/ARQ retention without allocation, time or I/O.
+    /// Other recovery families have distinct owners and are not represented here.
+    pub fn visit_recovery_buffers(&self, mut visit: impl FnMut(RecoveryBufferSnapshot)) {
+        match &self.owner {
+            Owner::Aligned(owner) => {
+                visit(RecoveryBufferSnapshot::Endpoint(owner.recovery_storage()))
+            }
+            Owner::Packed(owner) => {
+                visit(RecoveryBufferSnapshot::Endpoint(owner.recovery_storage()))
+            }
+            Owner::Connections(owner) => {
+                owner
+                    .collection
+                    .visit_recovery_buffers(|owner, incarnation, storage| {
+                        visit(RecoveryBufferSnapshot::Connection {
+                            owner,
+                            incarnation,
+                            storage,
+                        })
+                    })
+            }
+            Owner::Swift(_) | Owner::Rolling(_) | Owner::Research(_) => {}
+        }
+    }
+}
+
+/// One actual staged-source wait owner; external epoch/config identity stays with Engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagedAdmissionSnapshot {
+    /// One shared Aligned or Packed staged source.
+    Endpoint(l2tunnel_aligned::staged_wait::Snapshot),
+    /// One independent connection recovery owner.
+    Connection {
+        /// Actual fixed-cohort owner label.
+        owner: crate::connection_records::OwnerId,
+        /// Full current incarnation.
+        incarnation: u64,
+        /// Exact source identity, reason counters and interval populations.
+        snapshot: l2tunnel_aligned::staged_wait::Snapshot,
+    },
+}
+impl Engine {
+    /// Visit exact retained-source admission wait summaries using only injected time.
+    /// Unsupported recovery families produce no fabricated zero-valued owner.
+    pub fn visit_staged_admission(
+        &self,
+        observed: std::time::Duration,
+        mut visit: impl FnMut(StagedAdmissionSnapshot),
+    ) {
+        match &self.owner {
+            Owner::Aligned(owner) => visit(StagedAdmissionSnapshot::Endpoint(
+                owner.staged_admission_snapshot(observed),
+            )),
+            Owner::Packed(owner) => visit(StagedAdmissionSnapshot::Endpoint(
+                owner.staged_admission_snapshot(observed),
+            )),
+            Owner::Connections(owner) => {
+                owner
+                    .collection
+                    .visit_staged_admission(observed, |owner, incarnation, snapshot| {
+                        visit(StagedAdmissionSnapshot::Connection {
+                            owner,
+                            incarnation,
+                            snapshot,
+                        })
+                    })
+            }
+            Owner::Swift(_) | Owner::Rolling(_) | Owner::Research(_) => {}
+        }
+    }
+}

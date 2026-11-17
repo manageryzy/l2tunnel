@@ -26,7 +26,10 @@ mod connection_ingress;
 /// Same-owner retirement driven by opaque authenticated selected commands.
 pub mod connection_reuse;
 mod connections;
-pub use buffer_diagnostics::{AdmissionBlock, AdmissionRefusal, CodecBufferSnapshot};
+pub use buffer_diagnostics::{
+    AdmissionBlock, AdmissionRefusal, CodecBufferSnapshot, RecoveryBufferSnapshot,
+    StagedAdmissionSnapshot,
+};
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
 pub use ingress::{IngressAdmission, IngressSnapshot};

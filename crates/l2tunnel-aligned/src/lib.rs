@@ -21,6 +21,8 @@ pub mod compact_storage;
 mod compact_wire;
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
+/// Exact injected-time observations of retained source admission refusal.
+pub mod staged_wait;
 /// Complete fallible backing for actual directional codec/recovery owners.
 pub mod storage;
 /// Read-only exact selected recovery and codec-envelope byte extents.
@@ -298,6 +300,7 @@ pub struct Endpoint {
     usage: Option<storage::Usage>,
     compact_wire: bool,
     compact_data_overhead: usize,
+    staged_wait: staged_wait::State,
 }
 impl Endpoint {
     /// Reserve complete actual same-policy duplex backing without fallback.
@@ -498,6 +501,7 @@ impl Endpoint {
             failure: None,
             compact_wire: false,
             compact_data_overhead: 0,
+            staged_wait: staged_wait::State::default(),
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes,
@@ -605,6 +609,7 @@ impl Endpoint {
             failure: None,
             compact_wire: false,
             compact_data_overhead: 0,
+            staged_wait: staged_wait::State::default(),
             usage: None,
         })
     }
@@ -1132,6 +1137,11 @@ impl Endpoint {
     ) -> Option<l2tunnel_recovery::CompactRetryFailureSnapshot> {
         self.recovery.compact_retry_failure_snapshot()
     }
+    /// Read actual staged-source refusal-to-admission observations at injected time.
+    /// This does not poll, advance or release any protocol state.
+    pub fn staged_admission_snapshot(&self, observed: Duration) -> staged_wait::Snapshot {
+        self.staged_wait.snapshot(observed)
+    }
     /// Actual ARQ timeout and source ownership counters.
     pub fn arq_statistics(&self) -> l2tunnel_recovery::Statistics {
         self.recovery.arq_statistics()
@@ -1147,6 +1157,11 @@ impl Endpoint {
             failure: self.failure,
         }
     }
+    /// Returns recovery retention without scanning codec receiver state.
+    pub fn recovery_storage(&self) -> l2tunnel_reliable::Storage {
+        self.recovery.storage()
+    }
+
     /// Read the actual codec stage and receiver; recovery buffers remain separate.
     pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
         l2tunnel_codec::diagnostics::DuplexBuffers {
@@ -1161,6 +1176,7 @@ impl Endpoint {
         if now < self.now {
             return Err(Error::Time);
         }
+        self.staged_wait.observe(now);
         if self.packing.is_some() && packed::micros(now).is_err() {
             return if self.drained() {
                 Err(Error::Time)
@@ -1196,11 +1212,23 @@ impl Endpoint {
                 self.compact_wire,
             )?;
             match self.recovery.submit(&self.send_buffer[..length], self.now) {
-                Ok(actual) if actual == id => self.sender.commit_source()?,
+                Ok(actual) if actual == id => {
+                    self.staged_wait.admitted(id, length, self.now);
+                    self.sender.commit_source()?;
+                }
                 Ok(_) => return self.fail(Error::Identity),
                 Err(l2tunnel_reliable::Error::Arq(
-                    RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow,
-                )) => break,
+                    error @ (RecoveryError::Capacity(BufferSide::Send)
+                    | RecoveryError::SequenceWindow),
+                )) => {
+                    let reason = if matches!(error, RecoveryError::SequenceWindow) {
+                        staged_wait::Reason::SequenceWindow
+                    } else {
+                        staged_wait::Reason::SendCapacity
+                    };
+                    self.staged_wait.refused(id, length, self.now, reason);
+                    break;
+                }
                 Err(error) => return self.fail(Error::Recovery(error)),
             }
         }
@@ -1220,13 +1248,22 @@ impl Endpoint {
         let length = self.terminal_result(result)?;
         match self.recovery.submit(&self.send_buffer[..length], self.now) {
             Ok(actual) if actual == id => {
+                self.staged_wait.admitted(id, length, self.now);
                 let result = self.sender.commit_source();
                 self.terminal_result(result)
             }
             Ok(_) => self.fail(Error::Identity),
             Err(l2tunnel_reliable::Error::Arq(
-                RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow,
-            )) => Ok(()),
+                error @ (RecoveryError::Capacity(BufferSide::Send) | RecoveryError::SequenceWindow),
+            )) => {
+                let reason = if matches!(error, RecoveryError::SequenceWindow) {
+                    staged_wait::Reason::SequenceWindow
+                } else {
+                    staged_wait::Reason::SendCapacity
+                };
+                self.staged_wait.refused(id, length, self.now, reason);
+                Ok(())
+            }
             Err(error) => self.fail(Error::Recovery(error)),
         }
     }
@@ -1322,6 +1359,17 @@ impl Endpoint {
         let now = ticks(self.now)?;
         let result = (|| {
             for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+                // Reliable retains immutable source bytes and rejects conflicting
+                // duplicates before this point. A previous successful preview is
+                // therefore not another admission. `advance` still checks every
+                // original deadline before any caller reaches this pump.
+                if self
+                    .receiver
+                    .source_observed(self.receive_scope, receiver::SourceId(id))
+                    .map_err(Error::Receiver)?
+                {
+                    continue;
+                }
                 let view = compact_wire::aligned(
                     self.compact_wire,
                     self.receive_scope,
@@ -1532,6 +1580,7 @@ impl Endpoint {
         result.or_else(|error| self.fail(error))
     }
     fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
+        self.staged_wait.stop_observed();
         self.failure = Some(error);
         Err(error)
     }

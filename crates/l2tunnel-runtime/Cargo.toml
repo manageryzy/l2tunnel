@@ -38,12 +38,12 @@ l2tunnel-device = { path = "../l2tunnel-device" }
 l2tunnel-wire = { path = "../l2tunnel-wire" }
 l2tunnel-management = { path = "../l2tunnel-management" }
 ring = "=0.17.14"
+socket2 = "=0.6.5"
 zeroize = "=1.9.0"
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 serde_json = "=1.0.151"
-socket2 = "=0.6.5"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

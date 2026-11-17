@@ -908,3 +908,181 @@ mod history_range {
         Ok(())
     }
 }
+
+#[test]
+fn admitted_body_history_backpressure_skips_caller_and_encoder() -> Result {
+    let policy = config(CompactRecovery::Guarded, 1, 2, 78)?;
+    let mut sender = CompactRepeat::new(policy, context(EndpointRole::Initiator))?;
+    sender.submit(b"source", Duration::ZERO)?;
+    let mut output = [0; 128];
+    for now in [Duration::ZERO, ms(150)] {
+        sender
+            .poll_source(now, &mut output)?
+            .ok_or("allowed attempt")?;
+        let physical = sender.pending_transmission(SourceId(0)).ok_or("physical")?;
+        sender.confirm_transmission_at(now, now, physical)?;
+    }
+    assert_eq!(sender.source_body_bytes(ms(300))?, None);
+    assert_eq!(sender.source_deadline(), None);
+    let before = sender.statistics();
+    let blocked: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            ms(300),
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Err("admission must not run"),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(blocked, Ok(None));
+    assert_eq!(sender.statistics(), before);
+    assert_eq!(sender.engine.last_now, ms(150));
+    assert_eq!(sender.failure(), None);
+    Ok(())
+}
+
+#[test]
+fn admitted_body_refusal_preserves_clock_selection_and_physical_custody() -> Result {
+    let (mut sender, _) = pair(CompactRecovery::Guarded)?;
+    sender.submit(b"source", Duration::ZERO)?;
+    let before = sender.statistics();
+    let refused: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            ms(50),
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Ok(false),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(refused, Ok(None));
+    assert_eq!(sender.engine.last_now, Duration::ZERO);
+    assert_eq!(sender.statistics(), before);
+    assert_eq!(sender.pending_transmission(SourceId(0)), None);
+    let rejected: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            ms(50),
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Err("caller output limit"),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(
+        rejected,
+        Err(CompactPollError::Encode("caller output limit"))
+    );
+    assert_eq!(sender.engine.last_now, Duration::ZERO);
+    let expected = sender
+        .source_body_bytes(Duration::ZERO)?
+        .ok_or("source extent")?;
+    let mut output = [0; 64];
+    let length = sender
+        .poll_admitted_body_with(
+            Duration::ZERO,
+            CompactPacketKind::Data,
+            &mut [],
+            |bytes| Ok::<_, RecoveryError>(bytes == expected),
+            |view| view.encode_compact_into(&mut output).map(Some),
+        )?
+        .ok_or("source")?;
+    assert_eq!(length, expected);
+    assert_eq!(sender.engine.pending_transmissions, 1);
+    assert_eq!(sender.source_deadline(), None);
+    let physical = sender
+        .pending_transmission(SourceId(0))
+        .ok_or("actual token")?;
+    sender.confirm_transmission_at(ms(3), ms(3), physical)?;
+    assert_eq!(sender.source_deadline(), Some(ms(153)));
+    Ok(())
+}
+
+#[test]
+fn admitted_body_preserves_retry_failure_after_caller_preflight() -> Result {
+    let (mut sender, _) = pair(CompactRecovery::Guarded)?;
+    sender.submit(b"source", Duration::ZERO)?;
+    let mut now = Duration::ZERO;
+    let mut output = [0; 128];
+    for _ in 0..sender.send_config()?.maximum_attempts {
+        sender
+            .poll_source(now, &mut output)?
+            .ok_or("allowed attempt")?;
+        let physical = sender.pending_transmission(SourceId(0)).ok_or("physical")?;
+        sender.confirm_transmission_at(now, now, physical)?;
+        now = sender.source_deadline().ok_or("retry deadline")?;
+    }
+    let refused: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            now,
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Ok(false),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(refused, Ok(None));
+    assert_eq!(sender.failure(), None);
+    let rejected: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            now,
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Err("caller output limit"),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(
+        rejected,
+        Err(CompactPollError::Encode("caller output limit"))
+    );
+    assert_eq!(sender.failure(), None);
+    let exhausted: std::result::Result<Option<usize>, CompactPollError<&str>> = sender
+        .poll_admitted_body_with(
+            now,
+            CompactPacketKind::Data,
+            &mut [],
+            |_| Ok(true),
+            |_| Err("encoder must not run"),
+        );
+    assert_eq!(
+        exhausted,
+        Err(CompactPollError::Recovery(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        }))
+    );
+    assert_eq!(
+        sender.failure(),
+        Some(RecoveryError::RetryExhausted {
+            source: SourceId(0)
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn admitted_body_feedback_matches_existing_peek_and_emit() -> Result {
+    let (mut sender, mut left) = pair(CompactRecovery::Guarded)?;
+    let (_, mut right) = pair(CompactRecovery::Guarded)?;
+    let packet = emit(&mut sender, Duration::ZERO, Duration::ZERO, b"data")?;
+    left.receive(&packet, ms(40))?;
+    right.receive(&packet, ms(40))?;
+    let expected = left.feedback_body_bytes(ms(45))?.ok_or("feedback extent")?;
+    let mut a = [0; 128];
+    let mut b = [0; 128];
+    let mut bitmap_a = [0; 128];
+    let mut bitmap_b = [0; 128];
+    let la = left
+        .poll_feedback_with(ms(45), &mut bitmap_a, |view| {
+            view.encode_compact_into(&mut a).map(Some)
+        })?
+        .ok_or("old output")?;
+    let lb = right
+        .poll_admitted_body_with(
+            ms(45),
+            CompactPacketKind::Feedback,
+            &mut bitmap_b,
+            |bytes| Ok::<_, RecoveryError>(bytes == expected),
+            |view| view.encode_compact_into(&mut b).map(Some),
+        )?
+        .ok_or("new output")?;
+    assert_eq!(la, lb);
+    assert_eq!(&a[..la], &b[..lb]);
+    assert_eq!(left.statistics(), right.statistics());
+    assert_eq!(left.feedback_deadline(), right.feedback_deadline());
+    Ok(())
+}

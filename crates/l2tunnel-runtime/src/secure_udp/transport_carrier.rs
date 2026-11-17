@@ -920,7 +920,77 @@ impl Driver {
         }
         let observed = sample();
         clock(self.origin, observed)?;
-        if socket.deadline().is_some_and(|cap| observed >= cap) {
+        if let Some(cap) = socket.deadline()
+            && observed >= cap
+        {
+            if std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some()
+                && let IoOwner::Raw(values) = socket
+                && let Some(raw) = values.first_mut()
+            {
+                // Read existing scalar custody only, before terminal owner release.
+                let snapshot = raw.buffer_snapshot(observed);
+                let pending = |value: Option<raw_carrier::PendingBufferSnapshot>| {
+                    value.map(|p| {
+                        (
+                            p.lane,
+                            p.deadline.checked_duration_since(self.origin),
+                            p.record_bytes,
+                            p.charged_bytes,
+                            p.bootstrap,
+                            p.token_retained,
+                            p.receipt_retained,
+                        )
+                    })
+                };
+                eprintln!(
+                    "Raw carrier custody expiry: now={:?} selected_cap={:?} settlement_terminal={terminal} carrier_terminal={} unavailable_lanes={} slot_fields=(lane,original_cap,record_bytes,charge,bootstrap,token,receipt) user={:?} control={:?} prepared={:?}",
+                    observed.checked_duration_since(self.origin),
+                    cap.checked_duration_since(self.origin),
+                    snapshot.carrier.terminal,
+                    snapshot.carrier.unavailable_lanes,
+                    pending(snapshot.user),
+                    pending(snapshot.control),
+                    snapshot.prepared.map(|p| (p.lane, p.kind, p.record_bytes)),
+                );
+                for (index, lane) in snapshot.carrier.lanes.into_iter().enumerate() {
+                    if let Some(lane) = lane {
+                        let candidates =
+                            [lane.carrier_control, lane.upper_control, lane.bulk].map(|c| {
+                                (
+                                    c.queued_packets,
+                                    c.capacity_packets,
+                                    c.counters.capacity_refused.packets,
+                                    c.counters.verifier_rejected.packets,
+                                )
+                            });
+                        eprintln!(
+                            "Raw carrier custody lane: index={index} captured={:?} pending_ip_bytes={} packet_io_pending={} tracked={} completed={} prepared_payload_bytes={} send_debt={:?} peer_horizon={:?} local_retired={:?} selected_kind={:?} selected_age_us={:?} candidate_fields=(queued,capacity,capacity_refused,verifier_rejected) carrier_upper_bulk={candidates:?} last_prepare_refusals={:?} actual_io_blocked={} actual_io_calls={} actual_io_wouldblock={} pacing_refusals={} turn_refusals={}",
+                            snapshot
+                                .carrier
+                                .captured_at
+                                .checked_duration_since(self.origin),
+                            lane.pending_ip_bytes,
+                            lane.packet_io_pending,
+                            lane.tracked,
+                            lane.completed,
+                            lane.prepared_payload_bytes,
+                            lane.send_debt_bytes,
+                            lane.peer_horizon_bytes,
+                            lane.retired_bytes,
+                            lane.selected_kind,
+                            lane.selected_age_micros,
+                            lane.prepare.map(|p| p.last_refusal),
+                            lane.send_io.blocked,
+                            lane.send_io.packet_io_attempts,
+                            lane.send_io.would_block_observations,
+                            lane.send_io.pacing_refusals,
+                            lane.send_io.turn_budget_refusals,
+                        );
+                    } else {
+                        eprintln!("Raw carrier custody lane: index={index} available=false");
+                    }
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original carrier custody/lifetime cap",

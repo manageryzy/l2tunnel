@@ -555,6 +555,39 @@ impl CompactRepeat {
             .compact_emit_with(now, selected, bitmap, true, encode)
     }
 
+    /// Select one context-free body and preflight its exact length before output.
+    ///
+    /// The selection is borrowed from this owner for this call only. An absent
+    /// opportunity, false preflight, or preflight error commits no observation
+    /// time, source attempt, feedback cursor, serial or physical custody. Source
+    /// history capacity is checked before preflight, with finite attempt failure
+    /// remaining visible to the normal emitter after admission. The encoder has
+    /// the same Some-only commit boundary as `poll_source_with`.
+    pub fn poll_admitted_body_with<T, E>(
+        &mut self,
+        now: Duration,
+        kind: CompactPacketKind,
+        bitmap: &mut [u8],
+        admit: impl FnOnce(usize) -> Result<bool, E>,
+        encode: impl FnOnce(CompactPacketView<'_>) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, CompactPollError<E>> {
+        let feedback = kind == CompactPacketKind::Feedback;
+        let selected = self.engine.compact_selection(now, feedback, !feedback)?;
+        if let Some(Selection::Source { source, .. }) = selected
+            && self.engine.compact_source_blocked(source)?
+        {
+            return Ok(None);
+        }
+        let Some(bytes) = self.engine.compact_body_bytes(now, selected)? else {
+            return Ok(None);
+        };
+        if !admit(bytes).map_err(CompactPollError::Encode)? {
+            return Ok(None);
+        }
+        self.engine
+            .compact_emit_with(now, selected, bitmap, true, encode)
+    }
+
     /// Offer only a source from the same source/retry/history selection.
     pub fn poll_source_with<T, E>(
         &mut self,

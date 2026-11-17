@@ -49,6 +49,19 @@ def fixture():
                                    reason('QueueFull', untimed=9)]}]}
 
 
+def protocol_fixture():
+    return {'identity_errors': 0, 'clock_regressions': 0, 'counter_overflow': False,
+            'retired_epochs_omitted': 0, 'retired_owner_generations_omitted': 0,
+            'unsupported_codec_samples': 0, 'staged_terminal_unavailable': 0,
+            'epochs': [{'epoch': 7, 'configuration_digest_hex': 'ab' * 32,
+                        'live_at_last_sample': True, 'owner_capacity': 1,
+                        'owners': [{'scope': 'endpoint-shared', 'owner': None, 'incarnation': None,
+                                    'invalid_occupancy': False, 'counter_overflow': False,
+                                    'gauges': [{'name': 'arq_transmission_history_entries', 'samples': 1,
+                                                'used': None, 'high_water': None, 'capacity': 1024}],
+                                    'staged_admission': None}]}]}
+
+
 def save(directory, name, value):
     path = Path(directory) / name
     path.write_text(json.dumps(value), encoding='utf-8')
@@ -145,6 +158,84 @@ class BufferMetricsReportTests(unittest.TestCase):
         self.assertEqual(owner['provider_metadata'], {'raw': raw, 'quic_provider': quic})
         self.assertEqual(value, original)
         self.assertNotIn('used', owner['provider_metadata']['quic_provider']['lanes'][0])
+
+    def test_protocol_provider_unknown_is_unavailable_and_capacity_is_not_usage(self):
+        value = fixture()
+        value['protocol_buffers'] = protocol_fixture()
+        owner = report.normalize(value, 'protocol.bmetrics', 'digest')
+        validation = owner['protocol_provider_validation']
+        self.assertEqual(validation['status'], 'validated_known_fields_partial')
+        self.assertTrue(any('timing unavailable' in gap for gap in validation['coverage_gaps']))
+        self.assertIsNone(owner['provider_metadata']['protocol_buffers']['epochs'][0]
+                          ['owners'][0]['gauges'][0]['used'])
+        self.assertEqual(owner['owner_union_percent_of_observed_span'], 60)
+        for missing in (None,):
+            value['protocol_buffers'] = missing
+            validation = report.normalize(value, 'unknown.bmetrics', 'digest')['protocol_provider_validation']
+            self.assertEqual(validation['status'], 'unavailable')
+        value['protocol_buffers'] = {'future_layout': []}
+        owner = report.normalize(value, 'unknown.bmetrics', 'digest')
+        self.assertEqual(owner['protocol_provider_validation']['status'], 'invalid_or_unrecognized_shape')
+        self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+
+    def test_protocol_nested_invalidity_and_impossible_occupancy_are_visible(self):
+        for case in ('identity', 'overflow', 'row', 'capacity', 'duplicate', 'bound'):
+            with self.subTest(case=case):
+                value = fixture()
+                provider = protocol_fixture()
+                value['protocol_buffers'] = provider
+                row = provider['epochs'][0]['owners'][0]
+                if case == 'identity':
+                    provider['identity_errors'] = 1
+                elif case == 'overflow':
+                    provider['counter_overflow'] = True
+                elif case == 'row':
+                    row['invalid_occupancy'] = True
+                elif case == 'capacity':
+                    row['gauges'][0].update(used=2048, high_water=2048)
+                elif case == 'duplicate':
+                    row['gauges'].append(copy.deepcopy(row['gauges'][0]))
+                else:
+                    provider['epochs'][0]['owner_capacity'] = 257
+                owner = report.normalize(value, 'invalid-provider.bmetrics', 'digest')
+                self.assertEqual(owner['status'], 'invalid_observations')
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+                self.assertEqual(owner['provider_metadata']['protocol_buffers'], provider)
+                self.assertTrue(owner['protocol_provider_validation']['issues'])
+
+    def test_protocol_staged_invalid_flags_do_not_hide_behind_generic_zero(self):
+        totals = {'completed_episodes': 0, 'completed_us': 0, 'maximum_completed_us': 0,
+                  'censored_episodes': 0, 'censored_us': 0, 'maximum_censored_us': 0}
+        wait = {'observed_at_us': 1100, 'terminal_at_us': 1100, 'open_us': None,
+                'pending': None, 'clock_regression': False, 'identity_mismatch': False,
+                'counter_overflow': False, 'union': totals,
+                'reasons': [{'reason': key, 'refused_attempts': 0, 'totals': totals}
+                            for key in ('send_capacity', 'sequence_window')]}
+        for flag in ('clock_regression', 'identity_mismatch', 'counter_overflow'):
+            with self.subTest(flag=flag):
+                value = fixture()
+                value.update(blocked_union=duration(), sites=[], protocol_buffers=protocol_fixture())
+                observed = copy.deepcopy(wait)
+                observed[flag] = True
+                value['protocol_buffers']['epochs'][0]['owners'][0]['staged_admission'] = observed
+                owner = report.normalize(value, 'staged-invalid.bmetrics', 'digest')
+                self.assertEqual(owner['blocked_union']['observed_us'], 0)
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+                self.assertTrue(any(flag in issue for issue in owner['issues']))
+
+    def test_protocol_gaps_do_not_create_waits_or_union_additions(self):
+        value = fixture()
+        value['protocol_buffers'] = protocol_fixture()
+        value['protocol_buffers']['retired_epochs_omitted'] = 2
+        value['protocol_buffers']['staged_terminal_unavailable'] = 1
+        owner = report.normalize(value, 'partial-provider.bmetrics', 'digest')
+        self.assertEqual(owner['blocked_union']['observed_us'], 60)
+        self.assertEqual(len(owner['wait_ranking']), 2)
+        self.assertTrue(any('retired_epochs_omitted=2' == gap for gap in
+                            owner['protocol_provider_validation']['coverage_gaps']))
+        text = report.markdown({'status': owner['status'], 'owners': [owner], 'rejected_inputs': []})
+        self.assertIn('exclude separate protocol-owner waits', text)
+        self.assertIn('staged_terminal_unavailable=1', text)
 
     def test_invalid_input_schema_duplicates_types_and_nonfinite_values_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

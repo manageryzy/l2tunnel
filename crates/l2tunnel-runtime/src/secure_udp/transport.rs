@@ -165,6 +165,16 @@ where
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
     driver.counters.loop_input_capacity_bytes = inputs.capacity_bytes();
+    // Readback belongs to this retained original socket, never a requested tuple.
+    // Diagnostic allocation or getsockopt failure is retained as unavailable.
+    if let carrier::IoOwner::Udp(socket) = &socket
+        && let Some(metrics) = driver
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.buffer_metrics.as_mut())
+    {
+        metrics.observe_udp_socket(socket);
+    }
     let ready = sample();
     if ready >= setup_deadline {
         return Err(io::Error::new(

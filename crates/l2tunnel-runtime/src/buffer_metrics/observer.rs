@@ -18,6 +18,9 @@ pub(crate) struct Observer {
     finished: Option<u64>,
     // Reserve one slot only when diagnostics are enabled. Keeping this large
     // snapshot inline also enlarges disabled adapters and nested setup futures.
+    protocol: Vec<super::protocol_buffers::ProtocolBuffers>,
+    udp_socket: Vec<super::udp_socket::Snapshot>,
+    udp_socket_allocation_failed: bool,
     raw: Vec<crate::secure_udp::raw_buffer_metrics::Snapshot>,
     proxy: Vec<crate::proxy::timing::Snapshot>,
     quic: Vec<crate::secure_udp::maintained_io::quic_metrics::Snapshot>,
@@ -74,6 +77,9 @@ impl Observer {
             quic: Self::quic_storage("test")?,
             origin,
             finished: None,
+            protocol: Vec::new(),
+            udp_socket: Vec::new(),
+            udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
             proxy: Self::proxy_storage("test")?,
         })
@@ -120,11 +126,57 @@ impl Observer {
             quic: Self::quic_storage(label)?,
             origin,
             finished: None,
+            protocol: Vec::new(),
+            udp_socket: Vec::new(),
+            udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
             proxy: Self::proxy_storage(label)?,
         }))
     }
 
+    /// Read the actual retained original UDP socket once, only with opt-in diagnostics.
+    /// No option is set, and an unavailable diagnostic never changes forwarding.
+    pub(crate) fn observe_udp_socket(&mut self, socket: &tokio::net::UdpSocket) {
+        if self.is_finished() || !self.udp_socket.is_empty() || self.udp_socket_allocation_failed {
+            return;
+        }
+        if self.udp_socket.try_reserve_exact(1).is_err() {
+            self.udp_socket_allocation_failed = true;
+            return;
+        }
+        self.udp_socket
+            .push(super::udp_socket::Snapshot::read(socket));
+    }
+
+    pub(crate) fn configure_protocol_buffers(
+        &mut self,
+        maximum_owners: usize,
+        role: l2tunnel_management::Role,
+    ) -> io::Result<()> {
+        if !self.protocol.is_empty() || self.is_finished() {
+            return Err(io::Error::other(
+                "protocol buffer observer already configured",
+            ));
+        }
+        self.protocol
+            .try_reserve_exact(1)
+            .map_err(io::Error::other)?;
+        self.protocol
+            .push(super::protocol_buffers::ProtocolBuffers::new(
+                maximum_owners,
+                role,
+            )?);
+        Ok(())
+    }
+    pub(crate) fn protocol_buffers(
+        &mut self,
+    ) -> Option<&mut super::protocol_buffers::ProtocolBuffers> {
+        if self.is_finished() {
+            None
+        } else {
+            self.protocol.first_mut()
+        }
+    }
     pub(crate) fn is_finished(&self) -> bool {
         self.finished.is_some()
     }
@@ -190,6 +242,18 @@ impl Observer {
                     .map_or(0, |snapshot| snapshot.owner_heap_bytes),
             )
             .saturating_add(self.path.capacity())
+            .saturating_add(
+                self.udp_socket.capacity() * std::mem::size_of::<super::udp_socket::Snapshot>(),
+            )
+            .saturating_add(
+                self.protocol.capacity()
+                    * std::mem::size_of::<super::protocol_buffers::ProtocolBuffers>(),
+            )
+            .saturating_add(
+                self.protocol
+                    .first()
+                    .map_or(0, super::protocol_buffers::ProtocolBuffers::heap_bytes),
+            )
             .saturating_add(
                 self.quic.capacity()
                     * std::mem::size_of::<crate::secure_udp::maintained_io::quic_metrics::Snapshot>(
@@ -308,6 +372,23 @@ impl Observer {
         } else {
             write!(writer, "null")?;
         }
+        write!(writer, ",\"udp_socket\":")?;
+        if let Some(snapshot) = self.udp_socket.first() {
+            snapshot.write(writer)?;
+        } else if self.udp_socket_allocation_failed {
+            write!(
+                writer,
+                "{{\"availability\":\"unavailable\",\"reason\":\"diagnostic_allocation_failed\",\"lane\":\"Shared\",\"readback_attempted\":false}}"
+            )?;
+        } else {
+            write!(writer, "null")?;
+        }
+        write!(writer, ",\"protocol_buffers\":")?;
+        if let Some(snapshot) = self.protocol.first() {
+            snapshot.write(writer)?;
+        } else {
+            write!(writer, "null")?;
+        }
         writeln!(writer, "}}")
     }
 
@@ -384,6 +465,66 @@ fn gauge(writer: &mut impl Write, value: Gauge) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn original_udp_readback_export_is_once_only_and_reports_unavailability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-udp-readback-report-{}.bmetrics",
+            std::process::id()
+        ));
+        let mut observer = Observer::for_test(Instant::now(), path.clone())?;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(other.local_addr()?).await?;
+        let before = observer.heap_bytes();
+        assert_eq!(observer.udp_socket.capacity(), 0);
+        observer.observe_udp_socket(&socket);
+        assert_eq!(observer.udp_socket.len(), 1);
+        assert_eq!(
+            observer.heap_bytes() - before,
+            observer.udp_socket.capacity()
+                * std::mem::size_of::<super::super::udp_socket::Snapshot>()
+        );
+        observer.observe_udp_socket(&other);
+        observer.finish_at(0);
+        observer.observe_udp_socket(&other);
+        let mut bytes = Vec::new();
+        observer.write_report(&mut bytes, 0)?;
+        let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            report["udp_socket"]["local"]["address"],
+            socket.local_addr()?.to_string()
+        );
+        assert_eq!(
+            report["udp_socket"]["peer"]["address"],
+            other.local_addr()?.to_string()
+        );
+        assert!(report["sites"].as_array().ok_or("sites array")?.is_empty());
+        assert_eq!(report["blocked_union"]["episodes"], 0);
+        drop(observer);
+        std::fs::remove_file(&path)?;
+
+        // Exercise serialization of the explicit allocation-refusal state,
+        // without relying on nondeterministic allocator exhaustion.
+        let mut unavailable = Observer::for_test(Instant::now(), path.clone())?;
+        unavailable.udp_socket_allocation_failed = true;
+        unavailable.observe_udp_socket(&socket);
+        assert_eq!(unavailable.udp_socket.capacity(), 0);
+        let mut bytes = Vec::new();
+        unavailable.write_report(&mut bytes, 0)?;
+        let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(report["udp_socket"]["availability"], "unavailable");
+        assert_eq!(
+            report["udp_socket"]["reason"],
+            "diagnostic_allocation_failed"
+        );
+        assert_eq!(report["udp_socket"]["readback_attempted"], false);
+        drop(unavailable);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[test]
     fn terminal_report_parses_and_preserves_censored_waits()
     -> Result<(), Box<dyn std::error::Error>> {

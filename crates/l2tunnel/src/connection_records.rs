@@ -262,6 +262,34 @@ impl Collection {
             );
         }
     }
+    /// Visit each actual Reliable recovery owner, preserving its full incarnation.
+    /// Reading existing retention neither polls nor allocates diagnostic state.
+    pub fn visit_recovery_buffers(
+        &self,
+        mut visit: impl FnMut(OwnerId, u64, l2tunnel_reliable::Storage),
+    ) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            visit(
+                OwnerId(index as u16),
+                slot.incarnation,
+                slot.endpoint.recovery_storage(),
+            );
+        }
+    }
+    /// Read every independent staged-source wait owner without advancing its clock.
+    pub fn visit_staged_admission(
+        &self,
+        observed: Duration,
+        mut visit: impl FnMut(OwnerId, u64, aligned::staged_wait::Snapshot),
+    ) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            visit(
+                OwnerId(index as u16),
+                slot.incarnation,
+                slot.endpoint.staged_admission_snapshot(observed),
+            );
+        }
+    }
     /// Select compact nested recovery bodies and route arms before any admission.
     /// The caller binds this format into authenticated session establishment.
     pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {

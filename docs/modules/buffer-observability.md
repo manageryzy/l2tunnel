@@ -46,16 +46,16 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-01 | Pipeline/MUX packet/byte/flow/DRR bounds | Actual Engine admission refusal callback implemented; aggregate refusal counts wired. Per-flow occupancy, reason-specific interval and DRR/policy attribution pending. |
 | BP-02 | ACK ingress candidates/slab | Common held-input capacity wait implemented; internal deliberate coalescing hold and per-flow replacement age export pending. |
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
-| BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Read-only actual codec gauges and typed refusals implemented. Per-owner runtime gauge/timing export pending. |
-| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Read-only head/lookahead gauges implemented. Missing context/source vs consumer intervals and runtime export pending. |
+| BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
+| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
 | BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Existing storage observations; dedicated builder, recovery/output and whole-write intervals pending. |
-| BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Existing timing/storage facts; actual capacity/ACK/RTO/physical/output-budget attribution and export pending. Exhaustion remains an error, not an invented wait. |
+| BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges and actual packing refusal implemented. Independent channel timing/export pending. |
 | BP-09 | Block FEC generations/equations/restored output | Rank/storage limits and bounded scratch remain; dedicated gauges/refusals/export pending. |
 | BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Existing status and work-used facts; nested codec gauges implemented. Recovery/work/feedback intervals pending. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
-| BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Independent owner timing/export pending. |
+| BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Sampled codec/recovery export preserves full independent owner incarnation; exact staged-source admission waits retain the same identity. Remaining lifecycle/source-free/native wait timing is pending. |
 | BP-14 | Common native read slab and exclusive unsealed/sealed User slot | Sampled runtime occupancy, actual held-input capacity and User send/receipt waits implemented. Raw metadata preparation reasons and full receipt latency decomposition pending. |
 | BP-15 | Native output pool/device credit/receipts | Runtime occupancy, actual pool-acquire refusal counts and device-write WouldBlock intervals implemented. A refused scan lease does not prove useful native output exists, so its interval remains unmeasured. Native credit/controller internals remain BP-03. |
 | BP-16 | Management message/recovery/reassembly/semantic/dispatch slots | Existing expiry snapshots retained; stream-specific occupancy and submission/dispatch/dependency timing pending. |
@@ -478,3 +478,129 @@ peer horizon can hold all 32 Hello payloads. Shared defaults, production limits,
 Failed attempts and their exact credit observations remain retained. Required
 check5 plus its focused and remaining-stage continuations provide scoped passing
 coverage; the original aggregate process remains recorded as failed.
+
+### Native12 observed carrier waits and kernel receive loss
+
+The [stable release12](../../work/aligned-extents-20261117/matrix-source-binding-12.json)
+builds checkpoint `d0692ae`. Four affected owned-namespace phases run in parallel
+under the unchanged 100/10Mbit/s, 35ms one-way delay and 15% per-direction loss
+configuration. [The phase summary](../../work/aligned-extents-20261117/native12-summary1.md)
+records raw/Aligned Compact forward at 5.4178368Mbit/s, genuine QUIC/Swift ARQ
+forward at 0.2629568Mbit/s, and retained TLS/Swift ARQ reverse at 0.2154624Mbit/s.
+These three ten-second data samples pass. Raw and TLS disconnect both peers;
+QUIC's second disconnect fails. UDP/Aligned Compact fails without qualified
+throughput. Every owned namespace is removed after identity/empty-PID checks.
+
+The [twelve buffer exports](../../work/aligned-extents-20261117/buffer-native12-report1/report.md)
+parse as partial observations. The QUIC sender's carrier wait union is
+50.232816 seconds over 60.655126 observed seconds (82.817%); the TLS sender spends
+45.551866 seconds in observed FlushPending over 64.994978 seconds (70.085%).
+These owner-lifetime intervals include warmup and drain, not only the ten-second
+application sample. The Common receipt intervals overlap them and must not be
+summed. They locate observed stalls but do not prove a unique congestion cause.
+
+UDP has no timed event in the currently attached singleton hooks. Its receiver
+namespace nevertheless records 2005 additional Udp.RcvbufErrors and InErrors.
+This is actual kernel receive-buffer loss beyond configured netem loss; tuple
+and packet-population attribution is retained separately from namespace totals.
+Zero observed user-space intervals therefore cannot establish absence of pressure.
+Receive service cost and unhooked protocol-owner waits require further work.
+
+The [updated mixed-version matrix](../../work/aligned-extents-20261117/matrix-report-repairs12-complete1/report.md)
+contains 15 passed, 186 failed, 32 bound-exhausted and 7 not-run selected phases.
+It preserves prior receipts and does not qualify all 80 combinations on release12.
+Full original-native overhead quantiles and BP-01 through BP-24 remain open.
+
+
+### Exact staged-source waits and source-proven CPU work
+
+The next source batch adds opt-in `protocol_buffers` to each Common observer.
+Two preallocated epoch tables use the catalog maximum of actual independent
+connection owners (at most 256); shared multi-channel endpoints use one row.
+Full epoch, configuration digest and connection incarnation remain explicit.
+Sampling occurs at most once per 100 ms when the loop is serviced, plus a
+forced sample at the original pre-settlement metric stop.
+Current/capacity/high-water observations are sampled gauges, not continuous
+occupancy or wait time. Unknown transmission-history use remains null, and
+unsupported recovery families produce no fabricated zero-use owner. Diagnostic
+backing is charged by its actual allocated row capacity and remains separate
+from protocol resource limits.
+
+Aligned/Packed now observe real retryable recovery admission refusals for the
+exact retained source ID and length. Repeated attempts preserve the first refusal
+time; only admission of that same source closes its episode. Send-capacity and
+sequence-window reasons can overlap; their owner-local union is recorded
+separately. Original injected time remains the only clock in public libraries.
+Owner failure freezes an unresolved episode; the runtime censors a fresh snapshot
+at its original pre-settlement metric stop. Between-sample owner retirement can
+still lose the unsampled tail, and bounded generation replacement is explicit.
+These limitations keep the complete BP-04/BP-07/BP-13 scope open.
+
+The report tool now validates known provider identities, bounds, invalid flags,
+occupancy and wait totals while preserving unavailable fields. Provider-specific
+waits are not added to generic collector percentages. The actual Common fixture
+must drive its MUX input through the real first recovery emission before checking
+ARQ retention; a nonempty queue alone must not create an admission wait.
+
+The separate [diagnostic profile](../../work/aligned-extents-20261117/diagnostic-udp-native12-perf1/profile-binding.json)
+uses the unchanged release12 binary, with both owned-daemon perf processes exiting
+zero and no lost samples. Sender selection accounts for 42 of 126 CPU-clock self
+samples. Receiver `memcmp` accounts for 22.29% of 157 samples under repeated
+Aligned preview admission. These small sampled CPU populations identify work;
+they are neither blocked-time percentages nor qualified goodput measurements.
+The [sender draft evidence](../../work/aligned-extents-20261117/compact-selection-draft/proposal.md)
+and [receiver evidence](../../work/aligned-extents-20261117/receiver-service-draft13/notes.md)
+explain the integrated changes: reuse one Compact ARQ selection across its exact
+length/budget preflight and actual emission, skip reparsing only successfully
+observed immutable recovery sources, and use the existing allocation-free
+canonical Common configuration digest. Selection/error precedence, authentication,
+conflicting-duplicate rejection, original deadlines and every resource bound
+remain unchanged. Remaining full-window iteration and deadline scans are open.
+
+The required [check6 attempt](../../work/aligned-extents-20261117/required-buffer-checks6-attempt1/validation.json)
+passed preflight and failed on a new test-only Result alias compile error; that
+error was corrected. Its [continuation](../../work/aligned-extents-20261117/required-buffer-checks6-continuation1.json)
+passes strict Clippy/rustdoc and the actual external Common CLI probe. Runtime
+has 312 passes and two failures: the new fixture sampled before real ARQ admission,
+and the existing raw Half/IP switch case again expired. The fixture is corrected
+in source; final focused validation follows separately. The exact raw test
+[passes one focused rerun](../../work/aligned-extents-20261117/raw-frame-check6-diagnosis1.json)
+through all four Full/Half TAP/TUN combinations, leaving its aggregate failure
+unresolved. Its `RAW_FAILURE_LANE dropped` field counts transport object destruction,
+not injected packet loss. Original failed receipts remain unchanged.
+
+[Native12 encapsulation layers](../../work/aligned-extents-20261117/native12-overhead-analysis1/report.md)
+retain both directions and their independent populations. Aligned UDP IP bytes
+outside the same emission's codec body are 58.979/60 B mean/p99 forward and
+58.536/59 B reverse; raw TCP is 71.820/73 B and 70.788/71 B respectively. Those
+joined framing measurements are not full original-native overhead. Genuine
+TLS/QUIC physical-packet extents remain unavailable at inner Records acceptance;
+all recorded Records protection samples are 21 B. Full-native mean/p99 and the
+complete same-build throughput matrix remain required.
+
+
+The same batch reads actual original Common UDP `SO_RCVBUF` and `SO_SNDBUF`
+once at runtime entry when diagnostics are enabled. `udp_socket` retains the
+actual local/peer tuple, independent option readback/error metadata and explicit
+allocation failure. No setter is called. Linux values remain kernel accounting
+byte limits rather than inferred payload capacity, current use or blocked time.
+The readback is runtime-owned and adds no OS dependency to public protocol crates.
+
+The [affected-source continuation](../../work/aligned-extents-20261117/buffer-hotpath-validation13c/receipt.json)
+passes recovery, reliable, codec, record integration, all twelve measured client
+cases, codec without default features and strict rustdoc. Two new Aligned fixture
+configurations initially selected an invalid 128-byte threshold for a 128-byte
+symbol; the fixtures now use a valid 100-byte threshold. The
+[final continuation](../../work/aligned-extents-20261117/buffer-hotpath-validation13d/receipt.json)
+passes strict workspace Clippy, both corrected preview tests and all 318 runtime
+tests. The report provider's thirteen Python tests also pass. Each continuation
+records unchanged source during execution. Unchanged simulator and harness
+receipts are reused rather than rerun. This is scoped passing coverage, not a
+single fresh all-green aggregate process.
+
+The original intermittent raw aggregate failures remain open. An opt-in bounded
+terminal trace now distinguishes the original User/Control adapter custody
+deadlines and pending receipt identities, without polling I/O or extending any
+limit. The final runtime continuation did not reproduce that failure, so the new
+trace has no observed failure sample yet. Native throughput qualification of this
+batch is still separate.

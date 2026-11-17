@@ -601,3 +601,42 @@ fn original_unit_witness_rejects_invalid_geometry_and_truncation() -> TestResult
     assert!(unit_witness(identity(0, 8), &symbol, policy).is_err());
     Ok(())
 }
+
+#[test]
+fn source_observation_keeps_full_scope_identity_conflicts_and_original_expiry() -> TestResult {
+    let mut config = limits();
+    config.source_window = 4;
+    config.lifetime_ticks = 10;
+    let mut receiver = Receiver::new(scope(), config)?;
+    let bytes = raw(1460, 0, 1, b"retained with a source gap");
+    assert!(!receiver.source_observed(scope(), SourceId(1))?);
+    receiver.admit_authenticated(identity(1, 1), &bytes, Tick(1))?;
+    assert!(receiver.source_observed(scope(), SourceId(1))?);
+    assert!(!receiver.source_observed(scope(), SourceId(5))?);
+    assert!(!receiver.source_observed(scope(), SourceId(0))?);
+    let mut foreign = scope();
+    foreign.epoch = Epoch(4);
+    assert_eq!(
+        receiver.source_observed(foreign, SourceId(1)),
+        Err(Error::Scope)
+    );
+    let before = receiver.status();
+    let deadline = receiver.deadline();
+    for _ in 0..32 {
+        assert!(receiver.source_observed(scope(), SourceId(1))?);
+    }
+    assert_eq!(receiver.status(), before);
+    assert_eq!(receiver.deadline(), deadline);
+    let changed = raw(1460, 0, 1, b"different retained bytes");
+    assert_eq!(
+        receiver.admit_authenticated(identity(1, 1), &changed, Tick(2)),
+        Err(Error::Conflict)
+    );
+    receiver.tick(Tick(10))?;
+    assert_eq!(receiver.tick(Tick(11)), Err(Error::Expired));
+    assert_eq!(
+        receiver.source_observed(scope(), SourceId(1)),
+        Err(Error::Expired)
+    );
+    Ok(())
+}

@@ -91,6 +91,8 @@ pub(in crate::secure_udp) struct PendingBufferSnapshot {
     pub bootstrap: bool,
     pub token_retained: bool,
     pub receipt_retained: bool,
+    /// Original retained cap; copied for exact terminal diagnostics only.
+    pub deadline: Instant,
     pub deadline_remaining_micros: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +293,7 @@ impl Pending {
             bootstrap: self.bootstrap,
             token_retained: self.token.is_some(),
             receipt_retained: self.receipt.is_some(),
+            deadline: self.deadline,
             deadline_remaining_micros: micros(self.deadline.saturating_duration_since(now)),
         }
     }

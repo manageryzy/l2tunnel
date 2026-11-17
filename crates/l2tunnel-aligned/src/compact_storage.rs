@@ -337,6 +337,7 @@ impl Endpoint {
             failure: None,
             compact_wire: false,
             compact_data_overhead: 0,
+            staged_wait: staged_wait::State::default(),
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes: bytes,

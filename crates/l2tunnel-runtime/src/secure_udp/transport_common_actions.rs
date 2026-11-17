@@ -756,11 +756,9 @@ fn original_scope(operation: transaction::Operation) -> Scope {
 pub(super) fn common_scope(epoch: core::Epoch, value: &C) -> io::Result<Scope> {
     Ok(Scope {
         epoch: security::Epoch(epoch.0),
-        configuration: security::ConfigDigest(
-            transaction::configuration_digest(value)
-                .map_err(protocol)?
-                .0,
-        ),
+        // The concrete canonical encoder validates the same complete value and
+        // domain using bounded stack storage; no per-record Vec is needed.
+        configuration: security::ConfigDigest(value.digest().map_err(protocol)?.0),
     })
 }
 fn outcome_operation(outcome: transactions::Outcome) -> transaction::Operation {

@@ -579,6 +579,29 @@ impl Receiver {
             && independent_length(parsed.body)
                 .is_some_and(|length| length <= self.limits.body.independent_short_frame_bytes))
     }
+    /// Inspect this scope's source ledger in constant time without admitting bytes.
+    ///
+    /// True means the source is below the contiguous admission floor or has a
+    /// retained proof with that complete source identity. This grants no payload
+    /// authentication or native delivery authority. A caller may skip repeated
+    /// admission only when it already owns the identical immutable payload and
+    /// independently services the receiver's original deadlines.
+    pub fn source_observed(&self, scope: Scope, source: SourceId) -> Result<bool, Error> {
+        if scope != self.scope {
+            return Err(Error::Scope);
+        }
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let floor = self.floor.ok_or(Error::Exhausted)?;
+        if source.0 < floor.0 {
+            return Ok(true);
+        }
+        let slot = (source.0 % self.limits.source_window as u64) as usize;
+        Ok(self.proofs[slot]
+            .as_ref()
+            .is_some_and(|proof| proof.source == source))
+    }
     /// Admit one authenticated complete protected symbol; errors consume no source ID.
     pub fn admit_authenticated(
         &mut self,

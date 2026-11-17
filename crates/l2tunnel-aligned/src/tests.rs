@@ -686,3 +686,47 @@ fn selected_compact_aligned_preview_preserves_gap_and_deduplicates_native_delive
     assert_eq!(right.status().receiver.early_tombstones, 0);
     Ok(())
 }
+
+#[test]
+fn staged_source_wait_tracks_actual_capacity_refusal_then_same_source_admission() -> TestResult {
+    let mut config = config(128);
+    config.recovery.repair_symbols = 0;
+    let mut sender = Endpoint::new(config, context(EndpointRole::Initiator))?;
+    let mut peer = Reliable::new(config.recovery, context(EndpointRole::Responder))?;
+    for source in 0..8 {
+        assert_eq!(sender.recovery.submit(b"retained", ms(0))?, source);
+    }
+    let frames = native_frames()?;
+    sender.enqueue_admitted(ChannelId(0), &frames[0], ms(0))?;
+    let waiting = sender.staged_admission_snapshot(ms(0));
+    let pending = waiting.pending.ok_or("actual blocked stage")?;
+    assert_eq!(pending.source, 8);
+    assert_eq!(pending.since, ms(0));
+    assert_eq!(waiting.union.completed_episodes, 0);
+    for packet in emissions(&mut sender, 1)? {
+        peer.receive(&packet, ms(1))?;
+    }
+    let repeated = sender.staged_admission_snapshot(ms(1));
+    assert_eq!(repeated.pending.map(|v| v.source), Some(8));
+    assert_eq!(repeated.pending.map(|v| v.since), Some(ms(0)));
+    assert!(repeated.refusals[0] > waiting.refusals[0]);
+    let mut output = vec![0; sender.max_packet_bytes()];
+    let mut budget = allowance(&sender);
+    let length = peer
+        .poll_feedback(ms(2), &mut output, &mut budget)?
+        .ok_or("peer feedback")?;
+    sender.receive_authenticated(&output[..length], ms(10))?;
+    assert!(emit(&mut sender, 10, false, &mut budget)?.is_some());
+    let completed = sender.staged_admission_snapshot(ms(10));
+    assert_eq!(completed.union.completed_episodes, 1);
+    assert_eq!(completed.union.completed, ms(10));
+    assert_eq!(completed.union.censored_episodes, 0);
+    assert!(
+        matches!(completed.last_resolved, Some(staged_wait::Resolved {
+        source: 8, since, at, bytes, censored: false,
+    }) if since == ms(0) && at == ms(10) && bytes == pending.bytes)
+    );
+    assert!(!completed.identity_mismatch);
+    assert!(!completed.clock_regression);
+    Ok(())
+}

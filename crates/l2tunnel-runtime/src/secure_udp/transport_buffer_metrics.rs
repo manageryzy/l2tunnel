@@ -46,7 +46,63 @@ impl Driver {
         }
     }
 
+    fn sample_protocol_buffers(&mut self, now: u64, force: bool) {
+        use crate::buffer_metrics::protocol_buffers::Identity;
+        let epochs = self.common_epochs();
+        let owner::DataOwner::Common(state) = &self.owner;
+        let Some(metrics) = self
+            .common
+            .as_deref_mut()
+            .and_then(|r| r.buffer_metrics.as_mut())
+        else {
+            return;
+        };
+        let Some(protocol) = metrics.protocol_buffers() else {
+            return;
+        };
+        if !protocol.due(now, force) {
+            return;
+        }
+        let mut identities = [None; 2];
+        let mut identity_failed = false;
+        for (index, epoch) in epochs.into_iter().enumerate() {
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            match state
+                .engine(epoch)
+                .and_then(|engine| engine.configuration().digest().map_err(invalid))
+            {
+                Ok(digest) => {
+                    identities[index] = Some(Identity {
+                        epoch: epoch.0,
+                        configuration: digest.0,
+                    })
+                }
+                Err(_) => {
+                    protocol.identity_unavailable();
+                    identity_failed = true;
+                }
+            }
+        }
+        if identity_failed {
+            protocol.defer_sample(now);
+            return;
+        }
+        if !protocol.begin(now, identities) {
+            return;
+        }
+        for (epoch, identity) in epochs.into_iter().zip(identities) {
+            if let (Some(epoch), Some(identity)) = (epoch, identity)
+                && let Ok(engine) = state.engine(epoch)
+            {
+                protocol.sample_engine(identity, now, engine);
+            }
+        }
+    }
+
     pub(super) fn sample_common_buffers(&mut self, now: u64) {
+        self.sample_protocol_buffers(now, false);
         let Some(runtime) = self.common.as_deref_mut() else {
             return;
         };
@@ -119,12 +175,16 @@ impl Driver {
         }
     }
     pub(super) fn finish_buffer_metrics(&mut self, now: u64) {
+        self.sample_protocol_buffers(now, true);
         self.sample_common_buffers(now);
         if let Some(metrics) = self
             .common
             .as_deref_mut()
             .and_then(|r| r.buffer_metrics.as_mut())
         {
+            if let Some(protocol) = metrics.protocol_buffers() {
+                protocol.finish_staged_admission(now);
+            }
             metrics.finish_at(now);
         }
     }

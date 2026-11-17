@@ -519,6 +519,7 @@ mod tests {
                     bootstrap: false,
                     token_retained: true,
                     receipt_retained: false,
+                    deadline: now,
                     deadline_remaining_micros: 0,
                 }),
                 control: None,

@@ -417,3 +417,111 @@ async fn actual_early_compact_feedback_keeps_original_input_until_delayed_whole_
     assert_eq!(socket_owner.addresses()?, a.original);
     Ok(())
 }
+
+#[tokio::test]
+async fn actual_common_protocol_buffers_sample_real_engine_before_terminal_freeze() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let (contracts, _) = super::compact::selected_compact(kind)?;
+    let fixture = Fixture::from_contracts_with_tail(kind, contracts, false).await?;
+    let [mut a, _b] = fixture.endpoints;
+    let path = std::env::temp_dir().join(format!(
+        "l2tunnel-protocol-buffer-terminal-{}.bmetrics",
+        std::process::id()
+    ));
+    let mut observer = crate::buffer_metrics::Observer::for_test(a.driver.origin, path.clone())?;
+    let role = common_contract::mg_role(a.driver.info.role);
+    let current = a.driver.common_state()?.current();
+    let expected_digest = current.digest()?;
+    observer.configure_protocol_buffers(1, role)?;
+    let local = current.descriptor().local(role);
+    let needed = common_contract::maximum_body(local.send(), local.receive())?
+        .checked_add(a.driver.config.control.wire_overhead)
+        .and_then(|bytes| bytes.checked_add(a.driver.reserve))
+        .ok_or("actual wire requirement overflow")?;
+    a.driver
+        .common
+        .as_deref_mut()
+        .ok_or("Common owner")?
+        .buffer_metrics = Some(observer);
+    let now = clock(a.driver.origin, Instant::now())?.max(a.driver.bucket.ready_at(needed)?);
+    a.driver.sample_common_buffers(now);
+    let epoch = a.driver.common_state()?.epoch();
+    a.driver
+        .common_state_mut()?
+        .entry(epoch)?
+        .enqueue_borrowed(engine::Tick(now + 1), &frame(28_880, 71))?;
+    // Enqueue retains a MUX item. The production send path must actually admit
+    // that item into the codec and poll its first recovery output before sampling.
+    a.driver.bucket.refill(now + 2)?;
+    assert!(
+        !a.driver
+            .send_common_user_with(now + 2, |_| Err(io::ErrorKind::WouldBlock.into()))?
+    );
+    let first = a
+        .driver
+        .common_state_mut()?
+        .entry(epoch)?
+        .pending_carrier_output()
+        .ok_or("actual first recovery emission")?;
+    assert_eq!(
+        first.emission().kind,
+        engine::EmissionKind::Source(engine::SourceForm::DirectArq)
+    );
+    a.driver.sample_common_buffers(now + 50_000); // The periodic cadence must skip this observation.
+    a.driver.finish_buffer_metrics(now + 50_000); // Forced sample precedes the terminal freeze.
+    let metrics = a
+        .driver
+        .common
+        .as_deref_mut()
+        .ok_or("Common owner")?
+        .buffer_metrics
+        .as_mut()
+        .ok_or("observer")?;
+    assert!(metrics.is_finished());
+    assert!(metrics.protocol_buffers().is_none());
+    drop(
+        a.driver
+            .common
+            .as_deref_mut()
+            .ok_or("Common owner")?
+            .buffer_metrics
+            .take(),
+    );
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    std::fs::remove_file(path)?;
+    assert_eq!(json["finished_at_us"], now + 50_000);
+    let provider = &json["protocol_buffers"];
+    assert_eq!(provider["identity_errors"], 0);
+    assert_eq!(provider["staged_terminal_unavailable"], 0);
+    let observed = &provider["epochs"][0];
+    assert_eq!(observed["epoch"], epoch.0);
+    let digest: String = expected_digest
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(observed["configuration_digest_hex"], digest);
+    assert_eq!(observed["samples"], 2);
+    assert_eq!(observed["last_sample_us"], now + 50_000);
+    let row = &observed["owners"][0];
+    assert_eq!(row["scope"], "endpoint-shared");
+    assert_eq!(row["samples"], 2);
+    let retention = row["gauges"]
+        .as_array()
+        .ok_or("actual gauges")?
+        .iter()
+        .find(|value| value["name"] == "arq_send_records")
+        .ok_or("actual ARQ retention")?;
+    assert!(retention["used"].as_u64().is_some_and(|used| used > 0));
+    assert_eq!(retention["high_water"], retention["used"]);
+    let wait = &row["staged_admission"];
+    assert_eq!(wait["terminal_stage"], "pre_settlement_metric_stop");
+    assert_eq!(wait["terminal_at_us"], now + 50_000);
+    assert_eq!(wait["union"]["completed_episodes"], 0);
+    assert_eq!(wait["union"]["censored_episodes"], 0);
+    assert!(
+        wait["pending"].is_null(),
+        "nonempty retention alone must not open a wait"
+    );
+    Ok(())
+}

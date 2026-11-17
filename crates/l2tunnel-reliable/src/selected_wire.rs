@@ -384,38 +384,55 @@ impl Reliable {
         output: &mut [u8],
         budget: &mut OutboundBudget,
     ) -> Result<Option<usize>, Error> {
-        let Some(body) = self.arq.body_packet_bytes(now, feedback)? else {
-            return Ok(None);
-        };
-        let bytes = 1 + body;
         let kind = if feedback {
             RecordKind::Feedback
         } else {
             RecordKind::Source
         };
-        let charge = bytes
-            .checked_add(self.selected_overhead(kind))
-            .ok_or(Error::Exhausted)?;
-        if budget.packets == 0 || budget.wire_bytes < charge {
-            return Ok(None);
-        }
-        if output.len() < bytes {
-            return Err(Error::OutputTooSmall { required: bytes });
-        }
+        let overhead = self.selected_overhead(kind);
+        let output_capacity = output.len();
         let before = self.arq.statistics().retransmissions;
-        let owner = self.arq.compact_mut()?;
-        let encode =
-            |view: CompactPacketView<'_>| view.encode_compact_into(&mut output[1..]).map(Some);
-        let emitted = if feedback {
-            owner.poll_feedback_with(now, &mut self.scratch, encode)
-        } else {
-            owner.poll_source_with(now, encode)
-        }
-        .map_err(|error| match error {
-            l2tunnel_recovery::CompactPollError::Recovery(error)
-            | l2tunnel_recovery::CompactPollError::Encode(error) => Error::Arq(error),
-        })?;
-        if emitted != Some(body) {
+        let mut admitted = None;
+        let emitted = self
+            .arq
+            .compact_mut()?
+            .poll_admitted_body_with(
+                now,
+                if feedback {
+                    l2tunnel_recovery::CompactPacketKind::Feedback
+                } else {
+                    l2tunnel_recovery::CompactPacketKind::Data
+                },
+                &mut self.scratch,
+                |body| {
+                    let bytes = 1 + body;
+                    let charge = bytes.checked_add(overhead).ok_or(Error::Exhausted)?;
+                    if budget.packets == 0 || budget.wire_bytes < charge {
+                        return Ok(false);
+                    }
+                    if output_capacity < bytes {
+                        return Err(Error::OutputTooSmall { required: bytes });
+                    }
+                    admitted = Some((body, bytes, charge));
+                    Ok(true)
+                },
+                |view| {
+                    view.encode_compact_into(&mut output[1..])
+                        .map(Some)
+                        .map_err(Error::Arq)
+                },
+            )
+            .map_err(|error| match error {
+                l2tunnel_recovery::CompactPollError::Recovery(error) => Error::Arq(error),
+                l2tunnel_recovery::CompactPollError::Encode(error) => error,
+            })?;
+        let Some(emitted) = emitted else {
+            return Ok(None);
+        };
+        let Some((body, bytes, charge)) = admitted else {
+            return self.fail(Error::Malformed);
+        };
+        if emitted != body {
             return self.fail(Error::Malformed);
         }
         output[0] = if feedback { 2 } else { 1 };

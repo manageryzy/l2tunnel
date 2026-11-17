@@ -482,3 +482,155 @@ fn selected_compact_arq_short_aligned_unit_charges_actual_bytes_and_preserves_wi
     assert_eq!(a.storage_usage(), Some(usage));
     Ok(())
 }
+
+fn preview_gap_peers() -> TestResult<(Endpoint, Endpoint)> {
+    let mut config = policy(false, false)?.base;
+    config.native_policy = NativePolicy::RawIp;
+    config.receiver.first_record = receiver::RecordId(0);
+    config.receiver.body.elide_payload_length = false;
+    config.receiver.body.predictive = false;
+    config.receiver.body.timestamp_pair_dictionary = false;
+    config.receiver.body.independent_short_frame_bytes = 100;
+    config.receiver.lookahead_records = 1;
+    let plan = compact_storage::Plan::for_duplex(config, config)?;
+    let make = |role| -> TestResult<Endpoint> {
+        let mut endpoint = Endpoint::new_compact_duplex_reserved(
+            config,
+            config,
+            tests::context(role),
+            storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            },
+        )?;
+        endpoint.enable_compact_wire_with_overheads(49, 61)?;
+        Ok(endpoint)
+    };
+    Ok((
+        make(EndpointRole::Initiator)?,
+        make(EndpointRole::Responder)?,
+    ))
+}
+
+fn preview_packet(owner: &mut Endpoint, bytes: &[u8]) -> TestResult<Vec<u8>> {
+    owner.enqueue_admitted_raw(ChannelId(0), bytes, Duration::ZERO)?;
+    let mut packet = vec![0; owner.max_packet_bytes()];
+    let mut budget = OutboundBudget {
+        packets: 1,
+        wire_bytes: 100_000,
+    };
+    let length = owner
+        .poll_data_independent(Duration::ZERO, &mut packet, &mut budget)?
+        .ok_or("actual preview source")?;
+    packet.truncate(length);
+    let token = owner
+        .pending_data_output()
+        .ok_or("actual physical source")?;
+    owner.confirm_output_at(Duration::ZERO, Duration::ZERO, token)?;
+    Ok(packet)
+}
+
+#[test]
+fn known_preview_skips_only_successful_sources_and_retries_actual_capacity() -> TestResult {
+    let (mut sender, mut receiver) = preview_gap_peers()?;
+    let usage = receiver.storage_usage().ok_or("reserved receiver")?;
+    let frames = [vec![0x37; 100], vec![0x38; 100], vec![0; 100]];
+    let packets = frames
+        .iter()
+        .map(|bytes| preview_packet(&mut sender, bytes))
+        .collect::<TestResult<Vec<_>>>()?;
+    receiver.receive_authenticated_at(
+        &packets[1],
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+    )?;
+    receiver.receive_authenticated_at(
+        &packets[2],
+        Duration::from_millis(2),
+        Duration::from_millis(2),
+    )?;
+    assert!(
+        receiver
+            .receiver
+            .source_observed(receiver.receive_scope, receiver::SourceId(1))?
+    );
+    assert!(
+        !receiver
+            .receiver
+            .source_observed(receiver.receive_scope, receiver::SourceId(2))?
+    );
+    let deadline = receiver.receiver.deadline();
+    for tick in 3..8 {
+        receiver.tick(Duration::from_millis(tick))?;
+        assert_eq!(receiver.receiver.deadline(), deadline);
+        assert!(
+            !receiver
+                .receiver
+                .source_observed(receiver.receive_scope, receiver::SourceId(2))?
+        );
+    }
+    receiver.receive_authenticated_at(
+        &packets[0],
+        Duration::from_millis(8),
+        Duration::from_millis(8),
+    )?;
+    assert_eq!(
+        receiver.prepare_ordered(ChannelId(0), Duration::from_millis(8), 1)?,
+        Prepared::Ready
+    );
+    assert_eq!(receiver.pending().ok_or("head native")?.bytes, frames[0]);
+    receiver.commit_delivery(Duration::from_millis(8))?;
+    assert!(
+        receiver
+            .receiver
+            .source_observed(receiver.receive_scope, receiver::SourceId(2))?
+    );
+    for frame in &frames[1..] {
+        assert_eq!(
+            receiver.prepare_ordered(ChannelId(0), Duration::from_millis(8), 1)?,
+            Prepared::Ready
+        );
+        assert_eq!(receiver.pending().ok_or("ordered native")?.bytes, frame);
+        receiver.commit_delivery(Duration::from_millis(8))?;
+    }
+    assert_eq!(
+        receiver.prepare(ChannelId(0), Duration::from_millis(8), 1)?,
+        Prepared::Idle
+    );
+    assert_eq!(receiver.status().receiver.retained_records, 0);
+    assert_eq!(receiver.storage_usage(), Some(usage));
+    Ok(())
+}
+
+#[test]
+fn known_preview_does_not_bypass_recovery_conflicting_duplicate() -> TestResult {
+    let (mut sender, mut receiver) = preview_gap_peers()?;
+    let _missing = preview_packet(&mut sender, &[0x31; 100])?;
+    let packet = preview_packet(&mut sender, &[0x32; 100])?;
+    receiver.receive_authenticated_at(
+        &packet,
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+    )?;
+    assert!(
+        receiver
+            .receiver
+            .source_observed(receiver.receive_scope, receiver::SourceId(1))?
+    );
+    receiver.tick(Duration::from_millis(2))?;
+    let before = receiver.receiver.status();
+    let mut conflict = packet.clone();
+    *conflict.last_mut().ok_or("source body")? ^= 1;
+    assert!(matches!(
+        receiver.receive_authenticated_at(
+            &conflict,
+            Duration::from_millis(3),
+            Duration::from_millis(3)
+        ),
+        Err(Error::Recovery(l2tunnel_reliable::Error::Arq(
+            RecoveryError::ConflictingDuplicate
+        )))
+    ));
+    assert_eq!(receiver.receiver.status(), before);
+    assert!(receiver.pending().is_none());
+    Ok(())
+}

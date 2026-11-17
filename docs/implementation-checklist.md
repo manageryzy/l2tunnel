@@ -79,6 +79,22 @@ and its passing focused/remaining-stage continuations remain separate receipts;
 renewed native validation is pending. BP-01..BP-24 and full matrix/overhead gates
 remain open.
 
+The [native12 follow-up](modules/buffer-observability.md#native12-observed-carrier-waits-and-kernel-receive-loss)
+passes affected raw/Aligned forward, genuine QUIC/Swift forward and TLS/Swift
+reverse data phases. UDP still fails with 2005 receiver-kernel buffer drops;
+QUIC bilateral shutdown remains unqualified. Timed carrier waits locate substantial
+QUIC submission and TLS flush stalls. All-buffer intervals and full matrix/overhead
+qualification remain required.
+
+The [exact-stage and CPU-work batch](modules/buffer-observability.md#exact-staged-source-waits-and-source-proven-cpu-work)
+adds per-epoch/per-incarnation sampled occupancy and true retained-source
+refusal-to-admission intervals, validates unavailable/invalid provider data, and
+removes source-proven duplicate ARQ selection and Aligned preview work. Required
+check6 and its failed raw aggregate are retained. The final scoped continuation
+passes strict workspace Clippy, corrected preview tests and all 318 runtime tests;
+the intermittent raw failure remains unresolved. Native qualification is separate.
+No complete BP or CWC gate closes.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

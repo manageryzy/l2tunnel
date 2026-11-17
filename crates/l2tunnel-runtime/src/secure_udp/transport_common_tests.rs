@@ -1031,3 +1031,18 @@ mod native_window;
 
 #[path = "transport_common_native_batch_tests.rs"]
 mod native_batch;
+
+#[test]
+fn current_common_scope_matches_canonical_digest_without_allocating_encoder() -> Result {
+    for appearance in [cover::Appearance::QuicLike, cover::Appearance::MediaLike] {
+        for value in udp_values(appearance)? {
+            let expected = transaction::configuration_digest(&value)?;
+            for epoch in [core::Epoch(1), core::Epoch(17), core::Epoch(u64::MAX)] {
+                let scope = common_actions::common_scope(epoch, &value)?;
+                assert_eq!(scope.epoch.0, epoch.0);
+                assert_eq!(scope.configuration.0, expected.0);
+            }
+        }
+    }
+    Ok(())
+}

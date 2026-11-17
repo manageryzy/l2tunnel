@@ -111,6 +111,134 @@ def gauge(value, name, issues):
     return result
 
 
+
+def protocol_provider(value):
+    """Validate known provider metadata without deriving a union or filling nulls."""
+    result = {'status': 'unavailable', 'issues': [], 'coverage_gaps': [],
+              'definition': 'Separate protocol-owner observations; not included in generic '
+                            'collector rankings or its union percentage; unknown remains unknown.'}
+    if value is None:
+        return result
+    issues, gaps = result['issues'], result['coverage_gaps']
+
+    def boolean(obj, key, path, invalid=False):
+        require(type(obj.get(key)) is bool, path + '.' + key + ': expected boolean')
+        if invalid and obj[key]:
+            issues.append(path + ': producer invalid flag ' + key)
+
+    def number(obj, key, path, nullable=False):
+        require(key in obj, path + ': missing ' + key)
+        return uint(obj[key], path + '.' + key, nullable)
+
+    def totals(obj, path):
+        obj = object_value(obj, path)
+        for kind in ('completed', 'censored'):
+            count = number(obj, kind + '_episodes', path)
+            elapsed = number(obj, kind + '_us', path)
+            maximum = number(obj, 'maximum_' + kind + '_us', path)
+            if maximum > elapsed or (count == 0 and (elapsed or maximum)):
+                issues.append(path + ': inconsistent ' + kind + ' totals')
+
+    try:
+        value = object_value(value, 'protocol_buffers')
+        require('schema' not in value or (type(value['schema']) is int and value['schema'] == 1),
+                'protocol_buffers: unsupported provider schema')
+        for key in ('identity_errors', 'clock_regressions'):
+            if number(value, key, 'protocol_buffers'):
+                issues.append('protocol_buffers: nonzero ' + key)
+        boolean(value, 'counter_overflow', 'protocol_buffers', True)
+        for key in ('retired_epochs_omitted', 'retired_owner_generations_omitted',
+                    'unsupported_codec_samples', 'staged_terminal_unavailable'):
+            # Occupancy-only producers predate the optional staged wait fields.
+            if key == 'staged_terminal_unavailable' and key not in value:
+                gaps.append('staged admission terminal coverage unavailable')
+            elif number(value, key, 'protocol_buffers'):
+                gaps.append(key + '=' + str(value[key]))
+        epochs = value.get('epochs')
+        require(isinstance(epochs, list) and len(epochs) <= 2,
+                'protocol_buffers: invalid epoch array bound')
+        identities = set()
+        for ei, epoch in enumerate(epochs):
+            path = 'protocol_buffers.epochs[' + str(ei) + ']'
+            epoch = object_value(epoch, path)
+            digest = epoch.get('configuration_digest_hex')
+            require(isinstance(digest, str) and len(digest) == 64 and
+                    all(c in '0123456789abcdef' for c in digest), path + ': invalid digest')
+            identity = (number(epoch, 'epoch', path), digest)
+            require(identity not in identities, path + ': duplicate epoch identity')
+            identities.add(identity)
+            boolean(epoch, 'live_at_last_sample', path)
+            width = number(epoch, 'owner_capacity', path)
+            require(1 <= width <= 256, path + ': invalid owner capacity')
+            owners = epoch.get('owners')
+            require(isinstance(owners, list) and len(owners) <= width,
+                    path + ': invalid owner array bound')
+            seen = set()
+            for oi, owner in enumerate(owners):
+                prefix = path + '.owners[' + str(oi) + ']'
+                owner = object_value(owner, prefix)
+                scope = owner.get('scope')
+                if scope == 'endpoint-shared':
+                    require(owner.get('owner') is None and owner.get('incarnation') is None,
+                            prefix + ': shared owner has independent identity')
+                    identity = (scope, None, None)
+                else:
+                    require(scope == 'independent-connection', prefix + ': unknown owner scope')
+                    index = number(owner, 'owner', prefix)
+                    incarnation = number(owner, 'incarnation', prefix)
+                    require(index < width and incarnation > 0, prefix + ': invalid owner identity')
+                    identity = (scope, index, incarnation)
+                require(identity not in seen, prefix + ': duplicate owner identity')
+                seen.add(identity)
+                for key in ('invalid_occupancy', 'counter_overflow'):
+                    boolean(owner, key, prefix, True)
+                gauges = owner.get('gauges')
+                require(isinstance(gauges, list) and len(gauges) <= 128,
+                        prefix + ': invalid gauge array bound')
+                names = set()
+                for item in gauges:
+                    item = object_value(item, prefix + '.gauge')
+                    name = label(item.get('name'), prefix + '.gauge.name')
+                    require(name not in names, prefix + ': duplicate gauge name')
+                    names.add(name)
+                    number(item, 'samples', prefix + '.' + name)
+                    used, cap, high = (number(item, key, prefix + '.' + name, True)
+                                       for key in ('used', 'capacity', 'high_water'))
+                    if (used is None) != (high is None):
+                        issues.append(prefix + '.' + name + ': inconsistent use availability')
+                    if used is not None and ((cap is not None and used > cap) or
+                                             (high is not None and used > high)):
+                        issues.append(prefix + '.' + name + ': impossible occupancy')
+                wait = owner.get('staged_admission')
+                if wait is None:
+                    gaps.append(prefix + ': staged admission timing unavailable')
+                    continue
+                wait = object_value(wait, prefix + '.staged_admission')
+                for key in ('clock_regression', 'identity_mismatch', 'counter_overflow'):
+                    boolean(wait, key, prefix + '.staged_admission', True)
+                observed = number(wait, 'observed_at_us', prefix)
+                terminal = number(wait, 'terminal_at_us', prefix, True)
+                opened = number(wait, 'open_us', prefix, True)
+                totals(wait.get('union'), prefix + '.staged_admission.union')
+                if terminal is not None and (terminal != observed or opened is not None):
+                    issues.append(prefix + ': invalid staged terminal boundary')
+                if (opened is None) != (wait.get('pending') is None):
+                    issues.append(prefix + ': inconsistent staged source/open availability')
+                reasons = wait.get('reasons')
+                require(isinstance(reasons, list) and len(reasons) == 2,
+                        prefix + ': invalid staged reason array')
+                require([r.get('reason') if isinstance(r, dict) else None for r in reasons] ==
+                        ['send_capacity', 'sequence_window'], prefix + ': unknown staged reasons')
+                for reason in reasons:
+                    number(reason, 'refused_attempts', prefix)
+                    totals(reason.get('totals'), prefix + '.' + reason['reason'])
+        result['status'] = 'invalid_observations' if issues else 'validated_known_fields_partial'
+    except ValueError as error:
+        issues.append(str(error))
+        result['status'] = 'invalid_or_unrecognized_shape'
+    return result
+
+
 def normalize(value, source, digest):
     value = object_value(value, 'input')
     require(type(value.get('schema')) is int and value['schema'] == 1,
@@ -187,6 +315,8 @@ def normalize(value, source, digest):
                                row['class'], row['reason']))
     counts.sort(key=lambda row: (-row['untimed_refusals'], row['site'], row['lane'],
                                 row['class'], row['reason']))
+    protocol = protocol_provider(value.get('protocol_buffers'))
+    issues.extend(protocol['issues'])
     ratio = None
     if not issues and span is not None and span > 0:
         ratio = 100.0 * union['observed_us'] / span
@@ -200,6 +330,7 @@ def normalize(value, source, digest):
         'percentage_unavailable_reason': None if ratio is not None else
         ('invalid_observations' if issues else 'unknown_or_zero_observed_span'),
         'wait_ranking': waits, 'count_only_refusals': counts, 'occupancy': occupancy,
+        'protocol_provider_validation': protocol,
         'provider_metadata': {key: item for key, item in value.items() if key not in CORE_FIELDS},
         'provider_metadata_definition': 'Preserved source fields; no queue usage derived from provider space or limits.',
     }
@@ -253,7 +384,8 @@ def table(lines, columns, rows):
 def markdown(report):
     lines = ['# Observed buffer pressure', '', DEFINITION, '',
              'Status: ' + report['status'] + '. Raw and QUIC provider fields are retained in JSON; '
-             'provider-private queue usage is not inferred. No end-to-end blocked percentage is calculated.']
+             'provider-private queue usage is not inferred. Generic collector percentages exclude separate '
+             'protocol-owner waits. No end-to-end blocked percentage is calculated.']
     for index, owner in enumerate(report['owners'], 1):
         union = owner['blocked_union']
         percentage = owner['owner_union_percent_of_observed_span']
@@ -266,6 +398,10 @@ def markdown(report):
                 union['open_us'] if union['open_us'] is not None else 'none open',
                 f'{percentage:.6f}%' if percentage is not None else
                 'unavailable: ' + owner['percentage_unavailable_reason']]])
+        protocol = owner['protocol_provider_validation']
+        lines.extend(['', 'Protocol provider: ' + cell(protocol['status']) + '. ' +
+                      protocol['definition']])
+        lines.extend('- ' + cell(gap) for gap in protocol['coverage_gaps'])
         if owner['issues']:
             lines.extend(['', 'Diagnostic invalidity (values retained, percentage suppressed):'])
             lines.extend('- ' + cell(issue) for issue in owner['issues'])
@@ -282,7 +418,7 @@ def markdown(report):
                     row['blocked']['maximum_us'], row['refusals'], row['timing_coverage']]
                    for row in owner['wait_ranking']])
         else:
-            lines.extend(['', 'No timed episode was observed; unhooked waits remain unmeasured.'])
+            lines.extend(['', 'No generic collector timed episode was observed; protocol-owner and unhooked waits are not zero.'])
         lines.extend(['', '### Count-only refusals', '',
                       'These counts do not establish wait duration and are excluded from the timed union.'])
         if owner['count_only_refusals']:

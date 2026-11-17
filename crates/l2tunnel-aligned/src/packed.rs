@@ -617,6 +617,10 @@ impl Endpoint {
     ) -> Option<l2tunnel_recovery::CompactRetryFailureSnapshot> {
         self.0.compact_retry_failure_snapshot()
     }
+    /// Read the actual inner staged-source wait owner without protocol mutation.
+    pub fn staged_admission_snapshot(&self, observed: Duration) -> super::staged_wait::Snapshot {
+        self.0.staged_admission_snapshot(observed)
+    }
     /// Actual source/retry receipt counters from the authoritative ARQ owner.
     pub fn arq_statistics(&self) -> l2tunnel_recovery::Statistics {
         self.0.arq_statistics()
@@ -625,6 +629,11 @@ impl Endpoint {
     pub fn status(&self) -> Status {
         self.0.status()
     }
+    /// Returns recovery retention without scanning codec receiver state.
+    pub fn recovery_storage(&self) -> l2tunnel_reliable::Storage {
+        self.0.recovery_storage()
+    }
+
     /// Actual nested codec retention; this does not poll recovery or consume output.
     pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
         self.0.codec_buffer_snapshot()
