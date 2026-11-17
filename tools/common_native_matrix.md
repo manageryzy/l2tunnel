@@ -59,6 +59,13 @@ The data pattern is deterministic pseudorandom64KiB; payload compression is off
 in the supplied baseline. Failed phases do not trigger reconnect, retries,
 algorithm replacement or timeout changes. Remaining phases are explicitly
 `not_run`; later independent cases may continue after successful cleanup.
+The current exporter also sets an original120-second session lease. Three slow
+phases can cumulatively exhaust it even when each phase fits its60-second cap.
+Report `LeaseExpired` as observed; use explicitly labeled independent phase
+sessions to isolate a direction without extending that lease or implying one
+continuous three-phase pass. The stable `swift-arq` ID disables proportional
+repairs only; Swift's existing tail-probe repair equations remain enabled and
+are counted as repair traffic.
 
 ## Metric definitions
 

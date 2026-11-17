@@ -142,6 +142,14 @@ pub(super) fn validate<I: PacketIo>(
     inputs: &RawInputs<I>,
     config: PairConfig,
 ) -> Result<Profile, PairError> {
+    let (first, second) = inputs.configs();
+    validate_configs(first, second, config)
+}
+pub(super) fn validate_configs(
+    a: Config,
+    b: Option<Config>,
+    config: PairConfig,
+) -> Result<Profile, PairError> {
     config.messages.validate().map_err(PairError::Start)?;
     config
         .driver
@@ -156,7 +164,6 @@ pub(super) fn validate<I: PacketIo>(
     {
         return Err(PairError::Configuration);
     }
-    let (a, b) = inputs.configs();
     l2tunnel_raw_tcp::IpConfig::from(a)
         .validate()
         .map_err(|_| PairError::Configuration)?;

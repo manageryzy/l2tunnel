@@ -123,6 +123,14 @@ impl Request {
         Ok(ConfigDigest(finish(h)))
     }
 }
+/// Queue bounds copied from a genuine QUIC owner, without occupancy or flight claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuicQueues {
+    /// Configured receive queue and adapter custody ceiling, not occupancy.
+    pub maintained_queue_bytes: usize,
+    /// Actual outgoing Quinn FIFO ceiling, not physical in-flight bytes.
+    pub maintained_send_queue_bytes: usize,
+}
 /// Actual verified lane; copied observations cannot construct its transport owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Lane {
@@ -132,6 +140,8 @@ pub struct Lane {
     pub local: SocketAddr,
     /// Actual peer endpoint, never a replacement for cryptographic identity.
     pub peer: SocketAddr,
+    /// Queue bounds obtained from the genuine QUIC owner; absent for TLS.
+    pub quic_queues: Option<QuicQueues>,
 }
 /// Opaque genuine Full/Half proof used by the subsequent Noise/member handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +224,13 @@ impl Authenticated {
                     ));
                 }
             };
+            match (requested.kind, lane.quic_queues) {
+                (Kind::TlsStream, None) => {}
+                (Kind::QuicDatagram, Some(queues))
+                    if queues.maintained_send_queue_bytes > 0
+                        && queues.maintained_send_queue_bytes <= queues.maintained_queue_bytes => {}
+                _ => return Err(invalid("maintained actual queue observations differ")),
+            }
             // Scoped routing attributes are host-local, not a shared peer tuple.
             // This selected binding requires unscoped addresses until local route
             // selection and canonical peer identity have separate representations.

@@ -16,6 +16,22 @@ mod transaction;
 use gate::{GateIo, GateState, SharedBudget};
 pub use transaction::{PacketCarrier, PacketSetup, begin_packet_client, begin_packet_server};
 
+/// Immutable lane limits copied from the genuine original-owner handoff.
+/// These are byte capacities, not current occupancy or transfer authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaneLimits {
+    /// Actual local receive/reorder horizon after the advertised-window cap.
+    pub local_horizon_bytes: u64,
+    /// Actual peer receive/reorder horizon after the advertised-window cap.
+    pub peer_horizon_bytes: u64,
+    /// Fixed bytes reserved beyond Data admission for feedback and controls.
+    pub data_reserve_bytes: u64,
+    /// Maximum local Data byte debt after the fixed peer-window reserve.
+    pub send_data_capacity_bytes: u64,
+    /// Maximum peer Data byte debt after the fixed local-window reserve.
+    pub receive_data_capacity_bytes: u64,
+}
+
 /// Immutable experimental packet policy; all limits are authenticated before use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketPolicy {

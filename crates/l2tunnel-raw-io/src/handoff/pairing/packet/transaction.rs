@@ -7,6 +7,9 @@ use tokio::time::{sleep, sleep_until};
 #[path = "compact_owner.rs"]
 mod compact_owner;
 
+// This fixed interval is already committed by PacketPolicy::digest.
+const TRANSITION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 struct Detached<I: PacketIo> {
     io: GateIo<I>,
     _tcp: QuiescentTcp,
@@ -204,6 +207,11 @@ impl<I: PacketIo> Detached<I> {
                     // A staged header cannot grant physical report credit. Retain
                     // the exact snapshot until this same packet is accepted.
                     self.retirement_reported = self.retirement_reported.max(p.retired);
+                    if !p.bootstrap && p.kind == wire::Kind::Ping {
+                        // Retry spacing starts at actual acceptance, while the
+                        // independent last_alive deadline remains unchanged.
+                        self.last_ping = self.io.last_send_at.ok_or(Error::Proof)?;
+                    }
                     if let Some(token) = self.tracked.take() {
                         if self.completed.is_some() {
                             return Err(Error::Proof);
@@ -268,7 +276,7 @@ impl<I: PacketIo> Detached<I> {
             && self.copies < 32
             && self
                 .last_transition
-                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250))
+                .is_none_or(|t| now.saturating_duration_since(t) >= TRANSITION_RETRY_INTERVAL)
     }
 }
 
@@ -336,6 +344,88 @@ fn recover<I: PacketIo>(inputs: RawInputs<GateIo<I>>) -> RawInputs<I> {
         },
     }
 }
+fn configuration<I: PacketIo + Send + 'static>(
+    config: PacketPhaseConfig,
+    a: Config,
+    b: Option<Config>,
+) -> Result<(PairConfig, [u8; 32], usize), Error> {
+    config.packet.validate()?;
+    if config.pair.messages.max_payload < 244
+        || config.pair.messages.messages_per_direction < 5
+        || config.pair.messages.bytes_per_direction < 912
+    {
+        return Err(Error::Configuration);
+    }
+    if a.mtu != usize::from(config.packet.mtu) || b.is_some_and(|b| b.mtu != a.mtu) {
+        return Err(Error::Configuration);
+    }
+    let policy = config.packet.digest(config.pair.session.digest)?;
+    let mut pair = config.pair;
+    pair.session.digest = ConfigDigest(hash_parts(b"l2tunnel/raw-packet-pair/v1\0", &[&policy]));
+    let profile = profile::validate_configs(a, b, pair)?;
+    let retained = (profile.count as u64)
+        .checked_mul(
+            (u64::from(config.packet.queue_packets) + 11) * u64::from(config.packet.mtu)
+                + 65_536
+                + 2 * 128
+                + 104,
+        )
+        .and_then(|n| n.checked_add(2 * 280 + 2 * 104))
+        .ok_or(Error::Capacity)?;
+    let peak = retained
+        .checked_add(profile.count as u64 * (2 * u64::from(config.packet.mtu) + 64) + 512)
+        .ok_or(Error::Capacity)?;
+    if retained > 1_048_576 || peak > 2_097_152 {
+        return Err(Error::Capacity);
+    }
+    profile
+        .resources
+        .retained_payload
+        .checked_add(retained)
+        .ok_or(Error::Capacity)?;
+    profile
+        .resources
+        .peak_payload
+        .checked_add(peak)
+        .ok_or(Error::Capacity)?;
+    // Concrete owner/future/crypto descriptor charges, before attachment.
+    let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
+        + std::mem::size_of::<PacketCarrier<I>>()
+        + profile.count
+            * (std::mem::size_of::<GateIo<I>>()
+                + std::mem::size_of::<GateState>()
+                + std::mem::size_of::<PacketOpener>()
+                + std::mem::size_of::<PacketSealer>()
+                + std::mem::size_of::<Detached<I>>()
+                + 2 * std::mem::size_of::<Sleep>()
+                + (usize::from(config.packet.queue_packets) + 16) * std::mem::size_of::<Cell>());
+    if metadata > 1_048_576 {
+        return Err(Error::Capacity);
+    }
+    // Packet setup passes GateIo<I> into the unchanged inner pair factory.
+    // Check that exact concrete future/owner bound before either is created.
+    super::super::metadata::<GateIo<I>>(profile.count, a)?;
+    Ok((pair, policy, profile.count))
+}
+
+impl PacketPhaseConfig {
+    /// Check the exact raw lane configuration and bounded packet/pair storage
+    /// before opening either PacketIo owner. The type parameter must match the
+    /// actual original I/O type because its retained metadata is charged.
+    ///
+    /// This performs no I/O, clock access, randomness, timer construction or
+    /// owner creation and does not require a Tokio runtime. Canonical policy
+    /// hashing uses bounded temporary storage. Success grants no setup authority;
+    /// the actual factory repeats these checks and validates credentials/time.
+    pub fn preflight<I: PacketIo + Send + 'static>(
+        self,
+        first: Config,
+        second: Option<Config>,
+    ) -> Result<(), Error> {
+        configuration::<I>(self, first, second).map(|_| ())
+    }
+}
+
 fn begin<'a, I: PacketIo + Send + 'static>(
     inputs: RawInputs<I>,
     credentials: Credentials<'a>,
@@ -343,64 +433,10 @@ fn begin<'a, I: PacketIo + Send + 'static>(
 ) -> Result<PacketSetup<'a, I>, PacketStartFailure<I>> {
     let start = Instant::now();
     let prepared = (|| {
-        config.packet.validate()?;
-        if config.pair.messages.max_payload < 244
-            || config.pair.messages.messages_per_direction < 5
-            || config.pair.messages.bytes_per_direction < 912
-        {
-            return Err(Error::Configuration);
-        }
-        let (a, b) = inputs.configs();
-        if a.mtu != usize::from(config.packet.mtu) || b.is_some_and(|b| b.mtu != a.mtu) {
-            return Err(Error::Configuration);
-        }
-        let policy = config.packet.digest(config.pair.session.digest)?;
-        let mut pair = config.pair;
-        pair.session.digest =
-            ConfigDigest(hash_parts(b"l2tunnel/raw-packet-pair/v1\0", &[&policy]));
-        let profile = profile::validate(&inputs, pair)?;
-        let retained = (profile.count as u64)
-            .checked_mul(
-                (u64::from(config.packet.queue_packets) + 11) * u64::from(config.packet.mtu)
-                    + 65_536
-                    + 2 * 128
-                    + 104,
-            )
-            .and_then(|n| n.checked_add(2 * 280 + 2 * 104))
-            .ok_or(Error::Capacity)?;
-        let peak = retained
-            .checked_add(profile.count as u64 * (2 * u64::from(config.packet.mtu) + 64) + 512)
-            .ok_or(Error::Capacity)?;
-        if retained > 1_048_576 || peak > 2_097_152 {
-            return Err(Error::Capacity);
-        }
-        profile
-            .resources
-            .retained_payload
-            .checked_add(retained)
-            .ok_or(Error::Capacity)?;
-        profile
-            .resources
-            .peak_payload
-            .checked_add(peak)
-            .ok_or(Error::Capacity)?;
-        // Concrete owner/future/crypto descriptor charges, before attachment.
-        let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
-            + std::mem::size_of::<PacketCarrier<I>>()
-            + profile.count
-                * (std::mem::size_of::<GateIo<I>>()
-                    + std::mem::size_of::<GateState>()
-                    + std::mem::size_of::<PacketOpener>()
-                    + std::mem::size_of::<PacketSealer>()
-                    + std::mem::size_of::<Detached<I>>()
-                    + 2 * std::mem::size_of::<Sleep>()
-                    + (usize::from(config.packet.queue_packets) + 16)
-                        * std::mem::size_of::<Cell>());
-        if metadata > 1_048_576 {
-            return Err(Error::Capacity);
-        }
+        let (first, second) = inputs.configs();
+        let (pair, policy, count) = configuration::<I>(config, first, second)?;
         let deadline = start.checked_add(pair.timeout).ok_or(Error::Expired)?;
-        Ok((pair, policy, deadline, profile.count))
+        Ok((pair, policy, deadline, count))
     })();
     let (pair, policy_digest, deadline, count) = match prepared {
         Ok(p) => p,
@@ -1401,6 +1437,38 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         }
         Ok(result)
     }
+    /// Actual immutable per-lane byte capacities, without polling or changing credit.
+    pub fn lane_limits(&self) -> Result<[Option<LaneLimits>; 2], Error> {
+        self.geometry()?;
+        let maximum = u64::from(self.policy.mtu)
+            .checked_sub(40)
+            .ok_or(Error::Proof)?;
+        let data_reserve_bytes = compact::FinalKind::Data
+            .reserve()
+            .checked_mul(maximum)
+            .ok_or(Error::Exhausted)?;
+        let mut result = [None, None];
+        for (target, lane) in result.iter_mut().zip(&self.lanes) {
+            if let Some(lane) = lane {
+                let state = lock(&lane.io.state)?;
+                let fence = state.fence.as_ref().ok_or(Error::Proof)?;
+                *target = Some(LaneLimits {
+                    local_horizon_bytes: fence.local_horizon,
+                    peer_horizon_bytes: fence.peer_horizon,
+                    data_reserve_bytes,
+                    send_data_capacity_bytes: fence
+                        .peer_horizon
+                        .checked_sub(data_reserve_bytes)
+                        .ok_or(Error::Proof)?,
+                    receive_data_capacity_bytes: fence
+                        .local_horizon
+                        .checked_sub(data_reserve_bytes)
+                        .ok_or(Error::Proof)?,
+                });
+            }
+        }
+        Ok(result)
+    }
     /// Number of actual occupied original owners; never a synthetic duplex width.
     pub fn lane_count(&self) -> usize {
         self.count()
@@ -1423,16 +1491,27 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                         .checked_add(Duration::from_secs(15))
                         .ok_or(Error::Exhausted)?,
                 );
-                if lane.ping.is_none() {
+                let retry_ready = self.final_context.is_some()
+                    && lane.pending.is_none()
+                    && !lane.io.pending()
+                    && lane.final_prepared.is_none()
+                    && lane.tracked.is_none()
+                    && lane.completed.is_none();
+                if lane.ping.is_none() || retry_ready {
+                    let interval = if self.final_context.is_some() && lane.ping.is_some() {
+                        TRANSITION_RETRY_INTERVAL
+                    } else {
+                        Duration::from_secs(5)
+                    };
                     wake = wake.min(
                         lane.last_ping
-                            .checked_add(Duration::from_secs(5))
+                            .checked_add(interval)
                             .ok_or(Error::Exhausted)?,
                     );
                 }
             } else if let Some(last) = lane.last_transition {
                 wake = wake.min(
-                    last.checked_add(Duration::from_millis(250))
+                    last.checked_add(TRANSITION_RETRY_INTERVAL)
                         .ok_or(Error::Exhausted)?,
                 );
             }

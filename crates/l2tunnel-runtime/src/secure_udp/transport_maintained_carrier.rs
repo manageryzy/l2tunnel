@@ -295,9 +295,6 @@ impl MaintainedIo {
         receive: bool,
     ) -> Poll<io::Result<()>> {
         let mut ready = false;
-        if let Some(user) = &mut self.user {
-            ready |= poll(&mut self.carrier, &mut user.pending, cx);
-        }
         if let Some(control) = &mut self.control {
             if let Err(error) = begin(
                 &mut self.carrier,
@@ -309,6 +306,9 @@ impl MaintainedIo {
                 control.pending.result = Some(Err(wire::SendFailure::Io(error)));
             }
             ready |= poll(&mut self.carrier, &mut control.pending, cx);
+        }
+        if let Some(user) = &mut self.user {
+            ready |= poll(&mut self.carrier, &mut user.pending, cx);
         }
         // Completed receipts must reach the Common owner even if the connection
         // became terminal in the same poll. Failure is checked after both slots.

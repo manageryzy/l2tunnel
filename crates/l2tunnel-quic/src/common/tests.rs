@@ -99,6 +99,52 @@ fn selected_profile_binds_wire_and_recalculates_tiny_record_queue_bound() -> Tes
     Ok(())
 }
 
+#[tokio::test]
+async fn common_outgoing_fifo_backpressures_before_large_user_queue_hides_control() -> TestResult {
+    let mut profile = profile();
+    profile.queued_datagrams = 1024;
+    let (a, b) = connections(&[profile])
+        .await?
+        .pop()
+        .ok_or("missing connection")?;
+    let original = Instant::now() + Duration::from_secs(4);
+    let mut a = Carrier::new(a, profile, base(), original)?;
+    let mut b = Carrier::new(b, profile, base(), original)?;
+    a.select_final_records(original)?;
+    b.select_final_records(original)?;
+    let geometry = a.geometry();
+    assert_eq!(geometry.maintained_queue_bytes, (1072 + 64) * 1024);
+    assert_eq!(geometry.maintained_send_queue_bytes, (1072 + 64) * 2);
+    let body = vec![0x80; 1072];
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    // Current-thread polling deliberately gives Quinn no background transmit
+    // turn. Old code accepts this entire user burst into its large hidden FIFO.
+    for _ in 0..2 {
+        let mut ticket = a.try_send(Class::User, &body, original, Framing::Final)?;
+        assert!(matches!(
+            Pin::new(&mut ticket).poll(&mut context),
+            Poll::Ready(Ok(_))
+        ));
+    }
+    let mut held = a.try_send(Class::User, &body, original, Framing::Final)?;
+    assert!(Pin::new(&mut held).poll(&mut context).is_pending());
+    assert_eq!(a.acceptance_status()?.accepted_datagrams, 2);
+    assert_eq!(held.deadline(), original);
+    drop(held);
+    let control = [0x80; 21];
+    a.try_send(Class::Control, &control, original, Framing::Final)?
+        .await?;
+    assert_eq!(receive(&mut b).await?.bytes, body);
+    assert_eq!(receive(&mut b).await?.bytes, body);
+    assert_eq!(receive(&mut b).await?.bytes, control);
+    assert_eq!(a.acceptance_status()?.accepted_datagrams, 3);
+    assert_eq!(
+        a.acceptance_status()?.accepted_record_bytes,
+        (1072 * 2 + 21) as u64
+    );
+    Ok(())
+}
+
 #[test]
 fn selected_final_namespace_accepts_all_strong_reader_slots_without_bootstrap_overlap() {
     for route in u8::MIN..=u8::MAX {

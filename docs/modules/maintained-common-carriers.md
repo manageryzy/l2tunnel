@@ -11,10 +11,10 @@ QUIC retries and OpenVPN timeout continuations below retain their original sourc
 scope. They are not a pristine aggregate pass or qualification of every current
 composition.
 
-This is an additive selection for genuine TCP/TLS and genuine Quinn DATAGRAM
+The current Common format supports genuine TCP/TLS and genuine Quinn DATAGRAM
 transports. It is distinct from the minimal QUIC/media appearance over UDP and
-from the raw TCP-shaped phase after a real TLS handshake. Existing carrier
-defaults and historical experiment receipts remain unchanged. Swift remains a
+from the raw TCP-shaped phase after a real TLS handshake. Historical experiment
+receipts retain their original source and configuration. Swift remains a
 record transport algorithm inside the selected carrier.
 
 ## Original ownership and authentication
@@ -113,6 +113,30 @@ transport boundary for recovery custody; it does not invent an OS transmission
 timestamp, TCP acknowledgment or peer delivery. Maintained accepted-record and
 record-byte counters remain separate from socket/UDP physical counters.
 
+The shared CLI/service status distinguishes configured QUIC receive/custody
+queue bytes from the smaller outgoing FIFO bound. `quic_queues` is ordered by
+the original First/Second lanes. Requested values come from complete Settings;
+effective values come from queue geometry retained from the actual authenticated
+QUIC owners. A proxy observation without Settings therefore reports unknown
+requested queue geometry while retaining actual effective geometry. TLS and
+unavailable observations use `null`, never a guessed value. These fields are
+static bounds, not live occupancy, network flight, throughput or physical send
+observations. Offline inspection has no effective queue or connection claim.
+The Common outgoing bound is the lesser of the configured queue and two
+maximum-record allowances; receive/custody policy is unchanged. Focused CLI and
+actual Half QUIC service assertions pass with the affected TLS service and extent
+checks in the
+[status/extent receipt](../../work/aligned-extents-20261117/repair-status-extents-gate1.json).
+
+Control-before-User polling is restored in maintained output and runtime receipt
+selection. The existing bounded owner admits pending management ahead of a held
+User after a full QUIC FIFO becomes available; neither an accepted DATAGRAM nor
+network congestion flight is recalled. The
+[focused priority receipt](../../work/aligned-extents-20261117/trace-priority-focused2.json)
+passes that actual-owner case, original-arrival Compact feedback handling and
+the bounded scalar trace cases. This does not make feedback reliable or change
+its original deadline.
+
 The maintained runtime yields to the executor after each bounded Common work
 turn. Ready custom QUIC futures do not themselves guarantee cooperative
 scheduling. The same-turn receipt and bounded-input promotion preserve both
@@ -197,6 +221,50 @@ cutover remain pending; implementation alone does not close the existing proxy,
 TCP-window ownership or mode-parity acceptance requirements.
 The additive same-owner reuse profile has its existing Full/native-IP/
 PerConnection catalog constraints and needs actual composition evidence.
+
+## Repair-batch observations (2026-11-17)
+
+Release4's owned Linux `swift-arq-quic` forward phase passes at
+0.341728 Mbit/s with the original 100/10 Mbit/s links, 35 ms and 15% loss each
+way, sixteen native TCP flows and ten-second measurement window. The
+[exact case](../../work/aligned-extents-20261117/matrix-quic-repair4-forward-attempt1/swift-arq-quic/result.json)
+qualifies this finite phase after Control priority restoration. It does not
+qualify QUIC reverse/simultaneous phases, all algorithms or a throughput target.
+The [combined report](../../work/aligned-extents-20261117/matrix-report-repairs4-complete1/report.md)
+retains the failed baseline and each selected phase's source/binary provenance.
+
+The release4 `aligned-compact-tls` reverse attempt still fails. Its client reports
+`whole-message control error: Expired` at runtime elapsed 23.190915 seconds;
+the server subsequently reports `UnexpectedEof`. Both scalar traces show positive
+source0 feedback applied: the client after its first physical attempt, and the
+server after one retry. This attempt does not reproduce or explain the earlier
+source0 `RetryExhausted`. The
+[trace analysis](../../work/aligned-extents-20261117/compact-arq-trace4-analysis.json)
+records original acceptance, authenticated feedback and application timestamps.
+Each trace retains at most 512 events and overflows before the terminal failure,
+so it cannot attribute that later control expiry. The independent local time
+origins are not a cross-peer clock synchronization proof.
+
+Two failure/observation corrections have
+[focused passing checks](../../work/aligned-extents-20261117/receipt-and-proxy-errors-focused1.json).
+Proxy failures now retain both the Common runtime error and joined actor error
+when both exist, preserving the selected primary error's kind and source without
+claiming temporal order. Success, joins and handoff caps are unchanged; this is
+diagnostic correctness, not a repair of measured-proxy `HandoffExpired`.
+Accepted-emission metrics now commit only after receipt identity, scope, length
+and charge correlate with the retained output, while still counting a genuine
+late acceptance before reporting its original deadline failure. Prepared output
+and mismatched receipts never become sent-byte observations. These finite passes
+do not close the failed aggregate gate or the current proxy requirements.
+
+The later
+[required-check continuation](../../work/aligned-extents-20261117/required-repair-checks2-continuation1.json)
+passes the measured TLS proxy and both Half QUIC four-family switching cases.
+It still fails measured QUIC proxy handoff, Swift TLS reconnect (`AddrInUse`),
+and the Full QUIC CCM/CRC terminal checks after their switching exercises pass.
+Formatting, strict workspace Clippy and rustdoc pass, but the Rust aggregate
+does not. Earlier failed attempts retain their scope and unresolved causes;
+these latest passes do not establish a general timing or throughput repair.
 
 ## Source and validation boundaries
 

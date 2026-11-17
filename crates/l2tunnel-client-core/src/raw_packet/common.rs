@@ -31,13 +31,9 @@ impl Settings {
             .policy()
             .record_geometry()
             .map_err(io::Error::other)?;
-        l2tunnel_raw_tcp::IpConfig::from(raw_config(value.forward, value.packet.mtu))
-            .validate()
-            .map_err(io::Error::other)?;
+        raw_config(value.forward, value.packet)?;
         if let Some(reverse) = value.reverse {
-            l2tunnel_raw_tcp::IpConfig::from(raw_config(reverse, value.packet.mtu))
-                .validate()
-                .map_err(io::Error::other)?;
+            raw_config(reverse, value.packet)?;
             if reverse.local == value.forward.local || reverse.peer == value.forward.peer {
                 return Err(invalid("raw Half originals require distinct tuples"));
             }
@@ -86,7 +82,16 @@ impl Settings {
         if expected != (actual.0.into(), actual.1.into()) {
             return Err(invalid("raw first original differs from Common endpoint"));
         }
-        profile.validate_raw_request()
+        profile.validate_raw_request()?;
+        let first = raw_config(self.0.forward, self.0.packet)?;
+        let second = self
+            .0
+            .reverse
+            .map(|endpoints| raw_config(endpoints, self.0.packet))
+            .transpose()?;
+        self.phase(profile)?
+            .preflight::<PacketOwner>(first, second)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
     pub(crate) fn phase(
         &self,

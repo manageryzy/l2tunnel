@@ -265,7 +265,12 @@ where
                     let _ = stop.send(());
                     let common = runtime.await;
                     let outcome = (|| {
-                        let report = result?;
+                        let report = match result {
+                            Ok(report) => report,
+                            Err(error) => return Err(retain_joined_failure(
+                                error, common.err(), FailureComponent::Actor,
+                            )),
+                        };
                         let stopped = common?;
                         if stopped.reason == transport::StopReason::ProxyRetired {
                             require_retired(&bridge)?;
@@ -293,11 +298,12 @@ where
                         return report;
                     }
                     bridge.fail();
-                    let _ = actor.await; // Same owner performs abnormal cleanup and actual joins.
-                    return Err(match result {
+                    let joined = actor.await.err(); // Same owner performs abnormal cleanup and actual joins.
+                    let error = match result {
                         Err(error) => error,
                         Ok(stopped) => io::Error::other(format!("Common proxy carrier ended: {:?}", stopped.reason)),
-                    });
+                    };
+                    return Err(retain_joined_failure(error, joined, FailureComponent::Common));
                 }
                 result = &mut ready, if !started => {
                     if let Err(error) = result {
@@ -326,6 +332,55 @@ where
             }
         }
     }
+}
+
+#[derive(Debug)]
+enum FailureComponent {
+    Common,
+    Actor,
+}
+
+#[derive(Debug)]
+struct JoinedFailure {
+    primary: io::Error,
+    joined: io::Error,
+    component: FailureComponent,
+}
+
+impl std::fmt::Display for JoinedFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (common, actor) = match self.component {
+            FailureComponent::Common => (&self.primary, &self.joined),
+            FailureComponent::Actor => (&self.joined, &self.primary),
+        };
+        write!(output, "Common runtime: {common}; proxy actor: {actor}")
+    }
+}
+
+impl std::error::Error for JoinedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+/// Preserve the selected branch's error precedence without inferring the order
+/// in which the two independently observed failures occurred.
+fn retain_joined_failure(
+    primary: io::Error,
+    joined: Option<io::Error>,
+    component: FailureComponent,
+) -> io::Error {
+    let Some(joined) = joined else {
+        return primary;
+    };
+    io::Error::new(
+        primary.kind(),
+        JoinedFailure {
+            primary,
+            joined,
+            component,
+        },
+    )
 }
 
 fn require_retired(bridge: &super::common_bridge::Bridge) -> io::Result<()> {
@@ -357,6 +412,48 @@ async fn finish_joined_actor<T>(
 #[cfg(test)]
 mod close_completion_tests {
     use super::*;
+
+    #[test]
+    fn joined_proxy_failures_preserve_both_causes_and_selected_precedence() -> io::Result<()> {
+        for component in [FailureComponent::Common, FailureComponent::Actor] {
+            let common = io::Error::new(io::ErrorKind::ConnectionRefused, "closed record port");
+            let actor = io::Error::other("Record(HandoffExpired)");
+            let (primary, joined, expected) = match component {
+                FailureComponent::Common => (common, actor, io::ErrorKind::ConnectionRefused),
+                FailureComponent::Actor => (actor, common, io::ErrorKind::Other),
+            };
+            let error = retain_joined_failure(primary, Some(joined), component);
+            assert_eq!(error.kind(), expected);
+            let details = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<JoinedFailure>())
+                .ok_or_else(|| io::Error::other("joined failure was not retained"))?;
+            assert_eq!(details.primary.kind(), expected);
+            assert!(std::ptr::eq(
+                std::error::Error::source(details)
+                    .and_then(|source| source.downcast_ref::<io::Error>())
+                    .ok_or_else(|| io::Error::other("primary source was not retained"))?,
+                &details.primary,
+            ));
+            assert_eq!(
+                error.to_string(),
+                "Common runtime: closed record port; proxy actor: Record(HandoffExpired)",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_proxy_failure_keeps_original_error_without_wrapper() {
+        for component in [FailureComponent::Common, FailureComponent::Actor] {
+            let original = io::Error::from(io::ErrorKind::ConnectionRefused);
+            let text = original.to_string();
+            let error = retain_joined_failure(original, None, component);
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            assert_eq!(error.to_string(), text);
+            assert!(error.get_ref().is_none());
+        }
+    }
 
     #[tokio::test]
     async fn retired_actor_completion_is_one_poll_and_preserves_failure() -> io::Result<()> {

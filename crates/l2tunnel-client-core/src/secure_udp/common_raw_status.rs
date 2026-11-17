@@ -12,7 +12,7 @@ pub struct RawPacketPolicy {
     pub protection: String,
     /// Per-lane bounded packet slots.
     pub queue_packets: u16,
-    /// Byte reordering/window horizon.
+    /// Accepted upper byte-horizon policy; actual lane limits are reported separately.
     pub horizon_bytes: u32,
     /// Minimum remaining useful post-transition byte budget.
     pub minimum_transfer_bytes: u32,
@@ -30,6 +30,35 @@ pub struct RawPacketPolicy {
     pub max_key_bytes: u64,
 }
 
+/// Actual immutable capacities relative to the endpoint reporting this status.
+/// These do not report dynamic occupancy, TCP congestion window or native credit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawLaneLimits {
+    /// Actual local receive/reorder horizon after the original advertisement cap.
+    pub local_horizon_bytes: u64,
+    /// Actual peer receive/reorder horizon after the original advertisement cap.
+    pub peer_horizon_bytes: u64,
+    /// Fixed raw bytes reserved beyond Data admission for feedback and controls.
+    pub data_reserve_bytes: u64,
+    /// Actual maximum local Data byte debt, after the peer-horizon reserve.
+    pub send_data_capacity_bytes: u64,
+    /// Actual maximum peer Data byte debt, after the local-horizon reserve.
+    pub receive_data_capacity_bytes: u64,
+}
+
+impl From<l2tunnel_raw_io::handoff::pairing::packet::LaneLimits> for RawLaneLimits {
+    fn from(value: l2tunnel_raw_io::handoff::pairing::packet::LaneLimits) -> Self {
+        Self {
+            local_horizon_bytes: value.local_horizon_bytes,
+            peer_horizon_bytes: value.peer_horizon_bytes,
+            data_reserve_bytes: value.data_reserve_bytes,
+            send_data_capacity_bytes: value.send_data_capacity_bytes,
+            receive_data_capacity_bytes: value.receive_data_capacity_bytes,
+        }
+    }
+}
+
 /// One occupied original lane, in global client/server order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +71,8 @@ pub struct RawLane {
     pub session: [u8; 16],
     /// Actual TLS/member configuration commitment.
     pub configuration: [u8; 32],
+    /// Actual original-owner limits, separate from the accepted upper packet policy.
+    pub limits: RawLaneLimits,
 }
 
 /// Geometry observed only after the actual original owner activates compact Records.
@@ -159,17 +190,23 @@ impl RawCarrier {
         }
         let infos = outer.lane_infos();
         let tuples = outer.lane_endpoints();
+        let limits = outer.lane_limits();
         let mut lanes = [None, None];
         for index in 0..2 {
-            lanes[index] = match (infos[index], tuples[index]) {
-                (Some(info), Some((client, server))) => Some(RawLane {
+            lanes[index] = match (infos[index], tuples[index], limits[index]) {
+                (Some(info), Some((client, server)), Some(limits)) => Some(RawLane {
                     client: client.to_string(),
                     server: server.to_string(),
                     session: info.session_id,
                     configuration: info.config.digest.0,
+                    limits: limits.into(),
                 }),
-                (None, None) => None,
-                _ => return Err(invalid("actual raw lane identity and tuple disagree")),
+                (None, None, None) => None,
+                _ => {
+                    return Err(invalid(
+                        "actual raw lane identity, tuple and limits disagree",
+                    ));
+                }
             };
         }
         let number = |n| u64::try_from(n).map_err(invalid);

@@ -346,6 +346,53 @@ fn exercise(half: bool) -> Pin<Box<dyn std::future::Future<Output = Result> + Se
                     .ok_or("maintained status absent")?;
                 assert_eq!(status.carrier, if half { "quic" } else { "tcp" });
                 assert_eq!(maintained.effective, Some(maintained.requested.clone()));
+                let outer = frame
+                    .runtime
+                    .as_ref()
+                    .and_then(|value| value.maintained)
+                    .ok_or("actual maintained proof absent")?;
+                if half {
+                    let queues = maintained
+                        .effective
+                        .as_ref()
+                        .and_then(|value| value.quic_queues)
+                        .ok_or("actual QUIC queue geometry absent")?;
+                    for (observed, lane) in queues.into_iter().zip(outer.lanes()) {
+                        let observed = observed.ok_or("missing Half queue")?;
+                        let actual = lane
+                            .and_then(|lane| lane.quic_queues)
+                            .ok_or("missing actual Half queue")?;
+                        assert_eq!(
+                            observed.maintained_queue_bytes,
+                            actual.maintained_queue_bytes as u64
+                        );
+                        assert_eq!(
+                            observed.maintained_send_queue_bytes,
+                            actual.maintained_send_queue_bytes as u64
+                        );
+                        assert!(
+                            observed.maintained_send_queue_bytes < observed.maintained_queue_bytes
+                        );
+                    }
+                } else {
+                    assert!(maintained.requested.quic_queues.is_none());
+                    assert!(
+                        outer
+                            .lanes()
+                            .into_iter()
+                            .flatten()
+                            .all(|lane| lane.quic_queues.is_none())
+                    );
+                }
+                // The proxy-style projection has the actual proof but no Settings.
+                // Its effective queues remain known; requested queues stay unknown.
+                let without_settings =
+                    crate::secure_udp::common_status::MaintainedCarrier::from_observation(
+                        outer.requested(),
+                        Some(outer),
+                    )?;
+                assert!(without_settings.requested.quic_queues.is_none());
+                assert_eq!(without_settings.effective, maintained.effective);
                 assert!(maintained.binding.is_some());
                 assert!(!maintained.physical_wire_bytes_observed);
                 assert_eq!(

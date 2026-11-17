@@ -42,6 +42,15 @@ fn selected_arq_exact_bytes_charge_replay_and_original_physical_deadline() -> Te
             .poll_data(time(0), &mut output, &mut small)?
             .ok_or("source")?;
         assert_eq!(&output[..length], b"\x01\x00payload");
+        let extent = a.inspect_output_extent(&output[..length])?;
+        assert_eq!(
+            (
+                extent.header_bytes,
+                extent.payload_bytes,
+                extent.systematic_coded_fill_bytes
+            ),
+            (2, 7, 0)
+        );
         assert_eq!(
             small,
             OutboundBudget {
@@ -71,6 +80,11 @@ fn selected_arq_exact_bytes_charge_replay_and_original_physical_deadline() -> Te
             .poll_feedback(time(401), &mut feedback, &mut exact)?
             .ok_or("feedback")?;
         assert_eq!(&feedback[..n], &[2, 1, 0]);
+        let extent = b.inspect_output_extent(&feedback[..n])?;
+        assert_eq!(
+            (extent.kind, extent.header_bytes, extent.payload_bytes),
+            (RecordKind::Feedback, n, 0)
+        );
         assert_eq!(
             exact,
             OutboundBudget {
@@ -93,11 +107,32 @@ fn selected_fec_recovers_real_loss_without_legacy_context_in_coded_sources() -> 
         submit_all(&mut a, &input)?;
         let mut output = vec![0; a.max_packet_bytes()];
         let mut packets = Vec::new();
+        let mut observed_fill = false;
         while let Some(n) = a.poll_data(time(0), &mut output, &mut allowance())? {
             let bytes = output[..n].to_vec();
             let view = a.inspect_output_record(&bytes)?;
+            let before = a.arq_statistics();
+            let extent = a.inspect_output_extent(&bytes)?;
+            assert_eq!(a.arq_statistics(), before);
+            assert_eq!(extent.kind, view.kind);
+            assert_eq!(
+                extent.header_bytes + extent.payload_bytes + extent.systematic_coded_fill_bytes,
+                n
+            );
+            if view.kind == RecordKind::Repair {
+                assert_eq!(
+                    extent.payload_bytes,
+                    view.fec.ok_or("repair equation")?.payload.len()
+                );
+                assert_eq!(extent.systematic_coded_fill_bytes, 0);
+            }
             if let Some((source, payload)) = view.source {
                 assert_eq!(payload, input[source.0 as usize]);
+                assert_eq!(extent.payload_bytes, payload.len());
+                observed_fill |= extent.systematic_coded_fill_bytes != 0;
+            }
+            for end in 0..bytes.len() {
+                assert!(a.inspect_output_extent(&bytes[..end]).is_err());
             }
             assert!(
                 bytes
@@ -110,6 +145,7 @@ fn selected_fec_recovers_real_loss_without_legacy_context_in_coded_sources() -> 
             packets.push(bytes);
         }
         assert_eq!(packets.len(), 5);
+        assert!(observed_fill);
         for packet in packets.iter().skip(2) {
             b.receive(packet, time(0))?;
         }
@@ -133,6 +169,14 @@ fn selected_parser_rejects_noncanonical_union_and_legacy_fallback() -> TestResul
     assert!(b.inspect_peer(&[2, 0, 1]).is_err());
     assert!(b.inspect_peer(b"L2RF\x01\x01\0\0").is_err());
     assert!(b.inspect_peer(&[3, 0, 0, 0]).is_err());
+    for malformed in [b"".as_slice(), &[1], &[1, 0x80], &[2, 1], &[4, 0]] {
+        assert!(a.inspect_output_extent(malformed).is_err());
+    }
+    let (old, _) = endpoints()?;
+    assert_eq!(
+        old.inspect_output_extent(&[1, 0, 5]),
+        Err(Error::InvalidConfig)
+    );
     a.submit(b"one", time(0))?;
     assert_eq!(a.enable_compact_wire(49), Err(Error::InvalidConfig));
     Ok(())

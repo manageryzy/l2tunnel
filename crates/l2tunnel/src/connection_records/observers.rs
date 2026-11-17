@@ -3,6 +3,38 @@ use super::*;
 use l2tunnel_codec::aligned_receiver::UnitWitness;
 
 impl Collection {
+    /// Inspect one selected outgoing route and its actual owner without changing
+    /// incarnation, recovery or native custody. Source-free native has no codec.
+    pub fn inspect_output_extent(
+        &self,
+        packet: &[u8],
+    ) -> Result<(route::Header, Option<aligned::wire_extent::OutputExtent>), Error> {
+        let (header, body) = self.decode_route(packet)?;
+        let slot = self.slot(header.owner)?;
+        if header.incarnation != slot.incarnation {
+            return Err(Error::Incarnation);
+        }
+        if header.class == route::Class::UnreliableNative {
+            if self.plan.config().send_unreliable.is_none() {
+                return Err(Error::UnsupportedUnreliable);
+            }
+            return Ok((header, None));
+        }
+        let extent = slot
+            .endpoint
+            .inspect_output_extent(body)
+            .map_err(Error::Endpoint)?;
+        let expected = match header.class {
+            route::Class::Source => RecordKind::Source,
+            route::Class::Feedback => RecordKind::Feedback,
+            route::Class::UnreliableNative => return Err(Error::Invariant),
+        };
+        if extent.recovery.kind != expected {
+            return Err(Error::Class);
+        }
+        Ok((header, Some(extent)))
+    }
+
     /// Exact complete immutable directional request; no admission authority.
     pub fn configuration(&self) -> Config {
         self.plan.config()

@@ -23,6 +23,8 @@ mod compact_wire;
 pub mod packed;
 /// Complete fallible backing for actual directional codec/recovery owners.
 pub mod storage;
+/// Read-only exact selected recovery and codec-envelope byte extents.
+pub mod wire_extent;
 pub use compact::{CONFIG_BYTES as COMPACT_CONFIG_BYTES, Config as CompactConfig};
 
 pub use l2tunnel_codec::aligned_receiver::{

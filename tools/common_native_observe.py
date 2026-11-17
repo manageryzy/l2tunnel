@@ -14,6 +14,19 @@ import time
 CAPTURE_BYTES = 512 * 1024 * 1024
 CAPTURE_PACKETS = 2_000_000
 SNAPLEN = 2048
+RECORD_METRICS = ('algorithm_bytes', 'final_record_bytes', 'record_overhead_bytes')
+EXTENT_METRICS = ('route_header_bytes', 'fragment_header_bytes', 'recovery_header_bytes',
+                  'systematic_coded_fill_bytes', 'codec_envelope_bytes', 'codec_container_bytes',
+                  'codec_unit_header_bytes', 'codec_body_bytes')
+CODEC_COVERAGE = ('envelope_only', 'fragmented_units', 'swift_stream', 'fragmented_record',
+                  'not_applicable', 'unencoded_native')
+
+
+class ExtentMetricsError(ValueError):
+    """Invalid layer attribution with separately validated base record statistics."""
+    def __init__(self, message, base_validation):
+        super().__init__(message)
+        self.base_validation = base_validation
 
 
 def distribution(histogram):
@@ -139,7 +152,9 @@ def validate_wire_metrics(value, carrier):
     """Validate the actual opt-in report; invalid samples never qualify overhead."""
     def unsigned(number):
         return type(number) is int and number >= 0
-    if value.get('schema') != 1 or value.get('invalid_samples') != 0 or value.get('counter_overflow') != 0:
+    if (type(value.get('schema')) is not int or value['schema'] not in (1, 2)
+            or type(value.get('invalid_samples')) is not int or value['invalid_samples'] != 0
+            or type(value.get('counter_overflow')) is not int or value['counter_overflow'] != 0):
         raise ValueError('wire observer invalid samples, counter overflow, or unknown schema')
     classes, boundaries = value.get('accepted_classes'), value.get('accepted_boundaries')
     if not isinstance(classes, dict) or set(classes) != {'swift_source', 'direct_arq_source', 'systematic_fec_source', 'repair', 'recovery_feedback', 'unreliable_native'}:
@@ -152,8 +167,7 @@ def validate_wire_metrics(value, carrier):
     samples = sum(classes.values())
     if samples == 0 or sum(boundaries.values()) != samples or boundaries[expected] != samples:
         raise ValueError('actual record count or carrier boundary mismatch')
-    totals = {}
-    for name in ('algorithm_bytes', 'final_record_bytes', 'record_overhead_bytes'):
+    def histogram(name, expected_samples):
         metric = value.get(name)
         if not isinstance(metric, dict) or not isinstance(metric.get('histogram'), list) or len(metric['histogram']) > 65536:
             raise ValueError('missing bounded wire histogram')
@@ -165,8 +179,10 @@ def validate_wire_metrics(value, carrier):
             if not previous < size <= 65535 or amount == 0:
                 raise ValueError('duplicate, unordered, oversized or empty histogram bin')
             previous, count, total = size, count + amount, total + size * amount
-        if count != samples or metric.get('samples') != count or metric.get('total_bytes') != total:
-            raise ValueError('wire histogram totals differ from actual accepted records')
+        if (count != expected_samples or not unsigned(metric.get('samples'))
+                or not unsigned(metric.get('total_bytes'))
+                or metric['samples'] != count or metric['total_bytes'] != total):
+            raise ValueError('wire histogram totals differ from expected sample population: ' + name)
         for percentile in (50, 95, 99):
             rank, accumulated, answer = (count * percentile + 99) // 100, 0, None
             for size, amount in metric['histogram']:
@@ -174,14 +190,45 @@ def validate_wire_metrics(value, carrier):
                 if accumulated >= rank:
                     answer = size
                     break
-            if metric.get('p' + str(percentile)) != answer:
+            key = 'p' + str(percentile)
+            observed = metric.get(key)
+            if key not in metric or observed != answer or (observed is not None and not unsigned(observed)):
                 raise ValueError('wire histogram quantile mismatch')
-        totals[name] = total
+        return total
+    totals = {name: histogram(name, samples) for name in RECORD_METRICS}
     if totals['algorithm_bytes'] + totals['record_overhead_bytes'] != totals['final_record_bytes']:
         raise ValueError('record overhead totals do not equal final minus algorithm bytes')
     if not unsigned(value.get('fragmented_records')) or value['fragmented_records'] > samples:
         raise ValueError('invalid fragmented record count')
     if not unsigned(value.get('diagnostic_heap_bytes')) or value['diagnostic_heap_bytes'] == 0:
         raise ValueError('observer allocation absent')
-    return {'status': 'validated', 'accepted_records': samples, 'boundary': expected,
-            'diagnostic_heap_bytes': value['diagnostic_heap_bytes'], 'totals': totals}
+    result = {'status': 'validated', 'accepted_records': samples, 'boundary': expected,
+              'diagnostic_heap_bytes': value['diagnostic_heap_bytes'], 'totals': totals}
+    if value['schema'] == 1:
+        return result
+    try:
+        if not unsigned(value.get('extent_errors')) or value['extent_errors'] != 0:
+            raise ValueError('wire observer extent errors prevent layer attribution')
+        coverage = value.get('codec_coverage')
+        if (not isinstance(coverage, dict) or set(coverage) != set(CODEC_COVERAGE)
+                or not all(unsigned(count) for count in coverage.values())
+                or sum(coverage.values()) != samples):
+            raise ValueError('codec coverage differs from accepted record population')
+        if coverage['fragmented_record'] != value['fragmented_records']:
+            raise ValueError('outer fragment coverage differs from fragmented records')
+        recovery = samples - coverage['fragmented_record'] - coverage['unencoded_native']
+        codec = coverage['envelope_only'] + coverage['fragmented_units']
+        populations = dict(zip(EXTENT_METRICS, (samples, samples, recovery, recovery, codec, codec, codec, codec)))
+        extent_totals = {name: histogram(name, count) for name, count in populations.items()}
+        if any(total > totals['algorithm_bytes'] for total in extent_totals.values()):
+            raise ValueError('layer extent bytes exceed containing algorithm bytes')
+        allocations = [value.get(key) for key in ('diagnostic_histogram_heap_bytes', 'diagnostic_path_heap_bytes')]
+        if not all(unsigned(count) for count in allocations) or sum(allocations) != value['diagnostic_heap_bytes']:
+            raise ValueError('schema2 observer allocation totals differ')
+        result = {**result, 'extent_samples': populations, 'extent_totals': extent_totals,
+                  'codec_coverage': coverage, 'extent_errors': 0}
+    except ValueError as error:
+        # Runtime validation still refuses the complete observation. An offline
+        # reader may retain the independently valid three base histograms.
+        raise ExtentMetricsError(str(error), result) from error
+    return result

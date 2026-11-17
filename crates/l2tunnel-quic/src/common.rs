@@ -53,8 +53,10 @@ pub struct Geometry {
     pub ip_udp_bytes: usize,
     /// Explicit conservative QUIC allowance, not measured wire overhead.
     pub quic_allowance_bytes: usize,
-    /// Configured byte bound for each maintained DATAGRAM queue.
+    /// Configured maintained receive queue and adapter custody ceiling.
     pub maintained_queue_bytes: usize,
+    /// Actual smaller outgoing Quinn FIFO ceiling; acceptance can backpressure.
+    pub maintained_send_queue_bytes: usize,
     /// Conservative maintained send-entry count at the selected 9-byte minimum.
     pub maximum_queued_send_entries: usize,
     /// Bounded outstanding adapter tickets for each trusted scheduling class.
@@ -418,6 +420,7 @@ fn checked(
         ip_udp_bytes,
         quic_allowance_bytes: 128,
         maintained_queue_bytes: expected.datagram_queue_bytes()?,
+        maintained_send_queue_bytes: expected.datagram_send_queue_bytes()?,
         maximum_queued_send_entries: expected.maximum_queued_send_entries()?,
         pending_per_class: expected.queued_datagrams,
     };

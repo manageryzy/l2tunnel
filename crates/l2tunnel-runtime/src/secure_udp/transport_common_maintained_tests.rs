@@ -408,7 +408,10 @@ async fn establish_original_pair_inner(
         &allowed,
         cap,
     ))
-    .await?;
+    .await
+    .map_err(|error| {
+        format!("maintained {kind:?} {duplex:?} stage=outer-authentication: {error:?}")
+    })?;
     assert_eq!(a.authenticated().binding(), b.authenticated().binding());
     assert_eq!(a.authenticated().requested(), request);
     let lanes = if duplex == core::Duplex::Half { 2 } else { 1 };
@@ -494,7 +497,8 @@ async fn establish_original_pair_inner(
             &mut b_entropy,
             &mut b_noop
         ),
-    )?;
+    )
+    .map_err(|error| format!("maintained {kind:?} {duplex:?} stage=inner-noise: {error:?}"))?;
     assert_eq!(
         a.authenticated().configuration,
         a_contract.expected_configuration().0
@@ -510,7 +514,8 @@ async fn establish_original_pair_inner(
     let (a, b) = tokio::try_join!(
         member::maintained::connect_initial(a, &inner_member, a_settings, &mut a_noop),
         member::maintained::accept_initial(b, inner_allowed, b_settings, &mut b_noop),
-    )?;
+    )
+    .map_err(|error| format!("maintained {kind:?} {duplex:?} stage=inner-membership: {error:?}"))?;
     let a = a.into_parts();
     let b = b.into_parts();
     assert_eq!(a.info.member, inner_member.public_key());
@@ -662,33 +667,43 @@ async fn exercise_established(
             }
         }
     }
+    let stopped = |result: &io::Result<CommonStopped>| match result {
+        Ok(value) => format!(
+            "stop={:?}, elapsed={}, epoch={}, phase={:?}",
+            value.reason,
+            value.snapshot.elapsed_micros,
+            value.snapshot.epoch.0,
+            value.snapshot.phase
+        ),
+        Err(error) => format!("entry={error:?}"),
+    };
+    let observed = |snapshot: Option<&CommonSnapshot>| match snapshot {
+        Some(snapshot) => format!(
+            "elapsed={}, epoch={}, physical_epoch={}, phase={:?}, engine={:?}, control={:?}, counters={:?}, liveness={:?}",
+            snapshot.elapsed_micros,
+            snapshot.epoch.0,
+            snapshot.physical_scope.epoch.0,
+            snapshot.phase,
+            snapshot.engine,
+            snapshot.control,
+            snapshot.counters,
+            snapshot.liveness,
+        ),
+        None => "no native readiness observation".to_owned(),
+    };
     if let Err(error) = result {
-        let stopped = |result: &io::Result<CommonStopped>| match result {
-            Ok(value) => format!(
-                "stop={:?}, elapsed={}, epoch={}, phase={:?}",
-                value.reason,
-                value.snapshot.elapsed_micros,
-                value.snapshot.epoch.0,
-                value.snapshot.phase
-            ),
-            Err(error) => format!("entry={error:?}"),
-        };
-        let observed = |snapshot: Option<&CommonSnapshot>| match snapshot {
-            Some(snapshot) => format!(
-                "elapsed={}, epoch={}, physical_epoch={}, phase={:?}, engine={:?}, control={:?}, counters={:?}, liveness={:?}",
-                snapshot.elapsed_micros,
-                snapshot.epoch.0,
-                snapshot.physical_scope.epoch.0,
-                snapshot.phase,
-                snapshot.engine,
-                snapshot.control,
-                snapshot.counters,
-                snapshot.liveness,
-            ),
-            None => "no native readiness observation".to_owned(),
-        };
         return Err(format!(
             "maintained {kind:?} {duplex:?} exercise={error}; client {} [{}]; server {} [{}]",
+            stopped(&a),
+            observed(a_snapshots.borrow().as_ref()),
+            stopped(&b),
+            observed(b_snapshots.borrow().as_ref()),
+        )
+        .into());
+    }
+    if a.is_err() || b.is_err() {
+        return Err(format!(
+            "maintained {kind:?} {duplex:?} stage=runtime-terminal exercise=passed; client {} [{}]; server {} [{}]",
             stopped(&a),
             observed(a_snapshots.borrow().as_ref()),
             stopped(&b),
@@ -735,7 +750,13 @@ fn exercise(
     protection: security::compact::Protection,
 ) -> Pin<Box<dyn Future<Output = Result>>> {
     Box::pin(async move {
-        let pair = establish_original_pair(kind, duplex, protection).await?;
+        let pair = establish_original_pair(kind, duplex, protection)
+            .await
+            .map_err(|error| {
+                format!(
+                    "maintained {kind:?} {duplex:?} {protection:?} stage=establishment: {error}"
+                )
+            })?;
         Box::pin(exercise_established(kind, duplex, pair)).await
     })
 }

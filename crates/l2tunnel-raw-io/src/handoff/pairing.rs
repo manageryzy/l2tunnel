@@ -675,7 +675,8 @@ fn metadata<I: PacketIo + Send + 'static>(count: usize, raw: Config) -> Result<u
     // fixed boxed engine/socket/gate/timers, actual driver capture, and reserved
     // per-auth future metadata. Separately charged payload arrays may be repeated
     // here as part of an inline type, which deliberately overestimates the bound.
-    let driver = future_size(|d: SwitchDriver<I>| d.run_owned_pair(Instant::now()));
+    let driver =
+        future_size(|(d, deadline): (SwitchDriver<I>, Instant)| d.run_owned_pair(deadline));
     let fixed = size_of::<PairSetup<'static, I>>()
         .checked_add(size_of::<Group<I>>())
         .and_then(|n| n.checked_add(size_of::<PairedRaw<I>>()))

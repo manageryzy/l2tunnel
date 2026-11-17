@@ -12,10 +12,12 @@ mod backing;
 mod compact;
 mod recovery_owner;
 mod selected_wire;
+mod wire_extent;
 pub use compact::{
     CompactOutput, CompactOutputError, CompactOverheads, CompactReliableConfig,
     inspect_compact_structural,
 };
+pub use wire_extent::RecoveryExtent;
 mod legacy_layout;
 pub mod storage;
 use std::fmt;

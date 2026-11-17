@@ -71,7 +71,32 @@ fn exercise(
                     .maintained_carrier
                     .as_ref()
                     .ok_or("maintained status")?;
-                assert_eq!(carrier.effective.as_ref(), Some(&carrier.requested));
+                // Proxy requests retain only the authenticated generic geometry;
+                // actual QUIC queue observations come from the installed owner.
+                assert_eq!(carrier.requested.quic_queues, None);
+                assert!(carrier.matches_requested_policy());
+                let mut changed = carrier.clone();
+                changed.requested.charged_overhead_bytes += 1;
+                assert!(!changed.matches_requested_policy());
+                let mut absent = carrier.clone();
+                absent.effective = None;
+                assert!(!absent.matches_requested_policy());
+                let mut effective = carrier.effective.clone().ok_or("effective policy")?;
+                let queues = effective.quic_queues.take();
+                assert_eq!(effective, carrier.requested);
+                if half {
+                    let queues = queues.ok_or("actual QUIC queue bounds")?;
+                    let mut changed = carrier.clone();
+                    changed.requested.quic_queues = Some([None, None]);
+                    assert!(!changed.matches_requested_policy());
+                    for lane in queues {
+                        let lane = lane.ok_or("actual Half lane queue bounds")?;
+                        assert_eq!(lane.maintained_queue_bytes, (1344 + 64) * 8);
+                        assert_eq!(lane.maintained_send_queue_bytes, (1344 + 64) * 2);
+                    }
+                } else {
+                    assert_eq!(queues, None);
+                }
                 assert_eq!(
                     carrier.lanes.iter().flatten().count(),
                     if half { 2 } else { 1 }

@@ -247,6 +247,15 @@ fn effective_repair_extent_real_records_recovers_loss_and_charges_exact_short_by
         };
         source_extents.push(source.len());
         assert_eq!(prepared.bytes, 2 + source.len());
+        let extent = a.inspect_output_extent(&datagram.bytes)?;
+        assert_eq!(
+            (extent.recovery.header_bytes, extent.recovery.payload_bytes),
+            (2, source.len())
+        );
+        assert_eq!(
+            extent.codec.ok_or("packed source extent")?.bytes,
+            source.len()
+        );
         // Lose the first whole source; only the received second source and
         // actual encoded repair may contribute to reconstruction.
         if index != 0 {
@@ -273,6 +282,12 @@ fn effective_repair_extent_real_records_recovers_loss_and_charges_exact_short_by
             assert_eq!(prepared.kind, record_engine::EmissionKind::Repair);
             assert_eq!(prepared.bytes, 1 + 1 + 1 + 2 + 110);
             assert_eq!(prepared.wire_bytes, 115 + 41);
+            let extent = a.inspect_output_extent(&output[..prepared.bytes])?;
+            assert_eq!(
+                (extent.recovery.header_bytes, extent.recovery.payload_bytes),
+                (3, 112)
+            );
+            assert_eq!(extent.codec, None);
             assert_eq!(budget.packets, 0);
             assert_eq!(budget.wire_bytes, 10_000 - prepared.wire_bytes);
             assert!(prepared.bytes < config.forward.scheduler.recovery.width()?);
@@ -758,6 +773,15 @@ fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identi
         );
         assert_eq!(b.inspect_peer(&output[..sent.bytes])?, sent.kind);
         assert_eq!(sent.wire_bytes, sent.bytes + 41);
+        let extent = a.inspect_output_extent(&output[..sent.bytes])?;
+        assert_eq!(
+            extent.recovery.header_bytes + extent.recovery.payload_bytes,
+            sent.bytes
+        );
+        assert_eq!(
+            extent.codec.ok_or("research source extent")?.bytes,
+            extent.recovery.payload_bytes
+        );
         a.confirm_output(Tick(1), sent)?;
         b.accept_authenticated_at(Tick(2), Tick(2), sent.kind, &output[..sent.bytes])?;
         let mut delivered = false;
@@ -788,6 +812,12 @@ fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identi
                 assert_eq!(ack.kind, record_engine::EmissionKind::Feedback);
                 assert_eq!(ack.wire_bytes, ack.bytes + 85);
                 assert_eq!(a.inspect_peer(&output[..ack.bytes])?, ack.kind);
+                let extent = b.inspect_output_extent(&output[..ack.bytes])?;
+                assert_eq!(
+                    (extent.recovery.header_bytes, extent.recovery.payload_bytes),
+                    (ack.bytes, 0)
+                );
+                assert_eq!(extent.codec, None);
                 b.confirm_output(Tick(tick), ack)?;
                 a.accept_authenticated(Tick(tick), ack.kind, &output[..ack.bytes])?;
                 feedback = true;

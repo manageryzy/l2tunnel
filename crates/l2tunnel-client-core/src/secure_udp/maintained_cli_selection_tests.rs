@@ -151,6 +151,24 @@ fn maintained_cli_binds_complete_tls_quic_catalog_and_refuses_incompatible_selec
             assert_eq!(lines[0]["carrier"], carrier);
             assert!(lines[0]["maintained_carrier"]["effective"].is_null());
             assert!(lines[0]["maintained_carrier"]["binding"].is_null());
+            let queues = &lines[0]["maintained_carrier"]["requested"]["quic_queues"];
+            if quic {
+                assert_eq!(queues[0]["maintained_queue_bytes"], 8 * (1344 + 64));
+                assert_eq!(queues[0]["maintained_send_queue_bytes"], 2 * (1344 + 64));
+                assert!(queues[1].is_null());
+            } else {
+                assert!(queues.is_null());
+            }
+            // A request digest alone does not reveal configured lane queue sizes.
+            let request = profile
+                .maintained_settings()
+                .ok_or_else(|| input("missing maintained settings"))?
+                .request(connection)?;
+            let unknown = crate::secure_udp::common_status::MaintainedCarrier::from_observation(
+                request, None,
+            )?;
+            assert!(unknown.requested.quic_queues.is_none());
+            assert!(unknown.effective.is_none());
             assert_eq!(
                 lines[0]["maintained_carrier"]["outer_protection"],
                 "mandatory-maintained-aead-additional-to-inner"

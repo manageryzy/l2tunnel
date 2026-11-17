@@ -42,6 +42,8 @@ mod native_window;
 pub use native_counts::NativeCounts;
 pub use native_window::NativeDelivery;
 mod compact_wire;
+mod wire_extent;
+pub use wire_extent::{CodecCoverage, OutputExtent};
 mod owner;
 mod proxy_records;
 #[cfg(test)]

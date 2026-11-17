@@ -380,11 +380,11 @@ and eight-CPU affinity sets, but share host memory, storage and kernel resources
 These are finite concurrent-host observations, not production capacity maxima.
 See [the runner contract](../../tools/common_native_matrix.md).
 
-An opt-in bounded runtime observer records algorithm bytes, final Records bytes
+The initial opt-in bounded runtime observer records algorithm bytes, final Records bytes
 and their exact difference only at socket acceptance, TLS stream flush or Quinn
 DATAGRAM acceptance. Its fixed histograms and separately reported diagnostic heap
 are not protocol admission credit. No packet contents or keys are logged. These
-observations currently establish Records overhead, not total encapsulation:
+schema1 observations establish Records overhead, not total encapsulation:
 codec/source attribution, retry allocation and TLS/QUIC physical header quantiles
 remain unmeasured. Captured IP packet-size p99 must not be renamed overhead p99.
 `common_matrix_report.py` preserves every attempt, selects the latest explicitly
@@ -413,7 +413,149 @@ expiries, one integration port collision, three QUIC switching transport errors
 and one raw control expiry. No Aligned exact-extent assertion fails, but there is
 no aggregate green gate. Original failed attempts remain evidence.
 
+The independent direction fill is now complete as attempted coverage, with
+235 case sessions covering all80 combinations and240 selected phase outcomes:
+10 passed,192 failed,33 exhausted their original bounds, and5 failed during
+startup before their selected workload ran. All ten passing phases use UDP.
+Additional passing observations are Swift FEC simultaneous8.6555648/6.6978688,
+Aligned Cauchy reverse0.2988672, Packed ARQ reverse0.191136, and Packed Cauchy
+simultaneous0.4737856/0.411232 Mbit/s. Independent phases do not establish a
+continuous three-phase session. The complete source-bound table, exact errors,
+directional byte totals and original observations are retained in
+[the complete baseline report](../../work/aligned-extents-20261117/matrix-report-directions-complete1/report.md).
+
+Two targeted transport corrections follow these observations. Raw Common now
+retries an outstanding authenticated liveness challenge at the existing250 ms
+transition interval; new challenge cadence, original15 s expiry, held ciphertext
+age and actual-send receipt accounting remain unchanged. Twelve affected raw
+protocol/injected-I/O tests pass. Common QUIC now bounds its maintained outgoing
+FIFO to at most two maximum-record byte allowances, applying backpressure before
+further DATAGRAM acceptance; the configured receive/custody queue remains intact.
+Seven focused QUIC tests pass. This is neither strict control priority nor a
+two-packet limit, and excludes already transmitted congestion flight. The first
+repair binary passes raw forward0.874592 and reverse0.8873344 Mbit/s; the third
+phase of that session reaches the original120 s lease with live control. A fresh
+independent simultaneous session passes0.6904064/0.6938816 Mbit/s at unchanged
+bounds. QUIC still fails authenticated liveness expiry. These finite results
+qualify the raw loss-retry correction, not throughput targets or one continuous
+three-phase session. No failed baseline is relabeled. The subsequent source fix
+also restores Control-before-User polling in both maintained output and runtime
+receipt selection; its focused checks and release4 phase are recorded below.
+
+The opt-in observer now uses allocation-free canonical outgoing
+extent inspection: route, outer-fragment, recovery, systematic coded fill and
+codec envelope/container/unit header lengths. Counters commit only on actual
+whole-send acceptance. Each histogram has its own sample population. Swift
+stream codec attribution, codec-body compression fields, retries versus initial
+sources and physical TLS/QUIC overhead remain separate unmeasured quantities;
+these partial extents must not be presented as total encapsulation overhead.
+This work advances CWC-01/06/09/13/17/18 without closing their broader gates.
+
+The stable matrix ID `swift-arq` means proportional repair ratio zero, not removal
+of all FEC: the existing Swift tail probe still emits a repair equation to reveal
+the newest sequence and solicit recovery feedback. Actual repair counts remain
+included. Compact ARQ has a separate nine-attempt configured bound; the cited
+Python candidate has no attempt-count limit. A minimal TLS failure includes a
+TCP contiguous-byte gap despite only approximately1 KiB accepted per direction.
+The [capture audit](../../work/aligned-extents-20261117/tls-compact-hol-audit1/audit.md)
+cannot identify encrypted feedback contents. An opt-in bounded scalar trace
+(`L2TUNNEL_COMPACT_ARQ_TRACE`) distinguishes source0 selection, whole acceptance,
+authenticated feedback arrival and actual application/retention results. It
+preserves original timers and caps and records no payloads or keys.
+
+### Repair4 consolidation and remaining failures
+
+The [current combined report](../../work/aligned-extents-20261117/matrix-report-repairs4-complete1/report.md)
+retains 240 case sessions and selects 240 phase outcomes across the same eighty
+algorithm/carrier combinations: 14 passed, 187 failed, 32 exhausted their
+original bounds and 7 did not run. Selection is the latest explicitly requested
+attempt per phase, not the fastest or most successful attempt. Each phase keeps
+its own executable, input and receipt provenance; independent sessions are not
+a continuous three-phase pass. All failed baseline attempts remain available.
+Untouched combinations are not requalified by a newer repair binary.
+
+Release4's `swift-arq-quic` forward phase passes at 0.341728 Mbit/s after bounded
+Control-before-User scheduling was restored. The
+[focused priority/trace receipt](../../work/aligned-extents-20261117/trace-priority-focused2.json)
+also passes pending management before User after a full actual QUIC FIFO,
+original-arrival feedback retention and bounded scalar tracing. This is finite
+forward evidence at the original matrix settings, not QUIC all-direction or
+performance acceptance. The prior liveness failures remain in the report.
+
+Release4's `aligned-compact-tls` reverse phase fails with client
+`whole-message control error: Expired` at elapsed 23.190915 seconds, followed by
+server `UnexpectedEof`. It does not reproduce source0 `RetryExhausted`: both
+peers applied positive source0 feedback, one after its first attempt and the
+other after one retry. The
+[hashed trace analysis](../../work/aligned-extents-20261117/compact-arq-trace4-analysis.json)
+separates local acceptance, authenticated arrival and application. Both bounded
+512-event traces overflow before the terminal control failure; their successful
+source0 prefix cannot explain the later expiry or erase the earlier failure.
+Compact ARQ still has its configured finite attempt bound, unlike the cited
+Python candidate. This TLS trace changed no retry, window, lease or handoff cap.
+
+Raw actual-horizon/reserve status passes its affected lower-owner and two paired
+service checks in the
+[raw status receipt](../../work/aligned-extents-20261117/raw-status-and-rustdoc-focused1.json).
+The subsequent policy-derived native receive-buffer/slot planner and typed
+`PacketPhaseConfig::preflight::<PacketOwner>` pass all three client capacity and
+all three raw-io preflight tests in the
+[required-check continuation](../../work/aligned-extents-20261117/required-repair-checks2-continuation1.json).
+The actual paired compact raw service passes both suites with a 1 MiB policy,
+asserting genuine local and peer horizons above 65,535 bytes and no greater than
+the policy cap, rather than an exact effective cap. Configuration, payload and
+concrete metadata bounds are checked before opening I/O. This is caller-owned
+PacketIo/bootstrap evidence; earlier native captures do not qualify these new
+allocations. The
+[raw module](raw-common-carrier.md#shared-service-installation) records the exact
+planner and the separate, already tested liveness retry correction.
+
+The [receipt/proxy focused batch](../../work/aligned-extents-20261117/receipt-and-proxy-errors-focused1.json)
+passes actual UDP receipt correlation, dual proxy-error preservation and the
+report's offline checks. Metrics commit only after identity, scope, length and
+charge correlate, but retain a genuine late accepted send before its deadline
+error. Proxy failure reports preserve both runtime and joined actor causes
+without changing primary precedence, joins or the measured handoff deadline.
+Neither correction establishes that the remaining measured-proxy or control
+expiry is repaired. The required aggregate check remains open.
+
+The same required-check continuation passes formatting, strict workspace
+all-target/all-feature Clippy and workspace rustdoc. Its Rust workspace run still
+fails four cases: Swift TLS reconnect reports `AddrInUse`, the measured QUIC
+proxy reports `HandoffExpired`, and Full QUIC CCM/CRC switching fails at terminal
+handling after the exercise passes. Measured TLS proxy and both Half QUIC
+switching cases pass in this attempt; their earlier failures remain preserved
+and are not explained by this continuation. No pristine aggregate pass or full
+proxy/carrier qualification is claimed.
+
+Schema2 histograms describe cumulative accepted emissions for each actual owner,
+not a single phase when that owner served several phases. Canonical recovery,
+systematic-fill and supported codec-envelope/header fields have separate sample
+populations. Swift stream attribution, codec-body compression fields, initial
+versus retried source attribution and physical TLS/QUIC overhead quantiles remain
+explicitly unmeasured. The fixed 21-byte full-tag Records cost is one layer;
+neither it, captured IP packet-size p99, nor a sum of independent histogram
+quantiles is total encapsulation overhead. Same-window WAN/application ratios
+include ACKs, retransmissions and boundary-crossing flight and are not matched
+packet overhead. All CWC acceptance gates remain open.
+
 ## Accepted direction and open engineering choices
+
+The subsequent source-stable
+[release5 raw remeasurement](../../work/aligned-extents-20261117/matrix-raw-repair5-attempt1/swift-arq-raw/result.json)
+observes the requested1,048,576-byte horizon in both directions, with1,036,896
+Data bytes after the unchanged11,680-byte reserve. It fails before a qualified
+forward sample: client and server whole-message control expiry occur at10.511245
+and10.787993 seconds, before their liveness deadlines. Reverse and simultaneous
+phases do not run. This proves the bootstrap capacity correction reached the
+native owners, not a throughput improvement or completed control repair. The
+[latest complete report](../../work/aligned-extents-20261117/matrix-report-repairs5-complete1/report.md)
+therefore selects11 passing,188 failed,32 bound-exhausted and9 not-run phases;
+older raw passes remain historical attempts rather than current-version rates.
+The unchanged isolated TLS reconnect syscall probe passes both same-port
+connections, so TIME_WAIT remains an unproved explanation for aggregate
+`AddrInUse`. No timeout, retry, window-policy or original workload bound was
+relaxed to obtain these observations.
 
 The ordinary-data target is at most 24 bytes, with 20 bytes or less an optimization
 target. Neither is a universal bound for coefficient vectors, context records,

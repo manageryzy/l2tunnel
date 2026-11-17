@@ -1,5 +1,22 @@
 //! Portable requested/effective maintained transport observations.
 use serde::{Deserialize, Serialize};
+/// Per-original-lane queue bounds, never dynamic occupancy or physical flight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuicQueues {
+    /// Configured maintained receive queue and adapter custody ceiling.
+    pub maintained_queue_bytes: u64,
+    /// Effective outgoing Quinn FIFO ceiling installed for Common records.
+    pub maintained_send_queue_bytes: u64,
+}
+impl QuicQueues {
+    fn new(receive: usize, send: usize) -> std::io::Result<Self> {
+        Ok(Self {
+            maintained_queue_bytes: u64::try_from(receive).map_err(std::io::Error::other)?,
+            maintained_send_queue_bytes: u64::try_from(send).map_err(std::io::Error::other)?,
+        })
+    }
+}
 /// Exact requested record bounds; charges are allowances, not physical byte facts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +39,9 @@ pub struct MaintainedPolicy {
     pub bootstrap_overhead_bytes: u64,
     /// Exact application framing overhead, independently of mandatory outer AEAD.
     pub framing_bytes: u64,
+    /// Global First/Second lane queue geometry; None means unavailable or non-QUIC.
+    #[serde(default)]
+    pub quic_queues: Option<[Option<QuicQueues>; 2]>,
 }
 /// Actual original connection observations; copied fields confer no authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -81,10 +101,25 @@ impl MaintainedPolicy {
             charged_overhead_bytes: n(g.charged_overhead_bytes)?,
             bootstrap_overhead_bytes: n(g.bootstrap_overhead_bytes)?,
             framing_bytes: n(g.framing_bytes)?,
+            quic_queues: None,
         })
     }
 }
 impl MaintainedCarrier {
+    /// Compare all requested policy fields, preserving observed-only queue facts.
+    pub(crate) fn matches_requested_policy(&self) -> bool {
+        let Some(effective) = self.effective.as_ref() else {
+            return false;
+        };
+        let mut requested = self.requested.clone();
+        // Proxy requests retain generic authenticated geometry without the
+        // original Quinn profiles. Absence is unknown, not a zero queue bound.
+        if requested.quic_queues.is_none() {
+            requested.quic_queues = effective.quic_queues;
+        }
+        *effective == requested
+    }
+
     pub(crate) fn observe(
         profile: &crate::secure_udp::common_transaction_profile::Profile,
         snapshot: Option<&l2tunnel_runtime::secure_udp::transport::CommonSnapshot>,
@@ -106,7 +141,35 @@ impl MaintainedCarrier {
                 "maintained runtime differs from authenticated plan",
             ));
         }
-        Self::from_observation(request, actual).map(Some)
+        let mut observed = Self::from_observation(request, actual)?;
+        if let crate::secure_udp::maintained::Transport::Quic(profiles) = settings.transport {
+            let [first, second] = profiles.map(|profile| {
+                profile
+                    .map(|profile| {
+                        QuicQueues::new(
+                            profile
+                                .datagram_queue_bytes()
+                                .map_err(std::io::Error::other)?,
+                            profile
+                                .datagram_send_queue_bytes()
+                                .map_err(std::io::Error::other)?,
+                        )
+                    })
+                    .transpose()
+            });
+            let queues = Some([first?, second?]);
+            if observed
+                .effective
+                .as_ref()
+                .is_some_and(|effective| effective.quic_queues != queues)
+            {
+                return Err(std::io::Error::other(
+                    "actual QUIC queues differ from requested profiles",
+                ));
+            }
+            observed.requested.quic_queues = queues;
+        }
+        Ok(Some(observed))
     }
     pub(crate) fn from_observation(
         request: l2tunnel_runtime::secure_udp::maintained::Request,
@@ -127,11 +190,28 @@ impl MaintainedCarrier {
                 })
             })
         });
+        let effective = actual
+            .map(|outer| {
+                let mut effective = MaintainedPolicy::from_request(outer.requested())?;
+                if request.kind == l2tunnel_runtime::secure_udp::maintained::Kind::QuicDatagram {
+                    let [first, second] = outer.lanes().map(|lane| {
+                        lane.and_then(|lane| lane.quic_queues)
+                            .map(|queues| {
+                                QuicQueues::new(
+                                    queues.maintained_queue_bytes,
+                                    queues.maintained_send_queue_bytes,
+                                )
+                            })
+                            .transpose()
+                    });
+                    effective.quic_queues = Some([first?, second?]);
+                }
+                Ok::<_, std::io::Error>(effective)
+            })
+            .transpose()?;
         Ok(Self {
             requested: MaintainedPolicy::from_request(request)?,
-            effective: actual
-                .map(|outer| MaintainedPolicy::from_request(outer.requested()))
-                .transpose()?,
+            effective,
             binding: actual.map(|outer| outer.binding()),
             lanes,
             send_boundary: actual.map(|_| format!("{:?}", request.kind.send_boundary())),

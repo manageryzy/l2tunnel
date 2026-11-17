@@ -165,7 +165,20 @@ impl Engine {
     }
 
     fn inspect_swift_peer(&self, body: &[u8]) -> Result<EmissionKind, Error> {
+        self.inspect_swift_direction(body, false)
+    }
+
+    pub(super) fn inspect_swift_direction(
+        &self,
+        body: &[u8],
+        outgoing: bool,
+    ) -> Result<EmissionKind, Error> {
         let local = self.configuration.descriptor().local(self.context.role);
+        let (data, feedback) = if outgoing {
+            (local.send(), local.receive())
+        } else {
+            (local.receive(), local.send())
+        };
         let lead = *body.first().ok_or(Error::PacketSize)?;
         match lead & swift::KIND_MASK {
             swift::KIND_SOURCE | swift::KIND_REPAIR => {
@@ -177,7 +190,7 @@ impl Engine {
                 } else {
                     (swift::REPAIR_HEADER, EmissionKind::Repair)
                 };
-                if body.len() < minimum || u16::from(lead >> 2) >= local.receive().channels() {
+                if body.len() < minimum || u16::from(lead >> 2) >= data.channels() {
                     return Err(Error::PacketSize);
                 }
                 Ok(kind)
@@ -187,7 +200,7 @@ impl Engine {
                 while !rest.is_empty() {
                     if rest.len() < swift::FEEDBACK_HEADER
                         || rest[0] & swift::KIND_MASK != swift::KIND_FEEDBACK
-                        || u16::from(rest[0] >> 2) >= local.send().channels()
+                        || u16::from(rest[0] >> 2) >= feedback.channels()
                     {
                         return Err(Error::Kind);
                     }

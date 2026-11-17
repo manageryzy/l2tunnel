@@ -226,6 +226,14 @@ fn compact_collection_loss_independent_progress_strong_feedback_and_reuse_keep_o
     let length = token.bytes();
     let (header, inner) = a.decode_route(&bytes[..length])?;
     assert_eq!(length - inner.len(), 10);
+    let (observed_route, extent) = a.inspect_output_extent(&bytes[..length])?;
+    assert_eq!(observed_route, header);
+    let extent = extent.ok_or("actual recovered route extent")?;
+    assert_eq!(
+        extent.recovery.bytes + observed_route.compact_bytes(),
+        length
+    );
+    assert!(extent.codec.is_some());
     assert_eq!(header.incarnation, cfg.incarnation + 1);
     assert_eq!(token.wire_bytes(), length + 28);
     a.confirm_output_at(ms(2000), ms(2000), token)?;
@@ -323,6 +331,9 @@ fn compact_source_free_route_preserves_full_serial_once_cost_and_native_custody(
     assert_eq!(token.bytes() - payload.len(), 18);
     assert_eq!(header.unreliable_serial, original.serial);
     assert_eq!(payload, frame);
+    let (observed_route, extent) = a.inspect_output_extent(&bytes[..token.bytes()])?;
+    assert_eq!(observed_route, header);
+    assert_eq!(extent, None);
     assert_eq!(token.wire_bytes(), 18 + frame.len() + 28);
     assert_eq!(allowance.wire_bytes, 100_000 - token.wire_bytes());
     assert!(a.slot(id)?.endpoint.drained());

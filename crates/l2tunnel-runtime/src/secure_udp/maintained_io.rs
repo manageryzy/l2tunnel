@@ -1,5 +1,5 @@
 //! Actual maintained-owner custody, separate from physical datagram acceptance.
-use super::maintained::{Authenticated, Geometry, Kind, Lane, Request};
+use super::maintained::{Authenticated, Geometry, Kind, Lane, QuicQueues, Request};
 use crate::retained_tls as tls;
 use crate::retained_tls::failure::Failure;
 use l2tunnel_auth::SessionConfig;
@@ -169,6 +169,7 @@ impl Carrier {
             info: value.session,
             local: value.local_addr,
             peer: value.peer_addr,
+            quic_queues: None,
         };
         let proof = Authenticated::checked(
             request,
@@ -274,6 +275,10 @@ impl Carrier {
                 info: *value.info(),
                 local,
                 peer,
+                quic_queues: Some(QuicQueues {
+                    maintained_queue_bytes: actual.maintained_queue_bytes,
+                    maintained_send_queue_bytes: actual.maintained_send_queue_bytes,
+                }),
             });
             expected[index] =
                 Some(l2tunnel_quic::session_config(base, profile).map_err(quic_error)?);
@@ -536,7 +541,12 @@ impl Carrier {
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let geometry = self.geometry();
         let mut progress = false;
-        for output in self.output.iter_mut().flatten() {
+        // Every entry point services both retained classes. Preserve Control
+        // priority even when the caller is polling its User ticket first.
+        for class in [Class::Control, Class::User] {
+            let Some(output) = &mut self.output[class.index()] else {
+                continue;
+            };
             if output.result.is_some() {
                 continue;
             }
@@ -940,6 +950,7 @@ pub(crate) fn test_framing_carrier(
                 info: info.first.session,
                 local: info.first.local_addr,
                 peer: info.first.peer_addr,
+                quic_queues: None,
             }),
             None,
         ],
@@ -1114,6 +1125,81 @@ mod tests {
         assert_eq!(b.recv(&mut output, cap).await?.framing, Framing::Final);
         assert_eq!(&output[..9], &input);
         assert_eq!(b.recv(&mut output, cap).await?.framing, Framing::Final);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn maintained_quic_pending_management_precedes_user_after_full_fifo()
+    -> Result<(), Failure> {
+        let (a, b, request, base) = full().await?;
+        let mut a = Carrier::quic(vec![a], request, base, 1_000_000)?;
+        let mut b = Carrier::quic(vec![b], request, base, 1_000_000)?;
+        let cap = a.setup_deadline().min(b.setup_deadline());
+        a.select_final_records(cap)?;
+        b.select_final_records(cap)?;
+        let user = [0x80; 1072];
+        // A Ping/Pong uses 88 envelope bytes, 41 fragment bytes, 44 ARQ
+        // bytes, 8 stream bytes and 21 protected Records bytes. Its actual
+        // 202-byte final size does not fit the FIFO's spare 128 bytes.
+        let management = [0; 202];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut accepted_bytes = 0;
+        // Synchronous polls give the current-thread Quinn driver no turn to
+        // drain the two maximum-size entries before contention is installed.
+        for _ in 0..2 {
+            let mut token = a.try_send(Class::User, &user, cap, Framing::Final)?;
+            let Poll::Ready(Ok(receipt)) = a.poll_send(&mut cx, &mut token) else {
+                return Err(io::Error::other("initial QUIC FIFO allowance unavailable").into());
+            };
+            assert_eq!(receipt.record_bytes, user.len());
+            assert_eq!(receipt.deadline, cap);
+            accepted_bytes += receipt.charged_bytes;
+        }
+        let mut user_token = a.try_send(Class::User, &user, cap, Framing::Final)?;
+        let mut control_token = a.try_send(Class::Control, &management, cap, Framing::Final)?;
+        assert!(a.poll_send(&mut cx, &mut user_token).is_pending());
+        assert!(a.poll_send(&mut cx, &mut control_token).is_pending());
+        assert_eq!(user_token.deadline(), cap);
+        assert_eq!(control_token.deadline(), cap);
+        // Pending polling leaves both immutable tickets owned. Give the actual
+        // driver room to transmit the older records without replacing either.
+        let mut output = [0; 1072];
+        for _ in 0..2 {
+            let received = b.recv(&mut output, cap).await?;
+            assert_eq!(received.bytes, user.len());
+            assert_eq!(&output[..received.bytes], &user);
+        }
+        // Even an explicit User completion poll must first service retained
+        // Control. The former class-index order reverses these peer records.
+        let user_receipt = poll_fn(|cx| a.poll_send(cx, &mut user_token)).await?;
+        let control_receipt = poll_fn(|cx| a.poll_send(cx, &mut control_token)).await?;
+        for (receipt, bytes) in [
+            (control_receipt, management.len()),
+            (user_receipt, user.len()),
+        ] {
+            assert_eq!(receipt.record_bytes, bytes);
+            assert_eq!(receipt.framed_bytes, bytes);
+            assert_eq!(receipt.charged_bytes, bytes + 156);
+            assert_eq!(receipt.deadline, cap);
+            assert!(receipt.accepted_at < cap);
+            assert!(!receipt.late);
+            accepted_bytes += receipt.charged_bytes;
+        }
+        assert!(control_receipt.accepted_at <= user_receipt.accepted_at);
+        assert_eq!(accepted_bytes, user.len() * 3 + management.len() + 156 * 4);
+        let received = b.recv(&mut output, cap).await?;
+        assert_eq!(received.bytes, management.len());
+        assert_eq!(&output[..received.bytes], &management);
+        let received = b.recv(&mut output, cap).await?;
+        assert_eq!(received.bytes, user.len());
+        assert_eq!(&output[..received.bytes], &user);
+        assert!(matches!(
+            a.poll_send(&mut cx, &mut control_token),
+            Poll::Ready(Err(SendFailure::Ticket))
+        ));
+        assert!(matches!(
+            a.poll_send(&mut cx, &mut user_token),
+            Poll::Ready(Err(SendFailure::Ticket))
+        ));
         Ok(())
     }
     #[tokio::test(start_paused = true)]

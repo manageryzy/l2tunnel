@@ -151,3 +151,89 @@ async fn current_raw_opener_time_cannot_extend_original_cap() -> R {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     Ok(())
 }
+
+#[test]
+fn current_raw_capacity_planner_covers_unscaled_receive_horizon() -> R {
+    for half in [false, true] {
+        let mut value = document(half);
+        value["packet"]["mtu"] = 1500.into();
+        value["packet"]["horizon_bytes"] = 1_048_576.into();
+        Settings::from_json(&serde_json::to_vec(&value)?)?;
+        let packet: Packet = serde_json::from_value(value["packet"].clone())?;
+        for name in ["forward", "reverse"] {
+            if value[name].is_null() {
+                continue;
+            }
+            let endpoints: Endpoints = serde_json::from_value(value[name].clone())?;
+            let config = raw_config(endpoints, packet)?;
+            assert_eq!(config.send_bytes, 32_768);
+            assert_eq!(config.receive_bytes, 1_048_576);
+            assert_eq!(config.packet_slots, 739);
+            let payload = config.mtu.checked_sub(80).ok_or("packet payload")?;
+            assert!(
+                config
+                    .packet_slots
+                    .checked_mul(payload)
+                    .ok_or("queue bytes")?
+                    >= config.receive_bytes
+            );
+            assert!(
+                (config.packet_slots - 1)
+                    .checked_mul(payload)
+                    .ok_or("prior queue bytes")?
+                    < config.receive_bytes
+            );
+            assert_eq!(config.ack_delay_millis, 1);
+            assert_eq!(config.keepalive_millis, 1000);
+            assert_eq!(config.idle_timeout_millis, 30_000);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn current_raw_capacity_planner_refuses_unrepresentable_ring_or_packet_count() -> R {
+    for half in [false, true] {
+        for (mtu, horizon) in [
+            (576_u16, 1_048_576_u32),
+            (1500, 4_194_305),
+            (1500, u32::MAX),
+        ] {
+            let mut value = document(half);
+            value["packet"]["mtu"] = mtu.into();
+            value["packet"]["horizon_bytes"] = horizon.into();
+            assert!(Settings::from_json(&serde_json::to_vec(&value)?).is_err());
+            let endpoints: Endpoints = serde_json::from_value(value["forward"].clone())?;
+            let packet: Packet = serde_json::from_value(value["packet"].clone())?;
+            let result = raw_config(endpoints, packet);
+            assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_raw_capacity_refusal_precedes_every_opener_call() -> R {
+    for half in [false, true] {
+        let mut value = document(half);
+        value["packet"]["horizon_bytes"] = 1_048_576.into();
+        let forward: Endpoints = serde_json::from_value(value["forward"].clone())?;
+        let reverse: Option<Endpoints> = serde_json::from_value(value["reverse"].clone())?;
+        let packet: Packet = serde_json::from_value(value["packet"].clone())?;
+        let mut calls = 0;
+        let result = inputs_for(
+            forward,
+            reverse,
+            packet,
+            Role::Client,
+            Instant::now() + Duration::from_secs(1),
+            |_, _| {
+                calls += 1;
+                Ok(Input(Arc::new(AtomicUsize::new(0))))
+            },
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
+        assert_eq!(calls, 0);
+    }
+    Ok(())
+}

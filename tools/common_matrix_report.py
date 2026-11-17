@@ -16,9 +16,9 @@ import re
 import time
 
 try:
-    from .common_native_observe import validate_wire_metrics
+    from .common_native_observe import EXTENT_METRICS, ExtentMetricsError, validate_wire_metrics
 except ImportError:
-    from common_native_observe import validate_wire_metrics
+    from common_native_observe import EXTENT_METRICS, ExtentMetricsError, validate_wire_metrics
 
 CARRIERS = ('udp', 'raw', 'tls', 'quic')
 PHASES = ('forward', 'reverse', 'simultaneous')
@@ -196,6 +196,13 @@ def metric_summary(value):
             'p50_bytes': value['p50'], 'p99_bytes': value['p99']}
 
 
+def extent_summary(value):
+    """A layer's own population, never all accepted records or native packets."""
+    return {'samples': value['samples'], 'total_bytes': value['total_bytes'],
+            'mean_bytes_per_sample': value['total_bytes'] / value['samples'] if value['samples'] else None,
+            'p50_bytes': value['p50'], 'p95_bytes': value['p95'], 'p99_bytes': value['p99']}
+
+
 def wire_metrics(case, directory, carrier, provenance):
     result = {'scope': 'cumulative per-runtime, all executed phases including warmup and drain; not a phase-window metric',
               'excludes': ['bootstrap', 'management', 'raw carrier control', 'outer TLS/QUIC/IP headers'],
@@ -219,10 +226,24 @@ def wire_metrics(case, directory, carrier, provenance):
             value = read_json(path, provenance)
             expected = case.get('wire_metrics', {}).get('sha256', {}).get(path.name)
             require(expected == provenance[str(path.resolve())], 'wire report differs from saved case hash')
-            validation = validate_wire_metrics(value, carrier)
+            extents = None
+            try:
+                validation = validate_wire_metrics(value, carrier)
+            except ExtentMetricsError as error:
+                validation = error.base_validation
+                extents = {'status': 'invalid_observation', 'reason': str(error),
+                           'extent_errors': value.get('extent_errors'), 'metrics': None,
+                           'codec_coverage': None}
+            else:
+                if value['schema'] == 2:
+                    extents = {'status': 'validated', 'reason': None, 'extent_errors': 0,
+                               'codec_coverage': validation['codec_coverage'],
+                               'metrics': {key: extent_summary(value[key]) for key in EXTENT_METRICS}}
             observed.update(status='validated', reason=None, pid=pids[sender], receipt=str(path.resolve()),
                             receipt_sha256=expected, boundary=validation['boundary'],
-                            accepted_classes=value['accepted_classes'], diagnostic_heap_bytes=value['diagnostic_heap_bytes'])
+                            accepted_classes=value['accepted_classes'], diagnostic_heap_bytes=value['diagnostic_heap_bytes'],
+                            observer_schema=value['schema'], layer_extents=extents,
+                            layer_extent_scope='independent canonical parser populations; missing attribution is excluded, not zero-filled; no summed total overhead')
             for key in ('algorithm_bytes', 'final_record_bytes', 'record_overhead_bytes'):
                 observed[key] = metric_summary(value[key])
         except (ValueError, OSError, KeyError, TypeError) as error:
@@ -378,6 +399,7 @@ def build_report(manifest_path, directories):
             'input_sha256': provenance, 'combination_count': len(combinations),
             'algorithm_variant_count': len({row['algorithm_variant'] for row in combinations}),
             'status_counts': dict(Counter(row['status'] for row in combinations)),
+            'phase_status_counts': dict(Counter(phase['status'] for row in combinations for phase in row['phase_outcomes'])),
             'failure_summary': failure_summary(combinations),
             'selection': 'latest started saved attempt independently per explicitly requested phase; all attempts retained, never fastest/best; independent sessions keep separate case/binary/receipt provenance and cumulative metrics',
             'definitions': {
@@ -386,7 +408,8 @@ def build_report(manifest_path, directories):
                 'records': 'per-direction cumulative accepted Common algorithm/final record lengths and their exact difference; includes warmup, all executed phases, source retransmissions/copies, repairs and recovery feedback; excludes management/bootstrap/raw control and outer transport',
                 'capture': 'sender WAN egress before qdisc, sender native TUN and peer native TUN ingress, each separate; IPv4 total_length includes TCP/IP headers, ACKs and retransmissions; no duplicate summation across surfaces',
                 'ratios': 'same-window aggregate sender WAN IP bytes / unique received application bytes or peer native delivered IP bytes; active valid direction only; includes reverse-flow ACK/control sharing that direction and packets in flight across window boundaries, not packet-matched encapsulation overhead',
-                'unavailable': 'codec attribution, total encapsulation overhead p99 and TLS/QUIC outer overhead p99 remain null; IP packet size p99 and constant Records tag overhead are not substitutes',
+                'layer_extents': 'schema2 reports canonical route, outer fragment, recovery, systematic coded fill and codec envelope/container/unit/body lengths on actual acceptance. Each histogram retains its own population: recovery excludes outer fragments and source-free native; codec excludes Swift streams, outer fragments, repair/feedback and source-free native. No sums of means or quantiles across these populations are total overhead. Schema1 has no layer attribution',
+                'unavailable': 'native compression/context/body decomposition, generic padding, retry attribution, total encapsulation overhead p99 and TLS/QUIC outer overhead p99 remain unavailable; codec body bytes are not original native bytes, systematic coded fill is not repair redundancy, and IP packet size p99 and constant Records tag overhead are not substitutes',
                 'terminal_causes': 'daemon diagnostics retain the observed error, side, line and log hash; they are case-wide, without phase timestamps or causal ordering between peers. Periodic terminal DTOs retain their actual phase/sample/time as less specific fallback. Category names classify observations, not root causes; raw Expired remains unqualified and TLS record cap does not prove a send-side failure. No config DTOs are copied',
                 'provenance': 'JSON, daemon log and metrics input hashes recomputed; saved pcap hashes preserved without re-reading large captures; running attempts are snapshots and cannot qualify throughput'},
             'combinations': combinations}
@@ -449,7 +472,9 @@ def summary_cell(row):
 def markdown(report):
     rows = report['combinations']
     lines = ['# Common native matrix observations', '',
-             f"Saved snapshot: {report['combination_count']} combinations, {report['algorithm_variant_count']} algorithm variants. Status counts: `{json.dumps(report['status_counts'], sort_keys=True)}`.", '',
+             f"Saved snapshot: {report['combination_count']} combinations, {report['algorithm_variant_count']} algorithm variants. Aggregate combination outcomes: `{json.dumps(report['status_counts'], sort_keys=True)}`.", '',
+             f"Selected direction-phase outcomes: `{json.dumps(report['phase_status_counts'], sort_keys=True)}`. A passing direction does not make an incomplete or failed whole session pass.", '',
+             'This report may contain different source-bound executables; per-phase receipt and binary provenance remain explicit. A newer repaired case does not requalify untouched combinations.', '',
              'F = forward, R = reverse, S = simultaneous forward/reverse. Rates are valid Mbit/s only; — means no qualified rate. Each phase uses its latest started explicitly requested attempt, without selecting successful retries. All attempts remain in report.json. Phases from independent sessions are labeled; they do not establish one continuous three-phase run.', '',
              '| Algorithm variant | UDP | Raw TCP-shaped | Maintained TLS | Native QUIC |',
              '|---|---|---|---|---|']
@@ -500,7 +525,7 @@ def markdown(report):
                              + ' | ' + number(data['wan_sent_ip_bytes_per_unique_application_byte'])
                              + ' | ' + number(data['wan_sent_ip_bytes_per_delivered_native_ip_byte']) + ' |')
     lines += ['', '## Cumulative inner Records measurements', '',
-              'Each row covers one selected case runtime, not individual phase windows. Independent sessions are never merged. These measure the inner Records layer only. Codec/padding attribution, total encapsulation p99 and TLS/QUIC outer p99 remain unavailable.', '',
+              'Each row covers one selected case runtime, not individual phase windows. Independent sessions are never merged. These measure the inner Records layer only. Schema2 canonical layer extents appear separately below; full codec/padding attribution, total encapsulation p99 and TLS/QUIC outer p99 remain unavailable.', '',
               '| Combination / sending direction | Case session | Actual boundary | Accepted records | Algorithm bytes mean / p99 | Final Records bytes mean / p99 | Records overhead bytes mean / p99 |',
               '|---|---|---|---:|---:|---:|---:|']
     for row in rows:
@@ -515,6 +540,25 @@ def markdown(report):
                 for name in ('algorithm_bytes', 'final_record_bytes', 'record_overhead_bytes'):
                     pieces.append(number(metric[name]['mean_bytes_per_accepted_record']) + ' / ' + str(metric[name]['p99_bytes']))
                 lines.append('| ' + ' | '.join(pieces) + ' |')
+    lines += ['', '## Canonical layer extents', '',
+              'Schema2 only. N is the independent sample count for that layer, including retransmissions/copies when accepted. Zero bytes with N > 0 are an observed zero extent; N = 0 means no attributable samples. Missing schema1 attribution remains unavailable. These are neither native-packet overheads nor additive percentile components; codec bodies retain unmeasured internal fields and meaningful payload bytes.', '',
+              '| Combination / direction | Case session | Layer | N | Mean bytes / p99 |',
+              '|---|---|---|---:|---:|']
+    for row in rows:
+        for index in sorted({index for index in row['phase_selection'].values() if index is not None}):
+            value = row['attempts'][index]
+            session = escape(Path(value['run_directory']).name)
+            for direction, metric in value['common_record_metrics']['directions'].items():
+                label = escape(row['id'] + ' / ' + direction)
+                extents = metric.get('layer_extents')
+                if extents is None or extents['status'] != 'validated':
+                    reason = ('schema1 has no layer attribution' if metric.get('observer_schema') == 1
+                              else extents['reason'] if extents else metric.get('reason', 'unavailable'))
+                    lines.append('| ' + label + ' | ' + session + ' | ' + escape(reason) + ' | — | — |')
+                    continue
+                for name, layer in extents['metrics'].items():
+                    lines.append('| ' + label + ' | ' + session + ' | ' + name + ' | ' + str(layer['samples'])
+                                 + ' | ' + number(layer['mean_bytes_per_sample']) + ' / ' + number(layer['p99_bytes']) + ' |')
     lines += ['', '## Attempt provenance', '']
     for row in rows:
         for value in row['attempts']:

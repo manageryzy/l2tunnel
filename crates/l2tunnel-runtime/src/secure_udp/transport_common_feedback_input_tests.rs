@@ -14,6 +14,153 @@ async fn read_one(socket: &tokio::net::UdpSocket, driver: &mut Driver) -> Result
 }
 
 #[tokio::test]
+async fn actual_udp_metrics_require_receipt_identity_and_preserve_late_acceptance() -> Result {
+    for wrong_identity in [true, false] {
+        let kind = cover::Appearance::QuicLike;
+        let (contracts, _) = super::compact::selected_compact(kind)?;
+        let fixture = Fixture::from_contracts_with_tail(kind, contracts, false).await?;
+        let [mut a, b] = fixture.endpoints;
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-receipt-metrics-{}-{wrong_identity}.json",
+            std::process::id()
+        ));
+        a.driver
+            .common
+            .as_deref_mut()
+            .ok_or("Common owner")?
+            .wire_metrics = Some(common::wire_metrics::Observer::for_test(
+            path.clone(),
+            1500,
+        )?);
+        let now = clock(a.driver.origin, Instant::now())?;
+        let epoch = a.driver.common_state()?.epoch();
+        a.driver
+            .common_state_mut()?
+            .entry(epoch)?
+            .enqueue_borrowed(engine::Tick(now), &frame(28_802, 92))?;
+        let active = a.driver.common_state()?.current();
+        let local = active
+            .descriptor()
+            .local(common_contract::mg_role(a.driver.info.role));
+        let needed = common_contract::maximum_body(local.send(), local.receive())?
+            .checked_add(a.driver.config.control.wire_overhead)
+            .and_then(|bytes| bytes.checked_add(a.driver.reserve))
+            .ok_or("actual wire requirement overflow")?;
+        let ready = a.driver.bucket.ready_at(needed)?;
+        tokio::time::sleep_until(a.driver.origin + duration(ready)).await;
+        let now = clock(a.driver.origin, Instant::now())?;
+        a.driver.progress_common(now)?;
+        assert!(
+            !a.driver
+                .send_common_user_with(now, |_| Err(io::ErrorKind::WouldBlock.into()))?
+        );
+        let (identity, wire) = {
+            let runtime = a.driver.common.as_deref().ok_or("Common owner")?;
+            let pending = runtime
+                .sealed
+                .as_ref()
+                .ok_or("actual retained ciphertext")?;
+            assert!(runtime.wire_sample.is_some());
+            assert_eq!(
+                runtime
+                    .wire_metrics
+                    .as_ref()
+                    .ok_or("metrics observer")?
+                    .accepted_record_totals_for_test(),
+                (0, 0),
+                "WouldBlock cannot count as acceptance"
+            );
+            (
+                carrier::UserIdentity {
+                    scope: pending.scope,
+                    number: pending.sealed.number,
+                    bytes: pending.sealed.bytes,
+                    deadline: a.driver.origin + duration(pending.deadline),
+                },
+                runtime.wire[..pending.sealed.bytes].to_vec(),
+            )
+        };
+        let mut socket_owner: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+        let receipt = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let carrier::IoOwner::Udp(socket) = &socket_owner else {
+                    return Err(io::Error::other("real UDP owner changed"));
+                };
+                socket.writable().await?;
+                match socket_owner.try_user(identity, &wire) {
+                    Ok(carrier::SendProgress::Whole { receipt, late }) => {
+                        assert!(!late);
+                        return Ok(receipt);
+                    }
+                    Ok(carrier::SendProgress::Pending) => {
+                        return Err(io::Error::other("UDP admission was not a whole write"));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await??;
+        let mut received = [0; 1501];
+        let bytes =
+            tokio::time::timeout(Duration::from_secs(1), b.socket.recv(&mut received)).await??;
+        assert_eq!(&received[..bytes], wire);
+        assert!(receipt.accepted_at < identity.deadline);
+        let before = a.driver.counters;
+        let mut supplied = identity;
+        if wrong_identity {
+            supplied.number = security::PacketNumber(
+                supplied
+                    .number
+                    .0
+                    .checked_add(1)
+                    .ok_or("packet number exhausted")?,
+            );
+        }
+        // Use the unchanged original deadline as the delayed observation clock.
+        // The actual whole-send receipt and its acceptance time stay untouched.
+        let error = a
+            .driver
+            .complete_common_carrier(supplied, receipt, false, || identity.deadline)
+            .err()
+            .ok_or("wrong identity or original-cap observation must fail")?;
+        assert_eq!(
+            error.kind(),
+            if wrong_identity {
+                io::ErrorKind::InvalidData
+            } else {
+                io::ErrorKind::TimedOut
+            }
+        );
+        let runtime = a.driver.common.as_deref_mut().ok_or("Common owner")?;
+        let metrics = runtime.wire_metrics.take().ok_or("metrics observer")?;
+        assert_eq!(
+            metrics.accepted_record_totals_for_test(),
+            if wrong_identity {
+                (0, 0)
+            } else {
+                (1, identity.bytes as u128)
+            }
+        );
+        assert!(runtime.sealed.is_none());
+        assert_eq!(
+            a.driver.counters.socket_accepted_packets,
+            before.socket_accepted_packets + 1,
+            "the real whole write remains an irreversible physical fact"
+        );
+        assert_eq!(
+            a.driver.counters.socket_accepted_ip_bytes,
+            before.socket_accepted_ip_bytes
+                + u64::try_from(receipt.socket_ip_bytes.ok_or("actual UDP IP bytes")?)?
+        );
+        assert_eq!(socket_owner.addresses()?, a.original);
+        drop(metrics);
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn actual_early_compact_feedback_keeps_original_input_until_delayed_whole_write_observation()
 -> Result {
     let kind = cover::Appearance::QuicLike;

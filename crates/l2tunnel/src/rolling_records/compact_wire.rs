@@ -21,6 +21,11 @@ pub trait CompactRecovery<P: RecoveryPolicy> {
     ) -> Result<recovery::View<'_>, rolling::Error>;
     fn kind(policy: P, scope: rolling::Scope, bytes: &[u8])
     -> Result<EmissionKind, rolling::Error>;
+    fn extent(
+        policy: P,
+        scope: rolling::Scope,
+        bytes: &[u8],
+    ) -> Result<l2tunnel_reliable::RecoveryExtent, rolling::Error>;
     fn receive_feedback(
         policy: P,
         sender: &mut P::Sender,
@@ -100,6 +105,23 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
             rw::View::Feedback(_) => EmissionKind::Feedback,
         })
     }
+    fn extent(
+        policy: scheduler::Policy,
+        scope: rolling::Scope,
+        bytes: &[u8],
+    ) -> Result<l2tunnel_reliable::RecoveryExtent, rolling::Error> {
+        use l2tunnel_reliable::RecordKind;
+        let (kind, payload) = match rw::inspect(policy.recovery, scope, bytes)? {
+            rw::View::Data(rolling::wire::View::Source { original, .. }) => {
+                (RecordKind::Systematic, original.len())
+            }
+            rw::View::Data(rolling::wire::View::Repair(value)) => {
+                (RecordKind::Repair, value.bytes.len())
+            }
+            rw::View::Feedback(_) => (RecordKind::Feedback, 0),
+        };
+        recovery_extent(bytes.len(), payload, kind)
+    }
     fn receive_feedback(
         policy: scheduler::Policy,
         sender: &mut scheduler::Sender,
@@ -130,6 +152,21 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
 }
 impl CompactRecovery<research::Config> for Research {
     const MAXIMUM_FEEDBACK: usize = rs::MAXIMUM_FEEDBACK_BYTES;
+    fn extent(
+        policy: research::Config,
+        scope: rolling::Scope,
+        bytes: &[u8],
+    ) -> Result<l2tunnel_reliable::RecoveryExtent, rolling::Error> {
+        use l2tunnel_reliable::RecordKind;
+        let (kind, payload) = match rs::inspect(policy, scope, bytes)? {
+            research::wire::View::Source { original, .. } => {
+                (RecordKind::Systematic, original.len())
+            }
+            research::wire::View::Repair(value) => (RecordKind::Repair, value.equation.bytes.len()),
+            research::wire::View::Feedback(_) => (RecordKind::Feedback, 0),
+        };
+        recovery_extent(bytes.len(), payload, kind)
+    }
     fn maximum_data(policy: research::Config) -> Result<usize, rolling::Error> {
         rs::maximum_data_bytes(policy)
     }
@@ -208,6 +245,22 @@ impl CompactRecovery<research::Config> for Research {
         receiver.receive_view_at(rs::inspect(policy, scope, bytes)?, received, now, cap)
     }
 }
+
+fn recovery_extent(
+    bytes: usize,
+    payload_bytes: usize,
+    kind: l2tunnel_reliable::RecordKind,
+) -> Result<l2tunnel_reliable::RecoveryExtent, rolling::Error> {
+    Ok(l2tunnel_reliable::RecoveryExtent {
+        kind,
+        bytes,
+        header_bytes: bytes
+            .checked_sub(payload_bytes)
+            .ok_or(rolling::Error::Length)?,
+        payload_bytes,
+        systematic_coded_fill_bytes: 0,
+    })
+}
 impl<P: RecoveryPolicy> DirectionConfig<P> {
     /// Selected data body ceiling with no duplicate scope/profile or packing envelope.
     pub fn compact_wire_maximum_data_bytes(self) -> Result<usize, Error> {
@@ -221,6 +274,43 @@ impl<P: RecoveryPolicy> DirectionConfig<P> {
     }
 }
 impl<P: RecoveryPolicy> Endpoint<P> {
+    /// Read selected outgoing recovery and packed-envelope scalars using the
+    /// actual directional policies. No source, feedback or custody is consumed.
+    pub fn inspect_output_extent(
+        &self,
+        bytes: &[u8],
+    ) -> Result<l2tunnel_aligned::wire_extent::OutputExtent, Error> {
+        if self.compact_feedback_overhead.is_none() {
+            return Err(Error::Configuration);
+        }
+        let feedback = bytes.first() == Some(&3);
+        let (policy, scope) = if feedback {
+            (self.receive_config.scheduler, self.peer_rolling_scope())
+        } else {
+            (self.send_config.scheduler, self.send_rolling_scope)
+        };
+        let recovery = P::Compact::extent(policy, scope, bytes).map_err(Error::Rolling)?;
+        let codec = if recovery.kind == l2tunnel_reliable::RecordKind::Systematic {
+            let recovery::View::Source { id, original, .. } =
+                self.inspect_data(bytes, true).map_err(Error::Rolling)?
+            else {
+                return Err(Error::Identity);
+            };
+            Some(
+                l2tunnel_aligned::wire_extent::inspect_packed(
+                    self.send_config.packing.envelope(),
+                    self.send_scope,
+                    receiver::SourceId(u64::from(id.0)),
+                    original,
+                )
+                .map_err(Error::Envelope)?,
+            )
+        } else {
+            None
+        };
+        Ok(l2tunnel_aligned::wire_extent::OutputExtent { recovery, codec })
+    }
+
     /// Select compact data/feedback before traffic while keeping actual owners and config.
     pub fn enable_compact_wire(&mut self, feedback_overhead: usize) -> Result<(), Error> {
         self.enable_compact_wire_with_overheads(self.overhead, feedback_overhead)

@@ -131,7 +131,14 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             return Err(Error::Busy);
         }
         match control {
-            Some(FinalControl::Ping(_)) if owner.ping.is_some() => return Err(Error::Busy),
+            Some(FinalControl::Ping(value))
+                if owner.ping.is_some_and(|pending| pending != value)
+                    || (owner.ping.is_some()
+                        && Instant::now().saturating_duration_since(owner.last_ping)
+                            < TRANSITION_RETRY_INTERVAL) =>
+            {
+                return Err(Error::Busy);
+            }
             Some(FinalControl::Pong(value)) if owner.pong != Some(value) => {
                 return Err(Error::Configuration);
             }
@@ -320,9 +327,18 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if let Some(value) = owner.pong {
             return Ok(Some(FinalControl::Pong(value)));
         }
-        if Instant::now().saturating_duration_since(owner.last_ping) >= Duration::from_secs(5)
-            && owner.ping.is_none()
-        {
+        let interval = if owner.ping.is_some() {
+            TRANSITION_RETRY_INTERVAL
+        } else {
+            Duration::from_secs(5)
+        };
+        if Instant::now().saturating_duration_since(owner.last_ping) >= interval {
+            // Repeat the logical challenge, not its protected packet. The sole
+            // Records owner supplies a fresh nonce and this owner supplies a new
+            // raw extent. Only a matching authenticated Pong renews last_alive.
+            if let Some(value) = owner.ping {
+                return Ok(Some(FinalControl::Ping(value)));
+            }
             let mut value = [0; 8];
             SystemRandom::new()
                 .fill(&mut value)
@@ -426,6 +442,8 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         drop(state);
         match verdict.control {
             Some(FinalControl::Window) => {}
+            // A freshly authenticated retry must recreate the reply obligation
+            // after a lost Pong. Exact packet replays never reach this commit.
             Some(FinalControl::Ping(value)) => owner.pong = Some(value),
             Some(FinalControl::Pong(value)) => {
                 if owner.ping == Some(value) {

@@ -9,6 +9,9 @@ use std::{
 struct Fault {
     drops: Mutex<Vec<usize>>,
     phases: AtomicUsize,
+    drop_final_controls: AtomicBool,
+    final_control_packets: AtomicUsize,
+    final_control_bytes: AtomicUsize,
     blocked: AtomicBool,
     block_all: AtomicBool,
     fail_receive: AtomicBool,
@@ -50,6 +53,17 @@ impl PacketIo for Link {
                 *pending = Some(bytes.to_vec());
             }
             return Err(io::ErrorKind::WouldBlock.into());
+        }
+        if bytes.get(40) == Some(&1) {
+            self.fault
+                .final_control_packets
+                .fetch_add(1, Ordering::SeqCst);
+            self.fault
+                .final_control_bytes
+                .fetch_add(bytes.len(), Ordering::SeqCst);
+            if self.fault.drop_final_controls.load(Ordering::SeqCst) {
+                return Ok(());
+            }
         }
         if phase {
             let index = self.fault.phases.fetch_add(1, Ordering::SeqCst) + 1;
@@ -93,6 +107,96 @@ fn config() -> PacketPhaseConfig {
         packet: PacketPolicy::new(576),
     }
 }
+
+// The preflight tests use only this type, never an actual PacketIo value.
+struct MetadataOnly<const N: usize> {
+    _bytes: [u8; N],
+}
+impl<const N: usize> PacketIo for MetadataOnly<N> {
+    fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn send(&mut self, _: &[u8]) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[test]
+fn packet_phase_preflight_accepts_full_half_without_runtime_or_io_owner() -> R {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    for client in [false, true] {
+        let first = support::raw(client, 0);
+        let second = support::raw(client, 1);
+        config().preflight::<MetadataOnly<0>>(first, None)?;
+        config().preflight::<MetadataOnly<0>>(first, Some(second))?;
+        let (_, _, full_count) = configuration::<MetadataOnly<0>>(config(), first, None)?;
+        let (_, _, half_count) = configuration::<MetadataOnly<0>>(config(), first, Some(second))?;
+        assert_eq!((full_count, half_count), (1, 2));
+    }
+    Ok(())
+}
+
+#[test]
+fn packet_phase_preflight_preserves_configuration_and_geometry_refusals() -> R {
+    let first = support::raw(true, 0);
+    assert!(matches!(
+        config().preflight::<MetadataOnly<0>>(first, Some(first)),
+        Err(Error::Pair(PairError::Configuration))
+    ));
+    let mut second = support::raw(true, 1);
+    second.receive_bytes += 1;
+    assert!(matches!(
+        config().preflight::<MetadataOnly<0>>(first, Some(second)),
+        Err(Error::Pair(PairError::Configuration))
+    ));
+    let mut bad = first;
+    bad.packet_slots = 1025;
+    assert!(matches!(
+        config().preflight::<MetadataOnly<0>>(bad, None),
+        Err(Error::Pair(PairError::Configuration))
+    ));
+    let mut phase = config();
+    phase.packet.queue_packets = 65;
+    assert!(matches!(
+        phase.preflight::<MetadataOnly<0>>(first, None),
+        Err(Error::Configuration)
+    ));
+    let mut phase = config();
+    phase.pair.timeout += Duration::from_nanos(1);
+    assert!(matches!(
+        phase.preflight::<MetadataOnly<0>>(first, None),
+        Err(Error::Pair(PairError::Configuration))
+    ));
+    let mut phase = config();
+    phase.pair.messages.bytes_per_direction = 911;
+    assert!(matches!(
+        phase.preflight::<MetadataOnly<0>>(first, None),
+        Err(Error::Configuration)
+    ));
+    Ok(())
+}
+
+#[test]
+fn packet_phase_preflight_preserves_payload_and_concrete_metadata_caps() -> R {
+    let mut first = support::raw(true, 0);
+    let mut second = support::raw(true, 1);
+    for raw in [&mut first, &mut second] {
+        raw.send_bytes = 4_194_304;
+        raw.receive_bytes = 4_194_304;
+        raw.packet_slots = 1024;
+        l2tunnel_raw_tcp::IpConfig::from(*raw).validate()?;
+    }
+    assert!(matches!(
+        config().preflight::<MetadataOnly<0>>(first, Some(second)),
+        Err(Error::Pair(PairError::Capacity))
+    ));
+    assert!(matches!(
+        config().preflight::<MetadataOnly<1_048_576>>(support::raw(true, 0), None),
+        Err(Error::Capacity)
+    ));
+    Ok(())
+}
+
 async fn run(
     half: bool,
     a_fault: Arc<Fault>,

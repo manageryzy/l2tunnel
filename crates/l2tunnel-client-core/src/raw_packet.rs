@@ -82,19 +82,41 @@ impl Packet {
     }
 }
 #[cfg(unix)]
-fn raw_config(endpoints: Endpoints, mtu: u16) -> RawConfig {
-    RawConfig {
+fn raw_config(endpoints: Endpoints, packet: Packet) -> io::Result<RawConfig> {
+    let mtu = usize::from(packet.mtu);
+    let receive_bytes = usize::try_from(packet.horizon_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "raw receive horizon overflow"))?
+        .max(32768);
+    // Reserve actual packet slots for the unscaled receive capacity, including
+    // the maximum IPv4/TCP header size. A scaled window field is not a byte cap.
+    let packet_payload = mtu
+        .checked_sub(80)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "raw packet MTU is too small")
+        })?;
+    let packet_slots = receive_bytes
+        .checked_add(packet_payload - 1)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "raw packet capacity overflow")
+        })?
+        / packet_payload;
+    let config = RawConfig {
         local: endpoints.local,
         peer: endpoints.peer,
-        mtu: usize::from(mtu),
+        mtu,
         send_bytes: 32768,
-        receive_bytes: 32768,
-        packet_slots: 16,
+        receive_bytes,
+        packet_slots: packet_slots.max(16),
         random_seed: 1,
         ack_delay_millis: 1,
         keepalive_millis: 1000,
         idle_timeout_millis: 30000,
-    }
+    };
+    l2tunnel_raw_tcp::IpConfig::from(config)
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Ok(config)
 }
 #[cfg(unix)]
 fn invalid(text: &'static str) -> io::Error {
@@ -123,7 +145,7 @@ fn inputs_for<I: PacketIo>(
 ) -> io::Result<RawInputs<I>> {
     let mut lane = |endpoints| {
         check(end)?;
-        let mut config = raw_config(endpoints, packet.mtu);
+        let mut config = raw_config(endpoints, packet)?;
         let mut seed = [0; 8];
         SystemRandom::new()
             .fill(&mut seed)

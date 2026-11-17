@@ -128,6 +128,21 @@ impl Profile {
             .and_then(|value| value.checked_mul(self.queued_datagrams))
             .ok_or(Error::Configuration("datagram queue overflow"))
     }
+    /// Effective outgoing FIFO bound. Common keeps at most two maximum-record
+    /// allowances ahead of newly admitted control. The configured queue remains
+    /// the receive/custody ceiling; this backpressure never evicts an old record.
+    pub fn datagram_send_queue_bytes(self) -> Result<usize, Error> {
+        let configured = self.datagram_queue_bytes()?;
+        if self.datagram_format == DatagramFormat::Legacy {
+            return Ok(configured);
+        }
+        let flight = self
+            .maximum_carrier_bytes()
+            .checked_add(64)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(Error::Configuration("Common outgoing queue overflow"))?;
+        Ok(configured.min(flight))
+    }
     /// Conservative send-entry count from the authenticated minimum record size.
     pub fn maximum_queued_send_entries(self) -> Result<usize, Error> {
         let minimum = if self.datagram_format == DatagramFormat::Legacy {
@@ -135,7 +150,7 @@ impl Profile {
         } else {
             9
         };
-        Ok(self.datagram_queue_bytes()?.div_ceil(minimum))
+        Ok(self.datagram_send_queue_bytes()?.div_ceil(minimum))
     }
 }
 /// Local endpoint resource ceilings, not negotiated application semantics.
@@ -360,6 +375,6 @@ fn transport(profile: Profile, server: bool) -> Result<quinn::TransportConfig, E
     config.allow_spin(false);
     let bytes = profile.datagram_queue_bytes()?;
     config.datagram_receive_buffer_size(Some(bytes));
-    config.datagram_send_buffer_size(bytes);
+    config.datagram_send_buffer_size(profile.datagram_send_queue_bytes()?);
     Ok(config)
 }

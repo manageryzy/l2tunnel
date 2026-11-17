@@ -5,7 +5,7 @@ use l2tunnel_raw_io::{
     PacketIo,
     handoff::pairing::{
         PairInfo,
-        packet::{PacketCarrier, PacketPolicy, RecordGeometry},
+        packet::{LaneLimits, PacketCarrier, PacketPolicy, RecordGeometry},
     },
 };
 
@@ -30,6 +30,7 @@ pub struct AuthenticatedRaw {
     info: l2tunnel_auth::SessionInfo,
     infos: [Option<l2tunnel_auth::SessionInfo>; 2],
     endpoints: [Option<(SocketAddr, SocketAddr)>; 2],
+    lane_limits: [Option<LaneLimits>; 2],
     duplex: l2tunnel_core::Duplex,
     profile: l2tunnel_core::ConfigDigest,
     transcript: [u8; 32],
@@ -59,6 +60,10 @@ impl AuthenticatedRaw {
     /// Ordered global client/server endpoints of the actual occupied originals.
     pub fn lane_endpoints(self) -> [Option<(SocketAddr, SocketAddr)>; 2] {
         self.endpoints
+    }
+    /// Actual immutable local/peer capacities, separate from the accepted policy cap.
+    pub fn lane_limits(self) -> [Option<LaneLimits>; 2] {
+        self.lane_limits
     }
     /// Complete accepted original pair profile, without any transfer authority.
     pub fn profile(self) -> l2tunnel_core::ConfigDigest {
@@ -114,6 +119,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
         carrier.check_live().map_err(raw_error)?;
         let geometry = carrier.geometry().map_err(raw_error)?;
         let tuples = carrier.lane_endpoints().map_err(raw_error)?;
+        let lane_limits = carrier.lane_limits().map_err(raw_error)?;
         let PairInfo {
             duplex,
             is_client,
@@ -130,8 +136,13 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
         let first = infos[0].ok_or(Error::Configuration("actual raw first identity absent"))?;
         let mut endpoints = [None, None];
         for index in 0..2 {
-            match (infos[index], tuples[index], index < count) {
-                (Some(info), Some((local, peer)), true) => {
+            match (
+                infos[index],
+                tuples[index],
+                lane_limits[index],
+                index < count,
+            ) {
+                (Some(info), Some((local, peer)), Some(_), true) => {
                     if info.member != first.member
                         || info.server != first.server
                         || info.config.layer != first.config.layer
@@ -148,7 +159,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
                         (peer, local)
                     });
                 }
-                (None, None, false) => {}
+                (None, None, None, false) => {}
                 _ => return Err(Error::Configuration("raw actual lane shape differs")),
             }
         }
@@ -196,6 +207,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
             info: first,
             infos,
             endpoints,
+            lane_limits,
             duplex,
             profile,
             transcript,

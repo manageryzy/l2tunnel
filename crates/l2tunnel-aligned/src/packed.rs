@@ -575,6 +575,10 @@ impl Endpoint {
     pub fn inspect_output(&self, packet: &[u8]) -> Result<l2tunnel_reliable::RecordKind, Error> {
         self.0.inspect_output(packet)
     }
+    /// Exact selected recovery and codec-envelope extents without state changes.
+    pub fn inspect_output_extent(&self, packet: &[u8]) -> Result<wire_extent::OutputExtent, Error> {
+        self.0.inspect_output_extent(packet)
+    }
     /// Actual FEC/ARQ statistics, never inferred from codec work.
     pub fn statistics(&self) -> l2tunnel_reliable::Statistics {
         self.0.statistics()

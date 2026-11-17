@@ -5,6 +5,8 @@ use super::*;
 use l2tunnel::record_configuration::Configuration as C;
 use l2tunnel::{record_bank::storage, record_engine as engine};
 
+#[path = "transport_compact_arq_trace.rs"]
+pub(super) mod compact_arq_trace;
 #[path = "transport_common_managed.rs"]
 mod managed;
 #[path = "transport_common_provision.rs"]
@@ -271,6 +273,7 @@ pub(super) struct PendingIngress {
 pub(super) struct Runtime {
     pub(super) wire_metrics: Option<wire_metrics::Observer>,
     pub(super) wire_sample: Option<wire_metrics::Sample>,
+    pub(super) compact_arq_trace: Option<compact_arq_trace::Observer>,
     #[cfg(unix)]
     pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
     pub(super) reuse_owner: Option<owner::StateCell<super::common_reuse::Installed>>,
@@ -713,6 +716,7 @@ impl Driver {
         // borrow protocol storage or enlarge the authenticated protocol quota.
         let wire_metrics =
             wire_metrics::Observer::from_environment(input.cover.limits().max_packet_bytes)?;
+        let compact_arq_trace = compact_arq_trace::Observer::from_environment()?;
         let reuse_owner = if contract.connection_reuse() {
             Some(owner::StateCell::new(super::common_reuse::Installed::new())?)
         } else {
@@ -784,6 +788,7 @@ impl Driver {
             let common = owner::StateCell::new(Runtime {
                 wire_metrics,
                 wire_sample: None,
+                compact_arq_trace,
                 #[cfg(unix)]
                 proxy_bridge: None,
                 reuse_owner,

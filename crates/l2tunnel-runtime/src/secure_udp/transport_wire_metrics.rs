@@ -1,5 +1,5 @@
 //! Opt-in bounded observations of accepted Common records, never admission credit.
-use l2tunnel::record_engine::{EmissionKind, SourceForm};
+use l2tunnel::record_engine::{CodecCoverage, EmissionKind, OutputExtent, SourceForm};
 use std::{
     fs::OpenOptions,
     io::{self, BufWriter, Write},
@@ -10,13 +10,27 @@ use std::{
 use crate::secure_udp::SendBoundary;
 
 static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(1);
-const METRICS: usize = 3;
+const NAMES: [&str; 11] = [
+    "algorithm_bytes",
+    "final_record_bytes",
+    "record_overhead_bytes",
+    "route_header_bytes",
+    "fragment_header_bytes",
+    "recovery_header_bytes",
+    "systematic_coded_fill_bytes",
+    "codec_envelope_bytes",
+    "codec_container_bytes",
+    "codec_unit_header_bytes",
+    "codec_body_bytes",
+];
+const METRICS: usize = NAMES.len();
 
 #[derive(Clone, Copy)]
 pub(in crate::secure_udp) struct Sample {
     pub(in crate::secure_udp) algorithm_bytes: usize,
     pub(in crate::secure_udp) kind: EmissionKind,
     pub(in crate::secure_udp) fragmented: bool,
+    pub(in crate::secure_udp) extent: Option<OutputExtent>,
 }
 
 /// One explicitly requested diagnostic allocation, outside protocol retained-byte
@@ -29,9 +43,28 @@ pub(in crate::secure_udp) struct Observer {
     fragments: u64,
     invalid: u64,
     overflow: u64,
+    extent_errors: u64,
+    coverage: [u64; 6],
 }
 
 impl Observer {
+    #[cfg(test)]
+    pub(in crate::secure_udp) fn for_test(path: PathBuf, maximum: usize) -> io::Result<Self> {
+        Self::new(path, maximum)
+    }
+
+    #[cfg(test)]
+    pub(in crate::secure_udp) fn accepted_record_totals_for_test(&self) -> (u128, u128) {
+        let records = self.classes.iter().map(|count| u128::from(*count)).sum();
+        let bytes = self
+            .bins
+            .iter()
+            .enumerate()
+            .map(|(size, bin)| (size as u128) * u128::from(bin[1]))
+            .sum();
+        (records, bytes)
+    }
+
     pub(in crate::secure_udp) fn from_environment(maximum: usize) -> io::Result<Option<Self>> {
         let Some(prefix) = std::env::var_os("L2TUNNEL_WIRE_METRICS") else {
             return Ok(None);
@@ -72,6 +105,8 @@ impl Observer {
             fragments: 0,
             invalid: 0,
             overflow: 0,
+            extent_errors: 0,
+            coverage: [0; 6],
         })
     }
 
@@ -111,6 +146,43 @@ impl Observer {
         for (metric, length) in lengths.into_iter().enumerate() {
             increment(&mut self.bins[length][metric], &mut self.overflow);
         }
+        let Some(extent) = sample
+            .extent
+            .filter(|extent| extent.bytes == sample.algorithm_bytes && extent.kind == sample.kind)
+        else {
+            increment(&mut self.extent_errors, &mut self.overflow);
+            return;
+        };
+        let coverage = match extent.codec_coverage {
+            CodecCoverage::EnvelopeOnly => 0,
+            CodecCoverage::FragmentedUnits => 1,
+            CodecCoverage::SwiftStream => 2,
+            CodecCoverage::FragmentedRecord => 3,
+            CodecCoverage::NotApplicable => 4,
+            CodecCoverage::UnencodedNative => 5,
+        };
+        increment(&mut self.coverage[coverage], &mut self.overflow);
+        let lengths = [
+            Some(extent.route_header_bytes),
+            Some(extent.fragment_header_bytes),
+            extent.recovery.map(|value| value.header_bytes),
+            extent
+                .recovery
+                .map(|value| value.systematic_coded_fill_bytes),
+            extent.codec.map(|value| value.envelope_bytes),
+            extent.codec.map(|value| value.container_bytes),
+            extent.codec.map(|value| value.unit_header_bytes),
+            extent.codec.map(|value| value.body_bytes),
+        ];
+        for (metric, length) in lengths.into_iter().enumerate() {
+            if let Some(length) = length {
+                if let Some(bin) = self.bins.get_mut(length) {
+                    increment(&mut bin[metric + 3], &mut self.overflow);
+                } else {
+                    increment(&mut self.extent_errors, &mut self.overflow);
+                }
+            }
+        }
     }
 
     fn quantile(&self, metric: usize, percentile: u128) -> Option<usize> {
@@ -135,7 +207,7 @@ impl Observer {
     fn write_report(&self, writer: &mut impl Write) -> io::Result<()> {
         writeln!(
             writer,
-            "{{\"schema\":1,\"scope\":\"accepted Common user, repair and recovery-feedback records; excludes bootstrap, management and raw carrier control\","
+            "{{\"schema\":2,\"scope\":\"accepted Common user, repair and recovery-feedback records; excludes bootstrap, management and raw carrier control\","
         )?;
         writeln!(
             writer,
@@ -151,11 +223,26 @@ impl Observer {
         )?;
         writeln!(
             writer,
-            "\"codec_framing_bytes\":null,\"padding_bytes\":null,\"recovery_header_bytes\":null,\"retry_attribution\":null,\"native_compression_gain\":null,\"physical_carrier_overhead_quantiles\":null,"
+            "\"codec_framing_bytes\":null,\"padding_bytes\":null,\"retry_attribution\":null,\"native_compression_gain\":null,\"physical_carrier_overhead_quantiles\":null,"
         )?;
         writeln!(
             writer,
             "\"unsupported_definition\":\"null means unmeasured, not zero; no duplicate codec decoder, plaintext, encryption key or payload capture\","
+        )?;
+        writeln!(
+            writer,
+            "\"extent_definition\":\"exact canonical outgoing parser extents, counted only on actual acceptance; each histogram has its own sample population; absent repair/feedback codec and incomplete Swift stream or outer-fragment attribution are excluded, not zero-filled; codec body includes unmeasured compression/context/fragment fields; coded fill is distinct from repair redundancy and genuine zero payload\","
+        )?;
+        writeln!(
+            writer,
+            "\"extent_errors\":{},\"codec_coverage\":{{\"envelope_only\":{},\"fragmented_units\":{},\"swift_stream\":{},\"fragmented_record\":{},\"not_applicable\":{},\"unencoded_native\":{}}},",
+            self.extent_errors,
+            self.coverage[0],
+            self.coverage[1],
+            self.coverage[2],
+            self.coverage[3],
+            self.coverage[4],
+            self.coverage[5]
         )?;
         writeln!(
             writer,
@@ -184,14 +271,7 @@ impl Observer {
             self.invalid,
             self.overflow
         )?;
-        for (metric, name) in [
-            "algorithm_bytes",
-            "final_record_bytes",
-            "record_overhead_bytes",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (metric, name) in NAMES.into_iter().enumerate() {
             write!(writer, "\"{name}\":{{\"p50\":")?;
             write_optional(writer, self.quantile(metric, 50))?;
             write!(writer, ",\"p95\":")?;
@@ -293,6 +373,7 @@ mod tests {
             algorithm_bytes: 100,
             kind: EmissionKind::Repair,
             fragmented: false,
+            extent: None,
         };
         observer.accepted(sample, 121, SendBoundary::TlsStreamFlushed);
         observer.accepted(
@@ -300,6 +381,7 @@ mod tests {
                 algorithm_bytes: 200,
                 kind: EmissionKind::Feedback,
                 fragmented: true,
+                extent: None,
             },
             221,
             SendBoundary::QuicDatagramAccepted,
@@ -316,6 +398,58 @@ mod tests {
         let report = std::fs::read_to_string(&path)?;
         assert!(report.contains("\"record_overhead_bytes\":{\"p50\":21"));
         assert!(report.contains("\"padding_bytes\":null"));
+        std::fs::remove_file(path)
+    }
+
+    #[test]
+    fn extent_populations_exclude_unknown_codec_and_count_real_fill_only() -> io::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-wire-extent-test-{}.json",
+            std::process::id()
+        ));
+        let mut observer = Observer::new(path.clone(), 256)?;
+        let source = EmissionKind::Source(SourceForm::Swift);
+        let extent = OutputExtent {
+            bytes: 100,
+            kind: source,
+            route_header_bytes: 0,
+            fragment_header_bytes: 0,
+            recovery: Some(l2tunnel::reliable::RecoveryExtent {
+                kind: l2tunnel::reliable::RecordKind::Source,
+                bytes: 100,
+                header_bytes: 5,
+                payload_bytes: 95,
+                systematic_coded_fill_bytes: 0,
+            }),
+            codec: None,
+            codec_coverage: CodecCoverage::SwiftStream,
+        };
+        let sample = Sample {
+            algorithm_bytes: 100,
+            kind: source,
+            fragmented: false,
+            extent: Some(extent),
+        };
+        observer.accepted(sample, 121, SendBoundary::SocketAccepted);
+        assert_eq!(observer.quantile(5, 99), Some(5));
+        assert_eq!(observer.quantile(6, 99), Some(0));
+        assert_eq!(observer.quantile(7, 99), None);
+        assert_eq!(observer.coverage, [0, 0, 1, 0, 0, 0]);
+        assert_eq!(observer.extent_errors, 0);
+        observer.accepted(
+            Sample {
+                extent: None,
+                ..sample
+            },
+            121,
+            SendBoundary::SocketAccepted,
+        );
+        assert_eq!(observer.extent_errors, 1);
+        assert_eq!(observer.bins[5][5], 1);
+        drop(observer);
+        let report = std::fs::read_to_string(&path)?;
+        assert!(report.contains("\"recovery_header_bytes\":{\"p50\":5"));
+        assert!(report.contains("\"codec_envelope_bytes\":{\"p50\":null"));
         std::fs::remove_file(path)
     }
 }

@@ -780,6 +780,18 @@ fn selected_compact_wire_existing_poll_receive_and_custody_cross_direction() -> 
         .poll_data_independent(ms(0), &mut output, &mut exact)?
         .ok_or("source")?;
     assert_eq!(&output[..bytes], b"\x01\0\x01actual");
+    let extent = a.inspect_output_extent(&output[..bytes])?;
+    assert_eq!(
+        (
+            extent.header_bytes,
+            extent.payload_bytes,
+            extent.systematic_coded_fill_bytes
+        ),
+        (3, 6, 0)
+    );
+    for malformed in [b"".as_slice(), &[1], &[1, 0], &[1, 0, 0x80]] {
+        assert!(a.inspect_output_extent(malformed).is_err());
+    }
     assert_eq!(exact, OutboundBudget::default());
     let source = a.pending_data_output().ok_or("source custody")?;
     let view = a.inspect_output_record(&output[..bytes])?;
@@ -801,6 +813,8 @@ fn selected_compact_wire_existing_poll_receive_and_custody_cross_direction() -> 
         .ok_or("feedback beside held data")?;
     assert_eq!(output[0], 2);
     assert_eq!(b.inspect_output(&output[..ack])?, RecordKind::Feedback);
+    let extent = b.inspect_output_extent(&output[..ack])?;
+    assert_eq!((extent.header_bytes, extent.payload_bytes), (ack, 0));
     let pending = b.pending_feedback_output().ok_or("feedback custody")?;
     assert_eq!(pending.wire_bytes, ack + 49);
     assert_eq!(before.wire_bytes - allowance.wire_bytes, pending.wire_bytes);

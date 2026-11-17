@@ -223,7 +223,12 @@ fn raw_plans_from_carrier(
         addresses,
         requested: original,
     } = original;
-    let policy = PacketPolicy::new(1500);
+    let mut policy = PacketPolicy::new(1500);
+    if wire.is_some() {
+        // Exercise the requested native-matrix horizon through real bootstrap
+        // and handoff, including the negotiated scaled advertisements.
+        policy.horizon_bytes = 1_048_576;
+    }
     let geometry = policy.record_geometry()?;
     let delta = geometry.ip_tcp_bytes + geometry.record_overhead_bytes - 28;
     let mut connection = original.connection();
@@ -462,6 +467,50 @@ fn exercise_raw_wire(
                 assert!(encoded.get("original_carrier").is_none());
                 assert!(raw.lanes.iter().all(Option::is_some));
                 assert_eq!(raw.requested_policy, raw.effective_policy);
+                for (lane, limits) in raw.lanes.iter().zip(proof.lane_limits()) {
+                    let lane = lane.as_ref().ok_or("actual raw lane")?;
+                    let limits = limits.ok_or("actual raw lane limits")?;
+                    assert_eq!(
+                        lane.limits,
+                        crate::secure_udp::common_status::RawLaneLimits::from(limits)
+                    );
+                    assert_eq!(lane.limits.data_reserve_bytes, 11_680);
+                    assert_eq!(
+                        lane.limits.send_data_capacity_bytes,
+                        lane.limits.peer_horizon_bytes
+                            .checked_sub(lane.limits.data_reserve_bytes)
+                            .ok_or("peer horizon below Data reserve")?
+                    );
+                    assert_eq!(
+                        lane.limits.receive_data_capacity_bytes,
+                        lane.limits.local_horizon_bytes
+                            .checked_sub(lane.limits.data_reserve_bytes)
+                            .ok_or("local horizon below Data reserve")?
+                    );
+                    assert!(
+                        lane.limits.peer_horizon_bytes
+                            <= u64::from(raw.effective_policy.horizon_bytes)
+                    );
+                    assert!(
+                        lane.limits.local_horizon_bytes
+                            <= u64::from(raw.effective_policy.horizon_bytes)
+                    );
+                    if wire.is_some() {
+                        // A genuine horizon larger than the unscaled wire field
+                        // proves scaling survived the authenticated handoff.
+                        // The last advertisement need not equal the policy cap.
+                        assert!(lane.limits.local_horizon_bytes > u64::from(u16::MAX));
+                        assert!(lane.limits.peer_horizon_bytes > u64::from(u16::MAX));
+                    }
+                }
+                assert_eq!(
+                    encoded["raw_carrier"]["lanes"][0]["limits"]["send_data_capacity_bytes"],
+                    raw.lanes[0]
+                        .as_ref()
+                        .ok_or("first raw lane")?
+                        .limits
+                        .send_data_capacity_bytes
+                );
                 assert_eq!(raw.binding, proof.binding());
                 assert_eq!(raw.policy_digest, proof.policy_digest());
                 assert_eq!(raw.requested_configuration, requested.configuration()?.0);

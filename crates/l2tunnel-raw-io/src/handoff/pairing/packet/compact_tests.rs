@@ -37,7 +37,15 @@ async fn tick(a: &mut PacketCarrier<Link>, b: &mut PacketCarrier<Link>) -> R {
 }
 
 async fn selected(half: bool, fault: Arc<Fault>) -> R<(PacketCarrier<Link>, PacketCarrier<Link>)> {
-    let (mut a, mut b) = run(half, fault, Arc::new(Fault::default()), false).await?;
+    selected_faults(half, fault, Arc::new(Fault::default())).await
+}
+
+async fn selected_faults(
+    half: bool,
+    a_fault: Arc<Fault>,
+    b_fault: Arc<Fault>,
+) -> R<(PacketCarrier<Link>, PacketCarrier<Link>)> {
+    let (mut a, mut b) = run(half, a_fault, b_fault, false).await?;
     a.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
     b.enable_final_records([0x42; 32], |_, bytes| bytes == b"setup-tail")?;
     for _ in 0..3 {
@@ -46,6 +54,9 @@ async fn selected(half: bool, fault: Arc<Fault>) -> R<(PacketCarrier<Link>, Pack
     assert_eq!(a.final_context, b.final_context);
     Ok((a, b))
 }
+
+#[path = "compact_liveness_tests.rs"]
+mod liveness;
 
 #[tokio::test]
 async fn compact_final_raw_retained_retry_checks_its_original_direction() -> R {
@@ -115,6 +126,26 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         assert_eq!(geometry.ip_tcp_bytes, 40);
         assert_eq!(geometry.record_overhead_bytes, 0);
         assert_eq!(geometry.max_record_bytes, 536);
+        let a_limits = a.lane_limits()?;
+        let b_limits = b.lane_limits()?;
+        for index in 0..2 {
+            if index < if half { 2 } else { 1 } {
+                let local = a_limits[index].ok_or("local lane limits")?;
+                let peer = b_limits[index].ok_or("peer lane limits")?;
+                // The actual 16-slot device advertises 16 maximum cells, below
+                // the unchanged 32 KiB policy and TCP receive-ring capacity.
+                assert_eq!(local.local_horizon_bytes, 16 * 536);
+                assert_eq!(local.peer_horizon_bytes, peer.local_horizon_bytes);
+                assert_eq!(local.local_horizon_bytes, peer.peer_horizon_bytes);
+                assert_eq!(local.data_reserve_bytes, 8 * 536);
+                assert_eq!(local.send_data_capacity_bytes, 8 * 536);
+                assert_eq!(local.receive_data_capacity_bytes, 8 * 536);
+                assert!(local.peer_horizon_bytes < u64::from(a.policy().horizon_bytes));
+            } else {
+                assert_eq!(a_limits[index], None);
+                assert_eq!(b_limits[index], None);
+            }
+        }
         assert!(matches!(
             a.stage_setup_record(PairLane::First, RecordKind::Data, b"legacy"),
             Err(Error::Configuration)
@@ -122,6 +153,13 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         let protected = [0x80, 0, 0, 0, 0, 0x41, 0x42, 0x43, 0x44];
         let prepare = a.prepare_final_record(PairLane::First, FinalKind::Data, protected.len())?;
         let metadata = prepare.metadata();
+        assert_eq!(
+            u64::from(metadata.window),
+            a_limits[0]
+                .ok_or("actual first lane limits")?
+                .local_horizon_bytes
+        );
+        assert_eq!(a.lane_limits()?, a_limits);
         assert!(matches!(
             a.prepare_final_record(PairLane::First, FinalKind::Feedback, 21),
             Err(Error::Busy)

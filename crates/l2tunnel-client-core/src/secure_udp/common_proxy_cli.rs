@@ -252,9 +252,10 @@ pub(crate) fn event(
                 && common.requested_configuration != common.effective_configuration)
             || common.requested_carrier != common.effective_carrier
             || common.effective_cover != Some(common.requested_cover)
-            || common.maintained_carrier.as_ref().is_some_and(|value| {
-                value.effective.as_ref() != Some(&value.requested) || value.binding.is_none()
-            })
+            || common
+                .maintained_carrier
+                .as_ref()
+                .is_some_and(|value| !value.matches_requested_policy() || value.binding.is_none())
             || frame
                 .runtime
                 .as_ref()

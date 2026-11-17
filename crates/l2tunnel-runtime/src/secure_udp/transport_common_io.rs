@@ -766,6 +766,33 @@ impl Driver {
                     .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
                 bridge.bind_final_source(unit.identity, source)?;
             }
+            if let Some(trace) = runtime.compact_arq_trace.as_mut() {
+                let owner::DataOwner::Common(state) = &self.owner;
+                let packet = if fragment.is_none() {
+                    state.engine(epoch).ok().and_then(|engine| {
+                        trace.inspect(
+                            engine
+                                .configuration()
+                                .descriptor()
+                                .local(common_contract::mg_role(self.info.role)),
+                            true,
+                            &self.buffers.frame[..emission.bytes],
+                        )
+                    })
+                } else {
+                    None
+                };
+                trace.selected(
+                    epoch.0,
+                    if compact_feedback {
+                        self.records.next_feedback_number().0
+                    } else {
+                        number.0
+                    },
+                    now,
+                    packet,
+                );
+            }
             runtime.wire_sample =
                 runtime
                     .wire_metrics
@@ -774,6 +801,18 @@ impl Driver {
                         algorithm_bytes: emission.bytes,
                         kind: emission.kind,
                         fragmented: fragment.is_some(),
+                        extent: {
+                            let owner::DataOwner::Common(state) = &self.owner;
+                            state.engine(epoch).ok().and_then(|engine| {
+                                engine
+                                    .inspect_output_extent(
+                                        &self.buffers.frame[..emission.bytes],
+                                        emission.kind,
+                                        fragment.is_some(),
+                                    )
+                                    .ok()
+                            })
+                        },
                     });
             runtime.unsealed = Some(common::PendingPlain {
                 proxy_record,
@@ -984,12 +1023,6 @@ impl Driver {
             .sealed
             .take()
             .ok_or_else(|| protocol("whole carrier write lost pending ciphertext"))?;
-        if let Some(runtime) = self.common.as_deref_mut()
-            && let Some(sample) = runtime.wire_sample.take()
-            && let Some(metrics) = runtime.wire_metrics.as_mut()
-        {
-            metrics.accepted(sample, receipt.record_bytes, receipt.boundary);
-        }
         if pending.scope != identity.scope
             || pending.sealed.number != identity.number
             || pending.sealed.bytes != identity.bytes
@@ -1004,6 +1037,14 @@ impl Driver {
                 "actual carrier completion differs from retained ciphertext",
             ));
         }
+        // Attribute lengths only after correlating the actual receipt with its
+        // retained ciphertext. Genuine late acceptance still counts below.
+        if let Some(runtime) = self.common.as_deref_mut()
+            && let Some(sample) = runtime.wire_sample.take()
+            && let Some(metrics) = runtime.wire_metrics.as_mut()
+        {
+            metrics.accepted(sample, receipt.record_bytes, receipt.boundary);
+        }
         // Sample the same sole-loop clock only after retaining the irreversible
         // receipt and removing its exact ciphertext custody. The receipt's own
         // accepted_at remains the independent physical fact, never rewritten.
@@ -1012,6 +1053,19 @@ impl Driver {
         let accepted = clock(self.origin, receipt.accepted_at);
         let at = completed.as_ref().copied().unwrap_or(u64::MAX);
         let physical_at = accepted.as_ref().copied().unwrap_or(u64::MAX);
+        if let Some(trace) = self
+            .common
+            .as_deref_mut()
+            .and_then(|r| r.compact_arq_trace.as_mut())
+        {
+            trace.accepted(
+                pending.scope.epoch.0,
+                pending.sealed.number.0,
+                at,
+                accepted.as_ref().ok().copied(),
+                receipt.boundary,
+            );
+        }
         let early_feedback = self.research_feedback_before_receipt(
             pending.scope,
             pending.sealed.number.0,
@@ -1157,6 +1211,19 @@ impl Driver {
                 }
                 let sampled = sample();
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
+                if let Some(trace) = self
+                    .common
+                    .as_deref_mut()
+                    .and_then(|r| r.compact_arq_trace.as_mut())
+                {
+                    trace.accepted(
+                        pending.scope.epoch.0,
+                        pending.sealed.number.0,
+                        completed,
+                        sampled.as_ref().ok().copied(),
+                        super::super::SendBoundary::SocketAccepted,
+                    );
+                }
                 let confirmation = self.confirm_common_output(
                     pending.scope,
                     completed,
@@ -1251,6 +1318,40 @@ impl Driver {
         now: u64,
         original: Instant,
     ) -> io::Result<()> {
+        // This method is reached only after the sole Records opener and route
+        // check; short unkeyed data is deliberately outside authenticated traces.
+        let trace_packet = if opened.authenticated {
+            let owner::DataOwner::Common(state) = &self.owner;
+            self.common
+                .as_deref_mut()
+                .and_then(|r| r.compact_arq_trace.as_mut())
+                .and_then(|trace| {
+                    let engine = state.engine(core::Epoch(opened.scope.epoch.0)).ok()?;
+                    if engine.fragment_policy().is_some() {
+                        return None;
+                    }
+                    let packet = trace.inspect(
+                        engine
+                            .configuration()
+                            .descriptor()
+                            .local(common_contract::mg_role(self.info.role)),
+                        false,
+                        &self.buffers.plain[..opened.bytes],
+                    )?;
+                    trace.input(
+                        "input",
+                        opened.scope.epoch.0,
+                        opened.number.0,
+                        now,
+                        Some(received),
+                        packet,
+                        common::compact_arq_trace::Outcome::AuthenticatedInput,
+                    );
+                    Some(packet)
+                })
+        } else {
+            None
+        };
         self.retry_common_feedback(now)?;
         self.retry_common_connection_input(now)?;
         if self.receive_common_fragment_at(opened, received, now, original)? {
@@ -1264,6 +1365,22 @@ impl Driver {
         {
             // Only one exact input is retained. Continue Control/Liveness reads;
             // additional lossy User packets cannot overwrite the retained ACK.
+            if let Some(packet) = trace_packet
+                && let Some(trace) = self
+                    .common
+                    .as_deref_mut()
+                    .and_then(|r| r.compact_arq_trace.as_mut())
+            {
+                trace.input(
+                    "blocked",
+                    opened.scope.epoch.0,
+                    opened.number.0,
+                    now,
+                    Some(received),
+                    packet,
+                    common::compact_arq_trace::Outcome::RetainedInputBlocked,
+                );
+            }
             self.counters.native_backpressure_drops =
                 self.counters.native_backpressure_drops.saturating_add(1);
             return Ok(());
@@ -1305,6 +1422,22 @@ impl Driver {
                 .as_deref()
                 .is_some_and(|runtime| runtime.pending_feedback.is_some())
         {
+            if let Some(packet) = trace_packet
+                && let Some(trace) = self
+                    .common
+                    .as_deref_mut()
+                    .and_then(|r| r.compact_arq_trace.as_mut())
+            {
+                trace.input(
+                    "blocked",
+                    opened.scope.epoch.0,
+                    opened.number.0,
+                    now,
+                    Some(received),
+                    packet,
+                    common::compact_arq_trace::Outcome::RetainedInputBlocked,
+                );
+            }
             self.counters.native_backpressure_drops =
                 self.counters.native_backpressure_drops.saturating_add(1);
             return Ok(());
@@ -1365,6 +1498,26 @@ impl Driver {
                 &mut self.buffers.plain[..opened.bytes],
             )
         };
+        if let Some(packet) = trace_packet
+            && let Some(trace) = self
+                .common
+                .as_deref_mut()
+                .and_then(|r| r.compact_arq_trace.as_mut())
+        {
+            let outcome = match &accepted {
+                Ok(()) => common::compact_arq_trace::Outcome::Applied,
+                Err(error) => common::compact_arq_trace::Outcome::Rejected(*error),
+            };
+            trace.input(
+                "apply",
+                opened.scope.epoch.0,
+                opened.number.0,
+                now,
+                Some(received),
+                packet,
+                outcome,
+            );
+        }
         match accepted {
             Ok(()) => Ok(()),
             Err(error) if common_connections::feedback_awaiting_physical(&error) => {
@@ -1772,6 +1925,24 @@ impl Driver {
             .feedback_input
             .get_mut(..pending.bytes)
             .ok_or_else(|| protocol("retained feedback length changed"))?;
+        let trace_packet = if pending.encoding == common_fragments::FeedbackEncoding::Record {
+            runtime.compact_arq_trace.as_mut().and_then(|trace| {
+                let engine = state.engine(epoch).ok()?;
+                if engine.fragment_policy().is_some() {
+                    return None;
+                }
+                trace.inspect(
+                    engine
+                        .configuration()
+                        .descriptor()
+                        .local(common_contract::mg_role(self.info.role)),
+                    false,
+                    bytes,
+                )
+            })
+        } else {
+            None
+        };
         let result = match pending.encoding {
             common_fragments::FeedbackEncoding::Record => {
                 state.entry(epoch)?.accept_authenticated_at(
@@ -1804,6 +1975,23 @@ impl Driver {
                 .map(|_| ())
             }
         };
+        if let Some(packet) = trace_packet
+            && let Some(trace) = runtime.compact_arq_trace.as_mut()
+        {
+            let outcome = match &result {
+                Ok(()) => common::compact_arq_trace::Outcome::Applied,
+                Err(error) => common::compact_arq_trace::Outcome::Rejected(*error),
+            };
+            trace.input(
+                "retry",
+                pending.scope.epoch.0,
+                pending.number,
+                now,
+                Some(pending.received),
+                packet,
+                outcome,
+            );
+        }
         match result {
             Ok(()) => {
                 runtime.pending_feedback = None;

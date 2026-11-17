@@ -388,6 +388,25 @@ fn selected_compact_arq_short_aligned_unit_charges_actual_bytes_and_preserves_wi
         .ok_or("actual compact data")?;
     // Kind, source and serial precede one record ID and the 106-byte raw unit.
     assert_eq!(length, 110);
+    let extent = a.inspect_output_extent(&output[..length])?;
+    assert_eq!(
+        (extent.recovery.header_bytes, extent.recovery.payload_bytes),
+        (3, 107)
+    );
+    let codec = extent.codec.ok_or("actual source codec extent")?;
+    assert_eq!(
+        (
+            codec.envelope_bytes,
+            codec.container_bytes,
+            codec.unit_header_bytes,
+            codec.body_bytes
+        ),
+        (1, 0, 3, 103)
+    );
+    assert_eq!((codec.units, codec.fragmented_units), (1, 0));
+    for end in 0..length {
+        assert!(a.inspect_output_extent(&output[..end]).is_err());
+    }
     assert_eq!(
         budget,
         OutboundBudget {

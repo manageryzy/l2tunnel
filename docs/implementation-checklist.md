@@ -10,6 +10,13 @@ records eighty initial algorithm/carrier cases and separately fills independent
 directions. Runtime failures and unmeasured full encapsulation quantiles remain
 open; accepted-record histograms and a successful plan are not full qualification.
 
+The [repair4 consolidation](modules/compact-wire-cleanup.md#repair4-consolidation-and-remaining-failures)
+records finite QUIC forward progress, the still-failed TLS control path with
+source0 acknowledged, focused receipt/error-reporting checks and passing raw
+planner/preflight plus large-horizon bootstrap checks. The latest required Rust
+aggregate still has four failures. Baseline failures, source-bound phase provenance,
+full-overhead limitations and every CWC acceptance gate remain unchanged.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,
