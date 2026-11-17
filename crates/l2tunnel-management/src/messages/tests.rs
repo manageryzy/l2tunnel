@@ -1365,6 +1365,13 @@ fn readonly_time_check_uses_real_outbound_held_partial_and_session_caps() -> Tes
     assert_eq!(owner.check_time(deadline - Duration::from_nanos(1)), Ok(()));
     assert_eq!(owner.check_time(deadline), Err(Error::Expired));
     assert_eq!(owner.failed, None);
+    assert_eq!(
+        owner.expiry_snapshot(deadline).candidate,
+        Some(ExpiryCandidate {
+            deadline,
+            kind: ExpiryKind::Session,
+        })
+    );
     Ok(())
 }
 
@@ -1386,6 +1393,7 @@ fn readonly_time_check_excludes_only_actual_confirmed_outbound_expiry() -> TestR
         network.peers[0].retained(),
     );
     assert_eq!(network.peers[0].check_time(deadline), Ok(()));
+    assert_eq!(network.peers[0].expiry_snapshot(deadline).candidate, None);
     assert_eq!(
         (
             network.peers[0].last_now,

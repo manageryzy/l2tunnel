@@ -539,6 +539,125 @@ quantiles is total encapsulation overhead. Same-window WAN/application ratios
 include ACKs, retransmissions and boundary-crossing flight and are not matched
 packet overhead. All CWC acceptance gates remain open.
 
+### Local TLS queue optimization and finite validation
+
+The current source installs and reads back `TCP_NOTSENT_LOWAT` on each original
+Full/Half TLS socket before retained ownership is split. The derived local
+request is `2 * (max_record_bytes + 5)`, or 2,870 bytes for the current matrix.
+This is an unsent-data threshold with possible kernel overshoot, not a hard
+queue/flight bound. Wire formats, authenticated policy digests, send-buffer
+sizes and deadlines remain unchanged. Linux/Android option errors are setup
+errors; other platforms preserve existing TLS functionality and explicitly
+report unavailable capability. Shared status separates requested thresholds
+from actual readbacks. See the [maintained carrier module](maintained-common-carriers.md#bounded-io-and-receipts).
+
+Focused threshold, actual Full/Half readback, local-binding independence and
+status tests pass in
+[required checks3](../../work/aligned-extents-20261117/required-repair-checks3.log).
+The aggregate still fails four cases, including measured TLS proxy
+`HandoffExpired`; the
+[continuation](../../work/aligned-extents-20261117/required-repair-checks3-continuation1.json)
+passes workspace rustdoc and the external Common CLI/service process probe.
+
+The [release6 AlignedCompact TLS reverse receipt](../../work/aligned-extents-20261117/matrix-tls-repair6-reverse-attempt1/aligned-compact-tls/result.json)
+passes the finite 16-flow byte/hash/EOF workload at 0.1946112 Mbit/s
+(243,264 unique application bytes in 10 seconds). Both Full sockets report the
+actual 2,870-byte LOWAT readback; capture drops and schema2 extent errors are
+zero. The 100/10 Mbit/s, 35 ms and 15% loss each-way configuration and original
+bounds are unchanged. Completion required 33.31 seconds of post-window drain,
+with only about 0.59 seconds remaining before the probe cap. Server EOF occurred
+after the client's explicit disconnect, so orderly bilateral shutdown is not
+qualified. The earlier control-expiry failure remains a separate receipt; these
+independent runs neither isolate causality nor measure a hard queue bound.
+This advances CWC-06/13/17/18 without closing their acceptance definitions;
+full carrier, measured-proxy and platform qualification remain pending.
+
+### Terminal settlement and fixed-port TLS reconnect
+
+Terminal Common settlement now consumes only already-retained carrier failures
+following cancellation; normal service still samples live failures. Exact
+first-error identity, retained User/Control receipts and original clock/custody
+deadlines remain authoritative. The three deterministic cancellation/observed
+failure/first-cause regressions and all four genuine QUIC Full/Half CCM/CRC switch
+cases pass in `required-repair-checks3.log`. That aggregate still records four
+failures: raw Half switching, both measured proxies and TLS reconnect binding.
+It is not an aggregate pass.
+
+The Unix TLS client now enables `SO_REUSEADDR` before the original and replacement
+binds; Windows behavior is unchanged. The
+[focused receipt](../../work/aligned-extents-20261117/tls-reuseaddr-focused1.json)
+records a real Linux ordered-FIN, exact-tuple `TIME_WAIT` bind regression and the
+genuine same-port Swift TLS switch/refusal/no-op/release/reconnect case passing.
+The first proves local-port rebinding, not unrestricted immediate reuse of an
+identical TCP four-tuple. Earlier aggregate failures remain preserved.
+
+The [release6 combined report](../../work/aligned-extents-20261117/matrix-report-repairs6-complete1/report.md)
+selects 12 passing, 187 failed, 32 bound-exhausted and 9 not-run phases. It includes
+multiple source-bound versions; older untouched combinations are not requalified
+by a new binary. Raw forward still fails before a qualified sample. Its new
+bounded diagnostic records a live Liveness source with neither source confirmation
+nor semantic ACCEPTED at expiry, while local message work continued. This does
+not support the proposed confirmed-but-unswept-source explanation.
+
+### Exact raw receive ranges and release7 results
+
+The former raw tracker could retain only 128 disjoint byte intervals inside an
+otherwise valid negotiated receive horizon. Loss could exhaust that metadata
+capacity and reject new packets before Records authentication. The implementation
+now uses a circular bit per byte, allocated once before consuming original raw
+I/O. The maximum 1 MiB horizon costs 131,072 bytes per lane. Authentication remains
+between read-only validation and commit; unauthenticated input cannot age the
+window. Overlap rejection, monotonic floors and original horizon/deadline rules
+remain unchanged. Both bootstrap and compact gates use this tracker. Actual
+retained capacities enter raw preflight, allocation counts and shared status;
+this does not claim completeness for other nested allocations.
+
+The [diagnosis](../../work/aligned-extents-20261117/raw-range-capacity6-analysis.md)
+records the source defect and capture evidence. The older 849-receive plateau
+was consistent with interval exhaustion, but missing pre-capture state prevented
+an exact reconstruction of all prior internal intervals. New protocol tests
+cover more than 500,000 sparse gaps in the maximum horizon, stable allocation,
+wrap and overlap, authentication refusal, reordered bootstrap packets, actual
+Full/Half capacities and a byte-set oracle.
+
+The [source-bound release7 binary](../../work/aligned-extents-20261117/matrix-source-binding-7.json)
+uses SHA-256 `2a2f44b629f1a43b299554453ef3860ae374bf9ad6e9b8cca700df238bbc83d0`.
+The original 100/10 Mbit/s, 35 ms delay and 15% loss each-way workload and all
+caps are unchanged:
+
+| Selected native run | Result |
+| --- | --- |
+| [Swift ARQ raw forward](../../work/aligned-extents-20261117/matrix-raw-repair7-forward-attempt1/swift-arq-raw/result.json) | Pass, 20.3322368 Mbit/s; 25,415,296 unique application bytes in 10 seconds |
+| [Swift ARQ raw reverse](../../work/aligned-extents-20261117/matrix-raw-repair7-swift-arq-raw-reverse-attempt2/swift-arq-raw/result.json) | Pass, 7.6720832 Mbit/s; 9,590,104 unique application bytes in 10 seconds |
+| [Swift ARQ raw simultaneous](../../work/aligned-extents-20261117/matrix-raw-repair7-swift-arq-raw-simultaneous-attempt2/swift-arq-raw/result.json) | Authenticated startup fails; data phase not run, no qualified rate |
+| [Aligned Compact raw forward](../../work/aligned-extents-20261117/matrix-raw-repair7-aligned-compact-raw-forward-attempt2/aligned-compact-raw/result.json) | Client whole-message control expiry at 18.978261 s; server liveness expiry at 18.979204 s; no qualified rate |
+
+The last case receives more than 4,000 authenticated records at each endpoint,
+including traffic near termination. It no longer exhibits the older total raw
+receive plateau, but control-source/semantic confirmation remains incomplete.
+The earlier attempted parallel configuration was refused by the runner before
+starting workloads; corrected runs retain its original exclusive raw namespace
+and CPU-lane contract.
+
+[Required checks4](../../work/aligned-extents-20261117/required-repair-checks4-environment1.json)
+run with the existing aioquic environment after the default Python invocation
+failed dependency preflight. Formatting, strict workspace Clippy and preceding
+tool/vector checks pass. Raw tests pass 163 with two existing ignored cases;
+runtime tests pass 285. Client tests pass 193 and fail the two existing measured
+TLS/QUIC proxy `HandoffExpired` cases. The actor-first coordinator scheduling
+change is implemented but does not close those failures. The
+[continuation](../../work/aligned-extents-20261117/required-repair-checks4-continuation1.json)
+passes strict workspace rustdoc, debug daemon build and the external Common
+CLI/service probe. There is no aggregate-green claim; unchanged earlier codec,
+simulator and tool evidence is reused rather than represented as newly run.
+
+The [release7 combined report](../../work/aligned-extents-20261117/matrix-report-repairs7-complete1/report.md)
+selects 14 passed, 186 failed, 32 bound-exhausted and 8 not-run phases across all
+80 combinations. Every attempt remains linked; untouched combinations retain
+older binary provenance. Passing data phases with failed endpoint disconnects
+are listed separately. Per-layer schema2 extents are not full encapsulation
+mean/p99, and no CWC parent acceptance gate closes through this batch.
+
 ## Accepted direction and open engineering choices
 
 The subsequent source-stable

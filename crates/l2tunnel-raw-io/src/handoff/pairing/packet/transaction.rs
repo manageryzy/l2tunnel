@@ -389,11 +389,13 @@ fn configuration<I: PacketIo + Send + 'static>(
         .checked_add(peak)
         .ok_or(Error::Capacity)?;
     // Concrete owner/future/crypto descriptor charges, before attachment.
+    let range_capacity = GateState::planned_range_capacity_bytes(config.packet)?;
     let metadata = std::mem::size_of::<PacketSetup<'static, I>>()
         + std::mem::size_of::<PacketCarrier<I>>()
         + profile.count
             * (std::mem::size_of::<GateIo<I>>()
                 + std::mem::size_of::<GateState>()
+                + range_capacity
                 + std::mem::size_of::<PacketOpener>()
                 + std::mem::size_of::<PacketSealer>()
                 + std::mem::size_of::<Detached<I>>()
@@ -436,9 +438,15 @@ fn begin<'a, I: PacketIo + Send + 'static>(
         let (first, second) = inputs.configs();
         let (pair, policy, count) = configuration::<I>(config, first, second)?;
         let deadline = start.checked_add(pair.timeout).ok_or(Error::Expired)?;
-        Ok((pair, policy, deadline, count))
+        // Allocate every receive bitmap before consuming either original I/O
+        // owner, so allocation refusal returns the unchanged inputs to the caller.
+        let first_state = GateState::new(first, config.packet, deadline)?;
+        let second_state = second
+            .map(|value| GateState::new(value, config.packet, deadline))
+            .transpose()?;
+        Ok((pair, policy, deadline, count, first_state, second_state))
     })();
-    let (pair, policy_digest, deadline, count) = match prepared {
+    let (pair, policy_digest, deadline, count, first_state, second_state) = match prepared {
         Ok(p) => p,
         Err(error) => {
             return Err(PacketStartFailure {
@@ -450,14 +458,8 @@ fn begin<'a, I: PacketIo + Send + 'static>(
     let budget = Arc::new(Mutex::new(Budget::new(config.packet, start)));
     let mut states = [None, None];
     let client = matches!(credentials, Credentials::Client(..));
-    let mut wrap = |input: RawInput<I>, index: usize| {
-        let io = GateIo::new(
-            input.io,
-            input.config,
-            config.packet,
-            deadline,
-            budget.clone(),
-        );
+    let mut wrap = |input: RawInput<I>, state: GateState, index: usize| {
+        let io = GateIo::new(input.io, state, budget.clone());
         if let Ok(mut state) = io.state.lock() {
             state.half = count == 2;
             state.lane = index;
@@ -469,12 +471,18 @@ fn begin<'a, I: PacketIo + Send + 'static>(
             io,
         }
     };
-    let wrapped = match inputs {
-        RawInputs::Full(a) => RawInputs::Full(wrap(a, 0)),
-        RawInputs::Half { forward, reverse } => RawInputs::Half {
-            forward: wrap(forward, 0),
-            reverse: wrap(reverse, 1),
+    let wrapped = match (inputs, second_state) {
+        (RawInputs::Full(a), None) => RawInputs::Full(wrap(a, first_state, 0)),
+        (RawInputs::Half { forward, reverse }, Some(second_state)) => RawInputs::Half {
+            forward: wrap(forward, first_state, 0),
+            reverse: wrap(reverse, second_state, 1),
         },
+        (inputs, _) => {
+            return Err(PacketStartFailure {
+                inputs: Box::new(inputs),
+                error: Error::Configuration,
+            });
+        }
     };
     let setup = match build_at(wrapped, credentials, pair, start) {
         Ok(setup) => setup,
@@ -1472,6 +1480,15 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     /// Number of actual occupied original owners; never a synthetic duplex width.
     pub fn lane_count(&self) -> usize {
         self.count()
+    }
+    /// Actual retained receive bitmap bytes across the original occupied lanes.
+    /// Other nested transport allocations remain a separate resource inventory.
+    pub fn receive_range_capacity_bytes(&self) -> Result<usize, Error> {
+        self.lanes.iter().flatten().try_fold(0usize, |total, lane| {
+            total
+                .checked_add(lock(&lane.io.state)?.range_capacity_bytes())
+                .ok_or(Error::Capacity)
+        })
     }
     /// Original setup cap; observing it never grants another setup interval.
     pub fn setup_deadline(&self) -> Instant {

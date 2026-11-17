@@ -128,6 +128,17 @@ async fn compact_final_raw_exact_bytes_and_wouldblock_receipt_full_and_half() ->
         assert_eq!(geometry.max_record_bytes, 536);
         let a_limits = a.lane_limits()?;
         let b_limits = b.lane_limits()?;
+        // Bitmap allocation follows the requested upper horizon even when the
+        // genuine socket advertises a smaller effective window at handoff.
+        let bitmap_bytes = usize::try_from(a.policy().horizon_bytes)?.div_ceil(64) * 8;
+        assert_eq!(
+            a.receive_range_capacity_bytes()?,
+            bitmap_bytes * a.lane_count()
+        );
+        assert_eq!(
+            b.receive_range_capacity_bytes()?,
+            bitmap_bytes * b.lane_count()
+        );
         for index in 0..2 {
             if index < if half { 2 } else { 1 } {
                 let local = a_limits[index].ok_or("local lane limits")?;

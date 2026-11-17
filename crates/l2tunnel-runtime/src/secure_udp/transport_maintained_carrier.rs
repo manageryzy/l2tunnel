@@ -96,6 +96,9 @@ impl MaintainedIo {
     pub(super) fn check_failure(&self) -> io::Result<()> {
         self.carrier.check_failure()
     }
+    pub(super) fn check_retained_failure(&self) -> io::Result<()> {
+        self.carrier.check_retained_failure()
+    }
     #[cfg(unix)]
     pub(super) fn retained_peer_close(&self, error: &io::Error) -> bool {
         let lower = self.carrier.retained_peer_close(error);

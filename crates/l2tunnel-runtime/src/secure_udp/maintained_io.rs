@@ -170,6 +170,7 @@ impl Carrier {
             local: value.local_addr,
             peer: value.peer_addr,
             quic_queues: None,
+            tcp_notsent_lowat_bytes: value.tcp_notsent_lowat_bytes,
         };
         let proof = Authenticated::checked(
             request,
@@ -279,6 +280,7 @@ impl Carrier {
                     maintained_queue_bytes: actual.maintained_queue_bytes,
                     maintained_send_queue_bytes: actual.maintained_send_queue_bytes,
                 }),
+                tcp_notsent_lowat_bytes: None,
             });
             expected[index] =
                 Some(l2tunnel_quic::session_config(base, profile).map_err(quic_error)?);
@@ -393,13 +395,23 @@ impl Carrier {
                 Backend::Quic(_) => false,
             }
     }
-    /// First terminal maintained failure, without destroying saved completions.
-    pub fn check_failure(&self) -> io::Result<()> {
+    /// First retained failure, without sampling a new background transport close.
+    /// Terminal receipt settlement uses this after local cancellation wins.
+    pub(crate) fn check_retained_failure(&self) -> io::Result<()> {
         if let Some(error) = &self.failed {
             return Err(error.error());
         }
         match &self.backend {
             Backend::Tls(value) => value[0].check_failure(),
+            Backend::Quic(_) => Ok(()),
+        }
+    }
+    /// Current maintained failure, including background QUIC connection closure.
+    /// This regular-service query never destroys saved completions.
+    pub fn check_failure(&self) -> io::Result<()> {
+        self.check_retained_failure()?;
+        match &self.backend {
+            Backend::Tls(_) => Ok(()),
             Backend::Quic(values) => {
                 for value in values {
                     value.check_failure().map_err(quic_error)?;
@@ -951,6 +963,7 @@ pub(crate) fn test_framing_carrier(
                 local: info.first.local_addr,
                 peer: info.first.peer_addr,
                 quic_queues: None,
+                tcp_notsent_lowat_bytes: info.first.tcp_notsent_lowat_bytes,
             }),
             None,
         ],
@@ -972,6 +985,34 @@ mod tests {
     use l2tunnel_quic::{self as transport, DatagramFormat, EndpointLimits, Profile};
     use std::time::Duration;
     type Failure = Box<dyn std::error::Error + Send + Sync>;
+
+    #[tokio::test]
+    async fn tls_local_unsent_readback_does_not_change_shared_authentication() -> Result<(), Failure>
+    {
+        let (carrier, _peer) = test_framing_carrier(64)?;
+        let original = carrier.authenticated();
+        let mut lanes = original.lanes();
+        assert_eq!(lanes[0].and_then(|lane| lane.tcp_notsent_lowat_bytes), None);
+        let lane = lanes[0]
+            .as_mut()
+            .ok_or("synthetic framing fixture first lane missing")?;
+        // Change only a local observation in this private proof test. Synthetic
+        // framing itself never reports a real socket option as installed.
+        lane.tcp_notsent_lowat_bytes = Some(tls::tcp_notsent_lowat_bytes(
+            original.requested().geometry.max_record_bytes,
+        )?);
+        let local = Authenticated::checked(
+            original.requested(),
+            original.common_configuration(),
+            lanes,
+            [Some(original.common_configuration()), None],
+            original.deadline(),
+        )?;
+        assert_eq!(local.binding(), original.binding());
+        assert_eq!(local.requested(), original.requested());
+        assert_ne!(local.lanes(), original.lanes());
+        Ok(())
+    }
 
     #[test]
     fn half_input_lane_filters_both_data_authorities_without_restricting_control() {

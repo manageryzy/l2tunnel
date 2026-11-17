@@ -1501,6 +1501,43 @@ impl Owner {
             }
     }
 
+    /// Failure-only scalar inspection of at most four actual stream owners.
+    /// The caller gates output; candidates are observed now, not attributed to
+    /// the exact earlier failing operation. No packet bytes or digests are read.
+    pub(crate) fn write_failure_snapshot(
+        &self,
+        now: Duration,
+        output: &mut impl io::Write,
+    ) -> io::Result<()> {
+        if let Backend::Streamed(streamed) = &self.backend {
+            for (index, owner) in streamed.owners.iter().enumerate() {
+                let held = streamed.held[index];
+                writeln!(
+                    output,
+                    "Common control terminal candidate: stream={:?} snapshot={:?} wrapper_outgoing={} wrapper_confirmed={} wrapper_held={} wrapper_dispatched={} wrapper_leased={} reservation_deadline={:?} quota_packets_left={} quota_bytes_left={} quota_refill={:?}",
+                    streamed.stream(index)?,
+                    owner.expiry_snapshot(now),
+                    streamed.outgoing[index].len(),
+                    streamed.outgoing[index]
+                        .iter()
+                        .filter(|entry| entry.confirmed)
+                        .count(),
+                    held.is_some(),
+                    held.is_some_and(|entry| entry.dispatched),
+                    held.is_some_and(|entry| entry.leased),
+                    streamed
+                        .reservation
+                        .as_ref()
+                        .map(leased::Reservation::deadline),
+                    streamed.packets_left,
+                    streamed.bytes_left,
+                    streamed.refill,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(all(unix, debug_assertions))]
     pub(crate) fn trace_retained_close(&self) {
         if let Backend::Streamed(streamed) = &self.backend {

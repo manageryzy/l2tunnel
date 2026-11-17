@@ -18,6 +18,22 @@ fn limits() -> Limits {
         record_timeout: Duration::from_secs(1),
     }
 }
+
+#[test]
+fn retained_tls_unsent_threshold_is_checked_local_record_geometry() -> TestResult {
+    assert_eq!(tcp_notsent_lowat_bytes(1430)?, 2870);
+    assert_eq!(tcp_notsent_lowat_bytes(1)?, 12);
+    assert_eq!(tcp_notsent_lowat_bytes(MAX_RECORD_BYTES)?, 131080);
+    for size in [0, MAX_RECORD_BYTES + 1, usize::MAX] {
+        assert_eq!(
+            tcp_notsent_lowat_bytes(size)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
+    Ok(())
+}
 fn config() -> l2tunnel_auth::SessionConfig {
     l2tunnel_auth::SessionConfig {
         layer: PacketLayer::Ethernet,
@@ -63,18 +79,27 @@ async fn real_links(
     let (client, server) = connections
         .next()
         .ok_or_else(|| invalid("missing actual TLS pair"))?;
+    for connection in [&client, &server] {
+        assert_eq!(
+            connection
+                .configure_tcp_notsent_lowat(0)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
     if duplex == Duplex::Full {
         Ok((
-            Link::full(client, setup_deadline)?,
-            Link::full(server, setup_deadline)?,
+            Link::full(client, setup_deadline, limits())?,
+            Link::full(server, setup_deadline, limits())?,
         ))
     } else {
         let (second_client, second_server) = connections
             .next()
             .ok_or_else(|| invalid("missing actual second TLS pair"))?;
         Ok(tokio::try_join!(
-            client_pair(client, second_client, setup_deadline),
-            server_pair(server, second_server, setup_deadline)
+            client_pair(client, second_client, setup_deadline, limits()),
+            server_pair(server, second_server, setup_deadline, limits())
         )?)
     }
 }
@@ -98,6 +123,34 @@ async fn retained_tls_real_full_half_keep_original_membership_lanes_and_framed_r
         assert_eq!(a.role, Role::Initiator);
         assert_eq!(b.role, Role::Responder);
         assert_eq!(a.duplex, duplex);
+        let expected_lowat = if cfg!(any(target_os = "linux", target_os = "android")) {
+            Some(limits().tcp_notsent_lowat_bytes()?)
+        } else {
+            None
+        };
+        for lane in [Some(a.first), a.second, Some(b.first), b.second]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(lane.tcp_notsent_lowat_bytes, expected_lowat);
+        }
+        let different_limits = Limits {
+            max_record_bytes: limits().max_record_bytes - 1,
+            ..limits()
+        };
+        assert_eq!(
+            Plan::new(&client_link, different_limits)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            client_link
+                .policy_digest(different_limits)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
         if let (Some(a), Some(b)) = (a.second, b.second) {
             assert_eq!(a.session.session_id, b.session.session_id);
             assert_eq!(a.local_addr, b.peer_addr);
@@ -184,12 +237,14 @@ pub(super) fn framing_pair(capacity: usize) -> io::Result<(Adapter, DuplexStream
                 session,
                 local_addr: "127.0.0.1:10000".parse().map_err(io::Error::other)?,
                 peer_addr: "127.0.0.1:10001".parse().map_err(io::Error::other)?,
+                tcp_notsent_lowat_bytes: None,
             },
             second: None,
             role: Role::Initiator,
             duplex: Duplex::Full,
         },
         setup_deadline: Instant::now() + Duration::from_secs(10),
+        limits: limits(),
     };
     Ok((adapter(link)?, peer))
 }

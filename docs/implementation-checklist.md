@@ -13,9 +13,25 @@ open; accepted-record histograms and a successful plan are not full qualificatio
 The [repair4 consolidation](modules/compact-wire-cleanup.md#repair4-consolidation-and-remaining-failures)
 records finite QUIC forward progress, the still-failed TLS control path with
 source0 acknowledged, focused receipt/error-reporting checks and passing raw
-planner/preflight plus large-horizon bootstrap checks. The latest required Rust
-aggregate still has four failures. Baseline failures, source-bound phase provenance,
+planner/preflight plus large-horizon bootstrap checks. That required Rust
+aggregate retained four failures. Baseline failures, source-bound phase provenance,
 full-overhead limitations and every CWC acceptance gate remain unchanged.
+
+The [release6 continuation](modules/compact-wire-cleanup.md#terminal-settlement-and-fixed-port-tls-reconnect)
+adds finite TLS reverse data evidence, observable local TCP queue control, QUIC
+terminal error preservation and a focused fixed-port TLS reconnect repair. Raw
+receive-range capacity is repaired in the subsequent release7 batch below;
+measured-proxy deadline failures remain open. No broader acceptance gate closes
+through these finite results.
+
+The [release7 continuation](modules/compact-wire-cleanup.md#exact-raw-receive-ranges-and-release7-results)
+replaces the exhausted 128-interval raw receive tracker with an exact bounded
+bitmap. Swift raw forward and reverse pass at 20.3322368 and 7.6720832 Mbit/s;
+simultaneous startup and Aligned Compact raw control still fail. Required checks4
+pass all raw and runtime tests but retain both measured-proxy failures. The
+complete selected matrix has 14 passed, 186 failed, 32 bound-exhausted and
+8 not-run phases across multiple source-bound versions. Full overhead mean/p99
+remains unmeasured; these results do not qualify the complete matrix.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

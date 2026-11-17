@@ -83,6 +83,9 @@ pub struct LaneInfo {
     pub local_addr: SocketAddr,
     /// Actual retained TCP peer endpoint.
     pub peer_addr: SocketAddr,
+    /// Actual local TCP unsent threshold readback, absent when unavailable.
+    /// This is neither dynamic occupancy nor a hard byte bound on the queue.
+    pub tcp_notsent_lowat_bytes: Option<u32>,
 }
 /// Full/paired identity in global First (C2S bulk), Second (S2C bulk) order.
 /// Copying this value cannot construct an authenticated Link or Adapter.
@@ -103,12 +106,18 @@ pub struct Link {
     inner: crate::Link,
     info: Info,
     setup_deadline: Instant,
+    limits: Limits,
 }
 impl Link {
     /// Consume one already authenticated original TCP/TLS connection.
-    pub fn full(connection: AuthenticatedConnection, setup_deadline: Instant) -> io::Result<Self> {
+    pub fn full(
+        connection: AuthenticatedConnection,
+        setup_deadline: Instant,
+        limits: Limits,
+    ) -> io::Result<Self> {
         before(setup_deadline)?;
-        let first = lane_info(&connection)?;
+        let first = lane_info(&connection, limits)?;
+        before(setup_deadline)?;
         let info = Info {
             first,
             second: None,
@@ -119,6 +128,7 @@ impl Link {
             inner: crate::Link::full(connection),
             info,
             setup_deadline,
+            limits,
         })
     }
     /// Original authenticated public observations, not a construction capability.
@@ -131,6 +141,9 @@ impl Link {
     }
     /// Commit framing limits and the actual observed TCP/TLS lane topology.
     pub fn policy_digest(&self, limits: Limits) -> io::Result<ConfigDigest> {
+        if limits != self.limits {
+            return Err(input("retained TLS limits differ from original owner"));
+        }
         policy_digest(self.info.duplex, limits)
     }
 }
@@ -140,26 +153,29 @@ pub async fn client_pair(
     first: AuthenticatedConnection,
     second: AuthenticatedConnection,
     setup_deadline: Instant,
+    limits: Limits,
 ) -> io::Result<Link> {
-    paired(first, second, setup_deadline, Role::Initiator).await
+    paired(first, second, setup_deadline, limits, Role::Initiator).await
 }
 /// Pair the original authenticated server streams within the unchanged setup cap.
 pub async fn server_pair(
     first: AuthenticatedConnection,
     second: AuthenticatedConnection,
     setup_deadline: Instant,
+    limits: Limits,
 ) -> io::Result<Link> {
-    paired(first, second, setup_deadline, Role::Responder).await
+    paired(first, second, setup_deadline, limits, Role::Responder).await
 }
 async fn paired(
     first: AuthenticatedConnection,
     second: AuthenticatedConnection,
     setup_deadline: Instant,
+    limits: Limits,
     expected_role: Role,
 ) -> io::Result<Link> {
     before(setup_deadline)?;
-    let first_info = lane_info(&first)?;
-    let second_info = lane_info(&second)?;
+    let first_info = lane_info(&first, limits)?;
+    let second_info = lane_info(&second, limits)?;
     if role(first_info.session) != expected_role || role(second_info.session) != expected_role {
         return Err(input("retained TLS pair role mismatch"));
     }
@@ -181,9 +197,10 @@ async fn paired(
             duplex: Duplex::Half,
         },
         setup_deadline,
+        limits,
     })
 }
-fn lane_info(connection: &AuthenticatedConnection) -> io::Result<LaneInfo> {
+fn lane_info(connection: &AuthenticatedConnection, limits: Limits) -> io::Result<LaneInfo> {
     if connection.profile() != TlsIoProfile::TcpTls {
         return Err(input(
             "retained TLS requires the actual TCP authentication profile",
@@ -193,6 +210,8 @@ fn lane_info(connection: &AuthenticatedConnection) -> io::Result<LaneInfo> {
         session: *connection.info(),
         local_addr: connection.local_addr()?,
         peer_addr: connection.peer_addr()?,
+        tcp_notsent_lowat_bytes: connection
+            .configure_tcp_notsent_lowat(limits.tcp_notsent_lowat_bytes()?)?,
     })
 }
 fn role(info: SessionInfo) -> Role {
@@ -212,6 +231,14 @@ pub struct Limits {
     pub record_timeout: Duration,
 }
 impl Limits {
+    /// Local unsent-data threshold derived from two maximum framed records.
+    /// Kernel buffering can overshoot this threshold; it is not an exact FIFO
+    /// capacity, physical-byte charge or limit on unacknowledged TCP flight.
+    pub fn tcp_notsent_lowat_bytes(self) -> io::Result<u32> {
+        self.validate()?;
+        tcp_notsent_lowat_bytes(self.max_record_bytes)
+    }
+
     /// Validate bounds without allocating or accessing a connection.
     pub fn validate(self) -> io::Result<()> {
         if !(1..=MAX_RECORD_BYTES).contains(&self.max_record_bytes)
@@ -222,6 +249,19 @@ impl Limits {
         }
         Ok(())
     }
+}
+
+/// Derive the local TCP unsent threshold from the maximum framed record size.
+/// This scheduling preference is independent of the wire policy commitment.
+pub fn tcp_notsent_lowat_bytes(max_record_bytes: usize) -> io::Result<u32> {
+    if !(1..=MAX_RECORD_BYTES).contains(&max_record_bytes) {
+        return Err(input("invalid retained TLS record size for TCP threshold"));
+    }
+    max_record_bytes
+        .checked_add(FRAMING_BYTES)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(exhausted)
 }
 
 /// Canonical pre-authentication policy for the retained TCP/TLS adapter.
@@ -257,6 +297,9 @@ impl Plan {
     /// Pure framing/storage preflight on the actual original owner.
     pub fn new(link: &Link, limits: Limits) -> io::Result<Self> {
         limits.validate()?;
+        if limits != link.limits {
+            return Err(input("retained TLS plan differs from original limits"));
+        }
         let lanes = if link.info.duplex == Duplex::Half {
             2
         } else {

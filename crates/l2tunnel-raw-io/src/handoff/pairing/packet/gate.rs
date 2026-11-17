@@ -3,6 +3,9 @@ use super::*;
 use l2tunnel_raw_tcp::packet;
 #[path = "compact_gate.rs"]
 mod compact;
+#[path = "ranges.rs"]
+mod ranges;
+use ranges::Ranges;
 
 pub(super) struct Budget {
     policy: PacketPolicy,
@@ -83,66 +86,6 @@ struct Early {
     window: u16,
     wire_len: u64,
 }
-#[derive(Clone, Copy)]
-struct Ranges {
-    values: [(u64, u64); 128],
-    len: usize,
-}
-impl Ranges {
-    fn new() -> Self {
-        Self {
-            values: [(0, 0); 128],
-            len: 0,
-        }
-    }
-    fn propose(self, start: u64, end: u64, retired: u64, horizon: u64) -> Result<Self, Error> {
-        let left = retired.saturating_sub(horizon);
-        if start < left || start >= end {
-            return Err(Error::Proof);
-        }
-        let mut out = Self::new();
-        let mut merged = (start, end);
-        for &(a, b) in &self.values[..self.len] {
-            if b <= left {
-                continue;
-            }
-            if a < end && start < b {
-                return Err(Error::Proof);
-            }
-            if b == merged.0 {
-                merged.0 = a;
-            } else if a == merged.1 {
-                merged.1 = b;
-            } else {
-                if out.len == 128 {
-                    return Err(Error::Capacity);
-                }
-                out.values[out.len] = (a, b);
-                out.len += 1;
-            }
-        }
-        // A formerly separate adjacent range can become mergeable after another
-        // interval extends either end. Keep the fixed union bounded and exact.
-        let mut i = 0;
-        while i < out.len {
-            let (a, b) = out.values[i];
-            if b == merged.0 || a == merged.1 {
-                merged = (merged.0.min(a), merged.1.max(b));
-                out.len -= 1;
-                out.values[i] = out.values[out.len];
-                i = 0;
-            } else {
-                i += 1;
-            }
-        }
-        if out.len == 128 {
-            return Err(Error::Capacity);
-        }
-        out.values[out.len] = merged;
-        out.len += 1;
-        Ok(out)
-    }
-}
 pub(super) struct GateState {
     pub config: Config,
     pub policy: PacketPolicy,
@@ -201,8 +144,19 @@ impl GateState {
             )
             .min()
     }
-    fn new(config: Config, policy: PacketPolicy, deadline: Instant) -> Self {
-        Self {
+    pub(super) fn planned_range_capacity_bytes(policy: PacketPolicy) -> Result<usize, Error> {
+        Ranges::planned_capacity_bytes(policy.horizon_bytes)
+    }
+    pub(super) fn range_capacity_bytes(&self) -> usize {
+        self.ranges.capacity_bytes()
+    }
+    pub(super) fn new(
+        config: Config,
+        policy: PacketPolicy,
+        deadline: Instant,
+    ) -> Result<Self, Error> {
+        let ranges = Ranges::new(policy.horizon_bytes)?;
+        Ok(Self {
             config,
             policy,
             installed: false,
@@ -236,8 +190,8 @@ impl GateState {
             peer_hello: None,
             commit_body: None,
             ack_body: None,
-            ranges: Ranges::new(),
-        }
+            ranges,
+        })
     }
     fn reject(&mut self) -> Result<(), Error> {
         self.rejected_packets = self
@@ -288,7 +242,7 @@ impl GateState {
         let count = if self.half { 2 } else { 1 };
         let lane = self.lane;
         let mut protocol_fault = false;
-        let ranges = self.ranges;
+        let ranges = &self.ranges;
         let mut range_proposal = None;
         let result = self.opener.as_mut().ok_or(Error::Proof)?.open_checked(
             p.payload,
@@ -322,8 +276,8 @@ impl GateState {
                 {
                     return Err(Error::Proof);
                 }
-                range_proposal =
-                    Some(ranges.propose(h.offset, end, f.retired.max(end), f.local_horizon)?);
+                ranges.validate(h.offset, end, f.retired.max(end), f.local_horizon)?;
+                range_proposal = Some((h.offset, end, f.retired.max(end), f.local_horizon));
                 let body = &plain[wire::HEADER..];
                 if final_selected
                     && (!bootstrap_live
@@ -420,7 +374,8 @@ impl GateState {
                 return Err(Error::Proof);
             }
             Ok(opened) => {
-                self.ranges = range_proposal.ok_or(Error::Proof)?;
+                let (start, end, retired, horizon) = range_proposal.ok_or(Error::Proof)?;
+                self.ranges.commit(start, end, retired, horizon)?;
                 let h = wire::Header::parse(&output[..opened.payload_len])?;
                 let f = self.fence.as_mut().ok_or(Error::Proof)?;
                 f.retired = f.retired.max(h.offset + p.payload.len() as u64);
@@ -461,7 +416,7 @@ impl GateState {
         let policy = self.policy;
         let old = self.early.as_ref().map(|e| e.cell.body.as_slice());
         let mut conflict = false;
-        let ranges = self.ranges;
+        let ranges = &self.ranges;
         let mut range_proposal = None;
         let result = self.opener.as_mut().ok_or(Error::Proof)?.open_checked(
             p.payload,
@@ -508,13 +463,15 @@ impl GateState {
                 {
                     return Err(Error::Proof);
                 }
-                range_proposal = Some(ranges.propose(h.offset, end, end, horizon)?);
+                ranges.validate(h.offset, end, end, horizon)?;
+                range_proposal = Some((h.offset, end, end, horizon));
                 Ok(())
             },
         );
         match result {
             Ok(opened) => {
-                self.ranges = range_proposal.ok_or(Error::Proof)?;
+                let (start, end, retired, horizon) = range_proposal.ok_or(Error::Proof)?;
+                self.ranges.commit(start, end, retired, horizon)?;
                 let header = wire::Header::parse(&output[..opened.payload_len])?;
                 let candidate = Early {
                     cell: Cell {
@@ -611,16 +568,10 @@ pub(super) struct GateIo<I: PacketIo> {
     pub last_send_at: Option<Instant>,
 }
 impl<I: PacketIo> GateIo<I> {
-    pub fn new(
-        io: I,
-        config: Config,
-        policy: PacketPolicy,
-        deadline: Instant,
-        budget: SharedBudget,
-    ) -> Self {
+    pub fn new(io: I, state: GateState, budget: SharedBudget) -> Self {
         Self {
             io,
-            state: Arc::new(Mutex::new(GateState::new(config, policy, deadline))),
+            state: Arc::new(Mutex::new(state)),
             budget,
             pending: None,
             last_send_at: None,

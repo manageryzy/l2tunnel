@@ -74,7 +74,15 @@ async fn current_swift_tls_service_preserves_switch_refusal_noop_release_and_rec
     let generations = tokio::try_join!(
         connected(&client, first_client),
         connected(&server, first_server)
-    )?;
+    )
+    .map_err(|error| -> Error {
+        format!(
+            "initial TLS connection failed: {error}; client_setup={:?}; server_setup={:?}",
+            client.setup_observation(first_client.operation),
+            server.setup_observation(first_server.operation),
+        )
+        .into()
+    })?;
     let handles = [&client, &server];
     let original = common_frame(&client)?;
     let session = original.info.binding.session;
@@ -180,7 +188,15 @@ async fn current_swift_tls_service_preserves_switch_refusal_noop_release_and_rec
     tokio::try_join!(
         connected(&client, second_client),
         connected(&server, second_server)
-    )?;
+    )
+    .map_err(|error| -> Error {
+        format!(
+            "same-port TLS reconnect failed: {error}; client_setup={:?}; server_setup={:?}",
+            client.setup_observation(second_client.operation),
+            server.setup_observation(second_server.operation),
+        )
+        .into()
+    })?;
     let fresh = common_frame(&client)?;
     assert_ne!(fresh.info.binding.session, session);
     assert!(fresh.generation > generations.0.value());

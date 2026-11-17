@@ -305,13 +305,13 @@ async fn real_carriers(
             let (a, b) = if request.duplex == core::Duplex::Half {
                 let (c, d) = pairs.next().ok_or("actual reverse TLS pair")?;
                 tokio::try_join!(
-                    retained_tls::client_pair(a, c, deadline),
-                    retained_tls::server_pair(b, d, deadline)
+                    retained_tls::client_pair(a, c, deadline, tls_limits()),
+                    retained_tls::server_pair(b, d, deadline, tls_limits())
                 )?
             } else {
                 (
-                    retained_tls::Link::full(a, deadline)?,
-                    retained_tls::Link::full(b, deadline)?,
+                    retained_tls::Link::full(a, deadline, tls_limits())?,
+                    retained_tls::Link::full(b, deadline, tls_limits())?,
                 )
             };
             Ok((
@@ -865,4 +865,102 @@ async fn maintained_tls_half_cancellation_at_readiness_precedes_closed_peer_io()
     assert_eq!(stopped.snapshot.counters.native_read, 0);
     assert_eq!(stopped.snapshot.counters.native_written, 0);
     Ok(())
+}
+
+async fn quic_terminal_close(already_observed: bool, cancel: bool) -> Result {
+    let OriginalPair {
+        client,
+        server,
+        client_contract,
+        ..
+    } = establish_original_pair(
+        maintained::Kind::QuicDatagram,
+        core::Duplex::Full,
+        security::compact::Protection::ChaCha20Crc32c,
+    )
+    .await?;
+    let deadline = client.deadline;
+    let (mut socket, mut driver) = Driver::new_common_on_maintained(client, client_contract)?;
+    let (native, _host) = device()?;
+    let (stop, shutdown) = oneshot::channel();
+    let mut stop = Some(stop);
+    // Fix the causal order without a sleep: in the unobserved case local
+    // cancellation is ready before the peer's background close arrives.
+    if cancel && !already_observed {
+        stop.take()
+            .ok_or("QUIC cancellation sender lost")?
+            .send(())
+            .map_err(|_| "QUIC cancellation receiver lost")?;
+    }
+    drop(server);
+    tokio::time::timeout_at(deadline, async {
+        while socket.check_physical_failure().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let original = if already_observed {
+        // This is a real maintained poll, so its first error must survive both
+        // a later cancellation and terminal re-observation of the same cause.
+        socket.observe_completions().await;
+        Some(
+            socket
+                .check_physical_failure()
+                .err()
+                .ok_or("QUIC close was not retained by its actual poll")?,
+        )
+    } else {
+        None
+    };
+    if cancel && already_observed {
+        stop.take()
+            .ok_or("QUIC cancellation sender lost")?
+            .send(())
+            .map_err(|_| "QUIC cancellation receiver lost")?;
+    }
+    let result = run_driver_clock(
+        native,
+        socket,
+        &mut driver,
+        deadline,
+        Requests::Common(None),
+        async {
+            let _ = shutdown.await;
+        },
+        |_, _, _| Ok(()),
+        Instant::now,
+    )
+    .await;
+    drop(stop);
+    match original {
+        None => assert_eq!(result?.reason, StopReason::Cancelled),
+        Some(original) => {
+            let error = result.err().ok_or("observed QUIC failure was suppressed")?;
+            assert_eq!(error.kind(), original.kind());
+            let cause = original
+                .get_ref()
+                .and_then(|value| value.downcast_ref::<crate::retained_tls::failure::Failure>())
+                .ok_or("actual QUIC first-cause identity was not retained")?;
+            assert!(cause.is_peer_close(&error));
+        }
+    }
+    assert_eq!(driver.counters.maintained_accepted_records, 0);
+    assert_eq!(driver.counters.native_read, 0);
+    assert_eq!(driver.counters.native_written, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintained_quic_cancellation_does_not_sample_later_background_close() -> Result {
+    quic_terminal_close(false, true).await
+}
+
+#[tokio::test]
+async fn maintained_quic_cancellation_preserves_already_observed_close() -> Result {
+    quic_terminal_close(true, true).await
+}
+
+#[tokio::test]
+async fn maintained_quic_terminal_settlement_preserves_original_error_identity() -> Result {
+    quic_terminal_close(true, false).await
 }

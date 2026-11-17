@@ -91,6 +91,11 @@ fn four_actual_reserved_owners_charge_exact_plans_and_v1_rejects_without_upgrade
     let selected = selected_v2();
     let wrapper = wrapper_storage::Plan::new_v2(selected, base())?;
     let owner = make_v2(mg::Role::Client)?;
+    let mut snapshot = Vec::new();
+    owner.write_failure_snapshot(Duration::from_secs(10), &mut snapshot)?;
+    let snapshot = std::str::from_utf8(&snapshot)?;
+    assert_eq!(snapshot.lines().count(), 4);
+    assert!(snapshot.contains("stream=Lifecycle"));
     let actual = owner
         .message_storage_usage_v2()
         .ok_or("missing four actual message usages")?;

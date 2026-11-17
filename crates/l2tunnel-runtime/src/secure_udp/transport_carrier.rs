@@ -154,6 +154,12 @@ impl<R: RawBacking> IoOwner<R> {
             _ => Ok(()),
         }
     }
+    fn check_retained_physical_failure(&self) -> io::Result<()> {
+        match self {
+            Self::Maintained(values) => values[0].check_retained_failure(),
+            _ => self.check_physical_failure(),
+        }
+    }
     pub(super) fn physical_wake(&self) -> io::Result<Option<Instant>> {
         match self {
             Self::Raw(values) => values[0].next_wake().map(Some),
@@ -812,19 +818,21 @@ impl Driver {
         socket: &mut IoOwner<R>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
-        self.complete_carrier_io_inner(socket, false, &mut sample)
+        self.complete_carrier_io_inner(socket, false, None, &mut sample)
     }
     pub(super) fn complete_carrier_io_terminal<R: RawBacking>(
         &mut self,
         socket: &mut IoOwner<R>,
+        prior_error: Option<&io::Error>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
-        self.complete_carrier_io_inner(socket, true, &mut sample)
+        self.complete_carrier_io_inner(socket, true, prior_error, &mut sample)
     }
     fn complete_carrier_io_inner<R: RawBacking>(
         &mut self,
         socket: &mut IoOwner<R>,
         terminal: bool,
+        prior_error: Option<&io::Error>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
         // Both physical facts survive errors. Only the Research User receipt
@@ -883,14 +891,25 @@ impl Driver {
         control?;
         user?;
         ordering?;
-        if let Err(error) = socket.check_physical_failure() {
-            // The caller still owns the original I/O error. Re-observing that
-            // same typed peer close does not invalidate already settled facts;
-            // all actual receipt, queue, clock and cap failures remain errors.
+        let failure = if terminal {
+            socket.check_retained_physical_failure()
+        } else {
+            socket.check_physical_failure()
+        };
+        if let Err(error) = failure {
+            // Only the exact error already held by the caller may be excluded
+            // from receipt settlement. A retained close must still defeat an
+            // otherwise successful cancellation; newly sampled background
+            // closures are excluded by the retained-only query above.
             #[cfg(unix)]
-            let repeated_close = terminal && socket.retained_peer_close(&error);
+            let repeated_close = terminal
+                && prior_error.is_some_and(|original| socket.retained_peer_close(original))
+                && socket.retained_peer_close(&error);
             #[cfg(not(unix))]
-            let repeated_close = false;
+            let repeated_close = {
+                let _ = prior_error;
+                false
+            };
             if !repeated_close {
                 return Err(error);
             }

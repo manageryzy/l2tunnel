@@ -78,6 +78,7 @@ impl Driver {
             .capacity_bytes()?
             .checked_add(std::mem::size_of::<carrier::IoOwner<RawAdapter<I>>>())
             .ok_or_else(exhausted)?;
+        let io_allocations = parts.io.allocations();
         let input = CommonInput {
             material: establish::InitialMaterial::Legacy(parts.root),
             cover: parts.cover,
@@ -109,7 +110,7 @@ impl Driver {
             let socket = carrier::IoOwner::from_raw(raw)?;
             let usage = socket.adapter_usage()?;
             if usage.capacity_bytes != io_capacity
-                || usage.allocations != 3
+                || usage.allocations != io_allocations
                 || socket.addresses()? != (driver.info.local_addr, driver.info.peer_addr)
                 || socket.ip_wire_bytes()? != driver.ip
                 || socket.maximum_datagram_bytes() != Some(geometry.max_record_bytes)

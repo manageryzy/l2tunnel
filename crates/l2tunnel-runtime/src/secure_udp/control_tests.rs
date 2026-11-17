@@ -1079,3 +1079,43 @@ fn selected_settings_reject_wrapper_packet_overflow_before_owner_construction() 
     assert!(error.to_string().contains("control packet size overflow"));
     Ok(())
 }
+
+#[test]
+fn control_expiry_snapshot_writes_only_bounded_scalar_stream_observations() -> Result {
+    let mut peers = pair(base(), true)?;
+    peers[0]
+        .submit(
+            scope(1),
+            sc::Body::Ping {
+                nonce: 0x8877_6655_4433_2211,
+            },
+            Duration::ZERO,
+            Duration::from_millis(5),
+            true,
+        )?
+        .ok_or("missing Ping")?;
+    let error = peers[0]
+        .poll(Duration::from_millis(5), 4096, &mut [])
+        .err()
+        .ok_or("missing expiry")?;
+    assert_eq!(error.to_string(), "whole-message control error: Expired");
+    let before = (peers[0].now, peers[0].retained(), peers[0].expiry());
+    let mut bytes = Vec::new();
+    peers[0].write_failure_snapshot(Duration::from_millis(6), &mut bytes)?;
+    let text = std::str::from_utf8(&bytes)?;
+    assert_eq!(text.lines().count(), 3);
+    assert!(
+        text.lines()
+            .all(|line| line.starts_with("Common control terminal candidate:"))
+    );
+    assert!(text.contains("stream=Liveness"));
+    assert!(text.contains("last_successful_at:"));
+    assert!(text.contains("semantic_accepted: false"));
+    assert!(!text.contains("8877"));
+    assert!(!text.contains("digest"));
+    assert_eq!(
+        (peers[0].now, peers[0].retained(), peers[0].expiry()),
+        before
+    );
+    Ok(())
+}

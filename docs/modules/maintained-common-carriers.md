@@ -128,6 +128,54 @@ actual Half QUIC service assertions pass with the affected TLS service and exten
 checks in the
 [status/extent receipt](../../work/aligned-extents-20261117/repair-status-extents-gate1.json).
 
+The local TLS `TCP_NOTSENT_LOWAT` optimization is implemented and has finite
+local Linux verification. Before an original authenticated TCP stream is split
+into retained readers/writers, every Full/Half
+lane requests `2 * (max_record_bytes + 5)` unsent bytes and reads the socket option
+back. The current matrix's 1,430-byte maximum therefore requests 2,870 bytes.
+Linux/Android use the maintained `socket2` API; installation or readback errors
+fail setup under its original cap. Other platforms retain their existing TLS
+behavior and report the option as unavailable. API availability does not qualify
+an Android or other platform runtime.
+
+`local_tls_send_queue` is separate from authenticated policy: it reports the
+derived request, actual per-lane readbacks and `not_observed`, `unavailable` or
+`installed`. No wire bytes or policy digests change. The value is a local
+unsent-data threshold, not a hard FIFO capacity, current occupancy or TCP flight
+limit; kernel buffering can overshoot it. Send-buffer sizes, unacknowledged
+flight, admission charges and original deadlines remain unchanged. This cannot
+move control ahead of bytes already accepted into TCP or preempt a partial TLS
+record, and does not establish that the observed control expiry is fixed.
+
+The threshold, actual Full/Half socket readback, authentication-binding
+independence and requested/effective status tests pass in
+[required checks3](../../work/aligned-extents-20261117/required-repair-checks3.log),
+alongside the retained TLS custody/deadline tests. That aggregate run still
+fails four other cases, including the measured TLS proxy handoff deadline;
+it is not a full verification pass. The
+[continuation](../../work/aligned-extents-20261117/required-repair-checks3-continuation1.json)
+passes workspace rustdoc and the external Common CLI/service process probe.
+
+The [release6 AlignedCompact TLS reverse run](../../work/aligned-extents-20261117/matrix-tls-repair6-reverse-attempt1/aligned-compact-tls/result.json)
+passes all 16 TCP flow byte/hash/EOF checks with 243,264 unique application bytes
+in the 10-second sample, or **0.1946112 Mbit/s**. Both actual Full sockets report
+an installed 2,870-byte threshold. The unchanged network is 100/10 Mbit/s,
+35 ms delay and 15% loss each way. Captures report zero capture drops; the
+sample contains 300,478 reverse-direction and 84,516 opposite-direction WAN IP
+bytes. These totals include control, ACKs and retransmissions and are not
+encapsulation overhead. The
+[release4 attempt](../../work/aligned-extents-20261117/matrix-tls-repair4-reverse-attempt1/aligned-compact-tls/result.json)
+ended with client whole-message control expiry at 23.190915 seconds and had no
+qualified rate. These independent loss realizations do not isolate LOWAT as the
+cause of the changed outcome or measure peak kernel queue occupancy.
+
+The release6 pass remains narrow: receiving the complete stream took another
+33.31 seconds after the measurement window, leaving approximately 0.59 seconds
+before the original probe cap. Server TLS EOF followed the client's explicit
+disconnect, so this receipt qualifies the finite native TCP workload, not orderly
+bilateral shutdown. It does not close throughput, latency, measured-proxy or
+platform qualification gates.
+
 Control-before-User polling is restored in maintained output and runtime receipt
 selection. The existing bounded owner admits pending management ahead of a held
 User after a full QUIC FIFO becomes available; neither an accepted DATAGRAM nor

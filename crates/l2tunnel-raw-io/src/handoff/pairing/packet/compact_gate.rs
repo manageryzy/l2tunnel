@@ -119,7 +119,7 @@ impl GateState {
             return Err(Error::Proof);
         }
         self.ranges
-            .propose(offset, end, f.retired.max(end), f.local_horizon)?;
+            .validate(offset, end, f.retired.max(end), f.local_horizon)?;
         Ok(())
     }
     pub(in crate::handoff::pairing::packet) fn commit_final(
@@ -130,9 +130,8 @@ impl GateState {
         let f = self.fence.as_mut().ok_or(Error::Proof)?;
         let offset = u64::from(metadata.sequence - f.peer);
         let end = offset + u64::from(metadata.payload_bytes);
-        self.ranges = self
-            .ranges
-            .propose(offset, end, f.retired.max(end), f.local_horizon)?;
+        self.ranges
+            .commit(offset, end, f.retired.max(end), f.local_horizon)?;
         f.retired = f.retired.max(end);
         if metadata.kind != FinalKind::Data {
             f.peer_retired = f

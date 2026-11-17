@@ -229,7 +229,8 @@ struct Input {
 }
 
 /// Actual bounded backing, including the real inline PacketCarrier header.
-/// Nested raw/TLS/backend heaps remain separately retained and not fully qualified.
+/// Includes actual per-lane receive bitmaps. Other nested raw/TLS/backend heaps
+/// remain separately retained and not fully qualified.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::secure_udp) struct Plan {
     maximum: usize,
@@ -244,10 +245,12 @@ impl Plan {
             .path_mtu
             .checked_sub(geometry.ip_tcp_bytes)
             .ok_or_else(exhausted)?;
+        let ranges = carrier.receive_range_capacity_bytes().map_err(raw_error)?;
         let capacity = Layout::array::<RawAdapter<I>>(1)
             .map_err(invalid)?
             .size()
             .checked_add(maximum.checked_mul(2).ok_or_else(exhausted)?)
+            .and_then(|n| n.checked_add(ranges))
             .ok_or_else(exhausted)?;
         Ok(Self { maximum, capacity })
     }
@@ -716,15 +719,20 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
         self.addresses
     }
     fn capacity_bytes(&self) -> io::Result<usize> {
+        let ranges = self
+            .carrier
+            .receive_range_capacity_bytes()
+            .map_err(raw_error)?;
         Layout::array::<Self>(1)
             .map_err(invalid)?
             .size()
             .checked_add(self.control_bytes.capacity())
             .and_then(|n| n.checked_add(self.input_bytes.capacity()))
+            .and_then(|n| n.checked_add(ranges))
             .ok_or_else(exhausted)
     }
     fn allocations(&self) -> usize {
-        3
+        3 + self.carrier.lane_count()
     }
     fn next_wake(&self) -> io::Result<Instant> {
         self.carrier.next_wake().map_err(raw_error)

@@ -482,6 +482,24 @@ def markdown(report):
     for variant in variants:
         group = {row['carrier']: row for row in rows if row['algorithm_variant'] == variant}
         lines.append('| ' + escape(variant) + ' | ' + ' | '.join(summary_cell(group[carrier]) if carrier in group else 'not in manifest' for carrier in CARRIERS) + ' |')
+    lines += ['', '## Shutdown observations after passing data phases', '',
+              'A qualified data sample does not qualify orderly bilateral shutdown. The following selected cases contain a passing data phase but no successful disconnect response from at least one endpoint. Original cleanup receipts remain in report.json; successful namespace removal does not imply protocol shutdown.', '',
+              '| Combination / case | Passing selected phases | Endpoint disconnect responses | Owned namespace cleanup |',
+              '|---|---|---|---|']
+    for row in rows:
+        for index in sorted({index for index in row['phase_selection'].values() if index is not None}):
+            value = row['attempts'][index]
+            passed = [phase['phase'] for phase in value['phases']
+                      if phase['status'] == 'passed' and row['phase_selection'][phase['phase']] == index]
+            cleanup = value.get('cleanup') or {}
+            disconnect = cleanup.get('disconnect') or {}
+            states = {side: ('ok' if disconnect.get(side, {}).get('ok') is True
+                             else 'failed' if side in disconnect else 'not recorded') for side in ('a', 'b')}
+            if passed and any(state != 'ok' for state in states.values()):
+                lines.append('| ' + escape(row['id'] + ' / ' + Path(value['run_directory']).name)
+                             + ' | ' + ', '.join(passed) + ' | '
+                             + '; '.join(side + ': ' + state for side, state in states.items())
+                             + ' | ' + escape(cleanup.get('namespaces', 'not recorded')) + ' |')
     lines += ['', '## Observed terminal failures', '',
               'Counts use distinct case session / side / category across the cases selected by phase. They do not count the same case again for forward/reverse/simultaneous. Multiple categories and both peers can describe one failed case; no initiating cause or cross-peer causal ordering is inferred. All-attempt counts and prior diagnostics remain in report.json.', '',
               '| Evidence | Observed category | Case-side count |', '|---|---|---:|']

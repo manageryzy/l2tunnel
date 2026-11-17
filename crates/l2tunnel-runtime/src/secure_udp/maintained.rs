@@ -142,6 +142,9 @@ pub struct Lane {
     pub peer: SocketAddr,
     /// Queue bounds obtained from the genuine QUIC owner; absent for TLS.
     pub quic_queues: Option<QuicQueues>,
+    /// Actual local TCP unsent threshold readback; absent for other transports
+    /// or platforms without the option. This local observation is not hashed.
+    pub tcp_notsent_lowat_bytes: Option<u32>,
 }
 /// Opaque genuine Full/Half proof used by the subsequent Noise/member handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +233,12 @@ impl Authenticated {
                     if queues.maintained_send_queue_bytes > 0
                         && queues.maintained_send_queue_bytes <= queues.maintained_queue_bytes => {}
                 _ => return Err(invalid("maintained actual queue observations differ")),
+            }
+            if lane
+                .tcp_notsent_lowat_bytes
+                .is_some_and(|bytes| bytes == 0 || requested.kind != Kind::TlsStream)
+            {
+                return Err(invalid("maintained TCP queue observation differs"));
             }
             // Scoped routing attributes are host-local, not a shared peer tuple.
             // This selected binding requires unscoped addresses until local route

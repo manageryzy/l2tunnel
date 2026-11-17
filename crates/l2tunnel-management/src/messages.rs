@@ -21,8 +21,10 @@ use std::{
 };
 
 mod backing;
+mod diagnostics;
 pub mod storage;
 use backing::{Arrivals, OutboundStore};
+pub use diagnostics::{ExpiryCandidate, ExpiryKind, ExpirySnapshot, OutboundExpiry};
 
 /// Opaque-source discriminator for an unchanged LXv1 fragment.
 pub const FRAGMENT_KIND: u8 = 1;

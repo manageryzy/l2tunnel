@@ -332,7 +332,8 @@ where
     #[cfg(unix)]
     let mut terminal_facts_clear = true;
     let result = if socket.is_carrier() && driver.common.is_some() {
-        let facts = driver.complete_carrier_io_terminal(&mut socket, &mut sample);
+        let facts =
+            driver.complete_carrier_io_terminal(&mut socket, result.as_ref().err(), &mut sample);
         #[cfg(unix)]
         {
             terminal_facts_clear = facts.is_ok();
@@ -394,6 +395,11 @@ where
             driver.role(),
             error.kind(),
         );
+        if let Ok(observed) = clock(origin, sample()) {
+            let _ = driver
+                .control
+                .write_failure_snapshot(duration(observed), &mut io::stderr().lock());
+        }
     }
     let now = clock(origin, sample()).unwrap_or(u64::MAX);
     let reason = match &result {

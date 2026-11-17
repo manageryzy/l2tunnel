@@ -24,7 +24,10 @@ pub use rolling_ingress::{
 mod maintained;
 #[path = "common_raw_status.rs"]
 mod raw;
-pub use maintained::{MaintainedCarrier, MaintainedLane, MaintainedPolicy, QuicQueues};
+pub use maintained::{
+    MaintainedCarrier, MaintainedLane, MaintainedPolicy, QuicQueues, TlsQueueAvailability,
+    TlsSendQueue,
+};
 pub use raw::{RawCarrier, RawFinalFraming, RawLane, RawLaneLimits, RawPacketPolicy};
 
 #[path = "common_connection_status.rs"]

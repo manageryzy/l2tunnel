@@ -8,6 +8,24 @@ use l2tunnel_runtime::{retained_tls, secure_udp::maintained_io};
 use l2tunnel_security::Role;
 use tokio::net::TcpListener;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "maintained_socket_tests.rs"]
+mod socket_tests;
+
+fn tls_client_socket(local: std::net::SocketAddr) -> io::Result<tokio::net::TcpSocket> {
+    let socket = if local.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    // Fixed client ports can remain in TIME_WAIT after an orderly close. Linux
+    // requires reuse on both the original socket and its replacement, before bind.
+    // Windows gives this option different active-address ownership semantics.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    Ok(socket)
+}
+
 pub(in crate::service::owner) async fn establish(
     shared: &Arc<Shared>,
     plan: &Prepared,
@@ -262,6 +280,22 @@ async fn tls_lanes(
     settings: Settings,
     base: l2tunnel_auth::SessionConfig,
 ) -> io::Result<retained_tls::Link> {
+    let Transport::Tls(limits) = settings.transport else {
+        return Err(invalid("TLS framing limits absent"));
+    };
+    let trace_socket_error = |stage: &str,
+                              local: std::net::SocketAddr,
+                              peer: std::net::SocketAddr,
+                              error: &io::Error| {
+        if std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some() {
+            eprintln!(
+                "Common TLS socket failure: operation={:?} stage={stage} local={local} peer={peer} kind={:?} errno={:?}",
+                accepted.operation,
+                error.kind(),
+                error.raw_os_error(),
+            );
+        }
+    };
     let paths = [Some(settings.first), settings.second];
     let mut lanes = Vec::with_capacity(if settings.second.is_some() { 2 } else { 1 });
     match &plan.data.endpoint {
@@ -271,14 +305,15 @@ async fn tls_lanes(
         } => {
             for path in paths.into_iter().flatten() {
                 check(deadline)?;
-                let socket = if path.client.is_ipv6() {
-                    tokio::net::TcpSocket::new_v6()?
-                } else {
-                    tokio::net::TcpSocket::new_v4()?
-                };
-                socket.bind(path.client)?;
+                let socket = tls_client_socket(path.client)?;
+                setup::stage(shared, accepted.operation, SetupStage::SocketBind);
+                socket.bind(path.client).inspect_err(|error| {
+                    trace_socket_error("client-bind", path.client, path.server, error);
+                })?;
                 setup::stage(shared, accepted.operation, SetupStage::SocketConnect);
-                let stream = socket.connect(path.server).await?;
+                let stream = socket.connect(path.server).await.inspect_err(|error| {
+                    trace_socket_error("client-connect", path.client, path.server, error);
+                })?;
                 check(deadline)?;
                 if stream.local_addr()? != path.client || stream.peer_addr()? != path.server {
                     return Err(invalid("actual TLS client endpoints differ"));
@@ -304,7 +339,10 @@ async fn tls_lanes(
             };
             let mut listeners = Vec::with_capacity(lanes.capacity());
             for path in paths.into_iter().flatten() {
-                listeners.push((TcpListener::bind(path.server).await?, path));
+                let listener = TcpListener::bind(path.server).await.inspect_err(|error| {
+                    trace_socket_error("server-bind", path.server, path.client, error);
+                })?;
+                listeners.push((listener, path));
                 check(deadline)?;
             }
             shared.lock().snapshot.listening = Some(Listening {
@@ -317,7 +355,9 @@ async fn tls_lanes(
             });
             shared.changed();
             for (listener, path) in listeners {
-                let (stream, peer) = listener.accept().await?;
+                let (stream, peer) = listener.accept().await.inspect_err(|error| {
+                    trace_socket_error("server-accept", path.server, path.client, error);
+                })?;
                 check(deadline)?;
                 if peer != path.client || stream.local_addr()? != path.server {
                     return Err(invalid("actual TLS server endpoints differ"));
@@ -343,12 +383,12 @@ async fn tls_lanes(
         .next()
         .ok_or_else(|| invalid("missing first TLS lane"))?;
     match lanes.next() {
-        None => retained_tls::Link::full(first, deadline),
+        None => retained_tls::Link::full(first, deadline, limits),
         Some(second) => {
             if matches!(&plan.data.endpoint, Endpoint::CommonMaintainedClient { .. }) {
-                retained_tls::client_pair(first, second, deadline).await
+                retained_tls::client_pair(first, second, deadline, limits).await
             } else {
-                retained_tls::server_pair(first, second, deadline).await
+                retained_tls::server_pair(first, second, deadline, limits).await
             }
         }
     }

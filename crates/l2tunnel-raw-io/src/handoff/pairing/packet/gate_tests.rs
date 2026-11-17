@@ -8,7 +8,7 @@ fn fixture() -> R<(GateState, PacketSealer)> {
         raw(true, 0),
         policy,
         Instant::now() + Duration::from_secs(10),
-    );
+    )?;
     state.client = true;
     state.active = true;
     state.transaction = TX;
@@ -86,31 +86,41 @@ fn fresh_nonce_cannot_reuse_or_overlap_any_accepted_byte_range() -> R {
     }
     let c = seal(&mut sealer, wire::Kind::Data, a.len() as u64, b"adjacent")?;
     state.ingest_phase(&outer(&c, 2000 + a.len() as u32, 1000, 32768)?)?;
-    assert_eq!(state.ranges.len, 1);
+    assert_eq!(state.ranges.occupied_bytes(), (a.len() + c.len()) as u64);
     assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
     Ok(())
 }
 #[test]
-fn disjoint_reorder_is_accepted_but_range_table_is_finite() -> R {
+fn disjoint_reorder_is_accepted() -> R {
     let (mut state, mut sealer) = fixture()?;
     let a = seal(&mut sealer, wire::Kind::Data, 500, b"later")?;
     let b = seal(&mut sealer, wire::Kind::Data, 0, b"older")?;
     state.ingest_phase(&outer(&a, 2500, 1000, 32768)?)?;
     state.ingest_phase(&outer(&b, 2000, 1000, 32768)?)?;
     assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
-    let mut ranges = Ranges::new();
-    for i in 0..128 {
-        ranges = ranges.propose(i * 10, i * 10 + 1, 1280, 32768)?;
+    assert_eq!(state.ranges.occupied_bytes(), (a.len() + b.len()) as u64);
+    Ok(())
+}
+#[test]
+fn authenticated_sparse_packets_do_not_exhaust_a_disjoint_range_count() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    let capacity = state.range_capacity_bytes();
+    let mut offset = 0u64;
+    let mut accepted_bytes = 0u64;
+    for i in 0u16..180 {
+        let body = i.to_be_bytes();
+        let protected = seal(&mut sealer, wire::Kind::Data, offset, &body)?;
+        state.ingest_phase(&outer(&protected, 2000 + offset as u32, 1000, 32768)?)?;
+        assert_eq!(state.incoming.pop_front().ok_or("cell")?.body, body);
+        state.records_outstanding = 0;
+        accepted_bytes += protected.len() as u64;
+        offset += protected.len() as u64 + 1;
     }
-    assert!(matches!(
-        ranges.propose(1280, 1281, 1281, 32768),
-        Err(Error::Capacity)
-    ));
-    assert_eq!(ranges.len, 128);
-    let merged = ranges.propose(1, 10, 1281, 32768)?;
-    assert_eq!(merged.len, 127);
-    let advanced = ranges.propose(40000, 40001, 40001, 32768)?;
-    assert_eq!(advanced.len, 1);
+    assert!(offset < 32768);
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 180);
+    assert_eq!(state.rejected_packets, 0);
+    assert_eq!(state.ranges.occupied_bytes(), accepted_bytes);
+    assert_eq!(state.range_capacity_bytes(), capacity);
     Ok(())
 }
 #[test]
@@ -123,6 +133,8 @@ fn full_delivery_slot_does_not_burn_a_valid_nonce() -> R {
     let b = outer(&b, 2000 + a.len() as u32, 1000, 32768)?;
     state.ingest_phase(&b)?;
     assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    assert_eq!(state.ranges.occupied_bytes(), a.len() as u64);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, a.len() as u64);
     state.incoming.pop_front();
     state.records_outstanding = 0;
     state.ingest_phase(&b)?;
@@ -178,7 +190,7 @@ fn early_hello_uses_same_opener_range_table_and_one_coalesced_cell() -> R {
     let b = seal(&mut sealer, wire::Kind::Hello, a.len() as u64, &body)?;
     state.ingest_phase(&outer(&b, 2000 + a.len() as u32, 1000, 32768)?)?;
     assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
-    assert_eq!(state.ranges.len, 1);
+    assert_eq!(state.ranges.occupied_bytes(), (a.len() + b.len()) as u64);
     state.fence = fixture()?.0.fence;
     state.release_early()?;
     assert!(state.early.is_none());
@@ -187,6 +199,62 @@ fn early_hello_uses_same_opener_range_table_and_one_coalesced_cell() -> R {
         state.fence.as_ref().ok_or("fence")?.retired,
         (a.len() + b.len()) as u64
     );
+    Ok(())
+}
+#[test]
+fn early_hello_reordering_preserves_the_highest_end_and_missing_extents() -> R {
+    let (mut state, mut sealer) = fixture()?;
+    state.fence = None;
+    state.active = false;
+    state.hello_allowed = true;
+    state.expected_pair = [7; 32];
+    state.expected_armed = [8; 32];
+    let body = hello().encode()?;
+    let later = seal(&mut sealer, wire::Kind::Hello, 512, &body)?;
+    state.ingest_phase(&outer(&later, 2512, 1000, 32768)?)?;
+    let earlier = seal(&mut sealer, wire::Kind::Hello, 0, &body)?;
+    state.ingest_phase(&outer(&earlier, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    assert_eq!(
+        state.ranges.occupied_bytes(),
+        (earlier.len() + later.len()) as u64
+    );
+    let duplicate = seal(&mut sealer, wire::Kind::Hello, 0, &body)?;
+    state.ingest_phase(&outer(&duplicate, 2000, 1000, 32768)?)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 2);
+    state.fence = fixture()?.0.fence;
+    state.release_early()?;
+    assert_eq!(state.incoming.len(), 1);
+    assert_eq!(
+        state.fence.as_ref().ok_or("fence")?.retired,
+        512 + later.len() as u64
+    );
+    Ok(())
+}
+#[test]
+fn compact_preflight_does_not_advance_ranges_until_explicit_commit() -> R {
+    let (mut state, _) = fixture()?;
+    state.final_context = Some([7; 32]);
+    let body = [2, 1, 2, 3, 4];
+    state.ingest_final(&outer(&body, 22000, 1000, 32768)?)?;
+    assert_eq!(state.ranges.occupied_bytes(), 0);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, 0);
+    state.incoming.pop_front().ok_or("candidate")?;
+    for index in 0..180u32 {
+        state.ingest_final(&outer(&body, 2000 + index * 6, 1000, 32768)?)?;
+        let metadata = state
+            .incoming
+            .pop_front()
+            .ok_or("candidate")?
+            .final_metadata
+            .ok_or("metadata")?;
+        assert_eq!(state.ranges.occupied_bytes(), u64::from(index) * 5);
+        state.commit_final(metadata)?;
+        assert!(matches!(state.validate_final(metadata), Err(Error::Proof)));
+    }
+    assert_eq!(state.ranges.occupied_bytes(), 900);
+    assert_eq!(state.fence.as_ref().ok_or("fence")?.retired, 1079);
+    assert_eq!(state.rejected_packets, 0);
     Ok(())
 }
 #[test]

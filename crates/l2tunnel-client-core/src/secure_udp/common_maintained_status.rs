@@ -17,6 +17,85 @@ impl QuicQueues {
         })
     }
 }
+
+/// Availability of the local TCP unsent-data scheduling option.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsQueueAvailability {
+    /// No actual running maintained owner has reported its sockets yet.
+    NotObserved,
+    /// Actual lanes have no platform readback; no bounded-queue claim is made.
+    Unavailable,
+    /// Every actual lane reports the requested threshold installed.
+    Installed,
+}
+
+/// Local TCP scheduling observations, outside the authenticated wire policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsSendQueue {
+    /// Derived local request, not a negotiated transport or memory bound.
+    pub requested_notsent_lowat_bytes: u64,
+    /// Actual First/Second socket readbacks. None is unavailable or absent;
+    /// the actual lane inventory distinguishes those cases.
+    pub effective_notsent_lowat_bytes: [Option<u64>; 2],
+    /// Installation is reported only from actual retained socket observations.
+    pub availability: TlsQueueAvailability,
+}
+impl TlsSendQueue {
+    fn observe(
+        request: l2tunnel_runtime::secure_udp::maintained::Request,
+        actual: Option<l2tunnel_runtime::secure_udp::maintained::Authenticated>,
+    ) -> std::io::Result<Option<Self>> {
+        if request.kind != l2tunnel_runtime::secure_udp::maintained::Kind::TlsStream {
+            return Ok(None);
+        }
+        let requested = u64::from(l2tunnel_runtime::retained_tls::tcp_notsent_lowat_bytes(
+            request.geometry.max_record_bytes,
+        )?);
+        let effective = actual.map(|owner| {
+            owner.lanes().map(|lane| {
+                lane.and_then(|lane| lane.tcp_notsent_lowat_bytes)
+                    .map(u64::from)
+            })
+        });
+        Self::from_readbacks(requested, request.duplex, effective).map(Some)
+    }
+
+    fn from_readbacks(
+        requested: u64,
+        duplex: l2tunnel_core::Duplex,
+        effective: Option<[Option<u64>; 2]>,
+    ) -> std::io::Result<Self> {
+        let count = if duplex == l2tunnel_core::Duplex::Full {
+            1
+        } else {
+            2
+        };
+        let availability = match effective {
+            None => TlsQueueAvailability::NotObserved,
+            Some(values) => {
+                if values.iter().flatten().any(|value| *value != requested)
+                    || (count == 1 && values[1].is_some())
+                {
+                    return Err(std::io::Error::other(
+                        "actual TCP unsent threshold differs from local request",
+                    ));
+                }
+                if values[..count].iter().all(Option::is_some) {
+                    TlsQueueAvailability::Installed
+                } else {
+                    TlsQueueAvailability::Unavailable
+                }
+            }
+        };
+        Ok(Self {
+            requested_notsent_lowat_bytes: requested,
+            effective_notsent_lowat_bytes: effective.unwrap_or([None, None]),
+            availability,
+        })
+    }
+}
 /// Exact requested record bounds; charges are allowances, not physical byte facts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +155,10 @@ pub struct MaintainedCarrier {
     pub physical_wire_bytes_observed: bool,
     /// Configured independent public SNI is unavailable for genuine Quinn.
     pub independent_sni_supported: bool,
+    /// Local TCP scheduling only. The threshold can be exceeded by kernel
+    /// buffering; it is not occupancy, physical flight or a hard FIFO capacity.
+    #[serde(default)]
+    pub local_tls_send_queue: Option<TlsSendQueue>,
 }
 impl MaintainedPolicy {
     fn from_request(
@@ -221,6 +304,39 @@ impl MaintainedCarrier {
                 request.kind,
                 l2tunnel_runtime::secure_udp::maintained::Kind::TlsStream
             ),
+            local_tls_send_queue: TlsSendQueue::observe(request, actual)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use l2tunnel_core::Duplex;
+
+    #[test]
+    fn tls_queue_status_separates_request_unavailable_and_actual_readback() -> std::io::Result<()> {
+        let requested = TlsSendQueue::from_readbacks(2870, Duplex::Full, None)?;
+        assert_eq!(requested.availability, TlsQueueAvailability::NotObserved);
+        assert_eq!(requested.effective_notsent_lowat_bytes, [None, None]);
+        let unavailable = TlsSendQueue::from_readbacks(2870, Duplex::Full, Some([None, None]))?;
+        assert_eq!(unavailable.availability, TlsQueueAvailability::Unavailable);
+        assert_eq!(unavailable.effective_notsent_lowat_bytes, [None, None]);
+        for (duplex, values) in [
+            (Duplex::Full, [Some(2870), None]),
+            (Duplex::Half, [Some(2870), Some(2870)]),
+        ] {
+            let observed = TlsSendQueue::from_readbacks(2870, duplex, Some(values))?;
+            assert_eq!(observed.availability, TlsQueueAvailability::Installed);
+            assert_eq!(observed.effective_notsent_lowat_bytes, values);
+        }
+        assert!(
+            TlsSendQueue::from_readbacks(2870, Duplex::Full, Some([Some(2871), None])).is_err()
+        );
+        assert!(TlsSendQueue::from_readbacks(2870, Duplex::Full, Some([Some(2870); 2])).is_err());
+        let incomplete =
+            TlsSendQueue::from_readbacks(2870, Duplex::Half, Some([Some(2870), None]))?;
+        assert_eq!(incomplete.availability, TlsQueueAvailability::Unavailable);
+        Ok(())
     }
 }

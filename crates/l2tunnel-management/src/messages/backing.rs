@@ -59,6 +59,12 @@ pub(super) enum Sources<'a> {
     Reserved(&'a SourceFifo),
 }
 impl<'a> Sources<'a> {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Legacy(values) => values.len(),
+            Self::Reserved(values) => values.ids.len() - values.consumed,
+        }
+    }
     pub(super) fn front(&self) -> Option<&'a u64> {
         match self {
             Self::Legacy(values) => values.front(),
@@ -488,6 +494,18 @@ pub(super) enum Arrivals {
     Reserved(Vec<ArrivalSlot>),
 }
 impl Arrivals {
+    pub(super) fn earliest(&self) -> Option<(MessageId, Duration)> {
+        match self {
+            Self::Legacy(values) => values
+                .iter()
+                .map(|(message, deadline)| (*message, *deadline))
+                .min_by_key(|(message, deadline)| (*deadline, *message)),
+            Self::Reserved(slots) => slots
+                .iter()
+                .filter_map(|slot| slot.message.map(|message| (message, slot.deadline)))
+                .min_by_key(|(message, deadline)| (*deadline, *message)),
+        }
+    }
     pub(super) fn reserved(
         count: usize,
         allocation: &mut storage::Allocation,

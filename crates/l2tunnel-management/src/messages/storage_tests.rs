@@ -4,6 +4,135 @@ use l2tunnel_recovery::{EndpointRole, PacketView, RecoveryContext, inspect_packe
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+fn control_expiry_snapshot_separates_acknowledged_sources_from_confirmation_custody() -> Result {
+    for reserved in [false, true] {
+        let mut sender = owner(settings(), 0, reserved)?;
+        let mut receiver = owner(settings(), 1, reserved)?;
+        let deadline = Duration::from_secs(1);
+        let body = b"diagnostic payload must remain private";
+        let ticket = sender.submit(SubmissionId(7), body, Duration::ZERO, deadline)?;
+        let mut packet = [0; 512];
+        let emission = sender
+            .poll(Duration::ZERO, 4096, &mut packet)?
+            .ok_or("missing real source")?;
+        let before = sender.expiry_snapshot(deadline);
+        let Some(ExpiryCandidate {
+            deadline: original,
+            kind: ExpiryKind::Outbound(pending),
+        }) = before.candidate
+        else {
+            return Err("missing outbound candidate".into());
+        };
+        assert_eq!(original, deadline);
+        assert_eq!(pending.submission, SubmissionId(7));
+        assert_eq!(pending.message, ticket.message());
+        assert_eq!((pending.fragments, pending.submitted_fragments), (1, 1));
+        assert_eq!(pending.source_custody, 1);
+        assert_eq!(pending.first_source_confirmed, Some(Ok(false)));
+        assert!(!pending.semantic_accepted);
+        receiver.receive(verified(0), &packet[..emission.bytes], Duration::ZERO)?;
+        let ack = receiver
+            .poll(Duration::ZERO, 4096, &mut packet)?
+            .ok_or("missing real source ACK")?;
+        assert!(matches!(
+            view(1, &packet[..ack.bytes])?,
+            PacketView::Ack { .. }
+        ));
+        // Feed the actual ACK to its existing source owner before the bounded
+        // whole-message confirmation sweep consumes that source's custody.
+        sender
+            .service
+            .receive(verified(1), &packet[..ack.bytes], Duration::ZERO)?;
+        let state = (
+            sender.last_now,
+            sender.failed,
+            sender.retained(),
+            sender.statistics(),
+        );
+        let storage = reserved.then(|| inventory(&sender)).transpose()?;
+        let snapshot = sender.expiry_snapshot(deadline);
+        let Some(ExpiryCandidate {
+            kind: ExpiryKind::Outbound(pending),
+            ..
+        }) = snapshot.candidate
+        else {
+            return Err("missing ACKed outbound candidate".into());
+        };
+        assert_eq!(pending.source_custody, 1);
+        assert_eq!(pending.first_source_confirmed, Some(Ok(true)));
+        assert!(!pending.semantic_accepted);
+        assert_eq!(snapshot.last_successful_at, Duration::ZERO);
+        assert_eq!(snapshot.owner_error, None);
+        assert_eq!(
+            (
+                sender.last_now,
+                sender.failed,
+                sender.retained(),
+                sender.statistics()
+            ),
+            state
+        );
+        assert_eq!(reserved.then(|| inventory(&sender)).transpose()?, storage);
+        assert!(!format!("{snapshot:?}").contains(std::str::from_utf8(body)?));
+        sender.tick(Duration::ZERO)?;
+        let Some(ExpiryCandidate {
+            kind: ExpiryKind::Outbound(pending),
+            ..
+        }) = sender.expiry_snapshot(deadline).candidate
+        else {
+            return Err("missing semantic-receipt candidate".into());
+        };
+        assert_eq!(pending.source_custody, 0);
+        assert_eq!(pending.first_source_confirmed, None);
+        assert!(!pending.semantic_accepted);
+    }
+    Ok(())
+}
+
+#[test]
+fn control_expiry_snapshot_preserves_reassembly_identity_after_payload_expiry() -> Result {
+    for reserved in [false, true] {
+        let mut sender = owner(settings(), 0, reserved)?;
+        let mut receiver = owner(settings(), 1, reserved)?;
+        let ticket = sender.submit(
+            SubmissionId(1),
+            &[0x91; 200],
+            Duration::ZERO,
+            Duration::from_secs(2),
+        )?;
+        let mut packet = [0; 512];
+        let emission = sender
+            .poll(Duration::ZERO, 4096, &mut packet)?
+            .ok_or("missing first fragment")?;
+        receiver.receive(verified(0), &packet[..emission.bytes], Duration::ZERO)?;
+        receiver.tick(Duration::ZERO)?;
+        assert_eq!(receiver.retained().incomplete_messages, 1);
+        let deadline = settings().message_lifetime;
+        assert_eq!(
+            receiver
+                .expiry_snapshot(deadline - Duration::from_nanos(1))
+                .candidate,
+            None
+        );
+        assert_eq!(receiver.tick(deadline), Err(Error::Expired));
+        assert_eq!(receiver.retained().incomplete_messages, 0);
+        let snapshot = receiver.expiry_snapshot(deadline + Duration::from_nanos(1));
+        assert_eq!(
+            snapshot.candidate,
+            Some(ExpiryCandidate {
+                deadline,
+                kind: ExpiryKind::Reassembly {
+                    message: MessageId(ticket.message())
+                },
+            })
+        );
+        assert_eq!(snapshot.owner_error, Some(Error::Expired));
+        assert_eq!(snapshot.last_successful_at, Duration::ZERO);
+    }
+    Ok(())
+}
+
 fn settings() -> Settings {
     Settings {
         delivery: delivery::Settings {
@@ -810,6 +939,18 @@ fn held_acceptance_backpressure_preserves_exact_bytes_and_original_expiry_in_bot
             pair.peers[1].accept(incoming, deadline),
             Err(Error::Expired)
         );
+        let snapshot = pair.peers[1].expiry_snapshot(deadline);
+        assert_eq!(
+            snapshot.candidate,
+            Some(ExpiryCandidate {
+                deadline,
+                kind: ExpiryKind::Held {
+                    message: incoming.message(),
+                    length: bytes.len()
+                },
+            })
+        );
+        assert_eq!(snapshot.owner_error, Some(Error::Expired));
         assert_eq!(
             pair.peers[1]
                 .pending()

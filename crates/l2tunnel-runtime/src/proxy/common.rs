@@ -261,6 +261,9 @@ where
         let mut started = false;
         loop {
             tokio::select! {
+                // Poll ready physical callbacks before another Common work turn.
+                // The bounded actor returns Pending; carrier progress still follows.
+                biased;
                 result = &mut actor => {
                     let _ = stop.send(());
                     let common = runtime.await;

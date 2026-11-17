@@ -442,6 +442,35 @@ impl<S> AuthenticatedIo<S> {
 }
 
 impl AuthenticatedIo<TcpStream> {
+    /// Install and read back a local TCP unsent-data threshold on this original socket.
+    /// This does not bound unacknowledged flight or promise an exact queue size.
+    /// Platforms without this socket option retain their existing behavior and
+    /// return `None`; supported-platform errors are never silently ignored.
+    pub fn configure_tcp_notsent_lowat(&self, bytes: u32) -> io::Result<Option<u32>> {
+        if bytes == 0 || bytes > i32::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid TCP unsent-data threshold",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let socket = socket2::SockRef::from(self.stream.get_ref().0);
+            socket.set_tcp_notsent_lowat(bytes)?;
+            let observed = socket.tcp_notsent_lowat()?;
+            if observed != bytes {
+                return Err(io::Error::other(
+                    "TCP unsent-data threshold readback differs from request",
+                ));
+            }
+            Ok(Some(observed))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Retained socket's local address, useful for same-connection verification.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.stream.get_ref().0.local_addr()
