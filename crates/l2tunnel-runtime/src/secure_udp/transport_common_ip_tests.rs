@@ -207,6 +207,8 @@ async fn retain_source(fixture: &mut Fixture<IpDevice>) -> Result<Captured> {
             wire: runtime.wire[..pending.sealed.bytes].to_vec(),
             body: endpoint.driver.buffers.frame[..emission.bytes].to_vec(),
         };
+        assert_eq!(pending.cost, captured.wire.len() + 28);
+        assert_eq!(emission.wire_bytes, pending.cost);
         let number = endpoint.driver.records.next_number(Class::User);
         let debit = endpoint.driver.bucket.tokens;
         assert!(
@@ -219,10 +221,15 @@ async fn retain_source(fixture: &mut Fixture<IpDevice>) -> Result<Captured> {
         assert_eq!(&runtime.wire[..pending.sealed.bytes], captured.wire);
         assert_eq!(endpoint.driver.records.next_number(Class::User), number);
         assert_eq!(endpoint.driver.bucket.tokens, debit);
+        let accepted = endpoint.driver.counters.socket_accepted_ip_bytes;
         assert!(
             endpoint
                 .driver
                 .flush_common_wire_with(now, |bytes| endpoint.socket.try_send(bytes))?
+        );
+        assert_eq!(
+            endpoint.driver.counters.socket_accepted_ip_bytes - accepted,
+            (captured.wire.len() + 28) as u64
         );
         assert_eq!(endpoint.driver.records.next_number(Class::User), number);
         return Ok(captured);
@@ -299,11 +306,9 @@ fn assert_body(fixture: &Fixture<IpDevice>, packet: &[u8], expected: &[u8]) -> R
         )?;
         let body = &source.symbol[3..];
         assert_eq!(
-            &body[..expected.len()],
-            expected,
-            "literal IP context/delta absent from actual Aligned source"
+            body, expected,
+            "Aligned must transmit the exact context/delta without symbol padding"
         );
-        assert!(body[expected.len()..].iter().all(|byte| *byte == 0));
     }
     Ok(())
 }

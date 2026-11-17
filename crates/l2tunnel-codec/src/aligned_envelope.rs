@@ -8,6 +8,7 @@ use crate::{
 use std::fmt;
 
 mod compact;
+pub(crate) use compact::validate_unit as validate_compact_unit;
 pub use compact::{decode_compact, encode_compact};
 
 /// Bytes added before the unchanged Python aligned symbol.
@@ -42,7 +43,7 @@ impl std::error::Error for Error {}
 pub struct View<'a> {
     /// Full original symbol identity.
     pub identity: SymbolIdentity,
-    /// Unchanged channel/serial/body/padding bytes.
+    /// Channel/serial/body bytes, including padding only in the full-symbol format.
     pub symbol: &'a [u8],
 }
 

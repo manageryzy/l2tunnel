@@ -319,6 +319,46 @@ workspace Clippy and the checklist validator pass separately. Existing simulator
 evidence is unchanged. This focused correction does not close CWC-01/17/18, the broader
 cutover, native platform gates or the previously intermittent raw/switch cases.
 
+## Exact Aligned source extents (2026-11-17)
+
+The preceding overhead table describes the pre-correction source. Current
+Aligned sends the exact meaningful unit returned by its codec, including real
+trailing zero bytes. It no longer serializes the configured symbol tail. The
+record boundary provides the extent; no new length field is added. Fragment
+stride and bounded receiver storage retain their negotiated geometry. The
+receiver validates context-dependent payload lengths against the actual slice;
+it must not synthesize missing predictive payload by padding a truncated input.
+
+The complete configuration and catalog digest domains advance to v4 to bind
+these semantics. CompleteV2 descriptor fields and the five-byte final Records
+prefix are unchanged. Historical simulator vectors and receipts are unchanged.
+The independent configuration hash fixtures are recomputed with Python hashlib.
+
+Focused evidence is under `work/aligned-extents-20261117/`: 120 codec cases pass,
+including the existing 2,588 sender vectors and new exact-extent checks. The
+Aligned run passes 41 of 42 initially; the new Compact ARQ test's feedback-drain
+assertions are corrected and its focused continuation passes. Configuration v4
+tests pass. The actual UDP IP-header/context-loss/delta/replay and Aligned-to-Packed
+test passes, also under capture in an owned fresh namespace: 130 packets,
+zero capture drops. This fixture uses Unix packet devices, not kernel TUN.
+
+For an early one-byte identity and direct ARQ, the 100-byte raw native fixture
+now emits 109 algorithm bytes, 130 strong Records bytes and 158 IPv4/UDP bytes,
+instead of 308 IPv4/UDP bytes. Its loss/retry test checks exact retained and
+charged bytes, meaningful zero tails and native delivery. These are fixture
+observations and arithmetic, not workload mean/p99 or throughput results.
+Proxy's separate 81-byte relay/flow/local framing remains an open cleanup item.
+TLS Full and QUIC Half fixed proxy cases pass after this correction; both
+maintained measured proxy cases still fail `HandoffExpired` at their original
+cap. Aggregate and full native performance qualification remain open.
+
+The historical approximately 80 Mbit/s receipts select Swift. The Aligned
+receipt verifies ping and a 65,536-byte TCP transfer, with no throughput gate.
+Historical impaired shaping is 100/10 Mbit/s, 35 ms each way and 15% loss each
+way (nominal RTT 70 ms). No Aligned 80 Mbit/s pass is established by those
+receipts. The requested current algorithm/carrier/direction matrix is a separate
+measurement deliverable; configured carrier allowances are not captured bytes.
+
 ## Accepted direction and open engineering choices
 
 The ordinary-data target is at most 24 bytes, with 20 bytes or less an optimization

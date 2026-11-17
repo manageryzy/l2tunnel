@@ -13,7 +13,7 @@ except ImportError:
     import generic_cli_native as g
 
 require, uint, public_bytes = g.require, g.uint, g.public_bytes
-CONFIG_DOMAIN = b'l2tunnel/record-transaction-config/v3\0'
+CONFIG_DOMAIN = b'l2tunnel/record-transaction-config/v4\0'
 FAMILIES = {1: 'swift', 2: 'aligned', 3: 'packed', 4: 'rolling'}
 
 

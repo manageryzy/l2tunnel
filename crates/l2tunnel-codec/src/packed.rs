@@ -45,7 +45,16 @@ fn geometry(symbol_bytes: usize) -> Result<(), Error> {
 /// context for a subsequent exact-length check, as in the Python reference.
 pub fn validate_unit(unit: &[u8], symbol_bytes: usize) -> Result<(), Error> {
     geometry(symbol_bytes)?;
-    if !(4..=symbol_bytes).contains(&unit.len()) || unit[0] == PACKED_CHANNEL {
+    if unit.first() == Some(&PACKED_CHANNEL) {
+        return Err(Error::Malformed);
+    }
+    validate_aligned_unit(unit, symbol_bytes)
+}
+
+// Aligned admits channel 255; only the Packed container reserves that value.
+pub(crate) fn validate_aligned_unit(unit: &[u8], symbol_bytes: usize) -> Result<(), Error> {
+    geometry(symbol_bytes)?;
+    if !(4..=symbol_bytes).contains(&unit.len()) {
         return Err(Error::Malformed);
     }
     let body = &unit[3..];

@@ -196,6 +196,7 @@ impl Receiver {
         Ok(Self {
             scope,
             limits: l,
+            compact_units: false,
             channels,
             records,
             proofs,

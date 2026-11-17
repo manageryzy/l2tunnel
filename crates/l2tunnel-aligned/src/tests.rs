@@ -167,7 +167,10 @@ fn selected_compact_wire_elides_identity_envelope_and_restores_lost_fec_source()
     for packet in &packets[..3] {
         let record = left.recovery.inspect_output_record(packet)?;
         let (source, payload) = record.source.ok_or("systematic source")?;
-        assert_eq!(payload.len(), 129);
+        assert!(
+            payload.len() < 129,
+            "the complete Python unit excludes generated padding"
+        );
         assert_eq!(
             compact_wire::aligned(
                 true,
@@ -210,6 +213,9 @@ fn selected_compact_wire_elides_identity_envelope_and_restores_lost_fec_source()
     assert!(left.drained() && right.drained());
     Ok(())
 }
+
+#[path = "compact_extent_tests.rs"]
+mod compact_extent;
 #[test]
 fn protected_independent_peers_restore_python_bytes_before_rto_in_both_roles() -> TestResult {
     for cover in [

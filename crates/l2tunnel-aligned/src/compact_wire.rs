@@ -20,6 +20,11 @@ impl Endpoint {
         self.recovery
             .enable_compact_wire_with_overheads(data_overhead, feedback_overhead)
             .map_err(Error::Recovery)?;
+        if self.receive_packing.is_none() {
+            self.receiver
+                .enable_compact_units()
+                .map_err(Error::Receiver)?;
+        }
         self.compact_wire = true;
         self.compact_data_overhead = data_overhead;
         Ok(())
@@ -32,6 +37,11 @@ impl Endpoint {
     ) -> Result<(), Error> {
         if self.compact_wire || self.now != Duration::ZERO || !self.drained() {
             return Err(Error::Configuration);
+        }
+        if self.receive_packing.is_none() {
+            self.receiver
+                .validate_compact_units_selection()
+                .map_err(Error::Receiver)?;
         }
         self.recovery
             .validate_compact_wire_selection(data_overhead, feedback_overhead)

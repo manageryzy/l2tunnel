@@ -707,9 +707,16 @@ impl Endpoint {
             if aligned.identity.source.0 != source.0 {
                 return Err(Error::Identity);
             }
-            output[0] =
+            output[0] = if self.compact_wire {
+                receiver::unit_witness_compact(
+                    aligned.identity,
+                    aligned.symbol,
+                    self.config.receiver,
+                )
+            } else {
                 receiver::unit_witness(aligned.identity, aligned.symbol, self.config.receiver)
-                    .map_err(Error::Receiver)?;
+            }
+            .map_err(Error::Receiver)?;
             Ok(1)
         }
     }

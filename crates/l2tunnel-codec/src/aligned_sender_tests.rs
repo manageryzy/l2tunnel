@@ -88,6 +88,24 @@ fn every_actual_python_sender_symbol_matches_context_fragment_padding_and_wrap()
                 "{} step {} source {}",
                 name, fields[1], source.0
             );
+            let mut compact = vec![0xa5; expected.len() + 10];
+            let compact_length = sender.write_pending_compact(&mut compact)?;
+            let compact_view = aligned_envelope::decode_compact(
+                scope(),
+                source,
+                expected.len(),
+                2,
+                &compact[..compact_length],
+            )?;
+            assert_eq!(compact_view.identity, view.identity);
+            assert_eq!(compact_view.symbol, meaningful);
+            assert_eq!(
+                compact_length,
+                crate::source_identity::varint_len(absolute.0) + meaningful.len()
+            );
+            let held = compact.clone();
+            assert_eq!(sender.write_pending_compact(&mut compact)?, compact_length);
+            assert_eq!(compact, held);
             let original = output.clone();
             assert_eq!(sender.write_pending(source, &mut output)?, length);
             assert_eq!(output, original);

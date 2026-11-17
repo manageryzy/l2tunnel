@@ -348,17 +348,19 @@ impl Sender {
             output,
         )?)
     }
-    /// Write only selected record metadata and the original symbol before commit.
+    /// Write selected record metadata and the exact meaningful unit before commit.
     /// Authenticated outer context and recovery supply scope and source identity.
+    /// Generated symbol padding is omitted; original zero-valued bytes remain.
     pub fn write_pending_compact(&mut self, output: &mut [u8]) -> Result<usize, Error> {
-        let (pending, _, _) = self.build_symbol()?;
+        let (pending, length, _) = self.build_symbol()?;
         Ok(aligned_envelope::encode_compact(
             SymbolIdentity {
                 scope: self.scope,
                 source: SourceId(0),
                 record: pending.record,
             },
-            &self.symbol,
+            self.config.body.symbol_bytes,
+            &self.symbol[..length],
             output,
         )?)
     }

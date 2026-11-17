@@ -253,7 +253,7 @@ pub struct Status {
     pub failure: Option<Error>,
 }
 /// One externally authenticated symbol borrowed for atomic ledger admission.
-/// The full configured padded geometry and existing identity rules still apply.
+/// The selected exact-unit or padded geometry and existing identity rules apply.
 pub struct AuthenticatedSymbol<'a> {
     /// Authenticated absolute symbol and record identity.
     pub identity: SymbolIdentity,
@@ -314,6 +314,7 @@ struct Parsed<'a> {
 pub struct Receiver {
     scope: Scope,
     limits: Limits,
+    compact_units: bool,
     channels: Vec<Channel>,
     records: Vec<Option<Record>>,
     proofs: Vec<Option<Proof>>,
@@ -382,6 +383,7 @@ impl Receiver {
         Ok(Self {
             scope,
             limits,
+            compact_units: false,
             channels,
             records,
             proofs,
@@ -398,6 +400,38 @@ impl Receiver {
             failure: None,
             reserved: None,
         })
+    }
+    /// Preflight exact-unit parsing before this receiver has accepted time or input.
+    /// The enclosing authenticated configuration selects the wire grammar.
+    pub fn validate_compact_units_selection(&self) -> Result<(), Error> {
+        if self.last_time.is_some()
+            || self.pending.is_some()
+            || self.failure.is_some()
+            || self.floor != Some(self.limits.first_source)
+            || self.records.iter().any(Option::is_some)
+            || self.proofs.iter().any(Option::is_some)
+            || self.channels.iter().any(|channel| {
+                channel.expected != Some(self.limits.first_record) || channel.decoder.has_context()
+            })
+        {
+            return Err(Error::Configuration);
+        }
+        Ok(())
+    }
+    /// Select exact meaningful units without allocating or changing retained limits.
+    /// Implicit bodies retain their real length for later context-aware decoding.
+    /// Repeating selection is idempotent only before any time or input is accepted.
+    pub fn enable_compact_units(&mut self) -> Result<(), Error> {
+        self.validate_compact_units_selection()?;
+        self.compact_units = true;
+        Ok(())
+    }
+    fn parse_unit<'a>(&self, symbol: &'a [u8], record: RecordId) -> Result<Parsed<'a>, Error> {
+        if self.compact_units {
+            parse_compact(symbol, record, self.limits)
+        } else {
+            parse(symbol, record, self.limits)
+        }
     }
     /// Expected absolute record; None means this channel consumed its last u64 ID.
     pub fn expected(&self, channel: ChannelId) -> Result<Option<RecordId>, Error> {
@@ -499,6 +533,7 @@ impl Receiver {
     }
     fn validation_shadow(&self) -> Result<Self, Error> {
         let mut shadow = Self::new(self.scope, self.limits)?;
+        shadow.compact_units = self.compact_units;
         for (target, source) in shadow.channels.iter_mut().zip(&self.channels) {
             target.expected = source.expected;
             target.decoder.copy_context_from(&source.decoder);
@@ -525,7 +560,7 @@ impl Receiver {
         if identity.scope != self.scope {
             return Err(Error::Scope);
         }
-        let parsed = parse(symbol, identity.record, self.limits)?;
+        let parsed = self.parse_unit(symbol, identity.record)?;
         Ok(self.limits.body.independent_short_frame_bytes != 0
             && parsed.fragments == 0
             && independent_length(parsed.body)
@@ -561,7 +596,7 @@ impl Receiver {
             }
             return Err(Error::Conflict);
         }
-        let parsed = parse(symbol, identity.record, self.limits)?;
+        let parsed = self.parse_unit(symbol, identity.record)?;
         let expected = self.expected(parsed.channel)?.ok_or(Error::Exhausted)?;
         let deadline = Tick(
             now.0
@@ -949,7 +984,21 @@ pub fn unit_witness(
 ) -> Result<UnitWitness, Error> {
     limits.memory_bound_bytes()?;
     let parsed = parse(symbol, identity.record, limits)?;
-    Ok(UnitWitness {
+    Ok(witness(identity, parsed))
+}
+/// Inspect one exact current unit with the same parser used by compact admission.
+/// Context-dependent payload validation remains the receiver decoder's duty.
+pub fn unit_witness_compact(
+    identity: SymbolIdentity,
+    symbol: &[u8],
+    limits: Limits,
+) -> Result<UnitWitness, Error> {
+    limits.memory_bound_bytes()?;
+    let parsed = parse_compact(symbol, identity.record, limits)?;
+    Ok(witness(identity, parsed))
+}
+fn witness(identity: SymbolIdentity, parsed: Parsed<'_>) -> UnitWitness {
+    UnitWitness {
         identity: RecordIdentity {
             channel: parsed.channel,
             record: identity.record,
@@ -960,7 +1009,46 @@ pub fn unit_witness(
             parsed.offset / parsed.capacity
         },
         count: parsed.fragments.max(1),
-    })
+    }
+}
+fn parse_compact(symbol: &[u8], record: RecordId, limits: Limits) -> Result<Parsed<'_>, Error> {
+    crate::aligned_envelope::validate_compact_unit(symbol, limits.body.symbol_bytes)
+        .map_err(|_| Error::Malformed)?;
+    if usize::from(symbol[0]) >= usize::from(limits.channels)
+        || u16::from_be_bytes([symbol[1], symbol[2]]) != record.0 as u16
+    {
+        return Err(Error::Malformed);
+    }
+    let channel = ChannelId(symbol[0]);
+    let body = &symbol[3..];
+    if body[0] == 4 {
+        let total = usize::from(u16::from_be_bytes([body[1], body[2]]));
+        let offset = usize::from(u16::from_be_bytes([body[3], body[4]]));
+        let capacity = limits.body.symbol_bytes - 8;
+        let fragments = total.div_ceil(capacity);
+        if fragments > limits.max_fragments_per_record {
+            return Err(Error::Capacity);
+        }
+        Ok(Parsed {
+            channel,
+            body: &body[5..],
+            total,
+            offset,
+            fragments,
+            capacity,
+            padding: Padding::Exact,
+        })
+    } else {
+        Ok(Parsed {
+            channel,
+            body,
+            total: body.len(),
+            offset: 0,
+            fragments: 0,
+            capacity: 0,
+            padding: Padding::Exact,
+        })
+    }
 }
 fn parse(symbol: &[u8], record: RecordId, limits: Limits) -> Result<Parsed<'_>, Error> {
     if symbol.len() != limits.body.symbol_bytes
@@ -1089,3 +1177,7 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "aligned_short_preview_tests.rs"]
 mod short_preview_tests;
+
+#[cfg(test)]
+#[path = "aligned_receiver_compact_tests.rs"]
+mod compact_tests;

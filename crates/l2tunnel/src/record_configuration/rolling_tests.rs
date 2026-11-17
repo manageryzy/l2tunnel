@@ -80,7 +80,7 @@ fn tag4_preserves_fixed_v2_shape_and_literal_complete_directional_words() -> Tes
     config.descriptor().encode_into(&mut descriptor)?;
     assert_eq!(Descriptor::decode(&descriptor)?, *config.descriptor());
     let mut expected_digest = digest::Context::new(&digest::SHA256);
-    expected_digest.update(b"l2tunnel/record-transaction-config/v3\0");
+    expected_digest.update(b"l2tunnel/record-transaction-config/v4\0");
     expected_digest.update(&bytes);
     assert_eq!(
         config.digest()?.0.as_slice(),

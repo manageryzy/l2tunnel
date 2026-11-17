@@ -348,3 +348,118 @@ fn packed_requested_copies_remain_canonical_but_refuse_before_storage_admission(
 
 #[path = "native_compression_tests.rs"]
 mod native_compression;
+
+#[test]
+fn selected_compact_arq_short_aligned_unit_charges_actual_bytes_and_preserves_witness() -> TestResult
+{
+    let mut config = policy(false, false)?.base;
+    config.native_policy = NativePolicy::RawIp;
+    config.receiver.body.elide_payload_length = false;
+    config.receiver.body.predictive = false;
+    config.receiver.body.timestamp_pair_dictionary = false;
+    let plan = compact_storage::Plan::for_duplex(config, config)?;
+    let make = |role| {
+        Endpoint::new_compact_reserved(
+            config,
+            tests::context(role),
+            storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            },
+        )
+    };
+    let (mut a, mut b) = (
+        make(EndpointRole::Initiator)?,
+        make(EndpointRole::Responder)?,
+    );
+    a.enable_compact_wire_with_overheads(49, 61)?;
+    b.enable_compact_wire_with_overheads(49, 61)?;
+    let usage = a.storage_usage().ok_or("actual reserved owner")?;
+    let mut frame = vec![0x37; 100];
+    frame[93..].fill(0);
+    let identity = a.enqueue_identified(ChannelId(0), &frame, Duration::ZERO)?;
+    assert_eq!(a.status().recovery.arq.send_bytes, 107);
+    let mut output = vec![0xa5; a.max_packet_bytes()];
+    let mut budget = OutboundBudget {
+        packets: 1,
+        wire_bytes: 159,
+    };
+    let length = a
+        .poll_data_independent(Duration::ZERO, &mut output, &mut budget)?
+        .ok_or("actual compact data")?;
+    // Kind, source and serial precede one record ID and the 106-byte raw unit.
+    assert_eq!(length, 110);
+    assert_eq!(
+        budget,
+        OutboundBudget {
+            packets: 0,
+            wire_bytes: 0
+        }
+    );
+    let token = a.pending_data_output().ok_or("actual physical token")?;
+    assert_eq!((token.bytes, token.wire_bytes), (110, 159));
+    let mut witnesses = [UnitWitness {
+        identity,
+        index: 0,
+        count: 0,
+    }];
+    assert_eq!(a.outgoing_units(&output[..length], &mut witnesses)?, 1);
+    assert_eq!(
+        witnesses[0],
+        UnitWitness {
+            identity,
+            index: 0,
+            count: 1
+        }
+    );
+    a.confirm_output(Duration::from_millis(1), token)?;
+    b.receive_authenticated_at(
+        &output[..length],
+        Duration::from_millis(2),
+        Duration::from_millis(2),
+    )?;
+    assert_eq!(
+        b.prepare(ChannelId(0), Duration::from_millis(2), 1)?,
+        Prepared::Ready
+    );
+    assert_eq!(b.pending().ok_or("actual native bytes")?.bytes, frame);
+    b.commit_delivery(Duration::from_millis(2))?;
+    let mut feedback_budget = OutboundBudget {
+        packets: 1,
+        wire_bytes: 1000,
+    };
+    let feedback = b
+        .poll_feedback_independent(Duration::from_millis(10), &mut output, &mut feedback_budget)?
+        .ok_or("actual feedback")?;
+    assert_eq!(1000 - feedback_budget.wire_bytes, feedback + 61);
+    b.confirm_output(
+        Duration::from_millis(10),
+        b.pending_feedback_output().ok_or("feedback token")?,
+    )?;
+    a.receive_authenticated_at(
+        &output[..feedback],
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )?;
+    assert_eq!(a.status().recovery.arq.send_records, 0);
+    assert_eq!(a.status().recovery.arq.send_bytes, 0);
+    assert!(!b.drained());
+    // Compact ARQ retains two bounded feedback repetitions after the first ACK.
+    // They remain real charged outputs with physical custody, even though the
+    // first receipt has already retired the sender's source.
+    for _ in 0..2 {
+        let now = b.feedback_deadline().ok_or("retained feedback repeat")?;
+        let mut budget = OutboundBudget {
+            packets: 1,
+            wire_bytes: 1000,
+        };
+        let length = b
+            .poll_feedback_independent(now, &mut output, &mut budget)?
+            .ok_or("actual repeated feedback")?;
+        assert_eq!(1000 - budget.wire_bytes, length + 61);
+        b.confirm_output(now, b.pending_feedback_output().ok_or("repeat custody")?)?;
+        a.receive_authenticated_at(&output[..length], now, now)?;
+    }
+    assert!(a.drained() && b.drained());
+    assert_eq!(a.storage_usage(), Some(usage));
+    Ok(())
+}
