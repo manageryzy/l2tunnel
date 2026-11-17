@@ -36,7 +36,7 @@ def wire_fixture(schema):
              'accepted_boundaries': dict(socket_accepted=6, tls_stream_flushed=0, quic_datagram_accepted=0),
              'algorithm_bytes': histogram([[100, 6]]), 'final_record_bytes': histogram([[121, 6]]),
              'record_overhead_bytes': histogram([[21, 6]])}
-    if schema == 2:
+    if schema >= 2:
         value.update(extent_errors=0, codec_coverage=dict.fromkeys(observe.CODEC_COVERAGE, 1),
                      diagnostic_histogram_heap_bytes=800, diagnostic_path_heap_bytes=80,
                      route_header_bytes=histogram([[0, 5], [10, 1]]),
@@ -47,6 +47,16 @@ def wire_fixture(schema):
                      codec_container_bytes=histogram([[0, 2]]),
                      codec_unit_header_bytes=histogram([[3, 1], [6, 1]]),
                      codec_body_bytes=histogram([[70, 1], [80, 1]]))
+    if schema == 3:
+        value.update(socket_ip_bytes=histogram([[149, 6]]),
+                     socket_ip_over_record_bytes=histogram([[28, 6]]),
+                     record_outside_codec_body_bytes=histogram([[41, 1], [51, 1]]),
+                     socket_ip_outside_codec_body_bytes=histogram([[69, 1], [79, 1]]))
+        empty = dict(inputs=0, original_bytes=0, context_bytes=0, encoded_body_bytes=0,
+                     framing_bytes=0, codec_net_gain_bytes=0, net_gain_bytes=0)
+        value['native_encoding'] = {'counter_overflow': 0,
+            **{label: {name: dict(empty) for name in observe.NATIVE_ENCODING_KINDS}
+               for label in ('native_packet', 'proxy_record')}}
     return value
 
 
@@ -119,10 +129,63 @@ class WireMetricsTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(observe.ExtentMetricsError) as raised:
                 observe.validate_wire_metrics(value, 'udp')
             self.assertEqual(raised.exception.base_validation['totals']['algorithm_bytes'], 600)
-        for schema in (True, 0, 3):
+        for schema in (True, 0, 4):
             value = {**wire_fixture(1), 'schema': schema}
             with self.assertRaisesRegex(ValueError, 'unknown schema'):
                 observe.validate_wire_metrics(value, 'udp')
+
+    def test_schema3_joined_metrics_preserve_population_and_actual_ip_boundary(self):
+        value = wire_fixture(3)
+        result = observe.validate_wire_metrics(value, 'raw')
+        self.assertEqual(result['joined_samples'], dict(zip(observe.JOINED_METRICS, (6, 6, 2, 2))))
+        self.assertEqual(result['joined_totals']['record_outside_codec_body_bytes'], 92)
+        value['accepted_boundaries'] = dict(socket_accepted=0, tls_stream_flushed=6, quic_datagram_accepted=0)
+        for name in ('socket_ip_bytes', 'socket_ip_over_record_bytes', 'socket_ip_outside_codec_body_bytes'):
+            value[name] = histogram([])
+        result = observe.validate_wire_metrics(value, 'tls')
+        self.assertEqual(result['joined_samples'], dict(zip(observe.JOINED_METRICS, (0, 0, 2, 0))))
+        # A budget allowance must not masquerade as a physical TLS measurement.
+        value['socket_ip_bytes'] = histogram([[191, 6]])
+        with self.assertRaisesRegex(observe.ExtentMetricsError, 'population'):
+            observe.validate_wire_metrics(value, 'tls')
+
+    def test_schema3_report_keeps_same_sample_join_separate_from_full_overhead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = saved_metrics(root, [wire_fixture(2), wire_fixture(3)])
+            value = report.wire_metrics(case, root, 'udp', {})
+            old, new = (value['directions'][key] for key in ('a_to_b', 'b_to_a'))
+            self.assertIsNone(old['layer_extents']['joined_metrics'])
+            joined = new['layer_extents']['joined_metrics']['record_outside_codec_body_bytes']
+            self.assertEqual((joined['samples'], joined['mean_bytes_per_sample'], joined['p99_bytes']), (2, 46, 51))
+            self.assertIsNone(value['total_encapsulation_overhead_p99_bytes'])
+
+    def test_native_admission_gain_retains_expansion_and_separates_proxy(self):
+        value = wire_fixture(3)
+        literal = value['native_encoding']['native_packet']['swift_literal']
+        literal.update(inputs=1, original_bytes=100, encoded_body_bytes=101, framing_bytes=2,
+                       codec_net_gain_bytes=-1, net_gain_bytes=-3)
+        result = observe.validate_wire_metrics(value, 'udp')['native_encoding']
+        self.assertEqual(result['native_packet']['swift_literal']['mean_net_gain_bytes'], -3)
+        self.assertIsNone(result['proxy_record']['swift_literal']['mean_net_gain_bytes'])
+        literal['net_gain_bytes'] = 0
+        with self.assertRaisesRegex(observe.ExtentMetricsError, 'signed gains'):
+            observe.validate_wire_metrics(value, 'udp')
+
+    def test_native_admission_evidence_survives_no_successful_emissions(self):
+        value = wire_fixture(3)
+        value['accepted_classes'] = dict.fromkeys(value['accepted_classes'], 0)
+        value['accepted_boundaries'] = dict.fromkeys(value['accepted_boundaries'], 0)
+        value['native_encoding']['native_packet']['unencoded'].update(
+            inputs=1, original_bytes=100, encoded_body_bytes=100)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = saved_metrics(root, [value])
+            observed = report.wire_metrics(case, root, 'udp', {})['directions']['a_to_b']
+            self.assertEqual(observed['status'], 'invalid_observation')
+            self.assertEqual(observed['native_encoding_status'], 'validated')
+            self.assertEqual(observed['native_encoding']['native_packet']['unencoded']['inputs'], 1)
+            self.assertNotIn('record_overhead_bytes', observed)
 
     def test_report_retains_mixed_schema_provenance_without_filling_unknown(self):
         with tempfile.TemporaryDirectory() as directory:

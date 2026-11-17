@@ -193,6 +193,23 @@ impl Collection {
         now: Duration,
         bytes: &[u8],
     ) -> Result<Option<Identity>, Error> {
+        self.offer_recovered_observed(id, key, now, bytes)
+            .map(|value| value.map(|(identity, _)| identity))
+    }
+    /// Return scalar encoding facts with the successfully retained original.
+    pub fn offer_recovered_observed(
+        &mut self,
+        id: OwnerId,
+        key: FlowKey,
+        now: Duration,
+        bytes: &[u8],
+    ) -> Result<
+        Option<(
+            Identity,
+            l2tunnel_codec::aligned_body::NativeEncodingObservation,
+        )>,
+        Error,
+    > {
         self.check_owner_claim(id, key)?;
         if !self.admission_open(id)? {
             return Ok(None);
@@ -210,21 +227,25 @@ impl Collection {
         if let Some(error) = slot.raw_failure {
             return Err(error);
         }
-        let record = match slot
-            .endpoint
-            .enqueue_identified(aligned::ChannelId(0), bytes, now)
-        {
-            Ok(record) => record,
-            Err(aligned::Error::Busy) => return Ok(None),
-            Err(error) => return Err(Error::Endpoint(error)),
-        };
+        let (record, observation) =
+            match slot
+                .endpoint
+                .enqueue_observed(aligned::ChannelId(0), bytes, now)
+            {
+                Ok(record) => record,
+                Err(aligned::Error::Busy) => return Ok(None),
+                Err(error) => return Err(Error::Endpoint(error)),
+            };
         slot.claim = Some(key);
         slot.admitted_native = admitted;
-        Ok(Some(Identity {
-            owner: id,
-            incarnation,
-            record,
-        }))
+        Ok(Some((
+            Identity {
+                owner: id,
+                incarnation,
+                record,
+            },
+            observation,
+        )))
     }
 
     /// Reuse the maintained checksum/complete-ACK inspection, without state or parsing policy duplication.

@@ -32,6 +32,17 @@ const F_TSVAL: u8 = 16;
 const F_TSECR: u8 = 32;
 const TIMESTAMPS: [u8; 4] = [1, 1, 8, 10];
 
+/// Actual successful native record form, before the stream length prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncodingKind {
+    /// Original native bytes with one literal tag.
+    Literal,
+    /// Original native bytes with one tag, also establishing a header context.
+    LiteralContext,
+    /// Exact header delta followed by unchanged native payload.
+    Delta,
+}
+
 #[derive(Clone, Copy)]
 struct Context {
     header: [u8; MAX_HEADER],
@@ -239,7 +250,7 @@ impl Compressor {
         &mut self,
         packet: &[u8],
         record: &mut Vec<u8>,
-    ) -> Result<(), Error> {
+    ) -> Result<EncodingKind, Error> {
         if self.reserved
             && (self.scratch.capacity() < packet.len()
                 || record.capacity()
@@ -251,9 +262,15 @@ impl Compressor {
             return Err(Error::Storage);
         }
         self.compress(packet, record);
-        Ok(())
+        match record.first().map(|value| value & 3) {
+            Some(LITERAL) => Ok(EncodingKind::Literal),
+            Some(LITERAL_STORE) => Ok(EncodingKind::LiteralContext),
+            Some(DELTA) => Ok(EncodingKind::Delta),
+            _ => Err(Error::Malformed),
+        }
     }
-    /// Bytes removed so far, net of the record tags added to literal packets.
+    /// Gross bytes removed by successful deltas only. Literal tag expansion and
+    /// stream length prefixes are excluded; this is not net compression gain.
     pub fn saved(&self) -> u64 {
         self.saved
     }

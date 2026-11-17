@@ -2,7 +2,75 @@
 use super::super::compact::{FinalKind, FinalMetadata};
 use super::*;
 
+fn candidate_class(kind: FinalKind) -> u8 {
+    match kind {
+        FinalKind::CarrierControl => 0,
+        FinalKind::Control => 1,
+        FinalKind::Data | FinalKind::Feedback => 2,
+    }
+}
+
 impl GateState {
+    // These are untrusted candidate shares, not authenticated control authority.
+    // At capacity one, upper control and bulk retain the original shared slot.
+    pub(in crate::handoff::pairing::packet) fn final_upper_capacity(&self) -> usize {
+        (usize::from(self.policy.queue_packets) / 2).min(4)
+    }
+    pub(in crate::handoff::pairing::packet) fn final_bulk_capacity(&self) -> usize {
+        usize::from(self.policy.queue_packets) - self.final_upper_capacity()
+    }
+    pub(in crate::handoff::pairing::packet) fn select_final_candidate(
+        &mut self,
+    ) -> Result<Option<usize>, Error> {
+        if let Some(selected) = self.final_selected {
+            return self
+                .incoming
+                .iter()
+                .position(|cell| cell.final_metadata == Some(selected))
+                .map(Some)
+                .ok_or(Error::Proof);
+        }
+        for distance in 0..3 {
+            let class = (self.final_candidate_turn + distance) % 3;
+            if let Some(index) = self.incoming.iter().position(|cell| {
+                cell.final_metadata
+                    .is_some_and(|metadata| candidate_class(metadata.kind) == class)
+            }) {
+                self.final_selected = self.incoming[index].final_metadata;
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+    pub(in crate::handoff::pairing::packet) fn selected_final_candidate(
+        &self,
+        metadata: FinalMetadata,
+    ) -> Result<usize, Error> {
+        if self.final_selected != Some(metadata) {
+            return Err(Error::Proof);
+        }
+        self.incoming
+            .iter()
+            .position(|cell| cell.final_metadata == Some(metadata))
+            .ok_or(Error::Busy)
+    }
+    pub(in crate::handoff::pairing::packet) fn consume_final_candidate(
+        &mut self,
+        index: usize,
+    ) -> Result<Cell, Error> {
+        let metadata = self
+            .incoming
+            .get(index)
+            .and_then(|cell| cell.final_metadata)
+            .ok_or(Error::Proof)?;
+        if self.final_selected != Some(metadata) {
+            return Err(Error::Proof);
+        }
+        let cell = self.incoming.remove(index).ok_or(Error::Proof)?;
+        self.final_selected = None;
+        self.final_candidate_turn = (candidate_class(metadata.kind) + 1) % 3;
+        Ok(cell)
+    }
     pub(in crate::handoff::pairing::packet) fn ingest_final(
         &mut self,
         bytes: &[u8],
@@ -37,9 +105,24 @@ impl GateState {
                     .is_some_and(|meta| meta.kind != FinalKind::CarrierControl)
             })
             .count();
+        let upper = self
+            .incoming
+            .iter()
+            .filter(|cell| {
+                cell.final_metadata
+                    .is_some_and(|meta| meta.kind == FinalKind::Control)
+            })
+            .count();
+        let upper_capacity = self.final_upper_capacity();
+        let class_full = if kind == FinalKind::Control {
+            upper_capacity != 0 && upper >= upper_capacity
+        } else {
+            self.records_outstanding + finals - upper >= self.final_bulk_capacity()
+        };
         if (control && controls >= 4)
             || (!control
-                && self.records_outstanding + finals >= usize::from(self.policy.queue_packets))
+                && (self.records_outstanding + finals >= usize::from(self.policy.queue_packets)
+                    || class_full))
         {
             return self.reject();
         }

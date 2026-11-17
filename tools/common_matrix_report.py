@@ -16,9 +16,9 @@ import re
 import time
 
 try:
-    from .common_native_observe import EXTENT_METRICS, ExtentMetricsError, validate_wire_metrics
+    from .common_native_observe import EXTENT_METRICS, JOINED_METRICS, ExtentMetricsError, validate_wire_metrics, validate_native_encoding
 except ImportError:
-    from common_native_observe import EXTENT_METRICS, ExtentMetricsError, validate_wire_metrics
+    from common_native_observe import EXTENT_METRICS, JOINED_METRICS, ExtentMetricsError, validate_wire_metrics, validate_native_encoding
 
 CARRIERS = ('udp', 'raw', 'tls', 'quic')
 PHASES = ('forward', 'reverse', 'simultaneous')
@@ -205,7 +205,7 @@ def extent_summary(value):
 
 def wire_metrics(case, directory, carrier, provenance):
     result = {'scope': 'cumulative per-runtime, all executed phases including warmup and drain; not a phase-window metric',
-              'excludes': ['bootstrap', 'management', 'raw carrier control', 'outer TLS/QUIC/IP headers'],
+              'excludes': ['bootstrap', 'management', 'raw carrier control', 'outer TLS/QUIC headers and schema1/2 IP headers'],
               'codec_unattributed_bytes': None, 'total_encapsulation_overhead_p99_bytes': None,
               'tls_quic_outer_overhead_p99_bytes': None, 'directions': {}}
     pids = {}
@@ -226,6 +226,15 @@ def wire_metrics(case, directory, carrier, provenance):
             value = read_json(path, provenance)
             expected = case.get('wire_metrics', {}).get('sha256', {}).get(path.name)
             require(expected == provenance[str(path.resolve())], 'wire report differs from saved case hash')
+            observed['native_encoding'] = None
+            if value.get('schema') == 3:
+                # Admission and emission are independent populations. A failed
+                # first write must not erase successfully observed codec facts.
+                try:
+                    observed['native_encoding'] = validate_native_encoding(value.get('native_encoding'))
+                    observed['native_encoding_status'] = 'validated'
+                except ValueError as error:
+                    observed['native_encoding_status'] = 'invalid_observation: ' + str(error)
             extents = None
             try:
                 validation = validate_wire_metrics(value, carrier)
@@ -235,10 +244,12 @@ def wire_metrics(case, directory, carrier, provenance):
                            'extent_errors': value.get('extent_errors'), 'metrics': None,
                            'codec_coverage': None}
             else:
-                if value['schema'] == 2:
+                if value['schema'] >= 2:
                     extents = {'status': 'validated', 'reason': None, 'extent_errors': 0,
                                'codec_coverage': validation['codec_coverage'],
-                               'metrics': {key: extent_summary(value[key]) for key in EXTENT_METRICS}}
+                               'metrics': {key: extent_summary(value[key]) for key in EXTENT_METRICS},
+                               'joined_metrics': ({key: extent_summary(value[key]) for key in JOINED_METRICS}
+                                                  if value['schema'] == 3 else None)}
             observed.update(status='validated', reason=None, pid=pids[sender], receipt=str(path.resolve()),
                             receipt_sha256=expected, boundary=validation['boundary'],
                             accepted_classes=value['accepted_classes'], diagnostic_heap_bytes=value['diagnostic_heap_bytes'],
@@ -406,10 +417,10 @@ def build_report(manifest_path, directories):
                 'goodput': 'unique kernel TCP recv application bytes during the shared ten-second monotonic window; a valid rate requires a finalized passing phase with matched streams/hash/EOF in the runner',
                 'partial': 'failed/incomplete sample bytes are retained separately; an observed rate is shown only when the full configured window elapsed, and never qualifies as valid throughput',
                 'records': 'per-direction cumulative accepted Common algorithm/final record lengths and their exact difference; includes warmup, all executed phases, source retransmissions/copies, repairs and recovery feedback; excludes management/bootstrap/raw control and outer transport',
-                'capture': 'sender WAN egress before qdisc, sender native TUN and peer native TUN ingress, each separate; IPv4 total_length includes TCP/IP headers, ACKs and retransmissions; no duplicate summation across surfaces',
-                'ratios': 'same-window aggregate sender WAN IP bytes / unique received application bytes or peer native delivered IP bytes; active valid direction only; includes reverse-flow ACK/control sharing that direction and packets in flight across window boundaries, not packet-matched encapsulation overhead',
+                'capture': 'sender WAN post-qdisc survivors in the verified owned veth/HTB/netem lab, sender native TUN and peer native TUN ingress, each separate; IPv4 total_length includes TCP/IP headers, ACKs and retransmissions; no duplicate summation across surfaces',
+                'ratios': 'same-window aggregate post-qdisc captured sender WAN IP bytes / unique received application bytes or peer native delivered IP bytes; active valid direction only; includes reverse-flow ACK/control sharing that direction and packets in flight across window boundaries, not packet-matched encapsulation overhead',
                 'layer_extents': 'schema2 reports canonical route, outer fragment, recovery, systematic coded fill and codec envelope/container/unit/body lengths on actual acceptance. Each histogram retains its own population: recovery excludes outer fragments and source-free native; codec excludes Swift streams, outer fragments, repair/feedback and source-free native. No sums of means or quantiles across these populations are total overhead. Schema1 has no layer attribution',
-                'unavailable': 'native compression/context/body decomposition, generic padding, retry attribution, total encapsulation overhead p99 and TLS/QUIC outer overhead p99 remain unavailable; codec body bytes are not original native bytes, systematic coded fill is not repair redundancy, and IP packet size p99 and constant Records tag overhead are not substitutes',
+                'unavailable': 'per-emission native compression/context/body mapping, generic padding, retry attribution, total encapsulation overhead p99 and TLS/QUIC outer overhead p99 remain unavailable; schema3 native admission totals have a separate population; codec body bytes are not original native bytes, systematic coded fill is not repair redundancy, and IP packet size p99 and constant Records tag overhead are not substitutes',
                 'terminal_causes': 'daemon diagnostics retain the observed error, side, line and log hash; they are case-wide, without phase timestamps or causal ordering between peers. Periodic terminal DTOs retain their actual phase/sample/time as less specific fallback. Category names classify observations, not root causes; raw Expired remains unqualified and TLS record cap does not prove a send-side failure. No config DTOs are copied',
                 'provenance': 'JSON, daemon log and metrics input hashes recomputed; saved pcap hashes preserved without re-reading large captures; running attempts are snapshots and cannot qualify throughput'},
             'combinations': combinations}
@@ -559,7 +570,7 @@ def markdown(report):
                     pieces.append(number(metric[name]['mean_bytes_per_accepted_record']) + ' / ' + str(metric[name]['p99_bytes']))
                 lines.append('| ' + ' | '.join(pieces) + ' |')
     lines += ['', '## Canonical layer extents', '',
-              'Schema2 only. N is the independent sample count for that layer, including retransmissions/copies when accepted. Zero bytes with N > 0 are an observed zero extent; N = 0 means no attributable samples. Missing schema1 attribution remains unavailable. These are neither native-packet overheads nor additive percentile components; codec bodies retain unmeasured internal fields and meaningful payload bytes.', '',
+              'Schema2/3 canonical extents. N is the independent sample count for that layer, including retransmissions/copies when accepted. Zero bytes with N > 0 are an observed zero extent; N = 0 means no attributable samples. Missing schema1 attribution remains unavailable. These are neither native-packet overheads nor additive percentile components; codec bodies retain unmeasured internal fields and meaningful payload bytes.', '',
               '| Combination / direction | Case session | Layer | N | Mean bytes / p99 |',
               '|---|---|---|---:|---:|']
     for row in rows:
@@ -577,6 +588,38 @@ def markdown(report):
                 for name, layer in extents['metrics'].items():
                     lines.append('| ' + label + ' | ' + session + ' | ' + name + ' | ' + str(layer['samples'])
                                  + ' | ' + number(layer['mean_bytes_per_sample']) + ' / ' + number(layer['p99_bytes']) + ' |')
+    lines += ['', '## Joined framing observations', '',
+              'Schema3 only. Each value is computed from one correlated accepted emission before building its histogram. IP extents are actual UDP/raw receipt lengths; TLS/QUIC allowances are excluded. Outside-codec-body values include all intervening framing and coded fill, but the body still contains codec/context/fragment fields. Swift stream attribution and full native encapsulation overhead remain unavailable. N = 0 means unmeasured for this boundary.', '',
+              '| Combination / direction | Case session | Boundary | N | Mean bytes / p99 |',
+              '|---|---|---|---:|---:|']
+    for row in rows:
+        for index in sorted({index for index in row['phase_selection'].values() if index is not None}):
+            value = row['attempts'][index]
+            session = escape(Path(value['run_directory']).name)
+            for direction, metric in value['common_record_metrics']['directions'].items():
+                extents = metric.get('layer_extents') or {}
+                for name, joined in (extents.get('joined_metrics') or {}).items():
+                    lines.append('| ' + escape(row['id'] + ' / ' + direction) + ' | ' + session
+                                 + ' | ' + name + ' | ' + str(joined['samples']) + ' | '
+                                 + number(joined['mean_bytes_per_sample']) + ' / '
+                                 + number(joined['p99_bytes']) + ' |')
+    lines += ['', '## Native admission codec totals', '',
+              'Schema3 only. Each original input is counted once at successful codec admission. Positive gain saves bytes; negative gain is expansion. Net gain includes generated unit/fragment or stream framing, but excludes packing containers, recovery and carrier. LZ4 compresses the whole input. Proxy records are a separate input population. Admission does not establish transmission or peer delivery; no gain percentile is inferred from these totals.', '',
+              '| Combination / direction | Case session | Input / encoding | Inputs | Original / context / body / framing bytes | Mean codec gain / net gain bytes |',
+              '|---|---|---|---:|---:|---:|']
+    for row in rows:
+        for index in sorted({index for index in row['phase_selection'].values() if index is not None}):
+            value = row['attempts'][index]
+            session = escape(Path(value['run_directory']).name)
+            for direction, metric in value['common_record_metrics']['directions'].items():
+                for input_kind, forms in (metric.get('native_encoding') or {}).items():
+                    for form, item in forms.items():
+                        if item['inputs']:
+                            lengths = ' / '.join(str(item[key]) for key in ('original_bytes', 'context_bytes', 'encoded_body_bytes', 'framing_bytes'))
+                            lines.append('| ' + escape(row['id'] + ' / ' + direction) + ' | ' + session
+                                         + ' | ' + input_kind + ' / ' + form + ' | ' + str(item['inputs'])
+                                         + ' | ' + lengths + ' | ' + number(item['mean_codec_net_gain_bytes'])
+                                         + ' / ' + number(item['mean_net_gain_bytes']) + ' |')
     lines += ['', '## Attempt provenance', '']
     for row in rows:
         for value in row['attempts']:

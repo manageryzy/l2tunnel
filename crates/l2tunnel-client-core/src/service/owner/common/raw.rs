@@ -110,7 +110,7 @@ pub(in crate::service::owner) fn authenticate<'a>(
             ),
             _ => return Err(invalid("prepared raw outer endpoint mismatch")),
         }
-        .map_err(|failure| raw_error(failure.error))?;
+        .map_err(|failure| raw_setup_error("factory", failure.error))?;
         // timeout_at polls its inner future before its timer. The original service
         // cap must forbid another actual PacketIo poll even when the factory began
         // later and therefore retains a later internal setup deadline.
@@ -119,7 +119,7 @@ pub(in crate::service::owner) fn authenticate<'a>(
                 return Poll::Ready(Err(error));
             }
             std::future::Future::poll(std::pin::Pin::new(&mut factory), cx)
-                .map(|result| result.map_err(raw_error))
+                .map(|result| result.map_err(|error| raw_setup_error("handoff", error)))
         })
         .await?;
         drop(factory);
@@ -279,6 +279,40 @@ fn authentication_error(error: authentication::Error) -> io::Error {
     io::Error::new(kind, error)
 }
 
+fn raw_setup_error(boundary: &'static str, error: packet::Error) -> io::Error {
+    if std::env::var_os("L2TUNNEL_TRACE_FAILURE").is_some() {
+        eprintln!(
+            "Common raw setup failure: boundary={boundary} cause={}",
+            RawSetupCause(&error)
+        );
+    }
+    raw_error(error)
+}
+
+struct RawSetupCause<'a>(&'a packet::Error);
+
+impl std::fmt::Display for RawSetupCause<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use l2tunnel_raw_io::handoff::{SetupFailure, pairing::PairError};
+        match self.0 {
+            packet::Error::Pair(PairError::Setup(failure)) => match failure.as_ref() {
+                SetupFailure::Authentication(l2tunnel_auth::Error::Io(error)) => write!(
+                    output,
+                    "Pair(Setup(Authentication(Io {{ kind: {:?}, errno: {:?} }})))",
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+                // Authentication Display excludes provider text and certificate/key bytes.
+                SetupFailure::Authentication(error) => {
+                    write!(output, "Pair(Setup(Authentication({error})))")
+                }
+                other => write!(output, "Pair(Setup({other:?}))"),
+            },
+            other => write!(output, "{other:?}"),
+        }
+    }
+}
+
 fn raw_error(error: packet::Error) -> io::Error {
     use l2tunnel_raw_io::handoff::pairing::PairError;
     let kind = match &error {
@@ -302,5 +336,35 @@ fn raw_error(error: packet::Error) -> io::Error {
             ..
         }) => io::Error::from_raw_os_error(errno),
         _ => io::Error::new(kind, error),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use l2tunnel_raw_io::handoff::{SetupFailure, pairing::PairError};
+
+    #[test]
+    fn raw_setup_cause_retains_original_variant_without_provider_body() {
+        let error = packet::Error::Pair(PairError::Setup(Arc::new(SetupFailure::Authentication(
+            l2tunnel_auth::Error::Io(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "provider body must remain private",
+            )),
+        ))));
+        assert_eq!(
+            RawSetupCause(&error).to_string(),
+            "Pair(Setup(Authentication(Io { kind: ConnectionReset, errno: None })))"
+        );
+        assert_eq!(raw_error(error).kind(), io::ErrorKind::InvalidData);
+        let error = packet::Error::Pair(PairError::Message(
+            l2tunnel_raw_io::handoff::MessageError::Eof,
+        ));
+        assert_eq!(RawSetupCause(&error).to_string(), "Pair(Message(Eof))");
+        assert_eq!(raw_error(error).kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            raw_error(packet::Error::Expired).kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 }

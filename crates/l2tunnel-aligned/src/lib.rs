@@ -626,6 +626,22 @@ impl Endpoint {
         frame: &[u8],
         now: Duration,
     ) -> Result<RecordIdentity, Error> {
+        self.enqueue_observed(channel, frame, now)
+            .map(|(identity, _)| identity)
+    }
+    /// Observe exact codec lengths once after native admission, not on each output copy.
+    pub fn enqueue_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<
+        (
+            RecordIdentity,
+            l2tunnel_codec::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
         if let Some(options) = self.packing {
             if let Some(error) = self.failure {
                 return Err(error);

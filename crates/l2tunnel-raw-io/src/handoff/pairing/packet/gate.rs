@@ -101,6 +101,8 @@ pub(super) struct GateState {
     pub session: [u8; 16],
     pub expected_armed: [u8; 32],
     pub incoming: VecDeque<Cell>,
+    final_candidate_turn: u8,
+    final_selected: Option<super::compact::FinalMetadata>,
     pub old_reply: Option<Vec<u8>>,
     pub last_old: Option<Instant>,
     pub deadline: Instant,
@@ -171,6 +173,8 @@ impl GateState {
             session: [0; 16],
             expected_armed: [0; 32],
             incoming: VecDeque::with_capacity(usize::from(policy.queue_packets) + 5),
+            final_candidate_turn: 0,
+            final_selected: None,
             old_reply: None,
             last_old: None,
             deadline,
@@ -218,7 +222,11 @@ impl GateState {
                 .iter()
                 .filter(|cell| {
                     cell.final_metadata.is_some_and(|meta| {
-                        meta.kind() != super::compact::FinalKind::CarrierControl
+                        !matches!(
+                            meta.kind(),
+                            super::compact::FinalKind::CarrierControl
+                                | super::compact::FinalKind::Control
+                        )
                     })
                 })
                 .count();
@@ -237,6 +245,21 @@ impl GateState {
         let ack_body = self.ack_body;
         let client = self.client;
         let final_selected = self.final_context.is_some();
+        let data_capacity = if final_selected {
+            self.final_bulk_capacity()
+        } else {
+            usize::from(policy.queue_packets)
+        };
+        let queued_upper = self
+            .incoming
+            .iter()
+            .filter(|cell| {
+                cell.final_metadata
+                    .is_some_and(|meta| meta.kind() == super::compact::FinalKind::Control)
+            })
+            .count();
+        let data_full = queued_data >= if active { data_capacity } else { 1 }
+            || (final_selected && queued_data + queued_upper >= usize::from(policy.queue_packets));
         let bootstrap_filter = self.bootstrap_filter.clone();
         let bootstrap_live = Instant::now() < self.deadline;
         let count = if self.half { 2 } else { 1 };
@@ -356,13 +379,7 @@ impl GateState {
                     if queued_control >= 4 {
                         return Err(Error::Capacity);
                     }
-                } else if queued_data
-                    >= if active {
-                        usize::from(policy.queue_packets)
-                    } else {
-                        1
-                    }
-                {
+                } else if data_full {
                     return Err(Error::Capacity);
                 }
                 Ok(())

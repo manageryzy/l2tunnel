@@ -241,9 +241,29 @@ fn every_real_family_transition_publishes_the_exact_virgin_and_preserves_current
             assert_eq!(bank.retire(current), Err(Error::NotDrained));
             let admitted = bank
                 .entry(current)?
-                .admit_borrowed(engine::Tick(0))?
+                .admit_borrowed_observed(engine::Tick(0))?
                 .ok_or("actual old admission")?;
             assert_eq!(admitted.metadata, metadata);
+            let encoding = admitted.permit.encoding;
+            assert_eq!(encoding.original_native_bytes, bytes.len());
+            assert_eq!(encoding.context_bytes, 0);
+            match source {
+                Family::Swift => {
+                    assert_eq!(encoding.encoded_body_bytes, bytes.len() + 1);
+                    assert_eq!(encoding.framing_bytes, 2);
+                    assert_eq!(encoding.net_gain_bytes(), -3);
+                }
+                Family::Aligned | Family::Packed => {
+                    assert_eq!(encoding.encoded_body_bytes, bytes.len() + 3);
+                    assert_eq!(encoding.framing_bytes, 3);
+                    assert_eq!(encoding.net_gain_bytes(), -6);
+                }
+            }
+            assert!(
+                bank.entry(current)?
+                    .admit_borrowed_observed(engine::Tick(0))?
+                    .is_none()
+            );
             assert_eq!(bank.engine(current)?.statistics().admitted, 1);
             // Teardown releases this deliberately undrained old owner, without a clean-retire claim.
         }

@@ -259,10 +259,20 @@ fn actual_research_profiles_recover_native_bytes_with_loss_and_exact_physical_cu
         };
         let mut got_a = [false; 2];
         let mut got_b = [false; 2];
+        let mut encoding_observations = [0; 2];
         for turn in 0..5000u64 {
             let now = Tick(turn * 100);
-            a.admit_borrowed(now)?;
-            b.admit_borrowed(now)?;
+            for (index, owner) in [&mut a, &mut b].into_iter().enumerate() {
+                if let Some(admitted) = owner.admit_borrowed_observed(now)? {
+                    assert!(matches!(
+                        admitted.permit.identity,
+                        ProfileIdentity::Research(_)
+                    ));
+                    assert!(admitted.permit.encoding.original_native_bytes > 0);
+                    assert!(admitted.permit.encoding.framing_bytes > 0);
+                    encoding_observations[index] += 1;
+                }
+            }
             a.step(now, work())?;
             b.step(now, work())?;
             ab.transfer(now, &mut a, &mut b)?;
@@ -301,6 +311,7 @@ fn actual_research_profiles_recover_native_bytes_with_loss_and_exact_physical_cu
             }
         }
         assert!(got_a.iter().all(|got| *got) && got_b.iter().all(|got| *got));
+        assert_eq!(encoding_observations, [forward.len(), reverse.len()]);
         assert!(a.drained()? && b.drained()?);
         assert!(ab.lost_source && ba.lost_source && ab.lost_feedback && ba.lost_feedback);
         assert!(ab.repairs >= 2 && ba.repairs >= 2 && ab.feedback > 0 && ba.feedback > 0);

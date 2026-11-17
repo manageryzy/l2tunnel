@@ -386,6 +386,43 @@ async fn measured_common_coalesced_all_user_receipts_keep_exact_token_times_and_
 }
 
 #[tokio::test(start_paused = true)]
+async fn measured_common_ready_turn_yields_to_sibling_before_another_ready_tick() -> Result {
+    let mut side = side(true)?;
+    let (_port, _stream, bridge) = common_bridge::pair_retained(4096, Duration::from_secs(1))?;
+    bridge.enable_physical_receipts()?;
+    side.actor
+        .measured
+        .as_mut()
+        .ok_or("actual measured owner")?
+        .enable_physical_receipts()?;
+    side.actor.retirement = Some(bridge);
+    let now = Instant::now();
+    let mut tick =
+        tokio::time::interval_at(now - Duration::from_millis(4), Duration::from_millis(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let turns = std::cell::Cell::new(0);
+    let worker = async {
+        for _ in 0..2 {
+            side.actor.wait_service(&mut tick, None).await;
+            side.actor.measured_callbacks()?;
+            turns.set(turns.get() + 1);
+            side.actor.cooperate_after_turn().await;
+        }
+        Ok::<_, io::Error>(())
+    };
+    let sibling = async {
+        // Both overdue ticks are ready without advancing the paused clock.
+        // The production end-turn boundary must release the parent poll once.
+        assert_eq!(turns.get(), 1);
+    };
+    let (result, ()) = tokio::join!(biased; worker, sibling);
+    result?;
+    assert_eq!(turns.get(), 2);
+    assert_eq!(Instant::now(), now);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn measured_common_whole_write_wakes_callback_before_original_handoff_cap() -> Result {
     let mut lab = Lab::active().await?;
     let origin = lab.a.actor.start;

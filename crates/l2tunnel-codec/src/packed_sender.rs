@@ -306,6 +306,7 @@ impl Sender {
         now: u64,
     ) -> Result<RecordIdentity, Error> {
         self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Headers)
+            .map(|(identity, _)| identity)
     }
     /// Return the exact raw-native body identity before packing advances ownership.
     pub fn stage_raw_identified(
@@ -315,6 +316,7 @@ impl Sender {
         now: u64,
     ) -> Result<RecordIdentity, Error> {
         self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Raw)
+            .map(|(identity, _)| identity)
     }
     /// Stage stateless LZ4-or-raw bytes before the existing timed packer advances.
     pub fn stage_lz4_identified(
@@ -324,6 +326,53 @@ impl Sender {
         now: u64,
     ) -> Result<RecordIdentity, Error> {
         self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Lz4)
+            .map(|(identity, _)| identity)
+    }
+    /// Return exact native encoding facts after successful staging and bounded work.
+    /// Packing-container/recovery bytes and retries are not attributed here.
+    pub fn stage_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Headers)
+    }
+    /// Observe successful raw native staging without attributing packing containers.
+    pub fn stage_raw_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Raw)
+    }
+    /// Observe actual LZ4-or-raw encoding after successful native staging.
+    pub fn stage_lz4_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Lz4)
     }
     fn stage_selected(
         &mut self,
@@ -331,7 +380,13 @@ impl Sender {
         frame: &[u8],
         now: u64,
         encoding: crate::aligned_body::Encoding,
-    ) -> Result<RecordIdentity, Error> {
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
         self.live()?;
         // A fresh frame may need a new source even while an older one is sealed.
         // Reject an impossible first-unit deadline before changing time/context.
@@ -345,9 +400,9 @@ impl Sender {
             return Err(Error::Exhausted);
         }
         let identity = match encoding {
-            crate::aligned_body::Encoding::Headers => self.aligned.stage_identified(channel, frame),
-            crate::aligned_body::Encoding::Raw => self.aligned.stage_raw_identified(channel, frame),
-            crate::aligned_body::Encoding::Lz4 => self.aligned.stage_lz4_identified(channel, frame),
+            crate::aligned_body::Encoding::Headers => self.aligned.stage_observed(channel, frame),
+            crate::aligned_body::Encoding::Raw => self.aligned.stage_raw_observed(channel, frame),
+            crate::aligned_body::Encoding::Lz4 => self.aligned.stage_lz4_observed(channel, frame),
         }
         .map_err(Error::Aligned)?;
         self.poll(now)?;

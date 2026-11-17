@@ -9,8 +9,11 @@ use std::{
 
 use crate::secure_udp::SendBoundary;
 
+#[path = "transport_native_metrics.rs"]
+mod native;
+
 static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(1);
-const NAMES: [&str; 11] = [
+const NAMES: [&str; 15] = [
     "algorithm_bytes",
     "final_record_bytes",
     "record_overhead_bytes",
@@ -22,6 +25,10 @@ const NAMES: [&str; 11] = [
     "codec_container_bytes",
     "codec_unit_header_bytes",
     "codec_body_bytes",
+    "socket_ip_bytes",
+    "socket_ip_over_record_bytes",
+    "record_outside_codec_body_bytes",
+    "socket_ip_outside_codec_body_bytes",
 ];
 const METRICS: usize = NAMES.len();
 
@@ -45,6 +52,7 @@ pub(in crate::secure_udp) struct Observer {
     overflow: u64,
     extent_errors: u64,
     coverage: [u64; 6],
+    native: native::Native,
 }
 
 impl Observer {
@@ -90,7 +98,9 @@ impl Observer {
                 "wire metrics packet ceiling",
             ));
         }
-        let count = maximum + 1;
+        // Diagnostic capacity only, never an assumed wire overhead. Reserve room
+        // for the supported socket headers beyond the Records ceiling.
+        let count = maximum.saturating_add(128).min(65_535) + 1;
         let mut bins = Vec::new();
         bins.try_reserve_exact(count).map_err(io::Error::other)?;
         if bins.capacity() != count {
@@ -107,7 +117,16 @@ impl Observer {
             overflow: 0,
             extent_errors: 0,
             coverage: [0; 6],
+            native: native::Native::default(),
         })
+    }
+
+    pub(in crate::secure_udp) fn admitted_native(
+        &mut self,
+        value: l2tunnel::record_engine::NativeEncodingObservation,
+        proxy: bool,
+    ) {
+        self.native.admitted(value, proxy);
     }
 
     pub(in crate::secure_udp) fn accepted(
@@ -115,6 +134,7 @@ impl Observer {
         sample: Sample,
         record_bytes: usize,
         boundary: SendBoundary,
+        socket_ip_bytes: Option<usize>,
     ) {
         let class = match sample.kind {
             EmissionKind::Source(SourceForm::Swift) => 0,
@@ -146,6 +166,20 @@ impl Observer {
         for (metric, length) in lengths.into_iter().enumerate() {
             increment(&mut self.bins[length][metric], &mut self.overflow);
         }
+        // Only the original UDP/raw owner supplies an exact IP-packet extent.
+        // TLS and Quinn acceptance charges include allowances, not wire facts.
+        if let Some(ip_bytes) = socket_ip_bytes {
+            let Some(outer) = ip_bytes.checked_sub(record_bytes) else {
+                increment(&mut self.extent_errors, &mut self.overflow);
+                return;
+            };
+            if boundary != 0 || ip_bytes >= self.bins.len() {
+                increment(&mut self.extent_errors, &mut self.overflow);
+                return;
+            }
+            increment(&mut self.bins[ip_bytes][11], &mut self.overflow);
+            increment(&mut self.bins[outer][12], &mut self.overflow);
+        }
         let Some(extent) = sample
             .extent
             .filter(|extent| extent.bytes == sample.algorithm_bytes && extent.kind == sample.kind)
@@ -162,6 +196,20 @@ impl Observer {
             CodecCoverage::UnencodedNative => 5,
         };
         increment(&mut self.coverage[coverage], &mut self.overflow);
+        if let Some(codec) = extent.codec {
+            // Join the same accepted emission, rather than adding percentiles
+            // from independently sampled layers. Body-internal codec/context
+            // fields remain inside body_bytes; this is not native overhead.
+            let Some(joined) = record_bytes.checked_sub(codec.body_bytes) else {
+                increment(&mut self.extent_errors, &mut self.overflow);
+                return;
+            };
+            increment(&mut self.bins[joined][13], &mut self.overflow);
+            if let Some(ip_bytes) = socket_ip_bytes {
+                let joined_ip = ip_bytes - codec.body_bytes;
+                increment(&mut self.bins[joined_ip][14], &mut self.overflow);
+            }
+        }
         let lengths = [
             Some(extent.route_header_bytes),
             Some(extent.fragment_header_bytes),
@@ -207,7 +255,7 @@ impl Observer {
     fn write_report(&self, writer: &mut impl Write) -> io::Result<()> {
         writeln!(
             writer,
-            "{{\"schema\":2,\"scope\":\"accepted Common user, repair and recovery-feedback records; excludes bootstrap, management and raw carrier control\","
+            "{{\"schema\":3,\"scope\":\"accepted Common user, repair and recovery-feedback records; excludes bootstrap, management and raw carrier control\","
         )?;
         writeln!(
             writer,
@@ -223,7 +271,7 @@ impl Observer {
         )?;
         writeln!(
             writer,
-            "\"codec_framing_bytes\":null,\"padding_bytes\":null,\"retry_attribution\":null,\"native_compression_gain\":null,\"physical_carrier_overhead_quantiles\":null,"
+            "\"codec_framing_bytes\":null,\"padding_bytes\":null,\"retry_attribution\":null,\"native_compression_gain_quantiles\":null,\"physical_carrier_overhead_quantiles\":null,"
         )?;
         writeln!(
             writer,
@@ -232,6 +280,10 @@ impl Observer {
         writeln!(
             writer,
             "\"extent_definition\":\"exact canonical outgoing parser extents, counted only on actual acceptance; each histogram has its own sample population; absent repair/feedback codec and incomplete Swift stream or outer-fragment attribution are excluded, not zero-filled; codec body includes unmeasured compression/context/fragment fields; coded fill is distinct from repair redundancy and genuine zero payload\","
+        )?;
+        writeln!(
+            writer,
+            "\"joined_definition\":\"schema3 uses exact correlated receipt IP bytes only for UDP/raw; TLS/QUIC budget allowances are excluded. Outside-codec-body metrics subtract that same emission's codec body from its actual Records/IP length, including all intervening framing and coded fill. Body-internal fields, native compression, Swift stream splits and outer fragments remain unattributed. These are not full native encapsulation overhead; no sums of layer quantiles are used\","
         )?;
         writeln!(
             writer,
@@ -271,6 +323,7 @@ impl Observer {
             self.invalid,
             self.overflow
         )?;
+        self.native.write_report(writer)?;
         for (metric, name) in NAMES.into_iter().enumerate() {
             write!(writer, "\"{name}\":{{\"p50\":")?;
             write_optional(writer, self.quantile(metric, 50))?;
@@ -362,6 +415,71 @@ fn write_optional(writer: &mut impl Write, value: Option<usize>) -> io::Result<(
 mod tests {
     use super::*;
     #[test]
+    fn joined_framing_uses_each_receipt_and_excludes_tls_allowances() -> io::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "l2tunnel-wire-joined-test-{}.json",
+            std::process::id()
+        ));
+        let mut observer = Observer::new(path.clone(), 256)?;
+        let kind = EmissionKind::Source(SourceForm::DirectArq);
+        for (body, recovery_header, boundary, outer) in [
+            (90, 15, SendBoundary::SocketAccepted, Some(28)),
+            (200, 5, SendBoundary::SocketAccepted, Some(40)),
+            (90, 15, SendBoundary::TlsStreamFlushed, None),
+        ] {
+            let codec_bytes = body + 5;
+            let algorithm_bytes = codec_bytes + recovery_header;
+            let record_bytes = algorithm_bytes + 21;
+            observer.accepted(
+                Sample {
+                    algorithm_bytes,
+                    kind,
+                    fragmented: false,
+                    extent: Some(OutputExtent {
+                        bytes: algorithm_bytes,
+                        kind,
+                        route_header_bytes: 0,
+                        fragment_header_bytes: 0,
+                        recovery: Some(l2tunnel::reliable::RecoveryExtent {
+                            kind: l2tunnel::reliable::RecordKind::Source,
+                            bytes: algorithm_bytes,
+                            header_bytes: recovery_header,
+                            payload_bytes: codec_bytes,
+                            systematic_coded_fill_bytes: 0,
+                        }),
+                        codec: Some(l2tunnel::aligned::wire_extent::CodecEnvelopeExtent {
+                            bytes: codec_bytes,
+                            envelope_bytes: 2,
+                            container_bytes: 0,
+                            unit_header_bytes: 3,
+                            body_bytes: body,
+                            units: 1,
+                            fragmented_units: 0,
+                        }),
+                        codec_coverage: CodecCoverage::EnvelopeOnly,
+                    }),
+                },
+                record_bytes,
+                boundary,
+                outer.map(|bytes| record_bytes + bytes),
+            );
+        }
+        assert_eq!(observer.extent_errors, 0);
+        assert_eq!(observer.quantile(13, 99), Some(41));
+        assert_eq!(observer.quantile(14, 99), Some(71));
+        // Subtracting independent percentiles produces 31, not the observed 41.
+        assert_eq!(observer.quantile(1, 99), Some(231));
+        assert_eq!(observer.quantile(10, 99), Some(200));
+        assert_eq!(observer.bins.iter().map(|bin| bin[11]).sum::<u64>(), 2);
+        assert_eq!(observer.bins.iter().map(|bin| bin[13]).sum::<u64>(), 3);
+        assert_eq!(observer.bins.iter().map(|bin| bin[14]).sum::<u64>(), 2);
+        drop(observer);
+        let report = std::fs::read_to_string(&path)?;
+        assert!(report.contains("\"schema\":3"));
+        std::fs::remove_file(path)
+    }
+
+    #[test]
     fn accepted_record_histograms_separate_lengths_overhead_and_receipt_boundaries()
     -> io::Result<()> {
         let path = std::env::temp_dir().join(format!(
@@ -375,7 +493,7 @@ mod tests {
             fragmented: false,
             extent: None,
         };
-        observer.accepted(sample, 121, SendBoundary::TlsStreamFlushed);
+        observer.accepted(sample, 121, SendBoundary::TlsStreamFlushed, None);
         observer.accepted(
             Sample {
                 algorithm_bytes: 200,
@@ -385,13 +503,14 @@ mod tests {
             },
             221,
             SendBoundary::QuicDatagramAccepted,
+            None,
         );
         assert_eq!(observer.quantile(0, 50), Some(100));
         assert_eq!(observer.quantile(1, 99), Some(221));
         assert_eq!(observer.quantile(2, 99), Some(21));
         assert_eq!(observer.boundaries, [0, 1, 1]);
         assert_eq!(observer.classes, [0, 0, 0, 1, 1, 0]);
-        observer.accepted(sample, 99, SendBoundary::SocketAccepted);
+        observer.accepted(sample, 99, SendBoundary::SocketAccepted, Some(127));
         assert_eq!(observer.invalid, 1);
         assert_eq!(observer.quantile(2, 99), Some(21));
         drop(observer);
@@ -430,7 +549,7 @@ mod tests {
             fragmented: false,
             extent: Some(extent),
         };
-        observer.accepted(sample, 121, SendBoundary::SocketAccepted);
+        observer.accepted(sample, 121, SendBoundary::SocketAccepted, Some(149));
         assert_eq!(observer.quantile(5, 99), Some(5));
         assert_eq!(observer.quantile(6, 99), Some(0));
         assert_eq!(observer.quantile(7, 99), None);
@@ -443,6 +562,7 @@ mod tests {
             },
             121,
             SendBoundary::SocketAccepted,
+            Some(149),
         );
         assert_eq!(observer.extent_errors, 1);
         assert_eq!(observer.bins[5][5], 1);

@@ -122,7 +122,7 @@ pub(super) fn offer(
     metadata: pipeline::PacketMetadata,
     width: u16,
     bytes: &[u8],
-) -> Result<Option<ProfileIdentity>, Error> {
+) -> Result<Option<ObservedProfileIdentity>, Error> {
     if let Some(window) = window.as_mut()
         && !window.preview(now, bytes.len())?
     {
@@ -139,7 +139,7 @@ pub(super) fn offer(
     if let Some(id) = admitted
         && let Some(window) = window.as_mut()
     {
-        window.admitted(now, id, bytes.len())?;
+        window.admitted(now, id.identity, bytes.len())?;
     }
     if admitted.is_some()
         && let Some(next) = next

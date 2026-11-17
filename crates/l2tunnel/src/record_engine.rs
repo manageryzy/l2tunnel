@@ -38,6 +38,8 @@ pub use fragment::{
 mod native;
 pub use carrier::CarrierOutputToken;
 mod native_counts;
+mod native_encoding;
+pub use native_encoding::{NativeEncodingKind, NativeEncodingObservation, ObservedProfileIdentity};
 mod native_window;
 pub use native_counts::NativeCounts;
 pub use native_window::NativeDelivery;
@@ -506,7 +508,10 @@ impl Engine {
         }) {
             Ok(Some(admitted)) => {
                 self.statistics.admitted = next;
-                Ok(Some(admitted))
+                Ok(Some(pipeline::Admitted {
+                    packet: admitted.packet,
+                    permit: admitted.permit.identity,
+                }))
             }
             Ok(None) => Ok(None),
             Err(pipeline::DequeueError::Pipeline(error)) => self.fail(Error::Pipeline(error)),
@@ -540,6 +545,21 @@ impl Engine {
         &mut self,
         now: Tick,
     ) -> Result<Option<pipeline::Admission<ProfileIdentity>>, Error> {
+        self.admit_borrowed_observed(now).map(|value| {
+            value.map(|admitted| pipeline::Admission {
+                metadata: admitted.metadata,
+                permit: admitted.permit.identity,
+            })
+        })
+    }
+
+    /// Return exact encoding facts once with the actual committed Pipeline head.
+    /// Refusal returns no observation. Packing, retry and output polling cannot
+    /// create another admission sample; no state or allocation retains samples.
+    pub fn admit_borrowed_observed(
+        &mut self,
+        now: Tick,
+    ) -> Result<Option<pipeline::Admission<ObservedProfileIdentity>>, Error> {
         self.advance(now)?;
         let next = self
             .statistics

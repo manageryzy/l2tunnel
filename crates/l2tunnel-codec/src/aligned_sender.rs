@@ -276,7 +276,8 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
     ) -> Result<RecordIdentity, Error> {
-        self.stage_selected(channel, frame, aligned_body::Encoding::Headers)
+        self.stage_observed(channel, frame)
+            .map(|(identity, _)| identity)
     }
     /// Stage raw native bytes and return their original channel body identity.
     pub fn stage_raw_identified(
@@ -284,7 +285,8 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
     ) -> Result<RecordIdentity, Error> {
-        self.stage_selected(channel, frame, aligned_body::Encoding::Raw)
+        self.stage_raw_observed(channel, frame)
+            .map(|(identity, _)| identity)
     }
     /// Stage stateless LZ4-or-raw bytes under the actual channel identity.
     pub fn stage_lz4_identified(
@@ -292,6 +294,31 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
     ) -> Result<RecordIdentity, Error> {
+        self.stage_lz4_observed(channel, frame)
+            .map(|(identity, _)| identity)
+    }
+    /// Return exact encoding facts once, only after native staging succeeds.
+    pub fn stage_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
+        self.stage_selected(channel, frame, aligned_body::Encoding::Headers)
+    }
+    /// Return exact raw-body and complete generated unit framing after staging.
+    pub fn stage_raw_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
+        self.stage_selected(channel, frame, aligned_body::Encoding::Raw)
+    }
+    /// Return actual LZ4-or-raw encoding facts after staging succeeds.
+    pub fn stage_lz4_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
         self.stage_selected(channel, frame, aligned_body::Encoding::Lz4)
     }
     fn stage_selected(
@@ -299,7 +326,7 @@ impl Sender {
         channel: ChannelId,
         frame: &[u8],
         encoding: aligned_body::Encoding,
-    ) -> Result<RecordIdentity, Error> {
+    ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -319,6 +346,17 @@ impl Sender {
         } else {
             record.0
         };
+        let framing = |length: usize| {
+            if length == 0 {
+                0
+            } else if length <= self.config.body.symbol_bytes - 3 {
+                3
+            } else {
+                length.div_ceil(self.config.body.symbol_bytes - 8) * 8
+            }
+        };
+        let mut observation = encoded.observation();
+        observation.framing_bytes = framing(encoded.context_len) + framing(encoded.body_len);
         state.encoder.copy_context_from(&self.staged);
         state.next = last.checked_add(1).map(RecordId);
         self.pending = Some(Pending {
@@ -329,10 +367,13 @@ impl Sender {
             context: encoded.context_len != 0,
             offset: 0,
         });
-        Ok(RecordIdentity {
-            channel,
-            record: RecordId(last),
-        })
+        Ok((
+            RecordIdentity {
+                channel,
+                record: RecordId(last),
+            },
+            observation,
+        ))
     }
     /// Write immutable pending bytes using the recovery owner's source-ID snapshot.
     /// Failure or success here never consumes a pending symbol.

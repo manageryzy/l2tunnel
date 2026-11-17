@@ -1,7 +1,7 @@
 use super::connections::Connections;
 use super::{
-    Context, Emission, EmissionKind, Error, NativeStep, ProfileIdentity, SourceForm, Tick, aligned,
-    configuration, duration, pipeline, receiver, swift,
+    Context, Emission, EmissionKind, Error, NativeStep, ObservedProfileIdentity, ProfileIdentity,
+    SourceForm, Tick, aligned, configuration, duration, pipeline, receiver, swift,
 };
 use crate::rolling_records;
 use l2tunnel_recovery::{EndpointRole, RecoveryContext};
@@ -202,7 +202,7 @@ impl Owner {
         now: Tick,
         metadata: pipeline::PacketMetadata,
         bytes: &[u8],
-    ) -> Result<Option<ProfileIdentity>, Error> {
+    ) -> Result<Option<ObservedProfileIdentity>, Error> {
         if metadata.classification.kind == l2tunnel_packet::PacketKind::ProxyRecord
             && metadata
                 .timing
@@ -222,7 +222,7 @@ impl Owner {
         now: Tick,
         channel: u16,
         bytes: &[u8],
-    ) -> Result<Option<ProfileIdentity>, Error> {
+    ) -> Result<Option<ObservedProfileIdentity>, Error> {
         match self {
             Self::Connections(_) => Err(Error::IngressPolicy),
             Self::Swift(owned) => {
@@ -230,21 +230,27 @@ impl Owner {
                     records::ChannelId::new(usize::from(channel)).ok_or(Error::Configuration)?;
                 match owned
                     .entry()
-                    .offer_on_channel_identified(now.0, channel, bytes)
+                    .offer_on_channel_observed(now.0, channel, bytes)
                     .map_err(Error::Swift)?
                 {
-                    records::IdentifiedAdmission::Accepted(identity) => {
-                        Ok(Some(ProfileIdentity::Swift(identity)))
+                    records::ObservedAdmission::Accepted { identity, encoding } => {
+                        Ok(Some(ObservedProfileIdentity {
+                            identity: ProfileIdentity::Swift(identity),
+                            encoding: encoding.into(),
+                        }))
                     }
-                    records::IdentifiedAdmission::Full => Ok(None),
-                    records::IdentifiedAdmission::PacketSize => Err(Error::PacketSize),
+                    records::ObservedAdmission::Full => Ok(None),
+                    records::ObservedAdmission::PacketSize => Err(Error::PacketSize),
                 }
             }
             Self::Aligned(endpoint) => {
                 let channel =
                     receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
-                match endpoint.enqueue_identified(channel, bytes, duration(now)) {
-                    Ok(identity) => Ok(Some(ProfileIdentity::Aligned(identity))),
+                match endpoint.enqueue_observed(channel, bytes, duration(now)) {
+                    Ok((identity, encoding)) => Ok(Some(ObservedProfileIdentity {
+                        identity: ProfileIdentity::Aligned(identity),
+                        encoding: encoding.into(),
+                    })),
                     Err(aligned::Error::Busy) => Ok(None),
                     Err(error) => Err(Error::Aligned(error)),
                 }
@@ -252,19 +258,32 @@ impl Owner {
             Self::Packed(endpoint) => {
                 let channel =
                     receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
-                match endpoint.enqueue_identified(channel, bytes, duration(now)) {
-                    Ok(identity) => Ok(Some(ProfileIdentity::Packed(identity))),
+                match endpoint.enqueue_observed(channel, bytes, duration(now)) {
+                    Ok((identity, encoding)) => Ok(Some(ObservedProfileIdentity {
+                        identity: ProfileIdentity::Packed(identity),
+                        encoding: encoding.into(),
+                    })),
                     Err(aligned::Error::Busy) => Ok(None),
                     Err(error) => Err(Error::Aligned(error)),
                 }
             }
             Self::Rolling(endpoint) => endpoint
-                .enqueue_admitted_identified(now, channel, bytes)
-                .map(|identity| identity.map(ProfileIdentity::Rolling))
+                .enqueue_admitted_observed(now, channel, bytes)
+                .map(|value| {
+                    value.map(|(identity, encoding)| ObservedProfileIdentity {
+                        identity: ProfileIdentity::Rolling(identity),
+                        encoding: encoding.into(),
+                    })
+                })
                 .map_err(Error::Rolling),
             Self::Research(endpoint) => endpoint
-                .enqueue_admitted_identified(now, channel, bytes)
-                .map(|identity| identity.map(ProfileIdentity::Research))
+                .enqueue_admitted_observed(now, channel, bytes)
+                .map(|value| {
+                    value.map(|(identity, encoding)| ObservedProfileIdentity {
+                        identity: ProfileIdentity::Research(identity),
+                        encoding: encoding.into(),
+                    })
+                })
                 .map_err(Error::Rolling),
         }
     }

@@ -191,6 +191,15 @@ impl<'a> Entry<'a> {
     ) -> Result<Option<Admission<engine::ProfileIdentity>>, Error> {
         self.engine.admit_borrowed(now).map_err(Error::Engine)
     }
+    /// Return one scalar observation with a successfully committed native input.
+    pub fn admit_borrowed_observed(
+        &mut self,
+        now: engine::Tick,
+    ) -> Result<Option<Admission<engine::ObservedProfileIdentity>>, Error> {
+        self.engine
+            .admit_borrowed_observed(now)
+            .map_err(Error::Engine)
+    }
     /// Produce exact typed records under the one external shared wire allowance.
     pub fn poll(
         &mut self,

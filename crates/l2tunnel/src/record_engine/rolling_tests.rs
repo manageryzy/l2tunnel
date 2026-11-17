@@ -342,10 +342,13 @@ fn actual_rolling_plan_limits_aliases_foreign_tokens_and_functional_emissions_ar
     let bytes = packet(false, 3333, 512, 0x43);
     reserved.enqueue_borrowed(Tick(0), &bytes)?;
     functional.enqueue_borrowed(Tick(0), &bytes)?;
-    assert_eq!(
-        reserved.admit_borrowed(Tick(0))?,
-        functional.admit_borrowed(Tick(0))?
-    );
+    let observed = reserved.admit_borrowed_observed(Tick(0))?;
+    assert_eq!(observed, functional.admit_borrowed_observed(Tick(0))?);
+    let encoding = observed.ok_or("actual native admission")?.permit.encoding;
+    assert_eq!(encoding.original_native_bytes, bytes.len());
+    assert_eq!(encoding.context_bytes, 0);
+    assert_eq!(encoding.encoded_body_bytes, bytes.len() + 3);
+    assert_eq!(encoding.framing_bytes, 24);
     for engine in [&mut reserved, &mut functional] {
         engine.step(Tick(1000), work())?;
     }

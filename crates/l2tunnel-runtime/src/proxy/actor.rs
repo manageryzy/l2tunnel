@@ -558,6 +558,13 @@ impl Actor {
             }
         }
     }
+    async fn cooperate_after_turn(&mut self) {
+        if self.measured.is_some() && self.retirement.is_some() {
+            // Ready ticks/watch changes can otherwise chain several bounded
+            // turns in one poll, delaying the Common sibling and spawned writer.
+            tokio::task::yield_now().await;
+        }
+    }
     fn measured_deadlines(&self, now: Instant) -> io::Result<()> {
         if self.measured.is_none() {
             return Ok(());
@@ -1485,6 +1492,7 @@ pub(super) async fn run_profile_selected<D: PacketDevice<Error = io::Error>>(
             if let Some(report) = actor.shutdown()? {
                 return Ok(report);
             }
+            actor.cooperate_after_turn().await;
         }
     }
     .await;

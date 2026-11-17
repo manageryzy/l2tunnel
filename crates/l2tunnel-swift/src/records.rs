@@ -122,6 +122,58 @@ pub enum IdentifiedAdmission {
     PacketSize,
 }
 
+/// One successfully admitted native packet, before recovery or retransmission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEncodingObservation {
+    /// Exact original native length, including meaningful zero bytes.
+    pub original_native_bytes: usize,
+    /// Separate context bytes; Swift establishes its context inside the body.
+    pub context_bytes: usize,
+    /// Actual record bytes, including the literal/delta tag and changed fields.
+    pub encoded_body_bytes: usize,
+    /// Actual two-byte stream length prefix, excluding all recovery/carrier bytes.
+    pub framing_bytes: usize,
+    /// Literal context initialization is distinct from delta compression.
+    pub kind: header::EncodingKind,
+}
+impl NativeEncodingObservation {
+    /// Signed original minus codec bytes; literal expansion is negative.
+    pub fn codec_net_gain_bytes(self) -> i128 {
+        self.original_native_bytes as i128
+            - self.context_bytes as i128
+            - self.encoded_body_bytes as i128
+    }
+    /// Signed gain including stream framing, before recovery/Records/carrier.
+    pub fn net_gain_bytes(self) -> i128 {
+        self.codec_net_gain_bytes() - self.framing_bytes as i128
+    }
+}
+
+/// Successful admission carries one observation; refusals carry none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedAdmission {
+    /// Exactly one retained native packet and its actual encoding facts.
+    Accepted {
+        /// Original channel/native identity, not a send or delivery receipt.
+        identity: NativeIdentity,
+        /// Scalar lengths available only after successful native admission.
+        encoding: NativeEncodingObservation,
+    },
+    /// Common packing budget refused the packet before encoding.
+    Full,
+    /// Native length was refused before encoding.
+    PacketSize,
+}
+impl ObservedAdmission {
+    fn identified(self) -> IdentifiedAdmission {
+        match self {
+            Self::Accepted { identity, .. } => IdentifiedAdmission::Accepted(identity),
+            Self::Full => IdentifiedAdmission::Full,
+            Self::PacketSize => IdentifiedAdmission::PacketSize,
+        }
+    }
+}
+
 /// Native admission result, decided before changing header contexts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
@@ -205,7 +257,8 @@ pub struct Stats {
     pub native_read: u64,
     /// Native packets refused for size or common queue pressure.
     pub native_dropped: u64,
-    /// Native bytes removed by exact header records, net of record tags.
+    /// Gross delta savings only; literal tag expansion and stream prefixes are
+    /// excluded. Use successful admission observations for signed net gain.
     pub header_bytes_saved: u64,
 }
 
@@ -459,6 +512,11 @@ impl Engine {
         now: u64,
         packet: &[u8],
     ) -> Result<IdentifiedAdmission, Error> {
+        self.offer_observed(now, packet)
+            .map(ObservedAdmission::identified)
+    }
+    /// Admit once and return exact encoding facts; refusal and retries emit none.
+    pub fn offer_observed(&mut self, now: u64, packet: &[u8]) -> Result<ObservedAdmission, Error> {
         if let Some(rejected) = self.admission_refusal(packet)? {
             return Ok(rejected);
         }
@@ -477,6 +535,16 @@ impl Engine {
         channel: ChannelId,
         packet: &[u8],
     ) -> Result<IdentifiedAdmission, Error> {
+        self.offer_on_channel_observed(now, channel, packet)
+            .map(ObservedAdmission::identified)
+    }
+    /// Observe actual successful admission on the caller's selected channel.
+    pub fn offer_on_channel_observed(
+        &mut self,
+        now: u64,
+        channel: ChannelId,
+        packet: &[u8],
+    ) -> Result<ObservedAdmission, Error> {
         if channel.index() >= self.send.channels {
             return Err(Error::Configuration);
         }
@@ -486,11 +554,11 @@ impl Engine {
         self.retain_identified(now, channel.index(), packet)
     }
 
-    fn admission_refusal(&mut self, packet: &[u8]) -> Result<Option<IdentifiedAdmission>, Error> {
+    fn admission_refusal(&mut self, packet: &[u8]) -> Result<Option<ObservedAdmission>, Error> {
         let rejected = if packet.is_empty() || packet.len() > self.send.max_native {
-            Some(IdentifiedAdmission::PacketSize)
+            Some(ObservedAdmission::PacketSize)
         } else if !self.has_room() {
-            Some(IdentifiedAdmission::Full)
+            Some(ObservedAdmission::Full)
         } else {
             None
         };
@@ -510,7 +578,7 @@ impl Engine {
         now: u64,
         channel: usize,
         packet: &[u8],
-    ) -> Result<IdentifiedAdmission, Error> {
+    ) -> Result<ObservedAdmission, Error> {
         let native_read = self
             .base
             .native_read
@@ -528,13 +596,22 @@ impl Engine {
             channel: ChannelId::new(channel).ok_or(Error::Configuration)?,
             record: NativeRecordId(self.admitted[channel]),
         };
-        self.compressors[channel].compress_checked(packet, &mut self.record)?;
+        let kind = self.compressors[channel].compress_checked(packet, &mut self.record)?;
         if !self.senders[channel].push_packet(now, &self.record)? {
             return Err(Error::Admission);
         }
         self.admitted[channel] = admitted;
         self.base.native_read = native_read;
-        Ok(IdentifiedAdmission::Accepted(identity))
+        Ok(ObservedAdmission::Accepted {
+            identity,
+            encoding: NativeEncodingObservation {
+                original_native_bytes: packet.len(),
+                context_bytes: 0,
+                encoded_body_bytes: self.record.len(),
+                framing_bytes: crate::FRAME_PREFIX,
+                kind,
+            },
+        })
     }
 
     fn feedback(&mut self, now: u64) -> bool {

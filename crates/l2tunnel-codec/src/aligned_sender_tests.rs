@@ -34,6 +34,46 @@ fn hex(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .collect()
 }
 #[test]
+fn native_observation_counts_complete_fragment_framing_once_after_success() -> TestResult {
+    let mut sender = Sender::new(scope(), config(32, 0, 7))?;
+    let mut native = [0; 70];
+    native[..3].copy_from_slice(&[1, 2, 3]);
+    let (identity, observation) = sender.stage_raw_observed(ChannelId(0), &native)?;
+    assert_eq!(identity.record, RecordId(7));
+    assert_eq!(observation.original_native_bytes, 70);
+    assert_eq!(observation.context_bytes, 0);
+    assert_eq!(observation.encoded_body_bytes, 73);
+    assert_eq!(observation.framing_bytes, 32);
+    assert_eq!(observation.kind, aligned_body::BodyKind::Raw);
+    assert_eq!(observation.codec_net_gain_bytes(), -3);
+    assert_eq!(observation.net_gain_bytes(), -35);
+    assert_eq!(
+        sender.stage_raw_observed(ChannelId(0), &native),
+        Err(Error::Busy)
+    );
+    let mut body = Vec::new();
+    let mut wire_bytes = 0;
+    let mut units = 0;
+    while sender.is_pending() {
+        let unit = sender.pending_unit()?;
+        assert_eq!(unit.record, identity.record);
+        assert_eq!(unit.bytes[3], 4);
+        body.extend_from_slice(&unit.bytes[8..]);
+        wire_bytes += unit.bytes.len();
+        units += 1;
+        sender.commit_unit()?;
+    }
+    assert_eq!(units, 4);
+    assert_eq!(wire_bytes, 105);
+    assert_eq!(&body[..3], &[2, 0, 70]);
+    assert_eq!(&body[3..], native);
+    assert!(sender.stage_raw_observed(ChannelId(2), &native).is_err());
+    let (next, again) = sender.stage_raw_observed(ChannelId(0), &native)?;
+    assert_eq!(next.record, RecordId(8));
+    assert_eq!(again, observation);
+    Ok(())
+}
+#[test]
 fn every_actual_python_sender_symbol_matches_context_fragment_padding_and_wrap() -> TestResult {
     let mut name = "";
     let mut sender = Sender::new(scope(), config(1460, 0, 0))?;

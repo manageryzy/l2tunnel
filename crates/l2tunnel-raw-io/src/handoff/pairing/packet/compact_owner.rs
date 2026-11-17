@@ -367,6 +367,8 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         Ok(earliest)
     }
     /// Borrow one candidate after read-only raw preflight, before Records replay commits.
+    /// Bounded carrier/control/bulk turns grant verification attempts only. The
+    /// selected candidate stays pinned until its verifier verdict consumes it.
     /// Drop this guard before committing or polling any raw I/O.
     pub fn final_input(&self, lane: PairLane) -> Result<Option<FinalInput<'_>>, Error> {
         self.check()?;
@@ -378,11 +380,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             .ok_or(Error::Configuration)?;
         let mut state = lock(&owner.io.state)?;
         loop {
-            let Some(index) = state
-                .incoming
-                .iter()
-                .position(|cell| cell.final_metadata.is_some())
-            else {
+            let Some(index) = state.select_final_candidate()? else {
                 return Ok(None);
             };
             let cell = &state.incoming[index];
@@ -396,7 +394,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                     index,
                 }));
             }
-            state.incoming.remove(index);
+            state.consume_final_candidate(index)?;
             state.reject_final()?;
         }
     }
@@ -415,16 +413,9 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             .and_then(Option::as_mut)
             .ok_or(Error::Configuration)?;
         let mut state = lock(&owner.io.state)?;
-        let index = state
-            .incoming
-            .iter()
-            .position(|cell| cell.final_metadata.is_some())
-            .ok_or(Error::Busy)?;
-        if state.incoming[index].final_metadata != Some(metadata) {
-            return Err(Error::Proof);
-        }
+        let index = state.selected_final_candidate(metadata)?;
         let Some(verdict) = verdict else {
-            state.incoming.remove(index);
+            state.consume_final_candidate(index)?;
             state.reject_final()?;
             return Ok(());
         };
@@ -434,11 +425,7 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             return Err(Error::Proof);
         }
         let retired = state.commit_final(metadata)?;
-        let received_at = state
-            .incoming
-            .remove(index)
-            .ok_or(Error::Proof)?
-            .received_at;
+        let received_at = state.consume_final_candidate(index)?.received_at;
         drop(state);
         match verdict.control {
             Some(FinalControl::Window) => {}

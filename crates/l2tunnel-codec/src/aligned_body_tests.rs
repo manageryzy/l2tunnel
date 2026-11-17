@@ -121,6 +121,15 @@ fn actual_python_bodies_all_masks_pairs_and_contexts_match_exactly() -> TestResu
         }
         let mut bytes = vec![0xcc; encoder.max_encoded_len()];
         let encoded = encoder.encode(&vector.frame, &mut bytes)?;
+        let observation = encoded.observation();
+        assert_eq!(observation.original_native_bytes, vector.frame.len());
+        assert_eq!(observation.context_bytes, vector.context.len());
+        assert_eq!(observation.encoded_body_bytes, vector.body.len());
+        assert_eq!(observation.framing_bytes, 0);
+        assert_eq!(
+            observation.codec_net_gain_bytes(),
+            vector.frame.len() as i128 - vector.context.len() as i128 - vector.body.len() as i128
+        );
         assert_eq!(
             &bytes[..encoded.context_len],
             vector.context,

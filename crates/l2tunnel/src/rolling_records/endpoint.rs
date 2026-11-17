@@ -430,6 +430,22 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         channel: u16,
         frame: &[u8],
     ) -> Result<Option<receiver::RecordIdentity>, Error> {
+        self.enqueue_admitted_observed(now, channel, frame)
+            .map(|value| value.map(|(identity, _)| identity))
+    }
+    /// Return exact codec facts only for the actual successful native admission.
+    pub fn enqueue_admitted_observed(
+        &mut self,
+        now: Tick,
+        channel: u16,
+        frame: &[u8],
+    ) -> Result<
+        Option<(
+            receiver::RecordIdentity,
+            l2tunnel_codec::aligned_body::NativeEncodingObservation,
+        )>,
+        Error,
+    > {
         if channel >= self.send_config.receiver.channels
             || frame.is_empty()
             || frame.len() > self.send_config.receiver.body.max_frame_bytes
@@ -450,13 +466,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let channel = receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
         let result = match self.send_config.native_policy {
             NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
-                self.packing.stage_identified(channel, frame, now.0)
+                self.packing.stage_observed(channel, frame, now.0)
             }
             NativePolicy::RawIp | NativePolicy::RawEthernet => {
-                self.packing.stage_raw_identified(channel, frame, now.0)
+                self.packing.stage_raw_observed(channel, frame, now.0)
             }
             NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
-                self.packing.stage_lz4_identified(channel, frame, now.0)
+                self.packing.stage_lz4_observed(channel, frame, now.0)
             }
         };
         match result {

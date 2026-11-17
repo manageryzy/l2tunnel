@@ -3,7 +3,9 @@ use super::super::super::test_support::{R, raw};
 use super::*;
 const TX: [u8; 16] = [9; 16];
 fn fixture() -> R<(GateState, PacketSealer)> {
-    let policy = PacketPolicy::new(576);
+    fixture_with_policy(PacketPolicy::new(576))
+}
+fn fixture_with_policy(policy: PacketPolicy) -> R<(GateState, PacketSealer)> {
     let mut state = GateState::new(
         raw(true, 0),
         policy,
@@ -36,6 +38,8 @@ fn fixture() -> R<(GateState, PacketSealer)> {
     )?;
     Ok((state, sealer))
 }
+#[path = "candidate_tests.rs"]
+mod candidates;
 fn seal(sealer: &mut PacketSealer, kind: wire::Kind, offset: u64, body: &[u8]) -> R<Vec<u8>> {
     let plain = wire::Header {
         kind,

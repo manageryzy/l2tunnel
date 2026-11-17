@@ -616,20 +616,27 @@ impl Driver {
             // Existing queued originals are serviced after new native ingress has
             // stopped, before Stage can capture its immutable admitted fence.
             for _ in 0..self.config.work.native_read_batch {
-                let Some(_admitted) = state
+                let Some(admitted) = state
                     .entry(epoch)?
-                    .admit_borrowed(engine::Tick(now))
+                    .admit_borrowed_observed(engine::Tick(now))
                     .map_err(protocol)?
                 else {
                     break;
                 };
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    let proxy = runtime.contract.proxy_binding().is_some();
+                    if let Some(metrics) = runtime.wire_metrics.as_mut() {
+                        metrics.admitted_native(admitted.permit.encoding, proxy);
+                    }
+                }
                 #[cfg(unix)]
                 if let Some(bridge) = self
                     .common
                     .as_deref()
                     .and_then(|runtime| runtime.proxy_bridge.as_ref())
                 {
-                    let engine::ProfileIdentity::Aligned(identity) = _admitted.permit else {
+                    let engine::ProfileIdentity::Aligned(identity) = admitted.permit.identity
+                    else {
                         return Err(protocol(
                             "Common proxy admission has another record identity",
                         ));
@@ -1043,7 +1050,12 @@ impl Driver {
             && let Some(sample) = runtime.wire_sample.take()
             && let Some(metrics) = runtime.wire_metrics.as_mut()
         {
-            metrics.accepted(sample, receipt.record_bytes, receipt.boundary);
+            metrics.accepted(
+                sample,
+                receipt.record_bytes,
+                receipt.boundary,
+                receipt.socket_ip_bytes,
+            );
         }
         // Sample the same sole-loop clock only after retaining the irreversible
         // receipt and removing its exact ciphertext custody. The receipt's own
@@ -1207,7 +1219,12 @@ impl Driver {
                 if let Some(sample) = runtime.wire_sample.take()
                     && let Some(metrics) = runtime.wire_metrics.as_mut()
                 {
-                    metrics.accepted(sample, bytes, super::super::SendBoundary::SocketAccepted);
+                    metrics.accepted(
+                        sample,
+                        bytes,
+                        super::super::SendBoundary::SocketAccepted,
+                        Some(cost),
+                    );
                 }
                 let sampled = sample();
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);

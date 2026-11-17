@@ -35,6 +35,7 @@ impl Encoder {
                 self.scratch[3..5].copy_from_slice(&(frame.len() as u16).to_be_bytes());
                 output[..total].copy_from_slice(&self.scratch[..total]);
                 return Ok(EncodedBodies {
+                    original_native_bytes: frame.len(),
                     context_len: 0,
                     body_len: total,
                     kind: BodyKind::Lz4,
@@ -125,6 +126,16 @@ mod tests {
         ] {
             let mut encoded = [0xa5; 2100];
             let result = encoder.encode_lz4(&original, &mut encoded)?;
+            let observation = result.observation();
+            assert_eq!(observation.original_native_bytes, original.len());
+            assert_eq!(observation.context_bytes, 0);
+            assert_eq!(observation.framing_bytes, 0);
+            assert_eq!(observation.encoded_body_bytes, result.body_len);
+            assert_eq!(observation.kind, result.kind);
+            assert_eq!(
+                observation.net_gain_bytes(),
+                original.len() as i128 - result.body_len as i128
+            );
             assert_eq!(result.context_len, 0);
             assert_eq!(
                 result.kind == BodyKind::Lz4,

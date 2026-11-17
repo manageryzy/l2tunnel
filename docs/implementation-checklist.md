@@ -33,6 +33,12 @@ complete selected matrix has 14 passed, 186 failed, 32 bound-exhausted and
 8 not-run phases across multiple source-bound versions. Full overhead mean/p99
 remains unmeasured; these results do not qualify the complete matrix.
 
+The next [joined framing and native-admission batch](modules/compact-wire-cleanup.md#joined-framing-and-successful-native-admission-observations)
+implements correlated schema3 observations and actual successful-codec admission
+metadata; shared validation remains pending. The newly requested all-buffer
+backpressure instrumentation is planned with an explicit coverage inventory;
+nonempty queues, residence time and downstream blockage must remain distinct.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

@@ -271,6 +271,93 @@ fn make_final(
 }
 
 #[tokio::test]
+async fn compact_final_raw_pins_borrowed_input_and_rejects_forged_priority() -> R {
+    let (mut a, mut b) = selected(false, Arc::new(Fault::default())).await?;
+    let (data, original) = make_final(&mut a, PairLane::First, FinalKind::Data, None)?;
+    let sender_config = lock(&a.lanes[0].as_ref().ok_or("lane")?.io.state)?.config;
+    let peer = b.lanes[0].as_ref().ok_or("lane")?.io.state.clone();
+    lock(&peer)?.ingest_final(&original)?;
+    assert_eq!(
+        b.final_input(PairLane::First)?.ok_or("data")?.metadata(),
+        data
+    );
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0x61; 32]);
+    // Later candidates cannot replace the exact input already borrowed by the verifier.
+    for (route, sequence) in [(0, data.sequence + 37), (1, data.sequence + 74)] {
+        let mut payload = original[40..].to_vec();
+        payload[0] = route;
+        if route == 0 {
+            let mut metadata = data;
+            metadata.sequence = sequence;
+            metadata.kind = FinalKind::Control;
+            let mut authentication = metadata.aad().to_vec();
+            authentication.extend_from_slice(&payload[..5]);
+            payload[5..].copy_from_slice(ring::hmac::sign(&key, &authentication).as_ref());
+        }
+        let mut packet = vec![0; original.len()];
+        packet::encode(
+            sender_config,
+            sequence,
+            data.acknowledgment,
+            data.window,
+            &payload,
+            &mut packet,
+        )?;
+        lock(&peer)?.ingest_final(&packet)?;
+    }
+    let other = lock(&peer)?.incoming[1]
+        .final_metadata
+        .ok_or("other metadata")?;
+    assert!(matches!(
+        b.commit_final_input(PairLane::First, other, None),
+        Err(Error::Proof)
+    ));
+    assert_eq!(
+        b.final_input(PairLane::First)?.ok_or("pinned")?.metadata(),
+        data
+    );
+    b.commit_final_input(
+        PairLane::First,
+        data,
+        Some(FinalAcceptance::record((), true)),
+    )?;
+    let before = {
+        let state = lock(&peer)?;
+        let fence = state.fence.as_ref().ok_or("fence")?;
+        (fence.retired, fence.peer_retired)
+    };
+    for expected in [FinalKind::CarrierControl, FinalKind::Control] {
+        let input = b
+            .final_input(PairLane::First)?
+            .ok_or("priority candidate")?;
+        let metadata = input.metadata();
+        assert_eq!(metadata.kind(), expected);
+        let mut authentication = metadata.aad().to_vec();
+        authentication.extend_from_slice(&input.bytes()[..5]);
+        let verified = ring::hmac::verify(&key, &authentication, &input.bytes()[5..]).is_ok();
+        assert_eq!(verified, expected == FinalKind::Control);
+        drop(input);
+        b.commit_final_input(
+            PairLane::First,
+            metadata,
+            verified.then_some(FinalAcceptance::record((), true)),
+        )?;
+        let state = lock(&peer)?;
+        let fence = state.fence.as_ref().ok_or("fence")?;
+        if verified {
+            assert!(fence.retired > before.0);
+            assert!(matches!(state.validate_final(metadata), Err(Error::Proof)));
+        } else {
+            assert_eq!((fence.retired, fence.peer_retired), before);
+            // Failed authentication did not mark the candidate's extent as consumed.
+            state.validate_final(metadata)?;
+        }
+    }
+    assert!(b.final_input(PairLane::First)?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn compact_final_raw_metadata_rejection_and_short_data_never_retire_peer_credit() -> R {
     let (mut a, mut b) = selected(false, Arc::new(Fault::default())).await?;
     // Put real outstanding sequence space on the receiving owner so forged or
@@ -280,6 +367,12 @@ async fn compact_final_raw_metadata_rejection_and_short_data_never_retire_peer_c
     tick(&mut a, &mut b).await?;
     b.take_sent_record(PairLane::First)?
         .ok_or("reverse receipt")?;
+    assert_eq!(
+        a.final_input(PairLane::First)?
+            .ok_or("reverse input")?
+            .metadata(),
+        reverse
+    );
     a.commit_final_input(
         PairLane::First,
         reverse,
@@ -315,6 +408,12 @@ async fn compact_final_raw_metadata_rejection_and_short_data_never_retire_peer_c
     tick(&mut a, &mut b).await?;
     tick(&mut a, &mut b).await?;
     a.take_sent_record(PairLane::First)?.ok_or("data receipt")?;
+    assert_eq!(
+        b.final_input(PairLane::First)?
+            .ok_or("data input")?
+            .metadata(),
+        data
+    );
     b.commit_final_input(
         PairLane::First,
         data,
@@ -331,6 +430,12 @@ async fn compact_final_raw_metadata_rejection_and_short_data_never_retire_peer_c
     let (feedback, _) = make_final(&mut a, PairLane::First, FinalKind::Feedback, None)?;
     tick(&mut a, &mut b).await?;
     tick(&mut a, &mut b).await?;
+    assert_eq!(
+        b.final_input(PairLane::First)?
+            .ok_or("feedback input")?
+            .metadata(),
+        feedback
+    );
     assert!(matches!(
         b.commit_final_input(
             PairLane::First,
@@ -515,6 +620,10 @@ async fn compact_final_raw_strong_liveness_uses_every_original_lane() -> R {
             tick(&mut a, &mut b).await?;
             tick(&mut a, &mut b).await?;
             a.take_sent_record(lane)?.ok_or("ping receipt")?;
+            assert_eq!(
+                b.final_input(lane)?.ok_or("ping input")?.metadata(),
+                metadata
+            );
             b.commit_final_input(lane, metadata, Some(FinalAcceptance::control((), ping)))?;
             let pong = b.poll_final_control(lane)?.ok_or("pong due")?;
             assert_eq!(pong, FinalControl::Pong(nonce));

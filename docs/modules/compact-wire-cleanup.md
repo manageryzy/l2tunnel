@@ -658,6 +658,69 @@ older binary provenance. Passing data phases with failed endpoint disconnects
 are listed separately. Per-layer schema2 extents are not full encapsulation
 mean/p99, and no CWC parent acceptance gate closes through this batch.
 
+### Joined framing and successful native-admission observations
+
+The next implementation batch adds observer schema3. Each joined value uses one
+correlated accepted emission before histogramming: exact Records or actual
+UDP/raw IP length minus that same emission's codec body. The actual IP extent
+comes from its original send receipt; TLS/QUIC charging allowances are never
+substituted. Schema1/2 receipts remain readable. These joined values still leave
+codec-body syntax, context and fragmentation inside the body, and exclude Swift
+stream and outer-fragment attribution. They are not full native encapsulation
+mean/p99. No component quantiles are added or subtracted.
+
+The actual codec and Swift admission paths now return original input, context,
+encoded body and generated unit/fragment or stream-prefix lengths, actual
+encoding kind and signed gain. This return-only observation propagates through
+Aligned/Packed, Rolling/Research, recovered Connections, explicit native bypass,
+Engine and Bank to the existing Common admission loop. It adds no retained pure
+queue or allocator. Admission samples count each original input once; retries
+and source copies do not manufacture another sample. Proxy-record inputs stay
+separate from native packet inputs. Literal/context expansion remains negative,
+and LZ4 whole-input gain is not called header compression. Existing Swift gross
+delta-savings counters are explicitly documented as excluding literal expansion.
+The observer aggregates these admission facts independently of physical-send
+success, including a runtime that fails before its first accepted emission.
+Per-native gain quantiles and complete per-emission byte-range provenance remain
+open. The required checks5 continuation passes strict workspace Clippy, codec
+no-default-features tests and strict rustdoc with unchanged source hashes.
+Workspace tests retain two failures: measured QUIC Half proxy handoff expiry
+and raw Frame native mode-switch lifetime expiry. TLS measured proxy and the new
+codec, native-observer and raw candidate-scheduling tests pass. This is not an
+aggregate-green claim. The source-stable release8 build and external Common
+CLI/service process probe pass; native validation remains pending. Receipts:
+`work/aligned-extents-20261117/required-repair-checks5-continuation1.json`,
+`required-repair-checks5-cli-continuation1.json` and
+`matrix-source-binding-8.json` in that same directory.
+
+Raw candidate verification now reserves upper Control capacity separately from
+Data/Feedback and cycles through carrier control, upper control and bulk heads.
+A selected candidate stays pinned through authentication; rejected candidates do
+not gain authenticated credit. The 64-packet upper/bulk allowance splits into
+4 Control and 60 bulk slots, in addition to the existing 4 carrier-control slots.
+A one-slot configuration retains its explicit shared-slot limitation. This is a
+bounded attempt-opportunity guarantee, not a deadline or flood-delivery guarantee.
+Measured Common proxy actors now yield after a ready turn; this repairs a
+scheduler starvation opportunity but does not close the remaining QUIC deadline
+failure or relax its original 50 ms cap.
+
+The [paired-capture audit](../../work/aligned-extents-20261117/raw-capture-scope7-analysis.md)
+corrects a tool description: both endpoint WAN captures in this owned
+veth/HTB/netem lab observe post-qdisc survivors. All 11,216 TCP segment identities
+match one-to-one, with packet/frame-byte sums equal to netem transmitted deltas;
+1,221 forward and 786 reverse drops are absent. Captured IP bytes are distinct
+from socket-admitted bytes and from full physical-wire bytes. Historical captures
+are retained; their interpretation is corrected without rewriting observations.
+
+The owner also requested backpressure timing for all internal buffers. The full
+inventory must distinguish occupancy from downstream blockage, identify actual
+capacity and high-water occupancy, record cumulative and longest continuous
+blocked intervals plus transition reasons, and retain which owners are unmeasured.
+Overlapping buffer wait intervals must not be summed as elapsed wall time.
+Public protocol libraries retain injected time; no real clock, runtime dependency,
+per-packet log or unbounded trace is introduced. This requested instrumentation
+is planned; a first subset cannot qualify all internal buffers.
+
 ## Accepted direction and open engineering choices
 
 The subsequent source-stable

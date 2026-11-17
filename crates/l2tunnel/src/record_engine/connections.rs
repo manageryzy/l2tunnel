@@ -96,7 +96,7 @@ impl Connections {
         now: Tick,
         metadata: pipeline::PacketMetadata,
         bytes: &[u8],
-    ) -> Result<Option<ProfileIdentity>, Error> {
+    ) -> Result<Option<ObservedProfileIdentity>, Error> {
         let id = self
             .collection
             .owner(metadata.binding.channel)
@@ -126,12 +126,22 @@ impl Connections {
                     metadata.classification,
                     bytes,
                 )
-                .map(|identity| identity.map(ProfileIdentity::UnreliableNative))
+                .map(|identity| {
+                    identity.map(|identity| ObservedProfileIdentity {
+                        identity: ProfileIdentity::UnreliableNative(identity),
+                        encoding: NativeEncodingObservation::unencoded(bytes.len()),
+                    })
+                })
                 .map_err(Error::Connections);
         }
         self.collection
-            .offer_recovered(id, metadata.classification.key, duration(now), bytes)
-            .map(|identity| identity.map(ProfileIdentity::Connection))
+            .offer_recovered_observed(id, metadata.classification.key, duration(now), bytes)
+            .map(|value| {
+                value.map(|(identity, encoding)| ObservedProfileIdentity {
+                    identity: ProfileIdentity::Connection(identity),
+                    encoding: encoding.into(),
+                })
+            })
             .map_err(Error::Connections)
     }
 

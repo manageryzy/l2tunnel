@@ -499,6 +499,15 @@ impl Entry<'_> {
         self.engine.offer_identified(now, packet)
     }
 
+    /// Return encoding facts only after actual successful reserved-engine admission.
+    pub fn offer_observed(
+        &mut self,
+        now: u64,
+        packet: &[u8],
+    ) -> Result<records::ObservedAdmission, records::Error> {
+        self.engine.offer_observed(now, packet)
+    }
+
     /// Retain a packet on a checked selected channel using the actual shared budget.
     pub fn offer_on_channel_identified(
         &mut self,
@@ -508,6 +517,16 @@ impl Entry<'_> {
     ) -> Result<records::IdentifiedAdmission, records::Error> {
         self.engine
             .offer_on_channel_identified(now, channel, packet)
+    }
+
+    /// Observe selected-channel admission without exposing or replacing the reserved owner.
+    pub fn offer_on_channel_observed(
+        &mut self,
+        now: u64,
+        channel: records::ChannelId,
+        packet: &[u8],
+    ) -> Result<records::ObservedAdmission, records::Error> {
+        self.engine.offer_on_channel_observed(now, channel, packet)
     }
 
     /// Produce the exact borrowed body and actual algorithm branch without an ownership escape.

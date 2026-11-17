@@ -40,13 +40,22 @@ fn owned_exact_limits_and_movement_preserve_one_actual_duplex_engine() -> TestRe
     let channel = records::ChannelId::new(2).ok_or(Error::Stale)?;
     let admitted = moved
         .entry()
-        .offer_on_channel_identified(0, channel, &[0xad; 71])?;
+        .offer_on_channel_observed(0, channel, &[0xad; 71])?;
     assert_eq!(
         admitted,
-        IdentifiedAdmission::Accepted(records::NativeIdentity {
-            channel,
-            record: records::NativeRecordId(0)
-        })
+        records::ObservedAdmission::Accepted {
+            identity: records::NativeIdentity {
+                channel,
+                record: records::NativeRecordId(0)
+            },
+            encoding: records::NativeEncodingObservation {
+                original_native_bytes: 71,
+                context_bytes: 0,
+                encoded_body_bytes: 72,
+                framing_bytes: 2,
+                kind: crate::header::EncodingKind::Literal,
+            },
+        }
     );
     assert_eq!(moved.usage(), usage);
     Ok(())

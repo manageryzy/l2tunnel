@@ -269,11 +269,21 @@ fn actual_shared_pipeline_keeps_independent_loss_and_raw_ack_physical_custody_di
     };
     assert_eq!(metadata.binding.channel, 1);
     let admitted = b
-        .admit_borrowed(tick(6))?
+        .admit_borrowed_observed(tick(6))?
         .ok_or("same flow raw ACK admission")?;
     assert!(
-        matches!(admitted.permit, engine::ProfileIdentity::UnreliableNative(identity) if identity.owner.index() == 1)
+        matches!(admitted.permit.identity, engine::ProfileIdentity::UnreliableNative(identity) if identity.owner.index() == 1)
     );
+    assert_eq!(
+        admitted.permit.encoding.kind,
+        engine::NativeEncodingKind::Unencoded
+    );
+    assert_eq!(admitted.permit.encoding.original_native_bytes, ack.len());
+    assert_eq!(admitted.permit.encoding.encoded_body_bytes, ack.len());
+    assert_eq!(admitted.permit.encoding.context_bytes, 0);
+    assert_eq!(admitted.permit.encoding.framing_bytes, 0);
+    assert_eq!(admitted.permit.encoding.net_gain_bytes(), 0);
+    assert!(b.admit_borrowed_observed(tick(6))?.is_none());
     assert!(b.native_counts()?.admitted.iter().all(|count| *count == 0));
     let raw = b
         .poll(

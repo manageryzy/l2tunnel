@@ -98,9 +98,12 @@ fn compact_collection_loss_independent_progress_strong_feedback_and_reuse_keep_o
     let one = a.owner(1)?;
     let (first, key) = body(40000)?;
     let (second, other_key) = body(40001)?;
-    let original = a
-        .offer_recovered(zero, key, ms(0), &first)?
+    let (original, encoding) = a
+        .offer_recovered_observed(zero, key, ms(0), &first)?
         .ok_or("first admission")?;
+    assert_eq!(encoding.original_native_bytes, first.len());
+    assert!(encoding.encoded_body_bytes > 0);
+    assert!(encoding.framing_bytes > 0);
     a.offer_recovered(one, other_key, ms(0), &second)?
         .ok_or("independent admission")?;
     let mut bytes = vec![0; a.plan.send_max_packet_bytes()];

@@ -81,6 +81,8 @@ pub enum BodyKind {
 /// Nonoverlapping ranges of meaningful records in the caller's output buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncodedBodies {
+    /// Original native length used by this successful encoding, before compression.
+    pub original_native_bytes: usize,
     /// Context at `0..context_len`, either zero or 69 bytes.
     pub context_len: usize,
     /// Frame body at `context_len..context_len+body_len`.
@@ -92,6 +94,45 @@ impl EncodedBodies {
     /// Total meaningful bytes in the caller's buffer, excluding all symbol padding.
     pub fn written(self) -> usize {
         self.context_len + self.body_len
+    }
+    /// Observe this successful encoding before unit or fragment framing is added.
+    pub fn observation(self) -> NativeEncodingObservation {
+        NativeEncodingObservation {
+            original_native_bytes: self.original_native_bytes,
+            context_bytes: self.context_len,
+            encoded_body_bytes: self.body_len,
+            framing_bytes: 0,
+            kind: self.kind,
+        }
+    }
+}
+/// One successfully encoded native packet, never a retry or physical receipt.
+/// Body bytes include the body's own tag/length syntax. Context is separate.
+/// Sender observations add the complete packet's channel/serial and fragment
+/// framing, excluding packing containers, recovery, Records and carrier bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEncodingObservation {
+    /// Exact original native packet length, including meaningful zero bytes.
+    pub original_native_bytes: usize,
+    /// Separate context records emitted because of this native packet.
+    pub context_bytes: usize,
+    /// Complete encoded native body, including its internal syntax.
+    pub encoded_body_bytes: usize,
+    /// Generated unit/fragment framing; zero for the body encoder alone.
+    pub framing_bytes: usize,
+    /// Actual selected body encoding; LZ4 gain is whole-packet, not header-only.
+    pub kind: BodyKind,
+}
+impl NativeEncodingObservation {
+    /// Signed original minus context/body bytes; expansion is negative.
+    pub fn codec_net_gain_bytes(self) -> i128 {
+        self.original_native_bytes as i128
+            - self.context_bytes as i128
+            - self.encoded_body_bytes as i128
+    }
+    /// Signed gain after complete unit/fragment framing, before packing/recovery.
+    pub fn net_gain_bytes(self) -> i128 {
+        self.codec_net_gain_bytes() - self.framing_bytes as i128
     }
 }
 /// How the caller presents one complete body.
@@ -356,6 +397,7 @@ impl Encoder {
             body_len -= 2;
         }
         let result = EncodedBodies {
+            original_native_bytes: frame.len(),
             context_len,
             body_len,
             kind: kind(self.scratch[context_len])?,

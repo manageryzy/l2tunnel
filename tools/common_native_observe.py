@@ -18,8 +18,42 @@ RECORD_METRICS = ('algorithm_bytes', 'final_record_bytes', 'record_overhead_byte
 EXTENT_METRICS = ('route_header_bytes', 'fragment_header_bytes', 'recovery_header_bytes',
                   'systematic_coded_fill_bytes', 'codec_envelope_bytes', 'codec_container_bytes',
                   'codec_unit_header_bytes', 'codec_body_bytes')
+JOINED_METRICS = ('socket_ip_bytes', 'socket_ip_over_record_bytes',
+                  'record_outside_codec_body_bytes', 'socket_ip_outside_codec_body_bytes')
 CODEC_COVERAGE = ('envelope_only', 'fragmented_units', 'swift_stream', 'fragmented_record',
                   'not_applicable', 'unencoded_native')
+NATIVE_ENCODING_KINDS = ('aligned_timestamp', 'aligned_raw', 'aligned_lz4', 'aligned_delta',
+                         'aligned_elided', 'aligned_predictive', 'aligned_timestamp_pair',
+                         'swift_literal', 'swift_literal_context', 'swift_delta', 'unencoded')
+
+
+def validate_native_encoding(value):
+    """Validate once-per-admission totals separately from emitted-record counts."""
+    if (not isinstance(value, dict) or type(value.get('counter_overflow')) is not int
+            or value['counter_overflow'] != 0):
+        raise ValueError('native encoding counters absent or overflowed')
+    unsigned_keys = ('inputs', 'original_bytes', 'context_bytes', 'encoded_body_bytes', 'framing_bytes')
+    result = {}
+    for label in ('native_packet', 'proxy_record'):
+        forms = value.get(label)
+        if not isinstance(forms, dict) or set(forms) != set(NATIVE_ENCODING_KINDS):
+            raise ValueError('native encoding forms incomplete')
+        result[label] = {}
+        for name, item in forms.items():
+            if (not isinstance(item, dict) or set(item) != set(unsigned_keys)
+                    | {'codec_net_gain_bytes', 'net_gain_bytes'}
+                    or any(type(item[key]) is not int or item[key] < 0 for key in unsigned_keys)
+                    or any(type(item[key]) is not int for key in ('codec_net_gain_bytes', 'net_gain_bytes'))):
+                raise ValueError('native encoding totals invalid')
+            codec_gain = item['original_bytes'] - item['context_bytes'] - item['encoded_body_bytes']
+            if (codec_gain != item['codec_net_gain_bytes']
+                    or codec_gain - item['framing_bytes'] != item['net_gain_bytes']
+                    or (item['inputs'] == 0 and any(item[key] for key in unsigned_keys))):
+                raise ValueError('native encoding signed gains or empty population differ')
+            result[label][name] = {**item,
+                'mean_codec_net_gain_bytes': codec_gain / item['inputs'] if item['inputs'] else None,
+                'mean_net_gain_bytes': item['net_gain_bytes'] / item['inputs'] if item['inputs'] else None}
+    return result
 
 
 class ExtentMetricsError(ValueError):
@@ -50,8 +84,10 @@ def distribution(histogram):
 def capture_summary(path, addresses, sample_wall_ns=None):
     """Count observed IP lengths, never infer plaintext or per-packet encapsulation.
 
-Endpoint WAN capture contains local egress before qdisc and remote ingress after
-loss. Each surface is separate; summing the two would double-count delivery.
+The owned veth/HTB/netem lab observes post-qdisc survivors at both endpoint WAN
+surfaces, verified against paired packet identities and qdisc counters. Capture
+placement is lab-specific; it is not a pre-loss admission counter. Each surface
+is separate; summing the two would double-count delivery.
 """
     if path.is_symlink() or not path.is_file() or path.stat().st_size >= CAPTURE_BYTES:
         raise ValueError('capture absent, non-regular, or byte ceiling exhausted')
@@ -152,7 +188,7 @@ def validate_wire_metrics(value, carrier):
     """Validate the actual opt-in report; invalid samples never qualify overhead."""
     def unsigned(number):
         return type(number) is int and number >= 0
-    if (type(value.get('schema')) is not int or value['schema'] not in (1, 2)
+    if (type(value.get('schema')) is not int or value['schema'] not in (1, 2, 3)
             or type(value.get('invalid_samples')) is not int or value['invalid_samples'] != 0
             or type(value.get('counter_overflow')) is not int or value['counter_overflow'] != 0):
         raise ValueError('wire observer invalid samples, counter overflow, or unknown schema')
@@ -227,6 +263,23 @@ def validate_wire_metrics(value, carrier):
             raise ValueError('schema2 observer allocation totals differ')
         result = {**result, 'extent_samples': populations, 'extent_totals': extent_totals,
                   'codec_coverage': coverage, 'extent_errors': 0}
+        if value['schema'] == 3:
+            ip_samples = samples if carrier in ('udp', 'raw') else 0
+            joined_samples = dict(zip(JOINED_METRICS, (ip_samples, ip_samples, codec,
+                                                       codec if ip_samples else 0)))
+            joined_totals = {name: histogram(name, count) for name, count in joined_samples.items()}
+            if ip_samples and (joined_totals['socket_ip_bytes'] != totals['final_record_bytes']
+                               + joined_totals['socket_ip_over_record_bytes']):
+                raise ValueError('actual IP bytes differ from Records plus actual outer bytes')
+            # The codec population is a subset. Its joined histogram cannot be
+            # reconstructed by subtracting independent whole-owner histograms.
+            if joined_totals['record_outside_codec_body_bytes'] > totals['final_record_bytes']:
+                raise ValueError('joined codec framing exceeds all accepted Records bytes')
+            if (ip_samples and joined_totals['socket_ip_outside_codec_body_bytes']
+                    < joined_totals['record_outside_codec_body_bytes']):
+                raise ValueError('joined IP codec framing is shorter than Records framing')
+            result.update(joined_samples=joined_samples, joined_totals=joined_totals)
+            result['native_encoding'] = validate_native_encoding(value.get('native_encoding'))
     except ValueError as error:
         # Runtime validation still refuses the complete observation. An offline
         # reader may retain the independently valid three base histograms.

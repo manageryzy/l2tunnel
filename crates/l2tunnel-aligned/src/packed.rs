@@ -206,17 +206,23 @@ impl SenderOwner {
         channel: ChannelId,
         frame: &[u8],
         now: Duration,
-    ) -> Result<receiver::RecordIdentity, Error> {
+    ) -> Result<
+        (
+            receiver::RecordIdentity,
+            l2tunnel_codec::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
         match self {
             Self::Aligned(s) => match policy {
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
-                    s[0].stage_identified(channel, frame)
+                    s[0].stage_observed(channel, frame)
                 }
                 NativePolicy::RawIp | NativePolicy::RawEthernet => {
-                    s[0].stage_raw_identified(channel, frame)
+                    s[0].stage_raw_observed(channel, frame)
                 }
                 NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
-                    s[0].stage_lz4_identified(channel, frame)
+                    s[0].stage_lz4_observed(channel, frame)
                 }
             }
             .map_err(|e| {
@@ -228,13 +234,13 @@ impl SenderOwner {
             }),
             Self::Packed(s) => match policy {
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
-                    s[0].stage_identified(channel, frame, micros(now)?)
+                    s[0].stage_observed(channel, frame, micros(now)?)
                 }
                 NativePolicy::RawIp | NativePolicy::RawEthernet => {
-                    s[0].stage_raw_identified(channel, frame, micros(now)?)
+                    s[0].stage_raw_observed(channel, frame, micros(now)?)
                 }
                 NativePolicy::Lz4Ethernet | NativePolicy::Lz4Ip => {
-                    s[0].stage_lz4_identified(channel, frame, micros(now)?)
+                    s[0].stage_lz4_observed(channel, frame, micros(now)?)
                 }
             }
             .map_err(|e| {
@@ -380,6 +386,21 @@ impl Endpoint {
         now: Duration,
     ) -> Result<receiver::RecordIdentity, Error> {
         self.0.enqueue_identified(channel, frame, now)
+    }
+    /// Return one encoding observation only after the complete native admission succeeds.
+    pub fn enqueue_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<
+        (
+            receiver::RecordIdentity,
+            l2tunnel_codec::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.0.enqueue_observed(channel, frame, now)
     }
     /// Inspect source units through the same authoritative recovery/envelope parsers.
     pub fn outgoing_units(
