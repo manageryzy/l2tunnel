@@ -1600,6 +1600,14 @@ impl Driver {
             Err(record_bank::Error::Engine(engine::Error::Connections(error)))
                 if error.is_backpressure() =>
             {
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    buffer_metrics::authenticated_input_dropped(
+                        runtime,
+                        now,
+                        kind,
+                        engine::Error::Connections(error),
+                    );
+                }
                 self.counters.native_backpressure_drops =
                     self.counters.native_backpressure_drops.saturating_add(1);
                 Ok(())
@@ -1607,6 +1615,14 @@ impl Driver {
             Err(record_bank::Error::Engine(engine::Error::Aligned(error)))
                 if error.is_backpressure() =>
             {
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    buffer_metrics::authenticated_input_dropped(
+                        runtime,
+                        now,
+                        kind,
+                        engine::Error::Aligned(error),
+                    );
+                }
                 self.counters.native_backpressure_drops =
                     self.counters.native_backpressure_drops.saturating_add(1);
                 Ok(())

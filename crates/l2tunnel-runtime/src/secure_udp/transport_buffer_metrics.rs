@@ -158,3 +158,64 @@ pub(super) fn admission_refused(
         );
     }
 }
+
+/// Count actual authenticated inputs discarded by the existing pressure branches.
+/// These are aggregate counts across epochs/connection owners, never wait intervals.
+/// Unrepresented non-ARQ pressure retains its existing native_backpressure_drops count.
+pub(super) fn authenticated_input_dropped(
+    runtime: &mut common::Runtime,
+    now: u64,
+    kind: l2tunnel::record_engine::EmissionKind,
+    error: l2tunnel::record_engine::Error,
+) {
+    use l2tunnel::record_engine::{EmissionKind, Error as EngineError};
+    use l2tunnel_recovery::{BufferSide, RecoveryError};
+    let Some(metrics) = runtime
+        .buffer_metrics
+        .as_mut()
+        .filter(|value| !value.is_finished())
+    else {
+        return;
+    };
+    let aligned = match error {
+        EngineError::Aligned(error)
+        | EngineError::Connections(l2tunnel::connection_records::Error::Endpoint(error)) => error,
+        _ => return,
+    };
+    let pressure = match aligned {
+        l2tunnel_aligned::Error::RecoveryPressure(error)
+        | l2tunnel_aligned::Error::Recovery(error) => error,
+        _ => return,
+    };
+    let l2tunnel_reliable::Error::Arq(error) = pressure else {
+        return;
+    };
+    let (site, reason) = match error {
+        RecoveryError::Capacity(BufferSide::Send) => (Site::RecoverySend, Reason::BufferCapacity),
+        RecoveryError::Capacity(BufferSide::Receive) => {
+            (Site::RecoveryReceive, Reason::BufferCapacity)
+        }
+        // This hook is specifically on authenticated input admission. The
+        // selected receiver refused its horizon, not a local source submission.
+        RecoveryError::SequenceWindow => (Site::RecoveryReceive, Reason::RecoveryWindow),
+        // Transmission history belongs to local outgoing attempts, including
+        // when a receive operation exposes its current capacity refusal.
+        RecoveryError::HistoryCapacity => (Site::RecoverySend, Reason::RecoveryHistoryCapacity),
+        // FeedbackAwaitingPhysical retains the exact input in another branch;
+        // terminal errors and unsupported pressure kinds are not dropped here.
+        _ => return,
+    };
+    let class = match kind {
+        EmissionKind::Feedback => MetricClass::Feedback,
+        _ => MetricClass::User,
+    };
+    let _ = metrics.collector().refused(
+        Key {
+            site,
+            lane: Lane::Shared,
+            class,
+        },
+        reason,
+        now,
+    );
+}

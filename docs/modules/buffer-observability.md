@@ -405,3 +405,76 @@ candidates separately: operation, retained outcome, sealed and unsealed User,
 raw control, and deferred feedback. It preserves the existing minimum/deadline
 semantics. Raw per-slot identities are unavailable at this boundary; the trace
 does not infer them from a later sample.
+
+### Native11 and bounded scheduling follow-up
+
+The source-bound [release11 receipt](../../work/aligned-extents-20261117/matrix-source-binding-11.json)
+identifies checkpoint `4c237db`; both renewed native cases fail. Raw remains in
+PacketConfirmation at the original 30-second service cap. Its client consumed all
+32 shared transition copies on Hello before the delayed peer Hello arrived, so
+no first Commit could be sent. The current correction reserves two of those same
+32 attempts for the role's Commit/CommitAck, keeps the 250ms cadence and original
+absolute cap, and avoids advertising an expired Hello wake while waiting for a
+peer prerequisite. It reduces maximum Hello copies to 30; arbitrary losses can
+still exhaust the original bound. Both focused transition regressions now pass;
+the actual native correction remains unqualified. The
+[phase-budget investigation](../../work/aligned-extents-20261117/raw-native11-root-cause1/report.md)
+joins packet extents with retained owner state. `hello_reply` requests a local
+Hello resend; it is not a separate wire message or required peer-ack stage.
+
+UDP/Aligned fails at source 7127 after nine attempts. Both endpoints report zero
+authenticated-input pressure drops, authentication rejects and replay rejects.
+The [packet/counter analysis](../../work/aligned-extents-20261117/native11-udp-failure-analysis.json)
+finds the final-attempt candidate at both complete WAN capture surfaces. Its
+identity is inferred from the selected one-copy attempt/packet numbering and exact
+length, not decrypted payload. Receiver delivery still stops at 7127. Kernel UDP
+queue loss is a hypothesis, not established by these receipts. The observer now
+samples owned-namespace SNMP, UDP socket tables and sockstat with before/after
+qdisc observations; these are counters/gauges, never blocked intervals.
+
+The failed-run CPU sample spans 3.910751 seconds: sender user/kernel time is
+2.16/1.09 seconds and receiver 2.98/0.58 seconds. Host-wide load is separate. The
+[current mixed-version matrix](../../work/aligned-extents-20261117/matrix-report-repairs11-complete1/report.md)
+still retains every prior phase; this is not complete same-build qualification.
+The [two native buffer reports](../../work/aligned-extents-20261117/buffer-native11-report1/report.md)
+have no observed timed episode; unhooked internal waits remain unavailable.
+
+The next source batch removes two avoidable costs without changing protocol caps:
+CompactARQ samples/retires only the newly echoed contiguous history span instead
+of scanning all 131072 allocated slots, and maintained carriers settle already
+retained whole-send receipts before their cooperative yield. The latter preserves
+normal identity/Research-order checks, fresh observation time and cancellation
+before new I/O; it does not backdate a callback or qualify the 50ms proxy deadline.
+The [history validation](../../work/aligned-extents-20261117/history-range-validation1/receipt.json)
+passes 68 recovery tests, one doctest and strict Clippy, including same-source
+retry wrap and encoder refusal/error without serial holes.
+
+Authenticated Aligned/nested-Connections input pressure now retains typed aggregate
+ARQ receive/send capacity, receive horizon and transmission-history refusal counts
+in the existing provider. Dropped inputs do not start timed waits. These counters
+aggregate epochs/connection owners and do not implement per-owner occupancy or
+all BP-05/BP-07 intervals. Other BP rows and full overhead mean/p99 remain open.
+
+The [required check5 attempt](../../work/aligned-extents-20261117/required-buffer-checks5-attempt1/validation.json)
+passes preflight, strict workspace Clippy, all 310 runtime tests and all 196 client
+core tests, including the retained TLS and genuine QUIC measured-proxy cases.
+Its only aggregate failure is the new delayed-Hello regression. Separate focused
+clock/copy diagnostics retain that failure instead of discarding it. Strict
+rustdoc, CLI plan/rejection and the real external Common CLI probe subsequently
+pass in the [remaining-stage receipt](../../work/aligned-extents-20261117/required-buffer-checks5-remaining1.json).
+That continuation records concurrent changes only to the raw test fixture; none
+of its commands compile that test module. Unchanged codec no-default and Python
+harness/simulator checks retain their earlier receipts. These scoped results do
+not constitute a fresh all-green aggregate or native performance qualification.
+
+The [final focused raw continuation](../../work/aligned-extents-20261117/raw-reservation-final1/receipt.json)
+passes formatting, strict raw all-target/all-feature Clippy and both transition
+regressions, including all four first-Commit/first-CommitAck loss combinations.
+The initial fixture negotiated only 8576 bytes from 16 packet slots, so its
+21-copy stop was correct credit enforcement before the intended budget boundary.
+Only this new fixture now selects 32 initial packet slots and asserts its actual
+peer horizon can hold all 32 Hello payloads. Shared defaults, production limits,
+250ms cadence and the original 10-second absolute test cap remain unchanged.
+Failed attempts and their exact credit observations remain retained. Required
+check5 plus its focused and remaining-stage continuations provide scoped passing
+coverage; the original aggregate process remains recorded as failed.

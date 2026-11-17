@@ -337,6 +337,24 @@ impl State {
         self.history[(serial % self.history.len() as u64) as usize]
             .filter(|entry| entry.serial == serial)
     }
+    // Successful attempts append contiguous serials; only a sampled echo retires
+    // a prefix. Occupied modulo slots prevent the live span exceeding history.
+    // Return that prefix as at most two bounded slices, without scanning idle
+    // slots or allocating. The serial guard at each caller also preserves newer
+    // occupants if an old echo names a reused modulo slot.
+    fn history_prefix_ranges(&self, echo: u64) -> [std::ops::Range<usize>; 2] {
+        let count = echo
+            .saturating_sub(self.sampled)
+            .min(self.history.len() as u64) as usize;
+        if count == 0 {
+            return [0..0, 0..0];
+        }
+        // count > 0 and count <= echo make the addition safe even at u64::MAX.
+        let first_serial = echo - count as u64 + 1;
+        let first = (first_serial % self.history.len() as u64) as usize;
+        let first_count = count.min(self.history.len() - first);
+        [first..first + first_count, 0..count - first_count]
+    }
     fn rto_with(&self, srtt: Option<f64>, rttvar: f64) -> Result<Duration, RecoveryError> {
         let feedback = 2.0 * self.send.timing.feedback_interval.as_secs_f64();
         seconds_duration(match srtt {
@@ -1006,9 +1024,9 @@ impl Engine {
                         ),
                     };
                     if state
-                        .history
-                        .iter()
-                        .flatten()
+                        .history_prefix_ranges(feedback.echo)
+                        .into_iter()
+                        .flat_map(|range| state.history[range].iter().flatten())
                         .any(|entry| entry.serial <= feedback.echo && entry.accepted.is_none())
                     {
                         return Err(RecoveryError::FeedbackAwaitingPhysical);
@@ -1037,12 +1055,15 @@ impl Engine {
         }
         let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
         if let Some((srtt, variance)) = sample {
+            let retired = state.history_prefix_ranges(feedback.echo);
             state.srtt = Some(srtt);
             state.rttvar = variance;
             state.sampled = feedback.echo;
-            for entry in &mut state.history {
-                if entry.is_some_and(|entry| entry.serial <= feedback.echo) {
-                    *entry = None;
+            for range in retired {
+                for entry in &mut state.history[range] {
+                    if entry.is_some_and(|entry| entry.serial <= feedback.echo) {
+                        *entry = None;
+                    }
                 }
             }
         }

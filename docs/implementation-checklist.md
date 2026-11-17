@@ -70,6 +70,14 @@ Raw setup and proxy timeline diagnostics pass their focused fixtures; the
 retains both measured-proxy failures and the unexplained aggregate raw custody
 expiry despite its passing focused rerun.
 No parent gate closes through these observations.
+The [native11 continuation](modules/buffer-observability.md#native11-and-bounded-scheduling-follow-up)
+retains failed UDP retry/raw setup cases, identifies shared raw transition-budget
+starvation, and implements bounded phase reservation, pre-yield retained-receipt
+settlement, prefix-only ARQ history work and typed count-only receive refusals.
+History, runtime/client and final focused raw checks pass. The failed aggregate
+and its passing focused/remaining-stage continuations remain separate receipts;
+renewed native validation is pending. BP-01..BP-24 and full matrix/overhead gates
+remain open.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a

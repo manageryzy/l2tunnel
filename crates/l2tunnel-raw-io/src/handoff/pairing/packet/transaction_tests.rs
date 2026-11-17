@@ -1186,3 +1186,304 @@ async fn full_upper_feedback_piggybacks_retirement_before_idle_window_claims_slo
 
 #[path = "compact_tests.rs"]
 mod compact_tests;
+
+mod transition_reservation {
+    use super::*;
+
+    fn reservation_inputs(inputs: RawInputs<PacketLink>, fault: Arc<Fault>) -> R<RawInputs<Link>> {
+        let RawInputs::Full(mut input) = wrap(inputs, fault) else {
+            return Err("full reservation fixture required".into());
+        };
+        // The ordinary sixteen-slot fixture advertises only 16 * 536 bytes,
+        // which correctly stops at twenty-one unretired Hellos. This test needs
+        // enough actual initial window to reach the existing transition limit.
+        input.config.packet_slots = 32;
+        Ok(RawInputs::Full(input))
+    }
+
+    fn failure(
+        stage: &str,
+        losses: (bool, bool),
+        a: &PacketSetup<'_, Link>,
+        b: &PacketSetup<'_, Link>,
+        error: &dyn std::fmt::Display,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        format!(
+            "delayed Hello {stage}, lost Commit/Ack={losses:?}, now={:?}: {error}; client={:?}; server={:?}",
+            Instant::now(),
+            a.diagnostic_snapshot(),
+            b.diagnostic_snapshot(),
+        )
+        .into()
+    }
+
+    fn poll_peer(
+        setup: &mut PacketSetup<'_, Link>,
+        ready: &mut Option<PacketCarrier<Link>>,
+        fault: &Fault,
+        lose: Option<wire::Kind>,
+        loss_observed: &mut bool,
+        cx: &mut Context<'_>,
+    ) -> R {
+        let carrier = ready.as_ref().or(setup.carrier.as_ref());
+        if !*loss_observed
+            && let Some(kind) = lose
+            && carrier.is_some_and(|carrier| {
+                carrier.lanes[0]
+                    .as_ref()
+                    .and_then(|lane| lane.pending.as_ref())
+                    .is_some_and(|pending| pending.kind == kind)
+            })
+        {
+            // The test targets the actual selected phase, not ciphertext shape
+            // or a guessed ordinal. PacketIo still reports a complete lost send.
+            let index = fault.phases.load(Ordering::SeqCst) + 1;
+            fault.drops.lock().map_err(|_| "test lock")?.push(index);
+            *loss_observed = true;
+        }
+        if let Some(carrier) = ready {
+            if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                return Err(error.into());
+            }
+        } else if let Poll::Ready(result) = Pin::new(setup).poll(cx) {
+            *ready = Some(result?);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_peer_hello_reserves_original_final_attempts_and_keeps_loss_recovery() -> R {
+        for (lose_commit, lose_ack) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (c, s, m, allow) = support::fixture()?;
+            let (a, b, _) = support::inputs(false);
+            let af = Arc::new(Fault::default());
+            let bf = Arc::new(Fault::default());
+            // Retain the server's exact first Hello in actual PacketIo custody.
+            // The client keeps receiving no peer Hello while its sends complete.
+            bf.blocked.store(true, Ordering::SeqCst);
+            let mut a = begin_packet_client(
+                reservation_inputs(a, af.clone())?,
+                &c,
+                "tunnel.test",
+                &m,
+                config(),
+            )?;
+            let mut b =
+                begin_packet_server(reservation_inputs(b, bf.clone())?, &s, &allow, config())?;
+            let original_caps = [a.deadline, b.deadline];
+            poll_fn(|cx| -> Poll<R> {
+                for setup in [&mut a, &mut b] {
+                    match Pin::new(&mut *setup).poll(cx) {
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                        Poll::Ready(Ok(_)) => {
+                            return Poll::Ready(Err("early completion".into()));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if a.carrier.is_some()
+                    && b.carrier.is_some()
+                    && bf.pending.lock().map_err(|_| "test lock")?.is_some()
+                {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+            .map_err(|error| {
+                failure("bootstrap", (lose_commit, lose_ack), &a, &b, error.as_ref())
+            })?;
+            let hello_bytes = config().packet.overhead() - 40 + wire::HEADER + wire::HELLO;
+            for setup in [&a, &b] {
+                let lane = setup
+                    .carrier
+                    .as_ref()
+                    .and_then(|carrier| carrier.lanes[0].as_ref())
+                    .ok_or("actual reservation lane")?;
+                let state = lock(&lane.io.state)?;
+                let fence = state.fence.as_ref().ok_or("actual reservation fence")?;
+                assert!(
+                    fence.peer_horizon >= u64::from(TRANSITION_MAX_COPIES) * hello_bytes as u64,
+                    "the actual peer window must admit all transition copies without returned retirement"
+                );
+            }
+            poll_fn(|cx| -> Poll<R> {
+                for setup in [&mut a, &mut b] {
+                    match Pin::new(&mut *setup).poll(cx) {
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                        Poll::Ready(Ok(_)) => return Poll::Ready(Err("early completion".into())),
+                        Poll::Pending => {}
+                    }
+                }
+                if a.carrier.as_ref().is_some_and(|carrier| {
+                    carrier.lanes[0].as_ref().is_some_and(|lane| {
+                        lane.copies == TRANSITION_MAX_COPIES - TRANSITION_FINAL_RESERVE
+                            && lane.pending.is_none()
+                    })
+                }) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+            .map_err(|error| {
+                failure(
+                    "waiting for thirty Hellos",
+                    (lose_commit, lose_ack),
+                    &a,
+                    &b,
+                    error.as_ref(),
+                )
+            })?;
+            // Cross the old thirty-two-Hello exhaustion interval without
+            // renewing setup, resetting copies or changing the retry cadence.
+            tokio::time::advance(Duration::from_secs(1)).await;
+            poll_fn(|cx| -> Poll<R> {
+                for setup in [&mut a, &mut b] {
+                    if let Poll::Ready(result) = Pin::new(setup).poll(cx) {
+                        return Poll::Ready(Err(match result {
+                            Err(error) => error.into(),
+                            Ok(_) => "early completion".into(),
+                        }));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            })
+            .await
+            .map_err(|error| {
+                failure(
+                    "after the delayed interval",
+                    (lose_commit, lose_ack),
+                    &a,
+                    &b,
+                    error.as_ref(),
+                )
+            })?;
+            let client = a.carrier.as_ref().ok_or("actual client carrier")?;
+            let lane = client.lanes[0].as_ref().ok_or("actual client lane")?;
+            assert_eq!(lane.copies, 30);
+            assert!(!lane.hello);
+            assert!(lane.transition_kind(true, false, false, false).is_none());
+            assert!(client.next_wake()? > Instant::now());
+            assert_eq!(af.phases.load(Ordering::SeqCst), 30);
+            assert_eq!([a.deadline, b.deadline], original_caps);
+            assert_eq!(
+                b.carrier
+                    .as_ref()
+                    .and_then(|carrier| carrier.lanes[0].as_ref())
+                    .and_then(|lane| lane.pending.as_ref())
+                    .map(|pending| pending.kind),
+                Some(wire::Kind::Hello),
+                "the withheld packet must be the server's actual first Hello"
+            );
+            bf.blocked.store(false, Ordering::SeqCst);
+            let (mut ar, mut br) = (None, None);
+            let (mut commit_lost, mut ack_lost) = (false, false);
+            poll_fn(|cx| -> Poll<R> {
+                poll_peer(
+                    &mut a,
+                    &mut ar,
+                    &af,
+                    lose_commit.then_some(wire::Kind::Commit),
+                    &mut commit_lost,
+                    cx,
+                )?;
+                poll_peer(
+                    &mut b,
+                    &mut br,
+                    &bf,
+                    lose_ack.then_some(wire::Kind::CommitAck),
+                    &mut ack_lost,
+                    cx,
+                )?;
+                if ar.is_some() && br.is_some() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+            .map_err(|error| {
+                failure(
+                    "completing final phases",
+                    (lose_commit, lose_ack),
+                    &a,
+                    &b,
+                    error.as_ref(),
+                )
+            })?;
+            assert_eq!((commit_lost, ack_lost), (lose_commit, lose_ack));
+            let client = ar.ok_or("ready client")?;
+            let server = br.ok_or("ready server")?;
+            for (carrier, cap) in [(&client, original_caps[0]), (&server, original_caps[1])] {
+                assert!(carrier.ready);
+                assert_eq!(carrier.setup_deadline(), cap);
+                assert!(Instant::now() < cap);
+                assert!(carrier.lanes.iter().flatten().all(|lane| lane.copies <= 32));
+            }
+            assert!(client.lanes[0].as_ref().ok_or("client lane")?.sent_commit);
+            assert!(server.lanes[0].as_ref().ok_or("server lane")?.sent_ack);
+            assert!(af.phases.load(Ordering::SeqCst) <= 32);
+            assert!(bf.phases.load(Ordering::SeqCst) <= 32);
+            client.abort();
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserved_attempt_selection_and_wake_preserve_total_limit_and_original_expiry() -> R {
+        let (mut client, server) = run(
+            false,
+            Arc::new(Fault::default()),
+            Arc::new(Fault::default()),
+            false,
+        )
+        .await?;
+        // Exercise both roles' selection against the same actual retained lane;
+        // no packets are sent while setting up these finite boundary states.
+        let lane = client.lanes[0].as_mut().ok_or("actual lane")?;
+        assert!(lane.pending.is_none());
+        lane.copies = 30;
+        lane.hello_reply = true;
+        lane.last_transition_kind = Some(wire::Kind::Commit);
+        assert_eq!(
+            lane.transition_kind(true, false, true, false),
+            Some(wire::Kind::Commit)
+        );
+        assert_eq!(
+            lane.transition_kind(false, false, true, true),
+            Some(wire::Kind::CommitAck)
+        );
+        assert_eq!(lane.transition_kind(false, false, true, false), None);
+        assert_eq!(lane.transition_kind(true, false, false, false), None);
+        lane.copies = 31;
+        assert_eq!(
+            lane.transition_kind(true, false, true, false),
+            Some(wire::Kind::Commit)
+        );
+        lane.copies = 32;
+        assert_eq!(lane.transition_kind(true, false, true, false), None);
+        assert_eq!(lane.transition_kind(false, false, true, true), None);
+        assert!(!lane.retry_due(Instant::now() + Duration::from_secs(1)));
+        client.ready = false;
+        lane.last_transition = Some(Instant::now() - Duration::from_secs(1));
+        // Refresh only the existing physical-service tick to exclude that
+        // independent ready event from this transition-deadline assertion.
+        client
+            .tick
+            .as_mut()
+            .reset(Instant::now() + Duration::from_millis(1));
+        assert!(client.next_wake()? > Instant::now());
+        let cap = client.setup_deadline();
+        tokio::time::advance(cap - Instant::now()).await;
+        assert!(matches!(client.check_live(), Err(Error::Expired)));
+        assert!(client.lanes.iter().all(Option::is_none));
+        assert_eq!(client.setup_deadline(), cap);
+        server.abort();
+        Ok(())
+    }
+}

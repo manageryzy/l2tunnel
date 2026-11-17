@@ -261,6 +261,15 @@ impl MaintainedIo {
         self.user = None;
         complete(result).map(|progress| Some((identity, progress)))
     }
+    pub(super) fn receipt_ready(&self) -> bool {
+        self.user
+            .as_ref()
+            .is_some_and(|user| user.pending.result.is_some())
+            || self
+                .control
+                .as_ref()
+                .is_some_and(|control| control.pending.result.is_some())
+    }
     pub(super) fn user_accepted_at(&self) -> Option<Instant> {
         self.user
             .as_ref()

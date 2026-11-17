@@ -133,10 +133,12 @@ pub enum Reason {
     ReceiptWait,
     PolicyCredit,
     Dependency,
+    /// Actual CompactARQ transmission-history slot refusal.
+    RecoveryHistoryCapacity,
 }
 
 impl Reason {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::QueueFull,
         Self::ByteCapacity,
         Self::PeerCredit,
@@ -155,6 +157,7 @@ impl Reason {
         Self::ReceiptWait,
         Self::PolicyCredit,
         Self::Dependency,
+        Self::RecoveryHistoryCapacity,
     ];
 }
 

@@ -653,3 +653,258 @@ fn retry_failure_snapshot_distinguishes_fast_limit_before_armed_timeout() -> Res
     assert_eq!(sender.retry_failure_snapshot(), Some(snapshot));
     Ok(())
 }
+
+mod history_range {
+    use super::*;
+
+    fn owner() -> Result<CompactRepeat> {
+        Ok(CompactRepeat::new(
+            config(CompactRecovery::Guarded, 16, 3, 78)?,
+            context(EndpointRole::Initiator),
+        )?)
+    }
+
+    fn apply(
+        owner: &mut CompactRepeat,
+        prefix: u64,
+        echo: u64,
+        serial: u64,
+        received: Duration,
+        observed: Duration,
+    ) -> std::result::Result<(), RecoveryError> {
+        owner.receive_view_at(
+            CompactPacketView::Feedback(CompactFeedback {
+                prefix,
+                start: prefix,
+                count: 0,
+                echo,
+                receiver_delay_us: 0,
+                serial,
+                bitmap: &[],
+            }),
+            received,
+            observed,
+        )
+    }
+
+    fn history(owner: &CompactRepeat) -> Result<Vec<(u64, Option<Duration>)>> {
+        let state = owner.engine.compact.as_ref().ok_or("selected state")?;
+        let mut entries = state
+            .history
+            .iter()
+            .flatten()
+            .map(|entry| (entry.serial, entry.accepted))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.0);
+        Ok(entries)
+    }
+
+    fn prepare(owner: &mut CompactRepeat, now: Duration) -> Result<PhysicalTransmission> {
+        let source = SourceId(owner.submit(b"held", now)?);
+        owner
+            .poll_source(now, &mut [0; 128])?
+            .ok_or("prepared source")?;
+        Ok(owner.pending_transmission(source).ok_or("actual token")?)
+    }
+
+    #[test]
+    fn history_range_same_source_retries_wrap_without_encoder_refusal_holes() -> Result {
+        let mut owner = owner()?;
+        let source = SourceId(owner.submit(b"retry", ms(0))?);
+        let mut now = ms(0);
+        for serial in 1..=7 {
+            let before = history(&owner)?;
+            assert_eq!(
+                owner.poll_source_with::<u64, ()>(now, |_| Ok(None)),
+                Ok(None)
+            );
+            assert_eq!(
+                owner.poll_source_with::<u64, u8>(now, |_| Err(7)),
+                Err(CompactPollError::Encode(7))
+            );
+            assert_eq!(history(&owner)?, before);
+            assert_eq!(owner.engine.next_transmission, serial - 1);
+            let selected = owner.poll_source_with::<u64, RecoveryError>(now, |view| {
+                let CompactPacketView::Data {
+                    source: actual,
+                    serial,
+                    ..
+                } = view
+                else {
+                    return Err(RecoveryError::MalformedPacket);
+                };
+                assert_eq!(actual, source);
+                Ok(Some(serial))
+            })?;
+            assert_eq!(selected, Some(serial));
+            let token = owner
+                .pending_transmission(source)
+                .ok_or("actual retry token")?;
+            owner.confirm_transmission_at(now, now, token)?;
+            let arrival = now + ms(35);
+            // Sample the attempt while explicitly leaving the source missing.
+            apply(&mut owner, 0, serial, serial, arrival, arrival)?;
+            assert!(history(&owner)?.is_empty());
+            assert_eq!(owner.retained().send_records, 1);
+            now = owner.source_deadline().ok_or("next finite retry")?;
+        }
+        assert_eq!(owner.statistics().transmissions, 7);
+        assert_eq!(owner.statistics().retransmissions, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_wrap_retirement_preserves_later_entries_and_reuses_backing() -> Result {
+        let mut owner = owner()?;
+        let usage = owner.storage_usage();
+        let state = owner.engine.compact.as_ref().ok_or("state")?;
+        let allocation = (state.history.as_ptr(), state.history.capacity());
+        for _ in 0..3 {
+            emit(&mut owner, ms(0), ms(0), b"first")?;
+        }
+        apply(&mut owner, 1, 1, 1, ms(1), ms(1))?;
+        emit(&mut owner, ms(2), ms(2), b"reuse")?;
+        // Serials 2 and 3 straddle the end of the actual three-slot ring.
+        assert_eq!(
+            owner
+                .engine
+                .compact
+                .as_ref()
+                .ok_or("state")?
+                .history_prefix_ranges(3),
+            [2..3, 0..1]
+        );
+        apply(&mut owner, 3, 3, 2, ms(3), ms(3))?;
+        assert_eq!(history(&owner)?, vec![(4, Some(ms(2)))]);
+        assert_eq!(owner.retained().send_records, 1);
+        assert!(!owner.source_confirmed(SourceId(3))?);
+        for _ in 0..2 {
+            emit(&mut owner, ms(4), ms(4), b"next")?;
+        }
+        apply(&mut owner, 6, 6, 3, ms(5), ms(5))?;
+        assert!(history(&owner)?.is_empty());
+        assert_eq!(owner.retained().send_records, 0);
+        for round in 0..40_u64 {
+            let now = ms(10 + round * 3);
+            for _ in 0..3 {
+                emit(&mut owner, now, now, b"cycles")?;
+            }
+            let end = 9 + round * 3;
+            apply(&mut owner, end, end, 4 + round, now + ms(1), now + ms(1))?;
+            assert!(history(&owner)?.is_empty());
+            assert_eq!(owner.retained().send_records, 0);
+            assert_eq!(owner.storage_usage(), usage);
+            let state = owner.engine.compact.as_ref().ok_or("state")?;
+            assert_eq!(
+                (state.history.as_ptr(), state.history.capacity()),
+                allocation
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_pending_prefix_refuses_atomically_and_preserves_newer_token() -> Result {
+        let mut owner = owner()?;
+        for _ in 0..2 {
+            emit(&mut owner, ms(0), ms(0), b"warm")?;
+        }
+        apply(&mut owner, 2, 2, 1, ms(1), ms(1))?;
+        let older = prepare(&mut owner, ms(2))?; // Serial 3, slot 0.
+        let echo = prepare(&mut owner, ms(2))?; // Serial 4, slot 1.
+        owner.confirm_transmission_at(ms(3), ms(2), echo)?;
+        let newer = prepare(&mut owner, ms(3))?; // Serial 5, slot 2.
+        let before = format!("{:?}", owner.engine);
+        // No positive ACK depends on the held source; the history prefix alone
+        // must prevent a newer accepted echo from erasing its actual token.
+        assert_eq!(
+            apply(&mut owner, 2, 4, 2, ms(4), ms(4)),
+            Err(RecoveryError::FeedbackAwaitingPhysical)
+        );
+        assert_eq!(format!("{:?}", owner.engine), before);
+        owner.confirm_transmission_at(ms(5), ms(2), older)?;
+        apply(&mut owner, 4, 4, 2, ms(4), ms(5))?;
+        assert_eq!(history(&owner)?, vec![(5, None)]);
+        assert_eq!(owner.pending_transmission(SourceId(4)), Some(newer));
+        assert_eq!(owner.retained().send_records, 1);
+        owner.confirm_transmission_at(ms(6), ms(3), newer)?;
+        apply(&mut owner, 5, 5, 3, ms(7), ms(7))?;
+        assert!(history(&owner)?.is_empty());
+        assert_eq!(owner.retained().send_records, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_stale_echo_cannot_clear_reused_slots_but_new_echo_still_applies() -> Result {
+        let mut owner = owner()?;
+        for _ in 0..3 {
+            emit(&mut owner, ms(0), ms(0), b"first")?;
+        }
+        apply(&mut owner, 3, 3, 10, ms(1), ms(1))?;
+        for _ in 0..3 {
+            emit(&mut owner, ms(2), ms(2), b"reuse")?;
+        }
+        let before = (owner.timing()?, owner.retained(), history(&owner)?);
+        apply(&mut owner, 3, 3, 1, ms(3), ms(3))?;
+        assert_eq!(
+            (owner.timing()?, owner.retained(), history(&owner)?),
+            before
+        );
+        // Feedback output serial may be stale while its actual echo and ACKs
+        // are new. Preserve the established independent authorities.
+        apply(&mut owner, 5, 5, 1, ms(4), ms(4))?;
+        assert_eq!(owner.timing()?.sampled_serial, 5);
+        assert_eq!(history(&owner)?, vec![(6, Some(ms(2)))]);
+        assert!(owner.source_confirmed(SourceId(3))?);
+        assert!(owner.source_confirmed(SourceId(4))?);
+        assert!(!owner.source_confirmed(SourceId(5))?);
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_guard_overflow_preserves_complete_feedback_state() -> Result {
+        let mut policy = config(CompactRecovery::Guarded, 16, 3, 78)?;
+        policy.timing.nominal_rtt = Duration::ZERO;
+        let mut owner = CompactRepeat::new(policy, context(EndpointRole::Initiator))?;
+        emit(&mut owner, ms(0), ms(0), b"old")?;
+        // Retire the first source without sampling its retained transmission.
+        apply(&mut owner, 1, 0, 1, ms(1), ms(1))?;
+        let near_limit = Duration::MAX - ms(50);
+        emit(&mut owner, near_limit, near_limit, b"new")?;
+        let before = format!("{:?}", owner.engine);
+        // Original arrival is preserved despite arbitrarily delayed observation.
+        // The new RTT sample enlarges the guard for the later unacknowledged
+        // source beyond Duration::MAX. No RTT/history/ACK mutation may precede it.
+        assert_eq!(
+            apply(&mut owner, 1, 1, 2, ms(1000), Duration::MAX - ms(10)),
+            Err(RecoveryError::TimeOverflow)
+        );
+        assert_eq!(format!("{:?}", owner.engine), before);
+        assert_eq!(owner.timing()?.sampled_serial, 0);
+        assert_eq!(history(&owner)?.len(), 2);
+        assert_eq!(owner.failure(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_is_bounded_without_serial_limit_overflow() -> Result {
+        let mut owner = owner()?;
+        let state = owner.engine.compact.as_mut().ok_or("state")?;
+        state.sampled = u64::MAX - 3;
+        let ranges = state.history_prefix_ranges(u64::MAX);
+        assert_eq!(ranges.iter().map(std::ops::Range::len).sum::<usize>(), 3);
+        assert!(ranges.iter().all(|range| range.end <= state.history.len()));
+        state.sampled = u64::MAX;
+        assert_eq!(state.history_prefix_ranges(u64::MAX), [0..0, 0..0]);
+        state.sampled = 0;
+        assert_eq!(
+            state
+                .history_prefix_ranges(u64::MAX)
+                .iter()
+                .map(std::ops::Range::len)
+                .sum::<usize>(),
+            state.history.len()
+        );
+        Ok(())
+    }
+}

@@ -178,18 +178,9 @@ where
     let mut native_first = true;
     let result:io::Result<StopReason>=async {
         loop {
-            // Maintained transports may complete custom futures without yielding.
-            // Hand control back after each bounded work turn so their driver tasks
-            // remain schedulable during continuous ready receipts or input.
-            if socket.is_maintained() {
-                tokio::task::yield_now().await;
-            }
-            // Cancellation may become ready while a maintained owner yields.
-            // Observe it before another I/O poll can write or consume peer EOF.
-            // The terminal path below still settles already retained receipts.
-            if std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_ready())
-            }).await {
+            if begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
+                driver.complete_carrier_io(socket, &mut sample)
+            }).await? {
                 break Ok(StopReason::Cancelled);
             }
             socket.begin_turn();
@@ -481,6 +472,36 @@ async fn next_io<'a, D: NativeDevice, R: raw_carrier::RawBacking>(
             () = sleep_until(wake) => Ok(IoEvent::Timer),
         }
     }
+}
+
+// Keep the existing cooperative yield, but settle an already retained whole
+// receipt before handing execution to unrelated tasks. This callback performs
+// no I/O: normal identity, Research ordering, fresh-time and failure checks stay
+// with Driver::complete_carrier_io. Cancellation wins before settlement, and is
+// polled again after yielding before the caller can start any new I/O.
+async fn begin_driver_turn<R: raw_carrier::RawBacking, S: Future<Output = ()> + ?Sized>(
+    socket: &mut carrier::IoOwner<R>,
+    mut shutdown: std::pin::Pin<&mut S>,
+    settle: impl FnOnce(&mut carrier::IoOwner<R>) -> io::Result<()>,
+) -> io::Result<bool> {
+    if std::future::poll_fn(|cx| std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_ready()))
+        .await
+    {
+        return Ok(true);
+    }
+    if socket.is_maintained() {
+        if socket.maintained_receipt_ready() {
+            settle(socket)?;
+        }
+        // Bounded maintained turns still allow their driver and writer tasks
+        // to run; readiness facts do not authorize another unbounded work turn.
+        tokio::task::yield_now().await;
+        return Ok(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_ready())
+        })
+        .await);
+    }
+    Ok(false)
 }
 
 async fn next_selected_request(requests: &mut Requests) -> Option<Request> {

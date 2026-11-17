@@ -15,6 +15,8 @@ pub use setup_diagnostics::{
 
 // This fixed interval is already committed by PacketPolicy::digest.
 const TRANSITION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const TRANSITION_MAX_COPIES: u16 = 32;
+const TRANSITION_FINAL_RESERVE: u16 = 2;
 
 struct Detached<I: PacketIo> {
     io: GateIo<I>,
@@ -323,9 +325,37 @@ impl<I: PacketIo> Detached<I> {
         }
         Ok(progress)
     }
+    // Hello cannot consume the last two existing attempts: each local role
+    // still needs its Commit or CommitAck, including one possible lost copy.
+    // Duplicate-triggered Hello replies use this same total per-lane budget.
+    fn transition_kind(
+        &self,
+        client: bool,
+        ready: bool,
+        all_hello: bool,
+        all_commit: bool,
+    ) -> Option<wire::Kind> {
+        if self.copies >= TRANSITION_MAX_COPIES {
+            return None;
+        }
+        let hello = !all_hello
+            || (self.hello_reply
+                && (!client || self.last_transition_kind != Some(wire::Kind::Hello)));
+        if hello && self.copies < TRANSITION_MAX_COPIES - TRANSITION_FINAL_RESERVE {
+            Some(wire::Kind::Hello)
+        } else if !all_hello {
+            None
+        } else if client && !ready {
+            Some(wire::Kind::Commit)
+        } else if !client && all_commit {
+            Some(wire::Kind::CommitAck)
+        } else {
+            None
+        }
+    }
     fn retry_due(&self, now: Instant) -> bool {
         self.pending.is_none()
-            && self.copies < 32
+            && self.copies < TRANSITION_MAX_COPIES
             && self
                 .last_transition
                 .is_none_or(|t| now.saturating_duration_since(t) >= TRANSITION_RETRY_INTERVAL)
@@ -1453,38 +1483,22 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                 }
             }
             if now < self.deadline && lane.retry_due(now) {
-                let (kind, body) = if !all_hello
-                    || (lane.hello_reply
-                        && (!self.info.is_client
-                            || lane.last_transition_kind != Some(wire::Kind::Hello)))
-                {
-                    (wire::Kind::Hello, self.local_hello.to_vec())
-                } else if self.info.is_client && !self.ready {
-                    (
-                        wire::Kind::Commit,
-                        wire::commit(
-                            wire::Kind::Commit,
-                            count,
-                            self.commit_proof.ok_or(Error::Proof)?,
-                            self.info.transcript_digest,
-                            self.policy_digest,
-                        )
-                        .to_vec(),
-                    )
-                } else if !self.info.is_client && all_commit {
-                    (
-                        wire::Kind::CommitAck,
-                        wire::commit(
-                            wire::Kind::CommitAck,
-                            count,
-                            self.commit_proof.ok_or(Error::Proof)?,
-                            self.info.transcript_digest,
-                            self.policy_digest,
-                        )
-                        .to_vec(),
-                    )
-                } else {
+                let Some(kind) =
+                    lane.transition_kind(self.info.is_client, self.ready, all_hello, all_commit)
+                else {
                     continue;
+                };
+                let body = match kind {
+                    wire::Kind::Hello => self.local_hello.to_vec(),
+                    wire::Kind::Commit | wire::Kind::CommitAck => wire::commit(
+                        kind,
+                        count,
+                        self.commit_proof.ok_or(Error::Proof)?,
+                        self.info.transcript_digest,
+                        self.policy_digest,
+                    )
+                    .to_vec(),
+                    _ => return Err(Error::Proof),
                 };
                 match lane.stage(kind, &body, self.transaction) {
                     Ok(()) => {
@@ -1672,6 +1686,14 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         if !self.ready {
             wake = wake.min(self.timer.deadline());
         }
+        let count = self.count();
+        let all_hello = self.lanes[..count].iter().all(|lane| {
+            lane.as_ref()
+                .is_some_and(|lane| lane.hello && lane.sent_hello)
+        });
+        let all_commit = self.lanes[..count]
+            .iter()
+            .all(|lane| lane.as_ref().is_some_and(|lane| lane.commit));
         for lane in self.lanes.iter().flatten() {
             if self.ready {
                 wake = wake.min(
@@ -1697,7 +1719,14 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                             .ok_or(Error::Exhausted)?,
                     );
                 }
-            } else if let Some(last) = lane.last_transition {
+            } else if lane.pending.is_none()
+                && lane
+                    .transition_kind(self.info.is_client, self.ready, all_hello, all_commit)
+                    .is_some()
+                && let Some(last) = lane.last_transition
+            {
+                // Reserved attempts waiting for a peer prerequisite must not
+                // advertise an already elapsed Hello retry as an immediate wake.
                 wake = wake.min(
                     last.checked_add(TRANSITION_RETRY_INTERVAL)
                         .ok_or(Error::Exhausted)?,

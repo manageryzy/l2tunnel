@@ -636,6 +636,10 @@ impl<R: RawBacking> IoOwner<R> {
             }
         }
     }
+    /// Already retained maintained receipts only; this neither polls nor accepts I/O.
+    pub(super) fn maintained_receipt_ready(&self) -> bool {
+        matches!(self, Self::Maintained(values) if values[0].receipt_ready())
+    }
     pub(super) async fn observe_completions(&mut self) {
         if let Self::Maintained(values) = self {
             std::future::poll_fn(|cx| {

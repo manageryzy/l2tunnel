@@ -347,7 +347,19 @@ def qdisc(case):
         require(re.search(r'\bdelay 35(?:\.0+)?ms\b', text) is not None
                 and re.search(r'\bloss 15(?:\.0+)?%', text) is not None,
                 'effective owned netem delay/loss differs from35ms/15percent')
-        result[side] = {'class': classes, 'class_format': class_format, 'qdisc': qdiscs, 'qdisc_text': text}
+        # These counters belong only to the owned endpoint namespace. Record
+        # before/after the workload; never infer a blocked interval from occupancy.
+        observed_at = time.time_ns()
+        kernel_buffers = {
+            'scope': 'owned endpoint namespace; cumulative counters and instantaneous tables, not wait durations',
+            'begin_wall_ns': observed_at,
+            'snmp': case.command(role, 'cat', '/proc/net/snmp'),
+            'udp': case.command(role, 'cat', '/proc/net/udp'),
+            'sockstat': case.command(role, 'cat', '/proc/net/sockstat'),
+            'end_wall_ns': time.time_ns(),
+        }
+        result[side] = {'class': classes, 'class_format': class_format, 'qdisc': qdiscs,
+                        'qdisc_text': text, 'kernel_buffers': kernel_buffers}
     return result
 
 

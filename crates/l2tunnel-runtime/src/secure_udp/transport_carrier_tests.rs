@@ -280,3 +280,138 @@ async fn physical_late_projection_retains_actual_whole_udp_fact_without_success_
     );
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn maintained_retained_receipt_precedes_yield_without_polling_new_io() -> TestResult {
+    use std::{cell::Cell, pin::Pin, task::Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+
+    // This uses an actual retained framing write, not fabricated acceptance.
+    // Authentication and Driver correlation/cap behavior retain their existing
+    // integration tests; this case isolates the scheduler boundary itself.
+    for (cancel_first, late) in [(true, false), (false, false), (false, true)] {
+        let (mut carrier, mut peer) = crate::secure_udp::maintained_io::test_framing_carrier(128)?;
+        carrier.select_final_records(carrier.setup_deadline())?;
+        let mut socket: IoOwner = IoOwner::Maintained(MaintainedIo::new(carrier)?);
+        let start = Instant::now();
+        let cap = start + Duration::from_millis(50);
+        let body = [0x80, 0, 0, 0, 0, 0, 0, 0, 1];
+        let identity = UserIdentity {
+            scope: Scope {
+                epoch: security::Epoch(7),
+                configuration: security::ConfigDigest([3; 32]),
+            },
+            number: security::PacketNumber(99),
+            bytes: body.len(),
+            deadline: cap,
+        };
+        assert!(matches!(
+            socket.try_user(identity, &body)?,
+            SendProgress::Pending
+        ));
+        socket.ready(false).await?;
+        assert!(socket.maintained_receipt_ready());
+        let accepted = socket.user_accepted_at().ok_or("whole receipt absent")?;
+        assert!(accepted < cap);
+        let mut first = [0; 14];
+        peer.read_exact(&mut first).await?;
+        assert_eq!(&first[5..], &body);
+
+        // Admission of another class is allowed, but no I/O for it may be polled
+        // by the settlement-before-yield path.
+        let control = [0; 21];
+        assert!(matches!(
+            socket.stage_control(&control, control.len() + 69, cap)?,
+            SendProgress::Pending
+        ));
+        tokio::time::advance(Duration::from_millis(if late { 50 } else { 49 })).await;
+        let observed = Cell::new(None);
+        let settlements = Cell::new(0);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let mut cancel = Some(cancel);
+        if cancel_first {
+            cancel
+                .take()
+                .ok_or("cancel sender")?
+                .send(())
+                .map_err(|_| "cancel")?;
+        }
+        let shutdown = async move {
+            let _ = cancelled.await;
+        };
+        tokio::pin!(shutdown);
+        {
+            let boundary =
+                super::super::begin_driver_turn(&mut socket, shutdown.as_mut(), |socket| {
+                    settlements.set(settlements.get() + 1);
+                    assert!(socket.take_control()?.is_none());
+                    let (actual, result) = socket.take_user()?.ok_or_else(|| {
+                        io::Error::other("retained whole receipt was not settled")
+                    })?;
+                    assert_eq!(actual, identity);
+                    let SendProgress::Whole {
+                        receipt,
+                        late: physical_late,
+                    } = result
+                    else {
+                        return Err(io::Error::other("lost whole receipt"));
+                    };
+                    assert!(!physical_late);
+                    assert_eq!(receipt.accepted_at, accepted);
+                    assert_eq!(receipt.record_bytes, body.len());
+                    let now = Instant::now();
+                    observed.set(Some(now));
+                    if now >= identity.deadline {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    Ok(())
+                });
+            tokio::pin!(boundary);
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(boundary.as_mut().poll(cx))).await;
+            if cancel_first {
+                assert!(matches!(first_poll, Poll::Ready(Ok(true))));
+                assert_eq!(settlements.get(), 0);
+            } else if late {
+                assert!(
+                    matches!(first_poll, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut)
+                );
+                assert_eq!(settlements.get(), 1);
+                assert_eq!(observed.get(), Some(cap));
+            } else {
+                assert!(first_poll.is_pending(), "the cooperative yield remains");
+                assert_eq!(settlements.get(), 1, "receipt settles before the yield");
+                assert_eq!(observed.get(), Some(start + Duration::from_millis(49)));
+                cancel
+                    .take()
+                    .ok_or("cancel sender")?
+                    .send(())
+                    .map_err(|_| "cancel")?;
+                assert!(boundary.await?, "cancellation is rechecked after yielding");
+            }
+        }
+        assert!(socket.take_control()?.is_none());
+        if cancel_first {
+            assert!(
+                socket.take_user()?.is_some(),
+                "cancellation leaves terminal settlement intact"
+            );
+        } else {
+            assert!(
+                socket.take_user()?.is_none(),
+                "receipt is consumed exactly once"
+            );
+        }
+        let mut byte = [0];
+        let mut input = ReadBuf::new(&mut byte);
+        let next =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut peer).poll_read(cx, &mut input)))
+                .await;
+        assert!(
+            next.is_pending(),
+            "settlement never writes the queued Control"
+        );
+        assert!(input.filled().is_empty());
+    }
+    Ok(())
+}
