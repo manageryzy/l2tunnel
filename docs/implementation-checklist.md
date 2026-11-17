@@ -150,6 +150,13 @@ These pass [coordinated local validation](modules/buffer-observability.md#coordi
 native qualification, full buffer coverage, original native overhead and the
 requested current-build matrix remain open.
 
+The [native17 evidence](modules/buffer-observability.md#native17-observed-dependencies-and-residual-fec-fill)
+qualifies three finite raw/QUIC/Aligned-Cauchy data phases and validates sixteen
+buffer exports. TLS workload/close and Rolling original-expiry failures remain.
+It also confirms residual serialized Block FEC systematic padding and missing
+execution-timing handoff on successful future cancellation. Both require
+correction; full BP, original-native overhead and same-build matrix gates stay open.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

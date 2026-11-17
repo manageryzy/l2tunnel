@@ -48,10 +48,10 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
 | BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
-| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below; native qualification pending. Restored-source and whole-write durations remain open. |
+| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below and finite native17 Aligned Cauchy export. Restored-source and whole-write durations remain open. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
-| BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below; native qualification pending. Missing-equation and restored-source wait duration remain open. |
+| BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below and finite native17 generation-capacity observations. Missing-equation and restored-source wait duration remain open. |
 | BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and three exact retained-operation intervals are implemented: source admission, decoded handoff and ready-feedback budget. Optional bounded storage and runtime export are charged before I/O. Coordinated local validation passes below; native qualification, work slices, feedback construction, ingress and missing-source dependencies remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
@@ -1178,3 +1178,55 @@ is retained separately and is not a protocol or test result.
 This qualifies local Linux behavior and bounded diagnostic paths only. Native
 throughput improvement, complete current-build carrier coverage, all BP rows and
 full original-native encapsulation overhead remain open.
+
+### Native17 observed dependencies and residual FEC fill
+
+Source `6bab236126f1eea5c344bf96b91e4cdce8e38e25` and binary SHA256
+`4ddec3316c76649f76857f36199a9594239dd03c21bf044b7d121a820c337861`
+remain unchanged throughout the five-case, four-lane owned-namespace batch. The
+[source-bound report](../../work/aligned-extents-20261117/native17-analysis1/report.md)
+retains original 100/10 Mbit/s, 70 ms RTT, independent 15% loss each way and
+16 flows, with no deadline/window/retry expansion. Qualified data phases are raw
+Swift reverse 7.7867648, genuine QUIC Swift forward 0.324352 and Aligned Cauchy UDP
+forward 0.2224128 Mbit/s. TLS reverse exhausts its original workload bound and
+fails requested local disconnect; Rolling UDP fails original runtime expiry.
+Raw's passing occurrence produces no failing proof facts and does not resolve
+the previous intermittent frozen-window candidate.
+
+All sixteen buffer exports validate. QUIC bulk Common receipt waits total
+50.023106 seconds over 68.932471 seconds; independently, maintained QUIC observes
+49.783870 seconds. Both sampled Quinn minimum congestion windows are 2944 bytes.
+TLS bulk Common records 43.090995 seconds completed and 7.220097 seconds censored;
+its independently observed retained-TLS wait overlaps. Do not add these owners
+or infer exact kernel/provider queue occupancy. TLS turn-start gaps reach about
+6.9 seconds while its longest measured work stage is below 9 milliseconds. No
+CPU, disk or scheduling cause follows from those wall-time populations alone.
+
+Rolling protocol progress consumes 5.572930/7.050376 seconds of local wall time;
+partial owned-process CPU samples are 65.01%/82.69% of one CPU. The actual winning
+expiry checks are client EncoderDebt and server DecoderJob, not diagnostic
+control/ingress candidates. These observations motivate targeted computation
+attribution, without establishing a specific hot function.
+
+Aligned Cauchy receiver live generations reach 16/16 with 1078 actual generation
+capacity refusals. Systematic sources can still pass to ARQ on that branch, so
+this is not a count of lost user packets. Client sealed-head wire-budget waits
+complete 61 episodes totaling 11.885 milliseconds. Actual accepted-wire counters
+and source inspection prove residual Block FEC systematic fill: 1,864,271 bytes
+across 1848 nonzero-fill emissions. The source-emission joined IP-outside-codec
+body mean/p99 is 526.096/1265 bytes forward and 69.547/83 bytes reverse; these are
+not original-native packet populations. Removing this serialized padding remains
+required and is not satisfied by the earlier Aligned codec extent correction.
+
+Common execution timing is available at normal TLS/Rolling loop stops but marks
+`loop_stop_not_observed` for successful raw/QUIC/Cauchy future cancellation. Fresh
+protocol terminal sampling is separate. The native regular-file writer emits
+valid observed JSON and zero sampled write/drop/timeout errors, but SIGTERM
+cleanup supplies no final actual-write duration or terminal writer custody proof.
+Cancellation-safe timing and full writer-duration observation remain open.
+
+The mixed historical report now selects 18 passed, 181 failed, 32 bound-exhausted
+and 9 not-run phases from 62 attempt directories over 80 combinations. This is
+not a complete current-build matrix. Full BP-01..BP-24, original-native overhead
+mean/p99, complete carrier/algorithm qualification and functional failures remain
+open. No parent acceptance definition is reduced by these partial results.
