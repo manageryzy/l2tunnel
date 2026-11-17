@@ -116,6 +116,7 @@ pub(super) struct Bank {
     rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     rolling_fragments: Option<records::FragmentPolicy>,
     compact_feedback_overhead: Option<usize>,
+    rolling_wait_diagnostics: bool,
     // One actual Bank in a fallibly reserved cell keeps its two inline Engine
     // extents out of the retained State. The selected Common entry constructs
     // this owner before polling its I/O continuation.
@@ -218,6 +219,7 @@ impl Bank {
             rolling_ingress,
             rolling_fragments,
             None,
+            false,
         )
     }
 
@@ -234,6 +236,7 @@ impl Bank {
         rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
         rolling_fragments: Option<records::FragmentPolicy>,
         compact_feedback_overhead: Option<usize>,
+        rolling_wait_diagnostics: bool,
     ) -> io::Result<Self> {
         if epoch.0 == 0 || identity.session.0 == [0; 16] || identity.local == identity.remote {
             return Err(invalid("invalid actual common engine Bank identity"));
@@ -250,6 +253,12 @@ impl Bank {
             rolling_fragments,
             compact_feedback_overhead,
         )?;
+        let plan = if rolling_wait_diagnostics {
+            plan.with_rolling_wait_diagnostics()
+                .map_err(io::Error::other)?
+        } else {
+            plan
+        };
         let plan =
             storage::storage::Plan::for_bank(plan, external_bytes).map_err(io::Error::other)?;
         let owner = NEXT_OWNER
@@ -277,6 +286,7 @@ impl Bank {
             rolling_ingress,
             rolling_fragments,
             compact_feedback_overhead,
+            rolling_wait_diagnostics,
             storage,
         })
     }
@@ -408,6 +418,12 @@ impl Backend<C> for Bank {
             self.rolling_fragments,
             self.compact_feedback_overhead,
         )?;
+        let plan = if self.rolling_wait_diagnostics {
+            plan.with_rolling_wait_diagnostics()
+                .map_err(io::Error::other)?
+        } else {
+            plan
+        };
         let storage = self.storage.prepare(plan).map_err(io::Error::other)?;
         let serial = self.next_serial;
         self.reservation = Some(Reservation {

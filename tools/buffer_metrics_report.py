@@ -173,15 +173,36 @@ def protocol_provider(value):
             owners = epoch.get('owners')
             require(isinstance(owners, list) and len(owners) <= width,
                     path + ': invalid owner array bound')
+            if 'rolling_waits' in epoch:
+                try:
+                    from .buffer_metrics_rolling import validate as validate_rolling
+                except ImportError:
+                    from buffer_metrics_rolling import validate as validate_rolling
+                validate_rolling(epoch['rolling_waits'], epoch['epoch'],
+                                 path + '.rolling_waits', issues, gaps)
             seen = set()
             for oi, owner in enumerate(owners):
                 prefix = path + '.owners[' + str(oi) + ']'
                 owner = object_value(owner, prefix)
                 scope = owner.get('scope')
-                if scope == 'endpoint-shared':
+                if scope in ('endpoint-shared', 'swift-shared-packing'):
                     require(owner.get('owner') is None and owner.get('incarnation') is None,
                             prefix + ': shared owner has independent identity')
+                    if scope == 'swift-shared-packing':
+                        require(owner.get('channel') is None,
+                                prefix + ': shared Swift packing has channel identity')
                     identity = (scope, None, None)
+                elif scope == 'swift-channel':
+                    require(owner.get('owner') is None and owner.get('incarnation') is None,
+                            prefix + ': Swift channel has independent connection identity')
+                    channel = number(owner, 'channel', prefix)
+                    require(channel < 64 and channel + 1 < width,
+                            prefix + ': invalid Swift channel identity')
+                    boolean(owner, 'send_present', prefix)
+                    boolean(owner, 'receive_present', prefix)
+                    send, receive = owner['send_present'], owner['receive_present']
+                    require(send or receive, prefix + ': absent Swift channel')
+                    identity = (scope, channel, None)
                 else:
                     require(scope == 'independent-connection', prefix + ': unknown owner scope')
                     index = number(owner, 'owner', prefix)
@@ -201,6 +222,24 @@ def protocol_provider(value):
                     name = label(item.get('name'), prefix + '.gauge.name')
                     require(name not in names, prefix + ': duplicate gauge name')
                     names.add(name)
+                    if scope == 'swift-channel':
+                        require(name in {
+                            'swift_sender_packing_bytes', 'swift_sender_source_records',
+                            'swift_sender_source_payload_bytes', 'swift_sender_retry_entries',
+                            'swift_sender_repairs_due', 'swift_receiver_source_positions',
+                            'swift_receiver_known_sources', 'swift_receiver_source_payload_bytes',
+                            'swift_receiver_equation_rows', 'swift_receiver_equation_payload_bytes',
+                            'swift_receiver_stream_bytes'}, prefix + ': unknown Swift gauge')
+                        if name.startswith('swift_sender_'):
+                            require(send, prefix + ': absent Swift sender has gauges')
+                        if name.startswith('swift_receiver_'):
+                            require(receive, prefix + ': absent Swift receiver has gauges')
+                        if name == 'swift_sender_repairs_due':
+                            require(item.get('capacity') is None,
+                                    prefix + ': repair work debt has payload capacity')
+                    if scope == 'swift-shared-packing':
+                        require(name == 'swift_shared_packing_bytes',
+                                prefix + ': shared Swift packing has unrelated gauge')
                     number(item, 'samples', prefix + '.' + name)
                     used, cap, high = (number(item, key, prefix + '.' + name, True)
                                        for key in ('used', 'capacity', 'high_water'))
@@ -477,6 +516,12 @@ def normalize(value, source, digest):
     value = object_value(value, 'input')
     require(type(value.get('schema')) is int and value['schema'] == 1,
             'unsupported buffer metrics schema')
+    if value.get('owner') == 'raw_custody':
+        try:
+            from .buffer_metrics_raw_custody import normalize as normalize_raw_custody
+        except ImportError:
+            from buffer_metrics_raw_custody import normalize as normalize_raw_custody
+        return normalize_raw_custody(value, source, digest)
     issues = []
     invalid = object_value(value.get('invalid'), 'invalid')
     require(all(type(invalid.get(key)) is bool for key in INVALID_FLAGS),
@@ -629,6 +674,13 @@ def markdown(report):
         lines.extend(['', '## Owner ' + str(index) + ': ' + cell(owner['owner']), '',
                       'Source: ' + cell(owner['source']), '', 'SHA256: ' + owner['sha256'], '',
                       'Status: ' + owner['status'] + '. Coverage: ' + cell(owner['source_coverage'])])
+        if 'raw_custody_validation' in owner:
+            try:
+                from .buffer_metrics_raw_custody import render as render_raw_custody
+            except ImportError:
+                from buffer_metrics_raw_custody import render as render_raw_custody
+            render_raw_custody(lines, owner, table, cell)
+            continue
         table(lines, ['Observed span us', 'Union completed us', 'Union censored us',
                       'Union open us', 'Union / observed span'],
               [[owner['observed_span_us'], union['completed_us'], union['censored_us'],

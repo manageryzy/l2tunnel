@@ -1,6 +1,8 @@
 //! Same original raw packet owner used by setup, membership and the sole Driver.
 //! This adapter grants no Noise/member authority and owns no task or socket clone.
 use super::original_datagram::SendReceipt;
+#[path = "raw_carrier_custody.rs"]
+mod custody;
 use l2tunnel::secure_record::Scope;
 use l2tunnel_raw_io::{
     PacketIo,
@@ -360,6 +362,7 @@ pub(in crate::secure_udp) struct RawAdapter<I: PacketIo + Send + 'static> {
     polled: bool,
     fresh_output: bool,
     prepare_observations: [PrepareObservations; 4],
+    custody: custody::Observer,
 }
 impl<I: PacketIo + Send + 'static> RawAdapter<I> {
     fn observe_prepare_refusal(&mut self, kind: FinalKind, refusal: PrepareRefusal) {
@@ -427,6 +430,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                         .commit_final_record(token, bytes)
                         .map_err(raw_error)?,
                 );
+                self.custody.commit(custody::Class::User, &user.pending);
                 self.fresh_output = true;
             }
             self.fail()?;
@@ -435,12 +439,11 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         if hold {
             return Ok(SendProgress::Pending);
         }
-        Self::result(
-            self.user
-                .take()
-                .ok_or_else(|| protocol("raw User custody missing"))?
-                .pending,
-        )
+        let user = self
+            .user
+            .take()
+            .ok_or_else(|| protocol("raw User custody missing"))?;
+        self.result(custody::Class::User, user.pending)
     }
 
     pub(in crate::secure_udp) fn new(mut carrier: PacketCarrier<I>) -> io::Result<Self> {
@@ -451,6 +454,9 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             .ok_or_else(|| protocol("raw first original is absent"))?;
         let lanes = carrier.lane_count();
         let client = carrier.info().is_client;
+        // Opt-in diagnostic allocation precedes this adapter's I/O. Its heap is
+        // reported separately and never borrows protocol quota.
+        let custody = custody::Observer::from_environment()?;
         let control_bytes = buffer(plan.maximum)?;
         let input_bytes = buffer(plan.maximum)?;
         let mut result = Self {
@@ -472,6 +478,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             polled: false,
             fresh_output: false,
             prepare_observations: [PrepareObservations::default(); 4],
+            custody,
         };
         if result.capacity_bytes()? != plan.capacity_bytes() {
             return Err(protocol("raw adapter capacity differs"));
@@ -512,6 +519,17 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             .map_err(raw_error)?;
         self.geometry = self.carrier.final_geometry().map_err(raw_error)?;
         Ok(self.geometry)
+    }
+    #[cfg(test)]
+    pub(in crate::secure_udp) fn custody_observer_for_test(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> io::Result<()> {
+        if self.user.is_some() || self.control.is_some() {
+            return Err(protocol("raw custody observer requires idle fixture"));
+        }
+        self.custody = custody::Observer::for_test(path, Instant::now())?;
+        Ok(())
     }
     fn data_lane(&self) -> PairLane {
         if self.lanes == 1 || self.client {
@@ -593,24 +611,25 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                         let pending = if self.user.as_ref().is_some_and(|p| {
                             p.pending.lane == lane && p.pending.token == Some(sent.token)
                         }) {
-                            self.user.as_mut().map(|p| &mut p.pending)
+                            self.user
+                                .as_mut()
+                                .map(|p| (custody::Class::User, &mut p.pending))
                         } else if self
                             .control
                             .as_ref()
                             .is_some_and(|p| p.lane == lane && p.token == Some(sent.token))
                         {
-                            self.control.as_mut()
+                            self.control.as_mut().map(|p| (custody::Class::Control, p))
                         } else {
                             None
                         };
-                        if let Some(pending) = pending {
+                        if let Some((class, pending)) = pending {
                             if pending.receipt.is_some() {
                                 if first.is_none() {
                                     first = Some(raw::Error::Proof);
                                 }
                             } else {
-                                pending.token = None;
-                                pending.receipt = Some(AcceptedReceipt {
+                                let receipt = AcceptedReceipt {
                                     record_bytes: pending.bytes,
                                     udp_bytes: None,
                                     charged_bytes: pending.cost,
@@ -618,7 +637,19 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                                     boundary: super::SendBoundary::SocketAccepted,
                                     accepted_at: sent.sent_at,
                                     deadline: pending.deadline,
-                                });
+                                };
+                                // Existing exact lane/token correlation is complete before
+                                // clearing custody. Observe once; preserve the physical fact.
+                                if !pending.bootstrap {
+                                    self.custody.observe(
+                                        class,
+                                        lane_number(lane),
+                                        sent.token,
+                                        receipt,
+                                    );
+                                }
+                                pending.token = None;
+                                pending.receipt = Some(receipt);
                                 completed = true;
                             }
                         } else if first.is_none() {
@@ -730,10 +761,13 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         }
         Ok(ready)
     }
-    fn result(pending: Pending) -> io::Result<SendProgress> {
+    fn result(&mut self, class: custody::Class, pending: Pending) -> io::Result<SendProgress> {
         let receipt = pending
             .receipt
             .ok_or_else(|| protocol("raw completion is not physical"))?;
+        if !pending.bootstrap {
+            self.custody.take(class, lane_number(pending.lane), receipt);
+        }
         Ok(SendProgress::Whole {
             late: receipt.accepted_at >= receipt.deadline,
             receipt,
@@ -1054,6 +1088,9 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                 bytes,
             )?;
         }
+        if !bootstrap {
+            self.custody.commit(custody::Class::Control, &pending);
+        }
         self.fresh_output |= pending.token.is_some();
         self.control = Some(pending);
         Ok(SendProgress::Pending)
@@ -1068,7 +1105,9 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                 .take()
                 .ok_or_else(|| protocol("raw Control custody missing"))?;
             let cost = pending.cost;
-            return Self::result(pending).map(|p| Some((p, cost)));
+            return self
+                .result(custody::Class::Control, pending)
+                .map(|p| Some((p, cost)));
         }
         self.fail()?;
         Ok(None)
@@ -1086,7 +1125,9 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
                 .user
                 .take()
                 .ok_or_else(|| protocol("raw User custody missing"))?;
-            return Self::result(user.pending).map(|p| Some((user.identity, p)));
+            return self
+                .result(custody::Class::User, user.pending)
+                .map(|p| Some((user.identity, p)));
         }
         self.fail()?;
         Ok(None)
@@ -1197,4 +1238,12 @@ fn protocol(error: impl std::fmt::Display) -> io::Error {
 }
 fn exhausted() -> io::Error {
     io::Error::other("raw adapter checked capacity exhausted")
+}
+
+impl<I: PacketIo + Send + 'static> Drop for RawAdapter<I> {
+    fn drop(&mut self) {
+        // Observe release before lower fields are dropped. Never poll I/O or
+        // consume an unobserved physical receipt merely for diagnostics.
+        self.custody.finish(Instant::now());
+    }
 }

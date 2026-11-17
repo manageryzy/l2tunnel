@@ -44,6 +44,7 @@ pub struct Receiver {
     next_feedback: u64,
     last: Tick,
     terminal: Option<Error>,
+    expiry_failure: Option<expiry::Failure>,
 }
 impl Receiver {
     /// Admit every exact decoder bank, decision pool and scratch allocation first.
@@ -94,6 +95,7 @@ impl Receiver {
             next_feedback: 1,
             last: now,
             terminal: None,
+            expiry_failure: None,
         })
     }
     fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
@@ -105,6 +107,11 @@ impl Receiver {
             return Err(Error::Terminal);
         }
         if let Err(error) = check_time(self.last, now, &[self.output_end]) {
+            if error == Error::Expired {
+                self.expiry_failure = self
+                    .expiry_failure
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3]));
+            }
             return self.fail(error);
         }
         if let Err(error) = self.decoder.step(now, WorkBudget::default()) {
@@ -256,6 +263,14 @@ impl Receiver {
             self.decoder.pending_source()
         }
     }
+    /// Original ordered-handoff cohort cap of the actual nested decoder.
+    pub fn handoff_deadline(&self) -> Option<Tick> {
+        self.decoder.handoff_deadline()
+    }
+    /// Original cap of an actual ready immutable feedback output, if present.
+    pub fn feedback_deadline(&self) -> Option<Tick> {
+        self.feedback.and(self.output_end)
+    }
     /// Borrow a committed original without recovery/native receipt authority.
     /// Decoder candidate/shadow storage and retired handoffs remain hidden.
     pub fn decoded_source(&self, id: SourceId) -> Result<Option<&[u8]>, Error> {
@@ -296,6 +311,23 @@ impl Receiver {
         self.output_end = None;
         self.next_feedback += 1;
         Ok(())
+    }
+    /// Read original outer and nested lifetimes without advancing service.
+    pub fn expiry_snapshot(&self) -> expiry::Snapshot {
+        use expiry::{Deadline, Identity, Kind};
+        let mut snapshot = self.decoder.expiry_snapshot();
+        let identity = self
+            .feedback
+            .map(|f| f.id.0)
+            .or_else(|| self.scan.as_ref().map(|scan| scan.value.id.0))
+            .map(Identity::Feedback);
+        snapshot.candidates[3] = self
+            .output_end
+            .map(|at| Deadline::new(Kind::FeedbackOutput, at, identity));
+        snapshot.last_successful = self.last;
+        snapshot.terminal = self.terminal.or(snapshot.terminal);
+        snapshot.failure = self.expiry_failure.or(snapshot.failure);
+        snapshot
     }
     /// Earliest original decode/debt/handoff or feedback-output expiry.
     pub fn deadline(&self) -> Option<Tick> {

@@ -507,6 +507,31 @@ impl Plan {
     pub const fn context(&self) -> Context {
         self.context
     }
+    /// Pre-admit optional exact Rolling/Research wait diagnostics into this plan.
+    /// Other families remain unchanged; existing complete owner limits still apply.
+    pub fn with_rolling_wait_diagnostics(mut self) -> Result<Self, Error> {
+        let before = self.record.heap_bytes();
+        self.record = match self.record {
+            RecordPlan::Rolling(plan) => {
+                RecordPlan::Rolling(plan.with_wait_diagnostics().map_err(Error::Rolling)?)
+            }
+            RecordPlan::Research(plan) => {
+                RecordPlan::Research(plan.with_wait_diagnostics().map_err(Error::Rolling)?)
+            }
+            other => other,
+        };
+        let extra = self
+            .record
+            .heap_bytes()
+            .checked_sub(before)
+            .ok_or(Error::Layout)?;
+        self.heap_bytes = self.heap_bytes.checked_add(extra).ok_or(Error::Layout)?;
+        self.capacity_bytes = self
+            .capacity_bytes
+            .checked_add(extra)
+            .ok_or(Error::Layout)?;
+        Ok(self)
+    }
     /// Exact full-wire directional overhead inputs.
     pub const fn geometry(&self) -> Geometry {
         self.geometry

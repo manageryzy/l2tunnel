@@ -818,3 +818,149 @@ fn pending_job_handoff_does_not_renew_already_recovered_batch_deadline() -> Test
     assert_eq!(decoder.deadline(), Some(Tick(500)));
     Ok(())
 }
+
+#[test]
+fn expiry_snapshot_keeps_original_cohort_cap_after_partial_confirmation() -> TestResult {
+    let mut encoder = Encoder::new(config(), scope(), Tick(0))?;
+    encoder.admit_source(ORIGINALS[0], Tick(1))?;
+    encoder.admit_source(ORIGINALS[1], Tick(900))?;
+    encoder.confirm_prefix(1, Tick(950))?;
+    let before = encoder.expiry_snapshot();
+    assert_eq!(before.failure, None);
+    assert_eq!(
+        before.candidates[0],
+        Some(expiry::Deadline {
+            kind: expiry::Kind::EncoderDebt,
+            at: Tick(1001),
+            identity: Some(expiry::Identity::Sources { first: 1, end: 2 }),
+        })
+    );
+    assert_eq!(encoder.step(Tick(1001), budget(1)), Err(Error::Expired));
+    let failed = encoder.expiry_snapshot();
+    assert_eq!(
+        failed.failure,
+        Some(expiry::Failure {
+            observed: Tick(1001),
+            selected: before.candidates[0].ok_or("original debt")?,
+        })
+    );
+    assert_eq!(failed.last_successful, Tick(950));
+    assert_eq!(encoder.confirm_prefix(2, Tick(2000)), Err(Error::Terminal));
+    assert_eq!(encoder.expiry_snapshot().failure, failed.failure);
+
+    // A fully discharged cohort releases its cap before a later admission.
+    let mut drained = Encoder::new(config(), scope(), Tick(0))?;
+    drained.admit_source(ORIGINALS[0], Tick(1))?;
+    drained.confirm_prefix(1, Tick(950))?;
+    assert_eq!(drained.expiry_snapshot().candidates[0], None);
+    drained.admit_source(ORIGINALS[1], Tick(1000))?;
+    assert_eq!(
+        drained.expiry_snapshot().candidates[0].map(|d| d.at),
+        Some(Tick(2000))
+    );
+    Ok(())
+}
+
+#[test]
+fn expiry_snapshot_distinguishes_immutable_output_from_decoder_input_cap() -> TestResult {
+    let policy = scheduler::Policy {
+        recovery: config(),
+        repair_numerator: 1,
+        repair_denominator: 2,
+        tail_ticks: 50,
+        feedback_ticks: 10,
+        feedback_packets: 2,
+        memory_bytes: 1 << 20,
+        source_wire: wire::SourceWire::Exact,
+    };
+    let mut sender = scheduler::Sender::new(policy, scope(), Tick(0))?;
+    sender.admit_source(ORIGINALS[0], Tick(1))?;
+    assert_eq!(sender.step(Tick(101), budget(1)), Err(Error::Expired));
+    let output = sender.expiry_snapshot();
+    let failed = output.failure.ok_or("immutable output expiry")?;
+    assert_eq!(failed.observed, Tick(101));
+    assert_eq!(failed.selected.kind, expiry::Kind::DataOutput);
+    assert_eq!(failed.selected.at, Tick(101));
+    assert_eq!(
+        failed.selected.identity,
+        Some(expiry::Identity::Sources { first: 0, end: 1 })
+    );
+    assert_eq!(output.candidates[0].map(|d| d.at), Some(Tick(1001)));
+
+    let mut decoder = Decoder::new(config(), scope(), Tick(0))?;
+    assert_eq!(
+        decoder.begin_source_until(
+            scope(),
+            SourceId(0),
+            ORIGINALS[0],
+            Tick(1),
+            Tick(11),
+            Tick(10)
+        ),
+        Err(Error::Expired)
+    );
+    let input = decoder
+        .expiry_snapshot()
+        .failure
+        .ok_or("actual incoming cap")?;
+    assert_eq!(input.observed, Tick(11));
+    assert_eq!(input.selected.kind, expiry::Kind::IncomingCap);
+    assert_eq!(input.selected.at, Tick(10));
+    assert_eq!(
+        input.selected.identity,
+        Some(expiry::Identity::Sources { first: 0, end: 1 })
+    );
+    assert_eq!(decoder.step(Tick(20), budget(1)), Err(Error::Terminal));
+    assert_eq!(decoder.expiry_snapshot().failure, Some(input));
+    Ok(())
+}
+
+#[test]
+fn expiry_snapshot_preserves_outer_check_precedence_over_earlier_nested_debt() -> TestResult {
+    let policy = scheduler::Policy {
+        recovery: config(),
+        repair_numerator: 0,
+        repair_denominator: 1,
+        tail_ticks: 50,
+        feedback_ticks: 10,
+        feedback_packets: 2,
+        memory_bytes: 1 << 20,
+        source_wire: wire::SourceWire::Exact,
+    };
+    let mut sender = scheduler::Sender::new(policy, scope(), Tick(0))?;
+    let first = sender.admit_source(ORIGINALS[0], Tick(1))?;
+    sender.confirm_output(scheduler::OutputId::Source(first), Tick(2))?;
+    // The original tail is already due. Service that actual repair instead of
+    // attempting a new source while the unchanged scheduler correctly returns Busy.
+    sender.step(Tick(950), budget(65_536))?;
+    let scheduler::OutputId::Repair(repair) = sender
+        .pending_output()
+        .ok_or("actual complete tail repair")?
+        .id()
+    else {
+        return Err("expected actual tail repair".into());
+    };
+    let before = sender.expiry_snapshot();
+    assert_eq!(before.candidates[0].map(|d| d.at), Some(Tick(1001)));
+    assert_eq!(before.candidates[3].map(|d| d.at), Some(Tick(1050)));
+    assert_eq!(sender.step(Tick(1050), budget(1)), Err(Error::Expired));
+    let selected = sender
+        .expiry_snapshot()
+        .failure
+        .ok_or("outer expiry check")?;
+    assert_eq!(selected.observed, Tick(1050));
+    assert_eq!(selected.selected.kind, expiry::Kind::DataOutput);
+    assert_eq!(selected.selected.at, Tick(1050));
+    assert_eq!(
+        selected.selected.identity,
+        Some(expiry::Identity::Repair {
+            id: repair,
+            support: None
+        })
+    );
+    // The earlier absolute debt cap did not win: outer output was checked first.
+    assert_eq!(sender.status().encoder.terminal, None);
+    assert_eq!(sender.step(Tick(2000), budget(1)), Err(Error::Terminal));
+    assert_eq!(sender.expiry_snapshot().failure, Some(selected));
+    Ok(())
+}

@@ -27,6 +27,8 @@ use compact_wire::CompactRecovery;
 mod copies;
 mod deferred_feedback;
 mod endpoint;
+/// Bounded original lifetime observations for actual selected recovery owners.
+pub mod expiry;
 mod ingress;
 mod native;
 #[doc(hidden)]
@@ -36,6 +38,8 @@ use recovery::RecoveryPolicy;
 pub mod storage;
 #[cfg(test)]
 mod tests;
+/// Exact optional retained-operation refusal intervals.
+pub mod waits;
 
 pub use config::{Config, DirectionConfig, OutputFraming};
 pub use copies::{COPY_POLICY_BYTES, CopyPolicies};

@@ -6,6 +6,10 @@ use l2tunnel_management::Role;
 use std::io::{self, Write};
 use std::time::Duration;
 
+#[path = "rolling_wait_metrics.rs"]
+mod rolling_wait_metrics;
+use l2tunnel::rolling_records::waits::{Snapshot as RollingWait, Terminal as RollingTerminal};
+
 const SAMPLE_INTERVAL_US: u64 = 100_000;
 const MAX_OWNERS: usize = 256;
 
@@ -18,12 +22,22 @@ pub(crate) struct Identity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Owner {
     Endpoint,
-    Connection { owner: u16, incarnation: u64 },
+    SwiftPacking,
+    SwiftChannel {
+        channel: usize,
+        send: bool,
+        receive: bool,
+    },
+    Connection {
+        owner: u16,
+        incarnation: u64,
+    },
 }
 impl Owner {
     fn index(self) -> usize {
         match self {
-            Self::Endpoint => 0,
+            Self::Endpoint | Self::SwiftPacking => 0,
+            Self::SwiftChannel { channel, .. } => channel + 1,
             Self::Connection { owner, .. } => usize::from(owner),
         }
     }
@@ -67,6 +81,22 @@ const NAMES: [&str; 28] = [
     "arq_transmission_history_entries",
     "reliable_fec_reserved_bytes",
 ];
+
+// Reuse the existing row storage; Swift channel pools have different meanings.
+const SWIFT_NAMES: [&str; 11] = [
+    "swift_sender_packing_bytes",
+    "swift_sender_source_records",
+    "swift_sender_source_payload_bytes",
+    "swift_sender_retry_entries",
+    "swift_sender_repairs_due",
+    "swift_receiver_source_positions",
+    "swift_receiver_known_sources",
+    "swift_receiver_source_payload_bytes",
+    "swift_receiver_equation_rows",
+    "swift_receiver_equation_payload_bytes",
+    "swift_receiver_stream_bytes",
+];
+const SWIFT_PACKING_NAMES: [&str; 1] = ["swift_shared_packing_bytes"];
 
 #[derive(Clone, Copy)]
 struct Row {
@@ -171,6 +201,55 @@ impl Row {
             Some(received.native_capacity_bytes),
         );
     }
+    fn swift(&mut self, buffers: l2tunnel_swift::diagnostics::ChannelBuffers) {
+        self.codec = true;
+        self.recovery = true;
+        if let Some(send) = buffers.send {
+            self.gauge(
+                0,
+                Some(send.packing_bytes),
+                Some(send.packing_capacity_bytes),
+            );
+            self.gauge(
+                1,
+                Some(send.source_records),
+                Some(send.source_capacity_records),
+            );
+            self.gauge(2, Some(send.source_bytes), Some(send.source_capacity_bytes));
+            self.gauge(
+                3,
+                Some(send.retry_entries),
+                Some(send.retry_capacity_entries),
+            );
+            // Earned repair work has no allocated payload capacity. It is neither
+            // queued repair bytes nor evidence of an output wait.
+            self.gauge(4, Some(send.repairs_due as usize), None);
+        }
+        if let Some(receive) = buffers.receive {
+            self.gauge(
+                5,
+                Some(receive.source_positions),
+                Some(receive.source_capacity_positions),
+            );
+            self.gauge(
+                6,
+                Some(receive.known_sources),
+                Some(receive.source_capacity_positions),
+            );
+            self.gauge(
+                7,
+                Some(receive.source_bytes),
+                Some(receive.source_capacity_bytes),
+            );
+            self.gauge(8, Some(receive.rows), Some(receive.row_capacity));
+            self.gauge(9, Some(receive.row_bytes), Some(receive.row_capacity_bytes));
+            self.gauge(
+                10,
+                Some(receive.stream_bytes),
+                Some(receive.stream_capacity_bytes),
+            );
+        }
+    }
     fn recovery(
         &mut self,
         storage: l2tunnel_reliable::Storage,
@@ -223,6 +302,7 @@ struct Epoch {
     last: u64,
     samples: u64,
     rows: Vec<Option<Row>>,
+    rolling: Vec<RollingWait>,
 }
 impl Epoch {
     fn new(owners: usize) -> io::Result<Self> {
@@ -236,6 +316,7 @@ impl Epoch {
             last: 0,
             samples: 0,
             rows,
+            rolling: Vec::new(),
         })
     }
 }
@@ -278,12 +359,30 @@ impl ProtocolBuffers {
             overflow: false,
         })
     }
+    pub(crate) fn configure_rolling_waits(&mut self) -> io::Result<()> {
+        for epoch in &mut self.epochs {
+            if epoch.rolling.capacity() != 0 {
+                return Err(io::Error::other("rolling wait observer already configured"));
+            }
+            epoch
+                .rolling
+                .try_reserve_exact(1)
+                .map_err(io::Error::other)?;
+            if epoch.rolling.capacity() != 1 {
+                return Err(io::Error::other("rolling wait observer capacity differs"));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.epochs.capacity() * std::mem::size_of::<Epoch>()
             + self
                 .epochs
                 .iter()
-                .map(|v| v.rows.capacity() * std::mem::size_of::<Option<Row>>())
+                .map(|v| {
+                    v.rows.capacity() * std::mem::size_of::<Option<Row>>()
+                        + v.rolling.capacity() * std::mem::size_of::<RollingWait>()
+                })
                 .sum::<usize>()
     }
     pub(crate) fn identity_unavailable(&mut self) {
@@ -348,6 +447,7 @@ impl ProtocolBuffers {
                 epoch.first = now;
                 epoch.samples = 0;
                 epoch.rows.fill(None);
+                epoch.rolling.clear();
             }
             epoch.live = true;
             epoch.last = now;
@@ -380,13 +480,25 @@ impl ProtocolBuffers {
     }
     pub(crate) fn sample_engine(&mut self, identity: Identity, now: u64, engine: &engine::Engine) {
         use engine::{CodecBufferSnapshot as Codec, RecoveryBufferSnapshot as Recovery};
-        let local = engine.configuration().descriptor().local(self.role);
-        if matches!(local.send().profile(), DirectionProfile::Swift(_))
-            || matches!(local.receive().profile(), DirectionProfile::Swift(_))
-        {
-            increment(&mut self.unsupported_codec_samples, &mut self.overflow);
-            return;
+        if let Some(snapshot) = engine.rolling_wait_snapshot(engine::Tick(now)) {
+            if let Some(epoch) = self
+                .epochs
+                .iter_mut()
+                .find(|v| v.live && v.identity == Some(identity))
+                && epoch.rolling.capacity() == 1
+            {
+                if let Some(slot) = epoch.rolling.first_mut() {
+                    *slot = snapshot;
+                } else {
+                    epoch.rolling.push(snapshot);
+                }
+            } else {
+                increment(&mut self.identity_errors, &mut self.overflow);
+            }
         }
+        let local = engine.configuration().descriptor().local(self.role);
+        // Called only after the periodic/terminal sampling gate. Swift's exact
+        // payload and equation sums scan bounded retained channel state.
         engine.visit_codec_buffers(|snapshot| {
             let (owner, buffers) = match snapshot {
                 Codec::Endpoint(buffers) => (Owner::Endpoint, buffers),
@@ -401,8 +513,25 @@ impl ProtocolBuffers {
                     },
                     buffers,
                 ),
-                Codec::SwiftPacking { .. } | Codec::SwiftChannel { .. } => {
-                    increment(&mut self.unsupported_codec_samples, &mut self.overflow);
+                Codec::SwiftPacking {
+                    bytes,
+                    capacity_bytes,
+                } => {
+                    if let Some(row) = self.row(identity, Owner::SwiftPacking, now) {
+                        row.codec = true;
+                        row.gauge(0, Some(bytes), Some(capacity_bytes));
+                    }
+                    return;
+                }
+                Codec::SwiftChannel { channel, buffers } => {
+                    let owner = Owner::SwiftChannel {
+                        channel: channel.index(),
+                        send: buffers.send.is_some(),
+                        receive: buffers.receive.is_some(),
+                    };
+                    if let Some(row) = self.row(identity, owner, now) {
+                        row.swift(buffers);
+                    }
                     return;
                 }
             };
@@ -475,10 +604,35 @@ impl ProtocolBuffers {
             }
         }
     }
+    pub(crate) fn finish_rolling_waits(
+        &mut self,
+        now: u64,
+        boundary: crate::buffer_metrics::SourceBoundary,
+    ) {
+        let boundary = match boundary {
+            crate::buffer_metrics::SourceBoundary::DriverDrop => RollingTerminal::DriverDrop,
+            _ => RollingTerminal::MetricStop,
+        };
+        for epoch in &mut self.epochs {
+            if !epoch.live {
+                continue;
+            }
+            if let Some(snapshot) = epoch.rolling.first_mut() {
+                if snapshot.terminal.is_some() {
+                    continue;
+                }
+                if epoch.last == now && snapshot.observed_at == engine::Tick(now) {
+                    *snapshot = snapshot.censor(engine::Tick(now), boundary);
+                } else {
+                    increment(&mut self.staged_terminal_unavailable, &mut self.overflow);
+                }
+            }
+        }
+    }
     pub(crate) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         write!(
             out,
-            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention only; Swift and other recovery internals, history use, per-channel receiver gauges and waits outside exact retained Aligned/Packed source admission remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
+            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; Swift shared packing overlaps per-channel packing and is not additive; Swift source positions include gaps; equation payload bytes exclude coefficient metadata; repairs_due is work debt without allocated payload; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention and Swift shared packing/per-channel source/retry/equation/stream snapshots; Swift feedback/history/control and all Swift dependency waits, other recovery internals, history use, per-channel non-Swift receiver gauges and waits outside explicitly emitted interval sections remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
             self.role,
             self.omitted_epochs,
             self.omitted_owners,
@@ -525,6 +679,18 @@ impl ProtocolBuffers {
                         out,
                         "{{\"scope\":\"endpoint-shared\",\"owner\":null,\"incarnation\":null"
                     )?,
+                    Owner::SwiftPacking => write!(
+                        out,
+                        "{{\"scope\":\"swift-shared-packing\",\"owner\":null,\"incarnation\":null,\"channel\":null"
+                    )?,
+                    Owner::SwiftChannel {
+                        channel,
+                        send,
+                        receive,
+                    } => write!(
+                        out,
+                        "{{\"scope\":\"swift-channel\",\"owner\":null,\"incarnation\":null,\"channel\":{channel},\"send_present\":{send},\"receive_present\":{receive}"
+                    )?,
                     Owner::Connection { owner, incarnation } => write!(
                         out,
                         "{{\"scope\":\"independent-connection\",\"owner\":{owner},\"incarnation\":{incarnation}"
@@ -543,7 +709,12 @@ impl ProtocolBuffers {
                     row.overflow
                 )?;
                 let mut gauge_comma = false;
-                for (name, gauge) in NAMES.into_iter().zip(row.gauges) {
+                let names: &[&str] = match row.owner {
+                    Owner::SwiftPacking => &SWIFT_PACKING_NAMES,
+                    Owner::SwiftChannel { .. } => &SWIFT_NAMES,
+                    Owner::Endpoint | Owner::Connection { .. } => &NAMES,
+                };
+                for (name, gauge) in names.iter().zip(row.gauges) {
                     if gauge.samples == 0 {
                         continue;
                     }
@@ -570,7 +741,12 @@ impl ProtocolBuffers {
                 }
                 write!(out, "}}")?;
             }
-            write!(out, "]}}")?;
+            write!(out, "],\"rolling_waits\":")?;
+            match epoch.rolling.first() {
+                Some(snapshot) => rolling_wait_metrics::write(out, snapshot)?,
+                None => write!(out, "null")?,
+            }
+            write!(out, "}}")?;
         }
         write!(out, "]}}")
     }
@@ -892,6 +1068,78 @@ mod tests {
         assert_eq!(wait["terminal_stage"], "pre_settlement_metric_stop");
         assert_eq!(wait["union"]["censored_us"], 20);
         assert!(wait["open_us"].is_null());
+        Ok(())
+    }
+    #[test]
+    fn swift_channel_identity_preserves_asymmetry_and_epoch_high_water() -> Result {
+        use l2tunnel_swift::diagnostics::{ChannelBuffers, ReceiverBuffers};
+        let mut value = ProtocolBuffers::new(3, Role::Client)?;
+        let heap = value.heap_bytes();
+        let a = identity(11, 7);
+        let owner = Owner::SwiftChannel {
+            channel: 1,
+            send: false,
+            receive: true,
+        };
+        let buffers = ChannelBuffers {
+            send: None,
+            receive: Some(ReceiverBuffers {
+                source_positions: 3,
+                source_capacity_positions: 8,
+                known_sources: 2,
+                source_bytes: 7,
+                source_capacity_bytes: 128,
+                rows: 1,
+                row_capacity: 4,
+                row_bytes: 9,
+                row_capacity_bytes: 72,
+                stream_bytes: 5,
+                stream_capacity_bytes: 128,
+            }),
+        };
+        assert!(value.begin(1, [Some(a), None]));
+        value
+            .row(a, Owner::SwiftPacking, 1)
+            .ok_or("packing")?
+            .gauge(0, Some(0), Some(16));
+        value.row(a, owner, 1).ok_or("channel")?.swift(buffers);
+        assert!(!value.due(100_000, false));
+        assert!(value.begin(100_001, [Some(a), None]));
+        let mut smaller = buffers;
+        smaller.receive.as_mut().ok_or("receive")?.stream_bytes = 1;
+        value
+            .row(a, owner, 100_001)
+            .ok_or("channel")?
+            .swift(smaller);
+        let row = value.row(a, owner, 100_001).ok_or("channel")?;
+        assert_eq!(row.gauges[10].used, Some(1));
+        assert_eq!(row.gauges[10].high_water, Some(5));
+        assert_eq!(row.gauges[0].samples, 0, "absent sender is not zero usage");
+        assert!(
+            row.staged_admission.is_none(),
+            "retention cannot create a wait"
+        );
+        let mut output = Vec::new();
+        value.write(&mut output)?;
+        let json: serde_json::Value = serde_json::from_slice(&output)?;
+        let channel = &json["epochs"][0]["owners"][1];
+        assert_eq!(channel["scope"], "swift-channel");
+        assert_eq!(channel["channel"], 1);
+        assert_eq!(channel["send_present"], false);
+        assert_eq!(channel["receive_present"], true);
+        assert!(channel["owner"].is_null() && channel["incarnation"].is_null());
+        assert_eq!(channel["gauges"].as_array().ok_or("gauges")?.len(), 6);
+        let b = identity(11, 8);
+        assert!(value.begin(100_002, [Some(b), None]));
+        let fresh = value.row(b, owner, 100_002).ok_or("new digest")?;
+        assert_eq!(fresh.gauges[10].high_water, None);
+        fresh.swift(smaller);
+        assert_eq!(fresh.gauges[10].high_water, Some(1));
+        assert_eq!(value.heap_bytes(), heap, "sampling must not grow storage");
+        assert!(
+            value.row(a, owner, 100_002).is_none(),
+            "retired epoch cannot update"
+        );
         Ok(())
     }
 }

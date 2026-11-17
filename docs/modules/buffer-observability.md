@@ -50,9 +50,9 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
 | BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Existing storage observations; dedicated builder, recovery/output and whole-write intervals pending. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
-| BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges and actual packing refusal implemented. Independent channel timing/export pending. |
+| BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
 | BP-09 | Block FEC generations/equations/restored output | Rank/storage limits and bounded scratch remain; dedicated gauges/refusals/export pending. |
-| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Existing status and work-used facts; nested codec gauges implemented. Recovery/work/feedback intervals pending. |
+| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and three exact retained-operation intervals are implemented: source admission, decoded handoff and ready-feedback budget. Optional bounded storage and runtime export are charged before I/O. Coordinated local validation passes below; native qualification, work slices, feedback construction, ingress and missing-source dependencies remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
 | BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Sampled codec/recovery export preserves full independent owner incarnation; exact staged-source admission waits retain the same identity. Remaining lifecycle/source-free/native wait timing is pending. |
@@ -60,9 +60,9 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-15 | Native output pool/device credit/receipts | Runtime occupancy, actual pool-acquire refusal counts and device-write WouldBlock intervals implemented. A refused scan lease does not prove useful native output exists, so its interval remains unmeasured. Native credit/controller internals remain BP-03. |
 | BP-16 | Management message/recovery/reassembly/semantic/dispatch slots | Bounded per-stream occupancy and exact frozen Transaction submission refusal-to-admission timing are implemented and pass focused actual-owner tests. Ordinary reused-ID submissions are count-only; fragment, receipt, dispatch and dependency intervals remain pending. Runtime terminal export qualification remains separate. |
 | BP-17 | Proxy channels/writer/Bridge/ring/measured ledger/relay buffers | Actual selected-frame receipt-ring refusal intervals and bounded receipt/import/callback timing export implemented. Focused current validation is recorded separately; writer/channel/relay occupancy, publication-to-import timing and complete measured-ledger attribution remain pending. |
-| BP-18 | Raw candidate classes/pinned input/bitmap/prepared/tracked/receipts | Typed prepare reasons, per-class gauges/counters and terminal scalar retention implemented. Exact opt-in per-lane PacketIo intervals and Common scalar export pass focused local fixtures; native interval qualification is pending. Quota/pacing and prepare refusals remain separate untimed counts. Candidate residence, custody and peer-credit wait attribution remain incomplete. Bitmap is coverage state, not buffered packet bytes. |
+| BP-18 | Raw candidate classes/pinned input/bitmap/prepared/tracked/receipts | Typed prepare reasons, per-class gauges/counters and terminal scalar retention implemented. Exact opt-in per-lane PacketIo intervals and Common scalar export pass focused local fixtures; native interval qualification is pending. Quota/pacing and prepare refusals remain separate untimed counts. Exact commit/physical/observation/upper-take custody latency passes coordinated local validation; it is separate from blocked time. Candidate residence and peer-credit wait attribution remain incomplete. Bitmap is coverage state, not buffered packet bytes. |
 | BP-19 | OpenVPN submissions/held datagrams/receive/setup buffers | Class/channel fullness, socket waits and receive drops pending. |
-| BP-20 | Retained TLS class/writer/prefix/body/input/completion slots | Actual class refusal, write/flush Pending and work-budget waits implemented; bounded occupancy sampled. TLS Pending does not prove kernel queue saturation. |
+| BP-20 | Retained TLS class/writer/prefix/body/input/completion slots | Actual class refusal, write/flush Pending and work-budget waits implemented; bounded occupancy sampled. Actual queued-class writer selection and partial-input missing-byte intervals now pass focused framing tests; native qualification is pending. TLS Pending does not prove kernel queue saturation. |
 | BP-21 | QUIC permits/tickets/DATAGRAM wait/cache/provider queues | Actual class-slot refusal and pending-send intervals, permit/cached-input gauges and provider available-payload samples implemented. Public RTT/cwnd/congestion/loss and UDP counters now have bounded per-lane sampled export with passing focused validation and the finite native10 observation below. Exact provider send/receive occupancy remains unavailable; capacity minus available is not a valid occupancy calculation. Actual QUIC FIFO permit/capacity fixture passes; native9 exercises earlier diagnostic export but its finite QUIC case exhausts the original bound. |
 | BP-22 | Maintained carrier wrapper User/Control/cache slots | Common User completion wait implemented as combined wrapper/carrier wait. QUIC wrapper class admission, pending send and receipt-slot gauges implemented; remaining backend-specific attribution pending. |
 | BP-23 | Local request, bootstrap and joining retry buffers | Existing bounded owners retained. Opt-in constructor/readiness stages and accepted local API read/handler/reply durations implemented; listener backlog delay and full bootstrap/retry-buffer blockage attribution remain unmeasured. |
@@ -710,3 +710,169 @@ Common CLI. Earlier failed receipts remain retained. This fresh local pass does
 not establish native throughput, full buffer coverage or remote platform support.
 The next native run checks all three Aligned Compact raw/UDP directions plus
 Swift ARQ TLS reverse and QUIC forward under the original impairment and bounds.
+
+### Native14 scheduling and terminal observations
+
+The [stable release14](../../work/aligned-extents-20261117/matrix-source-binding-14.json)
+binds checkpoint `68f395e` and executable
+`343bce983a51ecd5708d6355c1223f4816ee6d76fcfbad79c4d002a3602b1d72`.
+Four carrier lanes ran concurrently with unchanged source, original bounds,
+100/10 Mbit/s, 70 ms RTT and 15% independent loss in each direction. Each data
+phase uses sixteen TCP flows and a ten-second unique receiver sample.
+
+| Mode/carrier | Forward Mbit/s | Reverse Mbit/s | Simultaneous forward / reverse Mbit/s | Separate terminal outcome |
+|---|---:|---:|---|---|
+| Aligned Compact raw | 15.7461312 | 7.332672 | 8.873344 / 6.8195008 | Both original 120 s leases expired before requested disconnect |
+| Aligned Compact UDP | 31.9289792 | 7.5516096 | Unqualified: capture-ring drops | Both requested disconnects passed |
+| Swift ARQ TLS | Not requested | Unqualified: original record cap expired | Not requested | Server timeout followed by client reset |
+| Swift ARQ QUIC | 0.324352 | Not requested | Not requested | Server peer-close Transport after data phase; bilateral close unqualified |
+
+The [raw/UDP analysis](../../work/aligned-extents-20261117/native14-raw-udp-analysis1/report.md)
+verifies persistent UDP socket identities: both drop counters and namespace
+receive-buffer errors remain zero through all three phases. The failed UDP
+simultaneous capture loses 6408 packets at client WAN and 1589 at client native;
+these diagnostic ring drops are not tunnel receive-socket drops. Original
+artifacts and invalid phase qualification remain retained. Capture output now
+uses buffered file writes rather than a forced per-packet flush, preserving the
+8192 KiB ring, immediate capture, packet timestamps and all completeness checks.
+Its renewed native qualification is pending.
+
+Raw sender cumulative receipt-wait fraction is 38.75%, with mean completed wait
+214.22 microseconds, versus native13 75.73% and 601.43 microseconds. These cover
+118.7 seconds/three phases versus 40.2 seconds/forward only. They support reduced
+observed receipt latency alongside the same-turn source correction, not an
+isolated phase-matched causal measurement. Actual raw PacketIo WouldBlock,
+quota, pacing and peer-horizon refusals remain zero; wrapper custody refusals
+remain separate from kernel blocking. The passing data phases do not turn the
+later lease expiry and failed disconnect into a passing shutdown test.
+
+The [twelve buffer exports](../../work/aligned-extents-20261117/buffer-native14-report1/findings.md)
+have no known-field invalidity. All eight Common owners have protocol and
+management final timestamps equal to their actual terminal-source attempt,
+including Driver-drop cancellation, with no source-unavailable event. Raw and
+UDP staged-source waits retain exact terminal markers. Raw sender/receiver
+sequence-window completed waits total 13.091722/6.444917 seconds; UDP receiver
+records 6.920781 seconds and sender zero at these hooks. These intervals overlap
+other sites and must not be summed into end-to-end blocked time. Exact frozen
+management submission waits are zero; internal management dependencies remain
+untimed. Swift provider timestamps are fresh but contain no Swift gauge rows
+in release14, so they do not qualify BP-08. TLS server FlushPending occupies
+63.09% of that owner span. QUIC client carrier submission occupies 88.85% and
+Common receipt waiting 89.62% in separate owners; they are not additive.
+
+[Measured layer extents](../../work/aligned-extents-20261117/native14-overhead-analysis1/report.md)
+retain all four carriers and both directions with their own counts. Records
+protection remains 21/21 B mean/p99. Same-emission IP outside codec body is
+60.783/61 B forward and 60.737/61 B reverse for UDP, and 72.736/73 B and
+72.706/73 B for raw. These lifetime populations include retries and feedback,
+not only throughput-window data. Full original-native mean/p99 and maintained
+TLS/QUIC outer-packet attribution remain unavailable. The
+[mixed-source matrix](../../work/aligned-extents-20261117/matrix-report-repairs14-complete1/report.md)
+now selects 18 passed, 182 failed, 32 bound-exhausted, one tool-failed and seven
+not-run phases. Most combinations still select historical binaries; no current
+all-modes qualification is claimed.
+
+### TLS dependencies and exact Rolling expiry attribution
+
+The next source batch measures actual retained TLS class output waiting for the
+other class's active frame to release its writer. Selection of that same class
+ends the ownership interval before its independent socket/TLS write wait. It
+also measures actual partial input waiting for missing bytes after read Pending;
+idle reads remain unobserved. Original tokens, I/O order, deadlines and quotas
+are unchanged. One bounded failure-only metadata export observes the original
+pending offsets, caps and active lanes before release, with no payload or key.
+Wait totals freeze before diagnostic I/O. Its snapshot timestamp follows the
+failing call; expired candidates are not invented as
+unique root causes. All fourteen focused TLS cases, including the two new
+actual framing regressions, pass in
+[focused15 attempt2](../../work/aligned-extents-20261117/focused-buffer15-attempt2/receipt.json).
+Native interpretation remains pending.
+
+Rolling/Research pure owners now retain a bounded first actual failed-check fact
+and expose read-only lifetime candidates under injected ticks. Runtime failure
+tracing visits at most two actual retained epochs. This distinguishes a winning
+check from another expired timer and preserves native failure identity after
+settlement. Three focused FEC regressions pass. The original new precedence
+fixture failed Busy because its original tail was due; the corrected fixture
+services that actual tail and verifies the unchanged outer-output check wins
+over an earlier nested debt deadline. The failed attempt is preserved.
+No timer, cap, recovery action or wire format was changed. The
+[Python comparison](../../work/aligned-extents-20261117/rolling-expiry-draft14/notes.md)
+shows Rust's retained cohort debt abort is extra policy, not Python parity;
+partial confirmation does not clear the original cohort bound. Current native
+winning-expiry evidence and actual BP-10 buffer wait intervals remain required.
+
+### Swift channel export and Rolling retained-operation waits
+
+The next coordinated batch forwards the actual Swift shared-packing snapshot and
+every independent send/receive channel, preserving asymmetric availability and
+full epoch/configuration identity. The maximum is 65 rows, charged before I/O
+within the existing bounded provider catalog. Sampling is gated before channel,
+source and equation scans. Shared packing and channel gauges overlap; repair
+work debt is not retained packet capacity. No wait duration is inferred from
+these samples. BP-08 feedback/history/control/RTO/source/rank/stream intervals
+remain required.
+
+The maintained Rolling/Research Endpoint now records actual sealed-source
+recovery Busy/Capacity until the same source commits, actual decoded-source
+record refusal until the same source hands off, and ready immutable feedback
+packet/byte refusal until that exact output is debited. Each site preserves its
+original identity, geometry and available deadline. Repeated refusals do not
+restart the wait. Independent reasons may overlap; only the site-local union
+is reported, with no invented endpoint-wide total. Failure or a fresh terminal
+observation censors unresolved work, distinct from successful progress.
+
+The pure owner uses injected time and an optional fallibly reserved singleton.
+Both initial and replacement Engine plans charge that storage before applying
+the original retained-byte limit; diagnostics do not enlarge the limit. Runtime
+exports at most one snapshot per retained epoch. Disabled owners allocate no
+diagnostic heap. Actual-owner and parser regressions are implemented; coordinated
+compilation, checks and native qualification remain pending. This initial slice
+does not close BP-10 work-slice, feedback-build, authenticated-ingress or
+missing-source/dependency coverage.
+
+### Raw token custody latency
+
+The same pending batch follows the real User/Control RecordToken through commit,
+original physical acceptance, first wrapper observation and exact upper receipt
+take. Four fixed lane/class rows and two live slots preserve original timestamps,
+deadlines and receipt identity. Repeated observations cannot double count. Owner
+release freezes unresolved stages before lower resources drop, without polling
+I/O; terminal age before observation does not prove no packet was transmitted.
+
+The optional raw-specific collector reserves bounded storage before I/O and
+exports separately from generic buffer waits. It adds no per-event allocation
+or size to unrelated observers. Successful stage latency and unresolved terminal
+ages are separate populations, with mean/max and no fabricated p99 or blocked
+percentage. Candidate, verifier and stable-demand peer-credit timing remain open.
+Focused actual Full/Half integration and parser cases are included in the pending
+coordinated check; source review alone does not qualify runtime behavior.
+
+### Coordinated local buffer batch15 validation
+
+The [full required attempt](../../work/aligned-extents-20261117/required-buffer-checks15-attempt1/validation.json)
+passes preflight, parser suites, strict workspace Clippy and all Rust cases except
+two newly added fixtures. The Rolling feedback fixture had staged input without
+servicing decode before its feedback timer. The Swift fixture incorrectly expected
+a Reliable/Rolling output token instead of its actual Common sealed ciphertext.
+The fixes only change those fixtures: no production deadline, cap or scheduling
+policy changes. The failed receipt remains preserved.
+
+The [scoped continuation](../../work/aligned-extents-20261117/required-buffer-checks15-continuation1/validation.json)
+passes both affected suites, formatting/Clippy and every remaining required stage,
+including strict rustdoc, codec no-default tests, external Common CLI and 1,658
+simulator cases. Its source stays unchanged throughout; the only source differences
+from the failed attempt are those two test files. Passing unchanged workspace
+cases are reused rather than rerun. This is a passing scoped continuation, not a
+pristine all-green invocation or native validation. New raw custody, Swift channel,
+Rolling retained-wait and TLS dependency exports now have actual-owner fixture
+coverage. All full BP gates and native/matrix qualifications remain open.
+
+The [saved native14 QUIC analysis](../../work/aligned-extents-20261117/native14-quic-swift-analysis/analysis.md)
+separately attributes the strongest observed stall to actual Quinn admission
+waiting. Sampled Cubic windows of 2,944--17,184 bytes are consistent with the low
+rate under 15% loss, but there is no captured BytesInFlight or matched window-time
+histogram to quantify causality. The source also exposes Swift starting retry
+timing before carrier acceptance; correcting that behavior is pending. It does
+not justify bypassing congestion control, enlarging caps or treating a Python
+fixed-rate link as an equivalent genuine-QUIC experiment.

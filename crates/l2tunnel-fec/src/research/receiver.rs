@@ -42,6 +42,7 @@ pub struct Receiver {
     next_feedback: u64,
     last: Tick,
     terminal: Option<Error>,
+    expiry_failure: Option<rolling::expiry::Failure>,
 }
 impl Receiver {
     #[cfg(test)]
@@ -76,6 +77,7 @@ impl Receiver {
             next_feedback: 1,
             last: now,
             terminal: None,
+            expiry_failure: None,
         })
     }
     /// Pre-admit all actual nested heap capacities before constructing this owner.
@@ -108,6 +110,11 @@ impl Receiver {
             now,
             &[self.output_end, self.event_end, self.retained_cap],
         ) {
+            if error == Error::Expired {
+                self.expiry_failure = self
+                    .expiry_failure
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3, 4, 5]));
+            }
             return self.fail(error);
         }
         if let Err(error) = self.decoder.step(now, WorkBudget::default()) {
@@ -212,6 +219,14 @@ impl Receiver {
             .map(|end| end.min(cap))
             .or_else(|error| self.fail(error))?;
         if now >= feedback_end {
+            self.expiry_failure.get_or_insert(rolling::expiry::Failure {
+                observed: now,
+                selected: rolling::expiry::Deadline::new(
+                    rolling::expiry::Kind::FeedbackEvent,
+                    feedback_end,
+                    None,
+                ),
+            });
             return self.fail(Error::Expired);
         }
         if cap != Tick(u64::MAX) {
@@ -288,6 +303,14 @@ impl Receiver {
             self.decoder.pending_source()
         }
     }
+    /// Original ordered-handoff cohort cap of the actual nested decoder.
+    pub fn handoff_deadline(&self) -> Option<Tick> {
+        self.decoder.handoff_deadline()
+    }
+    /// Original cap of an actual ready immutable feedback output, if present.
+    pub fn feedback_deadline(&self) -> Option<Tick> {
+        self.feedback.and(self.output_end)
+    }
     /// Borrow one actual committed source for bounded record preview without consuming handoff.
     pub fn decoded_source(&self, id: SourceId) -> Result<Option<&[u8]>, Error> {
         if self.terminal.is_some() {
@@ -330,6 +353,25 @@ impl Receiver {
         self.next_feedback += 1;
         self.release_idle_cap();
         Ok(())
+    }
+    /// Read original outer and nested lifetimes without advancing service.
+    pub fn expiry_snapshot(&self) -> rolling::expiry::Snapshot {
+        use rolling::expiry::{Deadline, Identity, Kind};
+        let mut snapshot = self.decoder.expiry_snapshot();
+        let identity = self.feedback.map(|f| Identity::Feedback(f.id.0));
+        snapshot.candidates[3] = self
+            .output_end
+            .map(|at| Deadline::new(Kind::FeedbackOutput, at, identity));
+        snapshot.candidates[4] = self
+            .event_end
+            .map(|at| Deadline::new(Kind::FeedbackEvent, at, None));
+        snapshot.candidates[5] = self
+            .retained_cap
+            .map(|at| Deadline::new(Kind::RetainedInput, at, None));
+        snapshot.last_successful = self.last;
+        snapshot.terminal = self.terminal.or(snapshot.terminal);
+        snapshot.failure = self.expiry_failure.or(snapshot.failure);
+        snapshot
     }
     /// Earliest original decoder, feedback output, or deferred-event expiry.
     pub fn deadline(&self) -> Option<Tick> {

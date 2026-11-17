@@ -198,3 +198,17 @@ impl Engine {
         }
     }
 }
+
+impl Engine {
+    /// Exact selected Rolling/Research wait state, absent when diagnostics are disabled.
+    pub fn rolling_wait_snapshot(
+        &self,
+        observed: Tick,
+    ) -> Option<crate::rolling_records::waits::Snapshot> {
+        match &self.owner {
+            Owner::Rolling(owner) => owner.wait_snapshot(observed),
+            Owner::Research(owner) => owner.wait_snapshot(observed),
+            _ => None,
+        }
+    }
+}

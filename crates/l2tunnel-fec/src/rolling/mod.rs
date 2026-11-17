@@ -7,6 +7,8 @@ use std::fmt;
 
 mod decoder;
 mod encoder;
+/// Bounded original lifetime facts and exact expiry-check observations.
+pub mod expiry;
 pub(crate) mod explicit;
 pub mod scheduler;
 pub mod storage;

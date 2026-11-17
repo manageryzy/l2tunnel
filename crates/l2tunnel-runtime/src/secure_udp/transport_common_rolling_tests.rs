@@ -411,3 +411,82 @@ mod fragments;
 
 #[path = "transport_common_research_tests.rs"]
 mod research_common;
+
+#[test]
+fn actual_rolling_engine_wait_export_is_bounded_and_censors_only_fresh_source() -> Result {
+    use crate::buffer_metrics::protocol_buffers::{Identity, ProtocolBuffers};
+    let (contracts, _) = selected(
+        cover::Appearance::QuicLike,
+        rolling::wire::SourceWire::Exact,
+        3,
+    )?;
+    let contract = &contracts[0];
+    let context = engine::Context {
+        session: 37,
+        epoch: 7,
+        role: mg::Role::Client,
+    };
+    let configuration = contract.initial();
+    let plan = engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
+        configuration,
+        context,
+        contract.geometry(),
+        contract.native_limits()?,
+        None,
+        contract.resources().rolling_ingress,
+        None,
+        contract.feedback_overhead_bytes()?,
+    )?
+    .with_rolling_wait_diagnostics()?;
+    let engine = engine::Engine::new_reserved(
+        plan,
+        engine::storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    let identity = Identity {
+        epoch: context.epoch,
+        configuration: configuration.digest()?.0,
+    };
+    let mut report = ProtocolBuffers::new(256, mg::Role::Client)?;
+    let before = report.heap_bytes();
+    report.configure_rolling_waits()?;
+    assert_eq!(
+        report.heap_bytes() - before,
+        2 * std::mem::size_of::<rolling_records::waits::Snapshot>()
+    );
+    let retained = report.heap_bytes();
+    assert!(report.begin(10, [Some(identity), None]));
+    report.sample_engine(identity, 10, &engine);
+    report.finish_rolling_waits(20, crate::buffer_metrics::SourceBoundary::LoopStop);
+    let mut out = Vec::new();
+    report.write(&mut out)?;
+    let stale: serde_json::Value = serde_json::from_slice(&out)?;
+    assert_eq!(stale["staged_terminal_unavailable"], 1);
+    assert!(stale["epochs"][0]["rolling_waits"]["terminal_at_us"].is_null());
+    assert!(report.begin(20, [Some(identity), None]));
+    report.sample_engine(identity, 20, &engine);
+    report.finish_rolling_waits(20, crate::buffer_metrics::SourceBoundary::DriverDrop);
+    out.clear();
+    report.write(&mut out)?;
+    let fresh: serde_json::Value = serde_json::from_slice(&out)?;
+    let snapshot = &fresh["epochs"][0]["rolling_waits"];
+    assert_eq!(snapshot["epoch"], 7);
+    assert_eq!(snapshot["stream"], 17);
+    assert_eq!(snapshot["terminal_stage"], "driver_drop");
+    assert_eq!(snapshot["observed_at_us"], 20);
+    assert_eq!(snapshot["terminal_at_us"], 20);
+    assert_eq!(
+        snapshot["sites"]
+            .as_array()
+            .ok_or("three bounded sites")?
+            .len(),
+        3
+    );
+    for row in snapshot["sites"].as_array().ok_or("actual sites")? {
+        assert!(row["pending"].is_null());
+        assert_eq!(row["union"]["censored_episodes"], 0);
+    }
+    assert_eq!(report.heap_bytes(), retained);
+    Ok(())
+}

@@ -25,6 +25,18 @@ enum Input {
     Repair(Descriptor),
 }
 impl Input {
+    fn expiry_identity(self) -> expiry::Identity {
+        match self {
+            Self::Source(id) => expiry::Identity::Sources {
+                first: id,
+                end: id + 1,
+            },
+            Self::Repair(d) => expiry::Identity::Repair {
+                id: d.id,
+                support: Some((d.support.start, d.support.end)),
+            },
+        }
+    }
     fn end(self) -> u32 {
         match self {
             Self::Source(id) => id + 1,
@@ -226,6 +238,7 @@ pub struct Decoder {
     debt: Option<Tick>,
     delivery: Option<Tick>,
     terminal: Option<Error>,
+    expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::DecoderState>,
 }
 enum Action {
@@ -374,6 +387,7 @@ impl Decoder {
             debt: None,
             delivery: None,
             terminal: None,
+            expiry_failure: None,
             explicit: None,
         })
     }
@@ -390,6 +404,11 @@ impl Decoder {
                 self.job.as_ref().map(|job| job.deadline),
             ],
         ) {
+            if error == Error::Expired {
+                self.expiry_failure = self
+                    .expiry_failure
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[0, 1, 2]));
+            }
             self.terminal = Some(error);
             return Err(error);
         }
@@ -424,6 +443,23 @@ impl Decoder {
             None => None,
         };
         if observed >= job_end || debt.is_some_and(|end| observed >= end) {
+            let at = if observed >= job_end {
+                job_end
+            } else {
+                debt.unwrap_or(job_end)
+            };
+            self.expiry_failure.get_or_insert(expiry::Failure {
+                observed,
+                selected: expiry::Deadline::new(
+                    if observed >= job_end {
+                        expiry::Kind::DecoderJob
+                    } else {
+                        expiry::Kind::DecoderDebt
+                    },
+                    at,
+                    Some(input.expiry_identity()),
+                ),
+            });
             return self.fail(Error::Expired);
         }
         Ok((job_end, debt))
@@ -504,6 +540,17 @@ impl Decoder {
             return self.fail(Error::TimeRegression);
         }
         if now >= original_deadline {
+            self.expiry_failure.get_or_insert(expiry::Failure {
+                observed: now,
+                selected: expiry::Deadline::new(
+                    expiry::Kind::IncomingCap,
+                    original_deadline,
+                    Some(expiry::Identity::Sources {
+                        first: id.0,
+                        end: id.0 + 1,
+                    }),
+                ),
+            });
             return self.fail(Error::Expired);
         }
         if self.job.is_some() {
@@ -665,6 +712,17 @@ impl Decoder {
             return self.fail(Error::TimeRegression);
         }
         if now >= original_deadline {
+            self.expiry_failure.get_or_insert(expiry::Failure {
+                observed: now,
+                selected: expiry::Deadline::new(
+                    expiry::Kind::IncomingCap,
+                    original_deadline,
+                    Some(expiry::Identity::Repair {
+                        id: repair.id,
+                        support: Some((repair.support.start, repair.support.end)),
+                    }),
+                ),
+            });
             return self.fail(Error::Expired);
         }
         if self.job.is_some() {
@@ -1497,6 +1555,10 @@ impl Decoder {
         }
         Ok(())
     }
+    /// Original ordered-handoff cohort cap, without renewing it for a new source.
+    pub const fn handoff_deadline(&self) -> Option<Tick> {
+        self.delivery
+    }
     /// Earliest original job, unresolved debt or upper handoff deadline.
     pub fn deadline(&self) -> Option<Tick> {
         self.debt
@@ -1527,6 +1589,48 @@ impl Decoder {
         let unknown = extent.checked_sub(future).ok_or(Error::Identity)?;
         let rank = u32::try_from(live.rank).map_err(|_| Error::Identity)?;
         Ok((live.prefix, live.observed, unknown.saturating_sub(rank)))
+    }
+    /// Read original lifetimes without examining payloads or advancing time.
+    pub fn expiry_snapshot(&self) -> expiry::Snapshot {
+        use expiry::{Deadline, Identity, Kind};
+        expiry::Snapshot {
+            scope: self.scope,
+            last_successful: self.last,
+            terminal: self.terminal,
+            failure: self.expiry_failure,
+            candidates: [
+                self.debt.map(|at| {
+                    Deadline::new(
+                        Kind::DecoderDebt,
+                        at,
+                        Some(Identity::Sources {
+                            first: self.live.prefix,
+                            end: self.live.observed,
+                        }),
+                    )
+                }),
+                self.delivery.map(|at| {
+                    Deadline::new(
+                        Kind::DecoderHandoff,
+                        at,
+                        Some(Identity::Sources {
+                            first: self.handoff,
+                            end: self.live.prefix,
+                        }),
+                    )
+                }),
+                self.job.as_ref().map(|job| {
+                    Deadline::new(
+                        Kind::DecoderJob,
+                        job.deadline,
+                        Some(job.input.expiry_identity()),
+                    )
+                }),
+                None,
+                None,
+                None,
+            ],
+        }
     }
     /// Constant-size ownership snapshot without allocating or scanning payloads.
     pub fn status(&self) -> DecoderStatus {

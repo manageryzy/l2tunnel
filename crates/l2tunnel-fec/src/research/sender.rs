@@ -111,6 +111,7 @@ pub struct Sender {
     last_source_accepted: Option<Tick>,
     last: Tick,
     terminal: Option<Error>,
+    expiry_failure: Option<rolling::expiry::Failure>,
 }
 impl Sender {
     /// Admit and verify the actual nested encoder heap capacities before use.
@@ -161,6 +162,7 @@ impl Sender {
             last_source_accepted: None,
             last: now,
             terminal: None,
+            expiry_failure: None,
         })
     }
 
@@ -181,6 +183,9 @@ impl Sender {
             .flatten()
             .any(|end| now >= end)
         {
+            self.expiry_failure = self
+                .expiry_failure
+                .or_else(|| self.expiry_snapshot().first_expired(now, &[3, 4]));
             return self.fail(Error::Expired);
         }
         if let Err(error) = self.encoder.step(now, WorkBudget::default()) {
@@ -501,6 +506,36 @@ impl Sender {
         }
     }
 
+    /// Read original outer and nested lifetimes without advancing service.
+    pub fn expiry_snapshot(&self) -> rolling::expiry::Snapshot {
+        use rolling::expiry::{Deadline, Identity, Kind};
+        let mut snapshot = self.encoder.expiry_snapshot();
+        let identity = self.pending.map(|pending| match pending {
+            Pending::Source(id) => Identity::Sources {
+                first: id.0,
+                end: id.0 + 1,
+            },
+            Pending::Repair { id, .. } => Identity::Repair { id, support: None },
+        });
+        snapshot.candidates[3] = self
+            .output_end
+            .map(|at| Deadline::new(Kind::DataOutput, at, identity));
+        let encoder = self.encoder.status();
+        snapshot.candidates[4] = self.debt_end.map(|at| {
+            Deadline::new(
+                Kind::ResearchDebt,
+                at,
+                Some(Identity::Sources {
+                    first: encoder.confirmed_prefix,
+                    end: encoder.next_source,
+                }),
+            )
+        });
+        snapshot.last_successful = self.last;
+        snapshot.terminal = self.terminal.or(snapshot.terminal);
+        snapshot.failure = self.expiry_failure.or(snapshot.failure);
+        snapshot
+    }
     /// Earliest original hard deadline; output polling and partial feedback never renew it.
     pub fn deadline(&self) -> Option<Tick> {
         self.encoder

@@ -251,6 +251,7 @@ impl Driver {
             if protocol_sampled {
                 if let Some(protocol) = metrics.protocol_buffers() {
                     protocol.finish_staged_admission(now);
+                    protocol.finish_rolling_waits(now, boundary);
                 }
             } else if metrics.protocol_buffers().is_some() {
                 // A previous sample at the same tick is not proof that this

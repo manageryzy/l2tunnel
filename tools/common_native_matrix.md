@@ -97,7 +97,12 @@ are counted as repair traffic.
   host utilization to the tunnel.
 
 Captures have finite512MiB and2million-packet ceilings per surface. Snaplen2048
-must preserve complete packets. Captures use preopened output descriptors and tcpdump immediate mode.
+must preserve complete packets. Captures use preopened output descriptors and
+tcpdump immediate mode with the original 8192 KiB capture ring. Output uses
+ordinary buffered file writes; it does not request a file flush per packet.
+Clean bounded SIGINT shutdown must flush the output before parsing and exact
+tcpdump/pcap packet-count validation. This reduces capture write calls without
+changing packet timestamps, tunnel socket buffers, impairment or protocol bounds.
 Missing/truncated captures, kernel capture drops,
 exhausted bounds and missing/invalid metrics reports prevent a passing row.
 Histogram counts, totals, quantiles, carrier boundaries and invalid/overflow

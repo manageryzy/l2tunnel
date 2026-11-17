@@ -190,6 +190,17 @@ async fn raw_new_final_output_progresses_after_idle_receipt_poll_without_new_tur
             progress_owner(&mut pair.a, &mut pair.ad).await?;
             progress_owner(&mut pair.b, &mut pair.bd).await?;
         }
+        let custody_path = std::env::temp_dir().join(format!(
+            "l2tunnel-raw-custody-same-turn-{}-{half}-{}.bmetrics",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        ));
+        pair.a
+            .final_raw_mut()
+            .ok_or("actual raw owner")?
+            .custody_observer_for_test(custody_path.clone())?;
         for management in [false, true] {
             let now = Instant::now();
             let deadline = pair.ad.origin + duration(pair.ad.lease);
@@ -214,6 +225,42 @@ async fn raw_new_final_output_progresses_after_idle_receipt_poll_without_new_tur
             assert_eq!(receipt.deadline, deadline);
             assert_eq!(Instant::now(), now);
         }
+        drop(pair);
+        let metrics: serde_json::Value = serde_json::from_slice(&std::fs::read(&custody_path)?)?;
+        let rows = metrics["raw_custody"]["rows"]
+            .as_array()
+            .ok_or("raw custody rows")?;
+        for class in ["User", "Control"] {
+            let matching = rows
+                .iter()
+                .filter(|row| row["class"] == class)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching
+                    .iter()
+                    .map(|row| row["committed"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+                1
+            );
+            assert_eq!(
+                matching
+                    .iter()
+                    .map(|row| row["physical_observed"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+                1
+            );
+            assert_eq!(
+                matching
+                    .iter()
+                    .map(|row| row["upper_taken"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+                1
+            );
+        }
+        assert_eq!(metrics["raw_custody"]["identity_mismatches"], 0);
+        assert_eq!(metrics["raw_custody"]["invalid_clock"], false);
+        assert!(metrics["blocked_union"].is_null());
+        std::fs::remove_file(custody_path)?;
     }
     Ok(())
 }

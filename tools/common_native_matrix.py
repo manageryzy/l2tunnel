@@ -472,7 +472,7 @@ def phase(case, name, binary, secrets, daemons):
             for kind, interface, addresses in [('wan', 'wan0', list(WAN.values())), ('native', 'tun0', list(NATIVE.values()))]:
                 label = name + '-' + side + '-' + kind
                 path = output / (side + '-' + kind + '.pcap')
-                args = ['tcpdump', '-Z', 'root', '--immediate-mode', '-n', '-U', '-s', str(observe.SNAPLEN), '-B', '8192', '-i', interface,
+                args = ['tcpdump', '-Z', 'root', '--immediate-mode', '-n', '-s', str(observe.SNAPLEN), '-B', '8192', '-i', interface,
                         '-c', str(observe.CAPTURE_PACKETS), '-w', '-', 'ip', 'and', 'host', addresses[0], 'and', 'host', addresses[1]]
                 child = case.spawn('endpoint_' + side, label, args, capture=path)
                 captures[side + '_' + kind] = (child, addresses)

@@ -662,3 +662,135 @@ async fn dropped_common_future_samples_live_protocol_and_management_before_owner
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn actual_common_swift_buffers_preserve_channels_and_terminal_sampling() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let fixture = Fixture::from_contracts_with_tail(kind, contracts(kind)?, false).await?;
+    let [mut a, _b] = fixture.endpoints;
+    let current = a.driver.common_state()?.current();
+    let role = common_contract::mg_role(a.driver.info.role);
+    let local = current.descriptor().local(role);
+    let l2tunnel::record_configuration::DirectionProfile::Swift(send) = local.send().profile()
+    else {
+        return Err("fixture did not install actual Swift".into());
+    };
+    let l2tunnel::record_configuration::DirectionProfile::Swift(receive) =
+        local.receive().profile()
+    else {
+        return Err("fixture did not install actual Swift peer".into());
+    };
+    let (send_channels, receive_channels) = (send.channels, receive.channels);
+    assert!(
+        send_channels > receive_channels,
+        "fixture must exercise absent receive direction"
+    );
+    let expected_digest = current.digest()?;
+    let needed = common_contract::maximum_body(local.send(), local.receive())?
+        .checked_add(a.driver.config.control.wire_overhead)
+        .and_then(|bytes| bytes.checked_add(a.driver.reserve))
+        .ok_or("actual wire requirement overflow")?;
+    let path = std::env::temp_dir().join(format!(
+        "l2tunnel-swift-channel-buffers-{}.bmetrics",
+        std::process::id()
+    ));
+    let mut observer = crate::buffer_metrics::Observer::for_test(a.driver.origin, path.clone())?;
+    observer.configure_protocol_buffers(send_channels.max(receive_channels) + 1, role)?;
+    a.driver
+        .common
+        .as_deref_mut()
+        .ok_or("Common owner")?
+        .buffer_metrics = Some(observer);
+    let now = clock(a.driver.origin, Instant::now())?.max(a.driver.bucket.ready_at(needed)?);
+    a.driver.sample_common_buffers(now);
+    let epoch = a.driver.common_state()?.epoch();
+    a.driver
+        .common_state_mut()?
+        .entry(epoch)?
+        .enqueue_borrowed(engine::Tick(now + 1), &frame(28_881, 73))?;
+    a.driver.bucket.refill(now + 2)?;
+    let mut send_attempts = 0;
+    assert!(!a.driver.send_common_user_with(now + 2, |_| {
+        send_attempts += 1;
+        Err(io::ErrorKind::WouldBlock.into())
+    })?);
+    assert_eq!(
+        send_attempts, 1,
+        "actual Swift ciphertext reached the carrier"
+    );
+    // Swift retains its source directly; its whole ciphertext belongs to the
+    // runtime slot rather than a Reliable/Rolling CarrierOutputToken.
+    let pending = a
+        .driver
+        .common
+        .as_deref()
+        .and_then(|runtime| runtime.sealed.as_ref())
+        .ok_or("WouldBlock did not retain actual Swift ciphertext")?;
+    assert!(pending.sealed.bytes > 0);
+    assert!(!pending.feedback);
+    a.driver.sample_common_buffers(now + 50_000);
+    a.driver.finish_buffer_metrics(now + 50_000);
+    drop(
+        a.driver
+            .common
+            .as_deref_mut()
+            .ok_or("Common owner")?
+            .buffer_metrics
+            .take(),
+    );
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    std::fs::remove_file(path)?;
+    assert_eq!(json["source_terminal_sample"]["boundary"], "loop_stop");
+    let provider = &json["protocol_buffers"];
+    assert_eq!(provider["unsupported_codec_samples"], 0);
+    assert_eq!(provider["identity_errors"], 0);
+    let observed = &provider["epochs"][0];
+    assert_eq!(observed["epoch"], epoch.0);
+    let digest: String = expected_digest
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(observed["configuration_digest_hex"], digest);
+    assert_eq!(
+        observed["samples"], 2,
+        "periodic sampling was gated before the forced terminal sample"
+    );
+    assert_eq!(observed["last_sample_us"], now + 50_000);
+    let rows = observed["owners"].as_array().ok_or("Swift rows")?;
+    assert_eq!(rows.len(), send_channels.max(receive_channels) + 1);
+    assert_eq!(rows[0]["scope"], "swift-shared-packing");
+    let mut retained_sources = 0;
+    for (channel, row) in rows.iter().skip(1).enumerate() {
+        assert_eq!(row["scope"], "swift-channel");
+        assert_eq!(row["channel"], channel);
+        assert_eq!(row["send_present"], channel < send_channels);
+        assert_eq!(row["receive_present"], channel < receive_channels);
+        assert!(row["staged_admission"].is_null(), "occupancy is not a wait");
+        let gauges = row["gauges"].as_array().ok_or("channel gauges")?;
+        for gauge in gauges {
+            if gauge["name"] == "swift_sender_source_records" {
+                retained_sources += gauge["used"].as_u64().ok_or("source count")?;
+            }
+            if gauge["name"] == "swift_sender_repairs_due" {
+                assert!(
+                    gauge["capacity"].is_null(),
+                    "repair work is not payload capacity"
+                );
+            }
+            if channel >= receive_channels {
+                assert!(
+                    !gauge["name"]
+                        .as_str()
+                        .ok_or("gauge name")?
+                        .starts_with("swift_receiver_")
+                );
+            }
+        }
+    }
+    assert!(
+        retained_sources > 0,
+        "must sample actual admitted source custody"
+    );
+    Ok(())
+}

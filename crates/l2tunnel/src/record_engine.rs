@@ -1026,6 +1026,14 @@ impl Engine {
             _ => None,
         }
     }
+    /// Actual selected Rolling/Research original lifetimes, without advancing owners.
+    pub fn rolling_expiry_snapshot(&self) -> Option<rolling_records::expiry::Snapshot> {
+        match &self.owner {
+            Owner::Rolling(owner) => Some(owner.expiry_snapshot()),
+            Owner::Research(owner) => Some(owner.expiry_snapshot()),
+            _ => None,
+        }
+    }
     /// Actual original fatal error, retained for cleanup and observability.
     pub const fn failure(&self) -> Option<Error> {
         self.failure

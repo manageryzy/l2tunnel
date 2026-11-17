@@ -412,6 +412,16 @@ where
         if let Ok(state) = driver.common_state() {
             for epoch in driver.common_epochs().into_iter().flatten() {
                 if let Ok(engine) = state.engine(epoch)
+                    && let Some(snapshot) = engine.rolling_expiry_snapshot()
+                {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "Common Rolling lifetime failure: role={:?} epoch={} snapshot={snapshot:?}",
+                        driver.role(),
+                        epoch.0,
+                    );
+                }
+                if let Ok(engine) = state.engine(epoch)
                     && let Some(snapshot) = engine.compact_retry_failure_snapshot()
                 {
                     let _ = writeln!(

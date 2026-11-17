@@ -686,6 +686,18 @@ fn actual_reserved_pipeline_handoff_retains_busy_head_and_original_native_expiry
     );
     assert_eq!(server.statistics().committed, 1);
     assert_eq!(server.pending_native(), None);
+    let lifetime = server.expiry_snapshot();
+    assert_eq!(lifetime.native, None);
+    assert_eq!(
+        lifetime.local_failure,
+        Some(expiry::LocalFailure {
+            owner: expiry::LocalOwner::Native,
+            observed: prepared.deadline(),
+            deadline: prepared.deadline(),
+            records_number: None,
+            native_record: Some(prepared.identity()),
+        })
+    );
     assert_eq!(
         server.commit_native(now, prepared.token()),
         Err(Error::Token)
@@ -830,3 +842,6 @@ fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identi
     }
     Ok(())
 }
+
+#[path = "wait_tests.rs"]
+mod wait_tests;

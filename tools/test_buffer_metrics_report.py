@@ -69,6 +69,43 @@ def save(directory, name, value):
 
 
 class BufferMetricsReportTests(unittest.TestCase):
+    def test_swift_channels_keep_asymmetry_work_debt_and_no_wait_inference(self):
+        value = fixture()
+        provider = protocol_fixture()
+        provider['epochs'][0]['owner_capacity'] = 3
+        shared = {'scope': 'swift-shared-packing', 'owner': None, 'incarnation': None,
+                  'channel': None, 'invalid_occupancy': False, 'counter_overflow': False,
+                  'gauges': [{'name': 'swift_shared_packing_bytes', 'samples': 1,
+                              'used': 12, 'high_water': 12, 'capacity': 64}],
+                  'staged_admission': None}
+        channel = {'scope': 'swift-channel', 'owner': None, 'incarnation': None,
+                   'channel': 1, 'send_present': True, 'receive_present': False,
+                   'invalid_occupancy': False, 'counter_overflow': False,
+                   'gauges': [{'name': 'swift_sender_repairs_due', 'samples': 1,
+                               'used': 3, 'high_water': 3, 'capacity': None}],
+                   'staged_admission': None}
+        provider['epochs'][0]['owners'] = [shared, channel]
+        value['protocol_buffers'] = provider
+        owner = report.normalize(value, 'swift.bmetrics', 'digest')
+        self.assertEqual(owner['protocol_provider_validation']['issues'], [])
+        self.assertEqual(owner['blocked_union']['observed_us'], report.normalize(fixture(), 'base.bmetrics', 'digest')['blocked_union']['observed_us'])
+        self.assertEqual(owner['provider_metadata']['protocol_buffers'], provider)
+        for mutation in ('duplicate', 'out_of_bound', 'absent_direction', 'invented_capacity'):
+            with self.subTest(mutation=mutation):
+                broken = json.loads(json.dumps(provider))
+                rows = broken['epochs'][0]['owners']
+                if mutation == 'duplicate':
+                    rows.append(json.loads(json.dumps(rows[1])))
+                elif mutation == 'out_of_bound':
+                    rows[1]['channel'] = 2
+                elif mutation == 'absent_direction':
+                    rows[1]['send_present'] = False
+                    rows[1]['receive_present'] = True
+                else:
+                    rows[1]['gauges'][0]['capacity'] = 99
+                self.assertTrue(report.protocol_provider(broken)['issues'])
+
+
     def test_union_uses_actual_span_and_never_sums_overlapping_rows_or_owners(self):
         with tempfile.TemporaryDirectory() as directory:
             first = save(directory, 'first.bmetrics', fixture())

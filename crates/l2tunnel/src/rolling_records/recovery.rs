@@ -138,6 +138,8 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         now: rolling::Tick,
     ) -> Result<(), rolling::Error>;
     fn source(receiver: &Self::Receiver) -> Option<(rolling::SourceId, &[u8])>;
+    fn handoff_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick>;
+    fn feedback_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick>;
     fn decoded_source(
         receiver: &Self::Receiver,
         id: rolling::SourceId,
@@ -157,6 +159,8 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn inspect(self, bytes: &[u8]) -> Result<View<'_>, rolling::Error>;
     fn send_deadline(sender: &Self::Sender) -> Option<rolling::Tick>;
     fn receive_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick>;
+    fn send_expiry(sender: &Self::Sender) -> rolling::expiry::Snapshot;
+    fn receive_expiry(receiver: &Self::Receiver) -> rolling::expiry::Snapshot;
     fn send_wake(sender: &Self::Sender) -> Option<rolling::Tick>;
     fn receive_wake(receiver: &Self::Receiver, now: rolling::Tick) -> Option<rolling::Tick>;
 }
@@ -383,6 +387,12 @@ impl RecoveryPolicy for scheduler::Policy {
     ) -> Result<(), rolling::Error> {
         r.confirm_feedback(i, n)
     }
+    fn handoff_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick> {
+        receiver.handoff_deadline()
+    }
+    fn feedback_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick> {
+        receiver.feedback_deadline()
+    }
     fn source(r: &Self::Receiver) -> Option<(rolling::SourceId, &[u8])> {
         r.pending_source()
     }
@@ -427,6 +437,12 @@ impl RecoveryPolicy for scheduler::Policy {
     }
     fn receive_deadline(r: &Self::Receiver) -> Option<rolling::Tick> {
         r.deadline()
+    }
+    fn send_expiry(s: &Self::Sender) -> rolling::expiry::Snapshot {
+        s.expiry_snapshot()
+    }
+    fn receive_expiry(r: &Self::Receiver) -> rolling::expiry::Snapshot {
+        r.expiry_snapshot()
     }
     fn send_wake(s: &Self::Sender) -> Option<rolling::Tick> {
         s.wake_at()
@@ -665,6 +681,12 @@ impl RecoveryPolicy for research::Config {
     ) -> Result<(), rolling::Error> {
         r.confirm_feedback(i, n)
     }
+    fn handoff_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick> {
+        receiver.handoff_deadline()
+    }
+    fn feedback_deadline(receiver: &Self::Receiver) -> Option<rolling::Tick> {
+        receiver.feedback_deadline()
+    }
     fn source(r: &Self::Receiver) -> Option<(rolling::SourceId, &[u8])> {
         r.pending_source()
     }
@@ -712,6 +734,12 @@ impl RecoveryPolicy for research::Config {
     }
     fn receive_deadline(r: &Self::Receiver) -> Option<rolling::Tick> {
         r.deadline()
+    }
+    fn send_expiry(s: &Self::Sender) -> rolling::expiry::Snapshot {
+        s.expiry_snapshot()
+    }
+    fn receive_expiry(r: &Self::Receiver) -> rolling::expiry::Snapshot {
+        r.expiry_snapshot()
     }
     fn send_wake(s: &Self::Sender) -> Option<rolling::Tick> {
         s.deadline()

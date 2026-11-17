@@ -48,6 +48,13 @@ impl Endpoint<crate::fec::research::Config> {
         )
         .min(cap);
         if now >= deadline {
+            self.note_expiry(
+                expiry::LocalOwner::Incoming,
+                now,
+                deadline,
+                Some(number),
+                None,
+            );
             return self.fail(Error::Expired);
         }
         let owner = self.ingress.as_mut().ok_or(Error::Identity)?;
@@ -81,7 +88,14 @@ impl Endpoint<crate::fec::research::Config> {
         let Some(owner) = &mut self.ingress else {
             return Ok(());
         };
-        if owner.deadline().is_some_and(|deadline| now >= deadline) {
+        if let Some(deadline) = owner.deadline().filter(|deadline| now >= *deadline) {
+            self.note_expiry(
+                expiry::LocalOwner::DeferredFeedback,
+                now,
+                deadline,
+                None,
+                None,
+            );
             return self.fail(Error::Expired);
         }
         let count = owner.queue.len();
@@ -97,6 +111,13 @@ impl Endpoint<crate::fec::research::Config> {
                 continue;
             }
             if now >= input.deadline {
+                self.note_expiry(
+                    expiry::LocalOwner::DeferredFeedback,
+                    now,
+                    input.deadline,
+                    input.number,
+                    None,
+                );
                 return self.fail(Error::Expired);
             }
             let result = compact_wire::receive_feedback::<crate::fec::research::Config>(

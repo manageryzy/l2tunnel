@@ -114,6 +114,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) framing: Option<codec::FragmentConfig>,
     pub(super) now: Tick,
     pub(super) failure: Option<Error>,
+    pub(super) expiry_failure: Option<expiry::LocalFailure>,
     pub(super) statistics: Statistics,
     pub(super) prepared_output: Option<PreparedOutput>,
     pub(super) next_output: u64,
@@ -127,6 +128,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     preview_blocked: bool,
     preview_rescan: bool,
     pub(super) usage: Option<storage::Usage>,
+    pub(super) waits: Vec<waits::Snapshot>,
 }
 impl<P: RecoveryPolicy> Endpoint<P> {
     /// Construct real codec and rolling owners after complete scalar validation.
@@ -354,6 +356,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             framing: framing.map(|value| value.local(context.role)),
             now,
             failure: None,
+            expiry_failure: None,
             statistics: Statistics::default(),
             prepared_output: None,
             next_output: 1,
@@ -367,13 +370,20 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             preview_blocked: false,
             preview_rescan: false,
             usage: None,
+            waits: Vec::new(),
         })
     }
     pub(super) fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
+        if let Some(waits) = self.waits.first_mut() {
+            waits.stop(waits.observed_at, waits::Terminal::OwnerFailure);
+        }
         let original = *self.failure.get_or_insert(error);
         Err(original)
     }
     pub(super) fn advance(&mut self, now: Tick) -> Result<(), Error> {
+        if let Some(waits) = self.waits.first_mut() {
+            waits.observe(now);
+        }
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -386,15 +396,29 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .and_then(|owner| owner.deadline())
             .is_some_and(|deadline| now >= deadline)
         {
+            if let Some(input) = self.earliest_input_expiry() {
+                self.note_expiry(
+                    expiry::LocalOwner::Ingress,
+                    now,
+                    input.deadline,
+                    input.records_number,
+                    None,
+                );
+            }
             return self.fail(Error::Expired);
         }
-        if self.stage_deadline.is_some_and(|deadline| now >= deadline) {
+        if let Some(deadline) = self.stage_deadline.filter(|deadline| now >= *deadline) {
+            self.note_expiry(expiry::LocalOwner::CodecStage, now, deadline, None, None);
             return self.fail(Error::Expired);
         }
-        if self
-            .prepared_native
-            .is_some_and(|native| now >= native.deadline)
-        {
+        if let Some(native) = self.prepared_native.filter(|native| now >= native.deadline) {
+            self.note_expiry(
+                expiry::LocalOwner::Native,
+                now,
+                native.deadline,
+                None,
+                Some(native.identity()),
+            );
             return self.fail(Error::Expired);
         }
         let result = (|| {
@@ -519,6 +543,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         .map_err(Error::Sender)?;
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
+        let operation = waits::Operation {
+            id: u64::from(expected.0),
+            bytes: length,
+            deadline: self.stage_deadline,
+            packets: 0,
+            wire_bytes: 0,
+            copies,
+        };
         match P::admit(
             &mut self.sender,
             &self.source[..length],
@@ -534,13 +566,26 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Err(error) = result {
                     return self.fail(error);
                 }
+                if let Some(waits) = self.waits.first_mut() {
+                    waits.progress(waits::Site::SourceAdmission, operation, now);
+                }
                 if self.packing.is_idle() {
                     self.stage_deadline = None;
                 }
                 Ok(())
             }
             Ok(_) => self.fail(Error::Identity),
-            Err(rolling::Error::Busy | rolling::Error::Capacity) => Ok(()),
+            Err(error @ (rolling::Error::Busy | rolling::Error::Capacity)) => {
+                if let Some(waits) = self.waits.first_mut() {
+                    let reason = if error == rolling::Error::Busy {
+                        waits::Reason::RecoveryBusy
+                    } else {
+                        waits::Reason::RecoveryCapacity
+                    };
+                    waits.refuse(waits::Site::SourceAdmission, operation, reason, now);
+                }
+                Ok(())
+            }
             Err(error) => self.fail(Error::Rolling(error)),
         }
     }
@@ -550,6 +595,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         let Some((id, bytes)) = P::source(&self.incoming) else {
             return Ok(false);
+        };
+        let operation = waits::Operation {
+            id: u64::from(id.0),
+            bytes: bytes.len(),
+            deadline: P::handoff_deadline(&self.incoming).map(|value| Tick(value.0)),
+            packets: 0,
+            wire_bytes: 0,
+            copies: 0,
         };
         // The same slab belongs to one actual ordered handoff or one bounded
         // preview preparation, never both. No preview admission is partial.
@@ -572,9 +625,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Err(error) = result {
                     return self.fail(error);
                 }
+                if let Some(waits) = self.waits.first_mut() {
+                    waits.progress(waits::Site::DecodedHandoff, operation, now);
+                }
                 Ok(true)
             }
-            Err(error) if error.is_backpressure() => Ok(false),
+            Err(error) if error.is_backpressure() => {
+                if let Some(reason) = waits::Reason::from_error(error)
+                    && let Some(waits) = self.waits.first_mut()
+                {
+                    waits.refuse(waits::Site::DecodedHandoff, operation, reason, now);
+                }
+                Ok(false)
+            }
             Err(error) => self.fail(error),
         }
     }
@@ -911,7 +974,38 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         } else {
             (1, length.checked_add(overhead).ok_or(Error::Arithmetic)?)
         };
+        let feedback_operation = match id {
+            OutputId::Feedback(id) => Some(waits::Operation {
+                id: id.0,
+                bytes: length,
+                deadline: P::feedback_deadline(&self.incoming).map(|value| Tick(value.0)),
+                packets,
+                wire_bytes,
+                copies: 0,
+            }),
+            OutputId::Data(_) => None,
+        };
         if budget.packets < packets || budget.wire_bytes < wire_bytes {
+            if let Some(operation) = feedback_operation
+                && let Some(waits) = self.waits.first_mut()
+            {
+                if budget.packets < packets {
+                    waits.refuse(
+                        waits::Site::FeedbackBudget,
+                        operation,
+                        waits::Reason::PacketBudget,
+                        now,
+                    );
+                }
+                if budget.wire_bytes < wire_bytes {
+                    waits.refuse(
+                        waits::Site::FeedbackBudget,
+                        operation,
+                        waits::Reason::WireByteBudget,
+                        now,
+                    );
+                }
+            }
             return Ok(None);
         }
         let next = self.next_output.checked_add(1).ok_or(Error::Arithmetic)?;
@@ -960,6 +1054,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.prepared_output = Some(pending);
         budget.packets -= packets;
         budget.wire_bytes -= wire_bytes;
+        if let Some(operation) = feedback_operation
+            && let Some(waits) = self.waits.first_mut()
+        {
+            waits.progress(waits::Site::FeedbackBudget, operation, now);
+        }
         Ok(Some(pending))
     }
     /// Observe the retained token without changing original output/timers.
@@ -1051,6 +1150,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         self.advance(now)?;
         if now >= original_deadline {
+            self.note_expiry(
+                expiry::LocalOwner::Incoming,
+                now,
+                original_deadline,
+                security_number,
+                None,
+            );
             return self.fail(Error::Expired);
         }
         match kind {
@@ -1095,6 +1201,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         .checked_add(policy.debt_ticks)
                         .ok_or(Error::Arithmetic)?;
                     if now >= deadline {
+                        self.note_expiry(
+                            expiry::LocalOwner::Incoming,
+                            now,
+                            deadline,
+                            security_number,
+                            None,
+                        );
                         return self.fail(Error::Expired);
                     }
                     let lease = owner.queue.acquire().ok_or(Error::Busy)?;

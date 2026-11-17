@@ -434,6 +434,7 @@ fn reserve_common_state(
     transaction_binding: delivery::Binding,
     external: usize,
     timing: &mut crate::initialization_timing::Timing,
+    rolling_wait_diagnostics: bool,
 ) -> io::Result<owner::ReservedCommonState> {
     let config = contract.resources();
     timing.enter_at(
@@ -454,6 +455,7 @@ fn reserve_common_state(
         config.rolling_ingress,
         config.rolling_fragments,
         Some(contract.feedback_overhead_bytes()?),
+        rolling_wait_diagnostics,
     )?;
     timing.enter_at(
         crate::initialization_timing::Stage::BankActivation,
@@ -709,6 +711,9 @@ impl Driver {
             role,
         };
         timing.enter_at(TimingStage::EngineAndBankPlanning, Instant::now());
+        let rolling_wait_diagnostics = std::env::var_os("L2TUNNEL_BUFFER_METRICS")
+            .or_else(|| std::env::var_os("L2TUNNEL_WIRE_METRICS"))
+            .is_some();
         let initial_plan = engine::storage::Plan::for_engine_with_compact_wire_and_fragmentation(
             contract.initial(),
             context,
@@ -723,6 +728,13 @@ impl Driver {
             contract.feedback_overhead_bytes()?,
         )
         .map_err(invalid)?;
+        let initial_plan = if rolling_wait_diagnostics {
+            initial_plan
+                .with_rolling_wait_diagnostics()
+                .map_err(invalid)?
+        } else {
+            initial_plan
+        };
         let bank_plan = l2tunnel::record_bank::storage::Plan::for_bank(initial_plan, external)
             .map_err(invalid)?;
         if bank_plan.capacity_bytes() > contract.settings().retained_bytes {
@@ -752,12 +764,30 @@ impl Driver {
                         forward,
                         reverse,
                     } => usize::from(forward.owners).max(usize::from(reverse.owners)),
-                    // Shared codec channels do not create independent recovery owners.
+                    l2tunnel::record_configuration::Profile::Swift { forward, reverse } => {
+                        // Validated Swift has at most 64 channels; reserve the
+                        // shared packing row once plus each actual channel.
+                        forward.channels.max(reverse.channels) + 1
+                    }
+                    // Other shared codec channels do not create independent owners.
                     _ => 1,
                 })
                 .max()
                 .unwrap_or(1);
             metrics.configure_protocol_buffers(maximum_owners, role)?;
+            if contract.catalog().descriptors().iter().any(|descriptor| {
+                matches!(
+                    descriptor.profile(),
+                    l2tunnel::record_configuration::Profile::Rolling { .. }
+                        | l2tunnel::record_configuration::Profile::RollingCopies { .. }
+                        | l2tunnel::record_configuration::Profile::Research { .. }
+                )
+            }) {
+                metrics
+                    .protocol_buffers()
+                    .ok_or_else(|| invalid("rolling buffer observer"))?
+                    .configure_rolling_waits()?;
+            }
             metrics.configure_management_buffers()?;
         }
         let reuse_owner = if contract.connection_reuse() {
@@ -818,6 +848,7 @@ impl Driver {
             control.transaction_binding()?,
             external,
             &mut timing,
+            rolling_wait_diagnostics,
         )?;
         timing.enter_at(TimingStage::DriverAssembly, Instant::now());
         let result = assemble_common_driver(move || {

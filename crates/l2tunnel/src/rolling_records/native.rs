@@ -114,6 +114,17 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     .pending_deadline()
                     .map_or(deadline, |actual| Tick(actual.0).min(deadline));
                 if now >= deadline {
+                    let identity = receiver::RecordIdentity {
+                        channel: delivery.channel,
+                        record: delivery.record,
+                    };
+                    self.note_expiry(
+                        expiry::LocalOwner::Native,
+                        now,
+                        deadline,
+                        None,
+                        Some(identity),
+                    );
                     return self.fail(Error::Expired);
                 }
                 let bytes = delivery.bytes.len();

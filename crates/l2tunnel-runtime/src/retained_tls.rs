@@ -30,6 +30,8 @@ use tokio::{
 #[path = "retained_failure.rs"]
 pub(crate) mod failure;
 use failure::Failure;
+#[path = "retained_tls_observations.rs"]
+mod observations;
 
 /// Four-byte checked length and one explicit bootstrap/final discriminator.
 pub const FRAMING_BYTES: usize = 5;
@@ -721,7 +723,7 @@ impl Adapter {
             .next_deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Poll::Ready(Err(self.fail(expired())));
+            return Poll::Ready(Err(self.fail(expired(), "pending-deadline")));
         }
         let mut progressed = false;
         for index in 0..self.lanes.len() {
@@ -733,7 +735,7 @@ impl Adapter {
                 cx,
             ) {
                 Ok(progress) => progressed |= progress,
-                Err(error) => return Poll::Ready(Err(self.fail(error))),
+                Err(error) => return Poll::Ready(Err(self.fail(error, "write-or-flush"))),
             }
             if self.output.iter().any(|output| {
                 output
@@ -742,7 +744,7 @@ impl Adapter {
                     .and_then(|pending| pending.receipt)
                     .is_some_and(|receipt| receipt.late)
             }) {
-                return Poll::Ready(Err(self.fail(expired())));
+                return Poll::Ready(Err(self.fail(expired(), "late-flush")));
             }
             match poll_read(
                 &mut self.lanes[index],
@@ -759,7 +761,7 @@ impl Adapter {
                                 && lane.input.body_used == 0
                                 && lane.input.ready.is_none()
                         });
-                    return Poll::Ready(Err(self.fail_with_close(error, peer_close)));
+                    return Poll::Ready(Err(self.fail_with_close(error, peer_close, "read")));
                 }
             }
         }
@@ -810,15 +812,22 @@ impl Adapter {
         }
         Poll::Pending
     }
-    fn fail(&mut self, error: io::Error) -> io::Error {
-        self.fail_with_close(error, false)
+    fn fail(&mut self, error: io::Error, site: &'static str) -> io::Error {
+        self.fail_with_close(error, false, site)
     }
-    fn fail_with_close(&mut self, error: io::Error, peer_close: bool) -> io::Error {
+    fn fail_with_close(
+        &mut self,
+        error: io::Error,
+        peer_close: bool,
+        site: &'static str,
+    ) -> io::Error {
         if self.failed.is_none() {
+            let kind = error.kind();
             self.failed = Some(Failure::new(error, peer_close));
             if let Some(metrics) = self.metrics.as_mut() {
                 metrics.finish_at(metrics.now());
             }
+            observations::trace_failure(self, kind, site);
             // Both original Half connections fail together. Completed output facts
             // remain available through their original tokens after the I/O drops.
             self.lanes.clear();
@@ -853,6 +862,7 @@ fn poll_write(
             lane.prefer_control = class == Class::User;
         }
     }
+    observations::writer_dependency(lane, index, outputs, metrics);
     let Some(class) = lane.active else {
         return Ok(false);
     };
@@ -952,6 +962,9 @@ fn poll_read(
         let mut read = ReadBuf::new(destination);
         match lane.reader.as_mut().poll_read(cx, &mut read) {
             Poll::Pending => {
+                if input.prefix_used != 0 || input.body_used != 0 {
+                    metric_blocked(metrics, key, Reason::Dependency);
+                }
                 metric_input(metrics, index, input, limits);
                 return Ok(progressed);
             }
@@ -974,6 +987,7 @@ fn poll_read(
                 if input.deadline.is_some_and(|deadline| now >= deadline) {
                     return Err(expired());
                 }
+                metric_resumed(metrics, key, Reason::Dependency);
                 progressed = true;
                 if input.prefix_used < FRAMING_BYTES {
                     input.prefix_used += bytes;

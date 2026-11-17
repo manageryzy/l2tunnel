@@ -107,6 +107,21 @@ pass the [complete required local check14](../work/aligned-extents-20261117/requ
 with unchanged source (2267 Rust, 448 tooling and 1658 simulator cases). Native
 qualification and remaining BP-16 intervals stay open. No complete BP gate closes.
 
+The [native14 result](modules/buffer-observability.md#native14-scheduling-and-terminal-observations)
+qualifies all three raw data phases, UDP forward/reverse and Swift QUIC forward.
+UDP simultaneous has capture-ring drops; TLS reverse expires its original record
+cap. Raw original lease expiry and QUIC peer-close remain separate failed close
+observations. All eight Common final protocol/management samples are fresh;
+full Swift per-channel coverage and remaining buffer intervals remain open.
+[The next diagnostics](modules/buffer-observability.md#tls-dependencies-and-exact-rolling-expiry-attribution)
+add actual TLS writer/input dependencies and exact Rolling failure attribution,
+with focused passing coverage. The same pending batch adds bounded Swift per-channel
+export and exact Rolling/Research source, decoded-handoff and feedback-budget
+waits, plus exact raw token custody latency across physical completion and upper
+take. The [scoped required continuation](modules/buffer-observability.md#coordinated-local-buffer-batch15-validation)
+passes after two fixture-only corrections; native qualification is pending.
+No parent gate closes, and historical failed receipts remain preserved.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

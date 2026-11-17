@@ -151,6 +151,123 @@ fn limits() -> Limits {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn retained_tls_queued_control_waits_for_original_writer_selection() -> TestResult {
+    let (mut adapter, mut peer) = framing_pair(3)?;
+    let path = attach_buffer_metrics(&mut adapter)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut user = adapter.try_send(Class::User, &[7], deadline, Framing::Final)?;
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(adapter.poll_send(&mut cx, &mut user).is_pending());
+    let control = adapter.try_send(Class::Control, &[8], deadline, Framing::Final)?;
+    let original = control.operation_deadline();
+    assert!(adapter.poll_progress(&mut cx).is_pending());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    assert!(adapter.poll_progress(&mut cx).is_pending());
+    peer.read_exact(&mut [0; 3]).await?;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(matches!(
+        adapter.poll_send(&mut cx, &mut user),
+        Poll::Ready(Ok(_))
+    ));
+    // User completion alone does not select Control. Selection, not another
+    // class's progress or a fresh timer, ends this ownership wait.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(adapter.poll_progress(&mut cx).is_pending());
+    assert_eq!(adapter.lanes[0].active, Some(Class::Control));
+    assert_eq!(control.operation_deadline(), original);
+    let metrics = adapter.metrics.as_mut().ok_or("metrics missing")?;
+    let now = metrics.now();
+    let state = metrics
+        .collector()
+        .reason(
+            lane_key(Site::TlsWrite, 0, MetricClass::Management),
+            Reason::Dependency,
+            now,
+        )
+        .map_err(|_| "invalid ownership wait")?;
+    assert_eq!(
+        (
+            state.blocked.episodes,
+            state.blocked.completed_us,
+            state.blocked.open_us
+        ),
+        (1, 16_000, None)
+    );
+    let blocked = metrics
+        .collector()
+        .reason(
+            lane_key(Site::TlsWrite, 0, MetricClass::Management),
+            Reason::IoPending,
+            now,
+        )
+        .map_err(|_| "invalid Control write wait")?;
+    assert_eq!(blocked.blocked.open_us, Some(0));
+    drop(adapter);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_tls_partial_input_dependency_excludes_idle_and_censors_original_cap() -> TestResult
+{
+    let (mut adapter, mut peer) = framing_pair(64)?;
+    let path = attach_buffer_metrics(&mut adapter)?;
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(adapter.poll_progress(&mut cx).is_pending());
+    tokio::time::advance(Duration::from_millis(5)).await;
+    peer.write_all(&[0, 0]).await?;
+    assert!(matches!(
+        adapter.poll_progress(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let original = adapter
+        .next_deadline()
+        .ok_or("missing original input cap")?;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    assert!(adapter.poll_progress(&mut cx).is_pending());
+    peer.write_all(&[0, 2, 1, 9]).await?;
+    let mut received = [0; 32];
+    assert!(matches!(
+        adapter.poll_receive(&mut cx, &mut received),
+        Poll::Ready(Ok(_))
+    ));
+    assert_eq!(received[0], 9);
+    peer.write_all(&[0]).await?;
+    assert!(matches!(
+        adapter.poll_progress(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let second = adapter.next_deadline().ok_or("missing next input cap")?;
+    assert_eq!(second - original, Duration::from_millis(10));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        matches!(adapter.poll_progress(&mut cx), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    let metrics = adapter.metrics.as_mut().ok_or("metrics missing")?;
+    let now = metrics.now();
+    let state = metrics
+        .collector()
+        .reason(
+            lane_key(Site::TlsInput, 0, MetricClass::Shared),
+            Reason::Dependency,
+            now,
+        )
+        .map_err(|_| "invalid incomplete input wait")?;
+    assert_eq!(
+        (
+            state.blocked.episodes,
+            state.blocked.completed_us,
+            state.blocked.censored_us
+        ),
+        (2, 10_000, 1_000_000)
+    );
+    assert_eq!(state.blocked.open_us, None);
+    drop(adapter);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 #[test]
 fn retained_tls_unsent_threshold_is_checked_local_record_geometry() -> TestResult {
     assert_eq!(tcp_notsent_lowat_bytes(1430)?, 2870);

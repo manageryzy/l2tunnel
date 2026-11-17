@@ -37,6 +37,7 @@ pub struct Plan<P: RecoveryPolicy = scheduler::Policy> {
     framing: Option<OutputFraming>,
     ingress_bytes: usize,
     capacity_bytes: usize,
+    wait_diagnostics: bool,
 }
 impl<P: RecoveryPolicy> Plan<P> {
     /// Validate both complete directions, every original time addition and layout.
@@ -164,7 +165,22 @@ impl<P: RecoveryPolicy> Plan<P> {
             framing,
             ingress_bytes,
             capacity_bytes,
+            wait_diagnostics: false,
         })
+    }
+    /// Select one bounded diagnostic sidecar before any owner allocation.
+    /// Existing limits still apply; selection never increases an allowance.
+    pub fn with_wait_diagnostics(mut self) -> Result<Self, Error> {
+        if !self.wait_diagnostics {
+            let bytes = std::mem::size_of::<waits::Snapshot>();
+            std::alloc::Layout::array::<waits::Snapshot>(1).map_err(|_| Error::Arithmetic)?;
+            self.capacity_bytes = self
+                .capacity_bytes
+                .checked_add(bytes)
+                .ok_or(Error::Arithmetic)?;
+            self.wait_diagnostics = true;
+        }
+        Ok(self)
     }
     /// Both complete globally ordered policies, unchanged.
     pub const fn config(&self) -> Config<P> {
@@ -227,6 +243,20 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 framing: plan.framing,
             },
         )?;
+        if plan.wait_diagnostics {
+            endpoint
+                .waits
+                .try_reserve_exact(1)
+                .map_err(|_| Error::Allocation)?;
+            if endpoint.waits.capacity() != 1 {
+                return Err(Error::StorageInvariant);
+            }
+            endpoint.waits.push(waits::Snapshot::new(
+                endpoint.instance,
+                endpoint.send_rolling_scope,
+                plan.now,
+            ));
+        }
         let packing = endpoint
             .packing
             .storage_usage()
@@ -260,6 +290,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.capacity_bytes,
             endpoint.source.capacity(),
             endpoint.symbols.capacity(),
+            endpoint.waits.capacity() * std::mem::size_of::<waits::Snapshot>(),
             endpoint
                 .ingress
                 .as_ref()
@@ -276,6 +307,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.allocations,
             usize::from(endpoint.source.capacity() != 0),
             usize::from(endpoint.symbols.capacity() != 0),
+            usize::from(endpoint.waits.capacity() != 0),
             endpoint
                 .ingress
                 .as_ref()

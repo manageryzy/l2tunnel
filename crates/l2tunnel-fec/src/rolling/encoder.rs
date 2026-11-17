@@ -42,6 +42,7 @@ pub struct Encoder {
     last: Tick,
     debt: Option<Tick>,
     terminal: Option<Error>,
+    expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::Row>,
 }
 impl Encoder {
@@ -112,6 +113,7 @@ impl Encoder {
             last: now,
             debt: None,
             terminal: None,
+            expiry_failure: None,
             explicit: None,
         })
     }
@@ -124,6 +126,11 @@ impl Encoder {
             now,
             &[self.debt, self.job.as_ref().map(|job| job.deadline)],
         ) {
+            if error == Error::Expired {
+                self.expiry_failure = self
+                    .expiry_failure
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[0, 1]));
+            }
             self.terminal = Some(error);
             return Err(error);
         }
@@ -302,6 +309,17 @@ impl Encoder {
         }
         let end = self.expires(queued, self.config.job_ticks)?.min(cap);
         if now >= end {
+            self.expiry_failure.get_or_insert(expiry::Failure {
+                observed: now,
+                selected: expiry::Deadline::new(
+                    expiry::Kind::EncoderJob,
+                    end,
+                    Some(expiry::Identity::Repair {
+                        id: RepairId(self.next_repair),
+                        support: Some((support.start, support.end)),
+                    }),
+                ),
+            });
             self.terminal = Some(Error::Expired);
             return Err(Error::Expired);
         }
@@ -486,6 +504,42 @@ impl Encoder {
             .into_iter()
             .chain(self.job.as_ref().map(|job| job.deadline))
             .min()
+    }
+    /// Read original lifetimes without checking time or changing authority.
+    pub fn expiry_snapshot(&self) -> expiry::Snapshot {
+        use expiry::{Deadline, Identity, Kind};
+        expiry::Snapshot {
+            scope: self.scope,
+            last_successful: self.last,
+            terminal: self.terminal,
+            failure: self.expiry_failure,
+            candidates: [
+                self.debt.map(|at| {
+                    Deadline::new(
+                        Kind::EncoderDebt,
+                        at,
+                        Some(Identity::Sources {
+                            first: self.confirmed,
+                            end: self.next,
+                        }),
+                    )
+                }),
+                self.job.as_ref().map(|job| {
+                    Deadline::new(
+                        Kind::EncoderJob,
+                        job.deadline,
+                        Some(Identity::Repair {
+                            id: job.id,
+                            support: Some((job.support.start, job.support.end)),
+                        }),
+                    )
+                }),
+                None,
+                None,
+                None,
+                None,
+            ],
+        }
     }
     /// Bounded diagnostic snapshot.
     pub fn status(&self) -> EncoderStatus {
