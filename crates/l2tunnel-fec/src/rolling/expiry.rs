@@ -72,6 +72,159 @@ pub struct Failure {
     /// First expired check in the unchanged original check order.
     pub selected: Deadline,
 }
+/// Exact current decoder phase and positional cursors, without field values,
+/// payload bytes, accumulation state or parsed original lengths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecoderPhase {
+    /// Copy one row between its transactional versions.
+    CopyRow {
+        /// Actual row slot.
+        row: usize,
+        /// Committed source bank.
+        from: usize,
+        /// Prepared destination bank.
+        to: usize,
+        /// Next row byte.
+        index: usize,
+    },
+    /// Next candidate byte to clear.
+    Clear(usize),
+    /// Next received coded-vector byte to load.
+    Load(usize),
+    /// Next source in the input equation support.
+    Support(u32),
+    /// Subtract an already known source.
+    Known {
+        /// Exact known source ID.
+        source: u32,
+        /// Next coded-vector byte.
+        column: usize,
+    },
+    /// Next absolute source whose pivot is considered.
+    Reduce(u32),
+    /// Subtract one selected pivot row.
+    Eliminate {
+        /// Actual row slot.
+        row: usize,
+        /// Next row byte, including coefficient bytes.
+        index: usize,
+        /// Next absolute source for pivot reduction.
+        next: u32,
+    },
+    /// Next absolute source considered as the candidate pivot.
+    Pivot(u32),
+    /// Current inverse exponentiation position; field values are omitted.
+    Invert {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Remaining public exponent, not an accumulated field value.
+        exponent: u8,
+    },
+    /// Current inverse squaring position; field values are omitted.
+    Square {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Remaining public exponent.
+        exponent: u8,
+    },
+    /// Next coded-vector byte checked for consistency.
+    Zero(usize),
+    /// Normalize one candidate row.
+    Normalize {
+        /// Absolute pivot source.
+        pivot: u32,
+        /// Next row byte, including coefficient bytes.
+        index: usize,
+    },
+    /// Next retained row considered for elimination.
+    Others {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Next retained row slot.
+        row: usize,
+    },
+    /// Subtract the candidate from one prepared retained row.
+    OtherEliminate {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Actual retained row slot.
+        row: usize,
+        /// Next row byte, including coefficient bytes.
+        index: usize,
+    },
+    /// Next candidate coefficient position to inspect.
+    CandidateCount {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Next coefficient byte.
+        index: usize,
+    },
+    /// Next retained coefficient position to inspect.
+    Scan {
+        /// Actual retained row slot.
+        row: usize,
+        /// Next coefficient byte.
+        index: usize,
+    },
+    /// Next row slot considered for a new pivot.
+    FindSlot {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Next row slot.
+        row: usize,
+    },
+    /// Copy a candidate into its prepared retained row.
+    Insert {
+        /// Absolute candidate pivot source.
+        pivot: u32,
+        /// Actual destination row slot.
+        row: usize,
+        /// Next row byte.
+        index: usize,
+    },
+    /// Validate an original reconstructed from a row, candidate or input.
+    Validate {
+        /// Actual retained row when selected; None denotes candidate/input.
+        row: Option<usize>,
+        /// Exact reconstructed source ID.
+        source: u32,
+        /// Next coded-vector byte.
+        index: usize,
+    },
+    /// Store an original under the active transaction.
+    Store {
+        /// Actual retained row when selected; None denotes candidate/input.
+        row: Option<usize>,
+        /// Exact reconstructed source ID.
+        source: u32,
+        /// Next coded-vector byte.
+        index: usize,
+    },
+    /// Consider contiguous source-prefix progress.
+    Advance,
+    /// Next absolute source considered for history eviction.
+    Evict(u32),
+    /// Next immutable repair-history byte.
+    History(usize),
+    /// Publish the already prepared transaction.
+    Commit,
+}
+/// Current retained decoder job, not proof that this job selected the failure.
+/// All times use the caller's injected tick domain, never an internal clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecoderJob {
+    /// Actual source or repair identity already retained by the decoder.
+    pub identity: Identity,
+    /// Original authenticated arrival, preserved through earlier queue residence.
+    pub received: Tick,
+    /// Injected observation tick of successful decoder admission.
+    /// This is not a separately sampled wall-clock instant within that call.
+    pub admitted: Tick,
+    /// Original min(input-age limit, caller cap); never renewed by observation.
+    pub deadline: Tick,
+    /// Exact current phase and positional cursors, excluding payload values.
+    pub phase: DecoderPhase,
+}
 /// Allocation-free snapshot of one actual encoder/decoder and its scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -85,6 +238,11 @@ pub struct Snapshot {
     pub failure: Option<Failure>,
     /// Bounded current retained candidates, including nonexpired deadlines.
     pub candidates: [Option<Deadline>; 6],
+    /// Current retained decoder job when present. Encoder snapshots and refused
+    /// inputs with no admitted job return None. Compare identity and original
+    /// deadline with `failure` before attributing that selected failure to it.
+    /// A latched decoder expiry retains this phase unchanged on later calls.
+    pub decoder_job: Option<DecoderJob>,
 }
 impl Snapshot {
     pub(crate) fn first_expired(&self, now: Tick, order: &[usize]) -> Option<Failure> {

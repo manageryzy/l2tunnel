@@ -193,6 +193,16 @@ impl Owner {
         feedback: bool,
         now: Duration,
     ) -> Result<(), RecoveryError> {
+        self.receive_body_diagnosed(bytes, feedback, now, now, None)
+    }
+    pub fn receive_body_diagnosed(
+        &mut self,
+        bytes: &[u8],
+        feedback: bool,
+        received: Duration,
+        observed: Duration,
+        diagnostics: Option<&mut diagnostics::Snapshot>,
+    ) -> Result<(), RecoveryError> {
         match self {
             Self::Legacy(owner) => {
                 let view = l2tunnel_recovery::inspect_body(
@@ -200,7 +210,27 @@ impl Owner {
                     bytes,
                     owner.receive_max_packet_bytes() - DATA_HEADER_BYTES,
                 )?;
-                owner.receive_view(view, now)
+                // Reuse the existing canonical view. Only a successfully applied
+                // ACK can reach the optional observer; malformed/unsent ACKs keep
+                // their original error and cannot replace a prior valid event.
+                if let Some(state) = diagnostics.filter(|_| feedback) {
+                    let mut observation = None;
+                    let result = owner.receive_view_observed(view, observed, &mut observation);
+                    if result.is_ok()
+                        && let Some(observation) = observation
+                    {
+                        state.source_ack(
+                            view,
+                            Some(observation.before),
+                            Some(observation.after),
+                            received,
+                            observed,
+                        );
+                    }
+                    result
+                } else {
+                    owner.receive_view(view, observed)
+                }
             }
             Self::Compact(_) => Err(RecoveryError::InvalidConfig),
         }

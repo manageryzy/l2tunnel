@@ -2,7 +2,7 @@
 use super::optional;
 use l2tunnel_recovery::AdmissionSnapshot;
 use l2tunnel_reliable::diagnostics::staged::{
-    Pending, Resolved, Retirement, RetirementKind, Snapshot,
+    Ack, AckOldest, Pending, Resolved, Retirement, RetirementKind, Snapshot,
 };
 use std::io::{self, Write};
 
@@ -63,6 +63,52 @@ fn retirement(out: &mut impl Write, value: Option<Retirement>) -> io::Result<()>
         value.records, value.bytes, value.operation_succeeded
     )
 }
+fn oldest_ack(out: &mut impl Write, value: Option<AckOldest>) -> io::Result<()> {
+    let Some(value) = value else {
+        return write!(out, "null");
+    };
+    write!(
+        out,
+        "{{\"source\":{},\"attempts\":{},\"transmission\":{},\"acknowledged\":{},\"physical_pending\":{},\"retry_at_us\":",
+        value.flight.source.0,
+        value.flight.attempts,
+        value.flight.transmission,
+        value.flight.acknowledged,
+        value.physical_pending
+    )?;
+    optional(out, value.flight.retry_at)?;
+    write!(out, "}}")
+}
+fn ack(out: &mut impl Write, value: Option<Ack>) -> io::Result<()> {
+    let Some(value) = value else {
+        return write!(out, "null");
+    };
+    write!(
+        out,
+        "{{\"serial\":{},\"received_us\":{},\"observed_us\":{},\"prefix\":{},\"bitmap\":{},\"released_records\":{},\"released_bytes\":{},\"before\":",
+        value.serial,
+        value.received.as_micros(),
+        value.observed.as_micros(),
+        value.prefix,
+        value.bitmap,
+        value.released_records,
+        value.released_bytes
+    )?;
+    oldest_ack(out, value.before)?;
+    write!(out, ",\"after\":")?;
+    oldest_ack(out, value.after)?;
+    for (name, flag) in [
+        ("covers_before", value.covers_before),
+        ("retired_before", value.retired_before),
+    ] {
+        write!(out, ",\"{name}\":")?;
+        match flag {
+            Some(value) => write!(out, "{value}")?,
+            None => write!(out, "null")?,
+        }
+    }
+    write!(out, "}}")
+}
 fn pending(out: &mut impl Write, value: Pending) -> io::Result<()> {
     write!(
         out,
@@ -96,7 +142,7 @@ fn pending(out: &mut impl Write, value: Pending) -> io::Result<()> {
     } else {
         write!(out, "null")?;
     }
-    write!(out, ",\"first_gate\":")?;
+    write!(out, ",\"ack_before\":{},\"first_gate\":", value.ack_before)?;
     gate(out, value.first)?;
     write!(out, ",\"last_gate\":")?;
     gate(out, value.last)?;
@@ -115,12 +161,14 @@ fn resolved(out: &mut impl Write, value: Option<Resolved>) -> io::Result<()> {
         value.censored
     )?;
     retirement(out, value.retirement)?;
+    write!(out, ",\"latest_ack\":")?;
+    ack(out, value.ack)?;
     write!(out, "}}")
 }
 pub(super) fn write(out: &mut impl Write, value: &Snapshot) -> io::Result<()> {
     write!(
         out,
-        "{{\"schema\":1,\"definition\":\"identity and actual predicates attached to existing staged_admission episodes, not additional timing totals; maximum and terminal identities are distinct; retirement is a witnessed retention decrease, not proof it alone enabled this source\",\"coverage\":\"shared SelectiveRepeat source only; Aligned unit and successful Pipeline native provenance when available; Packed multi-unit and independent Compact provenance unavailable; later refused Pipeline head remains a separate original\",\"invalid\":{},\"terminal_at_us\":",
+        "{{\"schema\":2,\"definition\":\"identity and actual predicates attached to existing staged_admission episodes, not additional timing totals; maximum and terminal identities are distinct; retirement is a witnessed retention decrease, not proof it alone enabled this source\",\"coverage\":\"shared SelectiveRepeat source only; Aligned unit and successful Pipeline native provenance when available; Packed multi-unit and independent Compact provenance unavailable; later refused Pipeline head remains a separate original\",\"invalid\":{},\"terminal_at_us\":",
         value.invalid
     )?;
     optional(out, value.terminal)?;
@@ -137,5 +185,15 @@ pub(super) fn write(out: &mut impl Write, value: &Snapshot) -> io::Result<()> {
     resolved(out, value.maximum_censored)?;
     write!(out, ",\"last_retirement\":")?;
     retirement(out, value.last_retirement)?;
+    write!(
+        out,
+        ",\"ack_coverage\":\"{}\",\"last_ack\":",
+        if value.ack_supported {
+            "selected_selective"
+        } else {
+            "unavailable"
+        }
+    )?;
+    ack(out, value.last_ack)?;
     write!(out, "}}")
 }

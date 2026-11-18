@@ -1,6 +1,8 @@
 use super::*;
 use crate::field;
 
+#[cfg(test)]
+mod expiry_detail_tests;
 mod transaction;
 use transaction::{Cell, Pool, Ticket};
 
@@ -149,6 +151,63 @@ enum Phase {
     History(usize),
     Commit,
 }
+impl Phase {
+    fn expiry_cursor(self) -> expiry::DecoderPhase {
+        use expiry::DecoderPhase as Cursor;
+        match self {
+            Self::CopyRow {
+                row,
+                from,
+                to,
+                index,
+            } => Cursor::CopyRow {
+                row,
+                from,
+                to,
+                index,
+            },
+            Self::Clear(index) => Cursor::Clear(index),
+            Self::Load(index) => Cursor::Load(index),
+            Self::Support(source) => Cursor::Support(source),
+            Self::Known { source, column, .. } => Cursor::Known { source, column },
+            Self::Reduce(source) => Cursor::Reduce(source),
+            Self::Eliminate {
+                row, index, next, ..
+            } => Cursor::Eliminate { row, index, next },
+            Self::Pivot(source) => Cursor::Pivot(source),
+            Self::Invert {
+                pivot, exponent, ..
+            } => Cursor::Invert { pivot, exponent },
+            Self::Square {
+                pivot, exponent, ..
+            } => Cursor::Square { pivot, exponent },
+            Self::Zero(index) => Cursor::Zero(index),
+            Self::Normalize { pivot, index, .. } => Cursor::Normalize { pivot, index },
+            Self::Others { pivot, row } => Cursor::Others { pivot, row },
+            Self::OtherEliminate {
+                pivot, row, index, ..
+            } => Cursor::OtherEliminate { pivot, row, index },
+            Self::CandidateCount { pivot, index, .. } => Cursor::CandidateCount { pivot, index },
+            Self::Scan { row, index, .. } => Cursor::Scan { row, index },
+            Self::FindSlot { pivot, row } => Cursor::FindSlot { pivot, row },
+            Self::Insert { pivot, row, index } => Cursor::Insert { pivot, row, index },
+            Self::Validate { row, id, index, .. } => Cursor::Validate {
+                row,
+                source: id,
+                index,
+            },
+            Self::Store { row, id, index } => Cursor::Store {
+                row,
+                source: id,
+                index,
+            },
+            Self::Advance => Cursor::Advance,
+            Self::Evict(source) => Cursor::Evict(source),
+            Self::History(index) => Cursor::History(index),
+            Self::Commit => Cursor::Commit,
+        }
+    }
+}
 struct Job {
     ticket: Ticket,
     resume: Option<Phase>,
@@ -157,6 +216,10 @@ struct Job {
     systematic: bool,
     input: Input,
     phase: Phase,
+    // Injected original arrival and successful decoder admission. These are
+    // diagnostic facts only; every deadline still uses the original inputs.
+    received: Tick,
+    admitted: Tick,
     deadline: Tick,
     debt: Option<Tick>,
     recovered: usize,
@@ -252,6 +315,19 @@ fn charge_copy_chunk(count: usize, budget: &mut WorkBudget) {
     // The caller has a nonempty phase and nonzero copy budget. copy_chunk also
     // bounds count by the remaining metadata plus the visit already charged.
     budget.copies -= count;
+    budget.metadata -= count - 1;
+}
+
+// The caller preserves the original first field debit before identity lookup;
+// step() already charged its metadata visit. Additional bytes consume both
+// domains without another phase dispatch or crossing this source/row extent.
+fn field_chunk(remaining: usize, budget: &WorkBudget) -> Result<usize, Error> {
+    Ok(remaining
+        .min(add(budget.field, 1)?)
+        .min(add(budget.metadata, 1)?))
+}
+fn charge_field_chunk(count: usize, budget: &mut WorkBudget) {
+    budget.field -= count - 1;
     budget.metadata -= count - 1;
 }
 
@@ -478,7 +554,14 @@ impl Decoder {
         }
         Ok((job_end, debt))
     }
-    fn stage(&mut self, input: Input, job_end: Tick, debt: Option<Tick>) -> Result<Begin, Error> {
+    fn stage(
+        &mut self,
+        input: Input,
+        job_end: Tick,
+        debt: Option<Tick>,
+        received: Tick,
+        admitted: Tick,
+    ) -> Result<Begin, Error> {
         let ticket = self.decisions.begin()?;
         self.active = Some(ticket);
         self.shadow = self.live;
@@ -502,6 +585,8 @@ impl Decoder {
             systematic,
             input,
             phase,
+            received,
+            admitted,
             deadline: job_end,
             debt,
             recovered: 0,
@@ -595,7 +680,7 @@ impl Decoder {
         self.input.fill(0);
         self.input[..2].copy_from_slice(&(original.len() as u16).to_be_bytes());
         self.input[2..2 + original.len()].copy_from_slice(original);
-        self.stage(input, job_end, debt)
+        self.stage(input, job_end, debt, received, now)
     }
     /// Stage a complete authenticated equation; useful end<=prefix+W is checked first.
     pub fn begin_repair(&mut self, repair: Repair<'_>, now: Tick) -> Result<Begin, Error> {
@@ -779,7 +864,7 @@ impl Decoder {
         // used by the solver and duplicate history, without another allocation.
         self.input.fill(0);
         self.input[..repair.bytes.len()].copy_from_slice(repair.bytes);
-        self.stage(input, job_end, debt)
+        self.stage(input, job_end, debt, received, now)
     }
     fn row_start(&self, row: usize) -> usize {
         row * (self.config.window + self.width)
@@ -997,12 +1082,25 @@ impl Decoder {
                         return Ok(Action::Paused);
                     }
                     let start = self.known(source)?.ok_or(Error::Identity)?;
-                    self.candidate[w + column] ^=
-                        field::multiply(factor, self.known_data[start + column]);
+                    let remaining = width.checked_sub(column).ok_or(Error::Identity)?;
+                    let count = field_chunk(remaining, budget)?;
+                    let end = add(column, count)?;
+                    let known = self
+                        .known_data
+                        .get(add(start, column)?..add(start, end)?)
+                        .ok_or(Error::Identity)?;
+                    let candidate = self
+                        .candidate
+                        .get_mut(add(w, column)?..add(w, end)?)
+                        .ok_or(Error::Identity)?;
+                    for (destination, value) in candidate.iter_mut().zip(known) {
+                        *destination ^= field::multiply(factor, *value);
+                    }
+                    charge_field_chunk(count, budget);
                     job.phase = Phase::Known {
                         source,
                         factor,
-                        column: column + 1,
+                        column: end,
                     };
                 }
             }
@@ -1040,11 +1138,25 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    self.candidate[index] ^= field::multiply(factor, self.row_byte(row, index)?);
+                    // No transaction decision changes within this row chunk.
+                    let bank = self.row_bank(row, self.active)?;
+                    let stride = add(w, width)?;
+                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let count = field_chunk(remaining, budget)?;
+                    let end = add(index, count)?;
+                    let start = mul(row, stride)?;
+                    let equation = self.data[bank]
+                        .get(add(start, index)?..add(start, end)?)
+                        .ok_or(Error::Identity)?;
+                    let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
+                    for (destination, value) in candidate.iter_mut().zip(equation) {
+                        *destination ^= field::multiply(factor, *value);
+                    }
+                    charge_field_chunk(count, budget);
                     job.phase = Phase::Eliminate {
                         row,
                         factor,
-                        index: index + 1,
+                        index: end,
                         next,
                     };
                 }
@@ -1133,11 +1245,18 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    self.candidate[index] = field::multiply(factor, self.candidate[index]);
+                    let remaining = add(w, width)?.checked_sub(index).ok_or(Error::Identity)?;
+                    let count = field_chunk(remaining, budget)?;
+                    let end = add(index, count)?;
+                    let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
+                    for value in candidate {
+                        *value = field::multiply(factor, *value);
+                    }
+                    charge_field_chunk(count, budget);
                     job.phase = Phase::Normalize {
                         pivot,
                         factor,
-                        index: index + 1,
+                        index: end,
                     };
                 }
             }
@@ -1676,6 +1795,13 @@ impl Decoder {
                 None,
                 None,
             ],
+            decoder_job: self.job.as_ref().map(|job| expiry::DecoderJob {
+                identity: job.input.expiry_identity(),
+                received: job.received,
+                admitted: job.admitted,
+                deadline: job.deadline,
+                phase: job.phase.expiry_cursor(),
+            }),
         }
     }
     /// Constant-size ownership snapshot without allocating or scanning payloads.
@@ -1713,3 +1839,6 @@ mod equation_tests;
 
 #[cfg(test)]
 mod copy_batch_tests;
+
+#[cfg(test)]
+mod field_batch_tests;

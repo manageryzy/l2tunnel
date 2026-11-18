@@ -560,6 +560,7 @@ impl Encoder {
                 None,
                 None,
             ],
+            decoder_job: None,
         }
     }
     /// Bounded diagnostic snapshot.

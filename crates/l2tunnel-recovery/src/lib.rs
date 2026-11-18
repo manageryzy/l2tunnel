@@ -7,14 +7,15 @@ mod arq;
 pub mod storage;
 pub use arq::{
     ACK_PACKET_BYTES, ARQ_BODY_DATA_MAX_HEADER_BYTES, ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES,
-    AdmissionFlight, AdmissionSnapshot, ArqConfig, BufferSide, COMPACT_BODY_DATA_MAX_HEADER_BYTES,
-    COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES, COMPACT_DATA_HEADER_BYTES,
-    COMPACT_FEEDBACK_HEADER_BYTES, CarrierOnly, CompactArqConfig, CompactBounds, CompactFeedback,
-    CompactPacketKind, CompactPacketView, CompactPeerFeedbackSnapshot, CompactPollError,
-    CompactRecovery, CompactRepeat, CompactRetryFailureSnapshot, CompactTiming,
-    CompactTimingSnapshot, DATA_HEADER_BYTES, EndpointRole, PacketView, PhysicalTransmission,
-    RecoveryContext, RecoveryError, Retained, SelectiveRepeat, SourceId, Statistics, inspect_body,
-    inspect_compact_body, inspect_compact_packet, inspect_packet,
+    AckObservation, AckRetained, AdmissionFlight, AdmissionSnapshot, ArqConfig, BufferSide,
+    COMPACT_BODY_DATA_MAX_HEADER_BYTES, COMPACT_BODY_FEEDBACK_MAX_HEADER_BYTES,
+    COMPACT_DATA_HEADER_BYTES, COMPACT_FEEDBACK_HEADER_BYTES, CarrierOnly, CompactArqConfig,
+    CompactBounds, CompactFeedback, CompactPacketKind, CompactPacketView,
+    CompactPeerFeedbackSnapshot, CompactPollError, CompactRecovery, CompactRepeat,
+    CompactRetryFailureSnapshot, CompactTiming, CompactTimingSnapshot, DATA_HEADER_BYTES,
+    EndpointRole, PacketView, PhysicalTransmission, RecoveryContext, RecoveryError, Retained,
+    SelectiveRepeat, SourceId, Statistics, inspect_body, inspect_compact_body,
+    inspect_compact_packet, inspect_packet,
 };
 
 /// Incremental recovery uses injected monotonic time and bounded caller buffers.

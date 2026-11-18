@@ -191,6 +191,15 @@ buffer owners validate. Identity attachments do not create another wait union,
 and selected Pending time is not buffer backpressure. All original algorithm,
 resource and coverage gates remain.
 
+The [batch20 implementation](modules/buffer-observability.md#batch20-ack-coverage-and-decoder-progress)
+adds exact successful ACK coverage to the same staged-wait identity and batches
+Rolling decoder GF work under the original byte allowances. Original decoder
+arrival/admission and returned-only expiry phase details distinguish earlier
+residence from retained job custody. The affected local continuation passes 813
+Rust and 45 Python cases, strict Clippy and rustdoc; unchanged passing check19
+stages are reused. Native20 remains pending. All original caps and open parent
+gates remain, including the documented Cauchy/Python recovery-policy differences.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

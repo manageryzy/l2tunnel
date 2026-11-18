@@ -236,6 +236,53 @@ pub struct AdmissionFlight {
     /// Original current retry deadline; None is not an immediate retry claim.
     pub retry_at: Option<Duration>,
 }
+/// Scalar retention boundary captured during an existing validated ACK pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckRetained {
+    /// Actual minimum retained source, independent of backing-slot order.
+    pub oldest: Option<AdmissionFlight>,
+    /// Same-flight physical-witness predicate; None means no oldest source.
+    pub oldest_pending: Option<bool>,
+    /// Actual retained outbound source count at this boundary.
+    pub records: usize,
+    /// Actual retained outbound payload bytes at this boundary.
+    pub bytes: usize,
+}
+impl AckRetained {
+    fn new(records: usize, bytes: usize) -> Self {
+        Self {
+            oldest: None,
+            oldest_pending: None,
+            records,
+            bytes,
+        }
+    }
+    fn visit(&mut self, source: SourceId, flight: &Flight, physical: bool) {
+        if self.oldest.is_none_or(|previous| source < previous.source) {
+            self.oldest = Some(AdmissionFlight {
+                source,
+                attempts: flight.attempts,
+                transmission: flight.transmission,
+                acknowledged: flight.acknowledged,
+                retry_at: flight.retry_at,
+            });
+            self.oldest_pending = Some(
+                physical
+                    && flight.retry_at.is_none()
+                    && flight.attempts > 0
+                    && flight.transmission != 0,
+            );
+        }
+    }
+}
+/// Optional successful ACK observation, without extra send-window traversals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckObservation {
+    /// State before this ACK changes retention or acknowledged flags.
+    pub before: AckRetained,
+    /// State after this ACK; covered physical retries can remain retained.
+    pub after: AckRetained,
+}
 /// Read-only scalar predicates reused by the actual source admission gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionSnapshot {
@@ -1040,6 +1087,15 @@ impl Engine {
     }
 
     fn receive_view(&mut self, view: PacketView<'_>, now: Duration) -> Result<(), RecoveryError> {
+        self.receive_view_observed(view, now, None)
+    }
+
+    fn receive_view_observed(
+        &mut self,
+        view: PacketView<'_>,
+        now: Duration,
+        observation: Option<&mut Option<AckObservation>>,
+    ) -> Result<(), RecoveryError> {
         self.check_time(now)?;
         view.body_encoded_len()?;
         match view {
@@ -1049,7 +1105,7 @@ impl Engine {
                 }
                 self.receive_source(source, payload, now)?;
             }
-            PacketView::Ack { prefix, bitmap } => self.receive_ack(prefix, bitmap)?,
+            PacketView::Ack { prefix, bitmap } => self.receive_ack(prefix, bitmap, observation)?,
         }
         self.last_now = now;
         Ok(())
@@ -1117,7 +1173,12 @@ impl Engine {
         }
     }
 
-    fn receive_ack(&mut self, prefix: u64, bitmap: u64) -> Result<(), RecoveryError> {
+    fn receive_ack(
+        &mut self,
+        prefix: u64,
+        bitmap: u64,
+        observation: Option<&mut Option<AckObservation>>,
+    ) -> Result<(), RecoveryError> {
         if prefix > self.next_source {
             return Err(RecoveryError::UnsentAcknowledgement);
         }
@@ -1130,7 +1191,15 @@ impl Engine {
                 return Err(RecoveryError::UnsentAcknowledgement);
             }
         }
+        let mut before = observation
+            .as_ref()
+            .map(|_| AckRetained::new(self.sent.len(), self.send_bytes));
         if self.sent.iter().any(|(source, flight)| {
+            // Reuse the existing validation pass. An invalid ACK never publishes
+            // this partial observation, and no lookup/second scan is introduced.
+            if let Some(before) = before.as_mut() {
+                before.visit(*source, flight, self.physical_confirmation);
+            }
             acknowledged(*source, prefix, bitmap)
                 && (flight.attempts == 0
                     || (self.physical_confirmation
@@ -1140,21 +1209,32 @@ impl Engine {
             return Err(RecoveryError::UnsentAcknowledgement);
         }
         let mut released_bytes = 0;
+        let mut after = observation.as_ref().map(|_| AckRetained::new(0, 0));
         self.sent.retain(|source, flight| {
-            if acknowledged(*source, prefix, bitmap) {
+            let keep = if acknowledged(*source, prefix, bitmap) {
                 if self.physical_confirmation && flight.retry_at.is_none() {
                     flight.acknowledged = true;
-                    return true;
+                    true
+                } else {
+                    released_bytes += flight.payload.len();
+                    false
                 }
-                released_bytes += flight.payload.len();
-                false
             } else {
                 true
+            };
+            if keep && let Some(after) = after.as_mut() {
+                after.visit(*source, flight, self.physical_confirmation);
             }
+            keep
         });
         // The removed payload subset cannot exceed the previously accounted sum.
         self.send_bytes -= released_bytes;
         self.statistics.feedback_received = self.statistics.feedback_received.saturating_add(1);
+        if let (Some(output), Some(before), Some(mut after)) = (observation, before, after) {
+            after.records = self.sent.len();
+            after.bytes = self.send_bytes;
+            *output = Some(AckObservation { before, after });
+        }
         Ok(())
     }
 

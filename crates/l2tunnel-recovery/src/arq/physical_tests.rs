@@ -71,6 +71,189 @@ fn token(owner: &SelectiveRepeat, source: u64) -> TestResult<PhysicalTransmissio
 }
 
 #[test]
+fn ack_observation_reuses_validated_passes_and_preserves_held_retry_and_slot_order() -> TestResult {
+    for reserved in [false, true] {
+        let mut observed = make(EndpointRole::Initiator, reserved, true)?;
+        let mut plain = make(EndpointRole::Initiator, reserved, true)?;
+        let storage = observed.storage_usage();
+        for owner in [&mut observed, &mut plain] {
+            owner.submit(&[0x51], ms(0))?;
+            owner.submit(&[0x52, 0], ms(0))?;
+            for source in [0, 1] {
+                emit_source(owner, ms(0))?;
+                owner.confirm_transmission(ms(0), token(owner, source)?)?;
+            }
+            emit_source(owner, ms(10))?;
+        }
+        let held = token(&observed, 0)?;
+        let mut observation = None;
+        let mut apply = |observed: &mut SelectiveRepeat,
+                         plain: &mut SelectiveRepeat,
+                         view: PacketView<'_>,
+                         now| {
+            let result = plain.receive_view(view, now);
+            assert_eq!(
+                observed.receive_view_observed(view, now, &mut observation),
+                result
+            );
+            assert_eq!(observed.statistics(), plain.statistics());
+            assert_eq!(observed.retained(), plain.retained());
+            assert_eq!(observed.source_deadline(), plain.source_deadline());
+            assert_eq!(observed.0.last_now, plain.0.last_now);
+            (result, observation)
+        };
+        let (result, first) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 1,
+                bitmap: 0,
+            },
+            ms(10),
+        );
+        result?;
+        let first = first.ok_or("missing valid ACK observation")?;
+        assert_eq!(first.before.records, 2);
+        assert_eq!(first.before.bytes, 3);
+        assert_eq!(first.after.records, 2);
+        assert_eq!(first.before.oldest_pending, Some(true));
+        assert_eq!(first.after.oldest_pending, Some(true));
+        let oldest = first.before.oldest.ok_or("missing held source")?;
+        assert_eq!(oldest.source, SourceId(0));
+        assert_eq!(oldest.transmission, held.serial);
+        assert!(!oldest.acknowledged);
+        assert!(
+            first
+                .after
+                .oldest
+                .ok_or("missing acknowledged retry")?
+                .acknowledged
+        );
+        assert_eq!(observed.pending_transmission(SourceId(0)), Some(held));
+        for (view, now, error) in [
+            (
+                PacketView::Ack {
+                    prefix: 3,
+                    bitmap: 0,
+                },
+                ms(10),
+                RecoveryError::UnsentAcknowledgement,
+            ),
+            (
+                PacketView::Ack {
+                    prefix: 0,
+                    bitmap: 1,
+                },
+                ms(10),
+                RecoveryError::MalformedPacket,
+            ),
+            (
+                PacketView::Ack {
+                    prefix: 0,
+                    bitmap: 1,
+                },
+                ms(9),
+                RecoveryError::NonMonotonicTime,
+            ),
+        ] {
+            let (result, saved) = apply(&mut observed, &mut plain, view, now);
+            assert_eq!(result, Err(error));
+            assert_eq!(saved, Some(first));
+        }
+        for owner in [&mut observed, &mut plain] {
+            owner.confirm_transmission(ms(11), token(owner, 0)?)?;
+            // Reserved storage reuses the first free slot for source 2. Its
+            // physical position precedes retained source 1; minimum ID is the
+            // authority, not the first visited occupied backing slot.
+            assert_eq!(owner.submit(&[0x53, 0, 0], ms(11))?, 2);
+        }
+        let (result, next) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 2,
+                bitmap: 0,
+            },
+            ms(11),
+        );
+        result?;
+        let next = next.ok_or("missing retirement observation")?;
+        assert_eq!(
+            next.before.oldest.ok_or("missing source one")?.source,
+            SourceId(1)
+        );
+        assert_eq!(next.before.oldest_pending, Some(false));
+        assert_eq!(
+            next.after.oldest.ok_or("missing unsent source two")?.source,
+            SourceId(2)
+        );
+        assert_eq!(next.after.oldest_pending, Some(false));
+        assert_eq!((next.before.records, next.before.bytes), (2, 5));
+        assert_eq!((next.after.records, next.after.bytes), (1, 3));
+        // A valid stale ACK is still a real successful observation and releases
+        // nothing. In contrast, ACKing the unsent source remains an error.
+        let (result, stale) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 0,
+                bitmap: 0,
+            },
+            ms(11),
+        );
+        result?;
+        let stale = stale.ok_or("missing stale ACK observation")?;
+        assert_eq!(stale.before, stale.after);
+        let (result, unchanged) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 3,
+                bitmap: 0,
+            },
+            ms(11),
+        );
+        assert_eq!(result, Err(RecoveryError::UnsentAcknowledgement));
+        assert_eq!(unchanged, Some(stale));
+        for owner in [&mut observed, &mut plain] {
+            emit_source(owner, ms(11))?;
+            owner.confirm_transmission(ms(11), token(owner, 2)?)?;
+        }
+        let (result, cleared) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 3,
+                bitmap: 0,
+            },
+            ms(11),
+        );
+        result?;
+        assert_eq!(
+            cleared.ok_or("missing final retirement")?.after.oldest,
+            None
+        );
+        let (result, empty) = apply(
+            &mut observed,
+            &mut plain,
+            PacketView::Ack {
+                prefix: 3,
+                bitmap: 0,
+            },
+            ms(11),
+        );
+        result?;
+        let empty = empty.ok_or("missing empty ACK observation")?;
+        assert_eq!(empty.before, empty.after);
+        assert_eq!(empty.before.oldest, None);
+        assert_eq!(empty.before.oldest_pending, None);
+        assert_eq!((empty.before.records, empty.before.bytes), (0, 0));
+        assert_eq!(observed.storage_usage(), storage);
+    }
+    Ok(())
+}
+
+#[test]
 fn explicit_mode_preserves_legacy_wire_and_arms_retry_only_after_whole_send() -> TestResult {
     for reserved in [false, true] {
         let mut selected = make(EndpointRole::Initiator, reserved, true)?;

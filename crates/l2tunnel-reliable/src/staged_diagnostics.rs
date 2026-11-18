@@ -1,6 +1,6 @@
 //! Optional identity/cause attachments to existing staged-source wait timing.
 //! No protocol decisions, payloads, event queue or duplicate duration totals.
-use l2tunnel_recovery::{AdmissionSnapshot, Retained};
+use l2tunnel_recovery::{AdmissionFlight, AdmissionSnapshot, PacketView, Retained};
 use std::time::Duration;
 
 /// Exact current codec unit and its enclosing originally admitted native record.
@@ -55,6 +55,41 @@ pub struct Retirement {
     /// Whether the full original operation returned success; later failure is preserved.
     pub operation_succeeded: bool,
 }
+/// Exact oldest retained source and actual physical-token availability at ACK apply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckOldest {
+    /// Original source state, not an inferred ACK or retransmission.
+    pub flight: AdmissionFlight,
+    /// Actual pending_transmission witness exists for this same source.
+    pub physical_pending: bool,
+}
+pub(crate) type AckBoundary = l2tunnel_recovery::AckRetained;
+/// Last successfully applied canonical ACK only; no packet or event history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ack {
+    /// Diagnostic serial, independent of all wire packet/source numbers.
+    pub serial: u64,
+    /// Original authenticated input arrival supplied by the caller.
+    pub received: Duration,
+    /// Injected actual successful ACK-application time.
+    pub observed: Duration,
+    /// Validated cumulative prefix and selective bitmap from the original parser.
+    pub prefix: u64,
+    /// Validated selective bitmap, not a replay/authentication decision.
+    pub bitmap: u64,
+    /// Actual oldest retained source immediately before ACK application.
+    pub before: Option<AckOldest>,
+    /// Actual oldest retained source immediately after ACK application.
+    pub after: Option<AckOldest>,
+    /// Coverage of the exact pre-ACK oldest; None means no retained source existed.
+    pub covers_before: Option<bool>,
+    /// Actual removal of that same oldest source, distinct from coverage or held retry.
+    pub retired_before: Option<bool>,
+    /// Actual retained source-count decrease during this successful ACK apply.
+    pub released_records: usize,
+    /// Actual retained source-byte decrease, which can be zero for empty sources.
+    pub released_bytes: usize,
+}
 /// Identity plus actual gate predicates on the first and latest refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pending {
@@ -76,6 +111,8 @@ pub struct Pending {
     pub last: AdmissionSnapshot,
     /// Retirement serial observed when this same-source wait began.
     pub retirement_before: u64,
+    /// Latest validated ACK serial already observed when this wait began.
+    pub ack_before: u64,
 }
 /// One completed/censored identity; only last and maxima are retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +125,8 @@ pub struct Resolved {
     pub censored: bool,
     /// Latest actual retirement after this wait started, if one was observed.
     pub retirement: Option<Retirement>,
+    /// Latest successfully applied ACK during this wait; contextual, not sole cause.
+    pub ack: Option<Ack>,
 }
 /// Fixed optional detailed state, charged through the existing Reliable diagnostic plan.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -102,6 +141,10 @@ pub struct Snapshot {
     pub maximum_censored: Option<Resolved>,
     /// Latest actual send-retention release, not an inferred ACK.
     pub last_retirement: Option<Retirement>,
+    /// True only for the selected shared SelectiveRepeat feedback boundary.
+    pub ack_supported: bool,
+    /// Latest successfully applied ACK; None with support means none observed yet.
+    pub last_ack: Option<Ack>,
     /// Terminal or snapshot boundary already finalized.
     pub terminal: Option<Duration>,
     /// Counter overflow, changed immutable identity or regressed observed clock.
@@ -123,6 +166,7 @@ impl Snapshot {
             first: gate,
             last: gate,
             retirement_before: self.last_retirement.map_or(0, |v| v.serial),
+            ack_before: self.last_ack.map_or(0, |v| v.serial),
         });
         if pending.source != gate.next_source.0
             || pending.bytes != gate.proposed_bytes
@@ -190,6 +234,7 @@ impl Snapshot {
             retirement: self
                 .last_retirement
                 .filter(|v| v.serial > pending.retirement_before),
+            ack: self.last_ack.filter(|v| v.serial > pending.ack_before),
         };
         let maximum = if censored {
             &mut self.maximum_censored
@@ -207,6 +252,75 @@ impl Snapshot {
             self.resolve(at, true);
             self.terminal = Some(at);
         }
+    }
+    pub(crate) fn ack(
+        &mut self,
+        view: PacketView<'_>,
+        before: Option<AckBoundary>,
+        after: Option<AckBoundary>,
+        received: Duration,
+        observed: Duration,
+    ) {
+        if self.terminal.is_some() {
+            return;
+        }
+        let PacketView::Ack { prefix, bitmap } = view else {
+            self.invalid = true;
+            return;
+        };
+        let Some((before, after)) = before.zip(after) else {
+            self.invalid = true;
+            return;
+        };
+        let (before_pending, after_pending) = (before.oldest_pending, after.oldest_pending);
+        if !self.ack_supported
+            || received > observed
+            || self.last_ack.is_some_and(|v| observed < v.observed)
+            || before.oldest.is_some() != before_pending.is_some()
+            || after.oldest.is_some() != after_pending.is_some()
+        {
+            self.invalid = true;
+            return;
+        }
+        let Some(serial) = self.last_ack.map_or(0, |v| v.serial).checked_add(1) else {
+            self.invalid = true;
+            return;
+        };
+        let Some((released_records, released_bytes)) = before
+            .records
+            .checked_sub(after.records)
+            .zip(before.bytes.checked_sub(after.bytes))
+        else {
+            self.invalid = true;
+            return;
+        };
+        self.last_ack = Some(Ack {
+            serial,
+            received,
+            observed,
+            prefix,
+            bitmap,
+            before: before
+                .oldest
+                .zip(before_pending)
+                .map(|(flight, physical_pending)| AckOldest {
+                    flight,
+                    physical_pending,
+                }),
+            after: after
+                .oldest
+                .zip(after_pending)
+                .map(|(flight, physical_pending)| AckOldest {
+                    flight,
+                    physical_pending,
+                }),
+            covers_before: before.oldest.and_then(|v| view.acknowledges(v.source)),
+            retired_before: before
+                .oldest
+                .map(|v| after.oldest.is_none_or(|next| next.source != v.source)),
+            released_records,
+            released_bytes,
+        });
     }
     pub(crate) fn retired(
         &mut self,

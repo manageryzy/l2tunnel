@@ -7,6 +7,16 @@ pub const ARQ_BODY_DATA_MAX_HEADER_BYTES: usize = 10;
 pub const ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES: usize = 20;
 
 impl PacketView<'_> {
+    /// Exact selective ACK coverage using the same predicate as receive retirement.
+    /// This is syntax-only metadata; the receive owner must validate the ACK first.
+    /// Data has no ACK coverage, and caller-created invalid views remain untrusted.
+    pub fn acknowledges(self, source: SourceId) -> Option<bool> {
+        match self {
+            Self::Ack { prefix, bitmap } => Some(acknowledged(source, prefix, bitmap)),
+            Self::Data { .. } => None,
+        }
+    }
+
     /// Exact context-free bytes; the enclosing union supplies the packet kind.
     pub fn body_encoded_len(self) -> Result<usize, RecoveryError> {
         match self {
@@ -110,6 +120,18 @@ impl SelectiveRepeat {
         now: Duration,
     ) -> Result<(), RecoveryError> {
         self.0.receive_view(view, now)
+    }
+    /// Apply the same validated view and optionally return exact ACK boundaries.
+    /// The output changes only after a successful ACK; data and all errors leave
+    /// it untouched. Original validation and retention passes collect the scalars
+    /// without allocating, reparsing, or scanning the send window again.
+    pub fn receive_view_observed(
+        &mut self,
+        view: PacketView<'_>,
+        now: Duration,
+        observation: &mut Option<AckObservation>,
+    ) -> Result<(), RecoveryError> {
+        self.0.receive_view_observed(view, now, Some(observation))
     }
     /// Exact currently due body size; does not consume output or renew deadlines.
     pub fn body_packet_bytes(

@@ -88,6 +88,9 @@ impl Reliable {
             data: data_overhead,
             feedback: feedback_overhead,
         });
+        if let Some(state) = self.diagnostics.first_mut() {
+            state.staged.ack_supported = !self.arq.is_compact();
+        }
         Ok(())
     }
 
@@ -252,7 +255,13 @@ impl Reliable {
             }
             RecordKind::Feedback => {
                 self.arq
-                    .receive_body(body, true, observed)
+                    .receive_body_diagnosed(
+                        body,
+                        true,
+                        received,
+                        observed,
+                        self.diagnostics.first_mut(),
+                    )
                     .or_else(|error| self.fail(error.into()))?;
                 self.advance(observed)
             }

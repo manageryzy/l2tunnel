@@ -157,6 +157,18 @@ impl Snapshot {
             self.staged.admitted(source, bytes, now);
         }
     }
+    pub(crate) fn source_ack(
+        &mut self,
+        view: l2tunnel_recovery::PacketView<'_>,
+        before: Option<staged::AckBoundary>,
+        after: Option<staged::AckBoundary>,
+        received: Duration,
+        observed: Duration,
+    ) {
+        if self.observe(observed) {
+            self.staged.ack(view, before, after, received, observed);
+        }
+    }
     pub(crate) fn source_retired(
         &mut self,
         before: l2tunnel_recovery::Retained,

@@ -115,6 +115,85 @@ class ReliableProviderTests(unittest.TestCase):
         self.assertIn('1/2', rendered)
         self.assertEqual(value['staged_source']['maximum_completed']['pending']['native']['flow'], 100)
 
+    def test_validated_ack_and_held_retry_remain_distinct_from_physical_retirement(self):
+        value = fixture(); value['staged_source'] = ack_staged_fixture()
+        self.assertEqual(self.check(value)['status'], 'validated_known_fields_partial')
+        lines = []
+        reliable.render(lines, {'protocol_buffers': self.provider(value)}, report.table, report.cell)
+        text = '\n'.join(lines)
+        self.assertIn('acknowledged held physical retry', text)
+        self.assertIn('Physical held after', text)
+        event = value['staged_source']['last_ack']
+        self.assertTrue(event['covers_before'])
+        self.assertFalse(event['retired_before'])
+        self.assertEqual(event['released_records'], 0)
+        old = fixture(); old['staged_source'] = staged_fixture()
+        self.assertTrue(any('schema 1' in gap for gap in self.check(old)['coverage_gaps']))
+        unsupported = value['staged_source']
+        unsupported.update(ack_coverage='unavailable', last_ack=None)
+        for key in ('maximum_completed', 'last_resolved'):
+            unsupported[key]['latest_ack'] = None
+        result = self.check(value)
+        self.assertEqual(result['status'], 'validated_known_fields_partial')
+        self.assertTrue(any('ACK boundary unavailable' in gap for gap in result['coverage_gaps']))
+
+    def test_ack_false_coverage_identity_and_time_are_rejected(self):
+        mutations = (
+            lambda v: v.update(ack_coverage='unknown'),
+            lambda v: v.update(last_ack=None),
+            lambda v: v['last_ack'].update(serial=0),
+            lambda v: v['last_ack'].update(covers_before=False),
+            lambda v: v['last_ack'].update(retired_before=True),
+            lambda v: v['last_ack'].update(released_bytes=4),
+            lambda v: v['last_ack']['after'].update(physical_pending=False),
+            lambda v: v['last_ack'].update(before=None),
+            lambda v: v['last_ack'].update(bitmap=1),
+            lambda v: v['last_ack'].update(received_us=100),
+            lambda v: v['maximum_completed']['latest_ack'].update(observed_us=31),
+            lambda v: v['maximum_completed']['pending'].update(ack_before=1),
+            lambda v: v.update(schema=3),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                value = fixture(); value['staged_source'] = ack_staged_fixture()
+                mutate(value['staged_source'])
+                self.assertTrue(self.check(value)['status'].startswith('invalid'))
+
+    def test_ack_start_serial_cannot_exceed_owner_history(self):
+        for population in ('pending', 'last_resolved', 'maximum_completed', 'maximum_censored'):
+            for history in ('observed', 'not_yet_observed', 'unavailable'):
+                with self.subTest(population=population, history=history):
+                    value = fixture()
+                    staged = value['staged_source'] = ack_staged_fixture()
+                    for name in ('last_resolved', 'maximum_completed'):
+                        staged[name]['latest_ack'] = None
+                    if history != 'observed':
+                        staged['last_ack'] = None
+                    if history == 'unavailable':
+                        staged['ack_coverage'] = 'unavailable'
+                    if population == 'pending':
+                        staged['pending'] = copy.deepcopy(staged['last_resolved']['pending'])
+                        pending = staged['pending']
+                    elif population == 'maximum_censored':
+                        value.update(terminal_at_us=100, pending=None,
+                                     last_resolved={'operation': {'generation': 4, 'symbol': 3, 'bytes': 127},
+                                                    'since_us': 90, 'at_us': 100, 'censored': True})
+                        for totals in [value['union'], *(v['totals'] for v in value['reasons'])]:
+                            totals.update(censored_episodes=1, censored_us=10, maximum_censored_us=10)
+                        for row in value['reasons']:
+                            row['pending_since_us'] = None
+                        staged['terminal_at_us'] = 100
+                        staged[population] = copy.deepcopy(staged['maximum_completed'])
+                        staged[population].update(at_us=100, censored=True)
+                        pending = staged[population]['pending']
+                    else:
+                        pending = staged[population]['pending']
+                    # Each population/availability shape is valid before the one
+                    # impossible producer-history mutation, including null history.
+                    self.assertEqual(self.check(value)['status'], 'validated_known_fields_partial')
+                    pending['ack_before'] = 2 if history == 'observed' else 1
+                    self.assertTrue(self.check(value)['status'].startswith('invalid'))
+
     def test_staged_unknown_identity_and_false_predicates_are_not_valid_zero(self):
         mutations = (
             lambda v: v.update(schema=2),
@@ -154,6 +233,24 @@ def staged_fixture():
     return {'schema': 1, 'invalid': False, 'terminal_at_us': None, 'pending': None,
             'last_resolved': copy.deepcopy(resolved), 'maximum_completed': copy.deepcopy(resolved),
             'maximum_censored': None, 'last_retirement': copy.deepcopy(resolved['latest_retirement'])}
+
+
+def ack_staged_fixture():
+    value = staged_fixture()
+    before = {'source': 0, 'attempts': 2, 'transmission': 7, 'acknowledged': False,
+              'physical_pending': True, 'retry_at_us': None}
+    event = {'serial': 1, 'received_us': 20, 'observed_us': 29, 'prefix': 1, 'bitmap': 0,
+             'before': before, 'after': dict(before, acknowledged=True),
+             'covers_before': True, 'retired_before': False,
+             'released_records': 0, 'released_bytes': 0}
+    value.update(schema=2, ack_coverage='selected_selective', last_ack=copy.deepcopy(event))
+    for key in ('last_resolved', 'maximum_completed'):
+        row = value[key]
+        row['pending']['ack_before'] = 0
+        row['latest_ack'] = copy.deepcopy(event)
+        row['latest_retirement'].update(kind='physical', accepted_us=29, observed_us=30)
+    value['last_retirement'] = copy.deepcopy(value['last_resolved']['latest_retirement'])
+    return value
 
 
 if __name__ == '__main__':

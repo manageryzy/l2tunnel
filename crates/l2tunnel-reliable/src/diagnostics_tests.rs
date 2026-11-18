@@ -288,6 +288,20 @@ fn staged_source_identity_survives_sparse_span_shorter_episode_and_terminal_cens
     );
     assert_eq!(pending.first.oldest.ok_or("held hole")?.source.0, 0);
     assert_eq!(pending.native.ok_or("original native")?.flow, 100);
+    let selective = sender
+        .output_wait_snapshot(time(2))
+        .ok_or("observer")?
+        .staged
+        .last_ack
+        .ok_or("validated selective feedback")?;
+    assert_eq!((selective.prefix, selective.bitmap), (0, 2));
+    assert_eq!(selective.covers_before, Some(false));
+    assert_eq!(selective.retired_before, Some(false));
+    assert_eq!(
+        selective.released_records, 1,
+        "source one retired; oldest zero did not"
+    );
+    assert_eq!(pending.ack_before, selective.serial);
     peer.receive(&zero, time(3))?;
     sender.receive(&actual_feedback(&mut peer, 4)?, time(12))?;
     assert_eq!(sender.submit(b"two", time(12))?, 2);
@@ -318,6 +332,15 @@ fn staged_source_identity_survives_sparse_span_shorter_episode_and_terminal_cens
         (2, Some(unit), pending.native)
     );
     assert_eq!(winner.at - winner.pending.since, time(10));
+    let winner_ack = winner.ack.ok_or("same-episode validated ACK")?;
+    assert_eq!((winner_ack.prefix, winner_ack.bitmap), (2, 0));
+    assert_eq!(winner_ack.before.ok_or("oldest zero")?.flight.source.0, 0);
+    assert!(winner_ack.after.is_none());
+    assert_eq!(
+        (winner_ack.covers_before, winner_ack.retired_before),
+        (Some(true), Some(true))
+    );
+    assert!(winner_ack.serial > winner.pending.ack_before);
     assert_eq!(
         winner.retirement.ok_or("real input retirement")?.kind,
         diagnostics::staged::RetirementKind::Input
@@ -367,8 +390,27 @@ fn staged_retirement_is_not_inferred_from_ack_while_actual_retry_is_held() -> Te
         .poll_data(time(100), &mut output, &mut budget())?
         .ok_or("retry")?;
     let token = sender.pending_data_output().ok_or("held retry")?;
-    sender.receive(&feedback, time(101))?;
+    sender.receive_at(&feedback, time(1), time(101))?;
     assert_eq!(sender.storage().arq.send_records, 1);
+    let ack = sender
+        .output_wait_snapshot(time(101))
+        .ok_or("observer")?
+        .staged
+        .last_ack
+        .ok_or("actual validated old-copy ACK")?;
+    assert_eq!((ack.received, ack.observed), (time(1), time(101)));
+    let (before, after) = (
+        ack.before.ok_or("oldest before")?,
+        ack.after.ok_or("oldest after")?,
+    );
+    assert_eq!(before.flight.source, after.flight.source);
+    assert!(before.physical_pending && after.physical_pending);
+    assert!(!before.flight.acknowledged && after.flight.acknowledged);
+    assert_eq!(
+        (ack.covers_before, ack.retired_before),
+        (Some(true), Some(false))
+    );
+    assert_eq!((ack.released_records, ack.released_bytes), (0, 0));
     assert!(
         sender
             .output_wait_snapshot(time(101))
@@ -378,6 +420,15 @@ fn staged_retirement_is_not_inferred_from_ack_while_actual_retry_is_held() -> Te
             .is_none()
     );
     sender.confirm_output_at(time(102), time(101), token)?;
+    assert_eq!(
+        sender
+            .output_wait_snapshot(time(102))
+            .ok_or("observer")?
+            .staged
+            .last_ack,
+        Some(ack),
+        "a physical retirement must not masquerade as another ACK"
+    );
     let event = sender
         .output_wait_snapshot(time(102))
         .ok_or("observer")?
@@ -404,5 +455,78 @@ fn staged_retirement_is_not_inferred_from_ack_while_actual_retry_is_held() -> Te
             .last_retirement,
         Some(event)
     );
+    Ok(())
+}
+
+#[test]
+fn selected_ack_diagnostics_keep_stale_valid_and_reject_invalid_feedback() -> TestResult {
+    for malformed in [false, true] {
+        let mut sender = direct_observed(EndpointRole::Initiator)?;
+        let mut peer = direct_observed(EndpointRole::Responder)?;
+        let usage = sender.storage_usage();
+        sender.submit(b"zero", time(0))?;
+        peer.receive(&actual_source(&mut sender, 0)?, time(0))?;
+        let old_feedback = actual_feedback(&mut peer, 1)?;
+        sender.receive(&old_feedback, time(1))?;
+        sender.submit(b"one", time(2))?;
+        actual_source(&mut sender, 2)?;
+        let before = sender.storage().arq;
+        sender.receive_at(&old_feedback, time(1), time(3))?;
+        let valid = sender
+            .output_wait_snapshot(time(3))
+            .ok_or("observer")?
+            .staged
+            .last_ack
+            .ok_or("valid stale ACK")?;
+        assert_eq!(valid.serial, 2);
+        assert_eq!((valid.prefix, valid.bitmap), (1, 0));
+        assert_eq!((valid.received, valid.observed), (time(1), time(3)));
+        assert_eq!(valid.before.ok_or("oldest")?.flight.source.0, 1);
+        assert_eq!(
+            (valid.covers_before, valid.retired_before),
+            (Some(false), Some(false))
+        );
+        assert_eq!((valid.released_records, valid.released_bytes), (0, 0));
+        assert_eq!(sender.storage().arq, before);
+        assert_eq!(
+            sender.receive_at(&old_feedback, time(5), time(4)),
+            Err(Error::NonMonotonicTime)
+        );
+        assert_eq!(
+            sender
+                .output_wait_snapshot(time(4))
+                .ok_or("observer")?
+                .staged
+                .last_ack,
+            Some(valid)
+        );
+        let invalid = if malformed {
+            vec![2, 0x80] // Truncated canonical prefix; no fabricated parsed feedback.
+        } else {
+            let mut bytes = vec![2; 1 + l2tunnel_recovery::ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES];
+            let n = PacketView::Ack {
+                prefix: 3,
+                bitmap: 0,
+            }
+            .encode_body_into(&mut bytes[1..])?;
+            bytes.truncate(1 + n);
+            bytes
+        };
+        let result = sender.receive(&invalid, time(4));
+        if malformed {
+            assert_eq!(result, Err(Error::Arq(RecoveryError::MalformedPacket)));
+        } else {
+            assert_eq!(
+                result,
+                Err(Error::Arq(RecoveryError::UnsentAcknowledgement))
+            );
+        }
+        assert_eq!(sender.storage().arq, before);
+        let snapshot = sender.output_wait_snapshot(time(4)).ok_or("observer")?;
+        assert_eq!(snapshot.staged.last_ack, Some(valid));
+        assert!(snapshot.staged.ack_supported && !snapshot.staged.invalid);
+        assert_eq!(sender.arq_statistics().feedback_received, 2);
+        assert_eq!(sender.storage_usage(), usage);
+    }
     Ok(())
 }

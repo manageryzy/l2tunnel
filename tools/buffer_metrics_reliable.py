@@ -201,6 +201,47 @@ def validate_staged(value, observed, terminal, path, issues, gaps):
         need(num(value, 'records') > 0, 'no actual source retention released')
         num(value, 'bytes')
 
+    def ack(value):
+        if value is None:
+            return
+        value = obj(value)
+        need(num(value, 'serial') > 0, 'invalid ACK serial')
+        arrived, applied = num(value, 'received_us'), num(value, 'observed_us')
+        need(arrived <= applied <= observed, 'invalid ACK input/application time')
+        prefix, bitmap = num(value, 'prefix'), num(value, 'bitmap')
+        need(bitmap & 1 == 0 and (not bitmap or prefix + bitmap.bit_length() - 1 <= U64_MAX),
+             'noncanonical ACK coverage')
+        released = num(value, 'released_records'); byte_count = num(value, 'released_bytes')
+        need(released > 0 or byte_count == 0, 'ACK byte release without actual source retirement')
+        need('before' in value and 'after' in value, 'missing ACK oldest availability')
+        before, after = value['before'], value['after']
+        for oldest in (before, after):
+            if oldest is None:
+                continue
+            oldest = obj(oldest)
+            need(num(oldest, 'source') < U64_MAX and num(oldest, 'attempts') < (1 << 32),
+                 'invalid ACK oldest identity')
+            transmission = num(oldest, 'transmission'); retry = num(oldest, 'retry_at_us', True)
+            held = flag(oldest, 'physical_pending'); acknowledged = flag(oldest, 'acknowledged')
+            need(held == (transmission != 0), 'ACK physical witness/serial mismatch')
+            need(not held or retry is None, 'held physical attempt has a retry timer')
+            need(not acknowledged or held, 'ACKed source retained without physical custody')
+        need('covers_before' in value and 'retired_before' in value, 'missing ACK outcome availability')
+        if before is None:
+            need(after is None and value['covers_before'] is None and value['retired_before'] is None
+                 and released == byte_count == 0, 'ACK invented oldest or release')
+        else:
+            offset = before['source'] - prefix
+            covered = before['source'] < prefix or (0 <= offset < 64 and bool(bitmap & (1 << offset)))
+            retired = after is None or after['source'] != before['source']
+            need(flag(value, 'covers_before') == covered, 'wrong ACK coverage predicate')
+            need(flag(value, 'retired_before') == retired, 'wrong actual oldest retirement')
+            need(not retired or (covered and released > 0), 'oldest retirement without ACK/release')
+            need(after is None or after['source'] >= before['source'], 'ACK moved oldest backwards')
+            if covered and not retired:
+                need(after['acknowledged'] and after['physical_pending'],
+                     'covered oldest neither retired nor physically held')
+
     def gate(value, source, length):
         value = obj(value)
         need(num(value, 'next_source') == source and num(value, 'proposed_bytes') == length,
@@ -233,6 +274,9 @@ def validate_staged(value, observed, terminal, path, issues, gaps):
         start, last = num(value, 'since_us'), num(value, 'last_refusal_us')
         need(start <= last <= observed, 'invalid refusal clock')
         num(value, 'retirement_before')
+        if schema == 2:
+            need(num(value, 'ack_before') <= last_ack_serial,
+                 'wait ACK start serial exceeds owner history')
         for name in ('first_gate', 'last_gate'):
             gate(value.get(name), source, length)
         need('unit' in value and 'native' in value, 'missing identity availability')
@@ -252,7 +296,20 @@ def validate_staged(value, observed, terminal, path, issues, gaps):
         return start, last
 
     value = obj(value)
-    need(value.get('schema') == 1, 'unknown schema')
+    schema = value.get('schema')
+    need(type(schema) is int and schema in (1, 2), 'unknown schema')
+    if schema == 2:
+        coverage = value.get('ack_coverage')
+        need(coverage in ('selected_selective', 'unavailable'), 'unknown ACK coverage')
+        need('last_ack' in value, 'missing ACK observation availability')
+        ack(value['last_ack'])
+        last_ack_serial = value['last_ack']['serial'] if value['last_ack'] is not None else 0
+        need(coverage != 'unavailable' or value['last_ack'] is None,
+             'ACK observation for unsupported owner')
+        if coverage == 'unavailable':
+            gaps.append(path + ': selected shared SelectiveRepeat ACK boundary unavailable')
+    else:
+        gaps.append(path + ': exact validated ACK/oldest attribution unavailable in schema 1')
     if flag(value, 'invalid'):
         issues.append(path + ': producer invalid identity/time/counter flag')
     need(num(value, 'terminal_at_us', True) == terminal, 'terminal boundary mismatch')
@@ -280,13 +337,24 @@ def validate_staged(value, observed, terminal, path, issues, gaps):
         if event is not None:
             need(event['serial'] > resolved['pending']['retirement_before'] and event['observed_us'] <= at,
                  'retirement outside same wait')
+        if schema == 2:
+            need('latest_ack' in resolved, 'missing same-episode ACK availability')
+            event = resolved['latest_ack']
+            ack(event)
+            if event is not None:
+                need(coverage == 'selected_selective' and value['last_ack'] is not None,
+                     'episode ACK without supported observed owner')
+                need(event['serial'] > resolved['pending']['ack_before']
+                     and event['serial'] <= value['last_ack']['serial']
+                     and start <= event['observed_us'] <= at,
+                     'ACK outside same wait/owner observation')
         durations[key] = (at - start, censored)
     if 'last_resolved' in durations:
         elapsed, censored = durations['last_resolved']
         winner = 'maximum_censored' if censored else 'maximum_completed'
         need(winner in durations and durations[winner][0] >= elapsed, 'maximum lost its identity')
     gaps.append(path + ': maxima attach to existing staged wait timing; no second union; native identity is '
-                'earlier admitted original, not the later refused FIFO head; latest retirement is not sole-cause proof')
+                'earlier admitted original, not the later refused FIFO head; latest retirement/ACK is not sole-cause proof')
 
 
 def render_staged(lines, value, table, cell):
@@ -309,3 +377,31 @@ def render_staged(lines, value, table, cell):
                      ', '.join(k for k in ('records_full', 'bytes_full', 'sequence_full') if gate[k])])
     table(lines, ['Population', 'Source', 'Episode us', 'Channel', 'Native record', 'Original flow',
                   'Records/cap', 'Span base', 'Actual latest predicates'], rows)
+    render_staged_ack(lines, value, table, cell)
+
+
+def render_staged_ack(lines, value, table, cell):
+    if value.get('schema') != 2:
+        lines.append('Exact validated ACK/oldest attribution: unavailable in this receipt schema.')
+        return
+    coverage = value['ack_coverage']
+    lines.append('Validated ACK boundary: ' + cell(coverage) + '. ACK coverage, acknowledged held '
+                 'physical retry, and actual source retirement are distinct. Latest ACK is context, '
+                 'not proof that it alone released a staged source. No ACK event history is retained.')
+    rows = []
+    for name, event in [('last_ack', value['last_ack']),
+                        *((name, value[name]['latest_ack']) for name in
+                          ('maximum_completed', 'maximum_censored', 'last_resolved') if value[name] is not None)]:
+        if event is None:
+            continue
+        before, after = event['before'], event['after']
+        rows.append([name, event['serial'], event['prefix'], event['bitmap'],
+                     event['received_us'], event['observed_us'],
+                     before['source'] if before else 'none', event['covers_before'],
+                     after['source'] if after else 'none',
+                     after['acknowledged'] if after else 'unavailable',
+                     after['physical_pending'] if after else 'unavailable',
+                     event['retired_before'], event['released_records']])
+    table(lines, ['Context', 'ACK serial', 'Prefix', 'Bitmap', 'Received us', 'Applied us',
+                  'Oldest before', 'Covered', 'Oldest after', 'ACKed after', 'Physical held after',
+                  'Oldest retired', 'Sources released'], rows)

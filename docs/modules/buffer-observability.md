@@ -1532,3 +1532,50 @@ for Rolling. These warmup/retry/drain populations are not full original-native
 overhead. Swift stream/native and TLS/QUIC physical-packet joins remain unavailable.
 BP-01 through BP-24, the full 20-algorithm by 4-carrier by 3-phase current-build
 matrix and full original-native overhead remain open.
+
+### Batch20 ACK coverage and decoder progress
+
+Implementation passes coordinated local validation below; native20 remains pending.
+Optional Reliable ACK attribution reuses the actual parsed selective ACK and the
+existing validation/retention passes. It captures exact prefix/bitmap, original
+arrival and observation, before/after retained minima and the same-flight physical
+retry state. Invalid ACKs never publish partial observations; backing-slot order
+cannot substitute for the minimum source ID. Fixed last/max staged-wait metadata
+uses the existing prepaid diagnostic owner, without extra send-window scans or
+an event queue. Staged-source schema2 carries these facts; historical schema1
+explicitly lacks ACK attribution. The ordinary selective-repeat owner is bounded
+at 64 sources; independent Compact recovery is a separate composition.
+
+Rolling decoder Known, Eliminate and Normalize phases now process bounded
+contiguous byte slices while retaining every original field/metadata debit,
+phase transition, selected transaction bank and failure order. No slice crosses
+its original source or row extent or receives additional work allowance.
+Existing output, deadlines, retry policy and resource limits remain unchanged.
+
+The decoder's existing inline Job also retains original received and successful
+admission ticks. A returned-only expiry detail projects its exact typed phase and
+cursor without payload or arithmetic values, scans or allocation. The existing
+first-failure trace forwards this detail. Readers must match the selected failure
+identity/deadline: an IncomingCap failure can concern another attempted input.
+Before-admission failures invent no job or phase. Arrival-to-admission and decoder
+custody are elapsed ownership intervals, not CPU time or buffer backpressure.
+Actual owner sizes remain charged against the original limits; no quota is enlarged.
+No full BP, parity or performance gate closes through these changes.
+
+The [affected batch20 validation](../../work/aligned-extents-20261117/required-buffer-checks20-attempt1/validation.json)
+passes 813 Rust cases, 45 Python report cases, strict workspace Clippy, formatting,
+strict documentation for the five changed Rust owner/caller crates, and checklist
+validation. Source remains unchanged during the run. The full passing check19
+sequence supplies unchanged simulator, codec, platform/carrier/service lifecycle
+and harness evidence; those are not reported as newly executed tests. Independent
+GF, ACK and expiry reviews are preserved with the isolated drafts. This validates
+exact work charges, rollback, original expiry, ACK acceptance/failure and parser
+boundaries; it does not qualify throughput or all-buffer coverage.
+
+The [native19 Python mapping](../../work/aligned-extents-20261117/native19-cauchy-python-mapping20/report.json)
+separately identifies the Cauchy benchmark's ordinary 64-source selective-repeat
+owner and fixed 8+2 repair policy. Its minimum-frontier bound and capped exponential
+RTO differ from the closest Python legacy block-FEC model. The Aligned codec and
+CompactARQ recovery contracts are separate; no exact Python Strategy is bound to
+this row. These remain explicit parity gaps, not authority to enlarge benchmark
+limits or claim CompactARQ serial/RTT/fast-retry behavior for Cauchy.
