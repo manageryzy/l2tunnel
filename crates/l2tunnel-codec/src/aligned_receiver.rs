@@ -8,6 +8,10 @@ use crate::aligned_body::{self, Decoder, Padding};
 use l2tunnel_core::Epoch;
 use std::{fmt, mem::size_of};
 
+#[path = "aligned_receiver/cache.rs"]
+mod cache;
+use cache::{DeadlineCache, Retention};
+
 /// Absolute nonwrapping source identity, retained through retransmission/recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceId(pub u64);
@@ -297,6 +301,11 @@ impl Record {
     fn complete(&self) -> bool {
         self.count == self.pieces.len()
     }
+    fn native_pending(&self) -> bool {
+        !self.early_delivered
+            && (self.bytes.first() != Some(&0)
+                || (!self.pieces.is_empty() && self.pieces.first().copied().unwrap_or(0) == 0))
+    }
 }
 #[allow(dead_code)]
 struct LegacyChannel {
@@ -331,6 +340,8 @@ pub struct Receiver {
     channels: Vec<Channel>,
     records: Vec<Option<Record>>,
     proofs: Vec<Option<Proof>>,
+    retention: Retention,
+    deadlines: DeadlineCache,
     floor: Option<SourceId>,
     staged: Decoder,
     native: Vec<u8>,
@@ -400,6 +411,8 @@ impl Receiver {
             channels,
             records,
             proofs,
+            retention: Retention::default(),
+            deadlines: DeadlineCache::default(),
             floor: Some(limits.first_source),
             staged: if ip {
                 Decoder::new_ip(limits.body)
@@ -476,6 +489,8 @@ impl Receiver {
         let proofs = self.proofs.clone();
         let floor = self.floor;
         let last_time = self.last_time;
+        let retention = self.retention;
+        let deadlines = self.deadlines.checkpoint();
         let mut outcomes = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             match self.admit_authenticated(symbol.identity, symbol.bytes, now) {
@@ -485,6 +500,8 @@ impl Receiver {
                     self.proofs = proofs;
                     self.floor = floor;
                     self.last_time = last_time;
+                    self.retention = retention;
+                    self.deadlines.restore(deadlines);
                     return Err(error);
                 }
             }
@@ -559,6 +576,8 @@ impl Receiver {
         shadow.pending = self.pending;
         shadow.last_time = self.last_time;
         shadow.failure = self.failure;
+        shadow.retention = self.retention;
+        shadow.deadlines.restore(self.deadlines.checkpoint());
         Ok(shadow)
     }
     /// Classify a complete symbol using this receiver's actual scope and parser.
@@ -674,9 +693,12 @@ impl Receiver {
                         }
                         self.touch_record(slot, true)?;
                         let entry = self.records[slot].as_mut().ok_or(Error::Malformed)?;
+                        let was_native = entry.native_pending();
                         entry.bytes[parsed.offset..end].copy_from_slice(parsed.body);
                         entry.pieces[index] = 1;
                         entry.count += 1;
+                        self.retention.native_records -= usize::from(was_native);
+                        self.retention.native_records += usize::from(entry.native_pending());
                         Admission::Accepted
                     }
                 }
@@ -700,7 +722,7 @@ impl Receiver {
                 if parsed.fragments != 0 {
                     pieces[parsed.offset / parsed.capacity] = 1;
                 }
-                self.records[slot] = Some(Record {
+                let record = Record {
                     channel: parsed.channel,
                     id: identity.record,
                     bytes,
@@ -710,7 +732,10 @@ impl Receiver {
                     padding: parsed.padding,
                     deadline,
                     early_delivered: false,
-                });
+                };
+                self.retention.add_record(&record);
+                self.deadlines.insert(record.deadline);
+                self.records[slot] = Some(record);
                 Admission::Accepted
             }
         };
@@ -722,6 +747,8 @@ impl Receiver {
             bytes,
             deadline,
         });
+        self.retention.sources += 1;
+        self.deadlines.insert(deadline);
         self.advance_sources()?;
         self.last_time = Some(now);
         Ok(outcome)
@@ -760,6 +787,9 @@ impl Receiver {
             return Ok(Prepared::Ready);
         }
         for _ in 0..max_records {
+            if self.retention.records == 0 {
+                return Ok(Prepared::Idle);
+            }
             let expected = match self.expected(channel)? {
                 Some(id) => id,
                 None => return Ok(Prepared::Idle),
@@ -768,18 +798,19 @@ impl Receiver {
                 .find(channel, expected)
                 .filter(|slot| self.records[*slot].as_ref().is_some_and(Record::complete));
             let slot = head.or_else(|| {
+                if !allow_early || self.limits.body.independent_short_frame_bytes == 0 {
+                    return None;
+                }
                 self.records
                     .iter()
                     .enumerate()
                     .filter_map(|(i, entry)| {
                         let entry = entry.as_ref()?;
-                        (allow_early
-                            && entry.channel == channel
+                        (entry.channel == channel
                             && entry.id > expected
                             && entry.complete()
                             && entry.pieces.is_empty()
                             && !entry.early_delivered
-                            && self.limits.body.independent_short_frame_bytes != 0
                             && independent_length(&entry.bytes).is_some_and(|length| {
                                 length <= self.limits.body.independent_short_frame_bytes
                             }))
@@ -858,10 +889,12 @@ impl Receiver {
         let pending = self.pending.ok_or(Error::NoPending)?;
         if pending.early {
             self.touch_record(pending.slot, true)?;
-            self.records[pending.slot]
+            let record = self.records[pending.slot]
                 .as_mut()
-                .ok_or(Error::Malformed)?
-                .early_delivered = true;
+                .ok_or(Error::Malformed)?;
+            self.retention.native_records -= usize::from(record.native_pending());
+            self.retention.tombstones += usize::from(!record.early_delivered);
+            record.early_delivered = true;
         } else {
             let channel = usize::from(
                 self.records[pending.slot]
@@ -891,40 +924,27 @@ impl Receiver {
         if self.failure.is_some() {
             return None;
         }
-        self.records
-            .iter()
-            .flatten()
-            .map(|record| record.deadline)
-            .chain(self.proofs.iter().flatten().map(|proof| proof.deadline))
-            .min()
+        self.deadlines.get(
+            self.records
+                .iter()
+                .flatten()
+                .map(|record| record.deadline)
+                .chain(self.proofs.iter().flatten().map(|proof| proof.deadline)),
+        )
     }
     /// Inspect payload/count retention without advancing receipt or native delivery.
     pub fn status(&self) -> Status {
-        let mut status = Status {
+        Status {
             source_floor: self.floor,
-            retained_sources: self.proofs.iter().flatten().count(),
-            retained_records: 0,
-            native_records: 0,
-            record_bytes: 0,
-            fragment_slots: 0,
-            early_tombstones: 0,
+            retained_sources: self.retention.sources,
+            retained_records: self.retention.records,
+            native_records: self.retention.native_records,
+            record_bytes: self.retention.record_bytes,
+            fragment_slots: self.retention.fragment_slots,
+            early_tombstones: self.retention.tombstones,
             pending_bytes: self.pending.map(|p| p.written),
             failure: self.failure,
-        };
-        for entry in self.records.iter().flatten() {
-            status.retained_records += 1;
-            if !entry.early_delivered
-                && (entry.bytes.first() != Some(&0)
-                    || (!entry.pieces.is_empty()
-                        && entry.pieces.first().copied().unwrap_or(0) == 0))
-            {
-                status.native_records += 1;
-            }
-            status.record_bytes += entry.bytes.len();
-            status.fragment_slots += entry.pieces.len();
-            status.early_tombstones += usize::from(entry.early_delivered);
         }
-        status
     }
     /// Bounded read-only scan of retained proofs and records, with separate head reserves.
     /// This allocates nothing; callers choose their diagnostic sampling cadence.
@@ -996,9 +1016,7 @@ impl Receiver {
         if self.last_time == Some(now) {
             return Ok(());
         }
-        if self.records.iter().flatten().any(|e| now >= e.deadline)
-            || self.proofs.iter().flatten().any(|p| now >= p.deadline)
-        {
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
             self.failure = Some(Error::Expired);
             return Err(Error::Expired);
         }
@@ -1042,6 +1060,9 @@ impl Receiver {
         self.touch_record(slot, false)?;
         self.channels[index].expected = id.0.checked_add(1).map(RecordId);
         if let Some(record) = self.records[slot].take() {
+            self.retention.remove_record(&record);
+            self.deadlines
+                .remove(record.deadline, self.retention.is_empty());
             self.recycle_record(record)?;
         }
         Ok(())
@@ -1057,6 +1078,9 @@ impl Receiver {
             }
             self.touch_proof(index)?;
             if let Some(proof) = self.proofs[index].take() {
+                self.retention.sources -= 1;
+                self.deadlines
+                    .remove(proof.deadline, self.retention.is_empty());
                 self.recycle_proof(proof)?;
             }
             self.floor = floor.0.checked_add(1).map(SourceId);
@@ -1273,3 +1297,7 @@ mod short_preview_tests;
 #[cfg(test)]
 #[path = "aligned_receiver_compact_tests.rs"]
 mod compact_tests;
+
+#[cfg(test)]
+#[path = "aligned_receiver/cache_tests.rs"]
+mod cache_tests;

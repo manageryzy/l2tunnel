@@ -266,6 +266,12 @@ fn genuine_equation_to_zero_rank_then_fast_original_repair_and_ring_reuse() -> R
         "must actually retain an unresolved equation"
     );
     assert!(d.pending_source().is_none());
+    // The retained equation has support ending at 3. A new original at that
+    // boundary is independent even while that older equation remains live.
+    d.begin_source(scope(), SourceId(3), &[0x91, 0, 0x72, 0], Tick(0))?;
+    let work = finish(&mut d, Tick(0), MAX_STEP_WORK)?;
+    assert_eq!(d.status().rank, 1);
+    assert!(d.pending_source().is_none());
     d.begin_source(scope(), SourceId(1), &[0, 0, 0, 0], Tick(0))?;
     finish(&mut d, Tick(0), 1)?;
     for (id, bytes) in [(1, &[0, 0, 0, 0][..]), (2, &[255][..])] {
@@ -279,8 +285,6 @@ fn genuine_equation_to_zero_rank_then_fast_original_repair_and_ring_reuse() -> R
     for mapping in &d.map {
         assert_eq!(mapping.get(&d.decisions, None)?, None);
     }
-    d.begin_source(scope(), SourceId(3), &[0x91, 0, 0x72, 0], Tick(0))?;
-    let work = finish(&mut d, Tick(0), MAX_STEP_WORK)?;
     assert_eq!(
         d.pending_source(),
         Some((SourceId(3), &[0x91, 0, 0x72, 0][..]))

@@ -388,13 +388,13 @@ where
                     };
                     let mut wake = driver.wake_selected_io(&socket, now)?;
                     if native_spent > 0 || (driver.native_deliverable()? && driver.native_room()) {
-                        wake = wake.min(sample());
+                        wake.at = wake.at.min(sample());
                     }
                     Ok::<_, io::Error>((read_native, write_native, interest, wake))
                 })?;
             let selected = execution
                 .measure_selection(
-                    wake,
+                    wake.at,
                     next_selected(
                         &mut socket,
                         &mut device,
@@ -626,6 +626,7 @@ where
                             }
                         }
                     }
+                    IoEvent::Work => {}
                     IoEvent::Timer => {
                         driver.performance.counters.timer_events =
                             driver.performance.counters.timer_events.saturating_add(1);
@@ -800,6 +801,7 @@ impl<D: NativeDevice> Selected<'_, D> {
             Self::Io(Ok(IoEvent::Udp)) => Winner::Carrier,
             Self::Io(Ok(IoEvent::Native(_))) => Winner::Native,
             Self::Io(Ok(IoEvent::Timer)) => Winner::Timer,
+            Self::Io(Ok(IoEvent::Work)) => Winner::Work,
             Self::Io(Err(_)) => Winner::IoError,
         }
     }
@@ -820,7 +822,7 @@ async fn next_selected<
     interest: Interest,
     native: bool,
     udp: bool,
-    wake: Instant,
+    wake: SelectedWake,
     native_first: bool,
 ) -> Selected<'a, D> {
     tokio::select! {
@@ -831,10 +833,34 @@ async fn next_selected<
     }
 }
 
+// A runnable protocol job is distinct from an idle timer. It still yields once
+// at the lowest I/O priority before the next normally bounded driver turn.
+#[derive(Clone, Copy, Debug)]
+struct SelectedWake {
+    at: Instant,
+    work_ready: bool,
+}
+impl SelectedWake {
+    fn timer(at: Instant) -> Self {
+        Self {
+            at,
+            work_ready: false,
+        }
+    }
+    async fn wait(self) {
+        if self.work_ready {
+            tokio::task::yield_now().await;
+        } else {
+            sleep_until(self.at).await;
+        }
+    }
+}
+
 enum IoEvent<'a, D: NativeDevice> {
     Udp,
     Native(NativeGuard<'a, D>),
     Timer,
+    Work,
 }
 
 // The caller polls shutdown and control first. Alternate ready I/O priorities so
@@ -845,7 +871,7 @@ async fn next_io<'a, D: NativeDevice, R: raw_carrier::RawBacking>(
     interest: Interest,
     native: bool,
     udp: bool,
-    wake: Instant,
+    wake: SelectedWake,
     native_first: bool,
 ) -> io::Result<IoEvent<'a, D>> {
     if native_first {
@@ -853,14 +879,14 @@ async fn next_io<'a, D: NativeDevice, R: raw_carrier::RawBacking>(
             biased;
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
             ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
-            () = sleep_until(wake) => Ok(IoEvent::Timer),
+            () = wake.wait() => Ok(if wake.work_ready { IoEvent::Work } else { IoEvent::Timer }),
         }
     } else {
         tokio::select! {
             biased;
             ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
-            () = sleep_until(wake) => Ok(IoEvent::Timer),
+            () = wake.wait() => Ok(if wake.work_ready { IoEvent::Work } else { IoEvent::Timer }),
         }
     }
 }

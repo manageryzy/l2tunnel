@@ -1,6 +1,9 @@
 //! Actual data FIFO-head refusal to removal, not arrival residence or decoder CPU time.
 use super::*;
 
+/// All successful input queue residence and separately sampled unresolved ages.
+pub mod residence;
+
 /// Canonical authenticated data arm already checked before entering the FIFO.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -83,6 +86,8 @@ pub struct Resolved {
 /// Fixed optional summary; one active data head, no per-packet queue or event log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
+    /// Original-arrival residence for all successful data removals, including no-Busy cases.
+    pub residence: residence::Snapshot,
     /// Next local data-head serial; u64::MAX means diagnostic exhaustion.
     pub next_head: u64,
     /// Actual Busy returns including retries.
@@ -109,6 +114,7 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            residence: residence::Snapshot::default(),
             next_head: 1,
             refusals: 0,
             completions: [0; 3],

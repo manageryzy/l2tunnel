@@ -124,6 +124,48 @@ class RollingIngressTests(unittest.TestCase):
             self.assertIn(token, text)
         self.assertNotIn('%', text)
 
+    def test_residence_histograms_keep_original_age_and_separate_censor_population(self):
+        def distribution(samples):
+            bins = [0] * 32
+            for sample in samples:
+                bins[min(sample.bit_length(), 31)] += 1
+            rank, cumulative, p99 = len(samples) - len(samples) // 100, 0, None
+            for i, count in enumerate(bins):
+                cumulative += count
+                if samples and p99 is None and cumulative >= rank:
+                    p99 = (1 << i) - 1 if i < 31 else ingress.MAX
+            return dict(count=len(samples), sum_us=sum(samples), maximum_us=max(samples, default=0),
+                        at_least_100ms=sum(v >= 100_000 for v in samples),
+                        mean_us=sum(samples) / len(samples) if samples else None,
+                        p99_upper_us=p99, buckets=bins)
+        value = resolved('staged')
+        value['queue_residence'] = dict(schema=1, all=distribution([0, 9, 18]),
+            immediate=distribution([0]), queued=distribution([9, 18]),
+            immediate_outcomes=[1, 0, 0], queued_outcomes=[2, 0, 0],
+            retained_at_us=100, retained_population='open_age_snapshot', retained_ages=distribution([50]))
+        self.assertEqual(self.check(value)[0], [])
+        mutations = [lambda r: r.update(schema=True), lambda r: r['all'].update(p99_upper_us=18),
+                     lambda r: r['queued'].update(mean_us=1), lambda r: r.update(queued_outcomes=[1, 0, 0]),
+                     lambda r: r['retained_ages'].update(maximum_us=101),
+                     lambda r: r.update(retained_population='censored'),
+                     lambda r: r['all']['buckets'].__setitem__(0, 2)]
+        for mutate in mutations:
+            changed = copy.deepcopy(value)
+            mutate(changed['queue_residence'])
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                self.check(changed)
+        changed = copy.deepcopy(value)
+        impossible = distribution([100_000, 100_000])
+        impossible.update(sum_us=100_000, mean_us=50_000, at_least_100ms=1)
+        changed['queue_residence'].update(all=copy.deepcopy(impossible), queued=impossible,
+            immediate=distribution([]), immediate_outcomes=[0, 0, 0])
+        with self.assertRaisesRegex(ValueError, 'histogram sum'):
+            ingress.validate(changed, 200_000, None, 0, 'ingress', [], [])
+        impossible.update(sum_us=200_000, mean_us=100_000, at_least_100ms=0)
+        changed['queue_residence']['all'] = copy.deepcopy(impossible)
+        with self.assertRaisesRegex(ValueError, 'threshold population'):
+            ingress.validate(changed, 200_000, None, 0, 'ingress', [], [])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -40,6 +40,73 @@ fn buffer_snapshot_distinguishes_timer_hold_sealed_source_and_staged_frame() -> 
 }
 
 #[test]
+fn admission_time_follows_retained_sources_and_refused_input_cannot_replace_it() -> TestResult {
+    let mut cfg = config(64);
+    cfg.max_units = 1;
+    let mut sender = Sender::new_reserved(
+        scope(),
+        cfg,
+        crate::aligned_storage::Limits {
+            capacity_bytes: usize::MAX,
+        },
+    )?;
+    let usage = sender.storage_usage();
+    sender.stage_raw(ChannelId(0), b"first", 10)?;
+    sender.stage_raw(ChannelId(1), b"second", 20)?;
+    assert_eq!(sender.oldest_admission_micros(), Some(10));
+    assert_eq!(sender.pending_admission_micros()?, 10);
+    assert_eq!(
+        sender.stage_raw(ChannelId(0), b"refused", 30),
+        Err(Error::Busy)
+    );
+    sender.commit_source()?;
+    assert_eq!(sender.oldest_admission_micros(), Some(20));
+    assert_eq!(sender.pending_admission_micros(), Err(Error::NoPending));
+    sender.poll(40)?;
+    assert_eq!(sender.pending_admission_micros()?, 20);
+    sender.stage_raw(ChannelId(0), b"third", 50)?;
+    sender.commit_source()?;
+    assert_eq!(sender.oldest_admission_micros(), Some(50));
+    sender.poll(60)?;
+    assert_eq!(sender.pending_admission_micros()?, 50);
+    sender.commit_source()?;
+    assert_eq!(sender.oldest_admission_micros(), None);
+    assert!(sender.is_idle());
+    assert_eq!(sender.storage_usage(), usage);
+    Ok(())
+}
+
+#[test]
+fn fragmented_native_time_survives_source_handoffs_and_mixed_age_packing() -> TestResult {
+    let mut cfg = config(64);
+    cfg.max_units = 1;
+    let mut sender = Sender::new(scope(), cfg)?;
+    let original = [0; 180];
+    sender.stage_raw(ChannelId(0), &original, 7)?;
+    let mut sources = 0;
+    while !sender.is_idle() {
+        sender.poll(20 + sources)?;
+        assert_eq!(sender.oldest_admission_micros(), Some(7));
+        assert_eq!(sender.pending_admission_micros()?, 7);
+        sender.commit_source()?;
+        sources += 1;
+        assert!(sources <= 8);
+    }
+    assert!(sources > 1);
+    assert_eq!(sender.oldest_admission_micros(), None);
+
+    let mut sender = Sender::new(scope(), config(64))?;
+    sender.stage_raw(ChannelId(0), b"old", 10)?;
+    sender.stage_raw(ChannelId(1), b"new", 20)?;
+    sender.flush(30)?;
+    assert_eq!(sender.status().packing.units, 2);
+    assert_eq!(sender.pending_admission_micros()?, 10);
+    sender.commit_source()?;
+    assert_eq!(sender.oldest_admission_micros(), None);
+    Ok(())
+}
+
+#[test]
 fn clock_exhaustion_rejects_fresh_ownership_and_is_terminal_for_an_owned_frame() -> TestResult {
     let config = config(64);
     let error = Error::Packing(packed::Error::ClockExhausted);

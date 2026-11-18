@@ -12,14 +12,16 @@ pub(crate) enum SelectionWinner {
     Native,
     Timer,
     IoError,
+    Work,
 }
-const WINNERS: [SelectionWinner; 6] = [
+const WINNERS: [SelectionWinner; 7] = [
     SelectionWinner::Shutdown,
     SelectionWinner::Request,
     SelectionWinner::Carrier,
     SelectionWinner::Native,
     SelectionWinner::Timer,
     SelectionWinner::IoError,
+    SelectionWinner::Work,
 ];
 
 #[derive(Default)]

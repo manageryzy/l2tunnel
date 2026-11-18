@@ -98,7 +98,9 @@ fn actual_python_reorder_fragment_short_wrap_and_duplicate_traces_match() -> Tes
         let bytes = hex(f[7])?;
         let now = Tick(step as u64 + 1);
         receiver.admit_authenticated(identity(f[5].parse()?, f[6].parse()?), &bytes, now)?;
+        super::cache_tests::assert_matches(&receiver);
         let actual = drain(&mut receiver, ChannelId(bytes[0]), now)?;
+        super::cache_tests::assert_matches(&receiver);
         let mut expected = Vec::new();
         for event in f[8].split(';').filter(|s| !s.is_empty()) {
             let parts: Vec<_> = event.split(':').collect();

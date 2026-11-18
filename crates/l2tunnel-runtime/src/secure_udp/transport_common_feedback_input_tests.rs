@@ -885,7 +885,10 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 Interest::READABLE,
                 true,
                 true,
-                origin,
+                SelectedWake {
+                    at: origin,
+                    work_ready: true,
+                },
                 true,
             ),
             Selected::winner,
@@ -906,7 +909,10 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 Interest::READABLE,
                 true,
                 true,
-                origin,
+                SelectedWake {
+                    at: origin,
+                    work_ready: true,
+                },
                 true,
             ),
             Selected::winner,
@@ -929,7 +935,10 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                     Interest::READABLE,
                     true,
                     true,
-                    origin,
+                    SelectedWake {
+                        at: origin,
+                        work_ready: true,
+                    },
                     native_first,
                 ),
                 Selected::winner,
@@ -953,7 +962,7 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 Interest::READABLE,
                 false,
                 false,
-                origin,
+                SelectedWake::timer(origin),
                 false,
             ),
             Selected::winner,
@@ -961,11 +970,35 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
         .await;
     assert!(matches!(selected, Selected::Io(Ok(IoEvent::Timer))));
     drop(selected);
+    // With both I/O branches disabled, local work wins after its cooperative
+    // yield and remains a distinct observation from an elapsed timer.
+    let selected = timing
+        .measure_selection(
+            origin,
+            next_selected(
+                &mut socket,
+                &mut a.device,
+                shutdown.as_mut(),
+                &mut requests,
+                Interest::READABLE,
+                false,
+                false,
+                SelectedWake {
+                    at: origin,
+                    work_ready: true,
+                },
+                false,
+            ),
+            Selected::winner,
+        )
+        .await;
+    assert!(matches!(selected, Selected::Io(Ok(IoEvent::Work))));
+    drop(selected);
     let mut bytes = Vec::new();
     timing.write_snapshot_at(Instant::now(), &mut bytes)?;
     let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-    assert_eq!(json["selection"]["completed"], 5);
-    for winner in ["Shutdown", "Request", "Native", "Carrier", "Timer"] {
+    assert_eq!(json["selection"]["completed"], 6);
+    for winner in ["Shutdown", "Request", "Native", "Carrier", "Timer", "Work"] {
         let row = json["selection"]["winners"]
             .as_array()
             .ok_or("winner array")?
@@ -974,5 +1007,25 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
             .ok_or("actual winner")?;
         assert_eq!(row["count"], 1);
     }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_wake_yields_without_timer_advance_and_idle_wake_stays_pending() -> Result {
+    let now = Instant::now();
+    let work = SelectedWake {
+        at: now,
+        work_ready: true,
+    };
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut work_wait = std::pin::pin!(work.wait());
+    assert!(std::future::Future::poll(work_wait.as_mut(), &mut cx).is_pending());
+    assert!(std::future::Future::poll(work_wait.as_mut(), &mut cx).is_ready());
+    assert_eq!(Instant::now(), now);
+    let idle = SelectedWake::timer(now + duration(100));
+    let mut idle_wait = std::pin::pin!(idle.wait());
+    assert!(std::future::Future::poll(idle_wait.as_mut(), &mut cx).is_pending());
+    assert!(std::future::Future::poll(idle_wait.as_mut(), &mut cx).is_pending());
+    assert_eq!(Instant::now(), now);
     Ok(())
 }

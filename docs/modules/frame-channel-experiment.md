@@ -551,3 +551,39 @@ and admitted it at tick 14,926,679, a 3.395 s wait. The decoder was copying
 a retained row while the unresolved prefix was 468. The 27.07 Mbit/s result
 above belongs to the integrated worktree. [Isolated build](../../work/packed-native-c48-20261118/checkpoint-pair/run.json)
 and [failed case results](../../work/packed-native-c48-20261118/checkpoint-pair/summary.json)
+
+### Reproducing the candidate from the Rust checkpoints
+
+The next checkpoint includes the Rolling receiver and sender work used by
+the Packed path: bounded GF operations, copying and scanning only necessary
+row contents, cached record lookups, timestamps of original pack admissions,
+and immediate service of runnable recovery work. Authenticated inputs enter
+an idle decoder directly when the FIFO is empty. A busy FIFO head resumes
+when the active decode finishes. These changes also export the actual time
+between authenticated arrival and admission. The reproduction uses a fresh
+source tree with these changes and the C48 implementation.
+
+| Final scoped binary, same 100/10, 70 ms RTT, 15% loss each way | Exact control | Queue-aware candidate |
+| --- | ---: | ---: |
+| Outcome | Encoder and decoder custody expired | Passed, hash and EOF on all 16 flows |
+| Sample goodput | Unqualified, 1,250,448 bytes observed | 26.53 Mbit/s |
+| Application records fully written / fully read | 7,653 / 4,249 | 78,904 / 78,904 |
+| First attempted write to complete ordered read P99 | Unqualified | 1,319.39 ms |
+| Scheduled release to complete ordered read P99 | Unqualified | 9,062.87 ms |
+| Forward / reverse repair, requested retry and quiet probe share | Unqualified | 33.76% / 12.85% |
+| Unconfirmed after application EOF, then at shutdown (forward / reverse) | Unqualified | 37 / 2, then 0 / 0 |
+| Maximum forward authenticated input residence | 4,343 ms | 93.545 ms |
+
+The candidate recorded no forward decoder admission at or above 100 ms
+across 62,576 inputs. It submitted 78,904 of 222,657 scheduled application
+records before cutoff. Its longer application P99 includes TCP, recovery and
+channel order. Measurements here do not allocate those waits to individual
+records. Forward named retries consumed 19,372,673 bytes, regular equations
+4,400,410 bytes and one quiet probe 1,311 bytes. Across 320 samples of the
+inner TCP sockets, smoothed RTT had median 310.62 ms and P99 473.13 ms.
+The old arm expired in both comparisons even with the same lifetime
+and decoder changes. The control remains available; the native UDP result
+does not qualify the other carriers or establish equivalence with Python.
+[Exact build and workload](../../work/packed-native-c48-20261118/hotpath-pair/run.json),
+[directional results](../../work/packed-native-c48-20261118/hotpath-pair/summary.json)
+and [CPU and queue measurements](../../work/packed-native-c48-20261118/hotpath-pair/bottlenecks.json)

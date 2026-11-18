@@ -236,3 +236,157 @@ fn original_group_cap_and_acceptance_bounds_survive_held_and_last_copy() -> Test
     }
     Ok(())
 }
+
+#[test]
+fn fresh_source_preempts_only_unmaterialized_tail_and_keeps_physical_copies() -> TestResult {
+    let mut policy = policy();
+    policy.repair_numerator = 0;
+    let mut sender = Sender::new(policy, scope(), Tick(0))?;
+    let mut peer = Receiver::new(policy, scope(), Tick(0))?;
+    for at in 0..3 {
+        let id = sender.admit_source(b"x\0", Tick(at))?;
+        let bytes = wire(&sender)?;
+        sender.confirm_output(OutputId::Source(id), Tick(at))?;
+        if at == 2 {
+            peer.receive_wire(&bytes, Tick(3))?;
+        }
+    }
+    for _ in 0..64 {
+        peer.step(Tick(3), work())?;
+        if peer.pending_feedback().is_some() {
+            break;
+        }
+    }
+    let feedback = peer.pending_feedback().ok_or("actual sparse receipt")?;
+    assert_eq!(
+        (feedback.prefix, feedback.observed_end, feedback.deficit),
+        (0, 3, 2)
+    );
+    sender.receive_feedback(feedback, Tick(3))?;
+    let original_debt = sender.expiry_snapshot().candidates[0].map(|value| value.at);
+    let usage = sender.storage_usage()?;
+    sender.step(
+        Tick(12),
+        WorkBudget {
+            field: 0,
+            copies: 0,
+            metadata: 1,
+        },
+    )?;
+    assert!(sender.status().encoder.pending_repair);
+    assert!(sender.pending_output().is_none());
+    assert_eq!(sender.admit_source(b"next", Tick(12)), Err(Error::Busy));
+    sender.step(Tick(12), work())?;
+    let repair = sender.pending_output().ok_or("computed tail")?.id();
+    let immutable = wire(&sender)?;
+    assert_eq!(sender.admit_source(b"next", Tick(12)), Err(Error::Busy));
+    assert_eq!(wire(&sender)?, immutable);
+    sender.confirm_output(repair, Tick(13))?;
+    assert_eq!(sender.status().tail_remaining, 1);
+    assert_eq!(sender.status().tail_due, Some(Tick(12)));
+    let source = sender.admit_source_with_copies(b"next\0", Tick(14), 3)?;
+    assert_eq!(source, SourceId(3));
+    assert_eq!(sender.status().tail_remaining, 0);
+    assert_eq!(sender.status().tail_due, None);
+    assert_eq!(
+        sender.expiry_snapshot().candidates[0].map(|value| value.at),
+        original_debt
+    );
+    let original_cap = sender.deadline();
+    let bytes = wire(&sender)?;
+    for at in 15..=17 {
+        let copy = sender.pending_source_copy().ok_or("actual copy witness")?;
+        assert_eq!(sender.admit_source(b"blocked", Tick(at)), Err(Error::Busy));
+        assert_eq!(wire(&sender)?, bytes);
+        assert_eq!(sender.deadline(), original_cap);
+        sender.confirm_source_copy(Tick(at), Tick(at), copy)?;
+        if at < 17 {
+            assert_eq!(sender.status().tail_due, None);
+        }
+    }
+    assert_eq!(sender.status().tail_due, Some(Tick(27)));
+    assert_eq!(
+        sender.expiry_snapshot().candidates[0].map(|value| value.at),
+        original_debt
+    );
+    assert_eq!(sender.storage_usage()?, usage);
+    Ok(())
+}
+
+#[test]
+fn overdue_idle_tail_yields_to_source_but_earned_regular_repair_does_not() -> TestResult {
+    for regular in [0, 1] {
+        let mut policy = policy();
+        policy.repair_numerator = regular;
+        let mut sender = Sender::new(policy, scope(), Tick(0))?;
+        let first = sender.admit_source(b"first", Tick(0))?;
+        sender.confirm_output(OutputId::Source(first), Tick(0))?;
+        assert_eq!(sender.status().tail_due, Some(Tick(10)));
+        if regular == 1 {
+            assert_eq!(sender.admit_source(b"next", Tick(10)), Err(Error::Busy));
+            assert_eq!(sender.status().regular_due, 1);
+            sender.step(Tick(10), work())?;
+            let output = sender.pending_output().ok_or("earned regular repair")?;
+            assert!(matches!(output, Output::Repair(repair) if !repair.support.tail));
+            sender.confirm_output(output.id(), Tick(10))?;
+        }
+        assert_eq!(sender.admit_source(b"next", Tick(11))?, SourceId(1));
+        assert_eq!(sender.status().tail_due, None);
+        sender.confirm_output(OutputId::Source(SourceId(1)), Tick(12))?;
+        assert_eq!(sender.status().tail_due, Some(Tick(22)));
+    }
+    Ok(())
+}
+
+#[test]
+fn refused_source_preserves_tail_recovery_and_silent_peer_drain() -> TestResult {
+    let mut policy = policy();
+    policy.repair_numerator = 0;
+    policy.recovery.window = 1;
+    policy.recovery.local_window = 1;
+    policy.recovery.max_rows = 1;
+    policy.recovery.handoff_sources = 1;
+    let mut sender = Sender::new(policy, scope(), Tick(0))?;
+    let mut peer = Receiver::new(policy, scope(), Tick(0))?;
+    let first = sender.admit_source(b"lost\0", Tick(0))?;
+    sender.confirm_output(OutputId::Source(first), Tick(0))?;
+    let original = sender.status();
+    assert_eq!(
+        sender.admit_source(b"invalid length", Tick(10)),
+        Err(Error::Length)
+    );
+    assert_eq!(sender.status().tail_due, original.tail_due);
+    assert_eq!(sender.admit_source(b"full", Tick(10)), Err(Error::Capacity));
+    assert_eq!(sender.status().tail_due, original.tail_due);
+    assert_eq!(sender.status().tail_remaining, original.tail_remaining);
+    sender.step(Tick(10), work())?;
+    let output = sender.pending_output().ok_or("required tail repair")?;
+    assert!(matches!(output, Output::Repair(repair) if repair.support.tail));
+    let id = output.id();
+    let bytes = wire(&sender)?;
+    sender.confirm_output(id, Tick(11))?;
+    assert_eq!(sender.status().tail_due, Some(Tick(21)));
+    peer.receive_wire(&bytes, Tick(12))?;
+    for _ in 0..64 {
+        peer.step(Tick(12), work())?;
+        if peer.pending_feedback().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        peer.pending_source(),
+        Some((SourceId(0), b"lost\0".as_slice()))
+    );
+    sender.receive_feedback_wire(
+        peer.pending_feedback_wire()
+            .ok_or("repaired cumulative receipt")?,
+        Tick(13),
+    )?;
+    assert_eq!(sender.status().encoder.confirmed_prefix, 1);
+    assert_eq!(sender.status().tail_remaining, 0);
+    assert_eq!(sender.status().tail_due, None);
+    assert_eq!(sender.deadline(), None);
+    sender.step(Tick(2000), work())?;
+    assert!(sender.pending_output().is_none());
+    Ok(())
+}

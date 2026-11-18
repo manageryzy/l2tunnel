@@ -49,6 +49,7 @@ fn bytewise_advance(
             index,
         } => {
             if index == w + width {
+                d.rows[row].nonzero[to] = d.rows[row].nonzero[from];
                 job.phase = job.resume.take().ok_or(Error::Identity)?;
             } else {
                 if !spend(&mut budget.copies) {

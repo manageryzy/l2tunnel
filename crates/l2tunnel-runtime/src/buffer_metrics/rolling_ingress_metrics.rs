@@ -3,6 +3,31 @@ use super::{Write, optional};
 use l2tunnel::fec::rolling::expiry::{DecoderJob, Identity};
 use l2tunnel::rolling_records::waits::ingress::{Input, Kind, Outcome, Pending, Snapshot};
 use std::io;
+fn distribution(
+    out: &mut impl Write,
+    value: &l2tunnel::rolling_records::waits::ingress::residence::Distribution,
+) -> io::Result<()> {
+    write!(
+        out,
+        "{{\"count\":{},\"sum_us\":{},\"maximum_us\":{},\"at_least_100ms\":{},\"mean_us\":",
+        value.count, value.sum_us, value.maximum_us, value.at_least_100ms
+    )?;
+    if value.count == 0 {
+        write!(out, "null")?;
+    } else {
+        write!(out, "{}", value.sum_us as f64 / value.count as f64)?;
+    }
+    write!(out, ",\"p99_upper_us\":")?;
+    optional(out, value.p99_upper_us())?;
+    write!(out, ",\"buckets\":[")?;
+    for (index, count) in value.buckets.iter().enumerate() {
+        if index != 0 {
+            write!(out, ",")?;
+        }
+        write!(out, "{count}")?;
+    }
+    write!(out, "]}}")
+}
 fn input(out: &mut impl Write, v: Input) -> io::Result<()> {
     write!(out, "{{\"records_number\":")?;
     optional(out, v.records_number)?;
@@ -122,7 +147,40 @@ pub(super) fn write(
     } else {
         write!(out, "null")?;
     }
-    write!(out, "}}")
+    write!(
+        out,
+        ",\"queue_residence\":{{\"schema\":1,\"definition\":\"original authenticated arrival to successful data removal on both paths; immediate means FIFO bypass, not zero age; includes Staged/Duplicate/Stale outcomes, not all decoder job admission; retained ages are current or terminal-censored, never completed; histogram p99 is an upper bound, not exact or additive; feedback excluded\",\"all\":"
+    )?;
+    distribution(out, &v.residence.all)?;
+    write!(out, ",\"immediate\":")?;
+    distribution(out, &v.residence.immediate)?;
+    write!(out, ",\"queued\":")?;
+    distribution(out, &v.residence.queued)?;
+    write!(
+        out,
+        ",\"immediate_outcomes\":{:?},\"queued_outcomes\":{:?},\"retained_at_us\":",
+        v.residence.immediate_outcomes, v.residence.queued_outcomes
+    )?;
+    optional(out, v.residence.retained_at.map(|at| at.0))?;
+    write!(
+        out,
+        ",\"retained_population\":\"{}\",\"retained_ages\":",
+        if v.terminal_unavailable {
+            "unavailable"
+        } else if v.terminal_at.is_some() {
+            "censored"
+        } else {
+            "open_age_snapshot"
+        }
+    )?;
+    if v.terminal_unavailable {
+        write!(out, "null")?;
+    } else if let Some(ages) = &v.residence.retained_ages {
+        distribution(out, ages)?;
+    } else {
+        write!(out, "null")?;
+    }
+    write!(out, "}}}}")
 }
 
 #[cfg(test)]
@@ -179,6 +237,21 @@ mod tests {
             elapsed_us: 9,
             maximum_us: 9,
         };
+        let mut buckets = [0; 32];
+        buckets[4] = 1; // 9 us.
+        buckets[5] = 1; // 18 us.
+        let residence = l2tunnel::rolling_records::waits::ingress::residence::Distribution {
+            count: 2,
+            sum_us: 27,
+            maximum_us: 18,
+            at_least_100ms: 0,
+            buckets,
+        };
+        value.residence.all = residence;
+        value.residence.queued = residence;
+        value.residence.queued_outcomes = [2, 0, 0];
+        value.residence.retained_ages = Some(Default::default());
+        value.residence.retained_at = Some(Tick(100));
         let mut output = Vec::new();
         write(&mut output, Some(&value), 1, 100)?;
         let parsed: serde_json::Value = serde_json::from_slice(&output)?;
@@ -196,6 +269,25 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(parsed["open_us"], serde_json::Value::Null);
+        assert_eq!(parsed["queue_residence"]["queued"]["mean_us"], 13.5);
+        assert_eq!(parsed["queue_residence"]["queued"]["p99_upper_us"], 31);
+        assert_eq!(parsed["queue_residence"]["retained_ages"]["count"], 0);
+        assert_eq!(
+            parsed["queue_residence"]["retained_ages"]["mean_us"],
+            serde_json::Value::Null
+        );
+        value.terminal_unavailable = true;
+        output.clear();
+        write(&mut output, Some(&value), 1, 100)?;
+        let stale: serde_json::Value = serde_json::from_slice(&output)?;
+        assert_eq!(
+            stale["queue_residence"]["retained_population"],
+            "unavailable"
+        );
+        assert_eq!(
+            stale["queue_residence"]["retained_ages"],
+            serde_json::Value::Null
+        );
         output.clear();
         write(&mut output, None, 1, 100)?;
         assert_eq!(output, b"null");

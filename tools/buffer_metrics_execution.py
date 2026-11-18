@@ -108,13 +108,16 @@ def validate_selection(value, elapsed, boundary, require, uint, object_value):
     value = object_value(value, 'common_execution.selection')
     completed = uint(value.get('completed'), 'selection.completed')
     rows = value.get('winners')
-    require(isinstance(rows, list) and len(rows) == len(WINNERS),
+    require(isinstance(rows, list) and len(rows) in (len(WINNERS), len(WINNERS) + 1),
             'selection: incomplete or oversized winner array')
+    # Historical schema2 has six branches; the optional seventh is actual local
+    # computation after a cooperative yield, never a timer or buffer wait.
+    expected = WINNERS + ('Work',) if len(rows) == len(WINNERS) + 1 else WINNERS
     winners = {}
     for row in rows:
         row = object_value(row, 'selection.winner')
         name = row.get('winner')
-        require(isinstance(name, str) and name in WINNERS and name not in winners,
+        require(isinstance(name, str) and name in expected and name not in winners,
                 'selection: duplicate or unknown winner')
         winners[name] = uint(row.get('count'), 'selection.count')
     require(sum(winners.values()) == completed, 'selection: winner count mismatch')

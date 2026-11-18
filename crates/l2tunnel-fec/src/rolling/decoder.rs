@@ -1,3 +1,4 @@
+use super::gf_batch::xor_scaled;
 use super::*;
 use crate::field;
 
@@ -80,6 +81,7 @@ enum Phase {
         source: u32,
         factor: u8,
         column: usize,
+        extent: usize,
     },
     Reduce(u32),
     Eliminate {
@@ -133,8 +135,6 @@ enum Phase {
     },
     Scan {
         row: usize,
-        index: usize,
-        count: usize,
     },
     Validate {
         row: Option<usize>,
@@ -189,7 +189,8 @@ impl Phase {
                 pivot, row, index, ..
             } => Cursor::OtherEliminate { pivot, row, index },
             Self::CandidateCount { pivot, index, .. } => Cursor::CandidateCount { pivot, index },
-            Self::Scan { row, index, .. } => Cursor::Scan { row, index },
+            // Scan visits one versioned row count, without a coefficient cursor.
+            Self::Scan { row } => Cursor::Scan { row, index: 0 },
             Self::FindSlot { pivot, row } => Cursor::FindSlot { pivot, row },
             Self::Insert { pivot, row, index } => Cursor::Insert { pivot, row, index },
             Self::Validate { row, id, index, .. } => Cursor::Validate {
@@ -215,6 +216,8 @@ struct Job {
     // Only authenticated originals with no unresolved equation may bypass
     // candidate algebra. The existing input vector retains exact length/padding.
     systematic: bool,
+    // Exact coefficient count from CandidateCount, retained until row insertion.
+    candidate_nonzero: usize,
     input: Input,
     phase: Phase,
     // Injected original arrival and successful decoder admission. These are
@@ -274,6 +277,29 @@ pub struct DecoderStatus {
     /// Latched terminal failure.
     pub terminal: Option<Error>,
 }
+#[derive(Clone, Copy)]
+struct Row {
+    version: Cell<()>,
+    nonzero: [usize; 2],
+}
+impl Row {
+    fn new() -> Self {
+        Self {
+            version: Cell::new(),
+            nonzero: [0; 2],
+        }
+    }
+    fn selected(&self, pool: &Pool, active: Option<Ticket>) -> Result<Option<usize>, Error> {
+        self.version.selected(pool, active)
+    }
+    fn prepare(
+        &mut self,
+        pool: &mut Pool,
+        active: Ticket,
+    ) -> Result<(usize, Option<usize>), Error> {
+        self.version.prepare(pool, active)
+    }
+}
 /// Resumable atomic rolling decoder retaining nearly 2W known columns.
 pub struct Decoder {
     config: Config,
@@ -285,7 +311,9 @@ pub struct Decoder {
     known: Vec<Cell<Option<u32>>>,
     pivots: Vec<Cell<Option<u32>>>,
     map: Vec<Cell<Option<usize>>>,
-    rows: Vec<Cell<()>>,
+    // The coefficient count follows the same two-version transaction decision
+    // as its row bytes. A failed candidate cannot publish a shadow count.
+    rows: Vec<Row>,
     decisions: Pool,
     active: Option<Ticket>,
     // Immutable while referenced by committed identities. Candidate recovery may
@@ -358,7 +386,7 @@ impl Decoder {
             )?)?)?
             .join(storage::requested::<Cell<Option<u32>>>(config.max_rows)?)?
             .join(storage::requested::<Cell<Option<usize>>>(config.window)?)?
-            .join(storage::requested::<Cell<()>>(config.max_rows)?)?
+            .join(storage::requested::<Row>(config.max_rows)?)?
             .join(Pool::requested_storage(cells)?)?
             .join(storage::requested::<u8>(mul(
                 mul(2, config.window)?,
@@ -453,7 +481,7 @@ impl Decoder {
                 mul(c.window, std::mem::size_of::<Cell<Option<usize>>>())?,
             )?,
             add(
-                mul(c.max_rows, std::mem::size_of::<Cell<()>>())?,
+                mul(c.max_rows, std::mem::size_of::<Row>())?,
                 Pool::memory_bound(cells)?,
             )?,
         )?;
@@ -493,7 +521,7 @@ impl Decoder {
             known: slots(2 * config.window, Cell::new())?,
             pivots: slots(config.max_rows, Cell::new())?,
             map: slots(config.window, Cell::new())?,
-            rows: slots(config.max_rows, Cell::new())?,
+            rows: slots(config.max_rows, Row::new())?,
             decisions: Pool::new(add(mul(3, config.window)?, mul(2, config.max_rows)?)?)?,
             active: None,
             known_data: bytes(mul(2 * config.window, width)?)?,
@@ -608,7 +636,10 @@ impl Decoder {
         self.active = Some(ticket);
         self.shadow = self.live;
         self.shadow.observed = self.shadow.observed.max(input.end());
-        let systematic = matches!(input, Input::Source(_)) && self.live.rank == 0;
+        // Every committed equation ends at or before the exclusive observed end.
+        // A newer original cannot eliminate a coefficient in any retained row.
+        let systematic =
+            matches!(input, Input::Source(id) if self.live.rank == 0 || id >= self.live.observed);
         let phase = if let Input::Source(id) = input
             && systematic
         {
@@ -625,6 +656,7 @@ impl Decoder {
             ticket,
             resume: None,
             systematic,
+            candidate_nonzero: 0,
             input,
             phase,
             received,
@@ -957,11 +989,23 @@ impl Decoder {
         let bank = self.row_bank(row, self.active)?;
         Ok(self.data[bank][self.row_start(row) + index])
     }
-    fn set_row_byte(&mut self, row: usize, index: usize, value: u8) -> Result<(), Error> {
-        let bank = self.row_bank(row, self.active)?;
-        let at = self.row_start(row) + index;
-        self.data[bank][at] = value;
-        Ok(())
+    fn zero_coefficient_run(&self, id: u32, budget: &WorkBudget) -> Result<usize, Error> {
+        let w = self.config.window;
+        let limit = (u64::from(self.live.prefix) + w as u64).min(u64::from(u32::MAX));
+        let remaining = limit.checked_sub(u64::from(id)).ok_or(Error::Identity)?;
+        let remaining = usize::try_from(remaining).map_err(|_| Error::Exhausted)?;
+        let column = id as usize % w;
+        // Do not cross the circular-column boundary, source-ID limit, first
+        // nonzero coefficient or this turn's original metadata allowance.
+        let bytes = metadata_chunk(remaining.min(w - column), budget)?;
+        let coefficients = self
+            .candidate
+            .get(column..add(column, bytes)?)
+            .ok_or(Error::Identity)?;
+        Ok(coefficients
+            .iter()
+            .position(|value| *value != 0)
+            .unwrap_or(bytes))
     }
     fn prepare_row(
         &mut self,
@@ -1013,6 +1057,8 @@ impl Decoder {
             } => {
                 let stride = add(w, width)?;
                 if index == stride {
+                    let nonzero = *self.rows[row].nonzero.get(from).ok_or(Error::Identity)?;
+                    *self.rows[row].nonzero.get_mut(to).ok_or(Error::Identity)? = nonzero;
                     job.phase = job.resume.take().ok_or(Error::Identity)?;
                 } else {
                     if budget.copies == 0 {
@@ -1097,11 +1143,24 @@ impl Decoder {
                     };
                     if factor == 0 {
                         job.phase = Phase::Support(id + 1);
-                    } else if self.known(id)?.is_some() {
+                    } else if let Some(start) = self.known(id)? {
+                        // Known vectors were length/padding validated before
+                        // publication. Their suffix is algebraic zero, so it
+                        // requires neither GF work nor per-byte metadata visits.
+                        let prefix = self
+                            .known_data
+                            .get(start..add(start, 2)?)
+                            .ok_or(Error::Identity)?;
+                        let extent =
+                            add(2, usize::from(u16::from_be_bytes([prefix[0], prefix[1]])))?;
+                        if !(3..=width).contains(&extent) {
+                            return Err(Error::Identity);
+                        }
                         job.phase = Phase::Known {
                             source: id,
                             factor,
                             column: 0,
+                            extent,
                         };
                     } else {
                         if id < self.live.prefix {
@@ -1116,15 +1175,16 @@ impl Decoder {
                 source,
                 factor,
                 column,
+                extent,
             } => {
-                if column == width {
+                if column == extent {
                     job.phase = Phase::Support(source + 1);
                 } else {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
                     let start = self.known(source)?.ok_or(Error::Identity)?;
-                    let remaining = width.checked_sub(column).ok_or(Error::Identity)?;
+                    let remaining = extent.checked_sub(column).ok_or(Error::Identity)?;
                     let count = field_chunk(remaining, budget)?;
                     let end = add(column, count)?;
                     let known = self
@@ -1135,14 +1195,13 @@ impl Decoder {
                         .candidate
                         .get_mut(add(w, column)?..add(w, end)?)
                         .ok_or(Error::Identity)?;
-                    for (destination, value) in candidate.iter_mut().zip(known) {
-                        *destination ^= field::multiply(factor, *value);
-                    }
+                    xor_scaled::<false>(candidate, known, factor);
                     charge_field_chunk(count, budget);
                     job.phase = Phase::Known {
                         source,
                         factor,
                         column: end,
+                        extent,
                     };
                 }
             }
@@ -1151,9 +1210,16 @@ impl Decoder {
                     job.phase = Phase::Pivot(self.live.prefix);
                 } else {
                     let factor = self.candidate[id as usize % w];
-                    if factor != 0
-                        && let Some(row) = self.map_at(id as usize % w)?
-                    {
+                    if factor == 0 {
+                        let count = self.zero_coefficient_run(id, budget)?;
+                        budget.metadata -= count - 1;
+                        job.phase = Phase::Reduce(
+                            id.checked_add(u32::try_from(count).map_err(|_| Error::Exhausted)?)
+                                .ok_or(Error::Exhausted)?,
+                        );
+                        return Ok(Action::Continue);
+                    }
+                    if let Some(row) = self.map_at(id as usize % w)? {
                         if self.pivot_at(row)? != Some(id) {
                             return Err(Error::Identity);
                         }
@@ -1191,9 +1257,7 @@ impl Decoder {
                         .get(add(start, index)?..add(start, end)?)
                         .ok_or(Error::Identity)?;
                     let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
-                    for (destination, value) in candidate.iter_mut().zip(equation) {
-                        *destination ^= field::multiply(factor, *value);
-                    }
+                    xor_scaled::<false>(candidate, equation, factor);
                     charge_field_chunk(count, budget);
                     job.phase = Phase::Eliminate {
                         row,
@@ -1209,7 +1273,12 @@ impl Decoder {
                 } else {
                     let value = self.candidate[id as usize % w];
                     if value == 0 {
-                        job.phase = Phase::Pivot(id + 1);
+                        let count = self.zero_coefficient_run(id, budget)?;
+                        budget.metadata -= count - 1;
+                        job.phase = Phase::Pivot(
+                            id.checked_add(u32::try_from(count).map_err(|_| Error::Exhausted)?)
+                                .ok_or(Error::Exhausted)?,
+                        );
                     } else {
                         job.phase = Phase::Invert {
                             pivot: id,
@@ -1351,14 +1420,38 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    let value =
-                        self.row_byte(row, index)? ^ field::multiply(factor, self.candidate[index]);
-                    self.set_row_byte(row, index, value)?;
+                    // prepare_row already selected this transaction's writable
+                    // bank. Resolve it after the original first field debit;
+                    // no decision or source row changes within this chunk.
+                    let bank = self.row_bank(row, self.active)?;
+                    let stride = add(w, width)?;
+                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let count = field_chunk(remaining, budget)?;
+                    let end = add(index, count)?;
+                    let start = mul(row, stride)?;
+                    let nonzero = self.rows[row].nonzero[bank];
+                    let candidate = self.candidate.get(index..end).ok_or(Error::Identity)?;
+                    let equation = self.data[bank]
+                        .get_mut(add(start, index)?..add(start, end)?)
+                        .ok_or(Error::Identity)?;
+                    let coefficients = w.saturating_sub(index).min(count);
+                    let (coefficient_row, payload_row) = equation.split_at_mut(coefficients);
+                    let (coefficient_input, payload_input) = candidate.split_at(coefficients);
+                    let (removed, added) =
+                        xor_scaled::<true>(coefficient_row, coefficient_input, factor);
+                    xor_scaled::<false>(payload_row, payload_input, factor);
+                    let nonzero = nonzero.checked_sub(removed).ok_or(Error::Identity)?;
+                    let nonzero = add(nonzero, added)?;
+                    if nonzero > w {
+                        return Err(Error::Identity);
+                    }
+                    self.rows[row].nonzero[bank] = nonzero;
+                    charge_field_chunk(count, budget);
                     job.phase = Phase::OtherEliminate {
                         pivot,
                         row,
                         factor,
-                        index: index + 1,
+                        index: end,
                     };
                 }
             }
@@ -1368,6 +1461,7 @@ impl Decoder {
                 count,
             } => {
                 if index == w {
+                    job.candidate_nonzero = count;
                     if count == 1 {
                         job.phase = Phase::Validate {
                             row: None,
@@ -1419,71 +1513,66 @@ impl Decoder {
             }
             Phase::Insert { pivot, row, index } => {
                 if index == w + width {
+                    let bank = self.row_bank(row, self.active)?;
+                    self.rows[row].nonzero[bank] = job.candidate_nonzero;
                     self.set_pivot(row, Some(pivot))?;
                     self.set_map(pivot as usize % w, Some(row))?;
                     self.shadow.rank += 1;
-                    job.phase = Phase::Scan {
-                        row: 0,
-                        index: 0,
-                        count: 0,
-                    };
+                    job.phase = Phase::Scan { row: 0 };
                 } else {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    self.set_row_byte(row, index, self.candidate[index])?;
+                    // The first copy and metadata visit are already charged.
+                    // Preserve the separate end visit that publishes the pivot.
+                    let bank = self.row_bank(row, self.active)?;
+                    let stride = add(w, width)?;
+                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let count = remaining
+                        .min(add(budget.copies, 1)?)
+                        .min(add(budget.metadata, 1)?);
+                    let end = add(index, count)?;
+                    let start = mul(row, stride)?;
+                    let candidate = self.candidate.get(index..end).ok_or(Error::Identity)?;
+                    self.data[bank]
+                        .get_mut(add(start, index)?..add(start, end)?)
+                        .ok_or(Error::Identity)?
+                        .copy_from_slice(candidate);
+                    budget.copies -= count - 1;
+                    budget.metadata -= count - 1;
                     job.phase = Phase::Insert {
                         pivot,
                         row,
-                        index: index + 1,
+                        index: end,
                     };
                 }
             }
-            Phase::Scan { row, index, count } => {
+            Phase::Scan { row } => {
                 if row == self.config.max_rows {
                     job.phase = Phase::Advance;
-                } else if self.pivot_at(row)?.is_none() {
-                    job.phase = Phase::Scan {
-                        row: row + 1,
-                        index: 0,
-                        count: 0,
-                    };
-                } else if index == w {
-                    if count == 1 {
-                        job.phase = Phase::Validate {
+                } else if let Some(pivot) = self.pivot_at(row)? {
+                    // Insert publishes the complete count; CopyRow transfers it
+                    // with the selected bank, and OtherEliminate updates it with
+                    // each coefficient chunk. The transaction selects both bytes
+                    // and count together, including after a rollback/reuse.
+                    // This is one row visit paid by step, not w coefficient work.
+                    let bank = self.row_bank(row, self.active)?;
+                    let count = self.rows[row].nonzero[bank];
+                    if count > w {
+                        return Err(Error::Identity);
+                    }
+                    job.phase = if count == 1 {
+                        Phase::Validate {
                             row: Some(row),
-                            id: self.pivot_at(row)?.ok_or(Error::Identity)?,
+                            id: pivot,
                             index: 0,
                             length: 0,
-                        };
+                        }
                     } else {
-                        job.phase = Phase::Scan {
-                            row: row + 1,
-                            index: 0,
-                            count: 0,
-                        };
-                    }
-                } else {
-                    // Preserve the first pivot/bank validation before any chunk
-                    // arithmetic. No decision or bank can change while counting.
-                    let bank = self.row_bank(row, self.active)?;
-                    let remaining = w.checked_sub(index).ok_or(Error::Identity)?;
-                    let bytes = metadata_chunk(remaining, budget)?;
-                    let end = add(index, bytes)?;
-                    let start = mul(row, add(w, width)?)?;
-                    let from = add(start, index)?;
-                    let to = add(start, end)?;
-                    let coefficients = self.data[bank].get(from..to).ok_or(Error::Identity)?;
-                    let count = add(
-                        count,
-                        coefficients.iter().filter(|value| **value != 0).count(),
-                    )?;
-                    budget.metadata -= bytes - 1;
-                    job.phase = Phase::Scan {
-                        row,
-                        index: end,
-                        count,
+                        Phase::Scan { row: row + 1 }
                     };
+                } else {
+                    job.phase = Phase::Scan { row: row + 1 };
                 }
             }
             Phase::Validate {
@@ -1528,13 +1617,26 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    if index >= length + 2 && self.payload_byte(row, index, job.systematic)? != 0 {
-                        return Err(Error::Length);
-                    }
+                    let count = if job.systematic {
+                        let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
+                        let end = index + count;
+                        let padding = (length + 2).max(index).min(end);
+                        if self.input[padding..end].iter().any(|byte| *byte != 0) {
+                            return Err(Error::Length);
+                        }
+                        budget.copies -= count - 1;
+                        budget.metadata -= count - 1;
+                        count
+                    } else {
+                        if index >= length + 2 && self.payload_byte(row, index, false)? != 0 {
+                            return Err(Error::Length);
+                        }
+                        1
+                    };
                     job.phase = Phase::Validate {
                         row,
                         id,
-                        index: index + 1,
+                        index: index + count,
                         length,
                     };
                 }
@@ -1551,34 +1653,35 @@ impl Decoder {
                         self.set_pivot(row, None)?;
                         self.set_map(id as usize % w, None)?;
                         self.shadow.rank -= 1;
-                        job.phase = Phase::Scan {
-                            row: row + 1,
-                            index: 0,
-                            count: 0,
-                        };
+                        job.phase = Phase::Scan { row: row + 1 };
                     } else if job.systematic {
-                        // Rank was zero at admission and this path never adds a
-                        // row. Shared prefix/eviction/publication still run.
+                        // No committed row depends on this original. Shared
+                        // prefix, eviction and publication still run.
                         job.phase = Phase::Advance;
                     } else {
-                        job.phase = Phase::Scan {
-                            row: 0,
-                            index: 0,
-                            count: 0,
-                        };
+                        job.phase = Phase::Scan { row: 0 };
                     }
                 } else {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    let value = self.payload_byte(row, index, job.systematic)?;
-                    // Both identity banks proved this slot unreferenced. Partial
-                    // payload writes are invisible until the identity bank commits.
-                    self.known_data[slot * width + index] = value;
+                    // The slot remains invisible until its staged identity commits.
+                    let target = slot * width + index;
+                    let count = if job.systematic {
+                        let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
+                        self.known_data[target..target + count]
+                            .copy_from_slice(&self.input[index..index + count]);
+                        budget.copies -= count - 1;
+                        budget.metadata -= count - 1;
+                        count
+                    } else {
+                        self.known_data[target] = self.payload_byte(row, index, false)?;
+                        1
+                    };
                     job.phase = Phase::Store {
                         row,
                         id,
-                        index: index + 1,
+                        index: index + count,
                     };
                 }
             }

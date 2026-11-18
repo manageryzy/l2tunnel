@@ -22,6 +22,8 @@ struct Globals {
     last_time: Option<Tick>,
     failure: Option<Error>,
     staged: DecoderState,
+    retention: Retention,
+    deadlines: cache::Checkpoint,
 }
 
 #[cfg(test)]
@@ -201,6 +203,8 @@ impl Receiver {
             channels,
             records,
             proofs,
+            retention: Retention::default(),
+            deadlines: DeadlineCache::default(),
             floor: Some(l.first_source),
             staged,
             native,
@@ -336,6 +340,13 @@ impl Receiver {
             None
         };
         let old = self.records[slot].take();
+        if replacement.is_none()
+            && let Some(record) = &old
+        {
+            self.retention.remove_record(record);
+            self.deadlines
+                .remove(record.deadline, self.retention.is_empty());
+        }
         r.journals[active].records[slot] = old.map_or(Undo::Empty, Undo::Value);
         r.journals[active].record_order.push(slot);
         self.records[slot] = replacement;
@@ -355,7 +366,13 @@ impl Receiver {
         if j.proof_order.len() == j.proof_order.capacity() {
             return Err(Error::Storage);
         }
-        j.proofs[slot] = self.proofs[slot].take().map_or(Undo::Empty, Undo::Value);
+        let old = self.proofs[slot].take();
+        if let Some(proof) = &old {
+            self.retention.sources -= 1;
+            self.deadlines
+                .remove(proof.deadline, self.retention.is_empty());
+        }
+        j.proofs[slot] = old.map_or(Undo::Empty, Undo::Value);
         j.proof_order.push(slot);
         Ok(())
     }
@@ -387,6 +404,8 @@ impl Receiver {
             last_time: self.last_time,
             failure: self.failure,
             staged: self.staged.checkpoint(),
+            retention: self.retention,
+            deadlines: self.deadlines.checkpoint(),
         };
         let r = self.reserved.as_mut().ok_or(Error::Storage)?;
         if r.active != (index == 1).then_some(0) || r.journals[index].globals.is_some() {
@@ -420,13 +439,21 @@ impl Receiver {
                 }
             } else {
                 if let Some(record) = self.records[slot].take() {
+                    self.retention.remove_record(&record);
+                    self.deadlines
+                        .remove(record.deadline, self.retention.is_empty());
                     self.recycle_record(record)?;
                 }
-                self.records[slot] = match old {
+                let restored = match old {
                     Undo::Empty => None,
                     Undo::Value(record) => Some(record),
                     Undo::Untouched => return Err(Error::Storage),
                 };
+                if let Some(record) = &restored {
+                    self.retention.add_record(record);
+                    self.deadlines.insert(record.deadline);
+                }
+                self.records[slot] = restored;
             }
         }
         loop {
@@ -446,13 +473,21 @@ impl Receiver {
                 }
             } else {
                 if let Some(proof) = self.proofs[slot].take() {
+                    self.retention.sources -= 1;
+                    self.deadlines
+                        .remove(proof.deadline, self.retention.is_empty());
                     self.recycle_proof(proof)?;
                 }
-                self.proofs[slot] = match old {
+                let restored = match old {
                     Undo::Empty => None,
                     Undo::Value(proof) => Some(proof),
                     Undo::Untouched => return Err(Error::Storage),
                 };
+                if let Some(proof) = &restored {
+                    self.retention.sources += 1;
+                    self.deadlines.insert(proof.deadline);
+                }
+                self.proofs[slot] = restored;
             }
         }
         loop {
@@ -478,6 +513,8 @@ impl Receiver {
             self.pending = globals.pending;
             self.last_time = globals.last_time;
             self.failure = globals.failure;
+            self.retention = globals.retention;
+            self.deadlines.restore(globals.deadlines);
             self.staged.restore(globals.staged);
             if index == 1 {
                 self.native.copy_from_slice(&r.native);

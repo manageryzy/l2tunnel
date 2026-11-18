@@ -1108,20 +1108,20 @@ impl Driver {
         &self,
         socket: &IoOwner<R>,
         now: u64,
-    ) -> io::Result<Instant> {
-        let mut wake = if socket.is_carrier() && self.common.is_some() {
+    ) -> io::Result<SelectedWake> {
+        let mut wake = if self.common.is_some() {
             self.wake_common_with_custody(now, socket.user_pending(), socket.control_pending())?
         } else {
-            self.wake(now)?
+            SelectedWake::timer(self.wake(now)?)
         };
         if let Some(cap) = socket.deadline() {
-            wake = wake.min(cap);
+            wake.at = wake.at.min(cap);
         }
         if let Some(physical) = socket.physical_wake()? {
-            wake = wake.min(physical);
+            wake.at = wake.at.min(physical);
         }
         if let Some(at) = socket.admission_wake(Instant::now()) {
-            wake = wake.min(at);
+            wake.at = wake.at.min(at);
         }
         Ok(wake)
     }

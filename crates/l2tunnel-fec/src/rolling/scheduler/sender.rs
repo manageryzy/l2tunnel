@@ -242,20 +242,16 @@ impl Sender {
             return Err(Error::Configuration);
         }
         self.time(now)?;
-        if self.pending.is_some()
-            || self.regular_due != 0
-            || self.retry_queue.has_retries()
-            || (!self.policy.source_wire.is_targeted()
-                && (self.tail_remaining != 0 || self.tail_due.is_some_and(|due| now >= due)))
-        {
+        if self.pending.is_some() || self.regular_due != 0 || self.retry_queue.has_retries() {
             return Err(Error::Busy);
         }
         let end = self.later(now, self.policy.recovery.job_ticks)?;
         let id = self.encoder.admit_source(original, now)?;
-        if self.policy.source_wire.is_targeted() {
-            self.tail_remaining = 0;
-            self.tail_due = None;
-        }
+        // New admitted data ends idle-tail demand. Never preempt an actual
+        // output/job or earned regular repair; a refused source must leave tail
+        // recovery intact. Physical completion arms the next idle-tail clock.
+        self.tail_remaining = 0;
+        self.tail_due = None;
         self.pending = Some(Pending::Source(id));
         self.source_copy = Some(SourceCopy {
             source: id,

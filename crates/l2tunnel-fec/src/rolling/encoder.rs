@@ -442,6 +442,13 @@ impl Encoder {
                 self.terminal = Some(Error::Identity);
                 return Err(Error::Identity);
             }
+            // Admission stores a validated length and canonical zero suffix.
+            // A zero suffix contributes nothing to any encoded equation.
+            let start = index * self.width;
+            let extent = 2 + usize::from(u16::from_be_bytes([
+                self.vectors[start],
+                self.vectors[start + 1],
+            ]));
             let factor = match job.factor {
                 Some(value) => value,
                 None => {
@@ -463,12 +470,7 @@ impl Encoder {
                     // in a contiguous policy. Explicit rows contain only nonzero
                     // terms, so their intervening gap IDs are outside support.
                     if self.explicit.is_none() || value != 0 {
-                        let start = index * self.width;
-                        let original = usize::from(u16::from_be_bytes([
-                            self.vectors[start],
-                            self.vectors[start + 1],
-                        ]));
-                        job.extent = job.extent.max(2 + original);
+                        job.extent = job.extent.max(extent);
                     }
                     job.factor = Some(value);
                     value
@@ -484,21 +486,19 @@ impl Encoder {
             }
             // Stay inside this validated source and retain the original field
             // and metadata charge, including a later unsuccessful visit.
-            let count = (self.width - job.column)
+            let count = (extent - job.column)
                 .min(budget.field)
                 .min(budget.metadata + 1);
             let end = job.column + count;
-            let start = index * self.width;
-            for (output, source) in self.output[job.column..end]
-                .iter_mut()
-                .zip(&self.vectors[start + job.column..start + end])
-            {
-                *output ^= field::multiply(factor, *source);
-            }
+            gf_batch::xor_scaled::<false>(
+                &mut self.output[job.column..end],
+                &self.vectors[start + job.column..start + end],
+                factor,
+            );
             budget.field -= count;
             budget.metadata -= count - 1;
             job.column = end;
-            if job.column == self.width {
+            if job.column == extent {
                 job.column = 0;
                 job.source += 1;
                 job.factor = None;

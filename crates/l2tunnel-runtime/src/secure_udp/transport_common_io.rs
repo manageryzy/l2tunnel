@@ -1639,15 +1639,16 @@ impl Driver {
         }
     }
     pub(super) fn wake_common(&self, now: u64) -> io::Result<Instant> {
-        self.wake_common_with_custody(now, false, false)
+        Ok(self.wake_common_with_custody(now, false, false)?.at)
     }
     pub(super) fn wake_common_with_custody(
         &self,
         now: u64,
         held_user: bool,
         held_control: bool,
-    ) -> io::Result<Instant> {
+    ) -> io::Result<SelectedWake> {
         let mut wake = self.lease;
+        let mut work_ready = false;
         if let Some(state) = self
             .common
             .as_deref()
@@ -1784,6 +1785,7 @@ impl Driver {
         for epoch in self.common_epochs().into_iter().flatten() {
             let engine = self.common_state()?.engine(epoch)?;
             if engine.work_pending().map_err(protocol)? {
+                work_ready = true;
                 wake = wake.min(now);
             }
             if held_user {
@@ -1879,7 +1881,16 @@ impl Driver {
             .origin
             .checked_add(duration(now.checked_add(100).ok_or_else(exhausted)?))
             .ok_or_else(exhausted)?;
-        Ok(instant.max(floor))
+        // Keep the idle anti-spin floor, but do not send runnable bounded
+        // protocol computation through the timer wheel on every work turn.
+        Ok(SelectedWake {
+            at: if work_ready {
+                instant
+            } else {
+                instant.max(floor)
+            },
+            work_ready,
+        })
     }
 }
 impl Driver {

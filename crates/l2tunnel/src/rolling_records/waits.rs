@@ -255,6 +255,13 @@ impl Snapshot {
             return;
         }
         if let Some(value) = &mut self.ingress_admission {
+            if let Some(elapsed) = now.0.checked_sub(input.received.0) {
+                value
+                    .residence
+                    .removed(elapsed, true, outcome, &mut self.overflow);
+            } else {
+                self.clock_regression = true;
+            }
             value.complete(
                 input,
                 outcome,
@@ -340,6 +347,54 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Exact opt-in diagnostics; unavailable means no backing was selected.
     /// No queue, timer, receipt or protocol state is advanced by observation.
     pub fn wait_snapshot(&self, now: Tick) -> Option<Snapshot> {
-        self.waits.first().copied().map(|value| value.observed(now))
+        self.waits.first().copied().map(|value| {
+            let mut snapshot = value.observed(now);
+            // An immutable failed owner retains the exact original terminal tick.
+            // Otherwise this is a bounded current metadata sample, not a wait.
+            let at = snapshot.observed_at;
+            if let (Some(row), Some(owner)) = (&mut snapshot.ingress_admission, &self.ingress) {
+                let mut ages = ingress::residence::Distribution::default();
+                for packet in owner.queue.iter() {
+                    let input = packet.metadata();
+                    if matches!(
+                        input.kind,
+                        record_engine::EmissionKind::Source(_)
+                            | record_engine::EmissionKind::Repair
+                    ) {
+                        if let Some(age) = at.0.checked_sub(input.received.0) {
+                            ages.record(age, &mut snapshot.overflow);
+                        } else {
+                            snapshot.clock_regression = true;
+                        }
+                    }
+                }
+                row.residence.retained_ages = Some(ages);
+                row.residence.retained_at = Some(at);
+            }
+            snapshot
+        })
+    }
+    pub(super) fn note_direct_ingress_admission(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        outcome: rolling::Begin,
+    ) {
+        let outcome = match outcome {
+            rolling::Begin::Staged => ingress::Outcome::Staged,
+            rolling::Begin::Duplicate => ingress::Outcome::Duplicate,
+            rolling::Begin::Stale => ingress::Outcome::Stale,
+        };
+        if let Some(waits) = self.waits.first_mut()
+            && waits.observe(now)
+            && let Some(row) = &mut waits.ingress_admission
+        {
+            if let Some(elapsed) = now.0.checked_sub(received.0) {
+                row.residence
+                    .removed(elapsed, false, outcome, &mut waits.overflow);
+            } else {
+                waits.clock_regression = true;
+            }
+        }
     }
 }

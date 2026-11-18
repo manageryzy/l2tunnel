@@ -64,6 +64,9 @@ impl IngressLimits {
 }
 pub(super) struct Ingress {
     limits: IngressLimits,
+    minimum: Option<Tick>,
+    feedback: usize,
+    pub(super) waiting_on_decoder: bool,
     pub(super) queue: queue::Queue<Input>,
 }
 impl Ingress {
@@ -76,7 +79,13 @@ impl Ingress {
             },
         )
         .map_err(Error::Ingress)?;
-        Ok(Self { limits, queue })
+        Ok(Self {
+            limits,
+            queue,
+            minimum: None,
+            feedback: 0,
+            waiting_on_decoder: false,
+        })
     }
     pub(super) fn status(&self) -> IngressStatus {
         IngressStatus {
@@ -94,10 +103,39 @@ impl Ingress {
         }
     }
     pub(super) fn deadline(&self) -> Option<Tick> {
+        self.minimum
+    }
+    pub(super) fn push(&mut self, input: Input, bytes: &[u8]) -> Result<(), Error> {
         self.queue
-            .iter()
-            .map(|packet| packet.metadata().deadline)
-            .min()
+            .acquire()
+            .ok_or(Error::Busy)?
+            .copy(input, input.received.0, bytes)
+            .map_err(Error::Ingress)?;
+        self.minimum = Some(
+            self.minimum
+                .map_or(input.deadline, |old| old.min(input.deadline)),
+        );
+        self.feedback += usize::from(input.kind == record_engine::EmissionKind::Feedback);
+        Ok(())
+    }
+    pub(super) fn has_feedback(&self) -> bool {
+        self.feedback != 0
+    }
+    pub(super) fn has_data(&self) -> bool {
+        self.queue.len() > self.feedback
+    }
+    pub(super) fn complete_front(&mut self) -> Result<(), Error> {
+        let input = *self.queue.front().ok_or(Error::Identity)?.metadata();
+        self.queue.complete_front().map_err(Error::Ingress)?;
+        self.feedback -= usize::from(input.kind == record_engine::EmissionKind::Feedback);
+        if self.minimum == Some(input.deadline) {
+            self.minimum = self
+                .queue
+                .iter()
+                .map(|packet| packet.metadata().deadline)
+                .min();
+        }
+        Ok(())
     }
     pub(super) fn usage(&self) -> queue::Usage {
         self.queue.storage_usage()

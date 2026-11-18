@@ -58,21 +58,17 @@ impl Endpoint<crate::fec::research::Config> {
             return self.fail(Error::Expired);
         }
         let owner = self.ingress.as_mut().ok_or(Error::Identity)?;
-        let lease = owner.queue.acquire().ok_or(Error::Busy)?;
-        lease
-            .copy(
-                ingress::Input {
-                    kind: record_engine::EmissionKind::Feedback,
-                    number: Some(number),
-                    received,
-                    order,
-                    original_cap: cap,
-                    deadline,
-                },
-                received.0,
-                bytes,
-            )
-            .map_err(Error::Ingress)?;
+        owner.push(
+            ingress::Input {
+                kind: record_engine::EmissionKind::Feedback,
+                number: Some(number),
+                received,
+                order,
+                original_cap: cap,
+                deadline,
+            },
+            bytes,
+        )?;
         Ok(true)
     }
 
@@ -97,6 +93,9 @@ impl Endpoint<crate::fec::research::Config> {
                 None,
             );
             return self.fail(Error::Expired);
+        }
+        if !owner.has_feedback() {
+            return Ok(());
         }
         let count = owner.queue.len();
         for _ in 0..count {
@@ -133,7 +132,7 @@ impl Endpoint<crate::fec::research::Config> {
             if let Err(error) = result {
                 return self.fail(error);
             }
-            owner.queue.complete_front().map_err(Error::Ingress)?;
+            owner.complete_front()?;
         }
         Ok(())
     }

@@ -633,6 +633,30 @@ class SelectionExecutionProviderTests(unittest.TestCase):
         self.assertFalse(owner['issues'])
         self.assertIsNone(owner['execution_provider_validation']['selection']['maximum_lateness'])
 
+    def test_work_selection_extension_preserves_historical_rows_and_requires_complete_shape(self):
+        old = self.normalized(self.observed_selection())
+        self.assertNotIn('Work', old['execution_provider_validation']['selection']['winners'])
+        value = self.observed_selection()
+        selection = value['timing']['selection']
+        for row in selection['winners']:
+            row['count'] = 0
+        selection['winners'].append(dict(winner='Work', count=1))
+        selection['maximum_lateness']['winner'] = 'Work'
+        owner = self.normalized(value)
+        self.assertFalse(owner['issues'])
+        winners = owner['execution_provider_validation']['selection']['winners']
+        self.assertEqual(winners['Work'], 1)
+        self.assertEqual(winners['Timer'], 0)
+        for mutation in ('missing_old', 'duplicate_work', 'unknown', 'missing_work'):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(value)
+                rows = changed['timing']['selection']['winners']
+                if mutation == 'missing_old': rows.pop(0)
+                elif mutation == 'duplicate_work': rows[0] = dict(rows[-1])
+                elif mutation == 'unknown': rows[-1]['winner'] = 'OtherWork'
+                else: rows[-1] = dict(rows[0])
+                self.assertTrue(self.normalized(changed)['issues'])
+
     def test_invalid_selected_identity_clock_and_schema_never_become_valid_zero(self):
         for mutation in ('missing', 'duplicate', 'unknown', 'count', 'maximum', 'time',
                          'late', 'winner', 'pending', 'interrupted', 'stages', 'historical'):

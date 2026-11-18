@@ -6,7 +6,7 @@ use super::*;
 pub enum LocalOwner {
     /// Earliest authenticated input retained by the bounded ingress owner.
     Ingress,
-    /// Original first-native-admission packing/codec stage.
+    /// Oldest original native admission still retained by the packing/codec stage.
     CodecStage,
     /// Prepared reconstructed native output awaiting physical acceptance.
     Native,

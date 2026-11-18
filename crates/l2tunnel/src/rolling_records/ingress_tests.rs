@@ -47,7 +47,7 @@ fn actual_queue_retains_busy_input_exact_bytes_and_original_age_until_decoder_ow
 -> TestResult {
     let config = short_config(64, rolling::wire::SourceWire::Exact);
     let (old_wire, short_wire, old_id, short_id, old, short) = originals(config)?;
-    let (mut receiver, usage) = queued(config, 2)?;
+    let (mut receiver, usage) = queued(config, 1)?;
     receiver.accept_authenticated_until(
         Tick(6),
         Tick(6),
@@ -65,11 +65,12 @@ fn actual_queue_retains_busy_input_exact_bytes_and_original_age_until_decoder_ow
         &old_wire.bytes,
     )?;
     let full = receiver.ingress_status().ok_or("actual ingress")?;
-    assert_eq!(full.packets, 2);
-    assert_eq!(full.bytes, short_wire.bytes.len() + old_wire.bytes.len());
-    assert_eq!(full.oldest_received, Some(Tick(6)));
-    assert_eq!(full.oldest_records_number, Some(71));
-    assert_eq!(full.deadline, Some(Tick(1_000_006)));
+    assert!(receiver.receiver_status().decoder.pending_job);
+    assert_eq!(full.packets, 1);
+    assert_eq!(full.bytes, old_wire.bytes.len());
+    assert_eq!(full.oldest_received, Some(Tick(7)));
+    assert_eq!(full.oldest_records_number, Some(72));
+    assert_eq!(full.deadline, Some(Tick(1_000_007)));
     assert!(!receiver.drained());
     assert_eq!(
         receiver.accept_authenticated_until(
@@ -133,6 +134,16 @@ fn queued_and_started_input_preserve_original_caller_cap_without_timer_renewal()
     let (_, wire, _, _, _, _) = originals(config)?;
     for start in [false, true] {
         let (mut receiver, usage) = queued(config, 1)?;
+        if !start {
+            receiver.accept_authenticated_until(
+                Tick(5),
+                Tick(5),
+                Tick(1000),
+                Some(90),
+                wire.kind,
+                &wire.bytes,
+            )?;
+        }
         receiver.accept_authenticated_until(
             Tick(6),
             Tick(6),
@@ -141,10 +152,7 @@ fn queued_and_started_input_preserve_original_caller_cap_without_timer_renewal()
             wire.kind,
             &wire.bytes,
         )?;
-        assert_eq!(
-            receiver.ingress_status().ok_or("actual input")?.deadline,
-            Some(Tick(11))
-        );
+        assert_eq!(receiver.deadline(), Some(Tick(11)));
         if start {
             receiver.step(
                 Tick(9),

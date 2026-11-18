@@ -300,3 +300,6 @@ fn actual_ready_feedback_budget_wait_does_not_include_idle_or_physical_receipt()
 
 #[path = "ingress_wait_tests.rs"]
 mod ingress_wait_tests;
+
+#[path = "stage_deadline_tests.rs"]
+mod stage_deadline_tests;

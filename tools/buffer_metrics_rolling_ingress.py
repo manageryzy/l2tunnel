@@ -107,6 +107,86 @@ def validate(value, observed, terminal, send_direction, path, issues, gaps):
         episodes += count
         duration += elapsed
     need(next_head == min(MAX, completions + 1), 'data-head serial/completion mismatch')
+    residence = value.get('queue_residence')
+    if residence is None:
+        gaps.append(path + ': all-data queue residence unavailable; absence is not zero')
+    else:
+        residence = obj(residence)
+        need(type(residence.get('schema')) is int and residence['schema'] == 1,
+             'unknown residence schema')
+
+        def distribution(row):
+            row = obj(row)
+            count, total, maximum, slow = (num(row, k) for k in
+                                           ('count', 'sum_us', 'maximum_us', 'at_least_100ms'))
+            bins = row.get('buckets')
+            need(isinstance(bins, list) and len(bins) == 32 and
+                 all(type(n) is int and 0 <= n <= MAX for n in bins) and sum(bins) == count,
+                 'invalid residence histogram')
+            need(maximum <= total <= count * maximum and slow <= count and
+                 total >= slow * 100_000 and (maximum >= 100_000 or slow == 0),
+                 'inconsistent residence totals')
+            ceiling = None
+            if count:
+                cumulative, rank = 0, count - count // 100
+                minimum_sum, maximum_sum, minimum_slow, maximum_slow = 0, 0, 0, 0
+                for index, number in enumerate(bins):
+                    upper = (1 << index) - 1 if index < 31 else MAX
+                    lower = 0 if index == 0 else 1 << (index - 1)
+                    need(not number or lower <= maximum, 'residence bucket exceeds maximum')
+                    minimum_sum += lower * number
+                    maximum_sum += min(upper, maximum) * number
+                    if lower >= 100_000:
+                        minimum_slow += number
+                    if upper >= 100_000:
+                        maximum_slow += number
+                    cumulative += number
+                    if ceiling is None and cumulative >= rank:
+                        ceiling = upper
+                need(minimum_sum <= total <= maximum_sum, 'residence histogram sum mismatch')
+                need(minimum_slow <= slow <= maximum_slow and (maximum < 100_000 or slow > 0),
+                     'residence threshold population mismatch')
+                highest = max(index for index, number in enumerate(bins) if number)
+                need(maximum <= ((1 << highest) - 1 if highest < 31 else MAX),
+                     'maximum outside residence histogram')
+                need(maximum <= observed, 'residence exceeds observation age')
+                mean = row.get('mean_us')
+                need(type(mean) in (int, float) and abs(mean - total / count) <= max(1, total / count) * 1e-12,
+                     'incorrect residence mean')
+            else:
+                need(row.get('mean_us') is None and maximum == total == slow == 0,
+                     'empty residence population is not a zero mean')
+            need(row.get('p99_upper_us') == ceiling and
+                 (ceiling is None or type(row['p99_upper_us']) is int), 'incorrect p99 upper bound')
+            return row
+
+        all_data, direct, queued = (distribution(residence.get(key)) for key in ('all', 'immediate', 'queued'))
+        for key in ('count', 'sum_us', 'at_least_100ms'):
+            need(all_data[key] == direct[key] + queued[key], 'all-data residence population mismatch')
+        need(all_data['maximum_us'] == max(direct['maximum_us'], queued['maximum_us']) and
+             all_data['buckets'] == [a + b for a, b in zip(direct['buckets'], queued['buckets'])],
+             'all-data histogram mismatch')
+        for key, population in [('immediate_outcomes', direct), ('queued_outcomes', queued)]:
+            counts = residence.get(key)
+            need(isinstance(counts, list) and len(counts) == 3 and
+                 all(type(n) is int and 0 <= n <= MAX for n in counts) and sum(counts) == population['count'],
+                 'invalid residence outcome counts')
+        need(residence['queued_outcomes'] == [row['completions'] for row in rows[:3]],
+             'queued residence does not cover successful removals')
+        at = num(residence, 'retained_at_us', True)
+        ages = residence.get('retained_ages')
+        mode = residence.get('retained_population')
+        need(mode == ('unavailable' if unavailable else 'censored' if stopped is not None else 'open_age_snapshot'),
+             'incorrect retained age boundary')
+        if unavailable:
+            need(ages is None and (at is None or at <= observed), 'stale retained age extrapolation')
+        elif ages is None:
+            need(at is None, 'retained age timestamp without population')
+            gaps.append(path + ': current retained input ages unavailable')
+        else:
+            ages = distribution(ages)
+            need(at == observed and ages['maximum_us'] <= observed,
+                 'retained ages lack exact current/frozen observation')
     need('pending' in value and 'last_resolved' in value, 'missing head availability')
     current, opened = value['pending'], num(value, 'open_us', True)
     if current is not None:
@@ -145,7 +225,7 @@ def validate(value, observed, terminal, send_direction, path, issues, gaps):
         else:
             need(serial < next_head and at < source['original_deadline_us'],
                  'successful removal crossed original cap or reused current head')
-    gaps.append(path + ': data-head Busy intervals include scheduling; earlier queue residence, work Pending, '
+    gaps.append(path + ': data-head Busy intervals include scheduling; queue residence is separately attributed when present; work Pending, '
                 'CPU cost, ingress-capacity refusal and feedback ordering dependencies remain separate/unavailable; '
                 'only last resolved and current head identities retained')
 
@@ -168,6 +248,17 @@ def render(lines, metadata, table, cell):
                       'All successful removals', 'Without Busy'],
               [[v['outcome'], v['episodes'], v['sum_us'], v['maximum_us'],
                 v['completions'], v['without_refusal']] for v in value['populations']])
+        residence = value.get('queue_residence')
+        if isinstance(residence, dict):
+            lines.extend(['', 'Data input receive-to-removal residence uses original authenticated arrival. Direct inputs bypass FIFO but retain actual receive-to-admission age. '
+                          'Staged, Duplicate and Stale are successful removals; retained ages are not completed admission. '
+                          'p99 is a histogram upper bound; overlapping residence and Busy durations are not added.'])
+            samples = [(name, residence[name]) for name in ('all', 'immediate', 'queued')]
+            if residence.get('retained_ages') is not None:
+                samples.append((residence['retained_population'], residence['retained_ages']))
+            table(lines, ['Population', 'Inputs', 'Mean us', 'p99 upper us', 'Maximum us', 'At least 100 ms'],
+                  [[name, row['count'], row['mean_us'], row['p99_upper_us'], row['maximum_us'], row['at_least_100ms']]
+                   for name, row in samples])
         contexts = []
         if value['pending'] is not None:
             contexts.append(('open', value['pending'],

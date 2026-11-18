@@ -42,16 +42,17 @@ fn encoder_batches_preserve_exact_work_cursors_equation_and_original_expiry()
     let mut owner = make()?;
     let usage = owner.storage_usage()?;
     // Includes zero allowance, a failed visit after copying and partial GF work.
-    // Expected counts/cursors describe the original byte-at-a-time contract.
+    // Source extents are 5, 6 and 3 bytes, including their length prefixes.
+    // Implicit zero suffixes neither modify the equation nor consume GF work.
     for (allowance, expected, cleared, source, column) in [
         (budget(0, 0, 0), budget(0, 0, 0), 0, 0, 0),
         (budget(4, 3, 4), budget(0, 3, 4), 3, 0, 0),
         (budget(4, 0, 7), budget(0, 0, 1), 3, 0, 0),
         (budget(4, 64, 2), budget(0, 2, 2), 5, 0, 0),
         (budget(4, 64, 64), budget(4, 5, 10), 10, 0, 4),
-        (budget(64, 64, 2), budget(2, 0, 2), 10, 0, 6),
-        (budget(5, 64, 64), budget(5, 0, 6), 10, 1, 1),
-        (budget(64, 64, 64), budget(19, 0, 20), 10, 3, 0),
+        (budget(64, 64, 2), budget(2, 0, 2), 10, 1, 1),
+        (budget(5, 64, 64), budget(5, 0, 6), 10, 2, 0),
+        (budget(64, 64, 64), budget(3, 0, 4), 10, 3, 0),
     ] {
         assert_eq!(owner.step(Tick(0), allowance)?, expected);
         let job = owner.job.as_ref().ok_or(Error::Identity)?;

@@ -491,11 +491,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .admitted
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
-        let stage_deadline = Tick(
-            now.0
-                .checked_add(self.send_config.codec_stage_micros)
-                .ok_or(Error::Arithmetic)?,
-        );
+        now.0
+            .checked_add(self.send_config.codec_stage_micros)
+            .ok_or(Error::Arithmetic)?;
         self.advance(now)?;
         let channel = receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
         let result = match self.send_config.native_policy {
@@ -512,7 +510,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         match result {
             Ok(identity) => {
                 self.statistics.admitted = next;
-                self.stage_deadline.get_or_insert(stage_deadline);
+                self.refresh_stage_deadline()?;
                 Ok(Some(identity))
             }
             Err(packed_sender::Error::Busy) => Ok(None),
@@ -540,6 +538,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         self.pump_send(now)
     }
+    fn refresh_stage_deadline(&mut self) -> Result<(), Error> {
+        self.stage_deadline = self
+            .packing
+            .oldest_admission_micros()
+            .map(|admitted| {
+                admitted
+                    .checked_add(self.send_config.codec_stage_micros)
+                    .map(Tick)
+                    .ok_or(Error::Arithmetic)
+            })
+            .transpose()?;
+        Ok(())
+    }
     fn pump_send(&mut self, now: Tick) -> Result<(), Error> {
         if !self.packing.status().packing.sealed {
             return Ok(());
@@ -553,10 +564,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         .map_err(Error::Sender)?;
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
+        let admitted = self
+            .packing
+            .pending_admission_micros()
+            .map_err(Error::Sender)?;
+        let source_deadline = Tick(
+            admitted
+                .checked_add(self.send_config.codec_stage_micros)
+                .ok_or(Error::Arithmetic)?,
+        );
         let operation = waits::Operation {
             id: u64::from(expected.0),
             bytes: length,
-            deadline: self.stage_deadline,
+            deadline: Some(source_deadline),
             packets: 0,
             wire_bytes: 0,
             copies,
@@ -564,10 +584,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         match P::admit(
             &mut self.sender,
             &self.source[..length],
-            rolling::Tick(
-                self.stage_deadline
-                    .map_or(now.0, |end| end.0 - self.send_config.codec_stage_micros),
-            ),
+            rolling::Tick(admitted),
             rolling_tick(now),
             copies,
         ) {
@@ -582,9 +599,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Some(waits) = self.waits.first_mut() {
                     waits.progress(waits::Site::SourceAdmission, operation, now);
                 }
-                if self.packing.is_idle() {
-                    self.stage_deadline = None;
-                }
+                self.refresh_stage_deadline()?;
                 Ok(())
             }
             Ok(_) => self.fail(Error::Identity),
@@ -909,6 +924,15 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         let mut receive =
             P::receive_step(&mut self.incoming, rolling_tick(now), work).map_err(Error::Rolling)?;
+        // An unchanged busy decoder cannot admit the same FIFO head. Resume
+        // that head in the completion turn, including capacity rollback.
+        if !matches!(receive.decode, rolling::DecodeStep::Pending(_))
+            && let Some(owner) = &mut self.ingress
+            && owner.waiting_on_decoder
+        {
+            owner.waiting_on_decoder = false;
+            self.service_ingress(now)?;
+        }
         if matches!(receive.decode, rolling::DecodeStep::Accepted { .. }) {
             self.request_preview_scan();
         }
@@ -1247,21 +1271,39 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         );
                         return self.fail(Error::Expired);
                     }
-                    let lease = owner.queue.acquire().ok_or(Error::Busy)?;
-                    lease
-                        .copy(
-                            ingress::Input {
-                                kind,
-                                number: security_number,
-                                received,
-                                order: None,
-                                original_cap: original_deadline,
-                                deadline,
-                            },
-                            received.0,
+                    // Start an idle decoder in this receive call. Never pass an older
+                    // retained input, even if the decoder just became available.
+                    if owner.queue.front().is_none() {
+                        match compact_wire::receive::<P>(
+                            self.compact_feedback_overhead.is_some(),
+                            self.receive_config.scheduler,
+                            expected,
+                            &mut self.incoming,
                             bytes,
-                        )
-                        .map_err(Error::Ingress)?;
+                            rolling_tick(received),
+                            rolling_tick(now),
+                            rolling_tick(original_deadline),
+                        ) {
+                            Ok(outcome) => {
+                                self.note_direct_ingress_admission(received, now, outcome);
+                                self.request_preview_scan();
+                                return Ok(());
+                            }
+                            Err(rolling::Error::Busy) => {}
+                            Err(error) => return self.fail(Error::Rolling(error)),
+                        }
+                    }
+                    owner.push(
+                        ingress::Input {
+                            kind,
+                            number: security_number,
+                            received,
+                            order: None,
+                            original_cap: original_deadline,
+                            deadline,
+                        },
+                        bytes,
+                    )?;
                 } else {
                     compact_wire::receive::<P>(
                         self.compact_feedback_overhead.is_some(),
@@ -1324,7 +1366,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             if let Err(error) = result {
                 return self.fail(error);
             }
-            owner.queue.complete_front().map_err(Error::Ingress)?;
+            owner.complete_front()?;
             self.expire_confirmed_credit();
             return Ok(());
         }
@@ -1333,6 +1375,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair
         ) {
             return self.fail(Error::Identity);
+        }
+        if owner.waiting_on_decoder {
+            return Ok(());
         }
         // The immutable data head cannot rotate while Busy. Only opt-in
         // observation reads its existing metadata; no bytes are parsed again.
@@ -1370,7 +1415,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         );
         match result {
             Ok(outcome) => {
-                owner.queue.complete_front().map_err(Error::Ingress)?;
+                owner.complete_front()?;
                 if let Some(input) = diagnostic_input {
                     let outcome = match outcome {
                         rolling::Begin::Staged => waits::ingress::Outcome::Staged,
@@ -1390,6 +1435,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 Ok(())
             }
             Err(rolling::Error::Busy) => {
+                owner.waiting_on_decoder = P::receive_state(&self.incoming, rolling_tick(now))
+                    .decoder
+                    .pending_job;
                 if let Some(input) = diagnostic_input {
                     let blocker = P::receive_expiry(&self.incoming).decoder_job;
                     if let Some(waits) = self.waits.first_mut() {
@@ -1490,12 +1538,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let send = P::send_state(&self.sender);
         let receive = P::receive_state(&self.incoming, rolling_tick(self.now));
         self.ingress.as_ref().is_some_and(|owner| {
-            owner.queue.iter().any(|input| {
-                input.metadata().kind != EmissionKind::Feedback
-                    || !self.prepared_output.is_some_and(|pending| {
+            owner.has_data()
+                || (owner.has_feedback()
+                    && !self.prepared_output.is_some_and(|pending| {
                         matches!(pending.kind, EmissionKind::Source(_) | EmissionKind::Repair)
-                    })
-            })
+                    }))
         }) || send.work_pending
             || receive.decoder.pending_job
             || receive.feedback_building

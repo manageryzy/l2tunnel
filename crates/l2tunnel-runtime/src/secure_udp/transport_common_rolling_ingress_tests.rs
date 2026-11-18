@@ -36,6 +36,12 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 .find(|value| matches!(value.descriptor().profile(), c::Profile::Swift { .. }))
                 .ok_or("actual Swift target")?;
             let mut fixture = Fixture::from_contracts(kind, contracts).await?;
+            let idle =
+                fixture.endpoints[1]
+                    .driver
+                    .wake_common_with_custody(fixture.now, false, false)?;
+            assert!(!idle.work_ready);
+            assert!(idle.at >= fixture.endpoints[1].driver.origin + duration(fixture.now + 100));
             let originals = [long_frame()?, frame(40_000, 82)];
             let mut wires = Vec::new();
             for (id, original) in originals.iter().enumerate() {
@@ -65,7 +71,7 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 .rolling_ingress_status()
                 .ok_or("actual input queue")?;
             assert_eq!(queued.limits, limits);
-            assert_eq!(queued.packets, 2);
+            assert_eq!(queued.packets, 1);
             assert!(queued.bytes > 0 && queued.capacity_bytes < limits.capacity_bytes);
             assert_eq!(queued.oldest_received, Some(engine::Tick(now)));
             assert_eq!(
@@ -100,6 +106,38 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 .ok_or("actual held input")?;
             assert_eq!(held.packets, 1);
             assert_eq!(held.oldest_received, queued.oldest_received);
+            let wake = endpoint
+                .driver
+                .wake_common_with_custody(now, false, false)?;
+            assert!(wake.work_ready);
+            assert!(wake.at <= endpoint.driver.origin + duration(now));
+            let before_work = endpoint
+                .driver
+                .snapshot_common(now, true)?
+                .rolling_work_used;
+            let mut wait = std::pin::pin!(wake.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // Runnable work is cooperative, not a Ready spin or a future timer.
+            assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());
+            assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_ready());
+            assert_eq!(
+                endpoint
+                    .driver
+                    .snapshot_common(now, true)?
+                    .rolling_work_used,
+                before_work
+            );
+            endpoint.driver.service_common_rolling(now)?;
+            let after_work = endpoint
+                .driver
+                .snapshot_common(now, true)?
+                .rolling_work_used;
+            // One existing step per direction: each still has the original unit
+            // allowance. Selecting Work itself granted and charged no work.
+            for (before, after) in before_work.into_iter().zip(after_work) {
+                assert!(after >= before && after - before <= 2);
+            }
+            assert!(after_work[2] > before_work[2]);
             let mut actual = Vec::new();
             let mut output = [0; 1024];
             for _ in 0..30_000 {

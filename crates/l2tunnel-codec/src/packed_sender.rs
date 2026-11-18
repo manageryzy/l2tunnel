@@ -112,6 +112,10 @@ pub struct Sender {
     failure: Option<Error>,
     usage: Option<crate::aligned_storage::Usage>,
     copy_policy: crate::source_copy::Policy,
+    // The staged frame can outlive several packed sources. Moving its units
+    // never renews its original admission time.
+    staged_at: Option<u64>,
+    source_started_at: Option<u64>,
 }
 #[allow(dead_code)]
 pub(crate) struct LegacyLayout {
@@ -230,6 +234,8 @@ impl Sender {
             failure: None,
             usage: None,
             copy_policy: crate::source_copy::Policy::ONE,
+            staged_at: None,
+            source_started_at: None,
         })
     }
     /// Validate all products before allocating packet/metadata storage.
@@ -258,6 +264,8 @@ impl Sender {
             failure: None,
             usage: None,
             copy_policy: crate::source_copy::Policy::ONE,
+            staged_at: None,
+            source_started_at: None,
         })
     }
     /// Select an explicit immutable policy while keeping existing constructors
@@ -415,6 +423,7 @@ impl Sender {
             crate::aligned_body::Encoding::Lz4 => self.aligned.stage_lz4_observed(channel, frame),
         }
         .map_err(Error::Aligned)?;
+        self.staged_at = Some(now);
         self.poll(now)?;
         Ok(identity)
     }
@@ -447,11 +456,19 @@ impl Sender {
             };
             match pushed {
                 packed::Push::Accepted => {
+                    let admitted = self.staged_at.ok_or(Error::Ownership)?;
+                    self.source_started_at = Some(
+                        self.source_started_at
+                            .map_or(admitted, |old| old.min(admitted)),
+                    );
                     self.records.push(record);
                     self.first_unit.get_or_insert(id);
                     self.next_unit = id.0.checked_add(1).map(SourceId);
                     if self.aligned.commit_unit().is_err() {
                         return self.fail(Error::Ownership);
+                    }
+                    if !self.aligned.is_pending() {
+                        self.staged_at = None;
                     }
                     if self.records.len() == usize::from(self.config.max_units) {
                         self.packing.flush();
@@ -522,7 +539,24 @@ impl Sender {
         self.packing.commit().map_err(Error::Packing)?;
         self.records.clear();
         self.first_unit = None;
+        self.source_started_at = None;
         Ok(())
+    }
+    /// Original native admission of the oldest bytes still owned by this codec.
+    /// Includes both the packed source and any staged context/body/fragment tail.
+    /// A source handoff retires only its bytes; it never renews a retained tail.
+    pub fn oldest_admission_micros(&self) -> Option<u64> {
+        match (self.source_started_at, self.staged_at) {
+            (Some(source), Some(staged)) => Some(source.min(staged)),
+            (source, staged) => source.or(staged),
+        }
+    }
+    /// Earliest original native admission represented by the sealed source.
+    /// Newer input behind that source cannot change this ownership timestamp.
+    pub fn pending_admission_micros(&self) -> Result<u64, Error> {
+        self.live()?;
+        self.packing.pending().ok_or(Error::NoPending)?;
+        self.source_started_at.ok_or(Error::Ownership)
     }
     /// Original first-unit deadline, including a sealed source under recovery pressure.
     pub fn deadline_micros(&self) -> Option<u64> {

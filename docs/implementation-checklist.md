@@ -1071,6 +1071,14 @@ The authenticated selected Common engine implements named retries, bounded
 old-gap custody, independent channel release and MUX-age-based repair accounting.
 Protocol tests and a two-peer UDP failure-injection test cover these mechanisms.
 The exact-source control remains selectable for matched native measurements.
+The [C48 native measurements](modules/frame-channel-experiment.md#matched-linux-tunudp-observation)
+also exercise the bounded Rolling decoder, receiver admission and runnable
+work scheduling. The isolated protocol checkpoint recorded a 3.395 s input
+residence and failed native load. The scoped hot-path checkpoint completed
+the UDP candidate at 26.53 Mbit/s, with terminal unconfirmed counts of 0/0
+and maximum forward input residence of 93.545 ms. The exact control expired
+and application P99 was 1.319 s for the candidate. RWI-03 and full native
+parity remain open.
 
 ## Per-mode parity implementation gates
 
