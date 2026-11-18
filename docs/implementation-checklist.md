@@ -208,8 +208,14 @@ The [batch21 continuation](modules/buffer-observability.md#batch21-scanning-and-
 integrates same-budget Rolling coefficient scans and bounded genuine QUIC
 DATAGRAM Pending context, plus exact restored-source ARQ refusal-to-admission
 intervals with prepaid per-slot identities. Scoped local validation passes all affected
-suites, strict Clippy/rustdoc, formatting and report validation; renewed native
-qualification is pending. All original quotas, deadlines and parent gates remain.
+suites, strict Clippy/rustdoc, formatting and report validation.
+[Native21](modules/buffer-observability.md#native21-actual-pending-and-restored-admission-observations)
+qualifies one genuine QUIC forward case at 0.3231936 Mbit/s and observes an actual
+763,391 us Pending ticket. Cauchy still exhausts the original phase bound; both
+restored-source observers validate with zero actual refusals. Rolling still
+expires after 4.962090 seconds before decoder admission. All original quotas,
+deadlines and parent gates remain; these finite results do not close full BP or
+matrix acceptance.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
