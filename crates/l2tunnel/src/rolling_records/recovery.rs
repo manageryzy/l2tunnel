@@ -18,6 +18,11 @@ pub struct OwnerPlan {
 #[derive(Clone, Copy)]
 pub struct SendState {
     pub encoder: rolling::EncoderStatus,
+    /// First unassigned source, including originals admitted ahead of carrier service.
+    pub next_source: u32,
+    pub queued_fresh: usize,
+    pub peak_queued_fresh: usize,
+    pub fresh_queue_limit: usize,
     pub output_ready: bool,
     pub work_pending: bool,
     pub drained: bool,
@@ -131,6 +136,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         work: rolling::WorkBudget,
     ) -> Result<scheduler::ReceiverStep, rolling::Error>;
     fn pending_data(sender: &Self::Sender) -> Result<Option<Data>, rolling::Error>;
+    fn pending_original(_sender: &Self::Sender) -> Option<(rolling::SourceId, usize)> {
+        None
+    }
     fn encode_data(sender: &Self::Sender, out: &mut [u8]) -> Result<usize, rolling::Error>;
     fn confirm_data(
         sender: &mut Self::Sender,
@@ -138,6 +146,7 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         copy: Option<scheduler::SourceCopy>,
         accepted: rolling::Tick,
         now: rolling::Tick,
+        wire_bytes: usize,
     ) -> Result<(), rolling::Error>;
     fn receive_feedback(
         sender: &mut Self::Sender,
@@ -304,13 +313,19 @@ impl RecoveryPolicy for scheduler::Policy {
         let x = s.status();
         SendState {
             encoder: x.encoder,
+            next_source: x.next_source,
+            queued_fresh: x.queued_fresh,
+            peak_queued_fresh: x.peak_queued_fresh,
+            fresh_queue_limit: x.fresh_queue_limit,
             output_ready: x.output_ready,
             work_pending: !x.output_ready
-                && (x.encoder.pending_repair
+                && (x.queued_fresh > 0
+                    || x.encoder.pending_repair
                     || x.regular_due > 0
                     || x.tail_remaining > 0
                     || s.requested_retry_waiting()),
             drained: !x.output_ready
+                && x.queued_fresh == 0
                 && x.regular_due == 0
                 && x.tail_remaining == 0
                 && x.encoder.confirmed_prefix == x.encoder.next_source,
@@ -330,11 +345,11 @@ impl RecoveryPolicy for scheduler::Policy {
     fn admit(
         s: &mut Self::Sender,
         b: &[u8],
-        _: rolling::Tick,
+        created: rolling::Tick,
         n: rolling::Tick,
         c: u8,
     ) -> Result<rolling::SourceId, rolling::Error> {
-        s.admit_source_with_copies(b, n, c)
+        s.admit_source_with_copies_at(b, created, n, c)
     }
     fn send_step(
         s: &mut Self::Sender,
@@ -381,24 +396,32 @@ impl RecoveryPolicy for scheduler::Policy {
     fn encode_data(s: &Self::Sender, o: &mut [u8]) -> Result<usize, rolling::Error> {
         s.encode_pending(o)
     }
+    fn pending_original(s: &Self::Sender) -> Option<(rolling::SourceId, usize)> {
+        match s.pending_output()? {
+            scheduler::Output::Source { id, original, .. } => Some((id, original.len())),
+            scheduler::Output::Repair(_) => None,
+        }
+    }
     fn confirm_data(
         s: &mut Self::Sender,
         id: scheduler::OutputId,
         c: Option<scheduler::SourceCopy>,
         a: rolling::Tick,
         n: rolling::Tick,
+        wire_bytes: usize,
     ) -> Result<(), rolling::Error> {
         match (id, c) {
             (scheduler::OutputId::Source(id), Some(c)) if c.source() == id => {
-                s.confirm_source_copy(n, a, c)
+                s.confirm_source_copy_charged(n, a, c, wire_bytes)
             }
             (scheduler::OutputId::Source(_), None) if s.pending_retry_token().is_some() => s
-                .confirm_retry(
+                .confirm_retry_charged(
                     s.pending_retry_token().ok_or(rolling::Error::Identity)?,
                     a,
                     n,
+                    wire_bytes,
                 ),
-            (id, None) => s.confirm_output(id, n),
+            (id, None) => s.confirm_output_charged(id, n, wire_bytes),
             _ => Err(rolling::Error::Identity),
         }
     }
@@ -618,6 +641,10 @@ impl RecoveryPolicy for research::Config {
         let x = s.status();
         SendState {
             encoder: x.encoder,
+            next_source: x.encoder.next_source,
+            queued_fresh: 0,
+            peak_queued_fresh: 0,
+            fresh_queue_limit: 0,
             output_ready: x.output_ready,
             work_pending: x.repair_pending && !x.output_ready,
             drained: !x.output_ready
@@ -686,6 +713,7 @@ impl RecoveryPolicy for research::Config {
         c: Option<scheduler::SourceCopy>,
         a: rolling::Tick,
         n: rolling::Tick,
+        _wire_bytes: usize,
     ) -> Result<(), rolling::Error> {
         if c.is_some() || a > n {
             return Err(rolling::Error::Identity);

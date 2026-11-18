@@ -49,6 +49,15 @@ pub struct RollingRepairBudget {
     pub copy_wire_bytes: u64,
     /// Originals retained beyond the authenticated cumulative prefix.
     pub unconfirmed_sources: u32,
+    /// Fresh originals waiting for encoder service.
+    #[serde(default)]
+    pub queued_fresh: usize,
+    /// Largest number of fresh originals simultaneously waiting for service.
+    #[serde(default)]
+    pub peak_queued_fresh: usize,
+    /// Maximum number of fresh originals admitted ahead of service.
+    #[serde(default)]
+    pub fresh_queue_limit: usize,
     /// Credit earned before saturation, in half-bytes.
     pub earned_half_bytes: u64,
     /// Credit above the fixed cap, in half-bytes.
@@ -76,6 +85,9 @@ impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget
             regular_wire_bytes: s.regular_wire_bytes,
             copy_wire_bytes: s.copy_wire_bytes,
             unconfirmed_sources: s.unconfirmed_sources,
+            queued_fresh: s.queued_fresh,
+            peak_queued_fresh: s.peak_queued_fresh,
+            fresh_queue_limit: s.fresh_queue_limit,
             earned_half_bytes: s.earned_half_bytes,
             capped_half_bytes: s.capped_half_bytes,
             expired_half_bytes: s.expired_half_bytes,

@@ -5,8 +5,14 @@ use super::*;
 /// regular-repair charges. Half-byte units retain odd-sized half credits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepairBudgetStatus {
-    /// Sources admitted to this encoder beyond its authenticated cumulative confirmation.
+    /// Admitted originals beyond authenticated cumulative confirmation, including queued originals.
     pub unconfirmed_sources: u32,
+    /// Fresh originals waiting for their first encoder service turn.
+    pub queued_fresh: usize,
+    /// Maximum simultaneous queued originals since sender construction.
+    pub peak_queued_fresh: usize,
+    /// Maximum fresh originals held ahead of encoder service.
+    pub fresh_queue_limit: usize,
     /// Remaining credit available for this direction.
     pub balance_half_bytes: u64,
     /// Bound of 32 selected path MTUs in half-byte units.
@@ -218,9 +224,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Current credit and wire-cost accounting for the selected direction.
     pub fn repair_budget_status(&self) -> Option<RepairBudgetStatus> {
         self.repair_budget.as_ref().map(|b| {
-            let encoder = P::send_state(&self.sender).encoder;
+            let state = P::send_state(&self.sender);
             RepairBudgetStatus {
-                unconfirmed_sources: encoder.next_source - encoder.confirmed_prefix,
+                unconfirmed_sources: state.next_source - state.encoder.confirmed_prefix,
+                queued_fresh: state.queued_fresh,
+                peak_queued_fresh: state.peak_queued_fresh,
+                fresh_queue_limit: state.fresh_queue_limit,
                 ..b.status
             }
         })
@@ -230,8 +239,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if let Some(budget) = &mut self.repair_budget
             && budget.status.balance_half_bytes != 0
         {
-            let state = P::send_state(&self.sender).encoder;
-            if state.confirmed_prefix == state.next_source {
+            let state = P::send_state(&self.sender);
+            if state.encoder.confirmed_prefix == state.next_source {
                 budget.expire();
             }
         }

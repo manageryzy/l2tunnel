@@ -587,3 +587,73 @@ does not qualify the other carriers or establish equivalence with Python.
 [Exact build and workload](../../work/packed-native-c48-20261118/hotpath-pair/run.json),
 [directional results](../../work/packed-native-c48-20261118/hotpath-pair/summary.json)
 and [CPU and queue measurements](../../work/packed-native-c48-20261118/hotpath-pair/bottlenecks.json)
+
+### Scheduling fresh sources during C48 recovery
+
+The selected Rust `TargetedExact` sender can admit up to eight sealed Packed
+sources while a carrier output or FEC job is in progress. These slots count
+toward the negotiated recovery window. The encoder starts them in order.
+A peer can acknowledge only a physically handed-off original. Equations use
+the existing encoder window and retain its original bytes until confirmation.
+The fresh queue holds the source creation time and copy policy. Its live
+depth, high-water mark and capacity are visible in the Common repair budget.
+
+When fresh and recovery work are both ready, the scheduler aims to send two
+fresh bytes per recovery byte. It charges full accepted physical outputs,
+including fragment overhead and each physical copy. When only one class has
+work it can use the whole sender. Regular repair debt can accumulate to two
+opportunities. Named retries and regular equations take turns when both are
+waiting. If cumulative confirmation stalls for 140 ms, the sender can probe
+the oldest retained source even as other channels send. The Python candidate
+instead waits for a quiet interval after the latest fresh source.
+
+The Linux comparison used the original MTU, source fragmentation, channel
+bindings and authenticated feedback. A separate experiment let a physical
+send batch select another output using the remainder of the same epoch's
+sender work grant. Its socket regression covered repeated `WouldBlock`,
+packet identity, and exhaustion of that grant. Two native runs delivered
+26.91 and 25.92 Mbit/s, with first-write-to-read P99 of 1.095 and 1.694 s.
+A third run ended before EOF when both peers reached the liveness message
+acceptance deadline. Both had submitted the fragment and still awaited
+semantic acceptance. This observation does not establish why those
+acknowledgments were missing. The selected sender keeps normal per-turn
+carrier service. [Experimental patch](../../work/packed-schedule-20261118/batch-final/reproduce.patch)
+
+All runs below used 16 Linux CUBIC flows on the same 100/10 Mbit/s link,
+70 ms round-trip delay and 15% independent loss in each direction. The
+installed netem did not expose a reproducible loss seed. Goodput covers ten
+seconds after warm-up. P99 runs from a record's first attempted write until
+its complete application read, including the period after the offer stops.
+Repair shares include regular equations, named retries and quiet probes as a
+fraction of accepted physical record bytes for that direction.
+
+| Scheduler and run | Forward goodput (Mbit/s) | Application P99 (ms) | Repair share forward / reverse | Unconfirmed forward / reverse at EOF, then teardown |
+| --- | ---: | ---: | --- | --- |
+| Previous sender, first control | 28.11 | 1,160 | 33.66% / 12.09% | 4/1, then 0/0 |
+| Previous sender, second control | 25.53 | 1,218 | 33.96% / 13.01% | 25/14, then 0/1 |
+| Selected sender, first run | 30.79 | 906 | 25.66% / 13.77% | 21/1, then 0/1 |
+| Selected sender, repeat | Failed before EOF | Incomplete | 25.18% / 11.46% through failure | No EOF, 2,218/22 at last observation |
+| Selected sender, separate EOF observation | 24.14 | 9,606 | 25.37% / 12.55% | 2/0, then 0/0 |
+
+The ordinary harness disconnects after EOF. A separate observer polled both
+peers after the capture ended and saw two consecutive 0/0 samples. The
+failed selected-sender repeat read 23,508 of 27,175 fully written records
+before the server's 5 s authenticated liveness challenge expired. Its
+source remained unconfirmed. Successful runs validated stream hashes on
+all 16 connections. These trials establish cross-channel service and a
+lower observed forward repair fraction. A repeatable goodput or tail
+latency improvement is still open.
+[All nine runs and failure evidence](../../work/packed-schedule-20261118/comparison.json)
+
+In the 9.606 s P99 trial, four receiver TCP sockets account for 483 of the
+735 tail records. Their bytes were visible in sequence at the receiver TUN
+after a median 3.755 s. Socket samples still placed their stream offsets
+beyond the received byte count a median of at least 6.994 s later. The
+first covering receiver ACK followed the TUN observation by a median of
+7.039 s. The TUN captures passed IPv4 and TCP checksum verification.
+The four flows advertised nonzero receive windows. For every one of the
+483 records, the first intersecting segment fit within the last observed
+advertised right edge. The captures do not identify a kernel drop reason.
+Per-record application read timestamps were unavailable to subdivide the
+remaining time. [Tail records and socket evidence](../../work/packed-schedule-20261118/fifo-post-eof/receiver-tail.json)
+and [receiver-window evidence](../../work/packed-schedule-20261118/fifo-post-eof/tcp-window-trace.json)

@@ -296,3 +296,280 @@ fn targeted_fresh_and_old_share_eight_ids_per_interval() -> Result<(), Error> {
     assert!(drain_receipts(&mut r, &mut s, Tick(83_999), w, true)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn targeted_fairness_charges_physical_bytes_and_keeps_retries_live() -> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let now = Tick(1);
+    let mut s = Sender::new(policy, scope, now)?;
+    for id in 0..8 {
+        admit_source(&mut s, id, now)?;
+    }
+    s.receive_request(
+        GapRequest {
+            scope,
+            id: FeedbackId(1),
+            prefix: 0,
+            start: 0,
+            mask: 255,
+        },
+        now,
+    )?;
+    for id in 8u32..16 {
+        assert_eq!(s.admit_source(&id.to_be_bytes(), now)?, SourceId(id));
+    }
+    assert_eq!(s.admit_source(b"full", now), Err(Error::Busy));
+    assert_eq!(
+        (
+            s.status().encoder.next_source,
+            s.status().next_source,
+            s.status().peak_queued_fresh
+        ),
+        (8, 16, 8)
+    );
+    assert_eq!(
+        s.receive_request(
+            GapRequest {
+                scope,
+                id: FeedbackId(2),
+                prefix: 0,
+                start: 8,
+                mask: 1
+            },
+            now
+        ),
+        Err(Error::Identity)
+    );
+
+    // The first original costs 210 actual bytes, so four 30-byte retries
+    // may run before fresh has used its two-to-one share. Polling and stale
+    // confirmations cannot consume credit.
+    s.step(now, work)?;
+    let copy = s.pending_source_copy().ok_or(Error::Busy)?;
+    assert_eq!(copy.source(), SourceId(8));
+    s.confirm_source_copy_charged(now, now, copy, 210)?;
+    assert_eq!(
+        s.confirm_source_copy_charged(now, now, copy, 210),
+        Err(Error::Identity)
+    );
+    for id in 0..4 {
+        s.step(now, work)?;
+        let token = s.pending_retry_token().ok_or(Error::Busy)?;
+        assert_eq!(
+            s.pending_output().ok_or(Error::Busy)?.id(),
+            OutputId::Source(SourceId(id))
+        );
+        s.confirm_retry_charged(token, now, now, 30)?;
+    }
+    s.step(now, work)?;
+    assert_eq!(
+        s.pending_source_copy().ok_or(Error::Busy)?.source(),
+        SourceId(9)
+    );
+    Ok(())
+}
+
+#[test]
+fn targeted_queued_originals_preserve_global_repair_across_ring_wrap() -> Result<(), Error> {
+    let (mut policy, scope, work) = setup();
+    policy.recovery.window = 4;
+    policy.recovery.local_window = 2;
+    policy.recovery.handoff_sources = 4;
+    policy.recovery.global_every = 1;
+    policy.repair_numerator = 1;
+    policy.repair_denominator = 4;
+    let now = Tick(1);
+    let mut expected = Vec::new();
+    for buffer in [false, true] {
+        let mut s = Sender::new(policy, scope, now)?;
+        for id in 0..4 {
+            admit_source(&mut s, id, now)?;
+        }
+        s.receive_feedback(
+            Feedback {
+                scope,
+                id: FeedbackId(1),
+                prefix: 2,
+                observed_end: 4,
+                deficit: 0,
+            },
+            now,
+        )?;
+        s.step(
+            now,
+            WorkBudget {
+                metadata: 1,
+                ..Default::default()
+            },
+        )?;
+        assert!(s.status().encoder.pending_repair);
+        assert!(s.pending_output().is_none());
+        if buffer {
+            assert_eq!(s.admit_source(b"later", now)?, SourceId(4));
+            assert_eq!(s.admit_source(b"newer", now)?, SourceId(5));
+            assert_eq!(s.admit_source(b"over", now), Err(Error::Capacity));
+        }
+        s.step(now, work)?;
+        let Output::Repair(row) = s.pending_output().ok_or(Error::Busy)? else {
+            return Err(Error::Identity);
+        };
+        assert_eq!((row.support.start, row.support.end), (0, 4));
+        if buffer {
+            assert_eq!(row.bytes, expected);
+        } else {
+            expected.extend_from_slice(row.bytes);
+        }
+        s.confirm_output(OutputId::Repair(row.id), now)?;
+        if buffer {
+            s.step(now, work)?;
+            let Output::Source { id, original, .. } = s.pending_output().ok_or(Error::Busy)? else {
+                return Err(Error::Identity);
+            };
+            assert_eq!((id, original), (SourceId(4), b"later".as_slice()));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn targeted_creation_deadlines_survive_reordering_and_queue_service() -> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let now = Tick(100);
+    let mut s = Sender::new(policy, scope, now)?;
+    s.admit_source(b"first", now)?;
+    s.admit_source_with_copies_at(b"older", Tick(60), now, 1)?;
+    s.admit_source_with_copies_at(b"oldest", Tick(20), now, 1)?;
+    assert_eq!(s.deadline(), Some(Tick(20 + policy.recovery.job_ticks)));
+    for id in 0..3 {
+        if id > 0 {
+            s.step(now, work)?;
+        }
+        s.confirm_output(OutputId::Source(SourceId(id)), now)?;
+    }
+    for prefix in 0..3 {
+        if prefix > 0 {
+            s.receive_feedback(
+                Feedback {
+                    scope,
+                    id: FeedbackId(u64::from(prefix)),
+                    prefix,
+                    observed_end: 3,
+                    deficit: 0,
+                },
+                now,
+            )?;
+        }
+        assert_eq!(s.deadline(), Some(Tick(20 + policy.recovery.debt_ticks)));
+    }
+    let mut held = Sender::new(policy, scope, now)?;
+    held.admit_source(b"held", now)?;
+    held.admit_source_with_copies_at(b"older", Tick(20), now, 1)?;
+    let expired = Tick(20 + policy.recovery.job_ticks);
+    assert_eq!(held.step(expired, work), Err(Error::Expired));
+    let selected = held.expiry_snapshot().failure.ok_or(Error::Busy)?.selected;
+    assert_eq!(selected.at, expired);
+    assert_eq!(
+        selected.identity,
+        Some(expiry::Identity::Sources { first: 1, end: 2 })
+    );
+    Ok(())
+}
+
+#[test]
+fn targeted_oldest_probe_only_rearms_on_observed_prefix_progress() -> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let mut s = Sender::new(policy, scope, Tick(0))?;
+    for id in 0..3 {
+        admit_source(&mut s, id, Tick(0))?;
+    }
+    let receipt = Feedback {
+        scope,
+        id: FeedbackId(1),
+        prefix: 1,
+        observed_end: 3,
+        deficit: 0,
+    };
+    let advanced = Tick(100_000);
+    s.receive_feedback(receipt, advanced)?;
+    let due = deadline(advanced, targeted::PROBE)?;
+    assert_eq!(s.status().tail_due, Some(due));
+    s.receive_feedback(
+        Feedback {
+            id: FeedbackId(2),
+            ..receipt
+        },
+        Tick(110_000),
+    )?;
+    s.receive_request(
+        GapRequest {
+            scope,
+            id: FeedbackId(3),
+            prefix: 1,
+            start: 2,
+            mask: 1,
+        },
+        Tick(120_000),
+    )?;
+    s.step(Tick(120_000), work)?;
+    let token = s.pending_retry_token().ok_or(Error::Busy)?;
+    s.confirm_retry(token, Tick(120_000), Tick(120_000))?;
+    admit_source(&mut s, 3, Tick(135_000))?;
+    assert_eq!(s.status().tail_due, Some(due));
+    s.step(due, work)?;
+    assert!(s.pending_retry_token().is_some());
+    assert!(!s.pending_requested_retry());
+    assert_eq!(
+        s.pending_output().ok_or(Error::Busy)?.id(),
+        OutputId::Source(SourceId(1))
+    );
+    Ok(())
+}
+
+#[test]
+fn targeted_contended_regular_debt_is_bounded_and_all_classes_advance() -> Result<(), Error> {
+    let (mut policy, scope, work) = setup();
+    policy.repair_numerator = 1;
+    let mut s = Sender::new(policy, scope, Tick(0))?;
+    admit_source(&mut s, 0, Tick(0))?;
+    for id in 1u32..9 {
+        assert_eq!(s.admit_source(&id.to_be_bytes(), Tick(0))?, SourceId(id));
+    }
+    let now = Tick(targeted::PROBE);
+    let (mut fresh, mut named, mut regular, mut oldest) = (0, 0, 0, 0);
+    for serial in 1..=40 {
+        s.receive_request(
+            GapRequest {
+                scope,
+                id: FeedbackId(serial),
+                prefix: 0,
+                start: 0,
+                mask: 1,
+            },
+            now,
+        )?;
+        s.step(now, work)?;
+        if let Some(token) = s.pending_retry_token() {
+            if s.pending_requested_retry() {
+                named += 1;
+            } else {
+                oldest += 1;
+            }
+            s.confirm_retry_charged(token, now, now, 120)?;
+        } else {
+            let id = s.pending_output().ok_or(Error::Busy)?.id();
+            match id {
+                OutputId::Source(_) => fresh += 1,
+                OutputId::Repair(_) => regular += 1,
+            }
+            s.confirm_output_charged(id, now, 120)?;
+        }
+        assert!(s.status().regular_due <= 2);
+        if fresh == 8 && regular == 9 {
+            break;
+        }
+    }
+    assert_eq!((fresh, regular, oldest), (8, 9, 1));
+    assert!(named >= 4);
+    assert_eq!(s.status().encoder.confirmed_prefix, 0);
+    Ok(())
+}

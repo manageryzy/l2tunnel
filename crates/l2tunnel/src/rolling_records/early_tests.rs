@@ -365,6 +365,8 @@ fn preview_reports_native_progress_only_after_actual_short_admission() -> TestRe
 
 #[path = "ingress_tests.rs"]
 mod ingress;
+#[path = "targeted_scheduling_tests.rs"]
+mod targeted_scheduling;
 
 #[test]
 fn targeted_ordinary_channel_delivery_crosses_old_source_without_duplicate_native_write()

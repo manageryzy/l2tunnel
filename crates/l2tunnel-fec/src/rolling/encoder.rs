@@ -128,6 +128,20 @@ impl Encoder {
             mul(config.window, std::mem::size_of::<Tick>())?,
         )
     }
+    pub(crate) fn targeted_memory_bound(config: Config) -> Result<usize, Error> {
+        add(
+            Self::sliding_memory_bound(config)?,
+            mul(config.window, std::mem::size_of::<Tick>())?,
+        )
+    }
+    pub(crate) fn new_targeted(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
+        if Self::targeted_memory_bound(config)? > config.memory_bytes {
+            return Err(Error::Capacity);
+        }
+        let mut owner = Self::new(config, scope, now)?;
+        owner.source_deadlines = slots(mul(2, config.window)?, Tick(u64::MAX))?;
+        Ok(owner)
+    }
     pub(crate) fn new_sliding(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
         if Self::sliding_memory_bound(config)? > config.memory_bytes {
             return Err(Error::Capacity);
@@ -168,7 +182,15 @@ impl Encoder {
     /// Admit one exact source. A pending encoding job freezes its support.
     /// This performs at most two fixed-width copies/clears, each <=4098 bytes.
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
-        self.admit_source_in(original, now, false)
+        self.admit_source_in(original, now, now, false)
+    }
+    pub(super) fn admit_source_created(
+        &mut self,
+        original: &[u8],
+        created: Tick,
+        now: Tick,
+    ) -> Result<SourceId, Error> {
+        self.admit_source_in(original, created, now, false)
     }
     // The legacy admission owner pins every queued/unsent column before calling
     // this opt-in path. A frozen explicit equation permits later non-overwriting
@@ -181,11 +203,12 @@ impl Encoder {
         if self.explicit.is_none() {
             return Err(Error::Configuration);
         }
-        self.admit_source_in(original, now, true)
+        self.admit_source_in(original, now, now, true)
     }
     fn admit_source_in(
         &mut self,
         original: &[u8],
+        created: Tick,
         now: Tick,
         explicit_admission: bool,
     ) -> Result<SourceId, Error> {
@@ -216,8 +239,17 @@ impl Encoder {
             return Err(Error::Capacity);
         }
         if self.debt.is_none() || !self.source_deadlines.is_empty() {
-            let expires = self.expires(now, self.config.debt_ticks)?;
-            if let Some(slot) = self.source_deadlines.get_mut(index) {
+            let expires = self.expires(created, self.config.debt_ticks)?;
+            if self.source_deadlines.len() > self.config.window {
+                let mut node = index + self.config.window;
+                self.source_deadlines[node] = expires;
+                while node > 1 {
+                    node /= 2;
+                    self.source_deadlines[node] =
+                        self.source_deadlines[node * 2].min(self.source_deadlines[node * 2 + 1]);
+                }
+                self.debt = Some(self.debt.map_or(expires, |old| old.min(expires)));
+            } else if let Some(slot) = self.source_deadlines.get_mut(index) {
                 *slot = expires;
             }
             self.debt.get_or_insert(expires);
@@ -256,6 +288,18 @@ impl Encoder {
         self.confirmed = prefix;
         if prefix == self.next {
             self.debt = None;
+        } else if self.source_deadlines.len() > self.config.window {
+            // Packing can admit an older frame from another channel later. Query
+            // only the live ring interval, excluding old acknowledged leaves.
+            let window = self.config.window;
+            let start = prefix as usize % window;
+            let count = (self.next - prefix) as usize;
+            let end = start + count;
+            let mut at = self.min_source_deadline(start, end.min(window));
+            if end > window {
+                at = at.min(self.min_source_deadline(0, end - window));
+            }
+            self.debt = Some(at);
         } else if let Some(&original) = self
             .source_deadlines
             .get(prefix as usize % self.config.window)
@@ -263,6 +307,24 @@ impl Encoder {
             self.debt = Some(original);
         }
         Ok(())
+    }
+    fn min_source_deadline(&self, begin: usize, end: usize) -> Tick {
+        let mut left = begin + self.config.window;
+        let mut right = end + self.config.window;
+        let mut at = Tick(u64::MAX);
+        while left < right {
+            if left % 2 == 1 {
+                at = at.min(self.source_deadlines[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                at = at.min(self.source_deadlines[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        at
     }
     pub(super) fn next_regular(&self) -> Result<(RepairId, Support), Error> {
         if self.next_repair == u64::MAX {

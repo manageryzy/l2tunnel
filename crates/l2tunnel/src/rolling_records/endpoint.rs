@@ -555,7 +555,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if !self.packing.status().packing.sealed {
             return Ok(());
         }
-        let expected = rolling::SourceId(P::send_state(&self.sender).encoder.next_source);
+        let expected = rolling::SourceId(P::send_state(&self.sender).next_source);
         let length = if self.compact_feedback_overhead.is_some() {
             self.packing.write_pending_compact(&mut self.source)
         } else {
@@ -589,9 +589,6 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             copies,
         ) {
             Ok(id) if id == expected => {
-                if let Some(budget) = &mut self.repair_budget {
-                    budget.record_source(id, length)?;
-                }
                 let result = self.packing.commit_source().map_err(Error::Sender);
                 if let Err(error) = result {
                     return self.fail(error);
@@ -1151,6 +1148,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.prepared_output = None;
         self.statistics.handed = handed;
         timing?;
+        // A queued original cannot participate in an equation. Publish its extent
+        // only at first handoff so future IDs cannot replace an active window slot.
+        let extent = if self.repair_budget.is_some()
+            && let Some(copy) = pending.source_copy
+            && copy.ordinal() == 1
+        {
+            match P::pending_original(&self.sender) {
+                Some((id, bytes)) if id == copy.source() => Some((id, bytes)),
+                _ => return self.fail(Error::Identity),
+            }
+        } else {
+            None
+        };
         let result = match pending.id {
             OutputId::Data(id) => P::confirm_data(
                 &mut self.sender,
@@ -1158,6 +1168,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 pending.source_copy,
                 rolling_tick(accepted),
                 rolling_tick(now),
+                pending.wire_bytes,
             ),
             OutputId::Feedback(id) if pending.source_copy.is_none() => {
                 P::confirm_feedback(&mut self.incoming, id, rolling_tick(now))
@@ -1169,6 +1180,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return self.fail(error);
         }
         if let Some(budget) = &mut self.repair_budget {
+            if let Some((id, length)) = extent {
+                budget.record_source(id, length)?;
+            }
             budget.accepted(pending);
         }
         self.expire_confirmed_credit();

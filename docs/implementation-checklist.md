@@ -1080,6 +1080,14 @@ and maximum forward input residence of 93.545 ms. The exact control expired
 and application P99 was 1.319 s for the candidate. RWI-03 and full native
 parity remain open.
 
+TEST-12 and PBA-03/06 additionally track
+[fresh-source service during C48 recovery](modules/frame-channel-experiment.md#scheduling-fresh-sources-during-c48-recovery).
+The targeted sender retains old gaps while admitting a bounded queue of fresh
+sources. The two-peer regression loses the same original twice, delivers an
+unaffected channel during the retry backlog, then checks ordered recovery and
+cumulative confirmation. The physical-send batch experiment and its liveness
+failure are recorded separately in the same study.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

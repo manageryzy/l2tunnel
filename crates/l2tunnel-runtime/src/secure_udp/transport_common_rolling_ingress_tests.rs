@@ -7,7 +7,7 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async {
+        .block_on(Box::pin(async {
             let kind = cover::Appearance::QuicLike;
             let old = short_contracts(kind)?;
             let limits = rolling_records::IngressLimits {
@@ -192,5 +192,5 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 );
             }
             Ok(())
-        })
+        }))
 }

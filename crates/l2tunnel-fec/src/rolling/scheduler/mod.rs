@@ -5,6 +5,7 @@
 use super::*;
 
 mod feedback;
+pub(in crate::rolling) mod fresh;
 mod receiver;
 mod sender;
 pub(in crate::rolling) mod targeted;

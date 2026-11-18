@@ -65,7 +65,13 @@ impl Plan {
     /// Plan the actual sender buffers and preserve both legacy reservation guards.
     pub fn for_sender(policy: scheduler::Policy) -> Result<Self, Error> {
         policy.validate()?;
-        if Encoder::sliding_memory_bound(policy.recovery)? > policy.recovery.memory_bytes
+        let targeted = policy.source_wire.is_targeted();
+        let encoder_bytes = if targeted {
+            Encoder::targeted_memory_bound(policy.recovery)?
+        } else {
+            Encoder::sliding_memory_bound(policy.recovery)?
+        };
+        if encoder_bytes > policy.recovery.memory_bytes
             || scheduler::Sender::memory_bound(policy)? > policy.memory_bytes
         {
             return Err(Error::Recovery(super::Error::Capacity));
@@ -74,7 +80,11 @@ impl Plan {
             policy,
             kind: Kind::Sender,
             usage: Encoder::requested_storage(policy.recovery)?
-                .join(requested::<Tick>(policy.recovery.window)?)?
+                .join(requested::<Tick>(super::mul(
+                    policy.recovery.window,
+                    if targeted { 2 } else { 1 },
+                )?)?)?
+                .join(scheduler::fresh::Queue::plan(policy)?)?
                 .join(scheduler::targeted::Queues::plan(policy)?)?,
         })
     }

@@ -75,11 +75,19 @@ pub enum FeedbackDisposition {
 pub struct SenderStatus {
     /// Actual bounded encoder ownership.
     pub encoder: EncoderStatus,
+    /// Exclusive identity after all accepted originals, including queued custody.
+    pub next_source: u32,
+    /// Originals in custody and awaiting physical scheduling outside the encoder.
+    pub queued_fresh: usize,
+    /// Largest observed custody queue depth.
+    pub peak_queued_fresh: usize,
+    /// Fixed preallocated custody queue capacity.
+    pub fresh_queue_limit: usize,
     /// Exclusive source prefix fully handed off by this scheduler's caller.
     pub sent_sources: u32,
     /// Residual exact numerator units, always below the denominator.
     pub repair_credit: u32,
-    /// Regular earned repairs waiting for service, at most one.
+    /// Regular earned repairs waiting for service, at most two for targeted service.
     pub regular_due: u32,
     /// Unfinished repairs in the current bounded tail burst, including its output.
     pub tail_remaining: u32,
@@ -117,6 +125,12 @@ pub struct Sender {
     scope: Scope,
     encoder: Encoder,
     retry_queue: targeted::Queues,
+    fresh: fresh::Queue,
+    // Fresh wire bytes minus twice recovery wire bytes under contention.
+    balance: i64,
+    competing: bool,
+    last_named: bool,
+    last_probe: bool,
     mux_age_micros: u64,
     full_credit: bool,
     requested_prefix: u32,
@@ -156,7 +170,8 @@ impl Sender {
     pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
         self.encoder
             .storage_usage()?
-            .join(self.retry_queue.usage()?)
+            .join(self.retry_queue.usage()?)?
+            .join(self.fresh.usage()?)
     }
 
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
@@ -164,8 +179,15 @@ impl Sender {
         policy.validate()?;
         add(
             add(
-                Encoder::sliding_memory_bound(policy.recovery)?,
-                targeted::Queues::bytes(policy)?,
+                if policy.source_wire.is_targeted() {
+                    Encoder::targeted_memory_bound(policy.recovery)?
+                } else {
+                    Encoder::sliding_memory_bound(policy.recovery)?
+                },
+                add(
+                    targeted::Queues::bytes(policy)?,
+                    fresh::Queue::bytes(policy)?,
+                )?,
             )?,
             std::mem::size_of::<Self>(),
         )
@@ -177,8 +199,17 @@ impl Sender {
         }
         deadline(now, policy.tail_ticks)?;
         Ok(Self {
-            encoder: Encoder::new_sliding(policy.recovery, scope, now)?,
+            encoder: if policy.source_wire.is_targeted() {
+                Encoder::new_targeted(policy.recovery, scope, now)?
+            } else {
+                Encoder::new_sliding(policy.recovery, scope, now)?
+            },
             retry_queue: targeted::Queues::new(policy)?,
+            fresh: fresh::Queue::new(policy)?,
+            balance: 0,
+            competing: false,
+            last_named: false,
+            last_probe: false,
             mux_age_micros: 0,
             full_credit: false,
             requested_prefix: 0,
@@ -208,11 +239,15 @@ impl Sender {
         if self.terminal.is_some() {
             return Err(Error::Terminal);
         }
-        if let Err(error) = check_time(self.last, now, &[self.output_end]) {
+        if let Err(error) = check_time(
+            self.last,
+            now,
+            &[self.output_end, self.fresh.earliest().map(|e| Tick(e.due))],
+        ) {
             if error == Error::Expired {
                 self.expiry_failure = self
                     .expiry_failure
-                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3]));
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3, 4]));
             }
             return self.fail(error);
         }
@@ -225,8 +260,7 @@ impl Sender {
     fn later(&mut self, now: Tick, ticks: u64) -> Result<Tick, Error> {
         deadline(now, ticks).or_else(|error| self.fail(error))
     }
-    /// Admit one source into the only output slot; no repair credit is earned yet.
-    /// Performs only the primitive's bounded source copy; no wire buffer is allocated.
+    /// Take bounded custody of one source. Repair credit starts at physical confirmation.
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
         self.admit_source_with_copies(original, now, 1)
     }
@@ -238,20 +272,86 @@ impl Sender {
         now: Tick,
         copies: u8,
     ) -> Result<SourceId, Error> {
+        self.admit_source_with_copies_at(original, now, now, copies)
+    }
+    /// Preserve the packing creation time through targeted custody, selection and receipt.
+    pub fn admit_source_with_copies_at(
+        &mut self,
+        original: &[u8],
+        created: Tick,
+        now: Tick,
+        copies: u8,
+    ) -> Result<SourceId, Error> {
         if !(1..=4).contains(&copies) {
             return Err(Error::Configuration);
         }
         self.time(now)?;
-        if self.pending.is_some() || self.regular_due != 0 || self.retry_queue.has_retries() {
+        let targeted = self.policy.source_wire.is_targeted();
+        let created = if targeted { created } else { now };
+        let busy =
+            self.pending.is_some() || self.regular_due != 0 || self.retry_queue.has_retries();
+        if !targeted && busy {
             return Err(Error::Busy);
         }
-        let end = self.later(now, self.policy.recovery.job_ticks)?;
-        let id = self.encoder.admit_source(original, now)?;
-        // New admitted data ends idle-tail demand. Never preempt an actual
-        // output/job or earned regular repair; a refused source must leave tail
-        // recovery intact. Physical completion arms the next idle-tail clock.
+        if original.is_empty() || original.len() > self.policy.recovery.max_payload {
+            return Err(Error::Length);
+        }
+        if created > now {
+            return self.fail(Error::TimeRegression);
+        }
+        let end = self.later(created, self.policy.recovery.job_ticks)?;
+        if targeted {
+            let due = end.min(self.later(created, self.policy.recovery.debt_ticks)?);
+            let state = self.encoder.status();
+            let id = state
+                .next_source
+                .checked_add(self.fresh.len as u32)
+                .ok_or(Error::Exhausted)?;
+            if id == u32::MAX {
+                return self.fail(Error::Exhausted);
+            }
+            if now >= due {
+                self.expiry_failure = Some(expiry::Failure {
+                    observed: now,
+                    selected: expiry::Deadline::new(
+                        expiry::Kind::IncomingCap,
+                        due,
+                        Some(expiry::Identity::Sources {
+                            first: id,
+                            end: id + 1,
+                        }),
+                    ),
+                });
+                return self.fail(Error::Expired);
+            }
+            if (id - state.confirmed_prefix) as usize >= self.policy.recovery.window {
+                return Err(Error::Capacity);
+            }
+            if busy || self.fresh.len > 0 || self.tail_due.is_some_and(|v| now >= v) {
+                self.fresh.push(
+                    fresh::Entry {
+                        id,
+                        created: created.0,
+                        due: due.0,
+                        copies,
+                        len: original.len(),
+                    },
+                    original,
+                )?;
+                return Ok(SourceId(id));
+            }
+            self.competing = false;
+            self.balance = 0;
+        }
+        let id = self.encoder.admit_source_created(original, created, now)?;
+        self.install_source(id, copies, now, end);
+        Ok(id)
+    }
+    fn install_source(&mut self, id: SourceId, copies: u8, now: Tick, end: Tick) {
         self.tail_remaining = 0;
-        self.tail_due = None;
+        if !self.policy.source_wire.is_targeted() {
+            self.tail_due = None;
+        }
         self.pending = Some(Pending::Source(id));
         self.source_copy = Some(SourceCopy {
             source: id,
@@ -260,7 +360,20 @@ impl Sender {
             prepared_at: now,
         });
         self.output_end = Some(end);
-        Ok(id)
+    }
+    fn select_fresh(&mut self, now: Tick) -> Result<(), Error> {
+        let (e, original) = self.fresh.front().ok_or(Error::Busy)?;
+        let id = self
+            .encoder
+            .admit_source_created(original, Tick(e.created), now)?;
+        self.fresh.pop();
+        self.install_source(
+            id,
+            e.copies,
+            now,
+            deadline(Tick(e.created), self.policy.recovery.job_ticks)?,
+        );
+        Ok(())
     }
     /// Advance at most one bounded repair job. All-zero work cannot start a job.
     pub fn step(&mut self, now: Tick, budget: WorkBudget) -> Result<WorkUsed, Error> {
@@ -280,30 +393,53 @@ impl Sender {
         let before = budget;
         if self.pending.is_none() && spend(&mut budget.metadata) {
             let state = self.encoder.status();
-            if let Some((id, full_credit)) = self
-                .retry_queue
-                .next_retry(state.confirmed_prefix, &mut budget)
-            {
-                self.queue_retry(id, Some(full_credit), now)?;
-                return Ok(used(before, budget));
-            }
-            if state.confirmed_prefix == state.next_source {
+            let targeted = self.policy.source_wire.is_targeted();
+            let outstanding = state.confirmed_prefix != state.next_source;
+            if !outstanding {
                 self.regular_due = 0;
                 self.tail_remaining = 0;
                 self.tail_due = None;
-            } else {
-                if self.regular_due == 0
+            }
+            let named = self.retry_queue.has_retries();
+            let regular = self.regular_due != 0 && outstanding;
+            let probe = targeted && outstanding && self.tail_due.is_some_and(|v| now >= v);
+            let recovery = named || regular || probe;
+            self.competing = self.fresh.len > 0 && recovery;
+            if !self.competing {
+                self.balance = 0;
+            }
+            if self.fresh.len > 0 && (!recovery || (self.balance <= 0 && self.regular_due < 2)) {
+                self.select_fresh(now)?;
+                return Ok(used(before, budget));
+            }
+            // The oldest unconfirmed source gets an independent timed probe even
+            // during continuous admissions and repeated newer named requests.
+            if probe && !(self.last_probe && (named || regular)) {
+                self.last_probe = true;
+                self.queue_retry(SourceId(state.confirmed_prefix), None, now)?;
+                return Ok(used(before, budget));
+            }
+            self.last_probe = false;
+            if !(regular && self.last_named)
+                && let Some((id, full_credit)) = self
+                    .retry_queue
+                    .next_retry(state.confirmed_prefix, &mut budget)
+            {
+                self.last_named = true;
+                self.queue_retry(id, Some(full_credit), now)?;
+                return Ok(used(before, budget));
+            }
+            if outstanding {
+                if !targeted
+                    && self.regular_due == 0
                     && self.tail_remaining == 0
                     && self.tail_due.is_some_and(|due| now >= due)
                 {
-                    if self.policy.source_wire.is_targeted() {
-                        self.queue_retry(SourceId(state.confirmed_prefix), None, now)?;
-                        return Ok(used(before, budget));
-                    }
                     self.tail_remaining = self.feedback.map_or(1, |f| f.deficit.max(1));
                 }
                 let tail = self.regular_due == 0;
                 if !tail || self.tail_remaining != 0 {
+                    self.last_named = false;
                     if !tail && self.policy.source_wire.is_targeted() {
                         let (id, support) = self.encoder.next_regular()?;
                         if displace(id, support)? {
@@ -357,6 +493,17 @@ impl Sender {
         accepted: Tick,
         observed: Tick,
     ) -> Result<(), Error> {
+        let bytes = self.pending_wire_len()?.unwrap_or_default();
+        self.confirm_retry_charged(token, accepted, observed, bytes)
+    }
+    /// Confirm the exact retry with the actual enclosing carrier byte cost.
+    pub fn confirm_retry_charged(
+        &mut self,
+        token: RetryToken,
+        accepted: Tick,
+        observed: Tick,
+        wire_bytes: usize,
+    ) -> Result<(), Error> {
         if self.retry_token != Some(token) {
             return Err(Error::Identity);
         }
@@ -364,7 +511,7 @@ impl Sender {
             return self.fail(Error::TimeRegression);
         }
         self.time(observed)?;
-        self.finish_output(OutputId::Source(token.id), observed, accepted)
+        self.finish_output(OutputId::Source(token.id), observed, accepted, wire_bytes)
     }
     /// Only a named retry earns shared repair credit at complete physical acceptance.
     pub fn pending_requested_retry(&self) -> bool {
@@ -392,6 +539,19 @@ impl Sender {
         } else {
             self.policy.tail_ticks
         }
+    }
+    fn observe_prefix_progress(&mut self, prefix: u32, now: Tick) -> Result<(), Error> {
+        let previous = self
+            .requested_prefix
+            .max(self.feedback.map_or(0, |f| f.prefix));
+        if self.policy.source_wire.is_targeted() && prefix > previous {
+            self.tail_due = if prefix < self.sent {
+                Some(self.later(now, targeted::PROBE)?)
+            } else {
+                None
+            };
+        }
+        Ok(())
     }
     /// Borrow the exact current immutable complete output. Polling changes nothing.
     pub fn pending_output(&self) -> Option<Output<'_>> {
@@ -460,11 +620,21 @@ impl Sender {
     /// Confirm an ordinary one-copy source or repair. Explicit repeated-source
     /// groups require their ordinal-bearing witness and cannot use this method.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
+        let bytes = self.pending_wire_len()?.unwrap_or_default();
+        self.confirm_output_charged(id, now, bytes)
+    }
+    /// Confirm one complete ordinary output with its enclosing carrier byte cost.
+    pub fn confirm_output_charged(
+        &mut self,
+        id: OutputId,
+        now: Tick,
+        wire_bytes: usize,
+    ) -> Result<(), Error> {
         if self.retry_token.is_some() || self.source_copy.is_some_and(|copy| copy.total != 1) {
             return Err(Error::Identity);
         }
         self.time(now)?;
-        self.finish_output(id, now, now)
+        self.finish_output(id, now, now, wire_bytes)
     }
     /// Consume exactly one caller-observed whole systematic-copy acceptance.
     /// A repeated ordinal is rejected before clock, counters or retirement change.
@@ -474,6 +644,17 @@ impl Sender {
         observed: Tick,
         accepted: Tick,
         copy: SourceCopy,
+    ) -> Result<(), Error> {
+        let bytes = self.pending_wire_len()?.unwrap_or_default();
+        self.confirm_source_copy_charged(observed, accepted, copy, bytes)
+    }
+    /// Confirm one physical original ordinal with its enclosing carrier byte cost.
+    pub fn confirm_source_copy_charged(
+        &mut self,
+        observed: Tick,
+        accepted: Tick,
+        copy: SourceCopy,
+        wire_bytes: usize,
     ) -> Result<(), Error> {
         if self.source_copy != Some(copy)
             || !matches!(self.pending, Some(Pending::Source(id)) if id == copy.source)
@@ -494,16 +675,42 @@ impl Sender {
                 prepared_at: observed,
                 ..copy
             });
+            self.charge(true, wire_bytes);
             return Ok(());
         }
-        self.finish_output(OutputId::Source(copy.source), observed, accepted)
+        self.finish_output(
+            OutputId::Source(copy.source),
+            observed,
+            accepted,
+            wire_bytes,
+        )
     }
-    fn finish_output(&mut self, id: OutputId, now: Tick, accepted: Tick) -> Result<(), Error> {
+    fn charge(&mut self, fresh: bool, wire_bytes: usize) {
+        if !self.competing {
+            return;
+        }
+        let cap = 4 * (self.policy.recovery.max_payload + wire::HEADER_BYTES) as i64;
+        let cost = i64::try_from(wire_bytes).unwrap_or(i64::MAX);
+        self.balance = if fresh {
+            self.balance.saturating_add(cost)
+        } else {
+            self.balance.saturating_sub(cost.saturating_mul(2))
+        }
+        .clamp(-cap, cap);
+    }
+    fn finish_output(
+        &mut self,
+        id: OutputId,
+        now: Tick,
+        accepted: Tick,
+        wire_bytes: usize,
+    ) -> Result<(), Error> {
         let output = self.pending_output().ok_or(Error::Busy)?;
         if output.id() != id {
             return Err(Error::Identity);
         }
-        match self.pending.ok_or(Error::Busy)? {
+        let pending = self.pending.ok_or(Error::Busy)?;
+        match pending {
             Pending::Source(source) => {
                 let tail_due =
                     deadline(accepted, self.idle_ticks()).or_else(|error| self.fail(error))?;
@@ -511,29 +718,36 @@ impl Sender {
                 let earned = self.credit + self.policy.repair_numerator;
                 self.regular_due += earned / self.policy.repair_denominator;
                 self.credit = earned % self.policy.repair_denominator;
-                self.tail_due = Some(tail_due);
+                if self.policy.source_wire.is_targeted() {
+                    self.tail_due.get_or_insert(tail_due);
+                } else {
+                    self.tail_due = Some(tail_due);
+                }
                 self.source_copy = None;
                 // A peer may have acknowledged the first actual copy already.
                 // Remaining physical copies pinned the exact encoder payload;
                 // applying the retained real prefix now cannot invent receipt.
-                if let Some(feedback) = self.feedback {
-                    self.encoder
-                        .confirm_prefix(feedback.prefix.max(self.requested_prefix), now)?;
-                    if feedback.prefix == self.encoder.status().next_source {
+                if self.feedback.is_some() || self.requested_prefix != 0 {
+                    let prefix = self
+                        .feedback
+                        .map_or(0, |f| f.prefix)
+                        .max(self.requested_prefix);
+                    self.encoder.confirm_prefix(prefix, now)?;
+                    if prefix == self.encoder.status().next_source {
                         self.regular_due = 0;
                         self.tail_remaining = 0;
                         self.tail_due = None;
                     }
                 }
             }
-            Pending::Retry { full_credit, .. } => {
+            Pending::Retry { id, full_credit } => {
                 self.retry_token = None;
-                if full_credit.is_none() {
-                    self.tail_due = Some(self.later(accepted, targeted::PROBE)?);
-                }
                 let prefix = self
                     .requested_prefix
                     .max(self.feedback.map_or(0, |f| f.prefix));
+                if full_credit.is_none() && id.0 >= prefix {
+                    self.tail_due = Some(self.later(accepted, targeted::PROBE)?);
+                }
                 self.encoder
                     .confirm_prefix(prefix.max(self.encoder.status().confirmed_prefix), now)?;
                 if self.encoder.status().confirmed_prefix == self.sent {
@@ -556,6 +770,7 @@ impl Sender {
                 }
             }
         }
+        self.charge(matches!(pending, Pending::Source(_)), wire_bytes);
         self.pending = None;
         self.output_end = None;
         Ok(())
@@ -604,6 +819,7 @@ impl Sender {
             .map_or(feedback.prefix, |copy| feedback.prefix.min(copy.source.0));
         let released = self.pin_retry(released);
         self.encoder.confirm_prefix(released, now)?;
+        self.observe_prefix_progress(feedback.prefix, now)?;
         self.feedback = Some(feedback);
         if released == self.encoder.status().next_source {
             self.regular_due = 0;
@@ -636,6 +852,7 @@ impl Sender {
             return Err(Error::Identity);
         }
         self.time(now)?;
+        self.observe_prefix_progress(request.prefix, now)?;
         self.requested_prefix = self.requested_prefix.max(request.prefix);
         let mut release = self
             .requested_prefix
@@ -695,6 +912,16 @@ impl Sender {
         snapshot.candidates[3] = self
             .output_end
             .map(|at| Deadline::new(Kind::DataOutput, at, identity));
+        snapshot.candidates[4] = self.fresh.earliest().map(|e| {
+            Deadline::new(
+                Kind::DataOutput,
+                Tick(e.due),
+                Some(Identity::Sources {
+                    first: e.id,
+                    end: e.id + 1,
+                }),
+            )
+        });
         snapshot.last_successful = self.last;
         snapshot.terminal = self.terminal.or(snapshot.terminal);
         snapshot.failure = self.expiry_failure.or(snapshot.failure);
@@ -706,6 +933,7 @@ impl Sender {
             .deadline()
             .into_iter()
             .chain(self.output_end)
+            .chain(self.fresh.earliest().map(|e| Tick(e.due)))
             .min()
     }
     /// Earliest hard expiry or idle-tail trigger. Immediate output/work is visible in status.
@@ -716,6 +944,10 @@ impl Sender {
     pub fn status(&self) -> SenderStatus {
         SenderStatus {
             encoder: self.encoder.status(),
+            next_source: self.encoder.status().next_source + self.fresh.len as u32,
+            queued_fresh: self.fresh.len,
+            peak_queued_fresh: self.fresh.peak,
+            fresh_queue_limit: self.fresh.limit(),
             sent_sources: self.sent,
             repair_credit: self.credit,
             regular_due: self.regular_due,
