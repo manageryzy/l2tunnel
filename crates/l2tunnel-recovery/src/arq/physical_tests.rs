@@ -387,7 +387,9 @@ fn older_ack_while_retry_is_held_confirms_source_but_retains_exact_custody() -> 
         let mut sender = make(EndpointRole::Initiator, reserved, true)?;
         let mut receiver = make(EndpointRole::Responder, reserved, true)?;
         let payload = [0xf3, 0, 0x41, 0xff, 0];
+        assert_eq!(sender.source_deadline(), None);
         sender.submit(&payload, ms(0))?;
+        assert_eq!(sender.source_deadline(), Some(ms(0)));
         let original = emit_source(&mut sender, ms(0))?;
         let first = token(&sender, 0)?;
         sender.confirm_transmission(ms(0), first)?;
@@ -416,6 +418,7 @@ fn older_ack_while_retry_is_held_confirms_source_but_retains_exact_custody() -> 
         assert_eq!(sender.source_deadline(), None);
         sender.confirm_transmission(ms(1_000), held_retry)?;
         assert_eq!(sender.retained().send_records, 0);
+        assert_eq!(sender.source_deadline(), None);
         assert_eq!(sender.retained().send_bytes, 0);
         assert!(sender.source_confirmed(SourceId(0))?);
         assert!(sender.drained());

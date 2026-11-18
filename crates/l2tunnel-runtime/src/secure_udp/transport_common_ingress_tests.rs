@@ -180,6 +180,68 @@ fn protocol_stage_boundaries_service_original_ack_or_expire_it() -> Result {
 }
 
 #[test]
+fn physical_device_write_services_opposite_ack_when_it_becomes_due() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let kind = cover::Appearance::QuicLike;
+            let mut fixture = Fixture::from_contracts(kind, selected_contracts(kind)?).await?;
+            let mut input = fixture.endpoints[0].driver.take_inputs()?;
+            assert!(read(&mut fixture, &mut input, &packet(100)).await?);
+            let payload = frame(40_101, 17);
+            fixture.admit(1, &payload).await?;
+            for _ in 0..32 {
+                fixture.turn_with_held_native(Some(0)).await?;
+                if !fixture.endpoints[0].driver.native.is_empty() {
+                    break;
+                }
+            }
+            assert!(!fixture.endpoints[0].driver.native.is_empty());
+            assert!(read(&mut fixture, &mut input, &packet(101)).await?);
+            let start = fixture.now;
+            let due = start + u64::try_from(policy().interval.as_micros())?;
+            let endpoint = &mut fixture.endpoints[0];
+            let epoch = endpoint.driver.common_state()?.epoch();
+            assert!(
+                !endpoint
+                    .driver
+                    .common_state()?
+                    .engine(epoch)?
+                    .ingress_empty()
+            );
+            let before = endpoint.driver.counters.native_written;
+            let mut ticks = [start, due].into_iter();
+            let mut ready = tokio::time::timeout(
+                Duration::from_secs(1),
+                endpoint.device.ready_mut(Interest::WRITABLE),
+            )
+            .await??;
+            assert_eq!(
+                endpoint.driver.write_native_batch(&mut ready, 1, || {
+                    ticks
+                        .next()
+                        .ok_or_else(|| io::Error::other("unexpected device clock read"))
+                })?,
+                1
+            );
+            assert_eq!(ticks.next(), None);
+            assert_eq!(endpoint.driver.counters.native_written, before + 1);
+            assert!(
+                endpoint
+                    .driver
+                    .common_state()?
+                    .engine(epoch)?
+                    .ingress_empty()
+            );
+            let mut delivered = [0; 513];
+            let len = endpoint.host.recv(&mut delivered)?;
+            assert_eq!(&delivered[..len], payload.as_slice());
+            Ok(())
+        })
+}
+
+#[test]
 fn busy_carrier_progress_flushes_due_ack_before_next_outer_turn() -> Result {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

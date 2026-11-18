@@ -205,3 +205,114 @@ fn local_repair_with_an_older_equation_costs_the_same_in_a_larger_row_bank() -> 
     assert_eq!(trial(2)?, trial(2048)?);
     Ok(())
 }
+
+#[test]
+fn wrapped_local_algebra_reuses_aborted_bank_and_recovers_older_global_gap() -> Result<(), Error> {
+    let c = Config {
+        window: 384,
+        local_window: 128,
+        handoff_sources: 384,
+        max_rows: 2,
+        max_payload: 31,
+        ..large()
+    };
+    let now = Tick(0);
+    let mut encoder = Encoder::new(c, scope(), now)?;
+    let mut decoder = Decoder::new(c, scope(), now)?;
+    let limited = WorkBudget {
+        field: 11,
+        copies: 7,
+        metadata: 17,
+    };
+    let originals = |id: u32| [id as u8, (id >> 8) as u8, 0x80, 0];
+    let missing = [190, 378, 383, 389, 401, 439];
+    for id in 0..458 {
+        encoder.admit_source(&originals(id), now)?;
+        if !missing.contains(&id) {
+            decoder.begin_source(scope(), SourceId(id), &originals(id), now)?;
+            finish(&mut decoder)?;
+        }
+        if id < missing[0] {
+            decoder.confirm_handoff(SourceId(id), now)?;
+            encoder.confirm_prefix(id + 1, now)?;
+        }
+    }
+    let verify_mask = |d: &Decoder| {
+        let width = coefficient_block_bytes(c.window);
+        let valid = |data: &[u8], mask: u64| {
+            data[..c.window]
+                .iter()
+                .enumerate()
+                .all(|(i, byte)| mask & (1u64 << (i / width)) != 0 || *byte == 0)
+        };
+        assert!(valid(&d.candidate, d.candidate_blocks));
+        for (row, state) in d.rows.iter().enumerate() {
+            for (bank, mask) in state.blocks.into_iter().enumerate() {
+                assert!(valid(&d.data[bank][d.row_start(row)..], mask));
+            }
+        }
+    };
+    for (i, global) in [true, false, false].into_iter().enumerate() {
+        let id = encoder.begin_repair(global, now)?;
+        while encoder.pending_repair().is_none() {
+            encoder.step(now, limited)?;
+        }
+        let repair = encoder.pending_repair().ok_or(Error::Identity)?;
+        if !global {
+            assert!(repair.support.start > missing[0]);
+            assert!(repair.support.start < c.window as u32 && repair.support.end > c.window as u32);
+        }
+        decoder.begin_repair(repair, now)?;
+        let committed = decoder.status();
+        loop {
+            let result = decoder.step(now, limited)?;
+            verify_mask(&decoder);
+            if let DecodeStep::Pending(work) = result {
+                assert!(
+                    work.field <= limited.field
+                        && work.copies <= limited.copies
+                        && work.metadata <= limited.metadata
+                );
+                assert_eq!(decoder.status().rank, committed.rank);
+                assert_eq!(decoder.status().decoded_prefix, committed.decoded_prefix);
+            } else {
+                if i == 2 {
+                    assert!(matches!(result, DecodeStep::Capacity(_)));
+                    assert_eq!(decoder.status().rank, 2);
+                } else {
+                    assert!(matches!(result, DecodeStep::Accepted { .. }));
+                    assert_eq!(decoder.status().rank, i + 1);
+                }
+                break;
+            }
+        }
+        encoder.confirm_repair(id, now)?;
+    }
+    // Deliver enough local originals to unlock both retained equations. Source
+    // 190 occurs only in the older global equation and is never retransmitted.
+    for id in [378, 383, 389, 401, 439] {
+        if decoder.decoded_source(SourceId(id))?.is_some() {
+            continue;
+        }
+        decoder.begin_source(scope(), SourceId(id), &originals(id), now)?;
+        loop {
+            let result = decoder.step(now, limited)?;
+            verify_mask(&decoder);
+            match result {
+                DecodeStep::Accepted { .. } => break,
+                DecodeStep::Pending(_) => {}
+                DecodeStep::Capacity(_) => break,
+                _ => return Err(Error::Identity),
+            }
+        }
+    }
+    assert_eq!(decoder.status().rank, 0);
+    for id in missing[0]..458 {
+        assert_eq!(
+            decoder.pending_source(),
+            Some((SourceId(id), originals(id).as_slice()))
+        );
+        decoder.confirm_handoff(SourceId(id), now)?;
+    }
+    Ok(())
+}

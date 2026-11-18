@@ -1102,6 +1102,9 @@ TEST-12 and PBA-03/06 track the
 [matched C48 measurements and sender MUX residence](modules/frame-channel-experiment.md#sender-mux-residence-and-the-c48-throughput-gap).
 The four-flow Linux trace joins original TCP byte ranges to native reads, MUX
 admission, recovery and application completion. Performance parity remains open.
+The same study records the local/global decoder work reduction, the
+per-device-write ACK service regression and end-to-end 50.44 Mbit/s repeat.
+Another draw exceeded the original ACK deadline. TEST-12 remains open.
 
 ## Per-mode parity implementation gates
 

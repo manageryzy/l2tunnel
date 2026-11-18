@@ -855,3 +855,77 @@ concurrent tick deficit across 28 vCPUs. The guest evidence cannot isolate a
 hypervisor cause. Both original five-second challenge caps remained active.
 This run does not qualify as a successful performance sample.
 [Failed-run timeline](../../work/c48-parity-20261119/native/candidate-r6/terminal-timeline.json).
+
+The sequence-number join on the qualified R6 repeat covers all 140,742
+records. For the slowest 1% of observed round trips, forward TUN transit
+averaged 427.89 ms, server data to covering ACK 0.15 ms, and reverse ACK
+transit 42.64 ms. Median reverse transit was 40.78 ms. The join uses the
+first covering cumulative ACK at each capture point and permits the returned
+ACK to cover more bytes. These are packet timings rather than Linux RTO
+estimates. [Cumulative ACK reconstruction](../../work/c48-parity-20261119/native/candidate-r6-repeat/cumulative-ack.json).
+
+An experimental extra encoder handoff on admission plus inline scheduler
+turns (R7) delivered 45.72 and 46.57 Mbit/s. The main path retains the R6
+scheduling behavior. R8 isolates runtime-dispatched GF(256) multiply-add
+over the existing polynomial and exact per-direction work bounds. The public
+encoder's dense 128-source equation fell from 43.53 to 9.27 microseconds in
+a same-CPU replay, and its dense 8192-source equation fell from 2.94 to
+1.10 ms. R9 also constructs only populated packed receive witnesses and
+records separate wall time for ACK service, native collection, management
+progress and Rolling computation. R8 and R9 delivered 44.11 and 47.47 Mbit/s
+in their completed trials. Each had a separate incomplete attempt at the
+receiver's held-ACK deadline. These observations establish an arithmetic
+speedup in the isolated encoder and leave whole-tunnel performance
+and deadline reliability open.
+[R7 experiment](../../work/c48-parity-20261119/native/r7-split/hashes.json),
+[encoder reference](../../work/c48-parity-20261119/recovery/encoder-reference-same-cpu.csv),
+[encoder with runtime dispatch](../../work/c48-parity-20261119/recovery/encoder-dispatch-repeat.csv),
+[R8](../../work/c48-parity-20261119/native/candidate-r8/summary.json)
+and [R9](../../work/c48-parity-20261119/native/candidate-r9/summary.json).
+
+Limiting the real Linux TCP payload to 1200 bytes on a separate R8 diagnostic
+kept both MTUs at 1500. The 96,255 captured native frames required 96,271
+aligned units, compared with 95,258 units for 53,166 frames in the ordinary
+R8 run. That diagnostic delivered 49.50 Mbit/s with first-write P99 434.60 ms
+and a complete bilateral drain. These trials have different record totals.
+The original Linux MTU and unconstrained TCP segment size remain the
+acceptance workload. [Diagnostic summary](../../work/c48-parity-20261119/native/diagnostic-r8-mss1200/summary.json).
+
+R9's terminal trace locates one missed ACK service inside a 23.01 ms native
+write batch. The original 5 ms service time and 20 ms hard expiry both fell
+inside that batch. R10 services the opposite-direction ACK at the existing
+clock checks around each native write. A successful write settles its
+original physical token first. Two complete four-capture runs delivered
+46.83 and 47.06 Mbit/s. First application write to read P99 was 729.30 and
+494.14 ms; scheduled issue to read P99 was 6512.44 and 5769.55 ms.
+Both reached zero unconfirmed sources in both directions after drain. Each
+accepted about 66 Mbit/s at the sender UDP socket during the observed steady
+interval, with zero socket drops. The two measurements leave a substantial
+gap to the Python 75.78–75.94 Mbit/s application results.
+[R10](../../work/c48-parity-20261119/native/candidate-r10/summary.json),
+[R10 repeat](../../work/c48-parity-20261119/native/candidate-r10-repeat/summary.json).
+
+The next decoder change records which of 64 physical coefficient blocks
+can contain a nonzero value in each working or committed row. All-zero
+blocks can be skipped during elimination, normalization and copying. Old
+and wrapped rows retain every previously occupied block. For the 2048-row
+configuration the two banks reserve an additional 32 KiB in total.
+In a matched single-CPU experiment restoring 19 known missing sources, the
+local case took 393.35 microseconds (previously 731.81) and needed 53
+bounded service calls (previously 125). The global case took 37.39 ms
+(previously 40.59) and needed 2223 calls (previously 2273). The benchmark
+checks every recovered byte and uses the same work grants in both versions.
+[Paired decoder benchmark](../../work/c48-parity-20261119/recovery/rank-block-comparison.json).
+
+With this change, the qualified R11 repeat delivered 50.44 Mbit/s with
+475.23 ms first-write P99 and 5119.56 ms scheduled P99. Of 222,657 scheduled
+records, 148,922 reached the receiver and 73,735 remained unsubmitted. At
+application EOF, 1137 forward and 35 reverse sources still awaited confirmation.
+Both peers drained to zero. Physical recovery traffic represented 21.79% of
+forward bytes and 12.08% of reverse bytes. A profiled repeat delivered 50.04
+Mbit/s. The first trial hit the original held-ACK deadline at the receiver
+and is excluded from throughput. A separate trace timed 52,373 receiver TUN
+writes and found a maximum of 5.29 ms. It did not reproduce that failed trial.
+[Regular repeat](../../work/c48-parity-20261119/native/candidate-r11-repeat/summary.json),
+[profile](../../work/c48-parity-20261119/native/candidate-r11-steady-perf/profile.json)
+and [failed trial](../../work/c48-parity-20261119/native/candidate-r11/diagnostic-failure.json).

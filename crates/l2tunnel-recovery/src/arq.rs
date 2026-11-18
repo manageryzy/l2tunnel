@@ -1446,7 +1446,8 @@ impl Engine {
     }
 
     fn source_deadline(&self) -> Option<Duration> {
-        if self.failure.is_some() {
+        // An idle reserved control sender has no deadlines in its preallocated slots.
+        if self.failure.is_some() || self.sent.is_empty() {
             return None;
         }
         if self.compact.is_some() {

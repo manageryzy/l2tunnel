@@ -2367,7 +2367,9 @@ impl Driver {
                     break;
                 }
                 spent += 1;
-                self.collect_native(now()?)?;
+                let observed = now()?;
+                self.service_due_acks(observed)?;
+                self.collect_native(observed)?;
                 if self.native.is_empty() {
                     continue;
                 }

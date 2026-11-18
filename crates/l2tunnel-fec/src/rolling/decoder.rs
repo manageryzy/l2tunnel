@@ -283,12 +283,16 @@ pub struct DecoderStatus {
 struct Row {
     version: Cell<()>,
     nonzero: [usize; 2],
+    // Physical writes to each bank, including partially prepared/aborted versions.
+    // A cleared bit proves that its coefficient block is zero in that bank.
+    blocks: [u64; 2],
 }
 impl Row {
     fn new() -> Self {
         Self {
             version: Cell::new(),
             nonzero: [0; 2],
+            blocks: [0; 2],
         }
     }
     fn selected(&self, pool: &Pool, active: Option<Ticket>) -> Result<Option<usize>, Error> {
@@ -323,6 +327,7 @@ pub struct Decoder {
     known_data: Vec<u8>,
     input: Vec<u8>,
     candidate: Vec<u8>,
+    candidate_blocks: u64,
     history: Vec<u8>,
     history_meta: Vec<Option<Descriptor>>,
     history_floor: u64,
@@ -367,6 +372,41 @@ fn field_chunk(remaining: usize, budget: &WorkBudget) -> Result<usize, Error> {
 fn charge_field_chunk(count: usize, budget: &mut WorkBudget) {
     budget.field -= count - 1;
     budget.metadata -= count - 1;
+}
+
+// One machine word covers the whole circular coefficient array, independent
+// of the absolute source IDs. Payload bytes always stay in the work range.
+fn coefficient_block_bytes(window: usize) -> usize {
+    window.div_ceil(u64::BITS as usize).max(128)
+}
+
+fn coefficient_run(
+    index: usize,
+    end: usize,
+    window: usize,
+    blocks: u64,
+) -> Result<std::ops::Range<usize>, Error> {
+    if index > end || window > end {
+        return Err(Error::Identity);
+    }
+    let width = coefficient_block_bytes(window);
+    if window <= width || index >= window {
+        return Ok(index..end);
+    }
+    let block = index / width;
+    let remaining = blocks >> block;
+    if remaining == 0 {
+        return Ok(window..end);
+    }
+    let skip = remaining.trailing_zeros() as usize;
+    let active = (remaining >> skip).trailing_ones() as usize;
+    let start = if skip == 0 {
+        index
+    } else {
+        ((block + skip) * width).min(window)
+    };
+    let stop = ((block + skip + active) * width).min(window);
+    Ok(start..if stop == window { end } else { stop })
 }
 
 enum Action {
@@ -529,6 +569,7 @@ impl Decoder {
             known_data: bytes(mul(2 * config.window, width)?)?,
             input: bytes(width)?,
             candidate: bytes(config.window + width)?,
+            candidate_blocks: 0,
             history: bytes(mul(config.repair_history, width)?)?,
             history_meta: slots(config.repair_history, None)?,
             history_floor: 1,
@@ -1055,6 +1096,7 @@ impl Decoder {
     ) -> Result<(), Error> {
         let (to, from) = self.rows[row].prepare(&mut self.decisions, job.ticket)?;
         if copy_old && let Some(from) = from {
+            self.rows[row].blocks[to] |= self.rows[row].blocks[from];
             job.resume = Some(next);
             job.phase = Phase::CopyRow {
                 row,
@@ -1063,6 +1105,9 @@ impl Decoder {
                 index: 0,
             };
         } else {
+            if !copy_old {
+                self.rows[row].blocks[to] |= self.candidate_blocks;
+            }
             job.phase = next;
         }
         Ok(())
@@ -1102,14 +1147,23 @@ impl Decoder {
             } => {
                 let stride = add(w, width)?;
                 if index == stride {
-                    let nonzero = *self.rows[row].nonzero.get(from).ok_or(Error::Identity)?;
-                    *self.rows[row].nonzero.get_mut(to).ok_or(Error::Identity)? = nonzero;
+                    let target = self.rows.get_mut(row).ok_or(Error::Identity)?;
+                    let nonzero = *target.nonzero.get(from).ok_or(Error::Identity)?;
+                    *target.nonzero.get_mut(to).ok_or(Error::Identity)? = nonzero;
+                    target.blocks[to] = target.blocks[from];
                     job.phase = job.resume.take().ok_or(Error::Identity)?;
                 } else {
                     if budget.copies == 0 {
                         return Ok(Action::Paused);
                     }
-                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let blocks = *self
+                        .rows
+                        .get(row)
+                        .and_then(|r| r.blocks.get(to))
+                        .ok_or(Error::Identity)?;
+                    let run = coefficient_run(index, stride, w, blocks)?;
+                    let index = run.start;
+                    let remaining = run.len();
                     let count = copy_chunk(remaining, budget)?;
                     let start = add(mul(row, stride)?, index)?;
                     let end = add(start, count)?;
@@ -1135,13 +1189,16 @@ impl Decoder {
                 }
             }
             Phase::Clear(i) => {
+                let run = coefficient_run(i, self.candidate.len(), w, self.candidate_blocks)?;
+                let i = run.start;
                 if i == self.candidate.len() {
+                    self.candidate_blocks = 0;
                     job.phase = Phase::Load(0);
                 } else {
                     if budget.copies == 0 {
                         return Ok(Action::Paused);
                     }
-                    let remaining = self.candidate.len().checked_sub(i).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let count = copy_chunk(remaining, budget)?;
                     let end = add(i, count)?;
                     self.candidate
@@ -1212,6 +1269,8 @@ impl Decoder {
                             return Err(Error::Identity);
                         }
                         self.candidate[id as usize % w] = factor;
+                        self.candidate_blocks |=
+                            1u64 << ((id as usize % w) / coefficient_block_bytes(w));
                         job.phase = Phase::Support(id + 1);
                     }
                 }
@@ -1293,10 +1352,14 @@ impl Decoder {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    // No transaction decision changes within this row chunk.
                     let bank = self.row_bank(row, self.active)?;
+                    let blocks = self.rows[row].blocks[bank];
+                    self.candidate_blocks |= blocks;
+                    let run = coefficient_run(index, w + width, w, blocks)?;
+                    let index = run.start;
+                    // No transaction decision changes within this row chunk.
                     let stride = add(w, width)?;
-                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let count = field_chunk(remaining, budget)?;
                     let end = add(index, count)?;
                     let start = mul(row, stride)?;
@@ -1401,13 +1464,15 @@ impl Decoder {
                 factor,
                 index,
             } => {
+                let run = coefficient_run(index, w + width, w, self.candidate_blocks)?;
+                let index = run.start;
                 if index == w + width {
                     job.phase = Phase::Others { pivot, row: 0 };
                 } else {
                     if !spend(&mut budget.field) {
                         return Ok(Action::Paused);
                     }
-                    let remaining = add(w, width)?.checked_sub(index).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let count = field_chunk(remaining, budget)?;
                     let end = add(index, count)?;
                     let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
@@ -1465,6 +1530,8 @@ impl Decoder {
                 factor,
                 index,
             } => {
+                let run = coefficient_run(index, w + width, w, self.candidate_blocks)?;
+                let index = run.start;
                 if index == w + width {
                     job.phase = Phase::Others {
                         pivot,
@@ -1478,8 +1545,9 @@ impl Decoder {
                     // bank. Resolve it after the original first field debit;
                     // no decision or source row changes within this chunk.
                     let bank = self.row_bank(row, self.active)?;
+                    self.rows[row].blocks[bank] |= self.candidate_blocks;
                     let stride = add(w, width)?;
-                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let count = field_chunk(remaining, budget)?;
                     let end = add(index, count)?;
                     let start = mul(row, stride)?;
@@ -1514,6 +1582,8 @@ impl Decoder {
                 index,
                 count,
             } => {
+                let run = coefficient_run(index, w, w, self.candidate_blocks)?;
+                let index = run.start;
                 if index == w {
                     job.candidate_nonzero = count;
                     if count == 1 {
@@ -1527,7 +1597,7 @@ impl Decoder {
                         job.phase = Phase::FindSlot { pivot, row: 0 };
                     }
                 } else {
-                    let remaining = w.checked_sub(index).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let bytes = metadata_chunk(remaining, budget)?;
                     let end = add(index, bytes)?;
                     let coefficients = self.candidate.get(index..end).ok_or(Error::Identity)?;
@@ -1569,6 +1639,7 @@ impl Decoder {
                 if index == w + width {
                     let bank = self.row_bank(row, self.active)?;
                     self.rows[row].nonzero[bank] = job.candidate_nonzero;
+                    self.rows[row].blocks[bank] = self.candidate_blocks;
                     self.set_pivot(row, Some(pivot))?;
                     self.set_map(pivot as usize % w, Some(row))?;
                     self.shadow.rank += 1;
@@ -1577,11 +1648,13 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
+                    let bank = self.row_bank(row, self.active)?;
+                    let run = coefficient_run(index, w + width, w, self.rows[row].blocks[bank])?;
+                    let index = run.start;
                     // The first copy and metadata visit are already charged.
                     // Preserve the separate end visit that publishes the pivot.
-                    let bank = self.row_bank(row, self.active)?;
                     let stride = add(w, width)?;
-                    let remaining = stride.checked_sub(index).ok_or(Error::Identity)?;
+                    let remaining = run.len();
                     let count = remaining
                         .min(add(budget.copies, 1)?)
                         .min(add(budget.metadata, 1)?);

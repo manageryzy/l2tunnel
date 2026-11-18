@@ -461,6 +461,7 @@ impl Driver {
         if !self.check_expiry(before)? {
             return Ok(false);
         }
+        self.service_due_acks(before)?;
         self.validate_common_fence()?;
         let Some(packet) = self.native.common()?.front() else {
             return Ok(false);
@@ -536,6 +537,11 @@ impl Driver {
         }
         if !self.check_expiry_with_completion(after, Some(since), Some(metadata.deadline))? {
             return Ok(false);
+        }
+        // A batch may include many nonblocking device writes. Each original
+        // token has been settled before servicing the opposite ACK direction.
+        if result.is_ok() {
+            self.service_due_acks(after)?;
         }
         result
     }

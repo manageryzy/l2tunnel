@@ -627,6 +627,32 @@ fn field_batch_python_vectors_match_every_step_and_repeated_capacity_rollback() 
 #[test]
 fn row_counts_large_window_preserve_global_recovery_against_full_coefficient_census()
 -> Result<(), Error> {
+    fn compare(a: &mut Decoder, b: &mut Decoder) -> Result<(), Error> {
+        let mut sums = [WorkUsed::default(); 2];
+        for ((owner, oracle), sum) in [(a, false), (b, true)].into_iter().zip(&mut sums) {
+            loop {
+                let result = if oracle {
+                    bytewise_step(owner, Tick(0), full())?
+                } else {
+                    owner.step(Tick(0), full())?
+                };
+                match result {
+                    DecodeStep::Accepted { work, .. } | DecodeStep::Pending(work) => {
+                        sum.field += work.field;
+                        sum.copies += work.copies;
+                        sum.metadata += work.metadata;
+                    }
+                    _ => return Err(Error::Identity),
+                }
+                if matches!(result, DecodeStep::Accepted { .. }) {
+                    break;
+                }
+            }
+        }
+        assert!(sums[0].metadata < sums[1].metadata);
+        assert!(sums[0].field < sums[1].field);
+        Ok(())
+    }
     let c = Config {
         window: 8192,
         handoff_sources: 8192,
@@ -640,17 +666,13 @@ fn row_counts_large_window_preserve_global_recovery_against_full_coefficient_cen
     for d in [&mut a, &mut b] {
         stage(d, 2, &E4_R2)?;
     }
-    assert!(matches!(
-        finish_pair(&mut a, &mut b)?,
-        DecodeStep::Accepted { .. }
-    ));
+    compare(&mut a, &mut b)?;
+    assert_same(&a, &b)?;
     for d in [&mut a, &mut b] {
         stage(d, 1, &E4_R1)?;
     }
-    assert!(matches!(
-        finish_pair(&mut a, &mut b)?,
-        DecodeStep::Accepted { .. }
-    ));
+    compare(&mut a, &mut b)?;
+    assert_same(&a, &b)?;
     for id in [0, 2] {
         for d in [&mut a, &mut b] {
             assert_eq!(
@@ -658,10 +680,8 @@ fn row_counts_large_window_preserve_global_recovery_against_full_coefficient_cen
                 Begin::Staged
             );
         }
-        assert!(matches!(
-            finish_pair(&mut a, &mut b)?,
-            DecodeStep::Accepted { .. }
-        ));
+        compare(&mut a, &mut b)?;
+        assert_same(&a, &b)?;
     }
     assert_eq!(a.status().decoded_prefix, 4);
     for (id, original) in ORIGINALS.into_iter().enumerate() {
