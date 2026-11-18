@@ -47,12 +47,12 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-02 | ACK ingress candidates/slab | Common held-input capacity wait implemented; internal deliberate coalescing hold and per-flow replacement age export pending. |
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
-| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Shared Aligned/Packed, including Compact variants, now have exact ordered recovery-source refusal-to-release intervals with scoped local batch22 validation below. Native qualification, independent owners, preview, missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
+| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Shared Aligned/Packed, including Compact variants, now have exact ordered recovery-source refusal-to-release intervals with scoped local batch22 validation below. Native22 Cauchy validates fresh terminal exports with zero actual refusals. Nonzero native waits, independent owners, preview, missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
 | BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below and finite native17 Aligned Cauchy export. Exact per-restored-source ARQ refusal-to-admission timing passes scoped local validation; native21 validates both Cauchy exports with zero actual refusals. Native nonzero-wait qualification and whole-write durations remain open. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
 | BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below and finite native17 generation-capacity observations. Exact restored-source admission timing passes scoped local validation; native21 validates both Cauchy exports with zero actual refusals. Native nonzero-wait qualification and missing-equation waits remain open. |
-| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and exact retained-operation intervals are implemented for source admission, decoded handoff, ready-feedback budget and receiving data-head Busy admission. Optional bounded storage and runtime export are charged before I/O. Scoped local batch22 validation passes below; native qualification, work slices, feedback construction, remaining ingress and missing-source dependencies remain open. |
+| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and exact retained-operation intervals are implemented for source admission, decoded handoff, ready-feedback budget and receiving data-head Busy admission. Optional bounded storage and runtime export are charged before I/O. Scoped local batch22 validation and finite native22 data-head Busy exports pass below. Work slices, feedback construction, remaining ingress, missing-source dependencies and full native qualification remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
 | BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Sampled codec/recovery export preserves full independent owner incarnation; exact staged-source admission waits retain the same identity. Remaining lifecycle/source-free/native wait timing is pending. |
@@ -1817,5 +1817,61 @@ type import in a new test; the continuation changes only that import. Independen
 source review also found and corrected a parser role-validation gap before
 execution. Existing real pressure, Packed rollback, original expiry, exact
 Compact accounting and current-wire ingress fixtures pass. Unchanged check21
-stages are reused, not rerun. Native22 and full BP/matrix qualification remain
-pending; these slices do not reduce any parent acceptance definition.
+stages are reused, not rerun. Native22 observations follow below; full BP/matrix
+qualification remains pending. These slices do not reduce any parent acceptance definition.
+
+### Native22 receiving refusal observations
+
+The [saved report](../../work/aligned-extents-20261117/native22-analysis1/report.md)
+binds commit `e8dc14f45dc6b7f9f3ac5e25a8495c9608d4f252` and executable
+`c3e909f55e5d2ea6e45963567ce3763a320e1a13a0611476723c079a9bfd55b4`.
+Two serial Full/TUN forward cases retain the original 16 TCP connections,
+100/10 Mbit/s link, 35 ms and 15% loss each way, two-second warmup,
+ten-second measurement, all work allowances, deadlines and retained quotas.
+The layout-dependent exporter suggestion is preserved separately; actual
+runtime construction admits the unchanged original quotas. Both cases confirm
+owned namespace/PID cleanup and stable source, executable and helper hashes.
+All four buffer and four wire owners validate with zero rejected inputs.
+
+Cauchy again exhausts the original 60-second phase bound, with successful local
+disconnect. Rolling fails and local disconnect fails; neither phase qualifies
+throughput. Cauchy's ordered receiver handoff and restored-source ARQ admission
+observers both report zero actual refusals, zero omissions and fresh terminal
+coverage at both endpoints. Client staged-source waits still total 53.771773 s
+over 173 completed episodes plus 2.742573 s censored. The maximum 4.602521 s wait
+holds source 5181 behind source 5117 at the original 64-source span; ACK299
+retires source 5117 at attempt six, followed by admission 20 us later. This
+does not distinguish missing data from delayed or lost feedback.
+
+Rolling server data-head admission records 12,076 actual Busy returns with zero
+omissions: 895 staged episodes total 6.730421 s, 46 stale episodes total
+18.733 ms, and one terminal censored episode is 46.725 ms. Staged maximum is
+105.657 ms; the bounded observer retains the last identity, not the maximum's
+identity. Client records seven staged episodes totaling 9.875 ms and two stale
+episodes totaling 0.422 ms. These are actual refusal intervals, including
+scheduling; they are neither CPU time nor earlier passive queue residence.
+
+The server's final waiting source is Records 1553, received at 7,616,337 us with
+original cap 12,616,337 us. Its blocker is Repair485, support [940,1068),
+received at 7,616,297 us, admitted at 12,570,632 us and capped at 12,616,297 us.
+At 12,617,458 us local failure selects the original ingress cap; the decoder
+still holds that repair at Insert(pivot941,row106,index1790). Thus the repair
+spent 4.954335 s before admission, leaving 45.665 ms of its original lifetime.
+The client independently expires its CodecStage. No deadline is renewed.
+
+[Finite process CPU samples](../../work/aligned-extents-20261117/native22-findings1/findings.json)
+span 7.687064 s: client user/kernel CPU is 1.48/0.41 s and server 2.34/0.49 s.
+These sampled CPU intervals differ from lifetime wall spans and do not exclude
+host contention or descheduling. Server lifetime CommonProtocolProgress totals
+1.683767 s; CommonSelectPending totals 9.057065 s. Source review finds a 100 us
+floor even when resumable work requests an immediate wake; its causal share
+and any correction remain unvalidated here.
+
+Record protection is 21 B mean/p99 across all four emission populations.
+Systematic source fill is zero for Cauchy 6,182/3,018 and Rolling 1,222/111 a/b
+emissions. Same-emission IPv4 bytes outside codec body have mean/p99 Cauchy
+69.237973/73 B and 67.902469/72 B, and Rolling 60.226678/68 B and 74.063063/105 B
+for a/b. These lifetime populations include warmup/retries/drain; they are not
+per-original-native overhead. No overlapping durations or independent p99s are
+summed. Full BP-01..BP-24, complete overhead and the 80-combination/three-phase
+current-build matrix remain open.

@@ -223,8 +223,13 @@ Aligned/Packed and Compact variants, plus actual Rolling/Research data-head Busy
 timing. Optional state and runtime snapshot copies are prepaid; Compact facade
 construction preserves the exact validated plan. Scoped local validation passes
 569 affected Rust cases, 63 report cases, strict Clippy/rustdoc and formatting.
-Native22 and full BP-05/BP-10 coverage remain pending. No original quota, timer,
-work allowance, recovery behavior or full parent definition changes.
+[Native22](modules/buffer-observability.md#native22-receiving-refusal-observations)
+validates fresh Cauchy receiver-handoff exports with zero actual refusals and
+Rolling server data-head Busy intervals totaling 6.730421 seconds across 895
+staged episodes. Cauchy still exhausts its original phase bound; Rolling still
+expires, with no qualified throughput in either case. Full BP-05/BP-10 and
+matrix coverage remain open. No original quota, timer, work allowance, recovery
+behavior or full parent definition changes.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
