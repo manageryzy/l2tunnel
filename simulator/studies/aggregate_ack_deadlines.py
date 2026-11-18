@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict
 from functools import partial
 from hashlib import sha256
 import json
@@ -35,6 +36,12 @@ class ObservedMuxTCP(SegmentDeadlineObserver, TCPRTTObserver, MuxTCP):
 def make_simulation(task):
     profile = task["profile"]
     mux = profile.get("mux")
+    targeted = task.get("packed_targeted_recovery", False)
+    if type(targeted) is not bool:
+        raise ValueError("packed_targeted_recovery must be a boolean")
+    if targeted and (mux is None or profile.get("wire_format") != "compact_wire"
+                     or profile["compact"].get("pack_sources_max_delay_ms", 0) <= 0):
+        raise ValueError("targeted recovery requires a packed duplex MUX")
     if mux is None and not profile["ack_aggregation"]:
         return baseline.make_simulation(task)
     wire_format = profile.get("wire_format", "aligned_records")
@@ -70,6 +77,19 @@ def make_simulation(task):
         Strategy(profile["name"], mode="tcp", tcp_rto_min_ms=profile["rto_min_ms"],
                  tcp_cc=profile.get("controller", "cubic")),
         task["seed"], profile["flow_count"], simulation_factory=factory, **simulation_options)
+    if targeted:
+        # Install before producers, probes or receiver service attach. The named
+        # historical MUX constructor and its source fingerprint stay reproducible.
+        from l2tunnel_sim.packed_targeted import TargetedPackedWireTransport
+        transports = tuple(TargetedPackedWireTransport(sim.flows[0], reverse, config)
+                           for reverse in (False, True))
+        for previous, current in zip(sim.mux.transports, transports):
+            current.capacity_callback = previous.capacity_callback
+            previous.capacity_callback = None
+        sim.shared_forward, sim.shared_reverse = transports
+        sim.mux.transports = transports
+        for flow in sim.flows:
+            flow.compact_forward.transport, flow.compact_reverse.transport = transports
     if mux is not None:
         return sim
     sim.ack_aggregate = ACKAggregator(sim.flows, hold_ms=profile["ack_batch_hold_ms"],
@@ -132,6 +152,11 @@ def execute(task, *, observe_packed=None):
                 "ack_superseded", "ack_transmitted", "ack_duplicates_transmitted", "ack_copy_duplicates"):
         row[key] = sum(getattr(flow, key) for flow in sim.flows)
     shared = sim.shared_forward
+    if task.get("packed_targeted_recovery"):
+        row["targeted_policy"] = asdict(shared.policy)
+        row["targeted_counts"] = {name: dict(transport.targeted_counts)
+                                  for name, transport in (("forward", shared),
+                                                          ("reverse", sim.shared_reverse))}
     aggregate = getattr(sim, "ack_aggregate", None)
     row["tcp_all_acknowledged"] = all(flow.tcp_acked == len(flow.sent_times) for flow in sim.flows)
     row["outer_all_confirmed"] = shared.base == len(shared.sources) and not shared.buffer_bytes and not shared.callbacks

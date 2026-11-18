@@ -38,6 +38,25 @@ def test_bulk_frames_have_distinct_correct_bidirectional_tuples():
     assert len(set(tuples)) == 16
 
 
+def test_targeted_recovery_selection_reaches_both_mux_endpoints(study):
+    from l2tunnel_sim.packed_targeted import TargetedPackedWireTransport
+    from l2tunnel_sim.packed_wire import PackedWireTransport
+
+    task = mux_case()
+    with pytest.raises(ValueError, match="packed duplex MUX"):
+        study.make_simulation(dict(task, packed_targeted_recovery=True))
+    task["profile"]["compact"]["pack_sources_max_delay_ms"] = .5
+    with pytest.raises(ValueError, match="boolean"):
+        study.make_simulation(dict(task, packed_targeted_recovery="false"))
+    for enabled, cls in ((False, PackedWireTransport), (True, TargetedPackedWireTransport)):
+        sim = study.make_simulation(dict(task, packed_targeted_recovery=enabled))
+        assert sim.mux.transports == (sim.shared_forward, sim.shared_reverse)
+        assert all(type(transport) is cls for transport in sim.mux.transports)
+        for flow in sim.flows:
+            assert flow.compact_forward.transport is sim.shared_forward
+            assert flow.compact_reverse.transport is sim.shared_reverse
+
+
 @pytest.mark.parametrize("channels", [1, 4, 16])
 @pytest.mark.parametrize("loss", [0, .15])
 def test_normal_entry_shares_both_directions_and_channel_pool(study, channels, loss):

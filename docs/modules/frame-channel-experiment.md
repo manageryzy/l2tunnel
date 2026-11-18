@@ -260,3 +260,62 @@ PYTHONPATH=simulator/src python3 simulator/studies/packed_decoder_sensitivity.py
   --paired-manifest work/c48-full-replay/manifest.json --rank-backend dense \
   --out work/c48-full-decoder-replay
 ```
+
+## Targeted recovery in the original PackedWire workload
+
+The opt-in `packed_targeted_recovery` experiment runs through the ordinary
+duplex PackedWire MUX. It keeps C48's packing, compressed channel records,
+local 128-source and periodic global 8,192-source FEC, decoder cost curve and
+16 inner TCP flows. The existing receiver already releases a solvable record
+when its own channel's dependencies are satisfied. Cumulative confirmation
+continues to control sender custody.
+
+A later source or repair header tells the receiver which source IDs could
+already have arrived. It waits 2 ms for a missing ID, then shares a budget
+of eight IDs per 2 ms between newly observed holes and older requests due
+for a repeat. Each packet names IDs within a 32-source span. The span start
+and the cumulative confirmation are separate fields so a request far ahead
+of the oldest hole never acknowledges that hole. A missing ID becomes
+eligible again after 80 ms. Both the request and the original-byte retry
+use their respective lossy link serializers. If the sender has gone quiet
+for 140 ms with outstanding data, it retries its earliest unconfirmed
+original. A wholly erased tail needs no receiver-side guess.
+
+In a forced-loss test, source 0 remained unavailable while source 150 on a
+different channel was explicitly requested, recovered and delivered. The
+receiver delivered 200 later frames before source 0, kept the cumulative
+frontier at zero and eventually confirmed all 201 sources. Tests also cover
+the loss of a request, a retry and a final confirmation, ID wrap, malformed
+requests, duplicate fragments and channel-local codec order.
+[Targeted repair tests](../../simulator/tests/test_packed_targeted.py) and
+[independent channel delivery tests](../../simulator/tests/test_packed_channel_release.py)
+
+Run the original calibrated C48 seed and write new evidence with
+`PYTHONPATH=simulator/src python3 simulator/studies/packed_targeted_study.py --out work/targeted-full-replay`.
+The runner verifies the archived control before starting. Goodput and wire
+byte shares use seconds 5 through 90. The delivery P99 includes delivery
+during the 30-second drain. The recovery byte share counts FEC repair and
+retransmitted original IP bytes divided by all departed IP bytes in the same
+direction and interval. The receipt also breaks out feedback and short-source
+copies.
+
+| Full C48 run, first archived seed | TCP goodput Mbit/s | Application delivery P99 ms | Forward recovery share | Reverse recovery share | Unconfirmed sources at 90 s, forward / reverse | Unconfirmed sources after drain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Archived calibrated deficit-driven tail | 0.885 | 19,677.27 | 98.24% | 1.66% | 1,694 / 0 | 0 / 0 |
+| Targeted originals with fair fresh/old requests | 67.863 | 577.73 | 29.21% | 10.92% | 1,322 / 0 | 0 / 0 |
+
+The targeted run delivered and confirmed all 1,496,400 original TCP segments.
+At traffic end 7,471 segments awaited acknowledgement and after drain none
+remained. Forward IP service ran at 100.00 Mbit/s over the measured interval.
+Of those bytes, 14.72% went to coded repairs and 14.48% to retried originals.
+On the reverse link, the recovery share including the configured short-source
+copies was 61.33%. Forward receiver queue P99 fell to 35.67 ms, with 50,286
+input overflows across the run. The short runs with two original seeds delivered
+71.22 and 71.09 Mbit/s, with delivery P99 of 271.92 and 255.65 ms and full
+confirmation. The long result is one finite simulation with the same receiver
+cost calibration as the baseline. The altered packet sequence consumes the
+seeded erasure stream differently.
+[Full targeted run](../../work/packed-targeted-20261118/fresh-full-r1/summary.json),
+[matched historical control](../../work/packed-targeted-20261118/fresh-full-r1/archived-full-summary.json),
+[short seed one](../../work/packed-targeted-20261118/fresh-pilot-r1/summary.json)
+and [short seed two](../../work/packed-targeted-20261118/fresh-pilot-r2/summary.json)

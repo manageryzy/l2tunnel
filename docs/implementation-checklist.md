@@ -1054,6 +1054,9 @@ integration or performance acceptance.
 TEST-12 now has a [causal frame-channel experiment and PackedWire service study](modules/frame-channel-experiment.md)
 with independently ordered frames, bounded admission, lossy gap requests,
 actual XOR reconstruction, serialized decoding and per-direction IP accounting.
+The [PackedWire targeted-recovery comparison](modules/frame-channel-experiment.md#targeted-recovery-in-the-original-packedwire-workload)
+exercises these gap requests with the named C48 workload, calibrated receiver
+service, independent channel delivery and retained-source recovery.
 Matched kernel validation and the existing named runtime acceptance gates remain open.
 
 ## Per-mode parity implementation gates
